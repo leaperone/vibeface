@@ -368,6 +368,7 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
 }
 
 const BOT_DELETED: &str = "bot 已删除";
+const DECLINED: &str = "用户选择不回复";
 
 /// A turn runs only under the ownership it was claimed in: this Node at the session's owner
 /// epoch. A move away and back raises the epoch, so the old turn stays fenced. An agent task
@@ -489,6 +490,27 @@ pub(crate) fn admit_from(
     kind: TriggerKind,
     reply_to: &str,
 ) -> Result<AdmissionReceipt> {
+    admit_ended_from(
+        connection,
+        network,
+        conversation,
+        trigger,
+        kind,
+        reply_to,
+        None,
+    )
+}
+
+/// `declined` records the trigger as already cancelled with that evidence, so it never runs here.
+fn admit_ended_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    trigger: &str,
+    kind: TriggerKind,
+    reply_to: &str,
+    declined: Option<&str>,
+) -> Result<AdmissionReceipt> {
     if let Some(job) = load_job(connection, conversation, trigger)? {
         return Ok(job.receipt(network));
     }
@@ -497,8 +519,9 @@ pub(crate) fn admit_from(
     // An agent task waits for `claim_next`, which also ends its work.
     let deleted = kind != TriggerKind::AgentTask
         && super::bots::bot_deleted_from(connection, network, conversation)?;
+    let ended = declined.or(deleted.then_some(BOT_DELETED));
     ensure!(
-        deleted || queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
+        ended.is_some() || queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
         "scheduler inbox is full; trigger was not admitted"
     );
     let job = SchedulerJob {
@@ -513,13 +536,12 @@ pub(crate) fn admit_from(
             trigger,
             conversation_from(connection, network, conversation)?.map_or(0, |c| c.owner_epoch),
         ),
-        state: if deleted {
-            JobState::Cancelled {
+        state: match ended {
+            Some(evidence) => JobState::Cancelled {
                 attempt: None,
-                evidence: BOT_DELETED.into(),
-            }
-        } else {
-            JobState::Queued
+                evidence: evidence.into(),
+            },
+            None => JobState::Queued,
         },
     };
     session.next_sequence = session
@@ -587,6 +609,30 @@ impl Store {
         conversation: &str,
         message_ids: &[String],
     ) -> Result<Vec<AdmissionReceipt>> {
+        self.settle_unanswered(network, local, conversation, message_ids, None)
+    }
+
+    /// The user wants no reply to `message_ids`: each still unanswered is recorded here as
+    /// cancelled before it started, so it is no longer listed and never runs. Like the queue, the
+    /// record stays on this owner. A retry finds them recorded and changes nothing.
+    pub fn dismiss_unanswered(
+        &mut self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<AdmissionReceipt>> {
+        self.settle_unanswered(network, local, conversation, message_ids, Some(DECLINED))
+    }
+
+    fn settle_unanswered(
+        &mut self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        message_ids: &[String],
+        declined: Option<&str>,
+    ) -> Result<Vec<AdmissionReceipt>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -599,13 +645,14 @@ impl Store {
                 Some(_) => TriggerKind::Answer,
                 None => TriggerKind::Human,
             };
-            receipts.push(admit_from(
+            receipts.push(admit_ended_from(
                 &tx,
                 network,
                 conversation,
                 &message_trigger(&message_id),
                 kind,
                 &message_id,
+                declined,
             )?);
         }
         tx.commit()?;

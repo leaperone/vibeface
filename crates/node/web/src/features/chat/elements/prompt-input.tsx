@@ -40,8 +40,9 @@ export function PromptInput({
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
   const keepFocus = (event: MouseEvent) => event.preventDefault()
-  // A written message is always sendable; Stop takes the button only while the box is empty.
-  const stop = value.trim() || files.length ? undefined : onStop
+  // A written message is always sendable; while writing, Stop moves beside Send instead of leaving.
+  const drafting = Boolean(value.trim() || files.length)
+  const stop = drafting ? undefined : onStop
   return (
     <form
       ref={formRef}
@@ -82,25 +83,30 @@ export function PromptInput({
               <PaperclipIcon aria-hidden="true" />
               {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[0.625rem] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
             </InputGroupButton>
-            {open && files.map((file, index) => <span key={`${file.name}:${index}`} className="flex max-w-48 min-w-0 items-center gap-1 rounded-full bg-muted ps-3 text-meta">
-              <span className="truncate">{file.name}</span>
+            {open && files.map((file, index) => <span key={`${file.name}:${index}`} title={file.name} className="flex max-w-56 min-w-0 items-center gap-1 rounded-full bg-muted ps-3 text-meta">
+              <FileName name={file.name} />
               <button type="button" onMouseDown={keepFocus} className="grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
             </span>)}
           </> : null}
-          <InputGroupButton
-            type={stop ? 'button' : 'submit'}
-            variant={stop ? 'outline' : 'default'}
-            size="icon-sm"
-            disabled={!stop && (disabled || busy || !value.trim())}
-            aria-busy={busy || undefined}
-            aria-label={stop ? '停止' : '发送'}
-            title={stop ? '停止' : '发送'}
-            className="ms-auto size-11 rounded-full"
-            onMouseDown={keepFocus}
-            onClick={stop}
-          >
-            {stop ? <SquareIcon aria-hidden="true" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
-          </InputGroupButton>
+          <span className="ms-auto flex shrink-0 gap-1">
+            {drafting && onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-11 rounded-full" onMouseDown={keepFocus} onClick={onStop}>
+              <SquareIcon aria-hidden="true" className="fill-current" />
+            </InputGroupButton> : null}
+            <InputGroupButton
+              type={stop ? 'button' : 'submit'}
+              variant={stop ? 'outline' : 'default'}
+              size="icon-sm"
+              disabled={!stop && (disabled || busy || !value.trim())}
+              aria-busy={busy || undefined}
+              aria-label={stop ? '停止' : '发送'}
+              title={stop ? '停止' : '发送'}
+              className="size-11 rounded-full"
+              onMouseDown={keepFocus}
+              onClick={stop}
+            >
+              {stop ? <SquareIcon aria-hidden="true" className="fill-current" /> : busy ? <Spinner aria-hidden="true" /> : <ArrowUpIcon aria-hidden="true" />}
+            </InputGroupButton>
+          </span>
         </InputGroupAddon>
       </InputGroup>
       <div className="grid gap-1 pt-2 text-meta text-muted-foreground">
@@ -109,4 +115,11 @@ export function PromptInput({
       </div>
     </form>
   )
+}
+
+/** The extension stays readable when a long name is cut. */
+function FileName({ name }: { name: string }) {
+  const dot = name.lastIndexOf('.')
+  if (dot <= 0 || name.length - dot > 8) return <span className="truncate">{name}</span>
+  return <span className="flex min-w-0"><span className="truncate">{name.slice(0, dot)}</span><span className="shrink-0">{name.slice(dot)}</span></span>
 }

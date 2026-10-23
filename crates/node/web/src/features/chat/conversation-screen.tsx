@@ -49,7 +49,7 @@ export function ConversationScreen() {
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
   const lookup = { nodes: workspace.nodes, directory }
 
-  const pendingRow = (message: ChatMessage): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message })
+  const pendingRow = (message: ChatMessage, retry?: () => Promise<void>): ChatEntry => ({ key: message.message_id, anchor: message.role === 'user', message, retry })
   const interruptedRow = (reply: (typeof workspace.interrupted)[number]): ChatMessage => ({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: 0, state: 'interrupted' })
 
   // Tasks sit right after the message that started them.
@@ -82,6 +82,10 @@ export function ConversationScreen() {
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
+  // When the newest reply failed, its message can go out again as is, unless it carried files.
+  const newest = data?.messages.at(-1)
+  const failedAsk = newest?.status === 'failed' ? data?.messages.find((message) => message.role === 'user' && message.message_id === newest.in_reply_to && !message.attachments?.length) : undefined
+  const retry = failedAsk && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(failedAsk.text) } : undefined
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
@@ -99,7 +103,7 @@ export function ConversationScreen() {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message))
+    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined))
     const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error
     if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
     for (const job of jobs) {
@@ -139,9 +143,10 @@ export function ConversationScreen() {
     ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
     } /> : null,
-    unanswered.length ? <ActionCard key="unanswered" icon={MessageSquareReply} title={unanswered.length > 1 ? `${unanswered.length} 条消息没等到回复` : '这条消息没等到回复'} actions={
-      <ActionButton variant="default" disabled={!workspace.writable || !agentReady} action={() => workspace.replyUnanswered(unanswered)}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
-    }>{lastUnanswered ? <p className="line-clamp-2 text-muted-foreground">{lastUnanswered.text}</p> : null}</ActionCard> : null,
+    unanswered.length ? <ActionCard key="unanswered" icon={MessageSquareReply} title={unanswered.length > 1 ? `${unanswered.length} 条消息没等到回复` : '这条消息没等到回复'} actions={<>
+      <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.settleUnanswered(unanswered, 'dismiss')}>不回复</ActionButton>
+      <ActionButton variant="default" disabled={!workspace.writable || !agentReady} action={() => workspace.settleUnanswered(unanswered, 'reply')}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
+    </>}>{lastUnanswered ? <p className="line-clamp-2 text-muted-foreground">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
