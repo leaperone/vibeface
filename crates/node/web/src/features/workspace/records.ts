@@ -18,7 +18,7 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
   return {
     ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions, sent: records.sent,
-    scheduler: shown.scheduler && { ...shown.scheduler, jobs: records.jobs },
+    scheduler: shown.scheduler && { ...shown.scheduler, jobs: records.jobs, unanswered: records.unanswered },
   }
 }
 

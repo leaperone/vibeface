@@ -173,6 +173,7 @@ impl Runtime {
             })
             .collect();
         let memory = store.memories(network, scope)?;
+        let unanswered = store.unanswered_messages(network, &self.identity.device_id()?, scope)?;
         drop(store);
         let manager = self.manager();
         let manager = manager.as_ref();
@@ -189,7 +190,7 @@ impl Runtime {
             "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
             "checks":checks,
             "local_node":self.identity.device_id()?,
-            "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
+            "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
                 "capabilities":manager.map(|m| m.provider.capabilities())},
         }))
     }
@@ -259,6 +260,7 @@ impl Runtime {
             "deliveries":deliveries(&store, scope, &works)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
+            "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
         })))
     }
 }

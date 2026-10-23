@@ -581,6 +581,15 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),
+    /** Queuing is keyed by message, so an unknown outcome is settled by reading the conversation again. */
+    replyUnanswered: (messageIds: string[]) => withMutation(`unanswered:${activeId.current}`, async () => {
+      const id = activeId.current
+      requireBotContext(id)
+      try { await connection.rpc("reply_unanswered", { conversation_id: id, message_ids: messageIds }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
       const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
       try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
