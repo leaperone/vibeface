@@ -3058,7 +3058,11 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
         let questions = store.conversation_questions(&net.network, "c")?;
         assert_eq!(questions[0]["answer"]["text"], "继续");
         assert_eq!(questions[0]["answer"]["message_id"], "a-q-1");
-        assert_eq!(questions[0]["answer"]["author"], signer.as_str(), "the signing device answered, not the entry Node");
+        assert_eq!(
+            questions[0]["answer"]["author"],
+            signer.as_str(),
+            "the signing device answered, not the entry Node"
+        );
     }
     Ok(())
 }
