@@ -19,6 +19,36 @@ pub struct BlobRef {
     pub size: u64,
 }
 
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
+
+/// A file the user attached to a message. The name belongs to the message, not the content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    pub hash: String,
+    pub size: u64,
+    pub name: String,
+}
+
+impl Attachment {
+    pub fn blob(&self) -> BlobRef {
+        BlobRef {
+            hash: self.hash.clone(),
+            size: self.size,
+        }
+    }
+}
+
+/// A file name as the web signs it: no path separators or control characters, at most
+/// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
+pub fn valid_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_ATTACHMENT_NAME_BYTES
+        && !name
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -521,13 +551,13 @@ pub enum EventBody {
         cause: Option<Cause>,
     },
     /// `report_results` and `attachments` belong to user messages; `in_reply_to` and `status` to
-    /// bot replies. `attachments` repeats the event's blobs so the user's signature covers them.
+    /// bot replies. `attachments` names the event's blobs so the user's signature covers them.
     MessagePosted {
         message_id: String,
         role: Role,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<BlobRef>,
+        attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report_results: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,7 +860,7 @@ pub struct Message {
     pub answers: Option<String>,
     /// The bot a bot message came from.
     pub sender: Option<Sender>,
-    pub blobs: Vec<BlobRef>,
+    pub attachments: Vec<Attachment>,
     /// Its place in the conversation's shared order; clients merge pushed messages by it.
     pub rank: String,
 }

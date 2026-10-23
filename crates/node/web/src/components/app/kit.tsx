@@ -131,8 +131,8 @@ export function Toaster() {
       return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg">
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
-        {item.action ? <Button type="button" size="sm" variant="ghost" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}
-        <button type="button" aria-label="关闭" className="-my-1.5 -me-2 grid size-9 shrink-0 place-items-center rounded-md text-muted-foreground hover:text-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
+        {item.action ? <Button type="button" size="sm" variant="ghost" className="-my-2 h-11 px-3 md:my-0 md:h-7 md:px-2.5" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}
+        <button type="button" aria-label="关闭" className="-my-2 -me-2 grid size-11 shrink-0 md:-my-1.5 md:size-9 place-items-center rounded-md text-muted-foreground hover:text-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
       </div>
     })}
   </div>

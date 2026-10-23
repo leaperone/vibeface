@@ -496,21 +496,6 @@ impl Store {
         rows.reverse();
         Ok(rows)
     }
-    /// Attachments an event carries, in its signed order.
-    pub fn event_blobs(&self, network: &str, event_hash: &str) -> Result<Vec<BlobRef>> {
-        let mut statement = self.connection.prepare(
-            "SELECT blob,size FROM event_blobs WHERE network_id=? AND hash=? ORDER BY blob",
-        )?;
-        statement
-            .query_map(params![network, event_hash], |r| {
-                Ok(BlobRef {
-                    hash: r.get(0)?,
-                    size: r.get(1)?,
-                })
-            })?
-            .map(|row| Ok(row?))
-            .collect()
-    }
     pub fn message(&self, network: &str, scope: &str, message_id: &str) -> Result<Option<Message>> {
         message_from(&self.connection, network, scope, message_id)
     }
@@ -697,12 +682,12 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers,rank,sender";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
     let status: Option<String> = r.get(7)?;
-    let blobs: String = r.get(9)?;
+    let attachments: String = r.get(9)?;
     let message_id: String = r.get(0)?;
     let text: String = r.get(2)?;
     let event_hash: String = r.get(3)?;
@@ -728,7 +713,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
             report_results,
             answers,
             sender: optional_json(sender)?,
-            blobs: serde_json::from_str(&blobs)?,
+            attachments: serde_json::from_str(&attachments)?,
             rank,
         })
     })())

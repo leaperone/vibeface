@@ -451,8 +451,20 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         report_results.is_some()
                             && in_reply_to.is_none()
                             && status.is_none()
-                            && *attachments == event.blobs,
+                            && attachments
+                                .iter()
+                                .map(Attachment::blob)
+                                .eq(event.blobs.iter().cloned()),
                         "a user message carries only its reporting choice and its signed attachments"
+                    );
+                    ensure!(
+                        attachments
+                            .windows(2)
+                            .all(|pair| pair[0].hash < pair[1].hash)
+                            && attachments
+                                .iter()
+                                .all(|attachment| valid_attachment_name(&attachment.name)),
+                        "attachments are ordered by content, once each, with clean file names"
                     );
                     if let Some(question) = answers {
                         question_id(&event.scope_id, question)?;
@@ -709,6 +721,73 @@ mod tests {
         let mut forged = event.clone();
         forged.signature = LocalIdentity::generate().sign_payload("x", b"y")?;
         assert!(verify_signed_event(&view.network_id, &forged).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn user_attachments_are_named_ordered_and_match_the_event_blobs() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let client = identity.fixture_admin();
+        let file = |seed: &[u8], name: &str| Attachment {
+            hash: digest(seed),
+            size: 3,
+            name: name.into(),
+        };
+        let mut files = vec![file(b"a", "报告 v2.pdf"), file(b"b", "notes.txt")];
+        files.sort();
+        let sign = |attachments: Vec<Attachment>, blobs: Vec<BlobRef>| -> Result<SignedEvent> {
+            let body = client.attest(
+                &network,
+                "conversation",
+                EventBody::MessagePosted {
+                    message_id: "m-1".into(),
+                    role: Role::User,
+                    text: "see files".into(),
+                    attachments,
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                },
+            )?;
+            identity.sign_event(Event {
+                version: WIRE_VERSION,
+                network_id: network.clone(),
+                author: identity.device_id()?,
+                seq: 1,
+                prev: None,
+                deps: vec![],
+                scope_id: "conversation".into(),
+                created_at_ms: 0,
+                body,
+                blobs,
+            })
+        };
+        let blobs = |files: &[Attachment]| files.iter().map(Attachment::blob).collect::<Vec<_>>();
+        let signed = sign(files.clone(), blobs(&files))?;
+        match verify_signed_event(&network, &signed)?.body {
+            EventBody::MessagePosted { attachments, .. } => assert_eq!(attachments, files),
+            _ => unreachable!(),
+        }
+        assert!(
+            sign(files.clone(), blobs(&files[..1])).is_err(),
+            "every attachment's content travels with the event"
+        );
+        let reversed: Vec<_> = files.iter().rev().cloned().collect();
+        assert!(sign(reversed.clone(), blobs(&reversed)).is_err());
+        let twice = vec![files[0].clone(), files[0].clone()];
+        assert!(sign(twice.clone(), blobs(&twice)).is_err());
+        for name in ["", "../etc/passwd", "a\\b", "bell\u{7}", &"x".repeat(256)] {
+            let bad = vec![file(b"a", name)];
+            assert!(
+                sign(bad.clone(), blobs(&bad)).is_err(),
+                "{name:?} is not a clean name"
+            );
+        }
+        let longest = vec![file(b"a", &"名".repeat(85))];
+        assert!(sign(longest.clone(), blobs(&longest)).is_ok());
         Ok(())
     }
 

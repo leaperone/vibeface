@@ -925,7 +925,7 @@ impl Store {
         conversation: &str,
         message_id: &str,
         text: &str,
-        blobs: Vec<BlobRef>,
+        attachments: Vec<Attachment>,
         report_results: bool,
         attestation: Attestation,
         created_at_ms: i64,
@@ -943,15 +943,12 @@ impl Store {
             .context("conversation not found")?
             .owner
             .context("conversation has no scheduling Node")?;
-        let mut blobs = blobs;
-        blobs.sort();
-        blobs.dedup();
         if let Some(existing) = message_from(&tx, network, conversation, message_id)? {
             ensure!(
                 existing.role == Role::User
                     && existing.answers.is_none()
                     && existing.text == text
-                    && existing.blobs == blobs
+                    && existing.attachments == attachments
                     && existing.report_results == Some(report_results),
                 "message ID reused with different content"
             );
@@ -966,14 +963,14 @@ impl Store {
                     message_id: message_id.into(),
                     role: Role::User,
                     text: text.into(),
-                    attachments: blobs.clone(),
+                    attachments: attachments.clone(),
                     report_results: Some(report_results),
                     in_reply_to: None,
                     status: None,
                     answers: None,
                     attestation: Some(attestation),
                 },
-                blobs,
+                attachments.iter().map(Attachment::blob).collect(),
                 created_at_ms,
             )?;
         }
