@@ -98,8 +98,8 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
   return <Link href={`/device/${member.device_id}`} asChild>
     <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
-      <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
-        <Text numberOfLines={1} className="shrink font-medium">{member.name}</Text>
+      <View className="min-w-0 flex-1 flex-row flex-wrap items-center gap-x-1.5">
+        <Text numberOfLines={2} className="shrink font-medium">{member.name}</Text>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
         {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
       </View>

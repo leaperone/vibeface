@@ -2,6 +2,7 @@ import { TextClassContext } from '@/components/ui/text';
 import { cn } from '@/lib/utils';
 import type { LucideIcon, LucideProps } from 'lucide-react-native';
 import * as React from 'react';
+import { useWindowDimensions } from 'react-native';
 import { withUniwind } from 'uniwind';
 
 type IconProps = LucideProps & {
@@ -9,8 +10,11 @@ type IconProps = LucideProps & {
 } & React.RefAttributes<LucideIcon>;
 
 // Without a `fill-*` class the mapping yields `fill: undefined`, which must not override Lucide's `fill="none"`.
-function IconImpl({ as: IconComponent, fill, ...props }: IconProps) {
-  return <IconComponent {...props} {...(fill === undefined ? {} : { fill })} />;
+function IconImpl({ as: IconComponent, fill, size, ...props }: IconProps) {
+  const { fontScale } = useWindowDimensions();
+  // Symbols follow Dynamic Type at half the text's rate, so they keep pace with labels and still fit their controls.
+  const scaled = typeof size === 'number' ? size * (1 + (Math.min(fontScale, 2) - 1) / 2) : size;
+  return <IconComponent {...props} size={scaled} {...(fill === undefined ? {} : { fill })} />;
 }
 
 const StyledIcon = withUniwind(IconImpl, {
