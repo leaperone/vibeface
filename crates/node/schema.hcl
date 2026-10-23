@@ -947,6 +947,10 @@ table "scheduler_sessions" {
     null = true
     type = text
   }
+  column "native_token" {
+    null = true
+    type = text
+  }
   column "covers" {
     null = false
     type = text
@@ -1106,6 +1110,24 @@ table "manager_processes" {
   }
   primary_key {
     columns = [column.attempt_id, column.process_group]
+  }
+}
+table "manager_turns" {
+  schema = schema.main
+  column "attempt_id" {
+    null = false
+    type = text
+  }
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  column "turn_id" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.attempt_id]
   }
 }
 table "work_runs" {

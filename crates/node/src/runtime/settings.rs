@@ -110,9 +110,7 @@ impl Runtime {
                 agents: self.cursor_agents.clone(),
             },
             ManagerKind::CodexSdk => Sdk::Codex {
-                node_bin: settings.node_bin,
-                codex_bin: self.providers().codex_bin,
-                sdk_script: settings.codex_sdk_script,
+                socket: self.codex.socket(),
             },
         };
         ManagerConfig {
@@ -126,6 +124,7 @@ impl Runtime {
             tool_token: None,
             provider_env: self.provider_env(settings.provider),
             process_started: None,
+            codex_turn: None,
         }
     }
 

@@ -1004,6 +1004,8 @@ pub struct DirectSession {
     /// Threads started on this connection. They have no rollout before their first turn, so they
     /// are not resumed.
     started: HashSet<String>,
+    /// Notifications that arrived while a request waited for its answer, oldest first.
+    arrived: VecDeque<Value>,
     /// The `userAgent` the App Server answered `initialize` with.
     pub user_agent: String,
 }
@@ -1015,6 +1017,7 @@ impl DirectSession {
             stream,
             next_id: 0,
             started: HashSet::new(),
+            arrived: VecDeque::new(),
             user_agent: String::new(),
         };
         let initialized = session
@@ -1096,6 +1099,10 @@ impl DirectSession {
             if request_id(&message).is_some() {
                 continue;
             }
+            if message["method"].is_string() {
+                push_ring(&mut self.arrived, message);
+                continue;
+            }
             if message
                 .get("id")
                 .and_then(|got| serde_json::from_value::<RpcId>(got.clone()).ok())
@@ -1115,6 +1122,9 @@ impl DirectSession {
 
     /// The next notification or server request on this connection.
     pub async fn notification(&mut self) -> Result<Value, CodexError> {
+        if let Some(message) = self.arrived.pop_front() {
+            return Ok(message);
+        }
         loop {
             let text = match self.stream.next().await {
                 Some(Ok(Message::Text(text))) => text,
