@@ -149,7 +149,8 @@ pub(crate) fn apply(
                     message_id,
                     hash,
                     rank,
-                    event.author,
+                    // A person's message is wrapped by the entry Node; the device that signed it wrote it.
+                    event.body.attestation().map_or(event.author.as_str(), |attestation| attestation.device_id.as_str()),
                     text(role)?,
                     body,
                     event.created_at_ms,

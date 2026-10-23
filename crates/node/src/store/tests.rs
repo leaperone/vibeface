@@ -2666,8 +2666,9 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     a.ask(&net.a, &net.network, "c", question(&net, "q-1", "t1")?, 2)?;
     sync(&a, &mut b, &net)?;
     assert_eq!(unanswered(&b, &net)?, vec!["q-1".to_owned()]);
-    let signed = Some(answer_signature(&net, "c", "q-1", "继续")?);
-    let answered = b.accept_answer(&net.b, &net.network, "q-1", "继续", signed, 3)?;
+    let signed = answer_signature(&net, "c", "q-1", "继续")?;
+    let signer = signed.device_id.clone();
+    let answered = b.accept_answer(&net.b, &net.network, "q-1", "继续", Some(signed), 3)?;
     assert!(b.scheduler_jobs("c")?.is_empty());
     let delivery = b.scheduler_outbox()?;
     assert_eq!(
@@ -2686,6 +2687,7 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
         let questions = store.conversation_questions(&net.network, "c")?;
         assert_eq!(questions[0]["answer"]["text"], "继续");
         assert_eq!(questions[0]["answer"]["message_id"], "a-q-1");
+        assert_eq!(questions[0]["answer"]["author"], signer.as_str(), "the signing device answered, not the entry Node");
     }
     Ok(())
 }
@@ -2835,7 +2837,8 @@ fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     assert_eq!(last.text, format!("{}…", "长".repeat(120)));
     assert_eq!(
         (last.role.as_str(), last.author),
-        ("user", net.a.device_id()?)
+        ("user", net.a.fixture_admin().device_id()?),
+        "the signing device wrote it, not the entry Node"
     );
     Ok(())
 }
