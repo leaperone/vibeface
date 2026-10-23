@@ -629,6 +629,7 @@ impl Runtime {
             "questions" => self.questions(&access).await,
             "answer" => self.answer_question(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
+            "delete_bot" => self.delete_bot(&access, &input).await,
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,

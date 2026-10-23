@@ -96,9 +96,12 @@ export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
 export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
 export type MemoryEntry = { memory_id: string; text: string }
+/** null: every shared skill, later ones included. */
+export type SkillSet = string[] | null
+export type SkillsEdit = { before: SkillSet; after: SkillSet }
 /** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
 export type BotChange =
-  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit }
+  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: FieldEdit; skills?: SkillsEdit }
   | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }
   | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
@@ -141,7 +144,8 @@ export type BotProject = { target_node: string; cwd: string }
 export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
 /** A bot conversation's newest message, cut short by the Node for the conversation list. */
 export type LastMessage = { text: string; role: string; created_at_ms: number }
-export type BotRecord = CreateBotRequest & { event_hash: string; last_message: LastMessage | null }
+/** `model` empty follows the running device's default. */
+export type BotRecord = CreateBotRequest & { model: string; skills: SkillSet; event_hash: string; last_message: LastMessage | null }
 
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }

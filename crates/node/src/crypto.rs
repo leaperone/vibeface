@@ -126,6 +126,7 @@ impl LocalIdentity {
         match &mut body {
             EventBody::ConversationOwner { attestation, .. }
             | EventBody::BotCreated { attestation, .. }
+            | EventBody::BotDeleted { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
@@ -306,12 +307,14 @@ fn validate_attestation(event: &Event) -> Result<()> {
         } => UserSignature::Optional,
         // A bot created in another bot's turn stands on the user's message; see `store::log`.
         EventBody::ConversationOwner { cause: Some(_), .. }
-        | EventBody::BotCreated { cause: Some(_), .. } => UserSignature::Forbidden,
+        | EventBody::BotCreated { cause: Some(_), .. }
+        | EventBody::BotDeleted { cause: Some(_), .. } => UserSignature::Forbidden,
         EventBody::MessagePosted {
             role: Role::User, ..
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
+        | EventBody::BotDeleted { .. }
         | EventBody::NotificationAcked { .. }
         | EventBody::PrimaryBotSet { .. }
         | EventBody::ScheduleControlled { .. } => UserSignature::Required,
@@ -363,7 +366,7 @@ fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
     vibeface_protocol::validate_id(&cause.message_id).map_err(anyhow::Error::msg)?;
     ensure!(
         cause.conversation_id != scope,
-        "a created bot's cause is in the creating conversation"
+        "a bot creates or deletes only another bot's conversation"
     );
     Ok(())
 }
@@ -495,6 +498,16 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         EventBody::BotCreated {
             cause: Some(cause), ..
         } => cause_id(&event.scope_id, cause)?,
+        EventBody::BotDeleted { cause, .. } => {
+            ensure!(
+                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                "a bot is deleted in its own conversation"
+            );
+            cause
+                .as_ref()
+                .map(|cause| cause_id(&event.scope_id, cause))
+                .transpose()?;
+        }
         EventBody::WorkDispatched {
             work_id,
             trigger,

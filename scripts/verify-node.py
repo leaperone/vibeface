@@ -1055,7 +1055,7 @@ READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "r
 WORK_TOOLS = {"dispatch_work", "interrupt_work"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
-                  "create_bot", "configure_bot"}
+                  "create_bot", "configure_bot", "delete_bot"}
 TRIAGE_WAKE = "New events from the user's local coding agent sessions"
 
 

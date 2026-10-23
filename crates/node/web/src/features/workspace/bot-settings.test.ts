@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { formatIn, formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
-import { parseConversation } from "./model.ts"
+import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord } from "./types.ts"
 
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).getTime()
@@ -114,6 +114,8 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.throws(() => parseConversation({ ...base, changes: undefined }, "chat"))
   assert.throws(() => parseConversation({ ...base, bot_settings: undefined }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile" } }] }, "chat"))
+  const configured = { kind: "profile", model: { before: "", after: "gpt-x" }, skills: { before: null, after: ["s"] } }
+  assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: configured }] }, "chat").changes[0]?.change, configured)
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "model" } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
   assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
@@ -124,4 +126,10 @@ test("a reminder whose note is its name shows the sentence once", () => {
   assert.equal(scheduleDetail({ name: "看看部署", prompt: " 看看部署\n" }), null)
   assert.equal(scheduleDetail({ name: "看看部署", prompt: "看看部署\n顺便查日志" }), "看看部署\n顺便查日志")
   assert.equal(scheduleDetail({ name: "每日巡检", prompt: "检查依赖更新" }), "检查依赖更新")
+})
+
+test("a bot lists its model and its skills, null meaning every skill", () => {
+  const bot = { bot_id: "b", conversation_id: "c", name: "Ops", instructions: "", event_hash: "h", last_message: null }
+  const [all, some] = parseBots({ bots: [{ ...bot, model: "", skills: null }, { ...bot, model: "gpt-x", skills: ["s"] }] })
+  assert.deepEqual([all?.model, all?.skills, some?.model, some?.skills], ["", null, "gpt-x", ["s"]])
 })

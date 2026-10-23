@@ -32,6 +32,8 @@ CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "bot_profiles" table
 CREATE TABLE `bot_profiles` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `field` text NOT NULL, `value` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `field`));
+-- Create "bot_deletions" table
+CREATE TABLE `bot_deletions` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "skills" table
 CREATE TABLE `skills` (`network_id` text NOT NULL, `skill_id` text NOT NULL, `skill` text NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `skill_id`));
 -- Create "schedules" table

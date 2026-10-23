@@ -48,11 +48,12 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 13] = [
+pub(crate) const TABLES: [&str; 14] = [
     "conversations",
     "messages",
     "bots",
     "bot_profiles",
+    "bot_deletions",
     "skills",
     "schedules",
     "memories",
@@ -295,12 +296,30 @@ pub(crate) fn apply(
                 params![network, change_id, scope, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?, serde_json::to_string(change)?, event.created_at_ms],
             )?;
             match change {
-                BotChange::Profile { name, instructions } => {
-                    for (field, edit) in [("name", name), ("instructions", instructions)] {
-                        let Some(edit) = edit else { continue };
+                BotChange::Profile {
+                    name,
+                    instructions,
+                    model,
+                    skills,
+                } => {
+                    let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
+                    let fields = [
+                        ("name", after(name)),
+                        ("instructions", after(instructions)),
+                        ("model", after(model)),
+                        (
+                            "skills",
+                            skills
+                                .as_ref()
+                                .map(|edit| serde_json::to_string(&edit.after))
+                                .transpose()?,
+                        ),
+                    ];
+                    for (field, value) in fields {
+                        let Some(value) = value else { continue };
                         connection.execute(
                             "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
-                            params![network, scope, field, edit.after, rank],
+                            params![network, scope, field, value, rank],
                         )?;
                     }
                 }
@@ -352,6 +371,12 @@ pub(crate) fn apply(
                     )?;
                 }
             }
+        }
+        EventBody::BotDeleted { .. } => {
+            connection.execute(
+                "INSERT INTO bot_deletions(network_id,conversation_id,event_hash,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank WHERE excluded.rank<rank",
+                params![network, scope, hash, rank],
+            )?;
         }
         EventBody::ScheduleControlled {
             schedule_id,

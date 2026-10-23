@@ -68,7 +68,9 @@ fn validate_definition(
     Ok(())
 }
 
-fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Bot, Option<String>)> {
+type BotRow = (Bot, Option<String>, Option<String>);
+
+fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
     Ok((
         Bot {
             bot_id: r.get(0)?,
@@ -76,27 +78,55 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Bot, Option<String>)> {
             name: r.get(2)?,
             instructions: r.get(3)?,
             project: None,
+            model: r.get(6)?,
+            skills: None,
             event_hash: r.get(5)?,
         },
         r.get(4)?,
+        r.get(7)?,
     ))
 }
 
-/// `BotCreated` gives the first name and instructions; a chat change with a later rank replaces each.
+/// `BotCreated` gives the first name and instructions; a chat change with a later rank replaces
+/// each. A bot follows its device's model and uses every shared skill until the chat sets them.
 const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
     CASE WHEN n.rank>b.rank THEN n.value ELSE b.name END,
     CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
-    b.project,b.event_hash";
+    b.project,b.event_hash,COALESCE(m.value,''),s.value";
 const CREATED_COLUMNS: &str =
-    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash";
+    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'',NULL";
 
+/// Bots not deleted.
 fn bots_where(
     connection: &Connection,
     network: &str,
     filter: &str,
     value: &str,
 ) -> Result<Vec<Bot>> {
-    select_bots(connection, network, MERGED_COLUMNS, filter, value)
+    select_bots(
+        connection,
+        network,
+        MERGED_COLUMNS,
+        &format!(
+            "{filter} AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=b.network_id AND d.conversation_id=b.conversation_id)"
+        ),
+        value,
+    )
+}
+
+pub(crate) fn bot_deleted_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+) -> Result<bool> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM bot_deletions WHERE network_id=? AND conversation_id=?",
+            params![network, scope],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn select_bots(
@@ -110,12 +140,18 @@ fn select_bots(
         "SELECT {columns} FROM bots b
          LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
          LEFT JOIN bot_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
+         LEFT JOIN bot_profiles m ON m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.field='model'
+         LEFT JOIN bot_profiles s ON s.network_id=b.network_id AND s.conversation_id=b.conversation_id AND s.field='skills'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
-        let (mut bot, project) = row?;
+        let (mut bot, project, skills) = row?;
         bot.project = project.map(|p| serde_json::from_str(&p)).transpose()?;
+        bot.skills = skills
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .flatten();
         Ok(bot)
     })
     .collect()
@@ -179,6 +215,10 @@ impl Store {
                     && existing.instructions == spec.instructions
                     && existing.project == spec.project,
                 "Bot ID already exists with another definition"
+            );
+            ensure!(
+                !bot_deleted_from(&tx, network, conversation)?,
+                "this bot was deleted"
             );
             return Ok(existing);
         }
@@ -260,6 +300,10 @@ impl Store {
                     && existing.instructions == instructions
                     && existing.project == project,
                 "call_ref {call_ref} already created another bot; use a new call_ref for a new bot"
+            );
+            ensure!(
+                !bot_deleted_from(&tx, network, &conversation)?,
+                "the bot this call_ref created was deleted"
             );
             return Ok((existing, false));
         }
@@ -364,10 +408,109 @@ impl Store {
     pub fn primary_bot(&self, network: &str) -> Result<Option<ScopeId>> {
         primary_bot_from(&self.connection, network)
     }
+
+    pub fn bot_deleted(&self, network: &str, scope: &str) -> Result<bool> {
+        bot_deleted_from(&self.connection, network, scope)
+    }
+
+    /// The user deletes the bot of `conversation` from the web. Returns the event written, or
+    /// `None` when it is already deleted.
+    pub fn delete_bot(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        conversation: &str,
+        attestation: Attestation,
+        at: i64,
+    ) -> Result<Option<SignedEvent>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if bot_deleted_from(&tx, network, conversation)? {
+            return Ok(None);
+        }
+        ensure!(
+            bot_for_conversation_from(&tx, network, conversation)?.is_some(),
+            "no such bot"
+        );
+        let event = log::append_from(
+            &tx,
+            &self.blob_dir,
+            identity,
+            network,
+            conversation,
+            EventBody::BotDeleted {
+                attestation: Some(attestation),
+                cause: None,
+            },
+            vec![],
+            at,
+        )?;
+        tx.commit()?;
+        Ok(Some(event))
+    }
+
+    /// A bot deletes another bot in a turn the user's own message started. A bot named again
+    /// after it is gone, as a retry does, writes nothing. Returns the deleted bot's
+    /// conversation and the event written, if any.
+    pub fn delete_bot_in_turn(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        wanted: &str,
+        at: i64,
+    ) -> Result<(ScopeId, Option<SignedEvent>)> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cause = super::bot_settings::user_cause(&tx, network, scope, trigger)?
+            .context(super::bot_settings::NOT_FROM_USER)?;
+        let target = match super::bot_settings::find_bot(&tx, network, wanted) {
+            Ok(bot) => bot.conversation_id,
+            Err(error) => {
+                let name = wanted.trim().to_lowercase();
+                let mut gone = select_bots(&tx, network, MERGED_COLUMNS, "AND ?2=''", "")?
+                    .into_iter()
+                    .filter(|bot| {
+                        bot.conversation_id == wanted
+                            || bot.bot_id == wanted
+                            || bot.name.trim().to_lowercase() == name
+                    });
+                match (gone.next(), gone.next()) {
+                    (Some(bot), None) if bot_deleted_from(&tx, network, &bot.conversation_id)? => {
+                        return Ok((bot.conversation_id, None));
+                    }
+                    _ => return Err(error),
+                }
+            }
+        };
+        ensure!(
+            target != scope,
+            "a bot does not delete itself; the user deletes it from its panel"
+        );
+        let event = log::append_from(
+            &tx,
+            &self.blob_dir,
+            identity,
+            network,
+            &target,
+            EventBody::BotDeleted {
+                attestation: None,
+                cause: Some(cause),
+            },
+            vec![],
+            at,
+        )?;
+        tx.commit()?;
+        Ok((target, Some(event)))
+    }
 }
 
 /// The bot that judges what comes in without an owner: the user's latest choice while it
-/// is a bot, otherwise the first bot created.
+/// is a bot, otherwise the first bot created. Deleting the primary bot hands the role to the
+/// earliest bot left.
 pub(crate) fn primary_bot_from(connection: &Connection, network: &str) -> Result<Option<ScopeId>> {
     let chosen = connection
         .query_row(
@@ -391,7 +534,9 @@ pub(crate) fn primary_bot_from(connection: &Connection, network: &str) -> Result
         .flatten();
     Ok(connection
         .query_row(
-            "SELECT conversation_id FROM bots WHERE network_id=?1 ORDER BY conversation_id IS ?2 DESC, rank LIMIT 1",
+            "SELECT conversation_id FROM bots b WHERE network_id=?1
+             AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=b.network_id AND d.conversation_id=b.conversation_id)
+             ORDER BY conversation_id IS ?2 DESC, rank LIMIT 1",
             params![network, chosen],
             |r| r.get(0),
         )

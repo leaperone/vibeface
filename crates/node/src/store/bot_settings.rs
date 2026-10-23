@@ -31,11 +31,16 @@ pub enum ChangeRequest {
         name: Option<String>,
         instructions: Option<String>,
     },
-    /// Another bot's name or instructions; `bot` is its conversation ID, bot ID or name.
+    /// A bot's profile, this one's or another's; `bot` is its conversation ID, bot ID or name.
+    /// An empty `model` follows the device's default; `all_skills` uses every shared skill
+    /// again, `skills` only those.
     ConfigureBot {
         bot: String,
         name: Option<String>,
         instructions: Option<String>,
+        model: Option<String>,
+        skills: Option<std::collections::BTreeSet<String>>,
+        all_skills: Option<bool>,
     },
     SaveSkill {
         skill_id: Option<String>,
@@ -72,24 +77,63 @@ pub enum ChangeRequest {
     },
 }
 
+/// The profile fields one request sets; `skills` is `Some(None)` for every shared skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileRequest {
+    name: Option<String>,
+    instructions: Option<String>,
+    model: Option<String>,
+    skills: Option<SkillSet>,
+}
+
 impl ChangeRequest {
     /// Every change but a reminder needs the user's own message to stand on.
     fn needs_user(&self) -> bool {
         !matches!(self, Self::Remind { .. })
     }
 
+    fn profile(&self) -> Result<Option<ProfileRequest>> {
+        Ok(Some(match self {
+            Self::UpdateProfile { name, instructions } => ProfileRequest {
+                name: name.clone(),
+                instructions: instructions.clone(),
+                model: None,
+                skills: None,
+            },
+            Self::ConfigureBot {
+                name,
+                instructions,
+                model,
+                skills,
+                all_skills,
+                ..
+            } => ProfileRequest {
+                name: name.clone(),
+                instructions: instructions.clone(),
+                model: model.as_ref().map(|model| model.trim().to_owned()),
+                skills: match (skills, all_skills) {
+                    (Some(_), Some(true)) => bail!("give skills or all_skills, not both"),
+                    (_, Some(true)) => Some(None),
+                    (Some(skills), _) => Some(Some(skills.clone())),
+                    (None, _) => None,
+                },
+            },
+            _ => return Ok(None),
+        }))
+    }
+
     /// Whether `change` already sets what this request asks for. A retry compares this, because
     /// the first write changed the values a new `before` would read.
     fn matches(&self, change: &BotChange) -> bool {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
+        if let Ok(Some(wanted)) = self.profile() {
+            return matches!(change, BotChange::Profile { name, instructions, model, skills }
+                if wanted.name == after(name)
+                    && wanted.instructions == after(instructions)
+                    && wanted.model == after(model)
+                    && wanted.skills == skills.as_ref().map(|edit| edit.after.clone()));
+        }
         match (self, change) {
-            (
-                Self::UpdateProfile { name, instructions },
-                BotChange::Profile {
-                    name: changed_name,
-                    instructions: changed_instructions,
-                },
-            ) => *name == after(changed_name) && *instructions == after(changed_instructions),
             (
                 Self::SaveSkill {
                     skill_id,
@@ -248,6 +292,10 @@ fn schedule_entry(
     })
 }
 
+/// A deleted bot's schedules stop with it.
+const LIVE_SCHEDULE: &str = "removed=0 AND NOT EXISTS (SELECT 1 FROM bot_deletions d
+    WHERE d.network_id=schedules.network_id AND d.conversation_id=schedules.conversation_id)";
+
 /// Schedules not removed, of one conversation or of all, by name.
 pub(crate) fn schedules_from(
     connection: &Connection,
@@ -256,7 +304,7 @@ pub(crate) fn schedules_from(
 ) -> Result<Vec<ScheduleEntry>> {
     let mut statement = connection.prepare(&format!(
         "SELECT {SCHEDULE_COLUMNS} FROM schedules
-         WHERE network_id=?1 AND removed=0 AND (?2 IS NULL OR conversation_id=?2)"
+         WHERE network_id=?1 AND {LIVE_SCHEDULE} AND (?2 IS NULL OR conversation_id=?2)"
     ))?;
     let rows = statement.query_map(params![network, conversation], schedule_row)?;
     let mut schedules = rows
@@ -279,7 +327,7 @@ pub(crate) fn schedule_from(
     connection
         .query_row(
             &format!(
-                "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE network_id=? AND schedule_id=? AND removed=0"
+                "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE network_id=? AND schedule_id=? AND {LIVE_SCHEDULE}"
             ),
             params![network, id],
             schedule_row,
@@ -322,6 +370,8 @@ fn change_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
             change: BotChange::Profile {
                 name: None,
                 instructions: None,
+                model: None,
+                skills: None,
             },
         },
         r.get(1)?,
@@ -457,40 +507,81 @@ fn resolve(
     request: ChangeRequest,
     now: i64,
 ) -> Result<BotChange> {
-    let change = match request {
-        ChangeRequest::UpdateProfile { name, instructions } => {
+    if let Some(ProfileRequest {
+        name,
+        instructions,
+        model,
+        skills,
+    }) = request.profile()?
+    {
+        ensure!(
+            name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
+            "name, instructions, model, skills or all_skills is required"
+        );
+        let bot = bot_for_conversation_from(connection, network, scope)?
+            .context("this conversation has no bot profile to change")?;
+        if let Some(name) = &name {
+            validate_bot_name(name)?;
             ensure!(
-                name.is_some() || instructions.is_some(),
-                "name or instructions is required"
+                *name != bot.name,
+                "the bot is already named {name}; nothing to change"
             );
-            let bot = bot_for_conversation_from(connection, network, scope)?
-                .context("this conversation has no bot profile to change")?;
-            if let Some(name) = &name {
-                validate_bot_name(name)?;
-                ensure!(
-                    *name != bot.name,
-                    "the bot is already named {name}; nothing to change"
-                );
-            }
-            if let Some(instructions) = &instructions {
-                validate_instructions(instructions)?;
-                ensure!(
-                    *instructions != bot.instructions,
-                    "the instructions already read like this; nothing to change"
-                );
-            }
-            BotChange::Profile {
-                name: name.map(|after| Edit {
-                    before: bot.name,
-                    after,
-                }),
-                instructions: instructions.map(|after| Edit {
-                    before: bot.instructions,
-                    after,
-                }),
+        }
+        if let Some(instructions) = &instructions {
+            validate_instructions(instructions)?;
+            ensure!(
+                *instructions != bot.instructions,
+                "the instructions already read like this; nothing to change"
+            );
+        }
+        if let Some(model) = &model {
+            validate_model(model)?;
+            ensure!(
+                *model != bot.model,
+                "the bot already uses this model; nothing to change"
+            );
+        }
+        if let Some(Some(wanted)) = &skills {
+            let library = skills_from(connection, network)?;
+            if let Some(missing) = wanted
+                .iter()
+                .find(|id| !library.iter().any(|entry| &entry.skill_id == *id))
+            {
+                bail!("skill {missing} not found; bot.skills and list_bots show skill IDs");
             }
         }
-        ChangeRequest::ConfigureBot { .. } => bail!("the bot to configure is resolved first"),
+        if let Some(skills) = &skills {
+            validate_skill_set(skills)?;
+            ensure!(
+                *skills != bot.skills,
+                "the bot already uses these skills; nothing to change"
+            );
+        }
+        let change = BotChange::Profile {
+            name: name.map(|after| Edit {
+                before: bot.name,
+                after,
+            }),
+            instructions: instructions.map(|after| Edit {
+                before: bot.instructions,
+                after,
+            }),
+            model: model.map(|after| Edit {
+                before: bot.model,
+                after,
+            }),
+            skills: skills.map(|after| SkillsEdit {
+                before: bot.skills,
+                after,
+            }),
+        };
+        change.validate()?;
+        return Ok(change);
+    }
+    let change = match request {
+        ChangeRequest::UpdateProfile { .. } | ChangeRequest::ConfigureBot { .. } => {
+            bail!("a profile change is resolved above")
+        }
         ChangeRequest::SaveSkill {
             skill_id,
             name,
@@ -702,16 +793,9 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cause = user_cause(&tx, network, scope, trigger)?;
         ensure!(cause.is_some() || !request.needs_user(), NOT_FROM_USER);
-        let (target, request) = match request {
-            ChangeRequest::ConfigureBot {
-                bot,
-                name,
-                instructions,
-            } => (
-                find_bot(&tx, network, &bot)?.conversation_id,
-                ChangeRequest::UpdateProfile { name, instructions },
-            ),
-            request => (scope.to_owned(), request),
+        let target = match &request {
+            ChangeRequest::ConfigureBot { bot, .. } => find_bot(&tx, network, bot)?.conversation_id,
+            _ => scope.to_owned(),
         };
         let digest = change_digest(scope, trigger, call_ref);
         let change_id = format!("change-{digest}");
