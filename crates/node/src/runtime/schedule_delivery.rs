@@ -256,11 +256,13 @@ impl Runtime {
     /// running turn, so the thread says where the message went: in a completed turn it was
     /// answered, in one that stopped it was not; absent from the thread while the target turn
     /// ended, it never arrived and waits for its own reply. Only a read that succeeded moves it
-    /// back to the queue; a thread that stays unreadable ends it as unknown, never resent.
+    /// back to the queue; a thread that stays unreadable, or keeps showing the turn running,
+    /// ends it as unknown, never resent.
     async fn settle_steer(&self, network: &str, job: &SchedulerJob) -> Result<()> {
         let JobState::Steering {
             into,
             unread_since_ms,
+            running_since_ms,
         } = &job.state
         else {
             return Ok(());
@@ -289,6 +291,7 @@ impl Runtime {
             &job.reply_to,
             into,
             *unread_since_ms,
+            *running_since_ms,
             now_ms(),
         ) else {
             return Ok(());
@@ -415,8 +418,9 @@ fn steer_params(candidate: &SteerCandidate) -> Value {
 /// How long one steer or read waits for the App Server inside the scheduling tick; a steer that
 /// times out is unknown and read back later.
 const STEER_WAIT: Duration = Duration::from_secs(5);
-/// How long a steered message waits for its thread to become readable after its reply ended.
-const STEER_UNREAD_LIMIT_MS: i64 = 10 * 60 * 1000;
+/// How long a steered message waits after its reply ended for its thread to become readable, or
+/// for the turn it shows running to end.
+const STEER_SETTLE_LIMIT_MS: i64 = 10 * 60 * 1000;
 
 /// Where a message steered into `into` went, from its thread's turns: `None` while the read does
 /// not show its target turn, `Some(None)` while the message may still arrive.
@@ -444,35 +448,39 @@ fn steer_settlement(
 }
 
 /// The state a steering message moves to after a read of its thread (`None` when it failed), or
-/// `None` to leave it. A successful read restarts the unreadable clock.
+/// `None` to leave it. A successful read restarts the unreadable clock; a failed read says nothing
+/// about the turn, so the running clock keeps going.
 fn next_steer_state(
     turns: Option<&[Value]>,
     message_id: &str,
     into: &SteerTarget,
     unread_since_ms: Option<i64>,
+    running_since_ms: Option<i64>,
     now: i64,
 ) -> Option<JobState> {
-    match turns.and_then(|turns| steer_settlement(turns, message_id, into)) {
-        Some(Some(next)) => Some(next),
-        Some(None) => unread_since_ms.is_some().then(|| JobState::Steering {
-            into: into.clone(),
-            unread_since_ms: None,
-        }),
+    let steering = |unread_since_ms, running_since_ms| JobState::Steering {
+        into: into.clone(),
+        unread_since_ms,
+        running_since_ms,
+    };
+    let (since, next) = match turns.and_then(|turns| steer_settlement(turns, message_id, into)) {
+        Some(Some(next)) => return Some(next),
+        Some(None) => {
+            let since = running_since_ms.unwrap_or(now);
+            (since, steering(None, Some(since)))
+        }
         None => {
             let since = unread_since_ms.unwrap_or(now);
-            if now.saturating_sub(since) >= STEER_UNREAD_LIMIT_MS {
-                Some(JobState::Steered {
-                    into: into.clone(),
-                    outcome: SteerOutcome::Unknown,
-                })
-            } else {
-                unread_since_ms.is_none().then(|| JobState::Steering {
-                    into: into.clone(),
-                    unread_since_ms: Some(since),
-                })
-            }
+            (since, steering(Some(since), running_since_ms))
         }
+    };
+    if now.saturating_sub(since) >= STEER_SETTLE_LIMIT_MS {
+        return Some(JobState::Steered {
+            into: into.clone(),
+            outcome: SteerOutcome::Unknown,
+        });
     }
+    (next != steering(unread_since_ms, running_since_ms)).then_some(next)
 }
 
 #[cfg(test)]
@@ -533,35 +541,57 @@ mod tests {
     #[test]
     fn a_readable_thread_restarts_the_unreadable_clock() {
         let into = into();
-        let steering = |since| {
+        let steering = |unread, running| {
             Some(JobState::Steering {
                 into: into.clone(),
-                unread_since_ms: since,
+                unread_since_ms: unread,
+                running_since_ms: running,
             })
         };
         let running = [turn("r", "inProgress", false)];
-        let limit = STEER_UNREAD_LIMIT_MS;
+        let limit = STEER_SETTLE_LIMIT_MS;
+        let next = |turns, unread, since_running, now| {
+            next_steer_state(turns, "m", &into, unread, since_running, now)
+        };
+        assert_eq!(next(None, None, None, 5), steering(Some(5), None));
+        assert_eq!(next(None, Some(5), None, 6), None);
         assert_eq!(
-            next_steer_state(None, "m", &into, None, 5),
-            steering(Some(5))
+            next(Some(&running), Some(5), None, 7),
+            steering(None, Some(7))
         );
-        assert_eq!(next_steer_state(None, "m", &into, Some(5), 6), None);
-        assert_eq!(
-            next_steer_state(Some(&running), "m", &into, Some(5), 7),
-            steering(None)
-        );
-        assert_eq!(next_steer_state(Some(&running), "m", &into, None, 7), None);
         // One failure after a good read starts a new wait instead of ending as unknown.
         assert_eq!(
-            next_steer_state(None, "m", &into, None, limit + 8),
-            steering(Some(limit + 8))
+            next(None, None, Some(7), limit + 6),
+            steering(Some(limit + 6), Some(7))
         );
         assert_eq!(
-            next_steer_state(None, "m", &into, Some(5), limit + 5),
+            next(None, Some(5), None, limit + 5),
             Some(JobState::Steered {
                 into: into.clone(),
                 outcome: SteerOutcome::Unknown,
             })
         );
+    }
+
+    #[test]
+    fn a_turn_still_running_after_its_reply_ended_settles_as_unknown() {
+        let into = into();
+        let unknown = Some(JobState::Steered {
+            into: into.clone(),
+            outcome: SteerOutcome::Unknown,
+        });
+        let limit = STEER_SETTLE_LIMIT_MS;
+        for running in [
+            [turn("r", "inProgress", false)],
+            [turn("r", "inProgress", true)],
+        ] {
+            let next = |unread, since_running, now| {
+                next_steer_state(Some(&running), "m", &into, unread, since_running, now)
+            };
+            assert_eq!(next(None, Some(5), limit + 4), None);
+            assert_eq!(next(None, Some(5), limit + 5), unknown);
+            // Failed reads in between do not restart the wait.
+            assert_eq!(next(Some(limit), Some(5), limit + 5), unknown);
+        }
     }
 }

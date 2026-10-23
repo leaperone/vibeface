@@ -1393,15 +1393,26 @@ impl Store {
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
-        if let JobState::Steering { into, .. } = &job.state
-            && let Some(host) = query_jobs(
+        if let JobState::Steering { into, .. } = &job.state {
+            let into = into.clone();
+            match query_jobs(
                 &tx,
                 "conversation_id=? AND attempt_id=?",
                 params![conversation, into.attempt_id],
             )?
             .pop()
-        {
-            job = host;
+            .filter(|host| !host.state.terminal())
+            {
+                Some(host) => job = host,
+                // The reply it went into already ended: there is nothing left to stop, and the
+                // message is never sent again.
+                None => {
+                    job.state = JobState::Steered {
+                        into,
+                        outcome: SteerOutcome::Unknown,
+                    }
+                }
+            }
         }
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
@@ -1640,6 +1651,7 @@ impl Store {
         job.state = JobState::Steering {
             into: into.clone(),
             unread_since_ms: None,
+            running_since_ms: None,
         };
         save_job(&tx, &job)?;
         tx.commit()?;
@@ -1647,7 +1659,7 @@ impl Store {
     }
 
     /// Moves a steering message on: back to the queue when nothing reached the turn, steered,
-    /// or still steering with when its thread first could not be read. Anything else is left.
+    /// or still steering with its updated wait clocks. Anything else is left.
     pub fn settle_steer(
         &mut self,
         conversation: &str,

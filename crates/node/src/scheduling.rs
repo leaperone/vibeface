@@ -167,7 +167,8 @@ pub enum SteerOutcome {
     Answered,
     /// The message is in a turn that stopped, failed or was interrupted.
     Unfinished,
-    /// The thread could not be read in time; whether it joined is unknown.
+    /// The thread could not be read, or still showed the turn running, in time; whether it
+    /// joined is unknown. Stopping the message after its reply ended also ends it here.
     Unknown,
 }
 
@@ -176,12 +177,15 @@ pub enum SteerOutcome {
 pub enum JobState {
     Queued,
     /// Sent, or about to be sent, as `turn/steer` into `into`. It is settled from the thread
-    /// once that reply's attempt ended, never sent again. `unread_since_ms` is when reading the
-    /// thread first failed after that.
+    /// once that reply's attempt ended, never sent again. After that, `unread_since_ms` is when
+    /// reading the thread first failed and `running_since_ms` when a read first still showed the
+    /// target turn running.
     Steering {
         into: SteerTarget,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unread_since_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_since_ms: Option<i64>,
     },
     /// Joined the reply `into`; it gets no reply of its own.
     Steered {
