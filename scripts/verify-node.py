@@ -2551,19 +2551,22 @@ def phase1_acceptance(options):
         first, _ = send(name, "steer-first", gate=str(gate), report_results=True)
         wait_for("the reply runs on its App Server turn", lambda: state(first, "running") and calls(name))
         joined, joined_text = send(name, "steer-joined", report_results=True)
-        merged = wait_for("a message sent mid-reply joins the running turn", lambda: state(joined, "steered"))
-        retry = a.client.rpc("message", conversation_id=name, message_id="steer-joined", text=joined_text,
-                             report_results=True)
-        require(retry["trigger"] == joined["trigger"], "a retried message keeps its trigger")
-
         def steers():
             return [row["message"] for row in map(json.loads, (run / "codex-rpc.jsonl").read_text().splitlines())
                     if row["message"].get("method") == "turn/steer"
                     and row["message"]["params"].get("clientUserMessageId") == "steer-joined"]
+        steering = wait_for("a message sent mid-reply joins the running turn",
+                            lambda: state(joined, "steering") and steers() and state(joined, "steering"))
+        into = json.loads(steering["detail"])["into"]
+        retry = a.client.rpc("message", conversation_id=name, message_id="steer-joined", text=joined_text,
+                             report_results=True)
+        require(retry["trigger"] == joined["trigger"], "a retried message keeps its trigger")
         gate.touch()
         done = wait_for("the reply that took the message completes", lambda: completed(first))
         answer = reply(name, done)
-        require(len(steers()) == 1 and steers()[0]["params"]["expectedTurnId"] == json.loads(merged["detail"])["turn_id"],
+        merged = wait_for("the joined message settles once its reply completed", lambda: state(joined, "steered"))
+        require(json.loads(merged["detail"])["outcome"] == "answered", "the joined message was answered by that reply")
+        require(len(steers()) == 1 and steers()[0]["params"]["expectedTurnId"] == into["turn_id"],
                 "the message is steered once into the running turn, whatever the retries")
         require(len(answer) == 1 and answer[0]["text"].endswith("+steer-joined"),
                 "the running turn's one reply answers the joined message")
@@ -2571,7 +2574,7 @@ def phase1_acceptance(options):
                 and not any(message.get("in_reply_to") == "steer-joined" for message in conversation(name)["messages"]),
                 "a joined message gets no turn or reply of its own")
         passed("a message sent while the bot replies joins that reply through one turn/steer",
-               trigger=joined["trigger"], turn=json.loads(merged["detail"])["turn_id"])
+               trigger=joined["trigger"], turn=into["turn_id"])
 
         for unconfirmed in (False, True):
             name = new_conversation("phase1-cancel-" + str(unconfirmed).lower())

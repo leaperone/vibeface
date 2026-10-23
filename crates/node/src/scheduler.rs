@@ -161,8 +161,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         .tool_url
         .get()
         .context("local tool listener is not ready")?;
-    // A Codex thread keeps the Shell environment it was created with, tool URL included, and
-    // that URL changes with every start: a new one starts a new thread.
+    // A Codex thread keeps the Shell environment it was created with, tool URL included: when
+    // the Node could not get its earlier tool port back, a new thread starts.
     let sdk_config = digest(&serde_json::to_vec(&(
         &settings,
         (kind == manager::ManagerKind::CodexSdk).then_some(tool_url),
