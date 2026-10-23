@@ -3193,10 +3193,12 @@ def phase4_acceptance(options):
         check_dir = folder("p4-check")
         r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dir),
                                                                        "native": {"gate": str(check_dir / "release")}}})
+        done_id = dispatched(a, "p4-check-done")
+        turn(a, r6a["trigger"])
+        # Sent while the first reply runs, the second message would only steer into it.
         r6b = send(a.client, "p4-m6b", {"label": "p4-m6b", "dispatch": {"label": "p4-check-not", "cwd": str(check_dir),
                                                                        "native": {"gate": str(check_dir / "release")}}})
-        done_id, not_id = dispatched(a, "p4-check-done"), dispatched(a, "p4-check-not")
-        turn(a, r6a["trigger"])
+        not_id = dispatched(a, "p4-check-not")
         turn(a, r6b["trigger"])
         threads = [wait_for("the check work runs", lambda: work_in(a.client, work_id, "running"))["thread_id"] for work_id in (done_id, not_id)]
         a.stop(crash=True)
