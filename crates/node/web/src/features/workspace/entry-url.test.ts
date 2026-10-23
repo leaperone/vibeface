@@ -8,7 +8,7 @@ import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import type { ReadyConnection } from "../../lib/node.ts"
 import type { WorkRecord } from "./types.ts"
 import { nodeName } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
+import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "./model.ts"
 import { placeChanges, scheduleName, scheduleTrigger } from "./bot-settings.ts"
 import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
 import { canSend, composerHint, threadReplies } from "../chat/protocol.ts"
@@ -19,6 +19,16 @@ const context = {
   works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
 }
 test("conversation navigation stays in the trusted web and carries no credentials", () => {
+})
+test("attachment names are signed clean and files once each in content order", () => {
+  assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
+  assert.equal(attachmentName("/\\"), "file", "a name with nothing left falls back")
+  const long = attachmentName("名".repeat(100))
+  assert.equal(new TextEncoder().encode(long).length, 255)
+  assert.equal(attachmentName("a" + "名".repeat(85)), "a" + "名".repeat(84), "a character is never split")
+  assert.equal(attachmentName("bad\ud800.txt"), "bad.txt", "a lone surrogate cannot reach the signed JSON")
+  const files = [{ hash: "b", size: 1, name: "b.txt" }, { hash: "a", size: 1, name: "a.txt" }, { hash: "b", size: 1, name: "copy of b.txt" }]
+  assert.deepEqual(signedOrder(files), [{ hash: "a", size: 1, name: "a.txt" }, { hash: "b", size: 1, name: "b.txt" }])
 })
 test("malformed conversation snapshots fail closed instead of authorizing writes", () => {
   assert.equal(parseConversation(context, "chat").conversation?.owner, "gateway")
@@ -42,14 +52,16 @@ test("capabilities parse the actual provider name and reject malformed node list
 test("works, reply status and pending checks keep their exact shape", () => {
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null }
   const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], capabilities: { streaming: true, cancel: false, steer: false } }
-  const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped", blobs: [{ hash: "result", size: 20 }] }
-  const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message] })
+  const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped" }
+  const sent = { message_id: "one", event_hash: "sent", role: "user", text: "看附件", created_at_ms: 0, attachments: [{ hash: "file", size: 20, name: "报告.pdf" }] }
+  const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message, sent] })
   assert.equal(parsed.works[0].state, "running")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
   assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
   assert.equal(parsed.messages[0].in_reply_to, "one")
-  assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
+  assert.deepEqual(parsed.messages[1].attachments, [{ hash: "file", size: 20, name: "报告.pdf" }])
+  assert.throws(() => parseConversation({ ...context, messages: [{ ...sent, attachments: [{ hash: "file", size: 20 }] }] }), "an attachment without a name fails closed")
   assert.equal(parseConversation(context).scheduler, null)
   for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
@@ -443,6 +455,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   let cursor = 0
   const react = {
     useId: () => 'component',
+    useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useState(initial: unknown) {
       const index = cursor++
       if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
@@ -473,6 +486,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return elements
     },
     close() { for (const effect of effects.values()) effect.cleanup?.() },
+    module: module.exports,
   }
 }
 
@@ -684,8 +698,8 @@ test("artifact reads retain their offset while old responses cannot append or un
     readArtifact: (_hash: string, offset: number) => { offsets.push(offset); return work.promise }, run: async (action: () => Promise<void>) => { try { await action() } catch {} } } }
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/workspace/model': { formatSize } })
-  const render = () => app.render('Artifact', { hash: 'result', size: 5 })
-  const open = () => render().find(({ props }) => props.children === '打开结果')?.props
+  const render = () => app.render('Artifact', { file: { hash: 'result', size: 5, name: 'notes.txt' } })
+  const open = () => render().find(({ props }) => props.children === '打开')?.props
   try {
     open()?.action?.(); assert.equal(open()?.disabled, true)
     const old = work
@@ -697,7 +711,35 @@ test("artifact reads retain their offset while old responses cannot append or un
     work.resolve({ size: 5, next_offset: null, text: 'fresh' }); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'pre')?.props.children, 'fresh')
     assert.deepEqual(offsets, [0, 0])
+    assert.ok(render().some(({ type, props }) => type === 'span' && props.children === 'notes.txt' && props.title === 'notes.txt'), 'the card names the file')
   } finally { app.close() }
+})
+
+test("a long message of the user's folds behind an icon button; a short one does not", () => {
+  const app = componentHarness('../chat/elements/message.tsx', {})
+  const toggle = (text: string) => app.render('FoldedText', { text }).find(({ type }) => type === 'button')?.props
+  assert.equal(toggle('短消息'), undefined)
+  const lines = (count: number) => Array(count).fill('一行').join('\n')
+  assert.equal(toggle(lines(12)), undefined)
+  for (const text of [lines(13), 'x'.repeat(601)]) {
+    assert.equal(toggle(text)?.['aria-expanded'], false)
+    assert.ok(app.render('FoldedText', { text }).some(({ props }) => props.className === 'line-clamp-8'))
+    toggle(text)?.onClick?.()
+    assert.equal(toggle(text)?.['aria-expanded'], true)
+    assert.equal(toggle(text)?.['aria-label'], '收起')
+    assert.ok(!app.render('FoldedText', { text }).some(({ props }) => props.className === 'line-clamp-8'))
+    toggle(text)?.onClick?.()
+  }
+})
+
+test("a toast's action is a 44px touch target on phones and stays compact on desktop", () => {
+  const app = componentHarness('../../components/app/kit.tsx', { cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  app.render('Toaster')
+  const kit = app.module
+  ;(kit.toast as (text: string, options: object) => void)('已发出', { persist: true, action: { label: '查看', onClick() {} } })
+  const action = app.render('Toaster').find(({ props }) => props.children === '查看')?.props
+  assert.match(String(action?.className), /(^| )h-11( |$)/)
+  assert.match(String(action?.className), /md:h-7/)
 })
 
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {

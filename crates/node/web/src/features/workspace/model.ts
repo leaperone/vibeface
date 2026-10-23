@@ -1,4 +1,4 @@
-import type { TranscriptMessage } from "../chat/types"
+import type { Attachment, TranscriptMessage } from "../chat/types"
 import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
@@ -59,7 +59,7 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), blobs: blobReferences(data.blobs), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender) }
 }
 function sender(value: unknown) {
   const data = record(value)
@@ -71,7 +71,7 @@ function replyStatus(value: unknown): ReplyStatus {
     default: throw new Error("未知的回复状态。")
   }
 }
-function blobReferences(value: unknown) { return value == null ? undefined : list(value).map((item) => { const blob = record(item); return { hash: text(blob.hash), size: number(blob.size) } }) }
+function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
@@ -252,6 +252,24 @@ export function formatSize(bytes: number) {
   let value = bytes, unit = 0
   while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1 }
   return unit === 0 ? `${bytes} 字节` : `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
+}
+
+/** The name a message signs, as the Node checks it: no path separators or control characters, at most 255 UTF-8 bytes. */
+export function attachmentName(raw: string) {
+  const encoder = new TextEncoder()
+  let name = "", bytes = 0
+  for (const char of raw.replace(/[/\\\p{Cc}\p{Cs}]/gu, "")) {
+    bytes += encoder.encode(char).length
+    if (bytes > 255) break
+    name += char
+  }
+  return name || "file"
+}
+
+/** The Node accepts attachments ordered by content, once each; the first name given for the same file stays. */
+export function signedOrder(files: readonly Attachment[]) {
+  return files.filter((file, index) => files.findIndex((other) => other.hash === file.hash) === index)
+    .sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0)
 }
 
 export function parseArtifactPage(value: unknown, hash: string, offset: number) {

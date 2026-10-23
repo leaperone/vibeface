@@ -23,7 +23,7 @@ CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missin
 -- Create "conversations" table
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
-CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `blobs` text NOT NULL, `sender` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
+CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `attachments` text NOT NULL, `sender` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
 -- Create index "messages_order" to table: "messages"
 CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
 -- Create index "messages_answers" to table: "messages"
@@ -94,8 +94,8 @@ CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text N
 CREATE INDEX `scheduler_jobs_state` ON `scheduler_jobs` (`state`, `conversation_id`);
 -- Create "scheduler_outbox" table
 CREATE TABLE `scheduler_outbox` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, PRIMARY KEY (`conversation_id`, `trigger`));
--- Create "schedule_runs" table
-CREATE TABLE `schedule_runs` (`conversation_id` text NOT NULL, `schedule_id` text NOT NULL, `slot_ms` integer NOT NULL, PRIMARY KEY (`conversation_id`, `schedule_id`));
+-- Create "schedule_claims" table
+CREATE TABLE `schedule_claims` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `schedule_id` text NOT NULL, `slot_ms` integer NOT NULL, `owner_epoch` integer NOT NULL, `author` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `schedule_id`, `slot_ms`));
 -- Create "pending_checks" table
 CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
 -- Create "manager_processes" table

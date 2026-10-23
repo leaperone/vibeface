@@ -320,6 +320,26 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
 
 const BOT_DELETED: &str = "bot 已删除";
 
+/// A turn runs only under the ownership it was claimed in: this Node at the session's owner
+/// epoch. A move away and back raises the epoch, so the old turn stays fenced. An agent task
+/// runs on its work's device, whoever owns the conversation.
+fn holds_turn(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    session: &SchedulerSession,
+    job: &SchedulerJob,
+) -> Result<bool> {
+    if job.kind == TriggerKind::AgentTask {
+        return Ok(true);
+    }
+    Ok(
+        conversation_from(connection, network, &session.conversation_id)?.is_some_and(|c| {
+            c.owner.as_deref() == Some(local) && c.owner_epoch == session.owner_epoch
+        }),
+    )
+}
+
 fn reply_message_id(conversation: &str, trigger: &str) -> String {
     format!(
         "reply-{}",
@@ -470,16 +490,37 @@ const LATE_START_MS: i64 = 5 * 60_000;
 /// A due time found later than this (the device was off or asleep) is skipped, not run late.
 pub(crate) const MAX_LATE_MS: i64 = 10 * 60_000;
 
-/// Queues the latest due time of each schedule in conversations this Node schedules. Earlier
-/// missed times are never run, a time found more than `MAX_LATE_MS` late is recorded as run and
-/// skipped, a time any owner already answered is skipped, and a schedule waits while its
-/// previous run is still queued. Returns `(conversation, trigger)` per job.
-fn admit_due_schedules_from(
+/// Which Node took a schedule's due time: of all claims the network holds, the one of the
+/// highest owner epoch, ties going to the smaller author.
+fn schedule_claim(
     connection: &Connection,
     network: &str,
-    local: &str,
+    conversation: &str,
+    schedule_id: &str,
+    slot: i64,
+) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT author FROM schedule_claims WHERE network_id=? AND conversation_id=? AND schedule_id=? AND slot_ms=?",
+            params![network, conversation, schedule_id, slot],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Queues the latest due time of each schedule in conversations this Node schedules. Earlier
+/// missed times are never run, and a time any Node already claimed is left to it. This Node
+/// claims a time in the network's log before it runs or, found more than `MAX_LATE_MS` late,
+/// skips it, so no other owner takes it again. A schedule waits while its previous run is still
+/// queued. Returns `(conversation, trigger)` per job.
+fn admit_due_schedules_from(
+    connection: &Connection,
+    blob_dir: &Path,
+    identity: &LocalIdentity,
+    network: &str,
     now: i64,
 ) -> Result<Vec<(String, String)>> {
+    let local = identity.device_id()?;
     let mut admitted = Vec::new();
     for entry in super::bot_settings::schedules_from(connection, network, None)? {
         let conversation = entry.conversation_id.as_str();
@@ -488,22 +529,41 @@ fn admit_due_schedules_from(
         else {
             continue;
         };
-        let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
-        let fired: Option<i64> = connection
-            .query_row(
-                "SELECT slot_ms FROM schedule_runs WHERE conversation_id=? AND schedule_id=?",
-                params![conversation, entry.schedule_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if owner.as_deref() != Some(local) || fired.is_some_and(|fired| fired >= slot) {
+        let Some(current) = conversation_from(connection, network, conversation)?
+            .filter(|c| c.owner.as_deref() == Some(local.as_str()))
+        else {
+            continue;
+        };
+        if schedule_claim(connection, network, conversation, &entry.schedule_id, slot)?.is_some() {
             continue;
         }
-        if now - slot > MAX_LATE_MS {
-            connection.execute(
-                "INSERT OR REPLACE INTO schedule_runs(conversation_id,schedule_id,slot_ms) VALUES(?,?,?)",
-                params![conversation, entry.schedule_id, slot],
-            )?;
+        let late = now - slot > MAX_LATE_MS;
+        if !late {
+            let queued = queued_jobs(connection, conversation)?;
+            if queued.len() >= MAX_PENDING_JOBS
+                || queued.iter().any(|job| {
+                    parse_schedule_trigger(&job.trigger)
+                        .is_some_and(|(id, _)| id == entry.schedule_id)
+                })
+            {
+                continue;
+            }
+        }
+        log::append_from(
+            connection,
+            blob_dir,
+            identity,
+            network,
+            conversation,
+            EventBody::ScheduleRunClaimed {
+                schedule_id: entry.schedule_id.clone(),
+                slot_ms: slot,
+                owner_epoch: current.owner_epoch,
+            },
+            vec![],
+            now,
+        )?;
+        if late {
             tracing::info!(
                 event = "schedule.skipped_late",
                 conversation_id = conversation,
@@ -514,30 +574,7 @@ fn admit_due_schedules_from(
             );
             continue;
         }
-        let queued = queued_jobs(connection, conversation)?;
-        if queued.len() >= MAX_PENDING_JOBS
-            || queued.iter().any(|job| {
-                parse_schedule_trigger(&job.trigger).is_some_and(|(id, _)| id == entry.schedule_id)
-            })
-        {
-            continue;
-        }
-        connection.execute(
-            "INSERT OR REPLACE INTO schedule_runs(conversation_id,schedule_id,slot_ms) VALUES(?,?,?)",
-            params![conversation, entry.schedule_id, slot],
-        )?;
         let trigger = schedule_trigger(&entry.schedule_id, slot);
-        // Another owner already ran this time before the conversation moved here.
-        if message_from(
-            connection,
-            network,
-            conversation,
-            &reply_message_id(conversation, &trigger),
-        )?
-        .is_some()
-        {
-            continue;
-        }
         admit_from(
             connection,
             network,
@@ -549,6 +586,22 @@ fn admit_due_schedules_from(
         admitted.push((conversation.to_owned(), trigger));
     }
     Ok(admitted)
+}
+
+/// Whether this Node holds the claim of the schedule time a queued job runs.
+fn holds_schedule_claim(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    job: &SchedulerJob,
+) -> Result<bool> {
+    let Some((schedule_id, slot)) = parse_schedule_trigger(&job.trigger) else {
+        return Ok(false);
+    };
+    Ok(
+        schedule_claim(connection, network, &job.conversation_id, schedule_id, slot)?.as_deref()
+            == Some(local),
+    )
 }
 
 /// Keeps a trigger for the conversation's owner until it returns a receipt.
@@ -872,7 +925,7 @@ impl Store {
         conversation: &str,
         message_id: &str,
         text: &str,
-        blobs: Vec<BlobRef>,
+        attachments: Vec<Attachment>,
         report_results: bool,
         attestation: Attestation,
         created_at_ms: i64,
@@ -890,15 +943,12 @@ impl Store {
             .context("conversation not found")?
             .owner
             .context("conversation has no scheduling Node")?;
-        let mut blobs = blobs;
-        blobs.sort();
-        blobs.dedup();
         if let Some(existing) = message_from(&tx, network, conversation, message_id)? {
             ensure!(
                 existing.role == Role::User
                     && existing.answers.is_none()
                     && existing.text == text
-                    && existing.blobs == blobs
+                    && existing.attachments == attachments
                     && existing.report_results == Some(report_results),
                 "message ID reused with different content"
             );
@@ -913,14 +963,14 @@ impl Store {
                     message_id: message_id.into(),
                     role: Role::User,
                     text: text.into(),
-                    attachments: blobs.clone(),
+                    attachments: attachments.clone(),
                     report_results: Some(report_results),
                     in_reply_to: None,
                     status: None,
                     answers: None,
                     attestation: Some(attestation),
                 },
-                blobs,
+                attachments.iter().map(Attachment::blob).collect(),
                 created_at_ms,
             )?;
         }
@@ -952,7 +1002,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let admitted = admit_due_schedules_from(&tx, network, &identity.device_id()?, now)?;
+        let admitted = admit_due_schedules_from(&tx, &self.blob_dir, identity, network, now)?;
         tx.commit()?;
         Ok(admitted)
     }
@@ -1045,9 +1095,10 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         }
+        let local = identity.device_id()?;
         let current = conversation_from(&tx, network, conversation)?;
         let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
-        let owned = current.and_then(|c| c.owner) == Some(identity.device_id()?);
+        let owned = current.and_then(|c| c.owner) == Some(local.clone());
         let mut queued = Vec::new();
         for job in queued_jobs(&tx, conversation)? {
             // The user moved the conversation: what never started goes to the new owner, which
@@ -1095,6 +1146,9 @@ impl Store {
                 _ if deleted => Some(BOT_DELETED),
                 TriggerKind::Schedule if live_schedule(&tx, network, &job)?.is_none() => {
                     Some("定时任务已暂停或删除")
+                }
+                TriggerKind::Schedule if !holds_schedule_claim(&tx, network, &local, &job)? => {
+                    Some("这次定时已由另一台设备领取")
                 }
                 TriggerKind::AgentTask if super::work::run_finished(&tx, &job.reply_to)? => {
                     Some("任务结果已由你确认")
@@ -1270,6 +1324,44 @@ impl Store {
         Ok(Some(job))
     }
 
+    /// Stops the turns of conversations that moved to a newer owner: each becomes cancelling
+    /// and loses its tool permission here, before the runtime cancels its SDK call. Returns
+    /// `(conversation, trigger, attempt_id)` per fenced turn.
+    pub fn fence_moved_turns(
+        &mut self,
+        network: &str,
+        local: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut fenced = Vec::new();
+        for mut session in query_sessions(&tx, "active IS NOT NULL", [])? {
+            let Some(trigger) = session.active.clone() else {
+                continue;
+            };
+            let Some(mut job) = load_job(&tx, &session.conversation_id, &trigger)? else {
+                continue;
+            };
+            let (JobState::Claimed { attempt } | JobState::Running { attempt }) = &job.state else {
+                continue;
+            };
+            if holds_turn(&tx, network, local, &session, &job)? {
+                continue;
+            }
+            let attempt = attempt.clone();
+            job.state = JobState::Cancelling {
+                attempt: attempt.clone(),
+            };
+            fence(&mut session)?;
+            save_job(&tx, &job)?;
+            save_session(&tx, &session)?;
+            fenced.push((session.conversation_id, trigger, attempt.id));
+        }
+        tx.commit()?;
+        Ok(fenced)
+    }
+
     pub(crate) fn fence_manager_permission(
         &mut self,
         conversation: &str,
@@ -1291,6 +1383,8 @@ impl Store {
 
     pub fn manager_attempt_allowed(
         &self,
+        network: &str,
+        local: &str,
         conversation: &str,
         trigger: &str,
         attempt_id: &str,
@@ -1308,7 +1402,8 @@ impl Store {
             && matches!(
                 job.state,
                 JobState::Claimed { .. } | JobState::Running { .. }
-            ))
+            )
+            && holds_turn(&self.connection, network, local, &session, &job)?)
     }
 
     /// Idempotent: a job that already ended returns as is.

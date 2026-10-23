@@ -315,16 +315,29 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         if !tools_fenced {
             tools_fenced = node.fence_manager_attempt(&attempt.id).await.is_ok();
         }
-        let current = node
-            .store
-            .lock()
-            .await
-            .scheduler_job(&conversation, &trigger)?
-            .context("scheduler job missing")?;
+        let (current, moved) = {
+            let store = node.store.lock().await;
+            let current = store
+                .scheduler_job(&conversation, &trigger)?
+                .context("scheduler job missing")?;
+            let owner = store
+                .conversation(&network, &conversation)?
+                .and_then(|c| c.owner);
+            let moved =
+                current.kind != TriggerKind::AgentTask && owner != Some(node.identity.device_id()?);
+            (current, moved)
+        };
         let stopped = matches!(current.state, JobState::Cancelling { .. });
         // Stopping a reply ends only this turn; dispatched work keeps its own tracking.
         let terminal = if (cancellation || (stopped && !started)) && tools_fenced {
-            JobOutcome::Cancelled("用户停止了回复".into())
+            JobOutcome::Cancelled(
+                if moved {
+                    "会话已移到另一台设备"
+                } else {
+                    "用户停止了回复"
+                }
+                .into(),
+            )
         } else if uncertain || !tools_fenced {
             JobOutcome::Interrupted {
                 detail: error.to_string(),
@@ -917,6 +930,40 @@ mod tests {
             PROMPT_LIMIT + largest + 3_000 <= 65_536,
             "the tool catalog takes {largest} bytes"
         );
+    }
+
+    #[test]
+    fn the_bot_sees_attachment_names_in_its_history() {
+        let file = crate::model::Attachment {
+            hash: crate::crypto::digest(b"a"),
+            size: 1,
+            name: "报告.pdf".into(),
+        };
+        let event = Event {
+            version: crate::model::WIRE_VERSION,
+            network_id: "n".into(),
+            author: "a".into(),
+            seq: 1,
+            prev: None,
+            deps: vec![],
+            scope_id: "c".into(),
+            created_at_ms: 0,
+            body: EventBody::MessagePosted {
+                message_id: "m".into(),
+                role: Role::User,
+                text: "看附件".into(),
+                attachments: vec![file.clone()],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+            },
+            blobs: vec![file.blob()],
+        };
+        let row = message_row(0, &event).unwrap();
+        assert_eq!(row["attachments"], json!([file]));
+        assert_eq!(row["attachments"][0]["name"], "报告.pdf");
     }
 
     #[test]

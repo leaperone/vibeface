@@ -1,4 +1,6 @@
 export type ReplyStatus = "completed" | "stopped" | "interrupted" | "failed"
+/** A file on a user's message: hex SHA-256, byte size and its cleaned file name. */
+export type Attachment = { hash: string; size: number; name: string }
 export type TranscriptMessage = {
   message_id: string
   role: string
@@ -7,7 +9,7 @@ export type TranscriptMessage = {
   created_at_ms: number
   in_reply_to?: string
   status?: ReplyStatus
-  blobs?: { hash: string; size: number }[]
+  attachments?: Attachment[]
   /** On a user message: the question it answers. */
   answers?: string
   /** Its place in the conversation's shared order. */
