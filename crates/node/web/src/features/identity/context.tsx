@@ -224,7 +224,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接自己的设备。'); return value }
-  function own() { const value = identityRef.current; if (!value) throw new Error('浏览器密钥尚未初始化。'); return value }
+  function own() { const value = identityRef.current; if (!value) throw new Error('这个浏览器还没准备好，请刷新页面。'); return value }
   async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
     let result: unknown
@@ -237,7 +237,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
   function managing() {
-    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理员能做这个操作。')
     return ready
   }
   async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
@@ -540,13 +540,13 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const pins = approvalPins()
     const seen = joins.find(item => item.join_id === joinId)
     if (!pins[joinId]) {
-      if (seen?.status !== 'pending') throw new Error('加入请求已失效。请让对方重新使用邀请。')
+      if (seen?.status !== 'pending') throw new Error('这个加入请求已失效。请重新生成加入链接。')
       // Kept across reloads and retries, so a repeated start sends the same nonce.
       pins[joinId] = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
       store('approval-pins', Object.fromEntries(Object.entries(pins).slice(-16)))
     }
     const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pins[joinId].nonce }))
-    if (request.status !== 'confirming') throw new Error('加入请求已失效。请让对方重新使用邀请。')
+    if (request.status !== 'confirming') throw new Error('这个加入请求已失效。请重新生成加入链接。')
     await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
@@ -570,7 +570,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   async function revoke(deviceId: string) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
-    if (!member) throw new Error('成员不存在。请刷新目录。')
+    if (!member) throw new Error('找不到这台设备，请刷新后再试。')
     if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error('不能移除这个浏览器或当前连接的电脑。')
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
@@ -613,8 +613,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       let response: ReturnType<typeof parseJoinRequest>
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
-      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入回执与邀请或此浏览器不一致。')
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
+      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error('这条加入链接已失效。请在已有设备上重新添加。')
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
     } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
@@ -753,14 +753,14 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const flow: Sensitive = {
         cancel: release,
         async recover(selectedInput) {
-          if (released || !verified || session.current !== active) throw new Error('恢复材料已清除。请重新导入。')
+          if (released || !verified || session.current !== active) throw new Error('恢复文件已关闭，请重新选择。')
           if (!prepared) {
             const selected = selectedInput.map(member => {
               const original = allowed.get(member.device_id)
-              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
+              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('设备列表变了，请重新打开恢复文件。')
               return member
             })
-            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
+            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这台电脑。')
             selected.push(newManager)
             const next = Identity.generate()
             try {
@@ -927,8 +927,8 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
     downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); sensitive.current.download() },
-    async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
-    async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },
+    async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
+    async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>

@@ -31,13 +31,15 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const entry = device.ready?.entry.device_id
   const here = entry ? nodeName(entry, lookup) : "这台设备"
   const canManage = device.ready?.principal.can_manage === true
+  const away = workspace.nodes.filter((node) => !node.revoked && !node.online && node.device_id !== entry).map((node) => nodeName(node.device_id, lookup)).join("、")
+  const unreached = `${away ? `${away} ` : "其他设备都"}连不上，没法确认数据是最新的。`
   if (kind === "read_only") return <ActionCard icon={Lock} title={`${here} 暂时只读`} actions={!canManage ? undefined : waiting
     ? <Button type="button" variant="ghost" onClick={() => setWaiting(false)}>返回</Button>
     : <>
       <Button type="button" variant="ghost" onClick={() => setWaiting(true)}>是，等其他设备</Button>
       <ActionButton variant="default" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
     </>}>
-    <p className="text-muted-foreground">{!canManage ? "其他设备都连不上，没法确认数据是最新的。打开其他设备，或在管理设备上确认。" : waiting ? "打开你的其他设备，连上后会自动同步，然后就能用。" : "其他设备都连不上，没法确认数据是最新的。它是从备份恢复的吗？"}</p>
+    <p className="text-muted-foreground">{!canManage ? `${unreached}打开其他设备，或在管理设备上确认。` : waiting ? `打开${away ? ` ${away}` : "你的其他设备"}，连上后会自动同步，然后就能用。` : `${unreached}它是从备份恢复的吗？`}</p>
   </ActionCard>
   const conflicts = workspace.writeState.conflicts
   const authors = [...new Set(conflicts.map((item) => item.author))]
