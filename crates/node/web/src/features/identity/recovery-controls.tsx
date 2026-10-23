@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArchiveRestore, CalendarDays, Hash, KeyRound, TriangleAlert } from 'lucide-react'
+import { ArchiveRestore, FileKey, KeyRound } from 'lucide-react'
 import { BusyIcon, Details, DetailRow, FilePicker, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Member } from '@/lib/node'
 import { messageOf, parseEntry } from '@/lib/node'
-import { passphrase, recoveryCode } from '@/lib/secure'
+import { passphrase, recoveryCode, recoveryFileStem } from '@/lib/secure'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice } from './context'
 import { deviceIcon } from '@/features/devices/devices'
@@ -52,11 +52,11 @@ export function CurrentRecoveryFile() {
     return () => { live = false }
   }, [key])
   if (!key || code?.key !== key) return null
-  return <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-meta">
-    <span className="flex items-center gap-1.5"><Hash aria-hidden="true" className="size-4 text-muted-foreground" /><span className="sr-only">文件编号</span><span className="font-mono font-medium tracking-wider">{code.value}</span></span>
-    {recoverySince ? <span className="flex items-center gap-1.5 text-muted-foreground"><CalendarDays aria-hidden="true" className="size-4" /><span className="sr-only">创建于</span><time dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time></span> : null}
-    <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />丢了无法重新生成</span>
-  </div>
+  return <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-meta">
+    <span className="flex min-w-0 items-center gap-2"><FileKey aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="sr-only">有效的文件 </span><span className="min-w-0 font-mono [overflow-wrap:anywhere]">{recoveryFileStem(code.value)}</span></span>
+    {recoverySince ? <time className="text-muted-foreground tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time> : null}
+    <span className="text-muted-foreground">只有这份有效，丢了不能补</span>
+  </p>
 }
 
 /** After unlocking a recovery file: keep every device except the lost ones. */
