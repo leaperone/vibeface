@@ -1,4 +1,5 @@
 import * as DocumentPicker from 'expo-document-picker'
+import * as Haptics from 'expo-haptics'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
 import { Button } from '@/components/ui/button'
@@ -43,7 +44,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, onSend, onS
         </Button>
         {onStop
           ? <Button variant="outline" size="icon" className="size-11 rounded-full" accessibilityLabel="停止" onPress={onStop}><Icon as={Square} className="size-4 fill-foreground" /></Button>
-          : <Button size="icon" variant={canSend ? 'default' : 'secondary'} className="size-11 rounded-full" accessibilityLabel="发送" disabled={!canSend} onPress={onSend}><Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} /></Button>}
+          : <Button size="icon" variant={canSend ? 'default' : 'secondary'} className="size-11 rounded-full" accessibilityLabel="发送" disabled={!canSend} onPress={() => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}><Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} /></Button>}
       </View>
     </View>
     {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}

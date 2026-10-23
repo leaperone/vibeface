@@ -22,7 +22,6 @@ export default function BotAbout() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
     <View className="gap-3">
-      <Text className="text-muted-foreground">在聊天里说一声就能改</Text>
       {shared.primary === bot.conversation_id
         ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 bot</Text></View>
         : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 bot</ActionButton>}
@@ -61,6 +60,7 @@ export default function BotAbout() {
         {skill.description ? <Text className="text-meta text-muted-foreground">{skill.description}</Text> : null}
       </View>)}
     </Section> : null}
+    <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
   </ScrollView>
 }
 

@@ -19,7 +19,7 @@ export default function Home() {
   const now = Date.now()
   const shared = useLive()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-2 px-2 pb-8">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl grow self-center gap-2 px-2 pb-8">
     <Stack.Screen options={{
       headerRight: () => <Link href="/settings" asChild>
         <Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button>
@@ -41,7 +41,7 @@ export default function Home() {
     }) : <EmptyState icon={Bot} title="还没有 bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新建 bot</Text></Button>
     </Link> : undefined} />}
-    <View className="mt-6 border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
+    <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView>
 }
 

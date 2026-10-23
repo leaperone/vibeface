@@ -14,7 +14,7 @@ import { useLive } from '@/data/live'
 import { confirmText } from '@/features/chat/work'
 import { cn } from '@/lib/utils'
 
-const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : taskActive(state) ? 'info' : 'neutral'
+const tone = (state: string): Tone => state === 'failed' ? 'danger' : state === 'completed' ? 'success' : ['awaiting_confirmation', 'stop_timed_out'].includes(state) ? 'warning' : 'neutral'
 
 /** One task of a bot's chat, as the web's task panel: progress, result, stop and the details behind it. */
 export default function TaskDetail() {
@@ -74,7 +74,7 @@ export default function TaskDetail() {
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return <View className="gap-2">
-    <Text role="heading" className="text-meta font-medium text-muted-foreground">{title}</Text>
+    <Text role="heading" className="text-heading font-semibold">{title}</Text>
     {children}
   </View>
 }

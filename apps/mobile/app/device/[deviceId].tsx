@@ -24,7 +24,7 @@ export default function DeviceDetail() {
     <View className="flex-row items-center gap-4">
       <View className="size-12 items-center justify-center rounded-xl bg-muted"><Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-6" /></View>
       <View className="min-w-0 flex-1 gap-1">
-        <Text numberOfLines={1} className="text-title font-semibold">{member.name}</Text>
+        <Text className="text-title font-semibold">{member.name}</Text>
         <View className="flex-row flex-wrap items-center gap-3">
           <View className="flex-row items-center gap-1.5">
             <View className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />

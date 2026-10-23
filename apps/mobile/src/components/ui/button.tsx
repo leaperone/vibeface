@@ -101,10 +101,11 @@ type ButtonProps = React.ComponentProps<typeof Pressable> &
 function Button({ className, variant, size, onPressIn, onPressOut, ...props }: ButtonProps) {
   const scale = useSharedValue(1);
   const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+  const muted = props.disabled && (variant ?? 'default') === 'default';
   return (
-    <TextClassContext.Provider value={buttonTextVariants({ variant, size })}>
+    <TextClassContext.Provider value={cn(buttonTextVariants({ variant, size }), muted && 'text-muted-foreground')}>
       <AnimatedPressable
-        className={cn(props.disabled && 'opacity-50', buttonVariants({ variant, size }), className)}
+        className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
         role="button"
         {...props}
         style={pressed}

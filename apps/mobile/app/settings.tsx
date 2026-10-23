@@ -1,5 +1,6 @@
+import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { Bell, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
@@ -29,7 +30,7 @@ export default function Settings() {
     <Section icon={Palette} title="外观">
       <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
         {themes.map(([value, label]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: current === value }}
-          variant={current === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => Uniwind.setTheme(value)}><Text>{label}</Text></Button>)}
+          variant={current === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { void Haptics.selectionAsync(); Uniwind.setTheme(value) }}><Text>{label}</Text></Button>)}
       </View>
     </Section>
     <Section icon={Globe} title="连接">
@@ -46,12 +47,12 @@ export default function Settings() {
     {device.ready ? <Notifications /> : null}
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
       <Link href="/ai" asChild>
-        <Button variant="outline" className="min-h-11 self-start"><Text>AI 设置</Text><Icon as={ChevronRight} /></Button>
+        <Button variant="outline" className="min-h-11 self-start"><Icon as={SlidersHorizontal} /><Text>AI 设置</Text><Icon as={ChevronRight} className="text-muted-foreground" /></Button>
       </Link>
     </Section> : null}
     <Section icon={FileKey} title="恢复文件">
       <Link href="/recovery" asChild>
-        <Button variant="outline" className="min-h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text></Button>
+        <Button variant="outline" className="min-h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text><Icon as={ChevronRight} className="text-muted-foreground" /></Button>
       </Link>
     </Section>
     <View className="border-t border-border pt-6">
@@ -61,7 +62,7 @@ export default function Settings() {
           <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
           <Button variant="destructive" className="min-h-11" onPress={workspace.actions.disconnect}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
         </View>
-      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLeaving(true)}>
+      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); setLeaving(true) }}>
         <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开这台手机</Text>
       </Button>}
     </View>
@@ -75,7 +76,7 @@ function Notifications() {
   const button = shared.notificationButton
   return <Section icon={Bell} title="通知">
     <Button variant="outline" className="min-h-11 self-start" disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
-      <Text>{button.label}</Text>
+      <Icon as={BellRing} /><Text>{button.label}</Text>
     </Button>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
   </Section>
@@ -96,15 +97,15 @@ const kindIcon = (member: Member) => member.kind === 'client' ? Smartphone : Lap
 
 function MemberRow({ member, first }: { member: Member; first: boolean }) {
   // iOS sits inline views on the line box, not the glyph baseline, so they sink as the line height grows with Dynamic Type.
-  // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap.
+  // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
   const fontScale = useWindowDimensions().fontScale
-  const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 0
+  const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 1
   return <Link href={`/device/${member.device_id}`} asChild>
     <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
-      {/* Title and subtitle, as a system cell. The crown is inline so it follows the last word of a wrapped name. */}
+      {/* Title and subtitle, as a system cell. The name wraps in full so the inline crown is never cut off with it. */}
       <View className="min-w-0 flex-1">
-        <Text numberOfLines={2} className="font-medium">{member.name}{member.admin ? <>{' '}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
+        <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />

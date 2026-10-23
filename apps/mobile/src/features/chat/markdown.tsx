@@ -14,7 +14,7 @@ export function Markdown({ text }: { text: string }) {
       text: body, paragraph: { marginVertical: 0, paddingVertical: 6 }, li: { ...body, fontVariant: ['tabular-nums'] }, strong: { ...body, fontWeight: '600' },
       h1: heading, h2: heading, h3: heading, h4: heading,
       link: { ...body, textDecorationLine: 'underline' },
-      codespan: { fontFamily: 'Geist Mono', fontSize: 13.5, backgroundColor: muted, color: foreground },
+      codespan: { fontFamily: 'Geist Mono', fontSize: 13.5, fontStyle: 'normal', fontWeight: '400', backgroundColor: muted, color: foreground },
       code: { padding: 12 },
       codeText: { fontFamily: 'Geist Mono', fontSize: 13, lineHeight: 20, color: foreground },
       blockquote: { borderLeftColor: border, borderLeftWidth: 3, paddingLeft: 12 },

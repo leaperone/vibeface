@@ -1,8 +1,9 @@
 import { TextClassContext } from '@/components/ui/text';
 import { cn } from '@/lib/utils';
-import type { LucideIcon, LucideProps } from 'lucide-react-native';
+import { LoaderCircle, type LucideIcon, type LucideProps } from 'lucide-react-native';
 import * as React from 'react';
 import { useWindowDimensions } from 'react-native';
+import Animated, { useReducedMotion } from 'react-native-reanimated';
 import { withUniwind } from 'uniwind';
 
 type IconProps = LucideProps & {
@@ -10,11 +11,16 @@ type IconProps = LucideProps & {
 } & React.RefAttributes<LucideIcon>;
 
 // Without a `fill-*` class the mapping yields `fill: undefined`, which must not override Lucide's `fill="none"`.
+const spin = { animationName: { to: { transform: [{ rotate: '360deg' }] } }, animationDuration: '1s', animationIterationCount: 'infinite', animationTimingFunction: 'linear' } as const;
+
 function IconImpl({ as: IconComponent, fill, size, ...props }: IconProps) {
   const { fontScale } = useWindowDimensions();
+  const reduced = useReducedMotion();
   // Symbols follow Dynamic Type at half the text's rate, so they keep pace with labels and still fit their controls.
   const scaled = typeof size === 'number' ? size * (1 + (Math.min(fontScale, 2) - 1) / 2) : size;
-  return <IconComponent {...props} size={scaled} {...(fill === undefined ? {} : { fill })} />;
+  const icon = <IconComponent {...props} size={scaled} {...(fill === undefined ? {} : { fill })} />;
+  // The loader means work in progress, so it turns wherever it appears; with Reduce Motion it holds still.
+  return IconComponent === LoaderCircle && !reduced ? <Animated.View style={spin}>{icon}</Animated.View> : icon;
 }
 
 const StyledIcon = withUniwind(IconImpl, {

@@ -1,7 +1,7 @@
 import { Link, Stack, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { Bot, LoaderCircle } from 'lucide-react-native'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle } from 'react-native-reanimated'
@@ -72,6 +72,7 @@ export default function ChatScreen() {
   // No device can run a bot at all: the entry device's AI settings set one up; an offline one only needs to come back.
   const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
   const keyboard = useReanimatedKeyboardAnimation()
+  const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
@@ -80,6 +81,7 @@ export default function ChatScreen() {
   const send = () => {
     const { text, files } = draft
     setDraft({ text: '', files: [] })
+    list.current?.scrollToOffset({ offset: 0, animated: true })
     workspace.actions.send(id, text.trim(), files).catch(() => setDraft({ text, files }))
   }
   const rows = chat ? entries(chat, extras) : []
@@ -100,6 +102,7 @@ export default function ChatScreen() {
     <View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
     <FlatList
+      ref={list}
       data={rows}
       inverted
       keyExtractor={(row) => row.key}
