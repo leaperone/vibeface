@@ -161,7 +161,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
 }
 
 function Toggle({ icon, label, pressed, busy, disabled, onPress }: { icon: LucideIcon; label: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
-  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed }} disabled={disabled} onPress={onPress}>
+  return <Button variant={pressed ? 'secondary' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed }} disabled={disabled} onPress={onPress}>
     <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
   </Button>
 }
