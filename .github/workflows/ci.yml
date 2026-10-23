@@ -310,6 +310,10 @@ jobs:
         run: |
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]
           bash scripts/package-node.sh --target "$PACKAGE_TARGET"
+          if [[ -n "${VIBEFACE_NOTARY_KEY:-}" ]]; then
+            security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db"
+            rm -f "$VIBEFACE_NOTARY_KEY"
+          fi
       - name: Verify checksum and unpacked source identity
         id: unpack
         shell: bash
@@ -350,6 +354,7 @@ jobs:
           grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
           grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
           grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
+          spctl -a -vvv -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | grep -qx 'source=Notarized Developer ID'
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}

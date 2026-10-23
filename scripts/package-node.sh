@@ -85,10 +85,12 @@ if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; th
     notary="$(mktemp -d)"
     trap 'rm -rf "$staging" "$notary"' EXIT
     ditto -c -k --keepParent "$package/vibeface" "$notary/vibeface.zip"
-    xcrun notarytool submit "$notary/vibeface.zip" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" --wait --output-format json > "$notary/result.json" || true
-    read -r submission status < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r.get("id", ""), r.get("status", ""))' "$notary/result.json")
+    xcrun notarytool submit "$notary/vibeface.zip" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" --wait --timeout 30m --output-format json > "$notary/result.json" || true
+    submission='' status=''
+    read -r submission status < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r.get("id", ""), r.get("status", ""))' "$notary/result.json" 2> /dev/null) || true
     if [[ "$status" != 'Accepted' ]]; then
       printf 'Notarization %s: %s\n' "${submission:-failed}" "${status:-unknown}" >&2
+      cat "$notary/result.json" >&2
       if [[ -n "$submission" ]]; then
         xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" >&2 || true
       fi
