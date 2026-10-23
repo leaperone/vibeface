@@ -454,9 +454,13 @@ pub(crate) fn chain_depth(
 /// anything older waits for the next time, so resuming never runs a missed one.
 const LATE_START_MS: i64 = 5 * 60_000;
 
+/// A due time found later than this (the device was off or asleep) is skipped, not run late.
+pub(crate) const MAX_LATE_MS: i64 = 10 * 60_000;
+
 /// Queues the latest due time of each schedule in conversations this Node schedules. Earlier
-/// missed times are never run, a time any owner already answered is skipped, and a schedule
-/// waits while its previous run is still queued. Returns `(conversation, trigger)` per job.
+/// missed times are never run, a time found more than `MAX_LATE_MS` late is recorded as run and
+/// skipped, a time any owner already answered is skipped, and a schedule waits while its
+/// previous run is still queued. Returns `(conversation, trigger)` per job.
 fn admit_due_schedules_from(
     connection: &Connection,
     network: &str,
@@ -480,6 +484,21 @@ fn admit_due_schedules_from(
             )
             .optional()?;
         if owner.as_deref() != Some(local) || fired.is_some_and(|fired| fired >= slot) {
+            continue;
+        }
+        if now - slot > MAX_LATE_MS {
+            connection.execute(
+                "INSERT OR REPLACE INTO schedule_runs(conversation_id,schedule_id,slot_ms) VALUES(?,?,?)",
+                params![conversation, entry.schedule_id, slot],
+            )?;
+            tracing::info!(
+                event = "schedule.skipped_late",
+                conversation_id = conversation,
+                schedule_id = entry.schedule_id,
+                slot_ms = slot,
+                late_ms = now - slot,
+                "a schedule time was missed and is skipped"
+            );
             continue;
         }
         let queued = queued_jobs(connection, conversation)?;
@@ -1066,6 +1085,8 @@ impl Store {
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
+        // A queued turn reads what came before it ran, such as the reply to the message ahead.
+        job.basis = log::version_vector_from(&tx, network)?;
         // Reused only under the same ownership and when this basis contains what it saw.
         let resumable = job.kind != TriggerKind::AgentTask
             && session.native_id.is_some()

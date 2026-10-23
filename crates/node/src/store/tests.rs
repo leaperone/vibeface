@@ -2,11 +2,12 @@ use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{
-        JobOutcome, JobState, TriggerKind, bot_message_trigger, message_trigger, schedule_trigger,
-        work_trigger,
+        JobOutcome, JobState, SchedulerJob, TriggerKind, bot_message_trigger, message_trigger,
+        schedule_trigger, work_trigger,
     },
     work::{Signal, WorkSpec},
 };
+use serde_json::json;
 
 struct Net {
     network: String,
@@ -2835,6 +2836,254 @@ fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     assert_eq!(
         (last.role.as_str(), last.author),
         ("user", net.a.device_id()?)
+    );
+    Ok(())
+}
+
+/// The data a turn prompt carries: the JSON after the instructions.
+fn prompt_data(prompt: &str) -> Result<Value> {
+    let start = prompt.rfind("\n\n{").context("prompt data")?;
+    Ok(serde_json::from_str(&prompt[start + 2..])?)
+}
+
+/// The `key` of each row of the list at `pointer`.
+fn listed(data: &Value, pointer: &str, key: &str) -> Vec<Value> {
+    data.pointer(pointer)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|row| row[key].clone())
+        .collect()
+}
+
+/// Over the prompt limit, works, the checkpoint and the oldest messages give way in that order,
+/// so a turn still runs and sees the newest of each, in reading order, with what was left out.
+#[test]
+fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let text = "x".repeat(3_000);
+    for i in 0..40 {
+        let message = user(&net, &format!("m{i:02}"), &text);
+        store.append_event(&net.a, &net.network, "c", message, vec![], 10 + i)?;
+    }
+    let context = store.context(&net.network, "c", None)?;
+    let checkpoint = crate::scheduler::checkpoint(&context, &[]).context("over budget")?;
+    store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 60)?;
+    for i in 40..50 {
+        let message = user(&net, &format!("m{i:02}"), &text);
+        store.append_event(&net.a, &net.network, "c", message, vec![], 100 + i)?;
+    }
+    for i in 0..30 {
+        let spec = WorkSpec {
+            work_id: format!("w{i:02}"),
+            conversation: "c".into(),
+            trigger: message_trigger("m49"),
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: format!("call-{i}"),
+            kind: WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".repeat(600),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        store.accept_work(&net.a, &net.network, spec, 200 + i)?;
+    }
+    let context = store.context(&net.network, "c", None)?;
+    let works = store.works(&net.network, "c")?;
+    let job = SchedulerJob {
+        conversation_id: "c".into(),
+        trigger: message_trigger("m49"),
+        kind: TriggerKind::Human,
+        sequence: 0,
+        basis: context.basis.clone(),
+        reply_to: "m49".into(),
+        message_id: "reply".into(),
+        state: JobState::Queued,
+    };
+    let materialize = |bot: Value| {
+        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None)
+    };
+    let newest = json!(
+        context
+            .events
+            .iter()
+            .rposition(|event| matches!(event.event.body, EventBody::MessagePosted { .. }))
+    );
+
+    let roomy = prompt_data(&materialize(json!({}))?)?;
+    let roomy_works = listed(&roomy, "/works", "work_id");
+    assert_eq!(
+        roomy_works.last(),
+        Some(&json!("w29")),
+        "the newest work stays"
+    );
+    assert!(
+        roomy_works
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str()),
+        "works read oldest to newest"
+    );
+    assert_eq!(
+        roomy["earlier_works_omitted"],
+        json!(30 - roomy_works.len())
+    );
+    assert!(roomy["conversation"]["checkpoint"].is_object());
+    assert_eq!(
+        listed(&roomy, "/conversation/messages", "offset").last(),
+        Some(&newest)
+    );
+
+    let notes = (0..8)
+        .map(|i| json!({"memory_id":format!("n{i}"),"text":"y".repeat(400)}))
+        .collect::<Vec<_>>();
+    let full_bot = json!({"configured_bot":{"name":"Helper","instructions":"i".repeat(MAX_INSTRUCTIONS_BYTES)},
+        "skills":notes,"schedules":notes,"memory":notes,"bots":notes});
+    let prompt = materialize(full_bot)?;
+    assert!(prompt.len() <= crate::scheduler::PROMPT_LIMIT);
+    let tight = prompt_data(&prompt)?;
+    let offsets = listed(&tight, "/conversation/messages", "offset");
+    assert_eq!(offsets.last(), Some(&newest), "the trigger message stays");
+    assert!(
+        offsets
+            .windows(2)
+            .all(|pair| pair[0].as_u64() < pair[1].as_u64())
+    );
+    assert!(
+        listed(&tight, "/works", "work_id").len() < roomy_works.len(),
+        "works give way first"
+    );
+    Ok(())
+}
+
+/// The bot's notes in its prompt are the newest that fit, oldest of them first.
+#[test]
+fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    for i in 0..12 {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            &format!("k{i}"),
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: format!("Note {i:02}: {}", "keep replies short. ".repeat(20)),
+            },
+            10 + i,
+        )?;
+    }
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    let notes: Vec<String> = listed(&bot, "/memory", "text")
+        .iter()
+        .filter_map(|text| Some(text.as_str()?[..7].to_owned()))
+        .collect();
+    let omitted = bot["memory_omitted"].as_u64().context("omitted")? as usize;
+    assert!(omitted > 0 && notes.len() + omitted == 12);
+    let expected: Vec<String> = (12 - notes.len()..12)
+        .map(|i| format!("Note {i:02}"))
+        .collect();
+    assert_eq!(notes, expected, "the newest notes, oldest first");
+    Ok(())
+}
+
+/// A due time found more than the lateness window after it passed is skipped and recorded, so
+/// it never runs; the next time on schedule runs as usual.
+#[test]
+fn a_schedule_time_found_too_late_is_skipped() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    let (saved, _) = store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", 60),
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
+    };
+    let every = 60 * 60_000;
+    let slot = 1_000 + every;
+    let late = slot + scheduler::MAX_LATE_MS + 1;
+    for now in [late, late + 1] {
+        assert!(
+            store
+                .admit_due_schedules(&net.a, &net.network, now)?
+                .is_empty()
+        );
+    }
+    assert!(store.scheduler_jobs("c")?.is_empty());
+    let next = slot + every;
+    assert_eq!(
+        store.admit_due_schedules(&net.a, &net.network, next + scheduler::MAX_LATE_MS)?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, next))],
+        "a time within the window still runs"
+    );
+    Ok(())
+}
+
+/// A queued message's turn reads the conversation as it is when the turn starts, so it sees
+/// the reply to the message ahead of it.
+#[test]
+fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (id, at) in [("m1", 2), ("m2", 3)] {
+        let signed = signature(&net, id, "question")?;
+        store.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            id,
+            "question",
+            vec![],
+            true,
+            signed,
+            at,
+        )?;
+    }
+    let first = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("first turn")?;
+    let attempt = first.job.state.attempt().context("attempt")?.id.clone();
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &first.job.trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "first answer",
+        4,
+    )?;
+    let second = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("second turn")?;
+    assert_eq!(second.job.trigger, message_trigger("m2"));
+    let read = store.context(&net.network, "c", Some(&second.job.basis))?;
+    assert!(read.events.iter().any(|event| matches!(
+        &event.event.body,
+        EventBody::MessagePosted { role: Role::Assistant, text, .. } if text == "first answer"
+    )));
+    assert_eq!(
+        store
+            .scheduler_job("c", &second.job.trigger)?
+            .context("job")?
+            .basis,
+        second.job.basis,
+        "the claimed basis is stored"
     );
     Ok(())
 }

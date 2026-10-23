@@ -173,7 +173,8 @@ pub struct SchedulerJob {
     pub trigger: String,
     pub kind: TriggerKind,
     pub sequence: u64,
-    /// The version vector the turn reads; later events are not part of its prompt.
+    /// The version vector the turn reads, taken again when it is claimed; later events are not
+    /// part of its prompt.
     pub basis: VersionVector,
     /// The user message this turn ultimately answers, an agent task's own work ID, a peer
     /// message, or a schedule run's trigger.

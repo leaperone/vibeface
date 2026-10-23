@@ -475,7 +475,7 @@ async fn main() -> Result<()> {
                 } => {
                     ensure!(
                         std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
-                        "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one use `vibeface codex call turn/start`"
+                        "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one, ask the bot in its chat"
                     );
                     let args = json!({"thread":thread,"prompt":text,"call_ref":id,
                         "model":model,"effort":effort,"images":image});
@@ -1600,6 +1600,45 @@ async fn triage(options: Triage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_call_refuses_turn_writes_before_reaching_the_app_server() {
+        use vibeface::agent_cli::{Command, run};
+        let socket = Path::new("/nonexistent/vibeface-codex.sock");
+        for method in [
+            "turn/start",
+            "turn/steer",
+            "turn/interrupt",
+            "thread/start",
+            "review/start",
+        ] {
+            let refused = run(
+                socket,
+                Command::Call {
+                    method: method.into(),
+                    params: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                refused.contains(method) && refused.contains("codex send"),
+                "{refused}"
+            );
+        }
+        let read = run(
+            socket,
+            Command::Call {
+                method: "thread/list".into(),
+                params: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!read.contains("codex send"), "{read}");
+    }
 
     #[test]
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
