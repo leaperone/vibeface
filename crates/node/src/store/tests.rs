@@ -668,6 +668,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     let unread = JobState::Steering {
         into: into.clone(),
         unread_since_ms: Some(7),
+        running_since_ms: Some(6),
     };
     store.settle_steer("c", &m2, unread.clone())?;
     assert_eq!(store.scheduler_job("c", &m2)?.context("job")?.state, unread);
@@ -735,10 +736,26 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
             .is_none()
     );
     assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
-    assert!(matches!(
+    let JobState::Steering { into, .. } = store.scheduler_job("c", &m3)?.context("job")?.state
+    else {
+        bail!("m3 is no longer steering");
+    };
+    // Stopping it once its reply ended settles it as unknown instead of reaching an ended reply.
+    let stopped = store
+        .request_manager_cancel(&net.a, &net.network, "c", &m3)?
+        .context("job")?;
+    let unknown = JobState::Steered {
+        into,
+        outcome: SteerOutcome::Unknown,
+    };
+    assert_eq!(
+        (stopped.trigger.as_str(), &stopped.state),
+        (m3.as_str(), &unknown)
+    );
+    assert_eq!(
         store.scheduler_job("c", &m3)?.context("job")?.state,
-        JobState::Steering { .. }
-    ));
+        unknown
+    );
     Ok(())
 }
 
