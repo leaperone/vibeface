@@ -1,5 +1,5 @@
 import * as Clipboard from 'expo-clipboard'
-import { CircleCheck, Copy, Link2, Plus, Share2, ShieldAlert } from 'lucide-react-native'
+import { Check, CircleCheck, Copy, Link2, Plus, Share2, ShieldAlert } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
@@ -15,7 +15,13 @@ import { useRun } from '@/lib/use-run'
 export default function AddDevice() {
   const device = useDevice()
   const { ready } = device
-  const { busy, error, status, run } = useRun()
+  const { busy, error, run } = useRun()
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
   const [result, setResult] = useState<Invitation | null>(null)
   const [added, setAdded] = useState<string | null>(null)
   const requests = useOpenJoins().length > 0
@@ -51,8 +57,8 @@ export default function AddDevice() {
       <QrCode value={result.publicEntry ? result.link : result.ticket} label={result.publicEntry ? '用手机相机扫码打开' : '在新设备的 Vibeface 里扫码'} />
       {result.publicEntry ? null : <Text className="text-center text-meta text-muted-foreground">在新设备的 Vibeface 里点“扫码”</Text>}
       <View className="flex-row flex-wrap gap-2">
-        <Button variant={requests ? 'outline' : 'default'} className="h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => {}), '已复制')}>
-          <Icon as={Copy} /><Text>复制链接</Text>
+        <Button variant={requests ? 'outline' : 'default'} className="h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
+          <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>
         </Button>
         <Button variant="outline" className="h-11" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
           <Icon as={Share2} /><Text>分享</Text>
@@ -60,7 +66,6 @@ export default function AddDevice() {
       </View>
       <Text className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</Text>
     </View> : null}
-    {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
   </ScrollView>
 }

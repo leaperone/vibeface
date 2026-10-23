@@ -81,6 +81,9 @@ export default function ChatScreen() {
       title: bot.name,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
+      // With the edge effects off, the bar keeps its own blur so messages scrolled under it stay behind frosted glass.
+      headerTransparent: true,
+      headerBlurEffect: 'systemChromeMaterial',
       headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild>
         <Button variant="ghost" size="icon" accessibilityLabel="bot 信息"><Icon as={Bot} /></Button>
       </Link>,

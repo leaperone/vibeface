@@ -44,6 +44,9 @@ const phoneKeys: DeviceKeys = {
 Notifications.setNotificationHandler({
   handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: false, shouldSetBadge: false }),
 })
+// Its own Android channel, so system settings show Vibeface's name for these alerts; iOS ignores channels.
+const channelId = 'vibeface'
+void Notifications.setNotificationChannelAsync(channelId, { name: '回答与进展', importance: Notifications.AndroidImportance.HIGH }).catch(() => {})
 const opens = new Map<string, () => void>()
 Notifications.addNotificationResponseReceivedListener((response) => {
   const tag = response.notification.request.content.data?.tag
@@ -59,7 +62,7 @@ const notifier: Notifier = {
   request: async () => permission(await Notifications.requestPermissionsAsync()),
   show({ title, body, tag }, open) {
     opens.set(tag, open)
-    void Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { tag } }, trigger: null })
+    void Notifications.scheduleNotificationAsync({ identifier: tag, content: { title, body, data: { tag } }, trigger: { channelId } })
   },
 }
 

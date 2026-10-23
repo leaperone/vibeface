@@ -1,4 +1,4 @@
-import { useRouter } from 'expo-router'
+import { Stack, useRouter } from 'expo-router'
 import { Check, FolderOpen, LoaderCircle } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, View } from 'react-native'
@@ -38,7 +38,12 @@ export default function NewBot() {
     if (bot) router.replace(`/b/${bot.bot_id}`)
   })
   const locked = Boolean(pending) || busy !== null
+  const disabled = busy !== null || !shared.writable || !(pending?.name ?? name).trim()
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-6 p-4 pb-10">
+    {/* In the header, so the keyboard never covers it. */}
+    <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="h-11 px-3" disabled={disabled} onPress={() => void create()}>
+      {busy ? <Icon as={LoaderCircle} /> : null}<Text className="font-semibold">{pending ? '再试一次' : '创建'}</Text>
+    </Button> }} />
     {pending ? <Text role="status" className="rounded-lg bg-muted p-3 text-meta">{pending.submission?.state === 'rejected' ? '上次没建成，确认后可以修改。' : '上次没确认是否建好，内容保持不变。'}</Text> : null}
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">名称</Text>
@@ -65,9 +70,6 @@ export default function NewBot() {
       {projects.length || pending?.project ? null : <Text className="text-meta text-muted-foreground">还没有可用的文件夹，可在 AI 设置里添加</Text>}
     </View>
     <ErrorText error={error} />
-    <Button className="h-11" disabled={busy !== null || !shared.writable || !(pending?.name ?? name).trim()} onPress={() => void create()}>
-      {busy ? <Icon as={LoaderCircle} /> : null}<Text>{pending ? '再试一次' : '创建'}</Text>
-    </Button>
     {!shared.writable ? <Text role="status" className="text-meta text-muted-foreground">{shared.writeNotice || '连上后就能创建。'}</Text> : null}
   </KeyboardAwareScrollView>
 }
