@@ -31,13 +31,14 @@ type Entry = { key: string; message: ChatMessage; last: boolean } | Row
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
   const rows: Entry[] = []
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
-  const sender = (message: ChatMessage | undefined) => message && (message.role === 'user' ? 'user' : 'bot')
   chat.messages.forEach((message, index) => {
     while (questions.length && questions[0].created_at_ms < message.created_at_ms) {
       const question = questions.shift()!
       rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
     }
-    rows.push({ key: message.message_id, message, last: sender(chat.messages[index + 1]) !== sender(message) })
+    const next = chat.messages[index + 1]
+    // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
+    rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000 })
     rows.push(...extras.after.get(message.message_id) ?? [])
   })
   for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })

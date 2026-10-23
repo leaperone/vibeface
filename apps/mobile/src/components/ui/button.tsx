@@ -2,6 +2,12 @@ import { TextClassContext } from '@/components/ui/text';
 import { cn } from '@/lib/utils';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { Platform, Pressable } from 'react-native';
+import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import { withUniwind } from 'uniwind';
+
+const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
+// Critically damped and quick, so the press lands on touch-down and settles without a bounce.
+const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
 
 const buttonVariants = cva(
   cn(
@@ -92,13 +98,18 @@ type ButtonProps = React.ComponentProps<typeof Pressable> &
   React.RefAttributes<typeof Pressable> &
   VariantProps<typeof buttonVariants>;
 
-function Button({ className, variant, size, ...props }: ButtonProps) {
+function Button({ className, variant, size, onPressIn, onPressOut, ...props }: ButtonProps) {
+  const scale = useSharedValue(1);
+  const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   return (
     <TextClassContext.Provider value={buttonTextVariants({ variant, size })}>
-      <Pressable
+      <AnimatedPressable
         className={cn(props.disabled && 'opacity-50', buttonVariants({ variant, size }), className)}
         role="button"
         {...props}
+        style={pressed}
+        onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
+        onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
       />
     </TextClassContext.Provider>
   );

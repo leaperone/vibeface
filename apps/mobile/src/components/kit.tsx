@@ -1,6 +1,7 @@
 import type { LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { View } from 'react-native'
+import { useUniwind } from 'uniwind'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { cn } from '@/lib/utils'
@@ -11,7 +12,7 @@ export const toneText: Record<Tone, string> = {
   neutral: 'text-muted-foreground', success: 'text-success', warning: 'text-warning', danger: 'text-danger', info: 'text-info',
 }
 const toneSurface: Record<Tone, string> = {
-  neutral: 'border-border bg-card', success: 'border-success-border bg-success-soft', warning: 'border-warning-border bg-warning-soft',
+  neutral: 'border-border bg-card', success: 'border-success-border bg-success-soft', warning: 'border-warning-border bg-card',
   danger: 'border-danger-border bg-danger-soft', info: 'border-info-border bg-info-soft',
 }
 
@@ -45,7 +46,19 @@ export function SafetyCode({ code }: { code: string }) {
 
 export function Badge({ count }: { count: number }) {
   if (!count) return null
-  return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-warning px-1.5">
+  return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-foreground px-1.5">
     <Text className="text-[11px] leading-5 font-semibold text-background" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text>
+  </View>
+}
+
+/** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
+export function Monogram({ name, seed }: { name: string; seed: string }) {
+  const { theme } = useUniwind()
+  let hash = 0
+  for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  const hue = hash % 360
+  const dark = theme === 'dark'
+  return <View className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
+    <Text className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
   </View>
 }

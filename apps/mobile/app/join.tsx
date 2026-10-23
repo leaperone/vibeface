@@ -1,7 +1,7 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, QrCode, ShieldAlert, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -25,7 +25,7 @@ export default function JoinScreen() {
   const choosing = device.phase !== 'key_lost' && !device.review && session.phase !== 'joining'
   return <SafeAreaView className="flex-1 bg-background">
     <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow justify-center gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
-      <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
+      <Text role="heading" className="text-[34px] leading-[40px] font-bold tracking-tight">Vibeface</Text>
       {device.phase === 'key_lost' ? <LostKey />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
         : session.phase === 'joining' ? <Waiting code={session.code} name={session.deviceName} onCancel={workspace.actions.cancelJoin} />
@@ -72,8 +72,10 @@ function JoinForm() {
     finally { setBusy(false) }
   }
   if (scanning) return <Scanner onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
-  return <Panel icon={QrCode} title="扫码加入">
-    <Button className="h-11 self-start" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码</Text></Button>
+  const ready = invitation.trim() !== ''
+  // Scanning leads; the name and 加入 only appear once there is a link to join with.
+  return <View className="gap-4">
+    <Button className="h-12 rounded-xl" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
@@ -81,10 +83,12 @@ function JoinForm() {
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
     </View>
-    <Input accessibilityLabel="设备名称" placeholder="设备名称" className="h-11" value={name} onChangeText={setName} maxLength={64} />
-    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-    <Button className="h-11" disabled={busy || !invitation.trim() || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
-  </Panel>
+    {ready ? <>
+      <Input accessibilityLabel="设备名称" placeholder="设备名称" className="h-11" value={name} onChangeText={setName} maxLength={64} />
+      {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+      <Button className="h-12 rounded-xl" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+    </> : null}
+  </View>
 }
 
 function Scanner({ onScanned, onCancel }: { onScanned: (link: string) => void; onCancel: () => void }) {
