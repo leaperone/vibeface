@@ -57,14 +57,22 @@ export function isSubmitKey(event: Pick<KeyboardEvent, 'key' | 'shiftKey' | 'isC
   return event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229
 }
 
-/** Each reply follows the message it answers, even when the person wrote again before that reply finished. */
-export function threadReplies<T extends Pick<TranscriptMessage, 'message_id' | 'role' | 'in_reply_to'>>(messages: T[]): T[] {
+/**
+ * Each reply follows the message it answers, even when the person wrote again before that reply finished.
+ * A `joined` message went into the reply then running, so it sits before that reply, after the message it answers.
+ */
+export function threadReplies<T extends Pick<TranscriptMessage, 'message_id' | 'role' | 'in_reply_to'>>(messages: T[], joined: { has(id: string): boolean } = new Set()): T[] {
   const ids = new Set(messages.map((message) => message.message_id))
   const answers = (message: T) => message.role === 'assistant' && message.in_reply_to !== undefined && ids.has(message.in_reply_to) ? message.in_reply_to : null
-  const replies = new Map<string, T[]>()
+  const replies = new Map<string, T[]>(), merged = new Map<string, T[]>(), moved = new Set<string>()
+  let head: string | null = null
   for (const message of messages) {
     const to = answers(message)
     if (to) replies.set(to, [...replies.get(to) ?? [], message])
+    else if (head && joined.has(message.message_id)) { merged.set(head, [...merged.get(head) ?? [], message]); moved.add(message.message_id) }
+    else head = message.message_id
   }
-  return messages.flatMap((message) => answers(message) ? [] : [message, ...replies.get(message.message_id) ?? []])
+  const thread = (message: T): T[] => [message, ...replies.get(message.message_id) ?? []]
+  return messages.flatMap((message) => answers(message) || moved.has(message.message_id) ? []
+    : [message, ...(merged.get(message.message_id) ?? []).flatMap(thread), ...replies.get(message.message_id) ?? []])
 }

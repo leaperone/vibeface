@@ -43,7 +43,7 @@ export function verifyRemoval(value: unknown, nodeId: string, networkId: string)
   return true
 }
 export function passphrase(password: string, confirmation: string): string {
-  if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 12 个字符。')
+  if ([...password].length < 8 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 8 个字符。')
   if (password !== confirmation) throw new Error('两次密码不一样。')
   return password
 }
