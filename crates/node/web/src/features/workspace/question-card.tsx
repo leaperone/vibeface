@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, SquareTerminal, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -24,7 +24,7 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> 
  */
 export function QuestionCard({ question, answer, inbox = false }: { question: Question; answer?: string; inbox?: boolean }) {
   const workspace = useWorkspace()
-  const { directory } = useDevice()
+  const { directory, ready } = useDevice()
   const action = useAction()
   const navigate = useNavigate()
   const [text, setText] = useState("")
@@ -72,7 +72,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       {task ? <Meta icon={ListChecks} label="任务">{task.title || "任务"}</Meta> : null}
       {session ? <Meta icon={SquareTerminal} label="会话">{agentName(question.about.agent)}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
-      <Meta icon={Laptop} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
+      <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
       {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
         <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
       </Link> : null}
