@@ -18,13 +18,13 @@ const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }], unanswered: ["m1"] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {
   const event = parseChanged({
     type: "records", conversation_id: "chat", messages: [], works: [], last_message: null, questions: [], notifications: [],
-    deliveries: [], checks: [], jobs: [], sent: [], ...extra,
+    deliveries: [], checks: [], jobs: [], unanswered: [], sent: [], ...extra,
   })
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)
@@ -38,6 +38,7 @@ test("a pushed message lands in rank order and the push replaces deliveries, che
   assert.deepEqual(next.messages.map((item) => item.message_id), ["m1", "m2", "m3"])
   assert.deepEqual(next.works.map((item) => [item.work_id, item.outcome, item.stop]), [["w1", null, undefined], ["w2", "completed", undefined]], "no delivery is still carried")
   assert.deepEqual(next.scheduler?.jobs.map((item) => item.state), ["completed"])
+  assert.deepEqual(next.scheduler?.unanswered, [], "a reply queued here clears the unanswered card")
   assert.equal(next.questions.length, 1)
   const again = mergeConversation(next, records({ messages: [message("m2", 2)] }))
   assert.equal(again.messages.length, 3, "a repeated push does not duplicate the message")

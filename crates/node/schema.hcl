@@ -257,6 +257,10 @@ table "messages" {
     null = true
     type = text
   }
+  column "steered_into" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }

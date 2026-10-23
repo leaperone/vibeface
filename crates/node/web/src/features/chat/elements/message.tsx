@@ -1,4 +1,4 @@
-import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, Clock, LoaderCircle, Merge } from 'lucide-react'
+import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, LoaderCircle, Merge } from 'lucide-react'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
 import { messageKey, replyStatusLabel } from '../protocol.ts'
@@ -9,7 +9,7 @@ import type { SteerOutcome } from '@/features/workspace/types'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 
-const mergedLabels: Record<SteerOutcome, string> = { answered: '已并入当前回复', unfinished: '已并入，回复未完成', unknown: '不确定是否已并入' }
+const mergedLabels: Record<SteerOutcome, string> = { answered: '已并入回复', unfinished: '已并入，回复未完成', unknown: '不确定是否已并入' }
 
 /** Today shows the time only; older messages also show the day. */
 function shortTime(when: Date) {
@@ -78,7 +78,8 @@ export function Message({ message, schedule, last = true }: { message: ChatMessa
       <Markdown text={message.text} />
     </div>
     {message.state === 'streaming' ? <LoaderCircle aria-label="正在回复" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} /> : null}
-    {ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
+    {ended === '失败' ? <span className="flex items-center gap-1 text-meta text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
+      : ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
     {time}
   </div>
 }

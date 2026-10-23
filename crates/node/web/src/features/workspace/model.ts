@@ -77,7 +77,7 @@ function optionalText(value: unknown): string | undefined { return value == null
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
+  return { unanswered: list(data.unanswered).map(text), jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
 function workState(value: unknown): WorkState {
   switch (value) {
@@ -158,12 +158,13 @@ export function parseOpenWorks(value: unknown): OpenWork[] {
 export function parseRecords(value: unknown): ConversationRecords {
   const data = record(value)
   const last = data.last_message == null ? null : record(data.last_message)
+  const scheduler = schedulerSnapshot({ jobs: data.jobs, unanswered: data.unanswered })
   return {
     conversation_id: text(data.conversation_id), messages: list(data.messages).map(message), works: list(data.works).map(work),
     last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) },
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
-    jobs: schedulerSnapshot({ jobs: data.jobs })?.jobs ?? [],
+    jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
     sent: list(data.sent).map(sentBotMessage),
   }
 }

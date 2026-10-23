@@ -635,6 +635,14 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             change.validate()?;
         }
         EventBody::ScheduleControlled { schedule_id, .. } => id(schedule_id)?,
+        EventBody::MessageSteered { message_id, reply } => {
+            id(message_id)?;
+            id(reply)?;
+            ensure!(
+                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                "a message is steered in its bot's conversation"
+            );
+        }
         EventBody::ScheduleRunClaimed { schedule_id, .. } => {
             id(schedule_id)?;
             ensure!(

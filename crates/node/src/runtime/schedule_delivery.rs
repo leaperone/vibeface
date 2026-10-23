@@ -232,10 +232,13 @@ impl Runtime {
                         error = error.message,
                         "the message waits for its own reply"
                     );
-                    self.store
-                        .lock()
-                        .await
-                        .settle_steer(scope, trigger, JobState::Queued)?;
+                    self.store.lock().await.settle_steer(
+                        &self.identity,
+                        network,
+                        scope,
+                        trigger,
+                        JobState::Queued,
+                    )?;
                     self.schedule_wakeup.notify_one();
                 }
                 Ok(Err(_)) | Err(_) => {
@@ -297,10 +300,13 @@ impl Runtime {
             return Ok(());
         };
         let settled = !matches!(next, JobState::Steering { .. });
-        self.store
-            .lock()
-            .await
-            .settle_steer(&job.conversation_id, &job.trigger, next)?;
+        self.store.lock().await.settle_steer(
+            &self.identity,
+            network,
+            &job.conversation_id,
+            &job.trigger,
+            next,
+        )?;
         if settled {
             self.schedule_wakeup.notify_one();
             self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
@@ -349,6 +355,29 @@ impl Runtime {
             json!({"accepted":true,"state":receipt.state,"trigger":receipt.trigger,
             "message_id":message_id,"receipt":receipt}),
         )
+    }
+
+    /// The user asks this Node, now scheduling the conversation, to reply to messages a former
+    /// owner left unanswered. Nothing replays on its own; a retry queues nothing twice.
+    pub(super) async fn reply_unanswered(&self, access: &Access, input: &Value) -> Result<Value> {
+        let _work = self.maintenance.enter()?;
+        ensure!(access.human, "only the user asks for these replies");
+        let network = &access.network_id;
+        let scope = id(input, "conversation_id")?;
+        self.require_scope(access, &scope).await?;
+        let message_ids: Vec<String> = serde_json::from_value(input["message_ids"].clone())
+            .context("message_ids must be a list of message IDs")?;
+        let receipts = self.store.lock().await.reply_unanswered(
+            network,
+            &self.identity.device_id()?,
+            &scope,
+            &message_ids,
+        )?;
+        for receipt in &receipts {
+            self.publish_changed(network, &scope, Changed::Job(&receipt.trigger));
+        }
+        self.schedule_wakeup.notify_one();
+        Ok(json!({"receipts":receipts}))
     }
 
     pub(super) async fn manager_status(

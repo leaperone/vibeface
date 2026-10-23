@@ -127,7 +127,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
-    sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {},
+    sealPackage: () => new Uint8Array([1, 2, 3]), downloadPackage() {}, recoveryCode: async () => 'ABCDEF12',
     verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: () => '{}', createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }

@@ -689,6 +689,12 @@ pub enum EventBody {
         slot_ms: i64,
         owner_epoch: u64,
     },
+    /// Written by the Node that steered user message `message_id` into its bot's running reply
+    /// `reply`, once that reply completed with it: the message needs no reply of its own.
+    MessageSteered {
+        message_id: String,
+        reply: String,
+    },
     /// In the receiving bot's conversation, written by the sender's scheduling Node.
     /// `message_id` derives from the sending turn and the tool's `call_ref`.
     BotMessaged {

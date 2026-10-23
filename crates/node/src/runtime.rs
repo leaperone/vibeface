@@ -359,6 +359,9 @@ impl Runtime {
     pub async fn membership_state(&self) -> Result<NetworkState> {
         self.store.lock().await.public_state()
     }
+    pub async fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
+        self.store.lock().await.recovery_since_ms(recovery_key)
+    }
     /// The name this Node had in its network, kept after its removal.
     pub async fn member_name(&self) -> Option<String> {
         let device = self.identity.device_id().ok()?;
@@ -633,6 +636,7 @@ impl Runtime {
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
+            "reply_unanswered" => self.reply_unanswered(&access, &input).await,
             "resolve" => self.resolve_check(&access, &input).await,
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
