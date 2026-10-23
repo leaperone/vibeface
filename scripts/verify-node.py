@@ -978,8 +978,10 @@ def fixture_codex(arguments):
                 if not select.select([stream], [], [], .1)[0]:
                     continue
                 message = websocket_receive(stream)
-                fixture_record(run, "codex-rpc.jsonl", {"connection": connection_id, "pid": os.getpid(), "message": message})
                 method, params = message.get("method"), message.get("params", {})
+                bot = bool(state["threads"].get(params.get("threadId"), {}).get("bot")) or params.get("threadSource") == "vibeface-bot"
+                fixture_record(run, "codex-rpc.jsonl", {"connection": connection_id, "pid": os.getpid(), "message": message,
+                                                        "bot": bot})
                 initialized = initialized or method == "initialized"
                 with state_lock:
                     if method is None:
@@ -1628,10 +1630,7 @@ def local_post(node, path, body):
 
 def work_checks(run, workspace, a, network, passed):
     def rpc(method):
-        """Calls for work; bot turns run on the same App Server in threads of their own."""
-        threads = json.loads((run / "fixture-codex-state.json").read_text())["threads"]
-        return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method
-                and not threads.get(row["message"].get("params", {}).get("threadId"), {}).get("bot")]
+        return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method and not row["bot"]]
 
     def snapshot(name):
         return a.client.rpc("conversation", conversation_id=name)
@@ -2979,7 +2978,7 @@ def phase4_acceptance(options):
             (row for row in records(node, "manager-native-work.jsonl") if row["label"] == label), None), timeout=60)["work_id"]
 
     def codex_rpc(node, method):
-        return [row for row in records(node, "codex-rpc.jsonl") if row["message"].get("method") == method]
+        return [row for row in records(node, "codex-rpc.jsonl") if row["message"].get("method") == method and not row["bot"]]
 
     def send(client, message_id, directive, **extra):
         text = directive if isinstance(directive, str) else json.dumps(directive)
