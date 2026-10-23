@@ -27,6 +27,7 @@ function Screens() {
     <StatusBar style="auto" />
     <Stack screenOptions={{
       headerShadowVisible: false,
+      headerStyle: { backgroundColor: background },
       headerBackButtonDisplayMode: 'minimal',
       headerTintColor: foreground,
       headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16, color: foreground },

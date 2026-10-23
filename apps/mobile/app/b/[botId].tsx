@@ -91,6 +91,7 @@ export default function ChatScreen() {
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       // With the edge effects off, the bar keeps its own blur so messages scrolled under it stay behind frosted glass.
       headerTransparent: ios,
+      ...ios ? { headerStyle: { backgroundColor: 'transparent' } } : {},
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild>
@@ -106,7 +107,7 @@ export default function ChatScreen() {
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
       renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
-      contentContainerClassName="px-4 py-6"
+      contentContainerClassName="w-full max-w-3xl self-center px-4 py-6"
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
       ItemSeparatorComponent={() => <View className="h-6" />}
