@@ -1,7 +1,7 @@
 import { Link } from 'expo-router'
 import { Bell, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Pressable, ScrollView, View } from 'react-native'
+import { Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
@@ -95,15 +95,16 @@ function Section({ icon, title, action, children }: { icon: LucideIcon; title: s
 const kindIcon = (member: Member) => member.kind === 'client' ? Smartphone : Laptop
 
 function MemberRow({ member, first }: { member: Member; first: boolean }) {
+  // iOS sits inline views on the line box, not the glyph baseline, so they sink as the line height grows with Dynamic Type.
+  // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap.
+  const fontScale = useWindowDimensions().fontScale
+  const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 0
   return <Link href={`/device/${member.device_id}`} asChild>
     <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
-      {/* Title and subtitle, as a system cell: the crown stays centred beside the name at every text size. */}
+      {/* Title and subtitle, as a system cell. The crown is inline so it follows the last word of a wrapped name. */}
       <View className="min-w-0 flex-1">
-        <View className="flex-row items-center gap-1.5">
-          <Text numberOfLines={2} className="shrink font-medium">{member.name}</Text>
-          {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
-        </View>
+        <Text numberOfLines={2} className="font-medium">{member.name}{member.admin ? <>{' '}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
