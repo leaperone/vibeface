@@ -12,7 +12,7 @@ import { QuestionCard } from '@/features/chat/question-card'
 export default function Inbox() {
   const workspace = useWorkspace()
   const open = workspace.questions.filter((question) => question.answer === null).sort((a, b) => b.created_at_ms - a.created_at_ms)
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentContainerClassName="gap-4 p-4">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-4 p-4 pb-10">
     {open.length ? open.map((question) => <View key={question.question_id} className="gap-2">
       {question.bot ? <Link href={`/b/${question.bot.bot_id}`} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
