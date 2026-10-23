@@ -4,10 +4,10 @@
 The default run starts four Nodes over iroh (one runs the member relay, one
 reaches others only through it) and checks sync, signed entrances, forwarding
 through other Gateways, delivery to the scheduling Node without replay, a relay
-outage and an entrance switch. Host work uses a controlled SDK sidecar, never a model. All state and logs stay beneath
+outage and an entrance switch. Host work uses bot turns on a controlled fixture App Server, never a model. All state and logs stay beneath
 --artifacts with private permissions. The script prints no credentials.
 --phase1 checks durable Manager queues, scoped tools and cross-entry progress
-using a controlled sidecar. It does not verify real provider model behavior.
+using a controlled fixture App Server. It does not verify real provider model behavior.
 --chat-agent checks direct App Server work through the Agent's Shell CLIs, request
 handling, triage, webhooks and decisions, and native event recovery with real Node
 processes and controlled provider protocol fixtures.
@@ -513,7 +513,7 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, fixture, helper, module, *, init_args=None):
+    def __init__(self, run, name, binary, workspace, helper, module, *, init_args=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
@@ -654,13 +654,7 @@ def invocations(run, label=None):
 
 def fixture_wrapper(run, name, mode):
     path = run / name
-    diagnostic = ""
-    if mode == "--fixture-manager":
-        diagnostic = ("import tempfile\n"
-                      "diagnostic_fd, _ = tempfile.mkstemp(prefix='fixture-manager-' + str(os.getpid()) + '-', "
-                      f"suffix='.stderr.log', dir={str(run)!r})\n"
-                      "os.dup2(diagnostic_fd, 2)\nos.close(diagnostic_fd)\n")
-    path.write_text(f"#!{sys.executable}\nimport os\n" + diagnostic + f"os.execv({sys.executable!r}, "
+    path.write_text(f"#!{sys.executable}\nimport os\n" + f"os.execv({sys.executable!r}, "
                     f"[{sys.executable!r}, {str(Path(__file__).resolve())!r}, "
                     f"{mode!r}, '--fixture-root', {str(run)!r}] + __import__('sys').argv[1:])\n")
     path.chmod(0o700)
@@ -668,9 +662,9 @@ def fixture_wrapper(run, name, mode):
 
 
 def fixture_manager_settings(run, workspace):
+    """Bot turns run on the fixture App Server, so `codex_bin` must be the `--fixture-codex` wrapper."""
     return {"provider": "codex_sdk", "workspace": str(workspace), "model": "controlled-fixture",
-            "cursor_sdk_bin": "unused-fixture", "node_bin": sys.executable,
-            "codex_sdk_script": str(fixture_wrapper(run, "fixture-manager", "--fixture-manager"))}
+            "cursor_sdk_bin": "unused-fixture", "node_bin": "unused-fixture", "codex_sdk_script": "unused-fixture"}
 
 
 def fixture_record(run, filename, record):
@@ -850,6 +844,54 @@ def fixture_codex(arguments):
         return {"id": "user-" + uuid.uuid4().hex, "type": "userMessage", "clientId": params.get("clientUserMessageId"),
                 "content": params.get("input", [])}
 
+    # A bot thread's Shell environment holds its tool token, so it stays in memory only.
+    bot_env, bot_stops = {}, {}
+
+    class BotTurn:
+        """One bot turn: progress and its end go to the connection that started it."""
+
+        def __init__(self, stream, thread, turn):
+            self.stream, self.thread, self.turn = stream, thread, turn
+            self.stopped = bot_stops[turn["id"]] = threading.Event()
+
+        def send(self, method, params):
+            try:
+                websocket_send(self.stream, {"method": method, "params": {
+                    "threadId": self.thread["id"], "turnId": self.turn["id"], **params}})
+            except OSError:
+                pass
+
+        def say(self, text):
+            with state_lock:
+                self.send("item/started", {"item": {"id": "fixture-text", "type": "agentMessage", "text": text}})
+
+        def end(self, status, text=None):
+            with state_lock:
+                bot_stops.pop(self.turn["id"], None)
+                if text is not None:
+                    item = {"id": "fixture-answer", "type": "agentMessage", "text": text}
+                    self.turn["items"].append(item)
+                    self.send("item/completed", {"item": item})
+                self.turn["status"] = status
+                self.thread["status"] = {"type": "idle"}
+                private_json(state_path, state)
+                self.send("turn/completed", {"turn": self.turn})
+
+    def bot_turn(stream, thread, turn, params, resumed):
+        prompt = params["input"][0]["text"]
+        cli = re.search(r"Run:\n'(.*?)' tool TOOL_NAME", prompt)
+        catalog = prompt[prompt.find("Available tools for this invocation:\n"):]
+        initial = {"prompt": prompt, "tool_env": bot_env.get(thread["id"], {}), "cwd": thread["cwd"],
+                   "session_id": thread["id"] if resumed else None, "tool_cli": cli and cli.group(1),
+                   "custom_tools": re.findall(r"(?m)^(\w+)\n[^\n]*\nJSON schema: ", catalog)}
+        bot = BotTurn(stream, thread, turn)
+        try:
+            fixture_manager(run, initial, bot)
+        except Exception as error:
+            fixture_record(run, "manager-errors.jsonl", {"thread_id": thread["id"], "error": str(error)[:2000],
+                                                         "trace": traceback.format_exc()[-2000:]})
+            bot.end("failed")
+
     def summary(thread):
         return {key: value for key, value in thread.items() if key not in ("turns", "directive", "request")}
 
@@ -882,7 +924,7 @@ def fixture_codex(arguments):
                                                 "method": "account/chatgptAuthTokens/refresh", "params": {"reason": "unauthorized"}})
                     for thread_id in list(subscribed):
                         thread = state["threads"].get(thread_id)
-                        if not thread or not thread["turns"]:
+                        if not thread or not thread["turns"] or thread.get("bot"):
                             continue
                         turn = thread["turns"][-1]
                         directive = thread.get("directive", {})
@@ -968,6 +1010,9 @@ def fixture_codex(arguments):
                         thread_id = "fixture-thread-" + uuid.uuid4().hex
                         thread = {"id": thread_id, "cwd": params["cwd"], "status": {"type": "idle"}, "turns": [],
                                   "name": None, "preview": "", "createdAt": int(time.time())}
+                        if params.get("threadSource") == "vibeface-bot":
+                            thread["bot"] = True
+                            bot_env[thread_id] = params["config"]["shell_environment_policy.set"]
                         state["threads"][thread_id] = thread
                         result = {"thread": thread}
                         subscribed.add(thread_id)
@@ -978,6 +1023,16 @@ def fixture_codex(arguments):
                         error = {"code": -32600, "message": "thread not found: " + str(thread_id)}
                     elif method == "thread/resume" and not thread["turns"]:
                         error = {"code": -32600, "message": "no rollout found for thread id " + thread_id}
+                    elif method == "turn/start" and thread.get("bot"):
+                        if thread["status"]["type"] == "active":
+                            error = {"code": -32600, "message": "a turn is already running"}
+                        else:
+                            resumed = bool(thread["turns"])
+                            thread["status"] = {"type": "active", "activeFlags": []}
+                            turn = {"id": "fixture-turn-" + uuid.uuid4().hex, "status": "inProgress", "items": [user_message(params)]}
+                            thread["turns"].append(turn)
+                            result = {"turn": turn}
+                            threading.Thread(target=bot_turn, args=(stream, thread, turn, params, resumed), daemon=True).start()
                     elif method == "turn/start":
                         if thread["status"]["type"] == "active":
                             error = {"code": -32600, "message": "a turn is already running"}
@@ -1006,6 +1061,9 @@ def fixture_codex(arguments):
                         else:
                             active["items"].append(user_message(params))
                             result = {"turnId": active["id"]}
+                    elif method == "turn/interrupt" and params.get("turnId") in bot_stops:
+                        bot_stops[params["turnId"]].set()
+                        result = {}
                     elif method == "turn/interrupt":
                         require(thread["turns"][-1]["id"] == params["turnId"], "interrupt selects the original turn")
                         thread["status"] = {"type": "idle"}
@@ -1036,6 +1094,8 @@ def fixture_codex(arguments):
                         result = {"thread": thread}
                         if method == "thread/resume":
                             subscribed.add(thread_id)
+                            if thread.get("bot"):
+                                bot_env[thread_id] = params["config"]["shell_environment_policy.set"]
                     if error:
                         websocket_send(stream, {"id": message["id"], "error": error})
                         continue
@@ -1060,7 +1120,7 @@ TRIAGE_WAKE = "New events from the user's local coding agent sessions"
 
 
 def fixture_cli(initial, *arguments, check=True):
-    """Runs the real `vibeface` CLI the way an Agent's Shell would, with the sidecar's tool environment."""
+    """Runs the real `vibeface` CLI the way an Agent's Shell would, with the bot turn's tool environment."""
     completed = subprocess.run([initial["tool_cli"], *arguments], capture_output=True, text=True, timeout=60,
                                env={**os.environ, **initial["tool_env"]})
     require(not check or completed.returncode == 0,
@@ -1068,7 +1128,7 @@ def fixture_cli(initial, *arguments, check=True):
     return completed
 
 
-def fixture_triage(run, initial, prompt, emit):
+def fixture_triage(run, initial, prompt, bot):
     """The coordination Agent's triage turn: answer, ask about or dismiss each event per the fixture thread's directive."""
     events = json.loads(prompt[prompt.index("Events:\n") + len("Events:\n"):])
     state_path = run / "fixture-codex-state.json"
@@ -1101,28 +1161,18 @@ def fixture_triage(run, initial, prompt, emit):
             fixture_cli(initial, "triage", "dismiss", "--event-id", event["event_id"])
             action.update(action="dismiss")
         fixture_record(run, "triage-actions.jsonl", action)
-    emit({"type": "result", "session_id": initial.get("session_id"), "final_response": "已处理"})
+    bot.end("completed", "已处理")
 
 
-def fixture_manager(arguments):
-    """Exercise only the sidecar protocol, the real `vibeface` CLIs and scoped Node tools, never a model."""
-    run = Path(arguments[arguments.index("--fixture-root") + 1])
-    initial = json.loads(sys.stdin.readline())
-    require(initial["type"] == "init", "fixture receives sidecar initialization")
+def fixture_manager(run, initial, bot):
+    """A bot turn on the fake App Server: the real `vibeface` CLIs and scoped Node tools, never a model."""
     prompt = initial["prompt"]
     require("VIBEFACE_CODEX_SOCKET" in initial["tool_env"], "the coordination Agent's Shell reaches the App Server socket")
-    emit = lambda value: print(json.dumps(value), flush=True)
-    native = initial.get("session_id") or "fixture-native-" + uuid.uuid4().hex
-    emit({"type": "ready", "session_id": initial.get("session_id")})
-    require(json.loads(sys.stdin.readline())["type"] == "ack", "fixture waits for durable start ACK")
-    if not initial.get("session_id"):
-        emit({"type": "session", "session_id": native})
-        require(json.loads(sys.stdin.readline())["type"] == "session_ack",
-                "fixture waits for durable native session ACK")
-    if prompt.startswith(TRIAGE_WAKE):
+    native = bot.thread["id"]
+    if TRIAGE_WAKE in prompt:
         fixture_record(run, "triage-invocations.jsonl", {"pid": os.getpid(), "native_session_id": native})
         initial["session_id"] = native
-        fixture_triage(run, initial, prompt, emit)
+        fixture_triage(run, initial, prompt, bot)
         return
     start = prompt.rfind("\n\n{")
     require(start >= 0, "fixture receives explicit management context")
@@ -1151,13 +1201,13 @@ def fixture_manager(arguments):
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in prompt],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
-    schemas = initial.get("custom_tools", {})
+    schemas = initial["custom_tools"]
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind not in ("agent_task", "route"):
         expected_tools |= WAKE_TOOLS
     if kind == "human":
         expected_tools |= SETTINGS_TOOLS
-    require(set(schemas) == expected_tools, "sidecar receives the authoritative scoped tool catalog")
+    require(set(schemas) == expected_tools, "the turn receives the authoritative scoped tool catalog")
 
     def tool(name, arguments, expected=True, rejection="unknown", discard=False):
         environment = initial["tool_env"]
@@ -1285,21 +1335,18 @@ def fixture_manager(arguments):
     spoken = "已看过任务结果" if autonomous else "收到，已处理"
     while True:
         sequence += 1
-        emit({"type": "event", "event": {"type": "item.updated", "item": {
-            "id": "fixture-text", "type": "agent_message", "text": f"{explicit}:{sequence}" if explicit else spoken}}})
+        bot.say(f"{explicit}:{sequence}" if explicit else spoken)
         if not gate or Path(gate).exists():
             break
-        if select.select([sys.stdin], [], [], 0.2)[0]:
-            control = sys.stdin.readline()
-            if not control:
-                return
-            if json.loads(control)["type"] == "cancel":
-                if not directive.get("cancel_unknown"):
-                    emit({"type": "cancelled", "session_id": native,
-                          "confirmation": "managed_processes_exited"})
-                return
-    emit({"type": "result", "session_id": native,
-          "final_response": "x" * directive.get("result_size", 0) or (f"{explicit}:complete" if explicit else spoken + "。")})
+        if bot.stopped.wait(0.2):
+            # An unconfirmed stop ends only after the Node stopped waiting for it.
+            if directive.get("cancel_unknown"):
+                time.sleep(10)
+            bot.end("interrupted")
+            return
+    steered = [item["clientId"] for item in bot.turn["items"][1:] if item["type"] == "userMessage"]
+    final = "x" * directive.get("result_size", 0) or (f"{explicit}:complete" if explicit else spoken + "。")
+    bot.end("completed", final + "".join(" +" + message for message in steered))
 
 
 def javascript_dependencies(content):
@@ -1581,7 +1628,10 @@ def local_post(node, path, body):
 
 def work_checks(run, workspace, a, network, passed):
     def rpc(method):
-        return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method]
+        """Calls for work; bot turns run on the same App Server in threads of their own."""
+        threads = json.loads((run / "fixture-codex-state.json").read_text())["threads"]
+        return [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") == method
+                and not threads.get(row["message"].get("params", {}).get("threadId"), {}).get("bot")]
 
     def snapshot(name):
         return a.client.rpc("conversation", conversation_id=name)
@@ -2271,7 +2321,6 @@ def chat_agent_acceptance(options):
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir()
-    fixture = fixture_wrapper(run, "fixture-manager", "--fixture-manager")
     codex = fixture_wrapper(run, "fixture-codex", "--fixture-codex")
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
@@ -2287,7 +2336,7 @@ def chat_agent_acceptance(options):
 
     try:
         for name in ("A", "BOT-OTHER-NETWORK"):
-            node = Node(run, name, binary, workspace, fixture, helper, module)
+            node = Node(run, name, binary, workspace, helper, module)
             node.configure(timeout_secs=600, manager=fixture_manager_settings(run, workspace) if name == "A" else None,
                            codex_bin=str(codex) if name == "A" else sys.executable, app_server=SPAWN_APP_SERVER,
                            daily_decision_limit=100)
@@ -2363,7 +2412,6 @@ def phase1_acceptance(options):
     shutil.copy2(source_binary, binary)
     workspace = run / "workspace"
     workspace.mkdir()
-    fixture = fixture_wrapper(run, "fixture-manager", "--fixture-manager")
     codex = fixture_wrapper(run, "fixture-codex", "--fixture-codex")
     manager = fixture_manager_settings(run, workspace)
     helper = run / "client.mjs"
@@ -2421,18 +2469,8 @@ def phase1_acceptance(options):
         a.client.connect()
         wait_for("A receives its client grant", lambda: a.client.authenticate())
 
-    def stop_managers():
-        for record in fixture_records(run):
-            pid = record["pid"]
-            result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
-            if "--fixture-manager" in result.stdout and str(run) in result.stdout:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
     try:
-        a = Node(run, "A", binary, workspace, fixture, helper, module)
+        a = Node(run, "A", binary, workspace, helper, module)
         nodes.append(a)
         a.configure(timeout_secs=600, manager=manager, codex_bin=str(codex), app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
@@ -2509,6 +2547,33 @@ def phase1_acceptance(options):
         passed("busy messages persist, retry deduplicates, queued cancellation is final and replies match",
                triggers=[first["trigger"], second["trigger"]], invocations=len(calls(name)))
 
+        name = new_conversation("phase1-steer")
+        gate = run / "release-steer"
+        first, _ = send(name, "steer-first", gate=str(gate), report_results=True)
+        wait_for("the reply runs on its App Server turn", lambda: state(first, "running") and calls(name))
+        joined, joined_text = send(name, "steer-joined", report_results=True)
+        merged = wait_for("a message sent mid-reply joins the running turn", lambda: state(joined, "steered"))
+        retry = a.client.rpc("message", conversation_id=name, message_id="steer-joined", text=joined_text,
+                             report_results=True)
+        require(retry["trigger"] == joined["trigger"], "a retried message keeps its trigger")
+
+        def steers():
+            return [row["message"] for row in map(json.loads, (run / "codex-rpc.jsonl").read_text().splitlines())
+                    if row["message"].get("method") == "turn/steer"
+                    and row["message"]["params"].get("clientUserMessageId") == "steer-joined"]
+        gate.touch()
+        done = wait_for("the reply that took the message completes", lambda: completed(first))
+        answer = reply(name, done)
+        require(len(steers()) == 1 and steers()[0]["params"]["expectedTurnId"] == json.loads(merged["detail"])["turn_id"],
+                "the message is steered once into the running turn, whatever the retries")
+        require(len(answer) == 1 and answer[0]["text"].endswith("+steer-joined"),
+                "the running turn's one reply answers the joined message")
+        require(len(calls(name)) == 1 and state(joined, "steered")
+                and not any(message.get("in_reply_to") == "steer-joined" for message in conversation(name)["messages"]),
+                "a joined message gets no turn or reply of its own")
+        passed("a message sent while the bot replies joins that reply through one turn/steer",
+               trigger=joined["trigger"], turn=json.loads(merged["detail"])["turn_id"])
+
         for unconfirmed in (False, True):
             name = new_conversation("phase1-cancel-" + str(unconfirmed).lower())
             cancelled, _ = send(name, "cancel-" + str(unconfirmed).lower(),
@@ -2536,7 +2601,7 @@ def phase1_acceptance(options):
         wait_for("second trigger is persisted before crash", lambda: state(queued, "queued"))
         old_attempt = state(interrupted, "running")["attempt"]["id"]
         a.stop(crash=True)
-        stop_managers()
+        stop_fixture_processes(run)
         a.start()
         reconnect()
         stopped = wait_for("restarted running attempt becomes interrupted", lambda: state(interrupted, "interrupted"))
@@ -2578,7 +2643,6 @@ def phase1_acceptance(options):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
-        stop_managers()
         stop_fixture_processes(run)
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
@@ -2599,7 +2663,7 @@ def web_acceptance(options):
               "not_checked": ["Node business tests", "provider behavior", "rendered browser UI"]}
     node = None
     try:
-        node = Node(run, "WEB", binary, workspace, None, None, module)
+        node = Node(run, "WEB", binary, workspace, None, module)
         node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
         node.start()
         verify_web_assets(node, module)
@@ -2657,7 +2721,6 @@ def acceptance(options):
     run.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
-    fixture = fixture_wrapper(run, "fixture-manager", "--fixture-manager")
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     helper.chmod(0o600)
@@ -2689,9 +2752,9 @@ def acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
-            nodes.append(Node(run, name, binary, workspace, fixture, helper, module))
+            nodes.append(Node(run, name, binary, workspace, helper, module))
         a, p, b, c, outsider = nodes
-        a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable,
+        a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
@@ -2940,7 +3003,7 @@ def phase4_acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         for name in ("A", "P", "B", "C"):
-            nodes.append(Node(run, name, binary, workspace, None, helper, module))
+            nodes.append(Node(run, name, binary, workspace, helper, module))
         a, p, b, c = nodes
         for node in (a, b, c):
             root = roots[node.name] = run / ("fixture-" + node.name)
@@ -3276,7 +3339,7 @@ def public_entry_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        p = Node(run, "P", binary, workspace, None, helper, module,
+        p = Node(run, "P", binary, workspace, helper, module,
                  init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}"])
         nodes.append(p)
         token = p.directory / "entry-token"
@@ -3288,9 +3351,9 @@ def public_entry_acceptance(options):
         wrong.chmod(0o600)
         fixture = run / "fixture-M"
         fixture.mkdir(mode=0o700)
-        m = Node(run, "M", binary, workspace, None, helper, module, init_args=[
+        m = Node(run, "M", binary, workspace, helper, module, init_args=[
             "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(token)])
-        x = Node(run, "X", binary, workspace, None, helper, module, init_args=[
+        x = Node(run, "X", binary, workspace, helper, module, init_args=[
             "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(wrong)])
         nodes += [m, x]
         for node in (m, x):
@@ -3455,8 +3518,8 @@ def phase5_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        a = Node(run, "A", binary, workspace, None, helper, module)
-        b = Node(run, "B", binary, workspace, None, helper, module)
+        a = Node(run, "A", binary, workspace, helper, module)
+        b = Node(run, "B", binary, workspace, helper, module)
         nodes += [a, b]
         for node in nodes:
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
@@ -3616,7 +3679,6 @@ def auto_route_acceptance(options):
     workspace.mkdir()
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
-    fixture = fixture_wrapper(run, "fixture-manager", "--fixture-manager")
     nodes, clients = [], []
     allowed = "https://client.vibeface.example"
     report = {"status": "running", "source_commit": subprocess.check_output(
@@ -3634,9 +3696,9 @@ def auto_route_acceptance(options):
         print("PASS auto-route " + name, flush=True)
 
     try:
-        target = Node(run, "TARGET", binary, workspace, fixture, helper, module)
+        target = Node(run, "TARGET", binary, workspace, helper, module)
         nodes.append(target)
-        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=sys.executable,
+        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
         target.start()
         network = target.bootstrap()
@@ -3749,7 +3811,7 @@ def auto_route_acceptance(options):
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
 
-        joining = Node(run, "CLI", binary, workspace, fixture, helper, module)
+        joining = Node(run, "CLI", binary, workspace, helper, module)
         nodes.append(joining)
         code = joining.pair(target)
         listed = target.client.call("directory")["view"]["members"]
@@ -3776,7 +3838,7 @@ def auto_route_acceptance(options):
         recovered = fresh(target.url)
         checkpoint = verify_recovery(target, recovered, network)
         passed("root-recovery-keeps-managers", epoch=checkpoint["epoch"])
-        blank = Node(run, "FRESH", binary, workspace, fixture, helper, module)
+        blank = Node(run, "FRESH", binary, workspace, helper, module)
         nodes.append(blank)
         fresh_checkpoint = recover_fresh_node(blank, target.backup, target.backup_password)
         passed("fresh-node-recovery", network=network, epoch=fresh_checkpoint["epoch"])
@@ -3804,9 +3866,7 @@ def auto_route_acceptance(options):
 
 if __name__ == "__main__":
     os.umask(0o077)
-    if "--fixture-manager" in sys.argv:
-        fixture_manager(sys.argv[1:])
-    elif "--fixture-codex" in sys.argv:
+    if "--fixture-codex" in sys.argv:
         fixture_codex(sys.argv[1:])
     else:
         parser = argparse.ArgumentParser(description=__doc__)

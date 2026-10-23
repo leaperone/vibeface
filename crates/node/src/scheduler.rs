@@ -221,6 +221,10 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             materialize(&context, &job, &works, bot, schedule.as_ref(), route, &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
+        if kind == manager::ManagerKind::CodexSdk {
+            // The turn runs on the App Server, which may still be starting with the Node.
+            node.codex.ready().await;
+        }
         let mut config = ManagerConfig {
             custom_tools: tools(job.kind),
             tool_cli: Some(std::env::current_exe()?),
