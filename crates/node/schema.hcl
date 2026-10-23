@@ -817,6 +817,20 @@ table "triage_scans" {
     columns = [column.rollout]
   }
 }
+table "coordination_threads" {
+  schema = schema.main
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  column "created_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.thread_id]
+  }
+}
 table "addresses" {
   schema = schema.main
   column "device_id" {
