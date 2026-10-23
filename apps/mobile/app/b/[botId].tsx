@@ -1,10 +1,12 @@
 import { Link, Stack, useLocalSearchParams } from 'expo-router'
+import { useHeaderHeight } from 'expo-router/react-navigation'
 import { Bot, LoaderCircle } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
-import { FlatList, StyleSheet, View } from 'react-native'
+import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { useUniwind } from 'uniwind'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -52,6 +54,11 @@ export default function ChatScreen() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const workspace = useWorkspace()
   const insets = useSafeAreaInsets()
+  // Only iOS draws the bar over the list; Android's stays opaque above it.
+  const ios = Platform.OS === 'ios'
+  const barHeight = useHeaderHeight()
+  const header = ios ? barHeight : 0
+  const { theme } = useUniwind()
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
@@ -82,8 +89,9 @@ export default function ChatScreen() {
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       // With the edge effects off, the bar keeps its own blur so messages scrolled under it stay behind frosted glass.
-      headerTransparent: true,
-      headerBlurEffect: 'systemChromeMaterial',
+      headerTransparent: ios,
+      // Follows the app's own appearance setting, which the system material does not see.
+      headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild>
         <Button variant="ghost" size="icon" accessibilityLabel="bot 信息"><Icon as={Bot} /></Button>
       </Link>,
@@ -98,10 +106,12 @@ export default function ChatScreen() {
       keyboardShouldPersistTaps="handled"
       renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
       contentContainerClassName="px-4 py-6"
+      // The inverted list's footer is its top: the oldest message starts below the transparent bar.
+      ListFooterComponent={<View style={{ height: header }} />}
       ItemSeparatorComponent={() => <View className="h-6" />}
       renderItem={({ item }) => 'message' in item ? <Message message={item.message} last={item.last} /> : <>{item.node}</>}
     />
-    {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, above]}>
+    {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
         <Icon as={Bot} className="size-8 text-muted-foreground" />
         <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
