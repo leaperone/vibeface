@@ -71,8 +71,11 @@ def wait_for(description, predicate, timeout=35):
 
 
 def private_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + "\n")
-    path.chmod(0o600)
+    """Replaces the file whole, so a reader in another thread or process never sees it half written."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}")
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+        output.write(json.dumps(value, indent=2) + "\n")
+    os.replace(temporary, path)
 
 
 def file_sha256(path):
