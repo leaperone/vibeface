@@ -51,6 +51,9 @@ export function Badge({ count }: { count: number }) {
   </View>
 }
 
+// Hand-spaced so no two read alike; even 45° steps put two pinks next to each other.
+const hues = [8, 32, 52, 100, 160, 200, 235, 280]
+
 /** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
 export function Monogram({ name, seed }: { name: string; seed: string }) {
   const { theme } = useUniwind()
@@ -58,8 +61,7 @@ export function Monogram({ name, seed }: { name: string; seed: string }) {
   let hash = 2166136261
   for (const char of seed) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619)
   hash = (hash ^ (hash >>> 16)) >>> 0
-  // Eight hues 45° apart, so neighbouring bots never land on near-identical tints.
-  const hue = (hash % 8) * 45
+  const hue = hues[hash % hues.length]
   const dark = theme === 'dark'
   return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
     <Text maxFontSizeMultiplier={1} className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
