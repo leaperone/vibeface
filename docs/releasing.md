@@ -12,7 +12,17 @@
 | Linux ARM64 | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 |
 | macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15 ARM64 |
 
-Linux 包依赖 glibc，未在旧版发行版验收。macOS 包没有 Apple 开发者签名或 notarization。根据设备选择包，在存放包的目录先校验再解压：
+Linux 包依赖 glibc，未在旧版发行版验收。扩展检查和 `v*` tag 产出的 macOS 包，`vibeface` 程序使用 Developer ID 签名，启用 hardened runtime，identifier 为 `cn.leaperone.vibeface`，并通过 Apple notarization。macOS 应用防火墙据此放行，安装和更新后不再询问是否接受传入连接。PR 产出的包不含 macOS 平台。本地运行 `scripts/package-node.sh` 时，只有设置 `VIBEFACE_CODESIGN_IDENTITY` 才签名；同时设置 `VIBEFACE_NOTARY_KEY`、`VIBEFACE_NOTARY_KEY_ID` 和 `VIBEFACE_NOTARY_ISSUER` 才提交 notarization，三者须同时设置，状态不是 `Accepted` 时打包失败。裸 Mach-O 无法 staple，首次运行由 Gatekeeper 在线核对公证记录。
+
+macOS 打包需要以下仓库 secrets，缺任何一项时打包失败，不回退为未签名包：
+
+- `MACOS_CERTIFICATE_P12_BASE64`：含私钥的 "Developer ID Application" 证书 `.p12`，base64 编码。
+- `MACOS_CERTIFICATE_PASSWORD`：该 `.p12` 的导出密码。
+- `APPLE_API_KEY_P8_BASE64`：App Store Connect API 密钥 `.p8`，base64 编码。
+- `APPLE_API_KEY_ID`：该 API 密钥的 Key ID。
+- `APPLE_API_ISSUER_ID`：App Store Connect 的 Issuer ID。
+
+根据设备选择包，在存放包的目录先校验再解压：
 
 ```sh
 shasum -a 256 -c vibeface-<version>-<target>.tar.gz.sha256
@@ -77,7 +87,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 匿名 GitHub API 请求被限流时，更新器明确报错并保留现版，自动更新在下轮再次检查。可在更新服务的运行环境提供 `GITHUB_TOKEN` 提高额度；token 只发往 `api.github.com`，不发给下载 CDN，也不写入配置或更新策略。后台服务不保证继承终端的临时环境变量。
 
-更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 开发者签名和 notarization 仍未提供。
+更新器只接受受管安装的 `current` 符号链接，下载对应平台的完整包，核对 SHA256、版本、target、源码身份和存储兼容声明后再安装。包和 checksum 都通过 GitHub HTTPS 下载，这依赖 GitHub 账户、仓库和 TLS 的可信性，不是独立发布签名。macOS 程序另有 Developer ID 签名和 notarization，供系统放行，更新器不校验它们。
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序和随包 sidecar，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。使用 Codex SDK 时，更新器在停服务前按新包的 lock 安装 sidecar 依赖，需要可用的 npm；安装失败保留现版，不复制旧 `node_modules`。Cursor SDK 不需要这一步。
 

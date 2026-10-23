@@ -1,6 +1,6 @@
 # 安装与管理节点
 
-Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 包尚无 Apple 开发者签名或 notarization。
+Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的程序使用 Developer ID 签名并通过 Apple notarization，应用防火墙直接放行，安装和更新后不再询问是否接受传入连接。
 
 ## npm Nightly
 

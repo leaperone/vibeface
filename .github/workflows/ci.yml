@@ -262,6 +262,50 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
+      - name: Import Developer ID signing identity
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [[ -n "${!name}" ]] || { echo "::error::Repository secret $name is required to sign and notarize macOS packages."; exit 1; }
+          done
+          echo "::add-mask::$APPLE_API_KEY_ID"
+          echo "::add-mask::$APPLE_API_ISSUER_ID"
+          keychain="$RUNNER_TEMP/vibeface-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          umask 077
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-signing.p12"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/vibeface-notary.p8"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/vibeface-signing.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/vibeface-signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          existing=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            existing+=("${line//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identities="$(security find-identity -v -p codesigning "$keychain" | grep '"Developer ID Application: ' || true)"
+          [[ -n "$identities" && "$(wc -l <<< "$identities")" -eq 1 ]] || { echo '::error::Expected exactly one Developer ID Application identity in the certificate.'; exit 1; }
+          identity="$(awk '{print $2}' <<< "$identities")"
+          team="$(sed -n 's/.*(\([A-Z0-9]\{10\}\))"$/\1/p' <<< "$identities")"
+          [[ "$identity" =~ ^[0-9A-F]{40}$ && -n "$team" ]] || { echo '::error::Could not resolve the signing identity or team.'; exit 1; }
+          {
+            printf 'VIBEFACE_CODESIGN_IDENTITY=%s\n' "$identity"
+            printf 'VIBEFACE_CODESIGN_TEAM=%s\n' "$team"
+            printf 'VIBEFACE_NOTARY_KEY=%s\n' "$RUNNER_TEMP/vibeface-notary.p8"
+            printf 'VIBEFACE_NOTARY_KEY_ID=%s\n' "$APPLE_API_KEY_ID"
+            printf 'VIBEFACE_NOTARY_ISSUER=%s\n' "$APPLE_API_ISSUER_ID"
+          } >> "$GITHUB_ENV"
       - name: Build native release package
         run: |
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$PACKAGE_TARGET" ]]
@@ -296,6 +340,16 @@ jobs:
           PY
           "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
+      - name: Verify Developer ID signature
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: |
+          codesign --verify --strict "$PACKAGE/vibeface"
+          details="$(codesign -dv "$PACKAGE/vibeface" 2>&1)"
+          grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
+          grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
+          grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
@@ -370,6 +424,11 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
+      - name: Remove signing keychain and notary key
+        if: always() && matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
+          rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
   npm-package:
     needs: [plan, package]
