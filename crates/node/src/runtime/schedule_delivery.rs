@@ -358,8 +358,14 @@ impl Runtime {
     }
 
     /// The user asks this Node, now scheduling the conversation, to reply to messages a former
-    /// owner left unanswered. Nothing replays on its own; a retry queues nothing twice.
-    pub(super) async fn reply_unanswered(&self, access: &Access, input: &Value) -> Result<Value> {
+    /// owner left unanswered, or with `dismiss` to reply to none of them. Nothing replays on its
+    /// own; a retry queues or records nothing twice.
+    pub(super) async fn settle_unanswered(
+        &self,
+        access: &Access,
+        input: &Value,
+        dismiss: bool,
+    ) -> Result<Value> {
         let _work = self.maintenance.enter()?;
         ensure!(access.human, "only the user asks for these replies");
         let network = &access.network_id;
@@ -367,12 +373,14 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         let message_ids: Vec<String> = serde_json::from_value(input["message_ids"].clone())
             .context("message_ids must be a list of message IDs")?;
-        let receipts = self.store.lock().await.reply_unanswered(
-            network,
-            &self.identity.device_id()?,
-            &scope,
-            &message_ids,
-        )?;
+        let local = self.identity.device_id()?;
+        let mut store = self.store.lock().await;
+        let receipts = if dismiss {
+            store.dismiss_unanswered(network, &local, &scope, &message_ids)?
+        } else {
+            store.reply_unanswered(network, &local, &scope, &message_ids)?
+        };
+        drop(store);
         for receipt in &receipts {
             self.publish_changed(network, &scope, Changed::Job(&receipt.trigger));
         }
