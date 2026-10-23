@@ -2108,7 +2108,13 @@ mod tests {
             for (id, server) in [("m1", "own:"), ("m2", "system")] {
                 let (trigger, attempt) = start_reply(&node, &admin, id).await?;
                 let mut store = node.store.lock().await;
-                store.record_manager_turn(&attempt, server, "thread", Some("turn"))?;
+                store.record_manager_turn(
+                    &attempt,
+                    server,
+                    "thread",
+                    Some("turn"),
+                    &Default::default(),
+                )?;
                 let interrupted = crate::scheduling::JobOutcome::Interrupted {
                     detail: "lost".into(),
                     process_unconfirmed: true,

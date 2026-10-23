@@ -66,6 +66,8 @@ pub struct ManagerConfig {
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
+    /// Guidance that holds for the whole Codex thread; see `codex_instructions`.
+    pub instructions: String,
     pub tool_env: BTreeMap<String, String>,
     /// Lets this turn's tool calls act as it; without one they are refused.
     pub tool_token: Option<String>,
@@ -213,15 +215,17 @@ where
     }
 }
 
-/// The tool instructions and catalog ahead of the turn prompt. Codex reaches Node tools through
-/// the CLI in its Shell, whose environment carries this turn's scope.
-fn codex_prompt(
-    prompt: &str,
+/// The developer instructions a Codex thread starts and resumes with: how to reach Node tools,
+/// their catalog, then `instructions`. Codex keeps them with the thread, so turns carry only
+/// their own prompt. Node tools go through the CLI in its Shell, whose environment carries the
+/// turn's scope.
+pub fn codex_instructions(
     tool_cli: Option<&Path>,
     tools: &BTreeMap<String, CustomToolConfig>,
-) -> Result<String> {
+    instructions: &str,
+) -> String {
     let Some(cli) = tool_cli else {
-        return Ok(prompt.into());
+        return instructions.into();
     };
     let executable = format!("'{}'", cli.to_string_lossy().replace('\'', r#"'"'"'"#));
     let with_call_ref = tools
@@ -247,13 +251,13 @@ fn codex_prompt(
         .join("\n\n");
     let host = "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server with `vibeface codex`. When Codex asks something (an approval, a question, a login), `vibeface codex requests` lists the waiting requests and `vibeface codex respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
     let text = format!(
-        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools for this invocation:\n{catalog}\n\n{prompt}"
+        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
-    ensure!(
-        text.len() <= MAX_PROMPT,
-        "management prompt with Node tool instructions exceeded the size limit"
-    );
-    Ok(text)
+    if instructions.is_empty() {
+        text
+    } else {
+        format!("{text}\n\n{instructions}")
+    }
 }
 
 /// Whether an App Server notification is about `turn` of `thread`.
@@ -410,8 +414,6 @@ where
     if *cancel.borrow() {
         return Err(stopped(previous));
     }
-    let text = codex_prompt(prompt, config.tool_cli.as_deref(), &config.custom_tools)
-        .map_err(|e| failed(previous, e.to_string()))?;
     let mut session = DirectSession::connect(socket)
         .await
         .map_err(|e| failed(previous, format!("Codex App Server: {}", e.message)))?;
@@ -423,6 +425,15 @@ where
         "sandbox":"danger-full-access","config":{"shell_environment_policy.set":env,"web_search":"live"}});
     if !config.model.is_empty() {
         thread_params["model"] = json!(config.model);
+    }
+    // Resuming sends them again: a thread Codex reloads rebuilds its context from them.
+    let instructions = codex_instructions(
+        config.tool_cli.as_deref(),
+        &config.custom_tools,
+        &config.instructions,
+    );
+    if !instructions.is_empty() {
+        thread_params["developerInstructions"] = json!(instructions);
     }
     let resumed = match previous {
         Some(id) => {
@@ -472,7 +483,7 @@ where
         None => uuid::Uuid::new_v4().to_string(),
     };
     let mut turn_params = json!({"threadId":thread,"clientUserMessageId":client_id,
-        "input":[{"type":"text","text":text,"text_elements":[]}]});
+        "input":[{"type":"text","text":prompt,"text_elements":[]}]});
     if !config.model.is_empty() {
         turn_params["model"] = json!(config.model);
     }
@@ -703,6 +714,7 @@ mod tests {
             timeout_secs: 5,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
+            instructions: String::new(),
             tool_env: BTreeMap::new(),
             tool_token: None,
             provider_env: BTreeMap::new(),
@@ -842,6 +854,9 @@ mod tests {
         let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = recorded.clone();
         let config = ManagerConfig {
+            model: "gpt-fixture".into(),
+            tool_cli: Some("/opt/vibeface".into()),
+            instructions: "fixed-thread-guide".into(),
             tool_token: Some("turn-token-secret".into()),
             codex_turn: Some(CodexTurn {
                 client_id: "attempt-1".into(),
@@ -886,9 +901,15 @@ mod tests {
             started[0]["config"]["shell_environment_policy.set"]["VIBEFACE_TOOL_TOKEN"],
             "turn-token-secret"
         );
+        let guide = started[0]["developerInstructions"].as_str().unwrap();
+        assert!(guide.contains("'/opt/vibeface' tool TOOL_NAME"));
+        assert!(guide.ends_with("fixed-thread-guide"));
+        let turn = &fake.calls("turn/start")[0];
+        assert_eq!(turn["clientUserMessageId"], "attempt-1");
+        assert_eq!(turn["model"], "gpt-fixture");
         assert_eq!(
-            fake.calls("turn/start")[0]["clientUserMessageId"],
-            "attempt-1"
+            turn["input"][0]["text"], "fixture",
+            "the turn carries only its own prompt"
         );
         let shown = serde_json::to_string(&*shown.lock().unwrap()).unwrap();
         assert!(shown.contains("hello") && shown.contains("\"command\""));

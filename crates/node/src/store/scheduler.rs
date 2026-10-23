@@ -178,7 +178,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     Ok(())
 }
 
-const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token";
+const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown";
 
 fn query_sessions(
     connection: &Connection,
@@ -201,15 +201,18 @@ fn query_sessions(
                     owner_epoch: r.get(5)?,
                     sdk_config: r.get(6)?,
                     permission_version: r.get(7)?,
+                    shown: Default::default(),
                 },
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(session, covers)| {
+        .map(|(session, covers, shown)| {
             Ok(SchedulerSession {
                 covers: serde_json::from_str(&covers)?,
+                shown: serde_json::from_str(&shown)?,
                 ..session
             })
         })
@@ -227,7 +230,7 @@ fn load_session(connection: &Connection, conversation: &str) -> Result<Scheduler
 fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?)"
         ),
         params![
             session.conversation_id,
@@ -239,6 +242,7 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
             session.sdk_config,
             session.permission_version,
             session.native_token,
+            serde_json::to_string(&session.shown)?,
         ],
     )?;
     Ok(())
@@ -1292,6 +1296,7 @@ impl Store {
             session.native_id = None;
             session.native_token = None;
             session.covers.clear();
+            session.shown = Shown::default();
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
@@ -1310,6 +1315,10 @@ impl Store {
         let covers = resumable
             .then(|| session.covers.clone())
             .filter(|covers| !covers.is_empty());
+        let shown = match covers {
+            Some(_) => session.shown.clone(),
+            None => Shown::default(),
+        };
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1326,6 +1335,7 @@ impl Store {
             previous_native_id,
             previous_token,
             covers,
+            shown,
         }))
     }
 
@@ -1392,6 +1402,7 @@ impl Store {
             if job.kind != TriggerKind::AgentTask {
                 if session.native_id.as_deref() != Some(native_id) {
                     session.covers.clear();
+                    session.shown = Shown::default();
                 }
                 session.native_id = Some(native_id.into());
                 session.native_token = Some(token.into());
@@ -1618,14 +1629,15 @@ impl Store {
     }
 
     /// The App Server turn of a reply, recorded before `turn/start` with its thread only and
-    /// again once the turn is known. Only a started turn has shown the thread the reply's basis;
-    /// a refused `turn/start` leaves its messages for the next turn.
+    /// again once the turn is known. Only a started turn has shown the thread the reply's basis
+    /// and `shown`; a refused `turn/start` leaves them for the next turn.
     pub fn record_manager_turn(
         &mut self,
         attempt_id: &str,
         server: &str,
         thread_id: &str,
         turn_id: Option<&str>,
+        shown: &Shown,
     ) -> Result<()> {
         let tx = self
             .connection
@@ -1641,6 +1653,7 @@ impl Store {
             let mut session = load_session(&tx, &job.conversation_id)?;
             if session.native_id.as_deref() == Some(thread_id) {
                 session.covers = job.basis;
+                session.shown = shown.clone();
                 save_session(&tx, &session)?;
             }
         }
