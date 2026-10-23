@@ -67,3 +67,14 @@ test('a reply follows the message it answers when the next message was sent befo
   ]
   assert.deepEqual(threadReplies(rows).map((row) => row.message_id), ['a', 'ra', 'b', 'rb', 'answer'])
 })
+test('a message that joined the running reply sits before that reply', () => {
+  const rows = [
+    { message_id: 'a', role: 'user' },
+    { message_id: 'j1', role: 'user' },
+    { message_id: 'j2', role: 'user' },
+    { message_id: 'ra', role: 'assistant', in_reply_to: 'a' },
+    { message_id: 'b', role: 'user' },
+    { message_id: 'rb', role: 'assistant', in_reply_to: 'b' },
+  ]
+  assert.deepEqual(threadReplies(rows, new Set(['j1', 'j2'])).map((row) => row.message_id), ['a', 'j1', 'j2', 'ra', 'b', 'rb'])
+})

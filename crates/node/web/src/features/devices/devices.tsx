@@ -47,10 +47,10 @@ function Tag({ children }: { children: ReactNode }) {
   return <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
-/** `compact`: the dot alone, for the list where every row would repeat the word. */
+/** `compact`: the list names only the exception, so an online row shows the dot alone. */
 function Online({ online, compact = false }: { online: boolean; compact?: boolean }) {
-  return <span title={compact ? (online ? "在线" : "离线") : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
-    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && "sr-only")}>{online ? "在线" : "离线"}</span>
+  return <span title={compact && online ? "在线" : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
+    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && online && "sr-only")}>{online ? "在线" : "离线"}</span>
   </span>
 }
 
