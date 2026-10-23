@@ -9,7 +9,7 @@ import { localBrowserEntry } from '@/lib/local-access'
 import { parseChanged } from '@/lib/progress'
 import type { ChangedEvent } from '@/lib/progress'
 import type { AuthenticationTrust } from '@/lib/secure'
-import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } from '@/lib/secure'
+import { Identity, createGenesis, downloadPackage, governancePayload, inviteSigningPayload, joinCommit, openPackage, recoveryCode, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } from '@/lib/secure'
 import { nextLink } from '@/lib/link'
 import type { Link, LinkEvent } from '@/lib/link'
 import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '@/lib/entrances'
@@ -43,7 +43,9 @@ type DeviceContextValue = {
   link: Link; entrances: OpenEntrance[]; tabs: Tabs
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
-  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
+  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null
+  /** When the Node first saw the current recovery key, if it knows. */
+  recoverySince: number | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
@@ -58,6 +60,7 @@ type DeviceContextValue = {
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 class AuthenticationError extends Error {}
+const sinceOf = (response: Record<string, unknown>) => typeof response.recovery_since_ms === 'number' ? response.recovery_since_ms : null
 const INVITE_TTL_MS = 10 * 60 * 1000
 /** Not an error: the entry buttons below it are the way in. */
 export const NOT_JOINED = '这个浏览器还没加入'
@@ -149,6 +152,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   const [entry, setEntry] = useState<ConnectionEntry | null>(null)
   const [info, setInfo] = useState<EntryInfo | null>(null)
   const [directory, setDirectory] = useState<MembershipView | null>(null)
+  const [recoverySince, setRecoverySince] = useState<number | null>(null)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
@@ -275,7 +279,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       isCurrent: () => session.current === active && generation.current === active.generation,
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
-    setDirectory(view); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
+    setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
     if (principal.source === 'membership') void refreshEntrances(active, view)
@@ -494,7 +498,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const me = own().deviceId
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    setDirectory(view); setJoins(pending)
+    setDirectory(view); setRecoverySince(sinceOf(response)); setJoins(pending)
   }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
@@ -673,11 +677,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       genesis = JSON.parse(createGenesis(root, JSON.stringify({ device_id: own().deviceId, kind: 'client', name, manage: true }), JSON.stringify({ device_id: active.info.device_id, kind: 'node', name: nodeName ? deviceName(nodeName) : active.info.name, manage: false })))
       recovery = sealPackage({ networkId, genesis, checkpoints: [] }, root, password)
     } finally { root.free(); password = '' }
+    const code = await recoveryCode(networkId)
     if (session.current !== active) { recovery.fill(0); throw changed() }
     let downloaded = false, cancelled = false
     const flow: Sensitive = {
       cancel() { cancelled = true; recovery.fill(0) },
-      download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery); downloaded = true },
+      download() { if (cancelled || session.current !== active) throw changed(); downloadPackage(recovery, code); downloaded = true },
       async bootstrap(saved) {
         if (!saved || !downloaded) throw new Error('请先下载恢复文件，并确认已妥善保存。')
         if (cancelled || session.current !== active) throw changed()
@@ -764,10 +769,12 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
             selected.push(newManager)
             const next = Identity.generate()
             try {
+              const code = await recoveryCode(next.deviceId())
+              if (released || session.current !== active) throw new Error('恢复文件已关闭，请重新选择。')
               const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
               const checkpoints = [...chain, checkpoint]
               const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints }, next, password)
-              try { downloadPackage(bytes) } finally { bytes.fill(0) }
+              try { downloadPackage(bytes, code) } finally { bytes.fill(0) }
               prepared = { checkpoints, checkpoint }
             } finally { next.free() }
             password = ''
@@ -801,10 +808,11 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
       const next = Identity.generate()
       let checkpoints: unknown[]
       try {
+        const code = await recoveryCode(next.deviceId())
         const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, next.deviceId()))
         checkpoints = [...array(state.checkpoints), checkpoint]
         const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints }, next, password)
-        try { downloadPackage(bytes) } finally { bytes.fill(0) }
+        try { downloadPackage(bytes, code) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
       await connection.request('recover', { genesis: state.genesis, checkpoints })
       await refreshDirectory()
@@ -922,7 +930,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
   }, [ready])
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
-    identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
