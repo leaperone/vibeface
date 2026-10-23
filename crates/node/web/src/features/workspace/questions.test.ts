@@ -56,9 +56,9 @@ test("an answer is signed as one message per question, for its chat or for sessi
   assert.equal(answerScope({ conversation_id: null }), "sessions")
 })
 
-test("待处理 lists exactly the unanswered questions, newest first", () => {
-  const questions = parseQuestions({ questions: [row("old", 1), row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("new", 2)] })
-  assert.deepEqual(openQuestions(questions).map((question) => question.question_id), ["new", "old"])
+test("待处理 lists exactly the unanswered questions, urgent first, then newest first", () => {
+  const questions = parseQuestions({ questions: [row("old", 1), row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("new", 2), row("urgent", 0, { severity: "urgent" })] })
+  assert.deepEqual(openQuestions(questions).map((question) => question.question_id), ["urgent", "new", "old"])
 })
 
 test("an answer folds into its question instead of showing as a message", () => {
