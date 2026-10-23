@@ -33,7 +33,7 @@ export function useInbox(): InboxItem[] {
   })
   for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", meta: check.title || undefined, to: "/inbox", kind: "confirm", check })
   const checks = data?.checks.length ?? 0
-  if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件事需要确认` : "需要确认", meta: bot?.name, to: chat, kind: "confirm" })
+  if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件待确认` : "待确认", meta: bot?.name, to: chat, kind: "confirm" })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   for (const join of joins) items.push({ key: `join:${join.join_id}`, icon: MonitorSmartphone, title: `${join.name || "新设备"} 想加入`, to: "/devices", kind: "join", join })
   for (const note of workspace.notifications) {

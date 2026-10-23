@@ -537,13 +537,14 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   } finally { app.close() }
 })
 
-test("any entrance stops an unfinished task once, even on another device", async () => {
+test("any entrance stops an unfinished task once, after a confirming second tap, even on another device", async () => {
   const stopped: string[] = []
-  const data = { local_node: 'worker', works: [] as unknown[] }
+  const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
+  const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
     const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
     data.works = [{ ...work, state: 'unverified' }]
@@ -551,6 +552,9 @@ test("any entrance stops an unfinished task once, even on another device", async
     data.works = [{ ...work, target_node: 'other', stop: 'stop_waiting' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined, "a stop already on its way is not sent twice")
     data.works = [{ ...work, target_node: 'other' }]
+    const first = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.equal(stop(first), undefined, 'one tap never stops a task')
+    ;(ask(first)?.props.onClick as () => void)()
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work'])
@@ -560,9 +564,10 @@ test("any entrance stops an unfinished task once, even on another device", async
     const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.match(words(elements), /会一起停止/, 'a shared turn lists what stops with it')
     assert.match(words(elements), /一起停止 2 个任务/)
-    ;(stop(elements)?.props.onClick as () => void)()
+    ;(ask(elements)?.props.onClick as () => void)()
+    ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
-    assert.deepEqual(stopped, ['work', 'work'], 'the button already names the count, so one tap stops')
+    assert.deepEqual(stopped, ['work', 'work'], 'the count is named before the confirming tap stops them all')
   } finally { app.close() }
 })
 

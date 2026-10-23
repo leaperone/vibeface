@@ -1,5 +1,5 @@
 import {
-  Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Inbox,
+  Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
   Laptop, Link, ListChecks, Lock, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
   Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
@@ -25,7 +25,8 @@ export const terms = {
   bot: { label: "Bot", icon: Bot },
   ai: { label: "AI", icon: Sparkles },
   task: { label: "任务", icon: ListChecks },
-  confirm: { label: "需要确认", icon: CircleQuestionMark },
+  approval: { label: "需要你同意", icon: Hand },
+  confirm: { label: "待确认", icon: CircleQuestionMark },
   inbox: { label: "待处理", icon: Inbox },
   folders: { label: "可用文件夹", icon: FolderOpen },
   readOnly: { label: "只读", icon: Lock },

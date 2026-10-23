@@ -1,4 +1,4 @@
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
 import { Link2, ListChecks, RotateCw, Square, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
@@ -8,9 +8,10 @@ import { humanError, rawError } from "@/lib/errors"
 import { useWorkspace } from "./context"
 import { confirmReason } from "./model"
 import { confirmText } from "./task-activity"
+import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "./labels"
 
-const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 /** /b/:botId/work/:workId — desktop side panel beside the chat, full screen on phones. */
 export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
@@ -19,7 +20,11 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
   const work = workspace.data?.works.find((item) => item.work_id === workId)
-  const state = work ? shownState(work, workspace.nodes) : ""
+  // A running turn held on an approval reads as 需要你同意, as in the chat, and the question is answered right here.
+  const asking = work?.thread_id ? workspace.data?.questions.find((question) => !question.answer && question.about.request_id && question.about.session_id === work.thread_id) : undefined
+  const shown = work ? shownState(work, workspace.nodes) : ""
+  const state = shown === "running" && asking ? "waiting" : shown
+  const [confirming, setConfirming] = useState(false)
   const device = work?.target_node ?? ""
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   // Any entry forwards the stop; an unreachable device gets it when it is back.
@@ -53,8 +58,13 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。</p> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
+      {asking ? <QuestionCard question={asking} /> : null}
       {stop ? <div className="grid gap-2">
-        <Button type="button" variant="destructive" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop)}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>
+        {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="destructive" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>
+          <Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => setConfirming(false)}>取消</Button>
+          <span className="text-meta text-muted-foreground">停下后不会自动接着做</span>
+        </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><Square aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
       {["failed", "interrupted", "rejected"].includes(state) ? <div className="grid gap-2">
