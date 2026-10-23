@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning, Send } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send } from 'lucide-react'
 import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -38,6 +38,7 @@ export function ConversationScreen() {
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
+  const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
@@ -136,6 +137,9 @@ export function ConversationScreen() {
     </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
     ownerAway && owner ? <ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`} actions={
       <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
+    } /> : null,
+    unanswered.length ? <ActionCard key="unanswered" icon={MessageSquareReply} title={`${unanswered.length} 条未回复，在这台设备回复？`} actions={
+      <ActionButton variant="default" disabled={!workspace.writable || !agentReady} action={() => workspace.replyUnanswered(unanswered)}>回复</ActionButton>
     } /> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)

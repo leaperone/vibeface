@@ -469,10 +469,14 @@ fn hand_off_from(connection: &Connection, network: &str, conversation: &str) -> 
     Ok(())
 }
 
-fn reply_message_id(conversation: &str, trigger: &str) -> String {
+/// A new owner answering a message the old one left unanswered writes its own reply, beside any
+/// status reply the old owner already wrote.
+fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
     format!(
         "reply-{}",
-        crate::crypto::digest(&serde_json::to_vec(&(conversation, trigger)).expect("strings"))
+        crate::crypto::digest(
+            &serde_json::to_vec(&(conversation, trigger, owner_epoch)).expect("strings")
+        )
     )
 }
 
@@ -504,7 +508,11 @@ pub(crate) fn admit_from(
         sequence: session.next_sequence,
         basis: log::version_vector_from(connection, network)?,
         reply_to: reply_to.into(),
-        message_id: reply_message_id(conversation, trigger),
+        message_id: reply_message_id(
+            conversation,
+            trigger,
+            conversation_from(connection, network, conversation)?.map_or(0, |c| c.owner_epoch),
+        ),
         state: if deleted {
             JobState::Cancelled {
                 attempt: None,
@@ -552,6 +560,88 @@ impl Store {
         tx.commit()?;
         Ok(true)
     }
+
+    /// The user messages of a conversation this Node schedules that no device answered, in
+    /// conversation order: no completed reply, not answered inside a reply they were steered
+    /// into, and no turn here. A former owner left them; only the user starts them again.
+    pub fn unanswered_messages(
+        &self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+    ) -> Result<Vec<String>> {
+        Ok(
+            unanswered_from(&self.connection, network, local, conversation)?
+                .into_iter()
+                .map(|(message_id, _)| message_id)
+                .collect(),
+        )
+    }
+
+    /// Queues a reply here to each of `message_ids` that is still unanswered. A retry finds them
+    /// queued and admits nothing again.
+    pub fn reply_unanswered(
+        &mut self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<AdmissionReceipt>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut receipts = Vec::new();
+        for (message_id, answers) in unanswered_from(&tx, network, local, conversation)? {
+            if !message_ids.contains(&message_id) {
+                continue;
+            }
+            let kind = match answers {
+                Some(_) => TriggerKind::Answer,
+                None => TriggerKind::Human,
+            };
+            receipts.push(admit_from(
+                &tx,
+                network,
+                conversation,
+                &message_trigger(&message_id),
+                kind,
+                &message_id,
+            )?);
+        }
+        tx.commit()?;
+        Ok(receipts)
+    }
+}
+
+/// `(message_id, answers)` of each unanswered user message; see `Store::unanswered_messages`.
+fn unanswered_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    conversation: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
+    if owner.as_deref() != Some(local)
+        || super::bots::bot_deleted_from(connection, network, conversation)?
+    {
+        return Ok(vec![]);
+    }
+    let mut statement = connection.prepare(
+        "SELECT m.message_id,m.answers FROM messages m
+        WHERE m.network_id=?1 AND m.conversation_id=?2 AND m.role='user' AND m.steered_into IS NULL
+        AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.network_id=?1 AND r.conversation_id=?2
+            AND r.in_reply_to=m.message_id AND r.status='completed')
+        AND NOT EXISTS(SELECT 1 FROM scheduler_jobs j WHERE j.conversation_id=?2
+            AND j.trigger='message:'||m.message_id)
+        AND NOT EXISTS(SELECT 1 FROM scheduler_outbox o WHERE o.conversation_id=?2
+            AND o.trigger='message:'||m.message_id)
+        ORDER BY m.rank",
+    )?;
+    Ok(statement
+        .query_map(params![network, conversation], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The enabled schedule a schedule job runs, if it still belongs to the job's conversation.
@@ -1739,9 +1829,12 @@ impl Store {
     }
 
     /// Moves a steering message on: back to the queue when nothing reached the turn, steered,
-    /// or still steering with its updated wait clocks. Anything else is left.
+    /// or still steering with its updated wait clocks. Anything else is left. An answered steer
+    /// is recorded in the conversation, so a later owner does not count the message unanswered.
     pub fn settle_steer(
         &mut self,
+        identity: &LocalIdentity,
+        network: &str,
         conversation: &str,
         trigger: &str,
         next: JobState,
@@ -1759,6 +1852,32 @@ impl Store {
         let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
         if !matches!(job.state, JobState::Steering { .. }) {
             return Ok(());
+        }
+        if let JobState::Steered {
+            into,
+            outcome: SteerOutcome::Answered,
+        } = &next
+        {
+            let host = query_jobs(
+                &tx,
+                "conversation_id=? AND attempt_id=?",
+                params![conversation, into.attempt_id],
+            )?
+            .pop()
+            .context("steered reply missing")?;
+            log::append_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                conversation,
+                EventBody::MessageSteered {
+                    message_id: job.reply_to.clone(),
+                    reply: host.message_id,
+                },
+                vec![],
+                crate::runtime::now_ms(),
+            )?;
         }
         job.state = next;
         save_job(&tx, &job)?;

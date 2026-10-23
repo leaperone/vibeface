@@ -172,6 +172,12 @@ pub(crate) fn apply(
                 notify(connection, network, hash, scope, kind, body, rank)?;
             }
         }
+        EventBody::MessageSteered { message_id, reply } => {
+            connection.execute(
+                "UPDATE messages SET steered_into=? WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
+                params![reply, network, scope, message_id],
+            )?;
+        }
         EventBody::WorkDispatched { work_id, .. } => {
             connection.execute(
                 "INSERT INTO works(network_id,work_id,conversation_id,target_node,dispatch,dispatch_rank) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,work_id) DO UPDATE SET target_node=excluded.target_node,dispatch=excluded.dispatch,dispatch_rank=excluded.dispatch_rank WHERE dispatch_rank IS NULL OR excluded.dispatch_rank<dispatch_rank",

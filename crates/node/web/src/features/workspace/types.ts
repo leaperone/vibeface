@@ -52,6 +52,8 @@ export type ManagerJob = {
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
+  unanswered: string[]
   provider?: string
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
@@ -82,6 +84,7 @@ export type ConversationRecords = {
   deliveries: unknown[]
   checks: CoordinationCheck[]
   jobs: ManagerJob[]
+  unanswered: string[]
   sent: SentBotMessage[]
 }
 /**

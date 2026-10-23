@@ -644,7 +644,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     assert!(begin(&mut store, &m2)?);
     assert!(!begin(&mut store, &m2)?);
     assert!(candidates(&store)?.is_empty());
-    store.settle_steer("c", &m2, JobState::Queued)?;
+    store.settle_steer(&net.a, &net.network, "c", &m2, JobState::Queued)?;
     assert_eq!(
         store.scheduler_job("c", &m2)?.context("job")?.state,
         JobState::Queued
@@ -676,15 +676,15 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         unread_since_ms: Some(7),
         running_since_ms: Some(6),
     };
-    store.settle_steer("c", &m2, unread.clone())?;
+    store.settle_steer(&net.a, &net.network, "c", &m2, unread.clone())?;
     assert_eq!(store.scheduler_job("c", &m2)?.context("job")?.state, unread);
     let answered = JobState::Steered {
         into: into.clone(),
         outcome: SteerOutcome::Answered,
     };
-    store.settle_steer("c", &m2, answered.clone())?;
+    store.settle_steer(&net.a, &net.network, "c", &m2, answered.clone())?;
     // Only an unsettled steer settles.
-    store.settle_steer("c", &m2, JobState::Queued)?;
+    store.settle_steer(&net.a, &net.network, "c", &m2, JobState::Queued)?;
     let steered = store.scheduler_job("c", &m2)?.context("job")?;
     assert_eq!(steered.state, answered);
     assert!(
@@ -4009,6 +4009,141 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     );
     store.fence_moved_turns(&net.network, &local)?;
     assert_eq!(handed(&store)?, [trigger]);
+    Ok(())
+}
+
+/// After a move the new owner lists what the old one left unanswered, a stopped reply and a
+/// message still queued there, but not one answered inside the reply it was steered into. Only
+/// the user's request queues them, once, with replies of the new owner's own.
+#[test]
+fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> {
+    let net = net()?;
+    let mut a_side = store(&net)?;
+    conversation(&mut a_side, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut a_side, &net, "m1", true)?;
+    let first = a_side
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (t1, a1) = (
+        first.job.trigger.clone(),
+        first.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    a_side.mark_started("c", &t1, &a1)?;
+    a_side.record_manager_turn(&a1, "system", "thread", Some("turn"), &Default::default())?;
+    say(&mut a_side, &net, "m2", true)?;
+    let into = a_side
+        .steer_candidates(&net.network, &local, "boot")?
+        .pop()
+        .context("steer candidate")?
+        .into;
+    let m2 = message_trigger("m2");
+    assert!(a_side.begin_steer(&net.network, &local, "boot", "c", &m2, &into)?);
+    a_side.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &t1,
+        &a1,
+        JobOutcome::Completed,
+        "both",
+        3,
+    )?;
+    let answered = JobState::Steered {
+        into,
+        outcome: SteerOutcome::Answered,
+    };
+    a_side.settle_steer(&net.a, &net.network, "c", &m2, answered.clone())?;
+    a_side.settle_steer(&net.a, &net.network, "c", &m2, answered)?;
+    let markers: i64 = a_side.connection.query_row(
+        "SELECT count(*) FROM events WHERE instr(envelope,'message_steered')>0",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(markers, 1, "a settled steer is recorded once");
+    say(&mut a_side, &net, "m3", true)?;
+    let third = a_side
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (t3, a3) = (
+        third.job.trigger.clone(),
+        third.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    a_side.mark_started("c", &t3, &a3)?;
+    a_side.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &t3,
+        &a3,
+        JobOutcome::Cancelled("stopped".into()),
+        "",
+        4,
+    )?;
+    say(&mut a_side, &net, "m4", true)?;
+    assert!(
+        a_side
+            .unanswered_messages(&net.network, &local, "c")?
+            .is_empty()
+    );
+
+    // The old owner is offline: nothing it holds is handed on.
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        5,
+    )?;
+    let b = net.b.device_id()?;
+    assert_eq!(
+        b_side.unanswered_messages(&net.network, &b, "c")?,
+        ["m3", "m4"]
+    );
+    sync(&b_side, &mut a_side, &net)?;
+    assert!(
+        a_side
+            .unanswered_messages(&net.network, &local, "c")?
+            .is_empty()
+    );
+
+    let asked: Vec<String> = ["m1", "m2", "m3", "m4"].map(String::from).into();
+    let receipts = b_side.reply_unanswered(&net.network, &b, "c", &asked)?;
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.trigger.as_str(), r.state.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (message_trigger("m3").as_str(), "queued"),
+            (message_trigger("m4").as_str(), "queued"),
+        ]
+    );
+    let stopped = a_side
+        .scheduler_job("c", &t3)?
+        .context("old job")?
+        .message_id;
+    assert!(b_side.message(&net.network, "c", &stopped)?.is_some());
+    let retried = b_side.scheduler_job("c", &t3)?.context("new job")?;
+    assert_ne!(retried.message_id, stopped);
+    assert!(
+        b_side
+            .message(&net.network, "c", &retried.message_id)?
+            .is_none()
+    );
+    assert!(
+        b_side
+            .reply_unanswered(&net.network, &b, "c", &asked)?
+            .is_empty()
+    );
+    assert!(
+        b_side
+            .unanswered_messages(&net.network, &b, "c")?
+            .is_empty()
+    );
     Ok(())
 }
 
