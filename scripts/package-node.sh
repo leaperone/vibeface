@@ -27,6 +27,19 @@ while (($#)); do
   esac
 done
 
+notary_vars=0
+for var in VIBEFACE_NOTARY_KEY VIBEFACE_NOTARY_KEY_ID VIBEFACE_NOTARY_ISSUER; do
+  if [[ -n "${!var:-}" ]]; then notary_vars=$((notary_vars + 1)); fi
+done
+if ((notary_vars != 0 && notary_vars != 3)); then
+  echo 'Set all of VIBEFACE_NOTARY_KEY, VIBEFACE_NOTARY_KEY_ID and VIBEFACE_NOTARY_ISSUER, or none.' >&2
+  exit 1
+fi
+if ((notary_vars == 3)) && [[ -z "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
+  echo 'Notarization needs VIBEFACE_CODESIGN_IDENTITY.' >&2
+  exit 1
+fi
+
 cd "$repo"
 build_args=(build --release -p vibeface --locked)
 target_dir="${CARGO_TARGET_DIR:-$repo/target}"
@@ -64,6 +77,26 @@ name="vibeface-$version-$target"
 package="$staging/$name"
 mkdir -p "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
+if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
+  codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$VIBEFACE_CODESIGN_IDENTITY" "$package/vibeface"
+  codesign --verify --strict "$package/vibeface"
+  if ((notary_vars == 3)); then
+    notary="$(mktemp -d)"
+    trap 'rm -rf "$staging" "$notary"' EXIT
+    ditto -c -k --keepParent "$package/vibeface" "$notary/vibeface.zip"
+    xcrun notarytool submit "$notary/vibeface.zip" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" --wait --timeout 30m --output-format json > "$notary/result.json" || true
+    submission='' status=''
+    read -r submission status < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r.get("id", ""), r.get("status", ""))' "$notary/result.json" 2> /dev/null) || true
+    if [[ "$status" != 'Accepted' ]]; then
+      printf 'Notarization %s: %s\n' "${submission:-failed}" "${status:-unknown}" >&2
+      cat "$notary/result.json" >&2
+      if [[ -n "$submission" ]]; then
+        xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" >&2 || true
+      fi
+      exit 1
+    fi
+  fi
+fi
 data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
 update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
 [[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/node/src/config.rs' >&2; exit 1; }
