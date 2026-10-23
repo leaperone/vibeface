@@ -1290,7 +1290,10 @@ impl Store {
                 .all(|(author, seq)| job.basis.get(author).is_some_and(|have| have >= seq));
         let previous_native_id = resumable.then(|| session.native_id.clone()).flatten();
         let previous_token = resumable.then(|| session.native_token.clone()).flatten();
-        let covers = resumable.then(|| session.covers.clone());
+        // A thread that never started a turn has seen nothing: the prompt carries the context.
+        let covers = resumable
+            .then(|| session.covers.clone())
+            .filter(|covers| !covers.is_empty());
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1359,6 +1362,7 @@ impl Store {
         attempt_id: &str,
         native_id: &str,
         token: &str,
+        sent: bool,
     ) -> Result<()> {
         self.update_attempt(conversation, trigger, attempt_id, |job, session| {
             ensure!(
@@ -1370,9 +1374,14 @@ impl Store {
             );
             job.state.attempt().context("scheduler attempt missing")?;
             if job.kind != TriggerKind::AgentTask {
+                if session.native_id.as_deref() != Some(native_id) {
+                    session.covers.clear();
+                }
                 session.native_id = Some(native_id.into());
                 session.native_token = Some(token.into());
-                session.covers = job.basis.clone();
+                if sent {
+                    session.covers = job.basis.clone();
+                }
             }
             Ok(())
         })?;
@@ -1583,17 +1592,32 @@ impl Store {
     }
 
     /// The App Server turn of a reply, recorded before `turn/start` with its thread only and
-    /// again once the turn is known.
+    /// again once the turn is known. Only a started turn has shown the thread the reply's basis;
+    /// a refused `turn/start` leaves its messages for the next turn.
     pub fn record_manager_turn(
         &mut self,
         attempt_id: &str,
         thread_id: &str,
         turn_id: Option<&str>,
     ) -> Result<()> {
-        self.connection.execute(
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT OR REPLACE INTO manager_turns(attempt_id,thread_id,turn_id) VALUES(?,?,?)",
             params![attempt_id, thread_id, turn_id],
         )?;
+        if turn_id.is_some()
+            && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
+            && job.kind != TriggerKind::AgentTask
+        {
+            let mut session = load_session(&tx, &job.conversation_id)?;
+            if session.native_id.as_deref() == Some(thread_id) {
+                session.covers = job.basis;
+                save_session(&tx, &session)?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

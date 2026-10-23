@@ -279,6 +279,9 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     &persist_attempt,
                     &id,
                     &persist_token,
+                    // Cursor sends the prompt right after this; a Codex thread has seen it only
+                    // once its turn starts, which the turn recorder marks.
+                    kind == manager::ManagerKind::CursorSdk,
                 )
             },
             cancel,
