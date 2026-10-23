@@ -137,12 +137,10 @@ check_archive() {
 verify_package() {
   local package="$1" version="$2" target="$3" commit="$4" scratch="$5" entry
   for entry in vibeface BUILD-INFO.json README.md RUNTIME-REQUIREMENTS.md \
-    sidecars/package.json sidecars/package-lock.json sidecars/codex-manager.mjs \
     scripts/install-node-service.sh docs/node.md docs/releasing.md \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     [[ -f "$package/$entry" && -s "$package/$entry" ]] || fail "package is missing $entry"
   done
-  [[ ! -e "$package/sidecars/node_modules" ]] || fail 'package contains generated SDK dependencies'
   json_fields "$package/BUILD-INFO.json" object > "$scratch/build-fields" || fail 'invalid BUILD-INFO.json'
   awk -F '\t' -v version="$version" -v target="$target" -v commit="$commit" '
     { info[$2]=$3 }
@@ -319,8 +317,7 @@ JSON
   package="vibeface-$version-$target"
   mkdir -p "$fixture/source/$package"
   local entry
-  for entry in README.md RUNTIME-REQUIREMENTS.md sidecars/package.json sidecars/package-lock.json \
-    sidecars/codex-manager.mjs scripts/install-node-service.sh docs/node.md docs/releasing.md \
+  for entry in README.md RUNTIME-REQUIREMENTS.md scripts/install-node-service.sh docs/node.md docs/releasing.md \
     web/vibeface_secure.js web/vibeface_secure_bg.wasm; do
     mkdir -p "$fixture/source/$package/$(dirname "$entry")"
     printf 'test fixture\n' > "$fixture/source/$package/$entry"

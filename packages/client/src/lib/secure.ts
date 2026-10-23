@@ -89,7 +89,16 @@ export function secureKit(secure: SecureApi) {
 }
 
 export function passphrase(password: string, confirmation: string): string {
-  if ([...password].length < 12 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 12 个字符。')
+  if ([...password].length < 8 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 8 个字符。')
   if (password !== confirmation) throw new Error('两次密码不一样。')
   return password
 }
+/** The code a person matches between the settings page and a file name; never the key itself. */
+export async function recoveryCode(recoveryKey: string): Promise<string> {
+  const key = Uint8Array.from(recoveryKey.match(/../g) ?? [], (pair) => parseInt(pair, 16))
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', key)).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, '0')).join('').toUpperCase()
+}
+/** The recovery file's name stem: the code people match against the file they kept. */
+export const recoveryFileStem = (code: string) => `vibeface-recovery-${code}`
+/** The name a new recovery file is saved under. */
+export const recoveryFileName = (code: string) => `${recoveryFileStem(code)}-${new Date().toLocaleDateString('sv')}.json`

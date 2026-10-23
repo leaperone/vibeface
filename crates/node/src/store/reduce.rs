@@ -48,11 +48,12 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 15] = [
+pub(crate) const TABLES: [&str; 16] = [
     "conversations",
     "messages",
     "bots",
     "bot_profiles",
+    "bot_models",
     "bot_deletions",
     "skills",
     "schedules",
@@ -172,6 +173,12 @@ pub(crate) fn apply(
                 };
                 notify(connection, network, hash, scope, kind, body, rank)?;
             }
+        }
+        EventBody::MessageSteered { message_id, reply } => {
+            connection.execute(
+                "UPDATE messages SET steered_into=? WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
+                params![reply, network, scope, message_id],
+            )?;
         }
         EventBody::WorkDispatched { work_id, .. } => {
             connection.execute(
@@ -306,10 +313,15 @@ pub(crate) fn apply(
                     skills,
                 } => {
                     let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
+                    if let Some(model) = model {
+                        connection.execute(
+                            "INSERT INTO bot_models(network_id,conversation_id,provider,model,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,provider) DO UPDATE SET model=excluded.model,rank=excluded.rank WHERE excluded.rank>rank",
+                            params![network, scope, serde_json::to_value(model.provider)?.as_str(), model.after, rank],
+                        )?;
+                    }
                     let fields = [
                         ("name", after(name)),
                         ("instructions", after(instructions)),
-                        ("model", after(model)),
                         (
                             "skills",
                             skills

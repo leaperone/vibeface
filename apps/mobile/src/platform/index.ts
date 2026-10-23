@@ -81,9 +81,9 @@ export const mobilePlatform: Platform = {
     return () => subscription.remove()
   },
   foreground: () => AppState.currentState === 'active',
-  async saveRecovery(bytes) {
+  async saveRecovery(bytes, name) {
     // Kept in the app's documents: the share sheet reports success even when dismissed, and the old file stops working.
-    const file = new File(Paths.document, `vibeface-recovery-${new Date().toLocaleDateString('sv')}.json`)
+    const file = new File(Paths.document, name)
     if (file.exists) file.delete()
     file.write(bytes)
     await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: '保存恢复文件' })

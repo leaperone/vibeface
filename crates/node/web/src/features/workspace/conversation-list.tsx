@@ -3,6 +3,7 @@ import { Bot, Inbox, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
 import { EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
+import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
@@ -39,7 +40,7 @@ export function ConversationList() {
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
     </div>
     {list}
-    <footer className="mt-6 border-t px-1 pt-2 md:hidden"><ConnectionCapsule /></footer>
+    <footer className="mt-6 grid gap-1 border-t px-1 pt-2 md:hidden"><SecondDeviceHint /><ConnectionCapsule /></footer>
   </div>
 }
 

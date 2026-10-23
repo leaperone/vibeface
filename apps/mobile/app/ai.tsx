@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { messageOf, parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
@@ -55,7 +55,6 @@ function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
   return { value, busy, error, call, load, setError }
 }
 
-const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor' }
 const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
@@ -66,10 +65,7 @@ const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon:
 // Names come from runtime/settings.rs readiness.missing.
 const checks: Record<ProviderId, { key: string; label: string }[]> = {
   codex: [
-    { key: 'Node.js', label: '缺少 Node.js 18 以上' },
     { key: 'Codex CLI', label: '缺少 Codex 命令行' },
-    { key: 'Codex SDK sidecar', label: 'Vibeface 安装不完整，请重新安装' },
-    { key: 'Codex SDK dependencies', label: 'bot 组件还没装好' },
   ],
   cursor: [{ key: 'Cursor SDK Bridge', label: '缺少 Cursor 组件' }],
 }
@@ -209,7 +205,7 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   </Field>
 }
 
-const assistantFields = ['model', 'workspace', 'cursor_sdk_bin', 'node_bin', 'codex_sdk_script'] as const
+const assistantFields = ['model', 'workspace', 'cursor_sdk_bin'] as const
 
 /** The bot's model, folder and programs, inside the settings of the provider it runs on. */
 function AssistantDetails({ manager, working, save }: { manager: ManagerSettings; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
@@ -224,7 +220,7 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
     <Text className="text-meta font-medium text-muted-foreground">bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
     {field('workspace', 'bot 工作文件夹')}
-    {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : <>{field('node_bin', 'Node.js')}{field('codex_sdk_script', 'Codex 组件')}</>}
+    {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : null}
     {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>

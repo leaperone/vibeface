@@ -114,18 +114,19 @@ let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
 export function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
-/** `persist`: stays until closed, for a message the person must act on. */
+/** `persist`: stays until closed, for a message the person must act on. Returns the id for `dismissToast`. */
 export function toast(text: string, options: { tone?: Tone; action?: ToastItem["action"]; persist?: boolean } = {}) {
   const item = { id: ++toastId, text, tone: options.tone ?? "neutral", action: options.action }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
   if (!options.persist) setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
+  return item.id
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
 export function Toaster() {
   const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }, () => toasts, () => toasts)
-  return <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[max(0.75rem,env(safe-area-inset-top))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:top-auto md:right-6 md:bottom-6 md:items-end">
+  return <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4rem)] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:top-auto md:right-6 md:bottom-6 md:items-end">
     {items.map((item) => {
       const Icon = toastIcon[item.tone]
       return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg">

@@ -257,6 +257,10 @@ table "messages" {
     null = true
     type = text
   }
+  column "steered_into" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
@@ -333,6 +337,32 @@ table "bot_profiles" {
   }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.field]
+  }
+}
+table "bot_models" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "provider" {
+    null = false
+    type = text
+  }
+  column "model" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.provider]
   }
 }
 table "bot_deletions" {
@@ -817,6 +847,20 @@ table "triage_scans" {
     columns = [column.rollout]
   }
 }
+table "coordination_threads" {
+  schema = schema.main
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  column "created_ms" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.thread_id]
+  }
+}
 table "addresses" {
   schema = schema.main
   column "device_id" {
@@ -947,6 +991,10 @@ table "scheduler_sessions" {
     null = true
     type = text
   }
+  column "native_token" {
+    null = true
+    type = text
+  }
   column "covers" {
     null = false
     type = text
@@ -962,6 +1010,10 @@ table "scheduler_sessions" {
   column "permission_version" {
     null = false
     type = integer
+  }
+  column "shown" {
+    null = false
+    type = text
   }
   primary_key {
     columns = [column.conversation_id]
@@ -1106,6 +1158,28 @@ table "manager_processes" {
   }
   primary_key {
     columns = [column.attempt_id, column.process_group]
+  }
+}
+table "manager_turns" {
+  schema = schema.main
+  column "attempt_id" {
+    null = false
+    type = text
+  }
+  column "server" {
+    null = false
+    type = text
+  }
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  column "turn_id" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.attempt_id]
   }
 }
 table "work_runs" {

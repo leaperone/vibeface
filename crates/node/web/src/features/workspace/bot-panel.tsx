@@ -2,11 +2,15 @@
 
 import { useRef, useState, type ReactNode } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Server, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { providerIcons } from "@/features/devices/ai-settings"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
 import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 
@@ -17,6 +21,7 @@ const GAP_MS = 4000
 /** Header button for the chat route; opens a view of the bot where schedules can be paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
+  const { directory, ready } = useDevice()
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const [gaps, setGaps] = useState<Gap[]>([])
@@ -25,6 +30,8 @@ export function BotPanelButton() {
   const navigate = useNavigate()
   const bot = workspace.selectedBot
   const view = workspace.data?.bot_settings
+  const owner = workspace.data?.conversation?.owner
+  const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
   if (!bot) return null
   const rows = sortSchedules(view?.schedules ?? []).map((schedule) => ({ schedule, deleted: false }))
   for (const gap of [...gaps].sort((a, b) => a.index - b.index)) {
@@ -39,6 +46,7 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
+  const models = Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
@@ -52,7 +60,19 @@ export function BotPanelButton() {
           {workspace.primary === bot.conversation_id
             ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主 Bot</p>
             : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
-          <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title="模型"><Cpu aria-hidden="true" className="size-3.5 shrink-0" /><span className="min-w-0 [overflow-wrap:anywhere]">{bot.model || "跟随设备"}</span></p>
+          <ul className="grid gap-1 text-meta text-muted-foreground">
+            {owner ? <li className="flex min-w-0 items-center gap-1.5" title="运行在">
+              {owner === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-3.5 shrink-0" /> : <Server aria-hidden="true" className="size-3.5 shrink-0" />}
+              <span className="sr-only">运行在 </span><span className="min-w-0 truncate">{nodeName(owner, { nodes: workspace.nodes, directory })}</span>
+              {ownerNode && !ownerNode.online ? <span className="shrink-0 text-warning">离线</span> : null}
+            </li> : null}
+            {models.length ? models.map(([provider, model]) => {
+              const Icon = providerIcons[provider]
+              return <li key={provider} className="flex min-w-0 items-center gap-1.5" title={providerNames[provider]}>
+                <Icon aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">{providerNames[provider]} 模型 </span><span className="min-w-0 [overflow-wrap:anywhere]">{model}</span>
+              </li>
+            }) : <li className="flex items-center gap-1.5"><Cpu aria-hidden="true" className="size-3.5 shrink-0" />设备默认模型</li>}
+          </ul>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           {empty ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有设置</p> : null}
@@ -101,15 +121,13 @@ export function BotPanelButton() {
               {skill.description ? <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{skill.description}</p> : null}
             </li>)}</ul>
           </Section> : null}
-          <section className="grid gap-3 rounded-xl border border-danger-border p-4">
-            {deleting ? <>
-              <p>删除后这个 bot 不再回复，定时任务停止，聊天记录保留。</p>
-              <div className="flex flex-wrap justify-end gap-2">
-                <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
-                <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); setOpen(false); void navigate({ to: "/" }) }}><Trash2 aria-hidden="true" />删除 bot</ActionButton>
-              </div>
-            </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" disabled={!workspace.writable} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除 bot</Button>}
-          </section>
+          {deleting ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
+            <p>删除后这个 Bot 不再回复，定时任务停止，聊天记录保留。</p>
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
+              <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); setOpen(false); void navigate({ to: "/" }) }}><Trash2 aria-hidden="true" />删除 Bot</ActionButton>
+            </div>
+          </section> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" disabled={!workspace.writable} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除 Bot</Button>}
         </div> : null}
       </SheetContent>
     </Sheet>

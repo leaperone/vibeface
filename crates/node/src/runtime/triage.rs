@@ -174,10 +174,14 @@ fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
 }
 
 /// The bot that owns this device's session. A thread this device's work bound counts at
-/// once: the App Server can ask before the turn's start is recorded.
+/// once: the App Server can ask before the turn's start is recorded. A bot's own reply thread
+/// belongs to its conversation.
 fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Result<Option<String>> {
     if let Some(owner) = store.session_owner(network, &event.node, &event.session_id)? {
         return Ok(Some(owner));
+    }
+    if let Some(conversation) = store.native_thread_conversation(&event.session_id)? {
+        return Ok(Some(conversation));
     }
     Ok(store
         .connection
@@ -187,6 +191,26 @@ fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Resu
             |r| r.get(0),
         )
         .optional()?)
+}
+
+/// A turn this device's coordination Agent or a bot's reply runs: it answers in its own chat,
+/// so its events are not news for the Agent. A request a bot's reply thread holds still goes
+/// to the Agent, the only one who can answer it.
+fn own_turn(store: &crate::store::Store, event: &AgentEvent) -> Result<bool> {
+    let coordination = store
+        .connection
+        .query_row(
+            "SELECT 1 FROM coordination_threads WHERE thread_id=?",
+            [&event.session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(coordination
+        || (event.request_id.is_none()
+            && store
+                .native_thread_conversation(&event.session_id)?
+                .is_some()))
 }
 
 fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
@@ -272,6 +296,9 @@ impl Runtime {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
         }
         let mut store = self.store.lock().await;
+        if own_turn(&store, &event)? {
+            return Ok(json!({"status":"own","event_id":event.event_id}));
+        }
         if owner(&store, &network, &event)?.is_none() {
             let question = self.ask_about_session(&mut store, &network, &event)?;
             drop(store);
@@ -609,6 +636,9 @@ impl Runtime {
         let Some(settings) = self.manager() else {
             return Ok(());
         };
+        if settings.provider == manager::ManagerKind::CodexSdk {
+            self.codex.ready().await;
+        }
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
@@ -616,14 +646,18 @@ impl Runtime {
             ..self.manager_config(settings)
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
-        manager::run_manager(
-            &config,
-            &prompt(&cli)?,
-            None,
-            |_| async { Ok(()) },
-            cancel,
-            |_| async { Ok(()) },
-        )
+        // Kept before the turn starts, so its hooks, scans and App Server events are known.
+        let record = |thread: String| async move {
+            self.store.lock().await.connection.execute(
+                "INSERT INTO coordination_threads(thread_id,created_ms) VALUES(?,?)
+                 ON CONFLICT(thread_id) DO NOTHING",
+                params![thread, now_ms()],
+            )?;
+            Ok(())
+        };
+        manager::run_manager(&config, &prompt(&cli)?, None, record, cancel, |_| async {
+            Ok(())
+        })
         .await
         .map(|_| ())
     }
@@ -1129,6 +1163,10 @@ impl Runtime {
             store
                 .connection
                 .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
+            store.connection.execute(
+                "DELETE FROM coordination_threads WHERE created_ms<?",
+                [cutoff],
+            )?;
         }
         if !self.triage.config().scan_codex_sessions {
             return Ok(());
@@ -1573,8 +1611,6 @@ mod tests {
             workspace: "/tmp".into(),
             model: "fixture".into(),
             cursor_sdk_bin: "/nonexistent".into(),
-            node_bin: "/nonexistent".into(),
-            codex_sdk_script: "/nonexistent".into(),
         });
     }
 
@@ -2035,6 +2071,237 @@ mod tests {
             let chat = node.store.lock().await.conversation_questions(&network, "c")?;
             assert_eq!(chat.len(), 1);
             assert_eq!((chat[0]["bot"]["name"].clone(), chat[0]["about"]["session_id"].clone()), (json!("前端"), json!("s1")));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// Posts the user's message `id` in `c` and starts its reply; returns its trigger and attempt.
+    async fn start_reply(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        id: &str,
+    ) -> Result<(String, String)> {
+        let network = node.network_id().await?;
+        let posted = admin.attest(
+            &network,
+            "c",
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: crate::model::Role::User,
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+            },
+        )?;
+        let signed = posted.attestation().cloned().context("signed")?;
+        let mut store = node.store.lock().await;
+        store.accept_message(
+            &node.identity,
+            &network,
+            "c",
+            id,
+            id,
+            vec![],
+            true,
+            signed,
+            now_ms(),
+        )?;
+        let claimed = store
+            .claim_next(&node.identity, &network, "c", "boot", "cfg")?
+            .context("job")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started("c", &trigger, &attempt)?;
+        Ok((trigger, attempt))
+    }
+
+    /// A pending check closes only from the App Server its turn ran on: after a switch to
+    /// another one, the old turn is unknown there, not missing.
+    #[tokio::test]
+    async fn a_check_from_another_app_server_stays_pending() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let _requests = answering_app_server(&node)?;
+            while node.codex.status().await["connection"]["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let network = node.network_id().await?;
+            assert_eq!(node.codex.server(), "system");
+            for (id, server) in [("m1", "own:"), ("m2", "system")] {
+                let (trigger, attempt) = start_reply(&node, &admin, id).await?;
+                let mut store = node.store.lock().await;
+                store.record_manager_turn(
+                    &attempt,
+                    server,
+                    "thread",
+                    Some("turn"),
+                    &Default::default(),
+                )?;
+                let interrupted = crate::scheduling::JobOutcome::Interrupted {
+                    detail: "lost".into(),
+                    process_unconfirmed: true,
+                };
+                store.finish_job(
+                    &node.identity,
+                    &network,
+                    "c",
+                    &trigger,
+                    &attempt,
+                    interrupted,
+                    "",
+                    now_ms(),
+                )?;
+            }
+            node.reconcile_checks(&network).await?;
+            let left = node.store.lock().await.pending_checks()?;
+            let servers: Vec<_> = left
+                .iter()
+                .filter_map(|check| check.codex_turn.as_ref())
+                .map(|turn| turn.server.as_str())
+                .collect();
+            assert_eq!(
+                servers,
+                ["own:"],
+                "only the turn on this App Server was found gone"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// A bot's own reply thread belongs to its chat: triage never asks whose it is, and no
+    /// bot sends work into it.
+    #[tokio::test]
+    async fn a_bots_reply_thread_is_its_chats_and_takes_no_work() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            node.store.lock().await.save_scheduler_native_id(
+                "c",
+                &trigger,
+                &attempt,
+                "bot-thread",
+                "token",
+                false,
+            )?;
+            let event = node
+                .ingest_agent_event(turn("bot-thread", "t1", "/w"))
+                .await?;
+            assert_eq!(event["status"], "own");
+            assert!(
+                unanswered(&node).await?.is_empty(),
+                "no question about a bot's own thread"
+            );
+            assert!(
+                node.pending_events().await?.is_empty(),
+                "a bot's own turn does not wake the Agent"
+            );
+            let held = AgentEvent {
+                request_id: Some("r1".into()),
+                ..turn("bot-thread", "request:r1", "/w")
+            };
+            assert_eq!(node.queue_event(held).await?["status"], "accepted");
+
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
+                .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let args = json!({"thread":"bot-thread","call_ref":"r1","title":"t","prompt":"p"});
+            let refused = node.tool(access, "track_work", args).await;
+            node.finish_manager_attempt(&attempt).await;
+            let refused = refused.expect_err("work into a bot's reply thread");
+            assert!(
+                refused.to_string().contains("own reply thread"),
+                "{refused:#}"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// The coordination Agent's own Codex thread is known before its turn starts: its hook,
+    /// scan and App Server events, requests included, neither ask the user nor wake the Agent.
+    #[tokio::test]
+    async fn the_coordination_agents_thread_is_not_triaged() -> Result<()> {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        while let Some(Ok(message)) = server.next().await {
+                            let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                            else {
+                                continue;
+                            };
+                            if request.get("id").is_none() {
+                                continue;
+                            }
+                            let result = match request["method"].as_str() {
+                                Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                                Some("thread/start") => json!({"thread":{"id":"coord-thread"}}),
+                                Some("turn/start") => json!({"turn":{"id":"coord-turn"}}),
+                                _ => json!({}),
+                            };
+                            let mut replies = vec![json!({"id":request["id"],"result":result})];
+                            if request["method"] == "turn/start" {
+                                replies.push(json!({"method":"turn/completed","params":{
+                                    "threadId":"coord-thread",
+                                    "turn":{"id":"coord-turn","status":"completed"}}}));
+                            }
+                            for reply in replies {
+                                let _ = server.send(reply.to_string().into()).await;
+                            }
+                        }
+                    });
+                }
+            });
+            node.coordination_turn(|_| Ok("triage".into())).await?;
+
+            let ended = node
+                .ingest_agent_event(turn("coord-thread", "coord-turn", "/tmp"))
+                .await?;
+            assert_eq!(ended["status"], "own");
+            let held = AgentEvent {
+                request_id: Some("r1".into()),
+                ..turn("coord-thread", "request:r1", "/tmp")
+            };
+            assert_eq!(node.queue_event(held).await?["status"], "own");
+            assert!(unanswered(&node).await?.is_empty(), "no question about it");
+            assert!(node.pending_events().await?.is_empty(), "nothing queued");
             Ok::<_, anyhow::Error>(())
         }
         .await;

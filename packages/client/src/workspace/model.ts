@@ -3,9 +3,10 @@ import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ConfirmReason, ConversationRecords, OpenWork, SkillSet,
+  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome,
 } from "./types.ts"
 import { answerId } from "./questions.ts"
+import type { ProviderId } from "../lib/node.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
   const normalized = value.trim()
@@ -76,7 +77,7 @@ function optionalText(value: unknown): string | undefined { return value == null
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
+  return { unanswered: list(data.unanswered).map(text), jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
 function workState(value: unknown): WorkState {
   switch (value) {
@@ -157,12 +158,13 @@ export function parseOpenWorks(value: unknown): OpenWork[] {
 export function parseRecords(value: unknown): ConversationRecords {
   const data = record(value)
   const last = data.last_message == null ? null : record(data.last_message)
+  const scheduler = schedulerSnapshot({ jobs: data.jobs, unanswered: data.unanswered })
   return {
     conversation_id: text(data.conversation_id), messages: list(data.messages).map(message), works: list(data.works).map(work),
     last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) },
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
-    jobs: schedulerSnapshot({ jobs: data.jobs })?.jobs ?? [],
+    jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
     sent: list(data.sent).map(sentBotMessage),
   }
 }
@@ -188,6 +190,18 @@ function edit(value: unknown): FieldEdit | undefined {
   const data = record(value)
   return { before: text(data.before), after: text(data.after) }
 }
+const providers: readonly ProviderId[] = ["codex", "cursor"]
+function provider(value: unknown): ProviderId {
+  if (!providers.includes(value as ProviderId)) throw new Error("模型的 provider 无法识别。")
+  return value as ProviderId
+}
+function modelEdit(value: unknown): ModelEdit | undefined {
+  const field = edit(value)
+  return field && { provider: provider(record(value).provider), ...field }
+}
+function botModels(value: unknown): BotModels {
+  return Object.fromEntries(Object.entries(record(value)).map(([key, model]) => [provider(key), text(model)]))
+}
 function skillSet(value: unknown): SkillSet {
   return value == null ? null : list(value).map(text)
 }
@@ -207,7 +221,7 @@ function schedule(value: unknown): BotSchedule {
 function botChange(value: unknown): BotChange {
   const data = record(value)
   if (data.kind === "profile") {
-    const name = edit(data.name), instructions = edit(data.instructions), model = edit(data.model)
+    const name = edit(data.name), instructions = edit(data.instructions), model = modelEdit(data.model)
     const skills = data.skills == null ? undefined : { before: skillSet(record(data.skills).before), after: skillSet(record(data.skills).after) }
     if (!name && !instructions && !model && !skills) throw new Error("Bot 修改记录是空的。")
     return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(skills ? { skills } : {}) }
@@ -288,7 +302,7 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
 }
 export function parseBot(value: unknown): BotRecord {
   const data = record(value), last = data.last_message == null ? null : record(data.last_message)
-  return { ...parseCreateBot(value), model: text(data.model), skills: skillSet(data.skills), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) } }
+  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) } }
 }
 export function parseBots(value: unknown): BotRecord[] {
   return list(record(value).bots).map(parseBot)

@@ -7,7 +7,7 @@ import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, Membe
 import { shouldAutoConnect } from './connection-lane.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
-import { secureKit } from '../lib/secure.ts'
+import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
@@ -42,7 +42,9 @@ type DeviceContextValue = {
   link: Link; entrances: OpenEntrance[]; tabs: Tabs
   identity: PublicIdentity | null; ready: ReadyConnection | null; entries: ConnectionEntry[]; phase: Phase; error: string
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
-  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
+  entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null
+  /** When the Node first saw the current recovery key, if it knows. */
+  recoverySince: number | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
@@ -57,6 +59,7 @@ type DeviceContextValue = {
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
 class AuthenticationError extends Error {}
+const sinceOf = (response: Record<string, unknown>) => typeof response.recovery_since_ms === 'number' ? response.recovery_since_ms : null
 const INVITE_TTL_MS = 10 * 60 * 1000
 /** Not an error: the entry buttons below it are the way in. */
 export const notJoined = (self: string) => `${self}还没加入`
@@ -147,6 +150,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [entry, setEntry] = useState<ConnectionEntry | null>(null)
   const [info, setInfo] = useState<EntryInfo | null>(null)
   const [directory, setDirectory] = useState<MembershipView | null>(null)
+  const [recoverySince, setRecoverySince] = useState<number | null>(null)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
@@ -222,7 +226,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     setEntries(next)
   }, [])
   function current() { const value = session.current; if (!value) throw new Error('先连接自己的设备。'); return value }
-  function own() { const value = identityRef.current; if (!value) throw new Error(`${self}的密钥尚未初始化。`); return value }
+  function own() { const value = identityRef.current; if (!value) throw new Error(`${self}还没准备好，请${page ? '刷新页面' : '重新打开'}。`); return value }
   async function callSession(active: Session, method: string, params: Record<string, unknown> = {}) {
     if (session.current !== active || active.generation !== generation.current) throw changed()
     let result: unknown
@@ -235,7 +239,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
   function managing() {
-    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('当前连接尚未核验，或此设备没有管理权限。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理员能做这个操作。')
     return ready
   }
   async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
@@ -273,7 +277,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       isCurrent: () => session.current === active && generation.current === active.generation,
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
-    setDirectory(view); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
+    setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
     if (principal.source === 'membership') void refreshEntrances(active, view)
@@ -493,7 +497,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const me = own().deviceId
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    setDirectory(view); setJoins(pending)
+    setDirectory(view); setRecoverySince(sinceOf(response)); setJoins(pending)
   }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
@@ -539,13 +543,13 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const pins = approvalPins()
     const seen = joins.find(item => item.join_id === joinId)
     if (!pins[joinId]) {
-      if (seen?.status !== 'pending') throw new Error('加入请求已失效。请让对方重新使用邀请。')
+      if (seen?.status !== 'pending') throw new Error('这个加入请求已失效。请重新生成加入链接。')
       // Kept across reloads and retries, so a repeated start sends the same nonce.
       pins[joinId] = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
       store('approval-pins', Object.fromEntries(Object.entries(pins).slice(-16)))
     }
     const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pins[joinId].nonce }))
-    if (request.status !== 'confirming') throw new Error('加入请求已失效。请让对方重新使用邀请。')
+    if (request.status !== 'confirming') throw new Error('这个加入请求已失效。请重新生成加入链接。')
     await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
@@ -569,7 +573,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   async function revoke(deviceId: string) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
-    if (!member) throw new Error('成员不存在。请刷新目录。')
+    if (!member) throw new Error('找不到这台设备，请刷新后再试。')
     if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的电脑。`)
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
@@ -612,8 +616,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       let response: ReturnType<typeof parseJoinRequest>
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
-      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error(`加入回执与邀请或${self}不一致。`)
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error('此邀请已失效。请在管理设备上重新邀请。')
+      if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error('这条加入链接已失效。请在已有设备上重新添加。')
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
     } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
@@ -672,11 +676,12 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       genesis = JSON.parse(createGenesis(root, JSON.stringify({ device_id: own().deviceId, kind: 'client', name, manage: true }), JSON.stringify({ device_id: active.info.device_id, kind: 'node', name: nodeName ? deviceName(nodeName) : active.info.name, manage: false })))
       recovery = sealPackage({ networkId, genesis, checkpoints: [] }, root, password)
     } finally { root.free(); password = '' }
+    const code = await recoveryCode(networkId)
     if (session.current !== active) { recovery.fill(0); throw changed() }
     let downloaded = false, cancelled = false
     const flow: Sensitive = {
       cancel() { cancelled = true; recovery.fill(0) },
-      async download() { if (cancelled || session.current !== active) throw changed(); await platform.saveRecovery(recovery); downloaded = true },
+      async download() { if (cancelled || session.current !== active) throw changed(); await platform.saveRecovery(recovery, recoveryFileName(code)); downloaded = true },
       async bootstrap(saved) {
         if (!saved || !downloaded) throw new Error('请先下载恢复文件，并确认已妥善保存。')
         if (cancelled || session.current !== active) throw changed()
@@ -751,21 +756,23 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const flow: Sensitive = {
         cancel: release,
         async recover(selectedInput) {
-          if (released || !verified || session.current !== active) throw new Error('恢复材料已清除。请重新导入。')
+          if (released || !verified || session.current !== active) throw new Error('恢复文件已关闭，请重新选择。')
           if (!prepared) {
             const selected = selectedInput.map(member => {
               const original = allowed.get(member.device_id)
-              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('所选成员与已验证目录不一致。')
+              if (!original || original.kind !== member.kind || original.name !== member.name || member.kind === 'node' && member.manage) throw new Error('设备列表变了，请重新打开恢复文件。')
               return member
             })
-            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('恢复必须保留当前目标，且不能重复选择成员。')
+            if (!selected.some(member => member.device_id === active.entry.device_id) || new Set(selected.map(member => member.device_id)).size !== selected.length) throw new Error('要保留正在连接的这台电脑。')
             selected.push(newManager)
             const next = Identity.generate()
             try {
+              const code = await recoveryCode(next.deviceId())
+              if (released || session.current !== active) throw new Error('恢复文件已关闭，请重新选择。')
               const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
               const checkpoints = [...chain, checkpoint]
               const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints }, next, password)
-              try { await platform.saveRecovery(bytes) } finally { bytes.fill(0) }
+              try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
               prepared = { checkpoints, checkpoint }
             } finally { next.free() }
             password = ''
@@ -799,10 +806,11 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const next = Identity.generate()
       let checkpoints: unknown[]
       try {
+        const code = await recoveryCode(next.deviceId())
         const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, next.deviceId()))
         checkpoints = [...array(state.checkpoints), checkpoint]
         const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints }, next, password)
-        try { await platform.saveRecovery(bytes) } finally { bytes.fill(0) }
+        try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
       await connection.request('recover', { genesis: state.genesis, checkpoints })
       await refreshDirectory()
@@ -916,13 +924,13 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }, [ready])
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
-    identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
-    async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },
-    async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('恢复确认已失效。'); await sensitive.current.recover(members) },
+    async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
+    async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>

@@ -180,7 +180,7 @@ fn bounded_text(text: &str, limit: usize) -> String {
 }
 
 /// Provider tool arguments, raw outputs and reasoning never enter the live UI protocol.
-pub(super) fn native_progress(event: &Value) -> Value {
+pub(crate) fn native_progress(event: &Value) -> Value {
     let method = event["method"].as_str().unwrap_or("");
     let params = &event["params"];
     let item = &params["item"];

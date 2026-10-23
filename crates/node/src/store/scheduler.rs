@@ -74,6 +74,11 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
             attempt: attempt_or()?,
             detail,
         },
+        "steering" | "steered" => {
+            let steer: JobState = serde_json::from_str(&detail)?;
+            ensure!(steer.name() == state, "scheduler job steer state mismatch");
+            steer
+        }
         other => bail!("unknown scheduler job state {other}"),
     };
     Ok(SchedulerJob {
@@ -142,8 +147,13 @@ fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<Schedu
 fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     let attempt = job.state.attempt();
     let detail = match &job.state {
-        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => Some(detail),
-        JobState::Cancelled { evidence, .. } => Some(evidence),
+        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => {
+            Some(detail.clone())
+        }
+        JobState::Cancelled { evidence, .. } => Some(evidence.clone()),
+        JobState::Steering { .. } | JobState::Steered { .. } => {
+            Some(serde_json::to_string(&job.state)?)
+        }
         _ => None,
     };
     connection.execute(
@@ -168,7 +178,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     Ok(())
 }
 
-const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version";
+const SESSION_COLUMNS: &str = "conversation_id,next_sequence,active,native_id,covers,owner_epoch,sdk_config,permission_version,native_token,shown";
 
 fn query_sessions(
     connection: &Connection,
@@ -186,19 +196,23 @@ fn query_sessions(
                     next_sequence: r.get(1)?,
                     active: r.get(2)?,
                     native_id: r.get(3)?,
+                    native_token: r.get(8)?,
                     covers: VersionVector::new(),
                     owner_epoch: r.get(5)?,
                     sdk_config: r.get(6)?,
                     permission_version: r.get(7)?,
+                    shown: Default::default(),
                 },
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(session, covers)| {
+        .map(|(session, covers, shown)| {
             Ok(SchedulerSession {
                 covers: serde_json::from_str(&covers)?,
+                shown: serde_json::from_str(&shown)?,
                 ..session
             })
         })
@@ -216,7 +230,7 @@ fn load_session(connection: &Connection, conversation: &str) -> Result<Scheduler
 fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<()> {
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_sessions({SESSION_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?)"
         ),
         params![
             session.conversation_id,
@@ -227,6 +241,8 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
             session.owner_epoch,
             session.sdk_config,
             session.permission_version,
+            session.native_token,
+            serde_json::to_string(&session.shown)?,
         ],
     )?;
     Ok(())
@@ -235,8 +251,10 @@ fn save_session(connection: &Connection, session: &SchedulerSession) -> Result<(
 pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<PendingCheck>> {
     let mut statement = connection.prepare(
         "SELECT c.attempt_id,c.conversation_id,c.trigger,c.detail,c.created_at_ms,
-            (SELECT json_group_array(process_group) FROM manager_processes p WHERE p.attempt_id=c.attempt_id)
-         FROM pending_checks c ORDER BY c.created_at_ms",
+            (SELECT json_group_array(process_group) FROM manager_processes p WHERE p.attempt_id=c.attempt_id),
+            t.server,t.thread_id,t.turn_id
+         FROM pending_checks c LEFT JOIN manager_turns t ON t.attempt_id=c.attempt_id
+         ORDER BY c.created_at_ms",
     )?;
     let rows = statement
         .query_map([], |r| {
@@ -247,12 +265,25 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
                 r.get(3)?,
                 r.get(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
         .map(
-            |(attempt_id, conversation_id, trigger, detail, created_at_ms, groups)| {
+            |(
+                attempt_id,
+                conversation_id,
+                trigger,
+                detail,
+                created_at_ms,
+                groups,
+                server,
+                thread,
+                turn,
+            )| {
                 Ok(PendingCheck {
                     check_id: PendingCheck::id(&attempt_id),
                     conversation_id,
@@ -260,6 +291,11 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
                     attempt_id,
                     detail,
                     process_groups: serde_json::from_str(&groups)?,
+                    codex_turn: server.zip(thread).map(|(server, thread)| ReplyTurn {
+                        server,
+                        thread,
+                        turn,
+                    }),
                     created_at_ms,
                 })
             },
@@ -287,7 +323,19 @@ fn forget_process(connection: &Connection, attempt_id: &str) -> Result<()> {
         "DELETE FROM manager_processes WHERE attempt_id=?",
         [attempt_id],
     )?;
+    connection.execute("DELETE FROM manager_turns WHERE attempt_id=?", [attempt_id])?;
     Ok(())
+}
+
+/// The reply's App Server turn while it runs, if it runs on one and its turn is known.
+fn manager_turn(connection: &Connection, attempt_id: &str) -> Result<Option<(String, String)>> {
+    Ok(connection
+        .query_row(
+            "SELECT thread_id,turn_id FROM manager_turns WHERE attempt_id=? AND turn_id IS NOT NULL",
+            [attempt_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 fn outbox_entry(
@@ -311,6 +359,7 @@ fn outbox_entry(
 
 fn fence(session: &mut SchedulerSession) -> Result<()> {
     session.native_id = None;
+    session.native_token = None;
     session.permission_version = session
         .permission_version
         .checked_add(1)
@@ -340,10 +389,94 @@ fn holds_turn(
     )
 }
 
-fn reply_message_id(conversation: &str, trigger: &str) -> String {
+/// The turn a user message may join: the session's running reply to a user message, started by
+/// this process and still held by this Node, on an App Server turn.
+fn steer_target(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    boot: &str,
+    session: &SchedulerSession,
+) -> Result<Option<SteerTarget>> {
+    let Some(trigger) = &session.active else {
+        return Ok(None);
+    };
+    let Some(job) = load_job(connection, &session.conversation_id, trigger)? else {
+        return Ok(None);
+    };
+    let JobState::Running { attempt } = &job.state else {
+        return Ok(None);
+    };
+    if job.kind != TriggerKind::Human
+        || attempt.boot != boot
+        || attempt.permission_version != session.permission_version
+        || !holds_turn(connection, network, local, session, &job)?
+    {
+        return Ok(None);
+    }
+    Ok(
+        manager_turn(connection, &attempt.id)?.map(|(thread_id, turn_id)| SteerTarget {
+            attempt_id: attempt.id.clone(),
+            thread_id,
+            turn_id,
+        }),
+    )
+}
+
+/// The text of a queued user message that can join a running turn as is: no attachments, and
+/// results reported as usual.
+fn steerable_text(
+    connection: &Connection,
+    network: &str,
+    job: &SchedulerJob,
+) -> Result<Option<String>> {
+    if job.kind != TriggerKind::Human {
+        return Ok(None);
+    }
+    Ok(
+        message_from(connection, network, &job.conversation_id, &job.reply_to)?
+            .filter(|message| {
+                message.attachments.is_empty() && message.report_results != Some(false)
+            })
+            .map(|message| message.text),
+    )
+}
+
+fn pending_conversations_from(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT conversation_id FROM scheduler_jobs WHERE state='queued' ORDER BY conversation_id",
+    )?;
+    Ok(statement
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// The user moved the conversation: what never started here goes to the new owner, which runs
+/// schedules by its own clock. An agent task stays with its work's device.
+fn hand_off_from(connection: &Connection, network: &str, conversation: &str) -> Result<()> {
+    for job in queued_jobs(connection, conversation)? {
+        if job.kind == TriggerKind::AgentTask {
+            continue;
+        }
+        connection.execute(
+            "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
+            params![conversation, job.trigger],
+        )?;
+        if job.kind != TriggerKind::Schedule {
+            queue_delivery_from(connection, network, conversation, &job.trigger)?;
+        }
+    }
+    Ok(())
+}
+
+/// A new owner answering a message the old one left unanswered writes its own reply, beside any
+/// status reply the old owner already wrote.
+fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
     format!(
         "reply-{}",
-        crate::crypto::digest(&serde_json::to_vec(&(conversation, trigger)).expect("strings"))
+        crate::crypto::digest(
+            &serde_json::to_vec(&(conversation, trigger, owner_epoch)).expect("strings")
+        )
     )
 }
 
@@ -375,7 +508,11 @@ pub(crate) fn admit_from(
         sequence: session.next_sequence,
         basis: log::version_vector_from(connection, network)?,
         reply_to: reply_to.into(),
-        message_id: reply_message_id(conversation, trigger),
+        message_id: reply_message_id(
+            conversation,
+            trigger,
+            conversation_from(connection, network, conversation)?.map_or(0, |c| c.owner_epoch),
+        ),
         state: if deleted {
             JobState::Cancelled {
                 attempt: None,
@@ -423,6 +560,88 @@ impl Store {
         tx.commit()?;
         Ok(true)
     }
+
+    /// The user messages of a conversation this Node schedules that no device answered, in
+    /// conversation order: no completed reply, not answered inside a reply they were steered
+    /// into, and no turn here. A former owner left them; only the user starts them again.
+    pub fn unanswered_messages(
+        &self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+    ) -> Result<Vec<String>> {
+        Ok(
+            unanswered_from(&self.connection, network, local, conversation)?
+                .into_iter()
+                .map(|(message_id, _)| message_id)
+                .collect(),
+        )
+    }
+
+    /// Queues a reply here to each of `message_ids` that is still unanswered. A retry finds them
+    /// queued and admits nothing again.
+    pub fn reply_unanswered(
+        &mut self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<AdmissionReceipt>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut receipts = Vec::new();
+        for (message_id, answers) in unanswered_from(&tx, network, local, conversation)? {
+            if !message_ids.contains(&message_id) {
+                continue;
+            }
+            let kind = match answers {
+                Some(_) => TriggerKind::Answer,
+                None => TriggerKind::Human,
+            };
+            receipts.push(admit_from(
+                &tx,
+                network,
+                conversation,
+                &message_trigger(&message_id),
+                kind,
+                &message_id,
+            )?);
+        }
+        tx.commit()?;
+        Ok(receipts)
+    }
+}
+
+/// `(message_id, answers)` of each unanswered user message; see `Store::unanswered_messages`.
+fn unanswered_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    conversation: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
+    if owner.as_deref() != Some(local)
+        || super::bots::bot_deleted_from(connection, network, conversation)?
+    {
+        return Ok(vec![]);
+    }
+    let mut statement = connection.prepare(
+        "SELECT m.message_id,m.answers FROM messages m
+        WHERE m.network_id=?1 AND m.conversation_id=?2 AND m.role='user' AND m.steered_into IS NULL
+        AND NOT EXISTS(SELECT 1 FROM messages r WHERE r.network_id=?1 AND r.conversation_id=?2
+            AND r.in_reply_to=m.message_id AND r.status='completed')
+        AND NOT EXISTS(SELECT 1 FROM scheduler_jobs j WHERE j.conversation_id=?2
+            AND j.trigger='message:'||m.message_id)
+        AND NOT EXISTS(SELECT 1 FROM scheduler_outbox o WHERE o.conversation_id=?2
+            AND o.trigger='message:'||m.message_id)
+        ORDER BY m.rank",
+    )?;
+    Ok(statement
+        .query_map(params![network, conversation], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// The enabled schedule a schedule job runs, if it still belongs to the job's conversation.
@@ -700,7 +919,6 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "executable was not found",
             "command not found",
             "no cursor sdk bridge",
-            "sidecar is missing",
             "enoent",
         ],
         "这台设备上找不到 AI 服务的程序。去「设备 → AI」检查后再发一次。",
@@ -1051,12 +1269,7 @@ impl Store {
     }
 
     pub fn pending_scheduler_conversations(&self) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT conversation_id FROM scheduler_jobs WHERE state='queued' ORDER BY conversation_id",
-        )?;
-        Ok(statement
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
+        pending_conversations_from(&self.connection)
     }
 
     pub fn recover_scheduler_jobs(
@@ -1090,31 +1303,29 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut session = load_session(&tx, conversation)?;
         recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
-        if session.active.is_some() {
-            save_session(&tx, &session)?;
-            tx.commit()?;
-            return Ok(None);
-        }
         let local = identity.device_id()?;
         let current = conversation_from(&tx, network, conversation)?;
         let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
         let owned = current.and_then(|c| c.owner) == Some(local.clone());
-        let mut queued = Vec::new();
-        for job in queued_jobs(&tx, conversation)? {
-            // The user moved the conversation: what never started goes to the new owner, which
-            // runs schedules by its own clock.
-            if !owned && job.kind != TriggerKind::AgentTask {
-                tx.execute(
-                    "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
-                    params![conversation, job.trigger],
-                )?;
-                if job.kind != TriggerKind::Schedule {
-                    queue_delivery_from(&tx, network, conversation, &job.trigger)?;
-                }
-                continue;
-            }
-            queued.push(job);
+        // A message whose steer is unsettled keeps its place here; nothing behind it runs first.
+        // A conversation that moved away still hands its queue on.
+        if session.active.is_some()
+            || owned
+                && !query_jobs(
+                    &tx,
+                    "conversation_id=? AND state='steering'",
+                    [conversation],
+                )?
+                .is_empty()
+        {
+            save_session(&tx, &session)?;
+            tx.commit()?;
+            return Ok(None);
         }
+        if !owned {
+            hand_off_from(&tx, network, conversation)?;
+        }
+        let mut queued = queued_jobs(&tx, conversation)?;
         queued.sort_by_key(|job| {
             (
                 !matches!(job.kind, TriggerKind::Human | TriggerKind::Answer),
@@ -1173,7 +1384,9 @@ impl Store {
         };
         if session.sdk_config.as_deref() != Some(sdk_config) || session.owner_epoch != owner_epoch {
             session.native_id = None;
+            session.native_token = None;
             session.covers.clear();
+            session.shown = Shown::default();
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
@@ -1187,7 +1400,15 @@ impl Store {
                 .iter()
                 .all(|(author, seq)| job.basis.get(author).is_some_and(|have| have >= seq));
         let previous_native_id = resumable.then(|| session.native_id.clone()).flatten();
-        let covers = resumable.then(|| session.covers.clone());
+        let previous_token = resumable.then(|| session.native_token.clone()).flatten();
+        // A thread that never started a turn has seen nothing: the prompt carries the context.
+        let covers = resumable
+            .then(|| session.covers.clone())
+            .filter(|covers| !covers.is_empty());
+        let shown = match covers {
+            Some(_) => session.shown.clone(),
+            None => Shown::default(),
+        };
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1202,7 +1423,9 @@ impl Store {
         Ok(Some(ClaimedJob {
             job,
             previous_native_id,
+            previous_token,
             covers,
+            shown,
         }))
     }
 
@@ -1254,6 +1477,8 @@ impl Store {
         trigger: &str,
         attempt_id: &str,
         native_id: &str,
+        token: &str,
+        sent: bool,
     ) -> Result<()> {
         self.update_attempt(conversation, trigger, attempt_id, |job, session| {
             ensure!(
@@ -1265,8 +1490,15 @@ impl Store {
             );
             job.state.attempt().context("scheduler attempt missing")?;
             if job.kind != TriggerKind::AgentTask {
+                if session.native_id.as_deref() != Some(native_id) {
+                    session.covers.clear();
+                    session.shown = Shown::default();
+                }
                 session.native_id = Some(native_id.into());
-                session.covers = job.basis.clone();
+                session.native_token = Some(token.into());
+                if sent {
+                    session.covers = job.basis.clone();
+                }
             }
             Ok(())
         })?;
@@ -1287,6 +1519,27 @@ impl Store {
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
+        if let JobState::Steering { into, .. } = &job.state {
+            let into = into.clone();
+            match query_jobs(
+                &tx,
+                "conversation_id=? AND attempt_id=?",
+                params![conversation, into.attempt_id],
+            )?
+            .pop()
+            .filter(|host| !host.state.terminal())
+            {
+                Some(host) => job = host,
+                // The reply it went into already ended: there is nothing left to stop, and the
+                // message is never sent again.
+                None => {
+                    job.state = JobState::Steered {
+                        into,
+                        outcome: SteerOutcome::Unknown,
+                    }
+                }
+            }
+        }
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
             let change = TaskJobChange::Ended {
@@ -1310,7 +1563,7 @@ impl Store {
             };
         } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
             ensure!(
-                session.active.as_deref() == Some(trigger),
+                session.active.as_deref() == Some(job.trigger.as_str()),
                 "management reply changed; refresh before stopping"
             );
             job.state = JobState::Cancelling {
@@ -1325,7 +1578,8 @@ impl Store {
     }
 
     /// Stops the turns of conversations that moved to a newer owner: each becomes cancelling
-    /// and loses its tool permission here, before the runtime cancels its SDK call. Returns
+    /// and loses its tool permission here, before the runtime cancels its SDK call. What never
+    /// started there goes to the new owner, whether or not a bot runs here. Returns
     /// `(conversation, trigger, attempt_id)` per fenced turn.
     pub fn fence_moved_turns(
         &mut self,
@@ -1335,6 +1589,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for conversation in pending_conversations_from(&tx)? {
+            if conversation_from(&tx, network, &conversation)?
+                .and_then(|c| c.owner)
+                .as_deref()
+                != Some(local)
+            {
+                hand_off_from(&tx, network, &conversation)?;
+            }
+        }
         let mut fenced = Vec::new();
         for mut session in query_sessions(&tx, "active IS NOT NULL", [])? {
             let Some(trigger) = session.active.clone() else {
@@ -1455,6 +1718,188 @@ impl Store {
         Ok(job)
     }
 
+    /// The App Server turn of a reply, recorded before `turn/start` with its thread only and
+    /// again once the turn is known. Only a started turn has shown the thread the reply's basis
+    /// and `shown`; a refused `turn/start` leaves them for the next turn.
+    pub fn record_manager_turn(
+        &mut self,
+        attempt_id: &str,
+        server: &str,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        shown: &Shown,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO manager_turns(attempt_id,server,thread_id,turn_id) VALUES(?,?,?,?)",
+            params![attempt_id, server, thread_id, turn_id],
+        )?;
+        if turn_id.is_some()
+            && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
+            && job.kind != TriggerKind::AgentTask
+        {
+            let mut session = load_session(&tx, &job.conversation_id)?;
+            if session.native_id.as_deref() == Some(thread_id) {
+                session.covers = job.basis;
+                session.shown = shown.clone();
+                save_session(&tx, &session)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The conversation whose own reply thread this is: its session's native thread, or the
+    /// thread a reply or agent task runs on now.
+    pub fn native_thread_conversation(&self, thread_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT conversation_id FROM scheduler_sessions WHERE native_id=?1
+                 UNION SELECT j.conversation_id FROM manager_turns t
+                    JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id WHERE t.thread_id=?1
+                 LIMIT 1",
+                [thread_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Queued user messages that may join the running reply of their conversation: plain text
+    /// while a reply to a user message runs on an App Server turn this Node holds.
+    pub fn steer_candidates(
+        &self,
+        network: &str,
+        local: &str,
+        boot: &str,
+    ) -> Result<Vec<SteerCandidate>> {
+        let mut candidates = Vec::new();
+        for session in query_sessions(&self.connection, "active IS NOT NULL", [])? {
+            if let Some(target) = steer_target(&self.connection, network, local, boot, &session)? {
+                for job in queued_jobs(&self.connection, &session.conversation_id)? {
+                    if let Some(text) = steerable_text(&self.connection, network, &job)? {
+                        candidates.push(SteerCandidate {
+                            conversation_id: job.conversation_id,
+                            trigger: job.trigger,
+                            message_id: job.reply_to,
+                            text,
+                            into: target.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Marks the message as being steered into `into` if that reply still runs here under the
+    /// same permission. Only then may `turn/steer` be sent.
+    pub fn begin_steer(
+        &mut self,
+        network: &str,
+        local: &str,
+        boot: &str,
+        conversation: &str,
+        trigger: &str,
+        into: &SteerTarget,
+    ) -> Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&tx, conversation)?;
+        let Some(mut job) = load_job(&tx, conversation, trigger)? else {
+            return Ok(false);
+        };
+        if job.state != JobState::Queued
+            || steerable_text(&tx, network, &job)?.is_none()
+            || steer_target(&tx, network, local, boot, &session)?.as_ref() != Some(into)
+        {
+            return Ok(false);
+        }
+        job.state = JobState::Steering {
+            into: into.clone(),
+            unread_since_ms: None,
+            running_since_ms: None,
+        };
+        save_job(&tx, &job)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Moves a steering message on: back to the queue when nothing reached the turn, steered,
+    /// or still steering with its updated wait clocks. Anything else is left. An answered steer
+    /// is recorded in the conversation, so a later owner does not count the message unanswered.
+    pub fn settle_steer(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        next: JobState,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                next,
+                JobState::Queued | JobState::Steering { .. } | JobState::Steered { .. }
+            ),
+            "a steer settles only into the queue or a steer state"
+        );
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        if !matches!(job.state, JobState::Steering { .. }) {
+            return Ok(());
+        }
+        if let JobState::Steered {
+            into,
+            outcome: SteerOutcome::Answered,
+        } = &next
+        {
+            let host = query_jobs(
+                &tx,
+                "conversation_id=? AND attempt_id=?",
+                params![conversation, into.attempt_id],
+            )?
+            .pop()
+            .context("steered reply missing")?;
+            log::append_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                conversation,
+                EventBody::MessageSteered {
+                    message_id: job.reply_to.clone(),
+                    reply: host.message_id,
+                },
+                vec![],
+                crate::runtime::now_ms(),
+            )?;
+        }
+        job.state = next;
+        save_job(&tx, &job)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the reply attempt a message was steered into is still claimed or running.
+    pub fn steer_host_active(&self, conversation: &str, attempt_id: &str) -> Result<bool> {
+        Ok(query_jobs(
+            &self.connection,
+            "conversation_id=? AND attempt_id=?",
+            params![conversation, attempt_id],
+        )?
+        .iter()
+        .any(|job| !job.state.terminal()))
+    }
+
+    pub fn steering_jobs(&self) -> Result<Vec<SchedulerJob>> {
+        query_jobs(&self.connection, "state='steering'", [])
+    }
+
     pub fn record_manager_process(&mut self, attempt_id: &str, process_group: u32) -> Result<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO manager_processes(attempt_id,process_group) VALUES(?,?)",
@@ -1482,7 +1927,7 @@ impl Store {
 
     pub fn scheduler_maintenance_idle(&self) -> Result<()> {
         let busy: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM scheduler_jobs WHERE state='queued')
+            "SELECT EXISTS(SELECT 1 FROM scheduler_jobs WHERE state IN ('queued','steering'))
                 OR EXISTS(SELECT 1 FROM scheduler_sessions WHERE active IS NOT NULL)",
             [],
             |r| r.get(0),

@@ -1,9 +1,10 @@
 use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
+    providers::Provider,
     scheduling::{
-        JobOutcome, JobState, SchedulerJob, TriggerKind, bot_message_trigger, message_trigger,
-        schedule_trigger, work_trigger,
+        JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, bot_message_trigger,
+        message_trigger, schedule_trigger, work_trigger,
     },
     work::{Signal, WorkSpec},
 };
@@ -559,6 +560,215 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
             .state,
         JobState::Interrupted { .. }
     ));
+    Ok(())
+}
+
+fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<()> {
+    let signed = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::MessagePosted {
+            message_id: id.into(),
+            role: Role::User,
+            text: id.into(),
+            attachments: vec![],
+            report_results: Some(report_results),
+            in_reply_to: None,
+            status: None,
+            answers: None,
+            attestation: None,
+        },
+    )?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        id,
+        id,
+        vec![],
+        report_results,
+        signed.attestation().cloned().context("signed message")?,
+        2,
+    )?;
+    Ok(())
+}
+
+/// A message steers only the running reply to a user message once its App Server turn is
+/// known; it is marked before the steer and either joins (no reply of its own) or queues again.
+#[test]
+fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (trigger, attempt) = (
+        claimed.job.trigger.clone(),
+        claimed.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    store.mark_started("c", &trigger, &attempt)?;
+    say(&mut store, &net, "m2", true)?;
+    say(&mut store, &net, "quiet", false)?;
+    let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
+    assert!(candidates(&store)?.is_empty());
+    store.record_manager_turn(&attempt, "system", "thread", None, &Default::default())?;
+    assert!(candidates(&store)?.is_empty());
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Default::default(),
+    )?;
+    // A reply left running by an earlier process is never a target.
+    assert!(
+        store
+            .steer_candidates(&net.network, &local, "later")?
+            .is_empty()
+    );
+    let found = candidates(&store)?;
+    let ids: Vec<_> = found.iter().map(|c| c.message_id.as_str()).collect();
+    assert_eq!(ids, ["m2"]);
+    let into = found[0].into.clone();
+    assert_eq!(
+        (into.thread_id.as_str(), into.turn_id.as_str()),
+        ("thread", "turn")
+    );
+    let m2 = message_trigger("m2");
+    let begin = |store: &mut Store, trigger: &str| {
+        store.begin_steer(&net.network, &local, "boot", "c", trigger, &into)
+    };
+
+    assert!(begin(&mut store, &m2)?);
+    assert!(!begin(&mut store, &m2)?);
+    assert!(candidates(&store)?.is_empty());
+    store.settle_steer(&net.a, &net.network, "c", &m2, JobState::Queued)?;
+    assert_eq!(
+        store.scheduler_job("c", &m2)?.context("job")?.state,
+        JobState::Queued
+    );
+
+    assert!(begin(&mut store, &m2)?);
+    assert!(store.steer_host_active("c", &attempt)?);
+    // The reply ends while the steer is unsettled: nothing behind the message runs first.
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        3,
+    )?;
+    assert!(!store.steer_host_active("c", &attempt)?);
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(store.scheduler_maintenance_idle().is_err());
+    // An unreadable thread keeps the message waiting with the time it was first unreadable.
+    let unread = JobState::Steering {
+        into: into.clone(),
+        unread_since_ms: Some(7),
+        running_since_ms: Some(6),
+    };
+    store.settle_steer(&net.a, &net.network, "c", &m2, unread.clone())?;
+    assert_eq!(store.scheduler_job("c", &m2)?.context("job")?.state, unread);
+    let answered = JobState::Steered {
+        into: into.clone(),
+        outcome: SteerOutcome::Answered,
+    };
+    store.settle_steer(&net.a, &net.network, "c", &m2, answered.clone())?;
+    // Only an unsettled steer settles.
+    store.settle_steer(&net.a, &net.network, "c", &m2, JobState::Queued)?;
+    let steered = store.scheduler_job("c", &m2)?.context("job")?;
+    assert_eq!(steered.state, answered);
+    assert!(
+        store
+            .message(&net.network, "c", &steered.message_id)?
+            .is_none()
+    );
+    let next = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(next.job.trigger, message_trigger("quiet"));
+
+    // Stopping a steered message stops the reply it went into.
+    let attempt = next.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &next.job.trigger, &attempt)?;
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn-2"),
+        &Default::default(),
+    )?;
+    say(&mut store, &net, "m3", true)?;
+    let found = candidates(&store)?;
+    assert_eq!(found.len(), 1);
+    let m3 = message_trigger("m3");
+    assert!(store.begin_steer(&net.network, &local, "boot", "c", &m3, &found[0].into)?);
+    say(&mut store, &net, "m4", true)?;
+    store.request_manager_cancel(&net.a, &net.network, "c", &m3)?;
+    assert!(matches!(
+        store
+            .scheduler_job("c", &next.job.trigger)?
+            .context("job")?
+            .state,
+        JobState::Cancelling { .. }
+    ));
+    assert!(candidates(&store)?.is_empty());
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &next.job.trigger,
+        &attempt,
+        JobOutcome::Cancelled("stopped".into()),
+        "",
+        4,
+    )?;
+
+    // A conversation that moved away hands its queue on while a steer is unsettled.
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        5,
+    )?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
+    let JobState::Steering { into, .. } = store.scheduler_job("c", &m3)?.context("job")?.state
+    else {
+        bail!("m3 is no longer steering");
+    };
+    // Stopping it once its reply ended settles it as unknown instead of reaching an ended reply.
+    let stopped = store
+        .request_manager_cancel(&net.a, &net.network, "c", &m3)?
+        .context("job")?;
+    let unknown = JobState::Steered {
+        into,
+        outcome: SteerOutcome::Unknown,
+    };
+    assert_eq!(
+        (stopped.trigger.as_str(), &stopped.state),
+        (m3.as_str(), &unknown)
+    );
+    assert_eq!(
+        store.scheduler_job("c", &m3)?.context("job")?.state,
+        unknown
+    );
     Ok(())
 }
 
@@ -1333,7 +1543,16 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     // The local writer takes the cause from the trigger and refuses anything but a user message.
     for trigger in ["work:w1", "message:a1"] {
         let error = origin
-            .change_bot(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
+            .change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                trigger,
+                "r1",
+                rename("Nova"),
+                Provider::Codex,
+                6,
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains(bot_settings::NOT_FROM_USER),
@@ -1353,7 +1572,16 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
     let change = |store: &mut Store, identity, trigger, call_ref, request, at| {
-        store.change_bot(identity, &net.network, "c", trigger, call_ref, request, at)
+        store.change_bot(
+            identity,
+            &net.network,
+            "c",
+            trigger,
+            call_ref,
+            request,
+            Provider::Codex,
+            at,
+        )
     };
     let (renamed, written) = change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 4)?;
     assert!(written);
@@ -1488,6 +1716,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -1553,6 +1782,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
             every_minutes: Some(5),
             enabled: Some(false),
         },
+        Provider::Codex,
         5,
     )?;
     assert!(
@@ -1635,6 +1865,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
             in_minutes: Some(1),
             at_ms: None,
         },
+        Provider::Codex,
         now,
     )?;
     let BotChange::Schedule {
@@ -1709,6 +1940,7 @@ fn scheduled_on_both(net: &Net, every_minutes: u32) -> Result<(Store, Store, Str
         "message:m1",
         "r1",
         save_schedule(None, "Digest", every_minutes),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -1887,6 +2119,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r",
             remind(format!("step {depth}")),
+            Provider::Codex,
             now,
         )?;
         assert_eq!(saved.cause.is_some(), depth == 1);
@@ -1910,6 +2143,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r",
             remind("again".into()),
+            Provider::Codex,
             now,
         )
         .unwrap_err();
@@ -1922,6 +2156,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r2",
             rename("Nova"),
+            Provider::Codex,
             now,
         )
         .unwrap_err();
@@ -1972,6 +2207,7 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -2219,6 +2455,7 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             skills: None,
             all_skills: None,
         },
+        Provider::Codex,
         11,
     )?;
     assert_eq!(changed.conversation_id, "d");
@@ -2298,6 +2535,7 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
             "message:m1",
             call_ref,
             request,
+            Provider::Codex,
             5,
         )
     };
@@ -2335,9 +2573,9 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
             .find(|bot| bot.name == "Helper")
             .context("helper")?;
         let ops = bots.iter().find(|bot| bot.name == "Ops").context("ops")?;
-        assert_eq!(helper.model, "");
+        assert!(helper.models.is_empty());
         assert_eq!(helper.skills, Some([skill_id.clone()].into()));
-        assert_eq!(ops.model, "gpt-x");
+        assert_eq!(ops.model(Provider::Codex), Some("gpt-x"));
         assert_eq!(ops.skills, None, "all_skills hands back every skill");
     }
     let prompt = |scope| crate::scheduler::bot_value(&other, &net.network, scope, 0);
@@ -2345,7 +2583,69 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
     assert_eq!(helper["skills"].as_array().map(Vec::len), Some(1));
     assert_eq!(helper["skills"][0]["skill_id"], skill_id.as_str());
     assert_eq!(ops["skills"].as_array().map(Vec::len), Some(2));
-    assert_eq!(ops["configured_bot"]["model"], "gpt-x");
+    assert_eq!(ops["configured_bot"]["models"]["codex"], "gpt-x");
+    Ok(())
+}
+
+/// The provider is device-local, so each device writes and runs the model of its own
+/// provider; a device whose provider has none runs its default, and clearing one model keeps
+/// the other.
+#[test]
+fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let change = |store: &mut Store, call_ref: &str, model: &str, provider| {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            configure("Helper", Some(model), None, None),
+            provider,
+            5,
+        )
+    };
+    let runs = |store: &Store, provider: Provider| -> Result<Option<String>> {
+        let device = crate::config::ManagerSettings {
+            provider: provider.manager_kind(),
+            workspace: "/w".into(),
+            model: "auto".into(),
+            cursor_sdk_bin: "/sdk".into(),
+        };
+        let bot = store.bot_for_conversation(&net.network, "c")?;
+        Ok(crate::scheduler::bot_model(&device, bot.as_ref()))
+    };
+    let (set, _) = change(&mut origin, "k1", "gpt-x", Provider::Codex)?;
+    assert!(matches!(
+        set.change,
+        BotChange::Profile { model: Some(ModelEdit { provider: Provider::Codex, ref before, ref after }), .. }
+            if before.is_empty() && after == "gpt-x"
+    ));
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert_eq!(runs(&other, Provider::Codex)?.as_deref(), Some("gpt-x"));
+    assert_eq!(
+        runs(&other, Provider::Cursor)?,
+        None,
+        "cursor runs its default"
+    );
+
+    change(&mut origin, "k2", "composer-1", Provider::Cursor)?;
+    change(&mut origin, "k3", "", Provider::Codex)?;
+    let same = change(&mut origin, "k4", "", Provider::Codex).unwrap_err();
+    assert!(same.to_string().contains("nothing to change"), "{same}");
+    let mut later = store(&net)?;
+    all_accepted(&mut later, &net, &origin)?;
+    assert_eq!(
+        runs(&later, Provider::Codex)?,
+        None,
+        "an emptied model follows the default"
+    );
+    assert_eq!(
+        runs(&later, Provider::Cursor)?.as_deref(),
+        Some("composer-1")
+    );
     Ok(())
 }
 
@@ -2373,6 +2673,7 @@ fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         4,
     )?;
     let delete = |store: &mut Store, trigger: &str, wanted: &str| {
@@ -2508,6 +2809,7 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
                 memory_id: None,
                 text: text.into(),
             },
+            Provider::Codex,
             10,
         )
     };
@@ -2549,6 +2851,7 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
         "message:m1",
         "k3",
         ChangeRequest::Forget { memory_id },
+        Provider::Codex,
         11,
     )?;
     let mut other = store(&net)?;
@@ -3524,7 +3827,8 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         state: JobState::Queued,
     };
     let materialize = |bot: Value| {
-        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None)
+        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None, None)
+            .map(|(prompt, _)| prompt)
     };
     let newest = json!(
         context
@@ -3594,6 +3898,7 @@ fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
                 memory_id: None,
                 text: format!("Note {i:02}: {}", "keep replies short. ".repeat(20)),
             },
+            Provider::Codex,
             10 + i,
         )?;
     }
@@ -3626,6 +3931,7 @@ fn a_schedule_time_found_too_late_is_skipped() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 60),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -3703,5 +4009,402 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
         second.job.basis,
         "the claimed basis is stored"
     );
+    Ok(())
+}
+
+/// A thread has seen a reply's messages only once its turn started: a refused `turn/start`
+/// leaves them for the next turn on that thread, a started one does not repeat them.
+#[test]
+fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let turn =
+        |store: &mut Store, id: &str, started: bool| -> Result<crate::scheduling::ClaimedJob> {
+            say(store, &net, id, true)?;
+            let claimed = store
+                .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+                .context("job")?;
+            let trigger = claimed.job.trigger.clone();
+            let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+            store.mark_started("c", &trigger, &attempt)?;
+            store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
+            store.record_manager_turn(&attempt, "system", "thread", None, &Default::default())?;
+            let outcome = if started {
+                store.record_manager_turn(
+                    &attempt,
+                    "system",
+                    "thread",
+                    Some("turn"),
+                    &Default::default(),
+                )?;
+                JobOutcome::Completed
+            } else {
+                JobOutcome::Failed("the model is unknown".into())
+            };
+            store.finish_job(
+                &net.a,
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                outcome,
+                "",
+                3,
+            )?;
+            Ok(claimed)
+        };
+    turn(&mut store, "m1", false)?;
+    let second = turn(&mut store, "m2", true)?;
+    assert_eq!(second.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(
+        second.covers, None,
+        "the refused turn's message is sent again"
+    );
+    say(&mut store, &net, "m3", true)?;
+    let third = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(third.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(
+        third.covers.as_ref(),
+        Some(&second.job.basis),
+        "the started turn's messages are not repeated"
+    );
+    Ok(())
+}
+
+/// The scheduling tick hands a moved conversation's queue on even when no bot runs here to
+/// claim it, and the later claim finds nothing left to hand on twice.
+#[test]
+fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut store, &net, "m1", true)?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    let trigger = message_trigger("m1");
+    assert!(store.scheduler_job("c", &trigger)?.is_some());
+    assert!(store.scheduler_outbox()?.is_empty());
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        3,
+    )?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    assert!(store.scheduler_job("c", &trigger)?.is_none());
+    let handed = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .scheduler_outbox()?
+            .into_iter()
+            .map(|e| e.trigger)
+            .collect())
+    };
+    assert_eq!(handed(&store)?, std::slice::from_ref(&trigger));
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    store.fence_moved_turns(&net.network, &local)?;
+    assert_eq!(handed(&store)?, [trigger]);
+    Ok(())
+}
+
+/// After a move the new owner lists what the old one left unanswered, a stopped reply and a
+/// message still queued there, but not one answered inside the reply it was steered into. Only
+/// the user's request queues them, once, with replies of the new owner's own.
+#[test]
+fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> {
+    let net = net()?;
+    let mut a_side = store(&net)?;
+    conversation(&mut a_side, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut a_side, &net, "m1", true)?;
+    let first = a_side
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (t1, a1) = (
+        first.job.trigger.clone(),
+        first.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    a_side.mark_started("c", &t1, &a1)?;
+    a_side.record_manager_turn(&a1, "system", "thread", Some("turn"), &Default::default())?;
+    say(&mut a_side, &net, "m2", true)?;
+    let into = a_side
+        .steer_candidates(&net.network, &local, "boot")?
+        .pop()
+        .context("steer candidate")?
+        .into;
+    let m2 = message_trigger("m2");
+    assert!(a_side.begin_steer(&net.network, &local, "boot", "c", &m2, &into)?);
+    a_side.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &t1,
+        &a1,
+        JobOutcome::Completed,
+        "both",
+        3,
+    )?;
+    let answered = JobState::Steered {
+        into,
+        outcome: SteerOutcome::Answered,
+    };
+    a_side.settle_steer(&net.a, &net.network, "c", &m2, answered.clone())?;
+    a_side.settle_steer(&net.a, &net.network, "c", &m2, answered)?;
+    let markers: i64 = a_side.connection.query_row(
+        "SELECT count(*) FROM events WHERE instr(envelope,'message_steered')>0",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(markers, 1, "a settled steer is recorded once");
+    say(&mut a_side, &net, "m3", true)?;
+    let third = a_side
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (t3, a3) = (
+        third.job.trigger.clone(),
+        third.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    a_side.mark_started("c", &t3, &a3)?;
+    a_side.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &t3,
+        &a3,
+        JobOutcome::Cancelled("stopped".into()),
+        "",
+        4,
+    )?;
+    say(&mut a_side, &net, "m4", true)?;
+    assert!(
+        a_side
+            .unanswered_messages(&net.network, &local, "c")?
+            .is_empty()
+    );
+
+    // The old owner is offline: nothing it holds is handed on.
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        5,
+    )?;
+    let b = net.b.device_id()?;
+    assert_eq!(
+        b_side.unanswered_messages(&net.network, &b, "c")?,
+        ["m3", "m4"]
+    );
+    sync(&b_side, &mut a_side, &net)?;
+    assert!(
+        a_side
+            .unanswered_messages(&net.network, &local, "c")?
+            .is_empty()
+    );
+
+    let asked: Vec<String> = ["m1", "m2", "m3", "m4"].map(String::from).into();
+    let receipts = b_side.reply_unanswered(&net.network, &b, "c", &asked)?;
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|r| (r.trigger.as_str(), r.state.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (message_trigger("m3").as_str(), "queued"),
+            (message_trigger("m4").as_str(), "queued"),
+        ]
+    );
+    let stopped = a_side
+        .scheduler_job("c", &t3)?
+        .context("old job")?
+        .message_id;
+    assert!(b_side.message(&net.network, "c", &stopped)?.is_some());
+    let retried = b_side.scheduler_job("c", &t3)?.context("new job")?;
+    assert_ne!(retried.message_id, stopped);
+    assert!(
+        b_side
+            .message(&net.network, "c", &retried.message_id)?
+            .is_none()
+    );
+    assert!(
+        b_side
+            .reply_unanswered(&net.network, &b, "c", &asked)?
+            .is_empty()
+    );
+    assert!(
+        b_side
+            .unanswered_messages(&net.network, &b, "c")?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// A resumed Codex turn carries its role, the new messages, the works that changed and the bot
+/// only when it changed; the shared rules live in the thread's instructions. Cursor still
+/// reads everything in each prompt.
+#[test]
+fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let work = |i: u64| -> Result<WorkSpec> {
+        Ok(WorkSpec {
+            work_id: format!("w{i}"),
+            conversation: "c".into(),
+            trigger: message_trigger("m1"),
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: format!("call-{i}"),
+            kind: WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".repeat(300),
+            continues: None,
+            parent: None,
+            thread: None,
+        })
+    };
+    for i in 0..3 {
+        store.accept_work(&net.a, &net.network, work(i)?, 10 + i as i64)?;
+    }
+    let render = |store: &Store, trigger: &str, resumed, thread| {
+        let context = store.context(&net.network, "c", None)?;
+        let job = SchedulerJob {
+            conversation_id: "c".into(),
+            trigger: message_trigger(trigger),
+            kind: TriggerKind::Human,
+            sequence: 0,
+            basis: context.basis.clone(),
+            reply_to: trigger.into(),
+            message_id: "reply".into(),
+            state: JobState::Queued,
+        };
+        let works = store.works(&net.network, "c")?;
+        let bot = crate::scheduler::bot_value(store, &net.network, "c", 100)?;
+        let rendered = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            bot,
+            None,
+            None,
+            &[],
+            resumed,
+            thread,
+        )?;
+        Ok::<_, anyhow::Error>((rendered, context.basis))
+    };
+    let rule = "Operate only inside this personal network";
+
+    let ((cursor, _), _) = render(&store, "m1", None, None)?;
+    assert!(
+        cursor.contains(rule),
+        "Cursor reads the rules in each prompt"
+    );
+    let fresh = Shown::default();
+    let ((first, shown), covers) = render(&store, "m1", None, Some(&fresh))?;
+    assert!(!first.contains(rule), "the rules are thread instructions");
+    let data = prompt_data(&first)?;
+    assert_eq!(data["bot"]["configured_bot"]["name"], "Helper");
+    assert_eq!(listed(&data, "/works", "work_id").len(), 3);
+    assert_eq!(data["trigger"]["unavailable_tools"], json!([]));
+
+    store.accept_work(&net.a, &net.network, work(3)?, 20)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", "next"),
+        vec![],
+        21,
+    )?;
+    let ((resumed, shown), covers) = render(&store, "m2", Some(&covers), Some(&shown))?;
+    let data = prompt_data(&resumed)?;
+    assert_eq!(data["bot"], json!({"unchanged":true,"now_ms":100}));
+    assert_eq!(listed(&data, "/works", "work_id"), [json!("w3")]);
+    assert_eq!(data["works_unchanged"], 3);
+    assert_eq!(
+        listed(&data, "/conversation/messages", "text"),
+        [json!("next")]
+    );
+
+    store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m2",
+        "note",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "prefers short replies".into(),
+        },
+        Provider::Codex,
+        22,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m3", "again"),
+        vec![],
+        23,
+    )?;
+    let ((changed, _), _) = render(&store, "m3", Some(&covers), Some(&shown))?;
+    let data = prompt_data(&changed)?;
+    assert_eq!(data["bot"]["memory"][0]["text"], "prefers short replies");
+    assert_eq!(data["works"], json!([]));
+    Ok(())
+}
+
+/// A Codex thread keeps what its turns were shown while the session key holds; a new key, such
+/// as changed thread instructions, opens a new thread that is shown everything again.
+#[test]
+fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let shown = Shown {
+        bot: Some("bot-digest".into()),
+        works: [("w1".to_owned(), "work-digest".to_owned())].into(),
+    };
+    let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
+        say(&mut store, &net, id, true)?;
+        let claimed = store
+            .claim_next(&net.a, &net.network, "c", "boot", key)?
+            .context("job")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started("c", &trigger, &attempt)?;
+        store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
+        store.record_manager_turn(&attempt, "system", "thread", Some("turn"), &shown)?;
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            JobOutcome::Completed,
+            "",
+            3,
+        )?;
+        Ok(claimed)
+    };
+    assert_eq!(turn("m1", "cfg")?.shown, Shown::default());
+    let resumed = turn("m2", "cfg")?;
+    assert_eq!(resumed.previous_native_id.as_deref(), Some("thread"));
+    assert_eq!(resumed.shown, shown);
+    let fresh = turn("m3", "cfg-new-instructions")?;
+    assert_eq!(fresh.previous_native_id, None);
+    assert_eq!(fresh.shown, Shown::default());
     Ok(())
 }

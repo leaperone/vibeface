@@ -5,11 +5,10 @@ import { Details, DetailRow, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { ConnectionEntry } from '@vibeface/client/lib/node.ts'
-import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 
-const hostOf = (address: string) => { try { return new URL(address).host } catch { return '' } }
 const keyOf = (entry: ConnectionEntry) => `${entry.address}|${entry.device_id}|${entry.local === true}`
 
 /** Settings → 连接: where this browser connects, other saved addresses and the raw ids. */

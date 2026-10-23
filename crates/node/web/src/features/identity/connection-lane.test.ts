@@ -20,6 +20,8 @@ test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: false }), 'saved')
   assert.equal(primaryLane({ hasInvitation: false, savedCount: 1, hasLocalSetup: true }), 'local')
   assert.equal(primaryLane({ hasInvitation: true, savedCount: 0, hasLocalSetup: true }), 'invite')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: false, removed: true }), 'invite')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: true, removed: true }), 'local')
 })
 
 const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64)
@@ -162,7 +164,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
       if (specifier === 'react') return react
       if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
       if (specifier.endsWith('/lib/transport.ts')) return transport
-      if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure }
+      if (specifier.endsWith('/lib/secure.ts')) return { secureKit: () => secure, recoveryCode: async () => 'ABCDEF12', recoveryFileName: (code: string) => `vibeface-recovery-${code}.json` }
       const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : specifier.startsWith('@vibeface/client/') ? resolve(clientRoot, specifier.slice(17)) : resolve(dirname(filename), specifier)
       return load(extname(path) ? path : `${path}.ts`)
     }
@@ -490,7 +492,7 @@ test('a join receipt for another invite or device is refused', async () => {
     try {
       app.render(); await settle()
       app.holds.set('join', { promise: Promise.resolve(joinRequest('pending', mismatch)), resolve() {}, reject() {} })
-      await assert.rejects(app.render().join('https://node.example/join#vibeface1ticket', 'browser'), /不一致/)
+      await assert.rejects(app.render().join('https://node.example/join#vibeface1ticket', 'browser'), /对不上/)
       assert.equal(app.render().joining, null)
     } finally { app.close() }
   }

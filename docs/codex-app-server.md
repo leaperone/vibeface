@@ -9,7 +9,7 @@
 | 方法 | 分类 | 处理与展示 |
 |---|---|---|
 | `initialize` | 隐藏 | 连接建立时由客户端发送，不对外暴露 |
-| `thread/start` | 写 | `dispatch_work` 先登记再发；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `thread/start` | 写 | `dispatch_work` 先登记再发；Bot 线程带 `developerInstructions`（工具说明、目录和固定规则），`thread/resume` 再带同一份，App Server 对已加载的线程忽略它；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/resume` | 写 | Node 订阅观察；`vibeface codex send`（带 `thread` 的工作）先 resume |
 | `thread/fork` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/archive` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
@@ -71,8 +71,8 @@
 | `skills/config/write` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/install` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/uninstall` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id`；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
-| `turn/steer` | 写 | `vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id`；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id`；Codex Bot 的回合也用它开始，`clientUserMessageId` 为 attempt ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `turn/steer` | 写 | `vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id`；Bot 回复进行中收到的用户消息先记为 `steering` 再发，`clientUserMessageId` 为消息 ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `turn/interrupt` | 写 | 停止按钮与 `interrupt_work` 经 Node 发送；工作还在开始阶段时停止请求留在本机，回合绑定后立即发送；`vibeface codex call` 拒绝 |
 | `review/start` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `model/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |

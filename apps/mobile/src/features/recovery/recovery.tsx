@@ -132,7 +132,7 @@ export function ReplaceRecovery() {
     <Text className="text-meta text-muted-foreground">换完后旧文件失效</Text>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={setOldPassword} editable={!locked} />
-    <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码（至少 12 个字符）" value={password} onChangeText={setPassword} editable={!locked} />
+    <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码（至少 8 个字符）" value={password} onChangeText={setPassword} editable={!locked} />
     <Input {...passwordProps} accessibilityLabel="再输一次" placeholder="再输一次" value={confirmation} onChangeText={setConfirmation} editable={!locked} />
     {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
     {errorText(error)}

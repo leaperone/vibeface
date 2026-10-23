@@ -6,6 +6,8 @@ export const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",
   queued: "等待处理",
+  steering: "正在并入当前回复",
+  steered: "已并入回复",
   claimed: "正在准备",
   running: "执行中",
   waiting: "需要你同意",
@@ -69,6 +71,8 @@ export function addressName(address: string) {
   if (isLoopback(address)) return "这台电脑"
   try { return new URL(address).hostname } catch { return address }
 }
+
+export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",

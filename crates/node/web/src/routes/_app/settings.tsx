@@ -1,12 +1,12 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { ArchiveRestore, Bell, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
+import { Bell, FileKey, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
-import { RecoveryControls } from '@/features/identity/recovery-controls'
+import { CurrentRecoveryFile, RecoveryControls } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -39,7 +39,8 @@ function SettingsPage() {
       <ConnectionSettings />
     </section>
     {device.ready?.principal.can_manage ? <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
+      <h2 className="flex items-center gap-2 text-heading font-semibold"><FileKey aria-hidden="true" className="size-5" />恢复文件</h2>
+      <CurrentRecoveryFile />
       <RecoveryControls />
     </section> : null}
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">

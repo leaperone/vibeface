@@ -5,6 +5,7 @@ use crate::{
     work::Signal,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -150,10 +151,48 @@ pub struct ManagerAttempt {
     pub permission_version: u64,
 }
 
+/// The running Codex turn a user message was steered into.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteerTarget {
+    /// The attempt of the reply the message joined.
+    pub attempt_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+/// How the reply a message joined ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerOutcome {
+    /// The turn holding the message completed.
+    Answered,
+    /// The message is in a turn that stopped, failed or was interrupted.
+    Unfinished,
+    /// The thread could not be read, or still showed the turn running, in time; whether it
+    /// joined is unknown. Stopping the message after its reply ended also ends it here.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     Queued,
+    /// Sent, or about to be sent, as `turn/steer` into `into`. It is settled from the thread
+    /// once that reply's attempt ended, never sent again. After that, `unread_since_ms` is when
+    /// reading the thread first failed and `running_since_ms` when a read first still showed the
+    /// target turn running.
+    Steering {
+        into: SteerTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unread_since_ms: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_since_ms: Option<i64>,
+    },
+    /// Joined the reply `into`; it gets no reply of its own.
+    Steered {
+        into: SteerTarget,
+        outcome: SteerOutcome,
+    },
     Claimed {
         attempt: ManagerAttempt,
     },
@@ -185,6 +224,8 @@ impl JobState {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::Steering { .. } => "steering",
+            Self::Steered { .. } => "steered",
             Self::Claimed { .. } => "claimed",
             Self::Running { .. } => "running",
             Self::Cancelling { .. } => "cancelling",
@@ -196,7 +237,7 @@ impl JobState {
     }
     pub fn attempt(&self) -> Option<&ManagerAttempt> {
         match self {
-            Self::Queued => None,
+            Self::Queued | Self::Steering { .. } | Self::Steered { .. } => None,
             Self::Cancelled { attempt, .. } => attempt.as_ref(),
             Self::Claimed { attempt }
             | Self::Running { attempt }
@@ -210,6 +251,7 @@ impl JobState {
         matches!(
             self,
             Self::Completed { .. }
+                | Self::Steered { .. }
                 | Self::Failed { .. }
                 | Self::Cancelled { .. }
                 | Self::Interrupted { .. }
@@ -276,12 +318,34 @@ impl OutboxEntry {
     }
 }
 
+/// A queued user message that can join the running reply `into`.
+#[derive(Debug, Clone)]
+pub struct SteerCandidate {
+    pub conversation_id: String,
+    pub trigger: String,
+    pub message_id: String,
+    pub text: String,
+    pub into: SteerTarget,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub job: SchedulerJob,
     pub previous_native_id: Option<String>,
+    /// The tool token the resumed native session's Shell already carries.
+    pub previous_token: Option<String>,
     /// What the resumed native session has already seen; the prompt carries only the rest.
     pub covers: Option<VersionVector>,
+    /// The bot and works the resumed native session was last shown; empty with no `covers`.
+    pub shown: Shown,
+}
+
+/// Digests of the bot and of each work a Codex thread was last shown, kept on this Node with
+/// the session, so a resumed turn sends only what changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shown {
+    pub bot: Option<String>,
+    pub works: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,7 +369,12 @@ pub(crate) struct SchedulerSession {
     /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
     /// basis it has seen and `owner_epoch` the ownership it was built under.
     pub native_id: Option<String>,
+    /// The tool token set in the native session's Shell when it was created. A Codex thread
+    /// keeps the environment it was loaded with, so every turn of it presents this token.
+    pub native_token: Option<String>,
     pub covers: VersionVector,
+    /// Moves with `covers`: what the native session's turns were shown of the bot and works.
+    pub shown: Shown,
     pub owner_epoch: u64,
     pub sdk_config: Option<String>,
     pub permission_version: u64,
@@ -318,7 +387,9 @@ impl SchedulerSession {
             next_sequence: 1,
             active: None,
             native_id: None,
+            native_token: None,
             covers: VersionVector::new(),
+            shown: Shown::default(),
             owner_epoch: 0,
             sdk_config: None,
             permission_version: 1,
@@ -326,8 +397,9 @@ impl SchedulerSession {
     }
 }
 
-/// A coordination process whose exit this Node has not seen. The runtime resolves it once every
-/// recorded process group is gone; only a group that stays alive needs the user.
+/// A coordination turn whose end this Node has not seen. The runtime resolves it once every
+/// recorded process group is gone and its App Server turn has ended; only a group that stays
+/// alive needs the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCheck {
     pub check_id: String,
@@ -336,7 +408,17 @@ pub struct PendingCheck {
     pub attempt_id: String,
     pub detail: String,
     pub process_groups: Vec<u32>,
+    pub codex_turn: Option<ReplyTurn>,
     pub created_at_ms: i64,
+}
+
+/// Where a reply ran on an App Server: `server` as `CodexTarget::server` names it, the thread,
+/// and the turn once it is known.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplyTurn {
+    pub server: String,
+    pub thread: String,
+    pub turn: Option<String>,
 }
 
 impl PendingCheck {

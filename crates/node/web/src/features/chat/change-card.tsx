@@ -1,6 +1,7 @@
 import { useId, type ReactNode } from 'react'
 import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
+import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
 import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
@@ -35,7 +36,7 @@ function ChangeRows({ change, schedules }: { change: BotChange; schedules: reado
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
-    {change.model ? <Row icon={Cpu} label='模型'><BeforeAfter before={change.model.before || '跟随设备'} after={change.model.after || '跟随设备'} /></Row> : null}
+    {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} /></Row> : null}
     {change.skills ? <Row icon={BookOpen} label='skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
@@ -112,7 +113,7 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
   const schedule = after ?? before!
   const once = schedule.every_minutes === undefined
   const icon = once ? AlarmClock : Repeat
-  const tag = !before ? (once ? '新提醒' : '新定时任务') : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
+  const tag = !before ? '新定时任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
   if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />
   const frequency = scheduleFrequency(after), previous = before ? scheduleFrequency(before) : frequency
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null

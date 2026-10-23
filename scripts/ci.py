@@ -23,7 +23,7 @@ DEPENDENTS = {
 CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi"), PACKAGES))
 PATH_RULES = (
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
-    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*", "crates/node/sdk/README.md")),
+    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -265,7 +265,7 @@ def self_test():
     assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web"]
     assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web"]
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
-    docs = make_plan(["README.md", "docs/node.md", "crates/node/sdk/README.md"])
+    docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["required_jobs"] == ["quick-check"]
     expected = {
         "node": ["vibeface"],

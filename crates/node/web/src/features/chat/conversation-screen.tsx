@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareWarning, Send } from 'lucide-react'
+import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, WifiOff } from 'lucide-react'
 import { ActionCard, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -25,7 +25,7 @@ import './chat.css'
 
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 const replyStates: Record<string, string> = { failed: '回复失败', rejected: '没有处理' }
-const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
+const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 
 export function ConversationScreen() {
   const workspace = useWorkspace()
@@ -38,6 +38,7 @@ export function ConversationScreen() {
   const bot = workspace.selectedBot
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
+  const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
@@ -64,7 +65,7 @@ export function ConversationScreen() {
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
-    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
+    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
   }
 
   // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
@@ -84,10 +85,13 @@ export function ConversationScreen() {
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
-  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued'].includes(job.state)).map((job) => job.message_id) : [])
+  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
+  // Steering already went into the running reply; it only settles once that reply ends.
+  const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
+  const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
-  for (const message of threadReplies(data?.messages ?? [])) {
+  for (const message of threadReplies(data?.messages ?? [], merged)) {
     const start = entries.length
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
     const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
@@ -95,7 +99,7 @@ export function ConversationScreen() {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
+    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message))
     const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error
     if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
     for (const job of jobs) {
@@ -106,7 +110,7 @@ export function ConversationScreen() {
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
     const turn = placedChanges.after.get(message.message_id)
     if (turn) entries.push(changeRow(turn))
-    if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: 'queued' as const } } : entry))
+    if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
   entries.push(...asides.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
@@ -118,6 +122,7 @@ export function ConversationScreen() {
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
   const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   if (botBusy && !live.length) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
   entries.push(...waiting)
@@ -131,9 +136,12 @@ export function ConversationScreen() {
         if (await workspace.sendMessage(messagePending.text) && workspace.isCurrent()) clearSentDraft(messagePending.conversation_id, messagePending.text)
       }}>重新发送</ActionButton>
     </>}><p className="line-clamp-2 text-muted-foreground">{messagePending.text}</p></ActionCard> : null,
-    ownerAway && owner ? <ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`} actions={
-      <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}>交给这台设备处理</ActionButton>
+    ownerAway && owner && here ? <ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`} actions={
+      <ActionButton variant="default" disabled={!workspace.writable} action={() => workspace.takeOver()}><ArrowRightLeft aria-hidden="true" />换到 {nodeName(here.device_id, lookup)}</ActionButton>
     } /> : null,
+    unanswered.length ? <ActionCard key="unanswered" icon={MessageSquareReply} title={unanswered.length > 1 ? `${unanswered.length} 条消息没等到回复` : '这条消息没等到回复'} actions={
+      <ActionButton variant="default" disabled={!workspace.writable || !agentReady} action={() => workspace.replyUnanswered(unanswered)}>{here ? <><Laptop aria-hidden="true" />由 {nodeName(here.device_id, lookup)} 回复</> : '现在回复'}</ActionButton>
+    }>{lastUnanswered ? <p className="line-clamp-2 text-muted-foreground">{lastUnanswered.text}</p> : null}</ActionCard> : null,
     ...checks.map((check) => <ConfirmCard key={check.check_id} check={check} />),
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
@@ -149,6 +157,7 @@ export function ConversationScreen() {
   const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
+  const setupTo = managerOffline || !ready ? '/devices' : '/devices/$deviceId'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -184,9 +193,10 @@ export function ConversationScreen() {
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <Bot aria-hidden="true" className="size-8 text-muted-foreground" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
-          <div className="flex flex-wrap justify-center gap-2">
-            {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
-          </div>
+          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }}><Bot aria-hidden="true" />{managerOffline ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            : <div className="flex flex-wrap justify-center gap-2">
+              {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+            </div>}
         </div> : null}
       />
       <PromptInput
@@ -206,7 +216,7 @@ export function ConversationScreen() {
       >
         <InlineError error={sendError} />
         {cards.length || asked ? <button type="button" className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-4 max-md:min-h-11" onClick={toCards}>去处理</button> : null}
-        {needsSetup ? <Link to={managerOffline || !ready ? '/devices' : '/devices/$deviceId'} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
+        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
   )
@@ -215,21 +225,21 @@ export function ConversationScreen() {
 type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord; joined?: string }
 
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
-function TaskCard({ task, botId, device, open, live }: { task: TaskRow; botId: string; device: string; open: boolean; live: boolean }) {
+function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
   const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} state={task.state} className="text-meta" /></span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>
         : taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
@@ -237,10 +247,11 @@ function TaskCard({ task, botId, device, open, live }: { task: TaskRow; botId: s
 }
 
 /** Device and state never yield to a long title: below `sm` they take their own line. */
-function TaskMeta({ device, state, className = '' }: { device: string; state: string; className?: string }) {
+function TaskMeta({ device, here, state, className = '' }: { device: string; here: boolean; state: string; className?: string }) {
+  const Icon = here ? Laptop : Server
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden sm:inline">·</span>
-    <Laptop aria-hidden="true" className="size-3.5 shrink-0" />
+    <Icon aria-hidden="true" className="size-3.5 shrink-0" />
     <span className="truncate">{device}</span>
     <span aria-hidden="true">·</span>
     <span className="shrink-0">{taskLabel(state)}</span>

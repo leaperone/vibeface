@@ -578,6 +578,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),
+    /** Queuing is keyed by message, so an unknown outcome is settled by reading the conversation again. */
+    replyUnanswered: (messageIds: string[]) => withMutation(`unanswered:${activeId.current}`, async () => {
+      const id = activeId.current
+      requireBotContext(id)
+      try { await connection.rpc("reply_unanswered", { conversation_id: id, message_ids: messageIds }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      if (activeId.current === id) await refreshRef.current()
+    }),
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
       const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
       try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
@@ -608,7 +617,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText("已交给这台设备处理，排队的消息会在这里继续。")
+      setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "这台设备"}`)
       if (activeId.current === id) await refreshRef.current()
     }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {

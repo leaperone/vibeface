@@ -21,18 +21,19 @@ export type DeviceRow = {
 
 export function useDeviceRows(): DeviceRow[] {
   const { directory, ready, identity } = useDevice()
-  const { nodes } = useWorkspace()
+  const { nodes, connectionOnline } = useWorkspace()
   const members = directory?.members ?? []
   const removed = new Set(directory?.revoked.map((item) => item.device_id))
   const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])].filter((id) => !removed.has(id))
   const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
-    const kind = member?.kind ?? "node"
+    const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
-      entry: id === ready?.entry.device_id, browser: id === identity?.deviceId,
-      online: kind === "node" ? node?.online ?? false : undefined, bot: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
+      entry, browser: id === identity?.deviceId,
+      // Before the device list arrives, the computer this page talks through is as online as the connection.
+      online: kind === "node" ? node?.online ?? (entry && connectionOnline) : undefined, bot: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -46,10 +47,10 @@ function Tag({ children }: { children: ReactNode }) {
   return <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
-/** `compact`: the dot alone, for the list where every row would repeat the word. */
+/** `compact`: the list names only the exception, so an online row shows the dot alone. */
 function Online({ online, compact = false }: { online: boolean; compact?: boolean }) {
-  return <span title={compact ? (online ? "在线" : "离线") : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
-    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && "sr-only")}>{online ? "在线" : "离线"}</span>
+  return <span title={compact && online ? "在线" : undefined} className={cn("flex shrink-0 items-center gap-1.5 text-meta", online ? "text-success" : "text-muted-foreground")}>
+    <span aria-hidden="true" className={cn("size-2 rounded-full", online ? "bg-success" : "border border-muted-foreground")} /><span className={cn(compact && online && "sr-only")}>{online ? "在线" : "离线"}</span>
   </span>
 }
 
@@ -169,7 +170,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
     </Details>
 
-    {canManage && row.member && !row.admin && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
+    {canManage && row.member && !row.entry && !row.browser ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
       {removing ? <>
         <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
         <div className="flex flex-wrap justify-end gap-2">

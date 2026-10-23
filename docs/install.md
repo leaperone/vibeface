@@ -1,6 +1,6 @@
 # 安装与管理节点
 
-Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 包尚无 Apple 开发者签名或 notarization。
+Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
 ## npm Nightly
 
@@ -23,13 +23,7 @@ vibeface service stop
 npm install -g @leaperone/vibeface@nightly
 ```
 
-若使用随包 Codex SDK 管理 Agent，首次安装及每次升级后都需为新包安装锁定依赖。将下面的 `<target>` 替换为本机平台：macOS ARM64 使用 `aarch64-apple-darwin`，Linux x64 使用 `x86_64-unknown-linux-gnu`，Linux ARM64 使用 `aarch64-unknown-linux-gnu`。隔离安装时，改用对应 prefix 下的包路径。
-
-```sh
-npm ci --prefix "$(npm root -g)/@leaperone/vibeface/vendor/<target>/sidecars" --omit=dev --ignore-scripts
-```
-
-完成所需依赖安装后，再启动服务并核对状态：
+再启动服务并核对状态：
 
 ```sh
 vibeface service start

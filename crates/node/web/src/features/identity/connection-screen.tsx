@@ -1,13 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { messageOf, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
-import { passphrase } from '@vibeface/client/lib/secure.ts'
+import { passphrase, recoveryCode, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
@@ -183,13 +183,15 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const [notice, setNotice] = useState('')
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(firstLane ?? null)
-  const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
+  const [names, setNames] = useState<Names | null>(null)
+  // Going back from the password keeps what was typed.
+  const [draftNames, setDraftNames] = useState<Names | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
   // A removed computer that started over keeps its old name, and joining again is its next step.
   const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
   const hostName = useComputerName(device.localSetup?.kind === 'uninitialized' && !formerName ? device.localSetup.entry : undefined)
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName) })
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName), removed: device.error === BROWSER_REMOVED })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -256,8 +258,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
-  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} onNext={setNames} />
-  else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
+  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} initial={draftNames} onNext={setNames} />
+  else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title="这台电脑">
     {device.localSetup.kind === 'initialized'
       ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
@@ -265,7 +267,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
-      <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
+      <span className="min-w-0 flex-1 truncate" title={entry.address}>{device.entryName(entry) || addressName(entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(entry.address)}</span></span>
       <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
     </li>)}</ul>
   </Panel>
@@ -288,9 +290,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
-    {publicEntry || thisComputer
-      ? <p className="text-meta text-muted-foreground">链接来自{thisComputer ? '已有设备' : '你的电脑'}上的“添加设备”</p>
-      : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
+    <p className="text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>
+    {publicEntry || thisComputer ? null : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
@@ -319,11 +320,22 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </main>
 }
 
-function NamesStep({ computer, onNext }: { computer?: string; onNext(names: { computer: string; browser: string }): void }) {
-  return <Panel icon={Laptop} title="给设备起名">
-    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() }) }}>
-      <Field label="这台电脑叫什么？"><Input key={computer} name="computer" required maxLength={128} autoComplete="off" defaultValue={computer || defaultComputerName()} /></Field>
-      <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
+type Names = { computer: string; browser: string }
+
+/** The browser's suggested name is usually fine, so only the computer's name asks for a thought. */
+function NamesStep({ computer, initial, onNext }: { computer?: string; initial: Names | null; onNext(names: Names): void }) {
+  const [browser, setBrowser] = useState(initial?.browser ?? defaultBrowserName())
+  const [renaming, setRenaming] = useState(false)
+  return <Panel icon={Laptop} title="给这台电脑起名">
+    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: browser.trim() || defaultBrowserName() }) }}>
+      <Input key={computer} name="computer" aria-label="这台电脑叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
+      {renaming
+        ? <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" autoFocus value={browser} onChange={(event) => setBrowser(event.target.value)} /></Field>
+        : <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
+          <Monitor aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">这个浏览器：</span>
+          <span className="min-w-0 truncate" title={browser}>{browser}</span>
+          <Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="改浏览器名称" title="改浏览器名称" onClick={() => setRenaming(true)}><Pencil aria-hidden="true" /></Button>
+        </p>}
       <Button type="submit" className="w-fit justify-self-end">下一步</Button>
     </form>
   </Panel>
@@ -332,17 +344,17 @@ function NamesStep({ computer, onNext }: { computer?: string; onNext(names: { co
 type Run = (action: () => Promise<void>) => Promise<void>
 
 /** Step 2a: the recovery password; the file is sealed with it right away. */
-function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: { computer: string; browser: string }; onBack(): void; run: Run }) {
+function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
   const [show, setShow] = useState(false)
   const [short, setShort] = useState(false)
-  return <Panel icon={FileKey} title="设置恢复">
+  return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
       const input = form.elements.namedItem('password') as HTMLInputElement
-      if ([...input.value].length < 12) { setShort(true); input.focus(); return }
+      if ([...input.value].length < 8) { setShort(true); input.focus(); return }
       void run(async () => {
         try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password'), value(form, 'password')), names.computer) }
         finally { form.reset() }
@@ -350,11 +362,11 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
-          <span className="flex gap-2">
-            <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-            <Button type="button" variant="ghost" size="icon" aria-label={show ? '隐藏密码' : '显示密码'} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+          <span className="relative">
+            <Input type={show ? 'text' : 'password'} name="password" className="pe-9 max-md:pe-11" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
+            <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={show ? '隐藏密码' : '显示密码'} aria-pressed={show} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
           </span>
-          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 12 个字符，忘了就无法找回</span>
+          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
@@ -370,8 +382,21 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [file, setFile] = useState('')
+  const networkId = device.review?.networkId
+  useEffect(() => {
+    if (!networkId) return
+    let live = true
+    void recoveryCode(networkId).then((code) => { if (live) setFile(recoveryFileStem(code)) })
+    return () => { live = false }
+  }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
-    <Button type="button" variant={downloaded ? 'outline' : 'default'} className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : <><Download aria-hidden="true" />下载恢复文件</>}</Button>
+    <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />文件用恢复密码加密，没有密码打不开</p>
+    {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
+      <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
+      <span className="min-w-0 flex-1 py-2 font-mono [overflow-wrap:anywhere]">{file}</span>
+      <Button type="button" variant="ghost" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup() })}>重新下载</Button>
+    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}><Download aria-hidden="true" />下载恢复文件</Button>}
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>

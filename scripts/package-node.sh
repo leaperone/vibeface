@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: package-node.sh [--skip-build] [--target RUST_TARGET] [--output DIRECTORY]
 
-Builds and packages the node binary, SDK sidecar sources, docs, and user service installer.
+Builds and packages the node binary, docs, and user service installer.
 The default output is .artifacts/packages. Provider runtimes and credentials are not bundled.
 USAGE
 }
@@ -26,6 +26,19 @@ while (($#)); do
     *) usage >&2; exit 2 ;;
   esac
 done
+
+notary_vars=0
+for var in VIBEFACE_NOTARY_KEY VIBEFACE_NOTARY_KEY_ID VIBEFACE_NOTARY_ISSUER; do
+  if [[ -n "${!var:-}" ]]; then notary_vars=$((notary_vars + 1)); fi
+done
+if ((notary_vars != 0 && notary_vars != 3)); then
+  echo 'Set all of VIBEFACE_NOTARY_KEY, VIBEFACE_NOTARY_KEY_ID and VIBEFACE_NOTARY_ISSUER, or none.' >&2
+  exit 1
+fi
+if ((notary_vars == 3)) && [[ -z "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
+  echo 'Notarization needs VIBEFACE_CODESIGN_IDENTITY.' >&2
+  exit 1
+fi
 
 cd "$repo"
 build_args=(build --release -p vibeface --locked)
@@ -48,7 +61,6 @@ crypto="$repo/crates/node/web/generated"
 }
 if "$build"; then cargo "${build_args[@]}"; fi
 [[ -x "$binary" ]] || { printf 'Release binary is missing: %s\n' "$binary" >&2; exit 1; }
-[[ -d "$repo/crates/node/sdk" ]] || { echo 'Node SDK sidecar sources are missing.' >&2; exit 1; }
 version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
 case "$version$target" in *[!a-zA-Z0-9._-]*) echo 'Invalid package version or target.' >&2; exit 1 ;; esac
@@ -63,8 +75,28 @@ staging="$(mktemp -d "$output/.vibeface-package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 name="vibeface-$version-$target"
 package="$staging/$name"
-mkdir -p "$package/sidecars" "$package/scripts" "$package/web"
+mkdir -p "$package/scripts" "$package/web"
 cp "$binary" "$package/vibeface"
+if [[ "$target" == *-apple-darwin && -n "${VIBEFACE_CODESIGN_IDENTITY:-}" ]]; then
+  codesign --force --options runtime --timestamp --identifier cn.leaperone.vibeface --sign "$VIBEFACE_CODESIGN_IDENTITY" "$package/vibeface"
+  codesign --verify --strict "$package/vibeface"
+  if ((notary_vars == 3)); then
+    notary="$(mktemp -d)"
+    trap 'rm -rf "$staging" "$notary"' EXIT
+    ditto -c -k --keepParent "$package/vibeface" "$notary/vibeface.zip"
+    xcrun notarytool submit "$notary/vibeface.zip" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" --wait --timeout 30m --output-format json > "$notary/result.json" || true
+    submission='' status=''
+    read -r submission status < <(python3 -c 'import json, sys; r = json.load(open(sys.argv[1])); print(r.get("id", ""), r.get("status", ""))' "$notary/result.json" 2> /dev/null) || true
+    if [[ "$status" != 'Accepted' ]]; then
+      printf 'Notarization %s: %s\n' "${submission:-failed}" "${status:-unknown}" >&2
+      cat "$notary/result.json" >&2
+      if [[ -n "$submission" ]]; then
+        xcrun notarytool log "$submission" --key "$VIBEFACE_NOTARY_KEY" --key-id "$VIBEFACE_NOTARY_KEY_ID" --issuer "$VIBEFACE_NOTARY_ISSUER" >&2 || true
+      fi
+      exit 1
+    fi
+  fi
+fi
 data_epoch="$(sed -n 's/^pub const DATA_EPOCH: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
 update_protocol="$(sed -n 's/^pub const UPDATE_PROTOCOL: u32 = \([0-9][0-9]*\);$/\1/p' "$repo/crates/node/src/config.rs")"
 [[ -n "$data_epoch" && -n "$update_protocol" ]] || { echo 'DATA_EPOCH or UPDATE_PROTOCOL not found in crates/node/src/config.rs' >&2; exit 1; }
@@ -74,20 +106,15 @@ cp "$repo/scripts/install-node-service.sh" "$package/scripts/"
 cp "$repo/README.md" "$package/"
 cp -R "$repo/docs" "$package/docs"
 if [[ -f "$repo/LICENSE" ]]; then cp "$repo/LICENSE" "$package/"; fi
-while IFS= read -r -d '' source; do
-  cp "$source" "$package/sidecars/"
-done < <(find "$repo/crates/node/sdk" -maxdepth 1 -type f \( -name '*.mjs' -o -name 'package.json' -o -name 'package-lock.json' -o -name 'README.md' \) -print0)
-[[ -f "$package/sidecars/package.json" && -f "$package/sidecars/package-lock.json" && -f "$package/sidecars/codex-manager.mjs" ]] || { echo 'SDK sidecar entry, lockfile, or package manifest is missing.' >&2; exit 1; }
 cat > "$package/RUNTIME-REQUIREMENTS.md" <<'REQUIREMENTS'
 # Runtime requirements
 
-The archive contains the Rust node binary and SDK sidecar sources. Install the provider tools separately before enabling the bot.
+The archive contains the Rust node binary. Install the provider tools separately before enabling the bot.
 
-- Codex SDK work and native App Server access need the `codex` CLI and its authenticated account.
-- The Codex SDK sidecar needs Node.js 18 or newer. Run `npm ci --omit=dev` in `sidecars/` before using it.
+- Codex bots and native App Server access need the `codex` CLI and its authenticated account.
 - Cursor scheduling needs the official Cursor SDK bridge executable and CURSOR_API_KEY in the service environment.
 
-Use absolute provider and sidecar paths in `config.json` when running a background service. No credentials, provider runtimes, or npm dependencies are included.
+Use absolute provider paths in `config.json` when running a background service. No credentials or provider runtimes are included.
 REQUIREMENTS
 tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
 cd "$output"

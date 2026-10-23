@@ -41,8 +41,8 @@ export type Platform = {
   /** Calls `listener` each time the app comes back to the foreground. */
   onForeground(listener: () => void): () => void
   foreground(): boolean
-  /** Hands a sealed recovery file to the person to keep. */
-  saveRecovery(bytes: Uint8Array): void | Promise<void>
+  /** Hands a sealed recovery file to the person to keep, under `name`. */
+  saveRecovery(bytes: Uint8Array, name: string): void | Promise<void>
   /** How messages name this device: 这个浏览器, 这台手机. */
   self: string
   page?: LocalPage

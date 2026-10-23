@@ -52,7 +52,7 @@ test("capabilities parse the actual provider name and reject malformed node list
 })
 test("works, reply status and pending checks keep their exact shape", () => {
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], capabilities: { streaming: true, cancel: false, steer: false } }
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], unanswered: [], capabilities: { streaming: true, cancel: false, steer: false } }
   const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped" }
   const sent = { message_id: "one", event_hash: "sent", role: "user", text: "看附件", created_at_ms: 0, attachments: [{ hash: "file", size: 20, name: "报告.pdf" }] }
   const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message, sent] })
@@ -88,7 +88,8 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(delivered.works[1], { work_id: "new", trigger: "", target_node: "other", cwd: "/p", title: "新任务", prompt: "", state: "dispatch_rejected", summary: "", outcome: null, result_text: "", failure_reason: "project unavailable" })
   assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
-  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
+  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }], unanswered: [] } }).scheduler?.jobs[0].state, "pending_delivery")
+  assert.throws(() => parseConversation({ ...context, scheduler: { jobs: [] } }), "the unanswered list is always sent")
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
@@ -181,7 +182,7 @@ test("workspace preserves bot and message requests while routing native decision
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
-  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", model: "", skills: null, event_hash: "bot-event", last_message: null }
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, event_hash: "bot-event", last_message: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
@@ -227,7 +228,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
-        const created = parseBot({ ...body, model: "", skills: null, event_hash: "new-bot-event" })
+        const created = parseBot({ ...body, models: {}, skills: null, event_hash: "new-bot-event" })
         knownBots = [...knownBots.filter((item) => item.bot_id !== created.bot_id), created]
         return { bot: created }
       }
@@ -675,10 +676,10 @@ test("connection form keeps current errors and busy ownership when an earlier co
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
     connectionGeneration: () => generation, entries: [{ address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
-    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
+    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '', entryName: () => '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address } })
+  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ props }) => props.children === '连接')?.props
   try {
@@ -705,7 +706,7 @@ test("artifact reads retain their offset while old responses cannot append or un
   let currentWorkspace = workspace()
   const app = componentHarness('../chat/elements/artifact.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/workspace/model.ts': { formatSize } })
   const render = () => app.render('Artifact', { file: { hash: 'result', size: 5, name: 'notes.txt' } })
-  const open = () => render().find(({ props }) => props.children === '打开')?.props
+  const open = () => render().find(({ props }) => props.label === '打开')?.props
   try {
     open()?.action?.(); assert.equal(open()?.disabled, true)
     const old = work

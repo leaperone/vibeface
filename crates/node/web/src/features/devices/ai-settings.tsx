@@ -6,11 +6,10 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { terms } from "@/lib/glossary"
-import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
-const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
-const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
 const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
@@ -20,10 +19,7 @@ const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon:
 // Names come from runtime/settings.rs readiness.missing.
 const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> = {
   codex: [
-    { key: "Node.js", label: "缺少 Node.js 18 以上", doc: "node.md#使用-codex-sdk" },
     { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
-    { key: "Codex SDK sidecar", label: "Vibeface 安装不完整，请重新安装", doc: "install.md" },
-    { key: "Codex SDK dependencies", label: "Bot 组件还没装好", doc: "install.md#npm-nightly" },
   ],
   cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
 }
@@ -60,8 +56,8 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
 }
 
 /** Where Codex work runs: the App Server already running on this computer, or one the device starts. */
-function AppServerSettings({ server, working, busy, save, test }: {
-  server: AppServer; working: boolean; busy: string
+function AppServerSettings({ server, working, blocked, busy, save, test }: {
+  server: AppServer; working: boolean; blocked: boolean; busy: string
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
   const [socket, setSocket] = useState(server.socket ?? "")
@@ -84,11 +80,11 @@ function AppServerSettings({ server, working, busy, save, test }: {
           <Icon aria-hidden="true" />{text}
         </Button>)}
       </div>
-      <Button type="button" variant="ghost" disabled={working || testing || link.state === "off"} onClick={() => void runTest()}>
+      <Button type="button" variant="ghost" disabled={working || testing || blocked || link.state === "off"} onClick={() => void runTest()}>
         <BusyIcon busy={testing} icon={PlugZap} />测试连接
       </Button>
     </div>
-    <LinkLine link={shown} prefix={tested ? "测试：" : ""} />
+    {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
     {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <code className="font-mono text-meta break-all text-muted-foreground">{shown.reason}</code> : null}
     {server.mode === "system" ? <Details label="手动指定">
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
@@ -117,7 +113,7 @@ type Failure = { at: ProviderId | "roots" | null; cause: unknown }
  * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
  * change saves right away. Variable values are write-only; the device only says which are set.
  */
-export function AiSettings({ onboarding = false }: { onboarding?: boolean }) {
+export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean; onBot?(on: boolean): void }) {
   const { ready } = useDevice()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [busy, setBusy] = useState("")
@@ -154,6 +150,18 @@ export function AiSettings({ onboarding = false }: { onboarding?: boolean }) {
     }
   }
   const starting = response?.providers.some((item) => item.state === "starting")
+  const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
+  const botReady = Boolean(response?.providers.some((item) => item.roles.includes("agent") && item.state === "ready") && !response?.readiness.missing.length)
+  useEffect(() => { onBot?.(botReady) }, [botReady])
+  // During setup the first provider that works runs the bot, so "可用" never leaves the chat without one.
+  const autoBot = useRef(false)
+  useEffect(() => {
+    if (!onboarding || !response || botOn || autoBot.current) return
+    const usable = response.providers.find((item) => item.state === "ready")
+    if (!usable) return
+    autoBot.current = true
+    void call(`${usable.provider}:bot`, usable.provider, "configure_provider", { provider: usable.provider, bot: true })
+  }, [response])
   useEffect(() => {
     if (!starting) return
     const timer = setTimeout(() => void load(), 2000)
@@ -186,7 +194,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
   change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
-  const name = providerNames[item.provider], Icon = icons[item.provider]
+  const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const manager = bot ? response.settings.manager : null
   const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
@@ -224,6 +232,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     {issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
+      {issue.code === "bin_missing" ? <a className="font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">怎么装</a> : null}
       {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="font-medium text-foreground underline underline-offset-4" disabled={working}
         onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
         : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
@@ -237,7 +246,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
       <div className="grid gap-4 px-3 pb-3">
-        {item.app_server ? <AppServerSettings server={item.app_server} working={working} busy={busy} save={change} test={test} /> : null}
+        {item.app_server ? <AppServerSettings server={item.app_server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test} /> : null}
 
         {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
           <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
@@ -294,7 +303,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   </li>
 }
 
-const botFields = ["model", "workspace", "cursor_sdk_bin", "node_bin", "codex_sdk_script"] as const
+const botFields = ["model", "workspace", "cursor_sdk_bin"] as const
 
 /** The bot's model, folder and programs, inside the settings of the provider it runs on. */
 function BotDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
@@ -306,12 +315,12 @@ function BotDetails({ manager, fixBin, working, busy, save }: { manager: Manager
       placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim(), node_bin: draft.node_bin.trim(), codex_sdk_script: draft.codex_sdk_script.trim() })
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim() })
   }}>
     <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
     {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
     {field("workspace", "Bot 工作文件夹")}
-    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : <>{field("node_bin", "Node.js")}{field("codex_sdk_script", "Codex 组件")}</>}
+    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }

@@ -92,11 +92,11 @@ export const webPlatform: Platform = {
     return () => document.removeEventListener('visibilitychange', visible)
   },
   foreground: () => !document.hidden,
-  saveRecovery(bytes) {
+  saveRecovery(bytes, name) {
     const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'application/json' }))
     const link = document.createElement('a')
     link.href = url
-    link.download = `vibeface-recovery-${new Date().toLocaleDateString('sv')}.json`
+    link.download = name
     link.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   },

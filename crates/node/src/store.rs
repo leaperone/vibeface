@@ -78,17 +78,45 @@ pub(crate) fn install_trust_bundle_in(
             |r| r.get(0),
         )
         .optional()?;
-    let merged = if let Some(previous) = &previous {
-        serde_json::from_str::<NetworkState>(previous)?.merge(state)?
-    } else {
-        state.clone()
+    let previous_state = previous
+        .as_deref()
+        .map(serde_json::from_str::<NetworkState>)
+        .transpose()?;
+    let merged = match &previous_state {
+        Some(previous) => previous.merge(state)?,
+        None => state.clone(),
     };
     let encoded = serde_json::to_string(&merged)?;
     if previous.as_ref() == Some(&encoded) {
         return Ok(false);
     }
     connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
+    if previous_state.as_ref().map(NetworkState::recovery_key) != Some(merged.recovery_key()) {
+        connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('recovery_since',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [format!("{}:{}", merged.recovery_key(), crate::runtime::now_ms())],
+        )?;
+    }
     log::recompute(connection, &merged.project()?)
+}
+
+/// When this Node first saw `recovery_key`; signed records carry no time of their own.
+pub(crate) fn recovery_since_ms(
+    connection: &Connection,
+    recovery_key: &str,
+) -> Result<Option<i64>> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key='recovery_since'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value
+        .as_deref()
+        .and_then(|value| value.split_once(':'))
+        .filter(|(key, _)| *key == recovery_key)
+        .and_then(|(_, ms)| ms.parse().ok()))
 }
 
 /// Total order shared by prompts and UI: a Kahn sort of the DAG with ties broken by

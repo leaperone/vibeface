@@ -1,25 +1,24 @@
 //! Management SDKs receive visible context and explicit Node capabilities.
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    process::Stdio,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-    sync::{Mutex, watch},
-};
+use tokio::sync::{Mutex, watch};
 pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
-use vibeface_bridge::agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn};
+use vibeface_bridge::{
+    agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
+    codex::DirectSession,
+};
 
-const MAX_LINE: usize = 1_048_576;
-const MAX_STREAM: usize = 16_777_216;
+/// Codex accepts 65536 bytes of user input per message.
+const MAX_PROMPT: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -39,12 +38,27 @@ pub enum Sdk {
         sdk_bin: PathBuf,
         agents: Arc<Mutex<HashMap<String, String>>>,
     },
-    /// Each turn runs its own sidecar; `vibeface tool` reads the turn from its environment.
-    Codex {
-        node_bin: PathBuf,
-        codex_bin: PathBuf,
-        sdk_script: PathBuf,
-    },
+    /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
+    /// from the Shell environment the thread was created with.
+    Codex { socket: PathBuf },
+}
+
+/// Records a turn's `(thread, turn)` on the App Server; the turn is `None` before `turn/start`.
+pub type TurnRecorder = Arc<
+    dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How the Node finds a Codex turn again: its user message carries `client_id`, and `record`
+/// keeps where it runs before anything can run in it.
+#[derive(Clone)]
+pub struct CodexTurn {
+    pub client_id: String,
+    pub record: TurnRecorder,
+    /// The prompt for a new thread, sent instead when the resumed thread is gone: the turn's
+    /// own prompt then leaves out what only the old thread had seen.
+    pub fresh_prompt: Option<String>,
 }
 
 #[derive(Clone)]
@@ -55,12 +69,15 @@ pub struct ManagerConfig {
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
+    /// Guidance that holds for the whole Codex thread; see `codex_instructions`.
+    pub instructions: String,
     pub tool_env: BTreeMap<String, String>,
     /// Lets this turn's tool calls act as it; without one they are refused.
     pub tool_token: Option<String>,
     /// The variables this Node set for the provider of `sdk`, over its own environment.
     pub provider_env: BTreeMap<String, String>,
     pub process_started: Option<agent::ProcessStarted>,
+    pub codex_turn: Option<CodexTurn>,
 }
 
 impl ManagerKind {
@@ -69,13 +86,13 @@ impl ManagerKind {
             "verified": false,
             "streaming": true,
             "cancel": true,
-            "steer": false,
+            "steer": self == ManagerKind::CodexSdk,
             "resume_local_session": true,
             "text_stream_mode": match self { ManagerKind::CursorSdk => "delta_and_snapshot", ManagerKind::CodexSdk => "snapshot" },
             "cancel_request": true,
             "cancel_confirmation": true,
-            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "managed_process_tree_exit" },
-            "native_steer": false,
+            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "app_server_turn_end" },
+            "native_steer": self == ManagerKind::CodexSdk,
             "run_reconcile": false,
         })
     }
@@ -186,14 +203,10 @@ where
                     .into()
                 })
         }
-        Sdk::Codex {
-            node_bin,
-            codex_bin,
-            sdk_script,
-        } => {
+        Sdk::Codex { socket } => {
             run_codex(
                 config,
-                (node_bin, codex_bin, sdk_script),
+                socket,
                 prompt,
                 previous_session_id,
                 persist_session,
@@ -205,11 +218,169 @@ where
     }
 }
 
+/// The developer instructions a Codex thread starts and resumes with: how to reach Node tools,
+/// their catalog, then `instructions`. Codex keeps them with the thread, so turns carry only
+/// their own prompt. Node tools go through the CLI in its Shell, whose environment carries the
+/// turn's scope.
+pub fn codex_instructions(
+    tool_cli: Option<&Path>,
+    tools: &BTreeMap<String, CustomToolConfig>,
+    instructions: &str,
+) -> String {
+    let Some(cli) = tool_cli else {
+        return instructions.into();
+    };
+    let executable = format!("'{}'", cli.to_string_lossy().replace('\'', r#"'"'"'"#));
+    let with_call_ref = tools
+        .iter()
+        .filter(|(_, spec)| {
+            spec.input_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|name| name == "call_ref"))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let catalog = tools
+        .iter()
+        .map(|(name, spec)| {
+            format!(
+                "{name}\n{}\nJSON schema: {}",
+                spec.description.as_deref().unwrap_or_default(),
+                spec.input_schema
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let host = "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server with `vibeface codex`. When Codex asks something (an approval, a question, a login), `vibeface codex requests` lists the waiting requests and `vibeface codex respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
+    let text = format!(
+        "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
+    );
+    if instructions.is_empty() {
+        text
+    } else {
+        format!("{text}\n\n{instructions}")
+    }
+}
+
+/// Whether an App Server notification is about `turn` of `thread`.
+fn of_turn(message: &Value, thread: &str, turn: &str) -> bool {
+    let params = &message["params"];
+    params["threadId"] == thread && (params["turnId"] == turn || params["turn"]["id"] == turn)
+}
+
+/// The reply text and the tools of a turn as the chat shows them; tool arguments, outputs,
+/// reasoning and the user's own messages stay out.
+fn codex_progress(message: &Value) -> Option<Value> {
+    let method = message["method"].as_str()?;
+    let shown = match method {
+        "item/agentMessage/delta" | "turn/completed" => true,
+        "item/started" | "item/completed" => matches!(
+            message["params"]["item"]["type"].as_str(),
+            Some(
+                "agentMessage"
+                    | "commandExecution"
+                    | "fileChange"
+                    | "mcpToolCall"
+                    | "dynamicToolCall"
+                    | "webSearch"
+            )
+        ),
+        _ => false,
+    };
+    shown.then(|| crate::runtime::native_progress(message))
+}
+
+/// The last answer of the turn the notifications described.
+#[derive(Default)]
+struct Answer(Vec<(String, String)>);
+
+impl Answer {
+    fn apply(&mut self, message: &Value) {
+        let params = &message["params"];
+        let (id, text) = match message["method"].as_str() {
+            Some("item/agentMessage/delta") => {
+                let (Some(id), Some(delta)) = (params["itemId"].as_str(), params["delta"].as_str())
+                else {
+                    return;
+                };
+                let previous = self.text(id);
+                (id, previous + delta)
+            }
+            Some("item/completed") if params["item"]["type"] == "agentMessage" => {
+                let (Some(id), Some(text)) = (
+                    params["item"]["id"].as_str(),
+                    params["item"]["text"].as_str(),
+                ) else {
+                    return;
+                };
+                (id, text.to_owned())
+            }
+            _ => return,
+        };
+        self.0.retain(|(item, _)| item != id);
+        self.0.push((id.into(), text));
+    }
+    fn text(&self, id: &str) -> String {
+        self.0
+            .iter()
+            .find(|(item, _)| item == id)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default()
+    }
+    fn last(&self) -> String {
+        self.0
+            .last()
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The status of `turn` as the thread records it, `None` while it runs or when the thread
+/// cannot be read.
+async fn turn_status(session: &mut DirectSession, thread: &str, turn: &str) -> Option<String> {
+    let reply = session
+        .request(
+            "thread/read",
+            json!({"threadId":thread,"includeTurns":true}),
+        )
+        .await
+        .ok()?;
+    reply["thread"]["turns"]
+        .as_array()?
+        .iter()
+        .find(|t| t["id"] == turn)
+        .and_then(|t| t["status"].as_str())
+        .filter(|status| *status != "inProgress")
+        .map(str::to_owned)
+}
+
+/// Interrupts the turn and waits for it to end; true once Codex reports it ended.
+async fn stop_turn(session: &mut DirectSession, thread: &str, turn: &str) -> bool {
+    let _ = session
+        .request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        match tokio::time::timeout_at(deadline, session.notification()).await {
+            Ok(Ok(message)) => {
+                if message["method"] == "turn/completed" && of_turn(&message, thread, turn) {
+                    return true;
+                }
+            }
+            Ok(Err(_)) | Err(_) => return turn_status(session, thread, turn).await.is_some(),
+        }
+    }
+}
+
+/// One turn on this Node's Codex App Server. The thread is created with the Shell environment of
+/// its tools; the turn's user message carries `client_id`, so an unknown `turn/start` is found
+/// again by it and never sent twice.
 async fn run_codex<F, P, PF>(
     config: &ManagerConfig,
-    (node_bin, codex_bin, sdk_script): (&PathBuf, &PathBuf, &PathBuf),
+    socket: &Path,
     prompt: &str,
-    session_id: Option<&str>,
+    previous: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
     mut cancel: watch::Receiver<bool>,
     mut progress: P,
@@ -223,334 +394,201 @@ where
         config.workspace.is_absolute() && config.workspace.is_dir(),
         "manager workspace must be an existing absolute directory"
     );
-    ensure!(sdk_script.is_file(), "Codex SDK sidecar is missing");
-    let codex = resolve_executable(codex_bin)?;
-    let mut tool_env = config.tool_env.clone();
-    if let Some(token) = &config.tool_token {
-        tool_env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
-    }
-    let tool_cli = config
-        .tool_cli
-        .as_ref()
-        .map(|path| resolve_executable(path))
-        .transpose()?;
-    let mut native = session_id.map(str::to_owned);
-    let mut persist = Some(persist_session);
-    if let Some(id) = &native {
-        persist.take().unwrap()(id.clone())
-            .await
-            .map_err(|error| ManagerError {
-                kind: ManagerFailure::Failed,
-                session_id: native.clone(),
-                message: format!("persist Codex SDK session before resume: {error}"),
-            })?;
-    }
-    let mut command = Command::new(node_bin);
-    // The sidecar hands Codex only the variables it is told about.
-    let mut provider_keys = provider_environment_keys(&config.provider_env)?;
-    provider_keys.extend(config.provider_env.keys().cloned());
-    provider_keys.sort();
-    provider_keys.dedup();
-    command
-        .envs(&config.provider_env)
-        .arg(sdk_script)
-        .env(
-            "VIBEFACE_CODEX_PROVIDER_ENV_KEYS",
-            serde_json::to_string(&provider_keys)?,
-        )
-        .current_dir(&config.workspace)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("start official Codex SDK sidecar; install the pinned SDK dependencies first")?;
-    let process_group = child.id().context("Codex SDK sidecar has no process id")?;
-    if let Some(record) = &config.process_started
-        && let Err(error) = record(process_group).await
-    {
-        let _ = agent::terminate_process_group(&mut child, process_group).await;
-        return Err(ManagerError {
-            kind: ManagerFailure::Failed,
-            session_id: native,
-            message: format!("record Codex SDK process group before start: {error}"),
-        }
-        .into());
-    }
-    let mut stdin = child.stdin.take().context("Codex SDK input unavailable")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Codex SDK output unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("Codex SDK diagnostic stream unavailable")?;
     let secrets = secret_values(config);
-    let stderr_secrets = secrets.clone();
-    let mut stderr_task = tokio::spawn(tracing::Instrument::instrument(
-        crate::logging::forward_lines(stderr, MAX_STREAM, move |line| {
-            let line = crate::logging::redact(line, &stderr_secrets);
-            crate::logging::child_line(
-                crate::logging::Source::Codex,
-                "codex.sdk.stderr",
-                &line,
-                None,
-            )
-        }),
-        tracing::Span::current(),
-    ));
-    let mut sent = false;
-    let mut reader = BufReader::new(stdout);
-    let operation = async {
-        write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "tool_cli":tool_cli,"tool_env":tool_env,"custom_tools":config.custom_tools})).await?;
-        let ready = read_message(&mut reader).await?;
-        ensure!(
-            ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),
-            "Codex SDK did not confirm the expected native session"
-        );
-        sent = true;
-        write_message(&mut stdin, &json!({"type":"ack","session_id":native})).await?;
-        let mut total = 0;
-        loop {
-            let message = redact(read_message(&mut reader).await?, &secrets);
-            total += serde_json::to_vec(&message)?.len();
-            ensure!(
-                total <= MAX_STREAM,
-                "Codex SDK stream exceeded the size limit"
-            );
-            match message["type"].as_str() {
-                Some("session") => {
-                    let id = message["session_id"]
-                        .as_str()
-                        .context("Codex SDK session event has no native ID")?;
-                    vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
-                    ensure!(
-                        native.as_deref().is_none_or(|previous| previous == id),
-                        "Codex SDK changed its native session"
-                    );
-                    native = Some(id.into());
-                    if let Some(persist) = persist.take() {
-                        persist(id.into())
-                            .await
-                            .context("persist observed Codex SDK native session")?;
-                    }
-                    write_message(&mut stdin, &json!({"type":"session_ack","session_id":id}))
-                        .await?;
-                }
-                Some("event") => {
-                    if let Some(event) = codex_progress(&message["event"]) {
-                        progress(event).await?;
-                    }
-                }
-                Some("result") => {
-                    ensure!(
-                        native.is_some() && message["session_id"].as_str() == native.as_deref(),
-                        "Codex SDK returned a different native session"
-                    );
-                    let output = message["final_response"]
-                        .as_str()
-                        .context("Codex SDK result has no final response")?;
-                    ensure!(output.len() <= 65_536, "Codex SDK result is too large");
-                    let status = child.wait().await.context("wait for Codex SDK sidecar")?;
-                    ensure!(
-                        status.success(),
-                        "Codex SDK sidecar exited unsuccessfully after its result"
-                    );
-                    return Ok(AgentResult {
-                        session_id: native.clone(),
-                        output: output.into(),
-                        usage: message
-                            .get("usage")
-                            .filter(|value| !value.is_null())
-                            .cloned(),
-                    });
-                }
-                Some("error") => {
-                    return Err(anyhow!(
-                        "{}",
-                        message["message"].as_str().unwrap_or("Codex SDK failed")
-                    ));
-                }
-                _ => return Err(anyhow!("Codex SDK emitted an unsupported protocol message")),
-            }
-        }
-    };
-    let mut cancellation_requested = false;
-    let outcome = tokio::select! {
-        biased;
-        result = tokio::time::timeout(Duration::from_secs(config.timeout_secs), operation) => result.unwrap_or_else(|_|Err(anyhow!("Codex SDK management timed out; reconcile before retrying"))),
-        diagnostics = async {
-            match (&mut stderr_task).await {
-                Ok(Ok(())) => std::future::pending::<Result<AgentResult>>().await,
-                _ => Err(anyhow!("Codex SDK diagnostic stream failed")),
-            }
-        } => diagnostics,
-        _ = agent::wait_for_cancel(&mut cancel) => {
-            cancellation_requested = true;
-            Err(anyhow!("Codex SDK management cancellation requested"))
-        }
-    };
-    let mut cancellation_confirmed = false;
-    if outcome.is_err() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(1),
-            write_message(&mut stdin, &json!({"type":"cancel","session_id":native})),
-        )
-        .await;
-        if cancellation_requested {
-            cancellation_confirmed = tokio::time::timeout(Duration::from_secs(6), async {
-                let mut total = 0;
-                loop {
-                    let message = read_message(&mut reader).await?;
-                    total += serde_json::to_vec(&message)?.len();
-                    ensure!(
-                        total <= MAX_STREAM,
-                        "Codex cancellation stream exceeded its size limit"
-                    );
-                    match message["type"].as_str() {
-                        Some("cancelled") => {
-                            ensure!(
-                                message["session_id"].as_str() == native.as_deref()
-                                    && message["confirmation"] == "managed_processes_exited",
-                                "Codex SDK returned an invalid cancellation confirmation"
-                            );
-                            ensure!(
-                                child.wait().await?.success(),
-                                "Codex SDK sidecar failed after cancellation"
-                            );
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                        Some("session") if native.is_none() => {
-                            let id = message["session_id"]
-                                .as_str()
-                                .context("Codex SDK session event has no native ID")?;
-                            vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
-                            native = Some(id.into());
-                            if let Some(persist) = persist.take() {
-                                persist(id.into()).await?;
-                            }
-                        }
-                        Some("event") => {}
-                        _ => return Err(anyhow!("Codex SDK cancellation was not confirmed")),
-                    }
-                }
-            })
-            .await
-            .is_ok_and(|result| result.is_ok());
-        } else {
-            let _ = tokio::time::timeout(Duration::from_secs(6), child.wait()).await;
-        }
-        let _ = agent::terminate_process_group(&mut child, process_group).await;
-    }
-    stderr_task.abort();
-    outcome.map_err(|error| {
+    let error = |kind, session_id: Option<&str>, message: String| -> anyhow::Error {
         ManagerError {
-            kind: if cancellation_confirmed {
-                ManagerFailure::Cancelled
-            } else if cancellation_requested || sent {
-                ManagerFailure::Unknown
-            } else {
-                ManagerFailure::Failed
-            },
-            session_id: native,
-            message: redact_string(error.to_string(), &secrets),
+            kind,
+            session_id: session_id.map(str::to_owned),
+            message: redact_string(message, &secrets),
         }
         .into()
-    })
-}
-
-fn codex_progress(event: &Value) -> Option<Value> {
-    let kind = event.get("type")?.as_str()?;
-    match kind {
-        "item.started" | "item.updated" | "item.completed" => {
-            let item = event.get("item")?;
-            let id = item.get("id")?.as_str()?;
-            if vibeface_protocol::validate_id(id).is_err() {
-                return None;
-            }
-            match item.get("type")?.as_str()? {
-                "agent_message" => {
-                    let text: String = item
-                        .get("text")?
-                        .as_str()?
-                        .chars()
-                        .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\r' | '\t'))
-                        .take(16_384)
-                        .collect();
-                    Some(json!({"type":"text_snapshot","item_id":id,"text":text}))
-                }
-                "command_execution" | "mcp_tool_call" | "file_change" | "web_search" => {
-                    let status = if kind == "item.completed" {
-                        "completed"
-                    } else {
-                        "running"
-                    };
-                    let mut value =
-                        json!({"type":"tool","item_id":id,"status":status,"name":item["type"]});
-                    if let Some(status) =
-                        item.get("status").and_then(Value::as_str).filter(|text| {
-                            !text.is_empty()
-                                && text.len() <= 128
-                                && !text.chars().any(char::is_control)
-                        })
-                    {
-                        value["status"] = json!(status);
-                    }
-                    Some(value)
-                }
-                _ => None,
+    };
+    let failed = |session_id: Option<&str>, message: String| {
+        error(ManagerFailure::Failed, session_id, message)
+    };
+    // A stop before the turn started ends the reply as stopped; nothing ran.
+    let stopped = |session_id: Option<&str>| {
+        error(
+            ManagerFailure::Cancelled,
+            session_id,
+            "stopped before the Codex turn started".into(),
+        )
+    };
+    if *cancel.borrow() {
+        return Err(stopped(previous));
+    }
+    let mut session = DirectSession::connect(socket)
+        .await
+        .map_err(|e| failed(previous, format!("Codex App Server: {}", e.message)))?;
+    let mut env = config.tool_env.clone();
+    if let Some(token) = &config.tool_token {
+        env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
+    }
+    let mut thread_params = json!({"cwd":config.workspace,"approvalPolicy":"never",
+        "sandbox":"danger-full-access","config":{"shell_environment_policy.set":env,"web_search":"live"}});
+    if !config.model.is_empty() {
+        thread_params["model"] = json!(config.model);
+    }
+    // Resuming sends them again: a thread Codex reloads rebuilds its context from them.
+    let instructions = codex_instructions(
+        config.tool_cli.as_deref(),
+        &config.custom_tools,
+        &config.instructions,
+    );
+    if !instructions.is_empty() {
+        thread_params["developerInstructions"] = json!(instructions);
+    }
+    let resumed = match previous {
+        Some(id) => {
+            let mut params = thread_params.clone();
+            params["threadId"] = json!(id);
+            match session.request("thread/resume", params).await {
+                Ok(_) => Some(id.to_owned()),
+                Err(e) if e.uncertain => return Err(failed(previous, e.message)),
+                // Codex no longer has the thread; the conversation goes on in a new one.
+                Err(_) => None,
             }
         }
-        "turn.started" => Some(json!({"type":"status","status":"running"})),
-        "turn.completed" => Some(json!({"type":"status","status":"finishing"})),
-        "turn.failed" | "error" => Some(json!({"type":"status","status":"failed"})),
-        _ => None,
+        None => None,
+    };
+    let prompt = match (&resumed, previous, &config.codex_turn) {
+        (
+            None,
+            Some(_),
+            Some(CodexTurn {
+                fresh_prompt: Some(fresh),
+                ..
+            }),
+        ) => fresh.as_str(),
+        _ => prompt,
+    };
+    let thread = match resumed {
+        Some(id) => id,
+        None => {
+            thread_params["threadSource"] = json!("vibeface-bot");
+            let started = session
+                .request("thread/start", thread_params)
+                .await
+                .map_err(|e| failed(previous, e.message))?;
+            let id = started["thread"]["id"]
+                .as_str()
+                .context("Codex started a thread without an ID")?
+                .to_owned();
+            vibeface_protocol::validate_id(&id).map_err(anyhow::Error::msg)?;
+            id
+        }
+    };
+    let native = Some(thread.as_str());
+    if let Err(e) = persist_session(thread.clone()).await {
+        // A stop fences the attempt, so saving its thread fails then.
+        return Err(if *cancel.borrow() {
+            stopped(native)
+        } else {
+            failed(native, format!("persist the Codex thread: {e}"))
+        });
     }
-}
-
-fn resolve_executable(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        ensure!(path.is_file(), "configured executable is missing");
-        return Ok(path.to_path_buf());
+    let client_id = match &config.codex_turn {
+        Some(turn) => {
+            (turn.record)(thread.clone(), None)
+                .await
+                .map_err(|e| failed(native, format!("record the Codex turn: {e}")))?;
+            turn.client_id.clone()
+        }
+        None => uuid::Uuid::new_v4().to_string(),
+    };
+    let mut turn_params = json!({"threadId":thread,"clientUserMessageId":client_id,
+        "input":[{"type":"text","text":prompt,"text_elements":[]}]});
+    if !config.model.is_empty() {
+        turn_params["model"] = json!(config.model);
     }
-    ensure!(
-        path.components().count() == 1,
-        "executable must be an absolute path or a PATH command"
-    );
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .map(|directory| directory.join(path))
-        .find(|candidate| candidate.is_file())
-        .context("configured executable was not found on PATH")
-}
-
-async fn write_message(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    value: &Value,
-) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
-    ensure!(bytes.len() <= MAX_LINE, "Codex SDK request is too large");
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
-    Ok(())
-}
-async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Value> {
-    let mut bytes = Vec::new();
-    reader
-        .take((MAX_LINE + 1) as u64)
-        .read_until(b'\n', &mut bytes)
-        .await?;
-    ensure!(
-        !bytes.is_empty() && bytes.len() <= MAX_LINE && bytes.ends_with(b"\n"),
-        "Codex SDK stream closed or exceeded its frame limit"
-    );
-    serde_json::from_slice(&bytes).context("Codex SDK emitted invalid JSON")
+    if *cancel.borrow() {
+        return Err(stopped(native));
+    }
+    let turn = match session.request("turn/start", turn_params).await {
+        Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
+        Err(e) if !e.uncertain => return Err(failed(native, e.message)),
+        Err(e) => match session.read_back(&thread, &client_id).await {
+            Ok(Some(turn)) => Some(turn),
+            _ => return Err(error(ManagerFailure::Unknown, native, e.message)),
+        },
+    }
+    .context("Codex started a turn without an ID")
+    .map_err(|e| error(ManagerFailure::Unknown, native, e.to_string()))?;
+    if let Some(record) = &config.codex_turn
+        && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
+    {
+        let stopped = stop_turn(&mut session, &thread, &turn).await;
+        let kind = if stopped {
+            ManagerFailure::Failed
+        } else {
+            ManagerFailure::Unknown
+        };
+        return Err(error(kind, native, format!("record the Codex turn: {e}")));
+    }
+    let mut answer = Answer::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
+    let outcome = loop {
+        let message = tokio::select! {
+            biased;
+            _ = agent::wait_for_cancel(&mut cancel) => {
+                break if stop_turn(&mut session, &thread, &turn).await {
+                    Err(error(ManagerFailure::Cancelled, native, "Codex turn interrupted".into()))
+                } else {
+                    Err(error(ManagerFailure::Unknown, native, "Codex did not confirm the interrupt".into()))
+                };
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let kind = if stop_turn(&mut session, &thread, &turn).await {
+                    ManagerFailure::Failed
+                } else {
+                    ManagerFailure::Unknown
+                };
+                break Err(error(kind, native, "Codex management timed out".into()));
+            }
+            message = session.notification() => match message {
+                Ok(message) => message,
+                // The turn may go on without this connection; reconciliation reads it.
+                Err(e) => break Err(error(ManagerFailure::Unknown, native, e.message)),
+            },
+        };
+        if !of_turn(&message, &thread, &turn) {
+            continue;
+        }
+        let message = redact(message, &secrets);
+        answer.apply(&message);
+        if let Some(update) = codex_progress(&message) {
+            progress(update)
+                .await
+                .map_err(|e| error(ManagerFailure::Unknown, native, e.to_string()))?;
+        }
+        if message["method"] == "turn/completed" {
+            let ended = &message["params"]["turn"];
+            break match ended["status"].as_str() {
+                Some("completed") => Ok(()),
+                Some("interrupted") => Err(error(
+                    ManagerFailure::Cancelled,
+                    native,
+                    "Codex turn was interrupted".into(),
+                )),
+                _ => Err(failed(
+                    native,
+                    ended["error"]["message"]
+                        .as_str()
+                        .unwrap_or("Codex turn failed")
+                        .into(),
+                )),
+            };
+        }
+    };
+    session.close().await;
+    outcome?;
+    let output = answer.last();
+    ensure!(output.len() <= MAX_PROMPT, "Codex result is too large");
+    Ok(AgentResult {
+        session_id: Some(thread),
+        output,
+        usage: None,
+    })
 }
 fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
@@ -678,26 +716,138 @@ fn redact(value: Value, secrets: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
 
-    /// A Codex turn whose sidecar is the shell script `script`.
-    fn codex(workspace: PathBuf, script: PathBuf) -> ManagerConfig {
+    /// A Codex turn on the App Server listening at `socket`.
+    fn codex(workspace: PathBuf, socket: PathBuf) -> ManagerConfig {
         ManagerConfig {
-            sdk: Sdk::Codex {
-                node_bin: "/bin/sh".into(),
-                codex_bin: "/usr/bin/true".into(),
-                sdk_script: script,
-            },
+            sdk: Sdk::Codex { socket },
             workspace,
             model: String::new(),
             timeout_secs: 5,
             custom_tools: BTreeMap::new(),
             tool_cli: None,
+            instructions: String::new(),
             tool_env: BTreeMap::new(),
             tool_token: None,
             provider_env: BTreeMap::new(),
             process_started: None,
+            codex_turn: None,
         }
     }
+
+    /// How the fake App Server treats a turn.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Turn {
+        /// Streams an answer and completes.
+        Answers,
+        /// Runs until interrupted; `confirm` says whether the interrupt ends it.
+        Runs { confirm: bool },
+        /// Closes the connection instead of answering `turn/start`.
+        Drops,
+    }
+
+    struct Fake {
+        socket: PathBuf,
+        requests: Arc<std::sync::Mutex<Vec<Value>>>,
+        _server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Fake {
+        fn calls(&self, method: &str) -> Vec<Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == method)
+                .map(|request| request["params"].clone())
+                .collect()
+        }
+    }
+
+    fn fake_app_server(turn: Turn) -> Fake {
+        let socket = std::env::temp_dir().join(format!(
+            "vf-manager-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut server = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut status = "inProgress";
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                        else {
+                            continue;
+                        };
+                        seen.lock().unwrap().push(request.clone());
+                        let method = request["method"].as_str().unwrap_or_default();
+                        if method == "turn/start" && turn == Turn::Drops {
+                            return;
+                        }
+                        if method == "thread/resume" && request["params"]["threadId"] == "gone" {
+                            let error = json!({"id":request["id"],"error":{"code":-32600,"message":"no rollout found"}});
+                            let _ = server.send(Message::Text(error.to_string().into())).await;
+                            continue;
+                        }
+                        let result = match method {
+                            "thread/start" => json!({"thread":{"id":"thread-1"}}),
+                            "turn/start" => json!({"turn":{"id":"turn-1"}}),
+                            "thread/read" => {
+                                json!({"thread":{"turns":[{"id":"turn-1","status":status}]}})
+                            }
+                            "initialized" => continue,
+                            _ => json!({}),
+                        };
+                        let mut replies = vec![json!({"id":request["id"],"result":result})];
+                        let note = |method: &str, params: Value| {
+                            let mut params = params;
+                            params["threadId"] = json!("thread-1");
+                            params["turnId"] = json!("turn-1");
+                            json!({"method":method,"params":params})
+                        };
+                        match (method, turn) {
+                            ("turn/start", Turn::Answers) => replies.extend([
+                                note("item/agentMessage/delta", json!({"itemId":"a","delta":"hel"})),
+                                note("item/started", json!({"item":{"id":"u","type":"userMessage"}})),
+                                note("item/started", json!({"item":{"id":"c","type":"commandExecution","command":"secret"}})),
+                                note("item/completed", json!({"item":{"id":"a","type":"agentMessage","text":"hello"}})),
+                                note("turn/completed", json!({"turn":{"id":"turn-1","status":"completed"}})),
+                            ]),
+                            ("turn/interrupt", Turn::Runs { confirm: true }) => {
+                                status = "interrupted";
+                                replies.push(note(
+                                    "turn/completed",
+                                    json!({"turn":{"id":"turn-1","status":"interrupted"}}),
+                                ));
+                            }
+                            _ => {}
+                        }
+                        for reply in replies {
+                            let _ = server.send(Message::Text(reply.to_string().into())).await;
+                        }
+                    }
+                });
+            }
+        });
+        Fake {
+            socket,
+            requests,
+            _server: server,
+        }
+    }
+
+    fn workspace() -> PathBuf {
+        let directory = std::env::temp_dir().join(format!("vf-manager-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
     #[test]
     fn provider_environment_uses_only_selected_profile_and_header_keys() -> Result<()> {
         let config = "model_provider='unused'\nprofile='local'\n[profiles.local]\nmodel_provider='active'\n[model_providers.active]\nenv_key='CUSTOM_API_KEY'\nenv_http_headers={X-Test='HEADER_TOKEN'}\n[model_providers.unused]\nenv_key='UNRELATED_SECRET'";
@@ -714,154 +864,163 @@ mod tests {
         assert!(provider_keys_from_config("model='default'")?.is_empty());
         Ok(())
     }
+
+    /// The thread is persisted and the turn recorded before it starts; the Shell carries the
+    /// turn's token; progress shows the answer and tools, never arguments or user messages.
     #[tokio::test]
-    async fn sdk_frames_require_newline_and_valid_bounded_json() {
-        assert_eq!(
-            read_message(&mut BufReader::new(&b"{\"type\":\"ready\"}\n"[..]))
-                .await
-                .unwrap()["type"],
-            "ready"
-        );
-        assert!(read_message(&mut BufReader::new(&b"{}"[..])).await.is_err());
-        assert!(
-            read_message(&mut BufReader::new(&b"bad\n"[..]))
-                .await
-                .is_err()
-        );
-    }
-    #[tokio::test]
-    async fn fresh_sdk_native_id_is_persisted_and_failed_persistence_is_unknown() {
-        let directory =
-            std::env::temp_dir().join(format!("vibeface-manager-fixture-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&directory).await.unwrap();
-        let script = directory.join("fixture.sh");
-        tokio::fs::write(
-            &script,
-            r#"IFS= read -r init || exit 1
-printf '%s\n' '{"type":"ready","session_id":null}'
-IFS= read -r ack || exit 2
-printf '%s\n' '{"type":"session","session_id":"fixture-native"}'
-IFS= read -r confirmed || exit 3
-case "$confirmed" in *session_ack*) ;; *) exit 4 ;; esac
-test -f persisted || exit 5
-printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"done","usage":null}'
-"#,
-        )
-        .await
-        .unwrap();
-        let config = codex(directory.clone(), script);
-        let marker = directory.join("persisted");
+    async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
+        let fake = fake_app_server(Turn::Answers);
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = recorded.clone();
+        let config = ManagerConfig {
+            model: "gpt-fixture".into(),
+            tool_cli: Some("/opt/vibeface".into()),
+            instructions: "fixed-thread-guide".into(),
+            tool_token: Some("turn-token-secret".into()),
+            codex_turn: Some(CodexTurn {
+                client_id: "attempt-1".into(),
+                record: Arc::new(move |thread, turn| {
+                    record.lock().unwrap().push((thread, turn));
+                    Box::pin(async { Ok(()) })
+                }),
+                fresh_prompt: None,
+            }),
+            ..codex(workspace(), fake.socket.clone())
+        };
+        let shown = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = shown.clone();
         let result = run_manager(
             &config,
             "fixture",
             None,
-            move |id| async move {
-                assert_eq!(id, "fixture-native");
-                tokio::fs::write(marker, b"yes").await?;
+            |id| async move {
+                assert_eq!(id, "thread-1");
                 Ok(())
             },
+            watch::channel(false).1,
+            move |event| {
+                progress.lock().unwrap().push(event);
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (result.session_id.as_deref(), result.output.as_str()),
+            (Some("thread-1"), "hello")
+        );
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            [
+                ("thread-1".to_owned(), None),
+                ("thread-1".to_owned(), Some("turn-1".to_owned()))
+            ]
+        );
+        let started = fake.calls("thread/start");
+        assert_eq!(
+            started[0]["config"]["shell_environment_policy.set"]["VIBEFACE_TOOL_TOKEN"],
+            "turn-token-secret"
+        );
+        let guide = started[0]["developerInstructions"].as_str().unwrap();
+        assert!(guide.contains("'/opt/vibeface' tool TOOL_NAME"));
+        assert!(guide.ends_with("fixed-thread-guide"));
+        let turn = &fake.calls("turn/start")[0];
+        assert_eq!(turn["clientUserMessageId"], "attempt-1");
+        assert_eq!(turn["model"], "gpt-fixture");
+        assert_eq!(
+            turn["input"][0]["text"], "fixture",
+            "the turn carries only its own prompt"
+        );
+        let shown = serde_json::to_string(&*shown.lock().unwrap()).unwrap();
+        assert!(shown.contains("hello") && shown.contains("\"command\""));
+        assert!(!shown.contains("secret") && !shown.contains("userMessage"));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_turn_is_cancelled_only_once_codex_confirms_it_ended() {
+        for (confirm, expected) in [
+            (true, ManagerFailure::Cancelled),
+            (false, ManagerFailure::Unknown),
+        ] {
+            let fake = fake_app_server(Turn::Runs { confirm });
+            let config = codex(workspace(), fake.socket.clone());
+            let (stop, cancel) = watch::channel(false);
+            let stopper = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                stop.send(true).unwrap();
+                stop
+            });
+            let error = run_manager(
+                &config,
+                "fixture",
+                Some("thread-1"),
+                |_| async { Ok(()) },
+                cancel,
+                |_| async { Ok(()) },
+            )
+            .await
+            .err()
+            .unwrap();
+            drop(stopper.await);
+            let error = error.downcast_ref::<ManagerError>().unwrap();
+            assert_eq!(
+                (error.kind, error.session_id.as_deref()),
+                (expected, Some("thread-1"))
+            );
+            assert_eq!(fake.calls("thread/resume").len(), 1);
+            assert_eq!(fake.calls("turn/interrupt").len(), 1);
+        }
+    }
+
+    /// When the resumed thread is gone, the new thread's first turn gets the fresh prompt with
+    /// the full context, not the resumed turn's delta.
+    #[tokio::test]
+    async fn a_new_thread_in_place_of_a_lost_one_gets_the_full_prompt() {
+        let fake = fake_app_server(Turn::Answers);
+        let config = ManagerConfig {
+            codex_turn: Some(CodexTurn {
+                client_id: "attempt-1".into(),
+                record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                fresh_prompt: Some("full context".into()),
+            }),
+            ..codex(workspace(), fake.socket.clone())
+        };
+        let result = run_manager(
+            &config,
+            "delta only",
+            Some("gone"),
+            |_| async { Ok(()) },
             watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
         .unwrap();
-        assert_eq!(result.session_id.as_deref(), Some("fixture-native"));
-        assert_eq!(result.output, "done");
+        assert_eq!(result.session_id.as_deref(), Some("thread-1"));
+        assert_eq!(fake.calls("thread/start").len(), 1);
+        assert_eq!(
+            fake.calls("turn/start")[0]["input"][0]["text"],
+            "full context"
+        );
+    }
+
+    /// A `turn/start` whose answer is lost is looked up by its client ID, never sent again.
+    #[tokio::test]
+    async fn an_unknown_turn_start_is_not_sent_again() {
+        let fake = fake_app_server(Turn::Drops);
+        let config = codex(workspace(), fake.socket.clone());
         let error = run_manager(
             &config,
             "fixture",
             None,
-            |_| async { anyhow::bail!("fixture storage failed") },
+            |_| async { Ok(()) },
             watch::channel(false).1,
             |_| async { Ok(()) },
         )
         .await
         .err()
         .unwrap();
-        let error = error.downcast_ref::<ManagerError>().unwrap();
-        assert!(error.uncertain());
-        assert_eq!(error.session_id.as_deref(), Some("fixture-native"));
-        tokio::fs::remove_dir_all(directory).await.unwrap();
-    }
-
-    #[test]
-    fn codex_full_item_updates_are_snapshots_without_tool_arguments() {
-        for (kind, status) in [
-            ("turn.started", "running"),
-            ("turn.completed", "finishing"),
-            ("turn.failed", "failed"),
-        ] {
-            assert_eq!(
-                codex_progress(&json!({"type":kind})),
-                Some(json!({"type":"status","status":status}))
-            );
-        }
-        let started = codex_progress(&json!({"type":"item.started","item":{"id":"m1","type":"agent_message","text":"hello"}})).unwrap();
-        let updated = codex_progress(&json!({"type":"item.updated","item":{"id":"m1","type":"agent_message","text":"hello\nworld"}})).unwrap();
-        assert_eq!(started["type"], "text_snapshot");
-        assert_eq!(
-            updated,
-            json!({"type":"text_snapshot","item_id":"m1","text":"hello\nworld"})
-        );
-        assert_eq!(codex_progress(&json!({"type":"item.completed","item":{"id":"t1","type":"command_execution","command":"secret-token","aggregated_output":"private","status":"completed"}})).unwrap(),
-            json!({"type":"tool","item_id":"t1","status":"completed","name":"command_execution"}));
-        assert_eq!(codex_progress(&json!({"type":"item.started","item":{"id":"t1","type":"command_execution","status":""}})).unwrap(),
-            json!({"type":"tool","item_id":"t1","status":"running","name":"command_execution"}));
-        assert!(codex_progress(&json!({"type":"item.updated","item":{"id":"r1","type":"reasoning","text":"private"}})).is_none());
-    }
-
-    #[tokio::test]
-    async fn cancellation_requires_bound_managed_process_confirmation() {
-        let directory =
-            std::env::temp_dir().join(format!("vibeface-manager-cancel-{}", uuid::Uuid::new_v4()));
-        tokio::fs::create_dir_all(&directory).await.unwrap();
-        let script = directory.join("fixture.sh");
-        // Exact lines codex-manager.mjs writes after confirmed and unconfirmed process-tree exit.
-        for (reply, expected) in [
-            (
-                r#"{"type":"cancelled","session_id":"fixture-native","confirmation":"managed_processes_exited"}"#,
-                ManagerFailure::Cancelled,
-            ),
-            (
-                r#"{"type":"cancelled","session_id":"wrong-native","confirmation":"managed_processes_exited"}"#,
-                ManagerFailure::Unknown,
-            ),
-            (
-                r#"{"type":"error","message":"Codex cancellation could not confirm managed process exit","uncertain":true}"#,
-                ManagerFailure::Unknown,
-            ),
-        ] {
-            let fixture = format!(
-                r#"IFS= read -r init || exit 1
-printf '%s\n' '{{"type":"ready","session_id":"fixture-native"}}'
-IFS= read -r ack || exit 2
-printf '%s\n' '{{"type":"event","event":{{"type":"turn.started"}}}}'
-IFS= read -r cancel || exit 3
-case "$cancel" in *cancel*) ;; *) exit 4 ;; esac
-printf '%s\n' '{reply}'
-"#
-            );
-            tokio::fs::write(&script, fixture).await.unwrap();
-            let config = codex(directory.clone(), script.clone());
-            let (cancel_tx, cancel_rx) = watch::channel(false);
-            let error = run_manager(
-                &config,
-                "fixture",
-                Some("fixture-native"),
-                |_| async { Ok(()) },
-                cancel_rx,
-                move |event| {
-                    assert_eq!(event, json!({"type":"status","status":"running"}));
-                    cancel_tx.send(true).unwrap();
-                    async { Ok(()) }
-                },
-            )
-            .await
-            .err()
-            .unwrap();
-            assert_eq!(error.downcast_ref::<ManagerError>().unwrap().kind, expected);
-        }
-        tokio::fs::remove_dir_all(directory).await.unwrap();
+        assert!(error.downcast_ref::<ManagerError>().unwrap().uncertain());
+        assert_eq!(fake.calls("turn/start").len(), 1);
     }
 
     #[test]
@@ -869,7 +1028,7 @@ printf '%s\n' '{reply}'
         let config = ManagerConfig {
             tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
             tool_token: Some("turn-token-secret".into()),
-            ..codex(".".into(), "fixture.sh".into())
+            ..codex(".".into(), "app-server.sock".into())
         };
         assert_eq!(
             redact(

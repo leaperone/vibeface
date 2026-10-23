@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Link2, ListChecks, RotateCw, Square, X } from "lucide-react"
+import { Laptop, Link2, ListChecks, RotateCw, Server, Square, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -16,7 +16,7 @@ const tone = (state: string): Tone => state === "failed" ? "danger" : state === 
 /** /b/:botId/work/:workId — desktop side panel beside the chat, full screen on phones. */
 export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const workspace = useWorkspace()
-  const { directory } = useDevice()
+  const { directory, ready } = useDevice()
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
   const work = workspace.data?.works.find((item) => item.work_id === workId)
@@ -50,7 +50,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       <Button asChild variant="ghost" size="icon"><Link to="/b/$botId" params={{ botId }} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      {device ? <p className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</p> : null}
+      {device ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}

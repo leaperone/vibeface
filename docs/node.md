@@ -13,7 +13,7 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内包括 Rust 程序、SDK sidecar 源码、文档和用户级服务安装脚本，不包含模型凭证、Provider 程序或 npm 依赖。若使用 Codex SDK 管理 Agent，先安装 Node.js 18+，然后在 `sidecars/` 运行 `npm ci --omit=dev`。仅使用 Cursor SDK 管理 Agent 时，无需 Node.js。
+包内包括 Rust 程序、文档和用户级服务安装脚本，不包含模型凭证或 Provider 程序。
 
 从源码生成包时，先构建同一 Rust 密码学模块的浏览器资源。发布包已包含资源，安装发布包不需要这些构建工具。
 
@@ -27,7 +27,7 @@ bash scripts/build-web.sh
 
 `--target` 指定 Rust target，仍需本机具备相应工具链。此选项不保证跨平台编译成功。`--skip-build` 使用已有 release 程序，不能用于证明程序与当前源码一致。
 
-验收制品时，密码学资源、网页、Rust 程序和 SDK sidecar 必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
+验收制品时，密码学资源、网页和 Rust 程序必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
 
 ## 初始化首台设备
 
@@ -98,21 +98,19 @@ Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `
 
 ### 使用 Codex SDK
 
-Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它，需要 Node.js 18+、已安装的锁定 npm 依赖和已登录的 Codex CLI。
+Codex Bot 的回合在本机 Codex App Server 上运行，只需要已登录的 Codex CLI。
 
 ```sh
 ./vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects \
 	--manager codex_sdk \
-	--workspace /absolute/path/to/manager-workspace \
-	--node-bin /absolute/path/to/node \
-	--codex-sdk-script /absolute/path/to/sidecars/codex-manager.mjs
+	--workspace /absolute/path/to/manager-workspace
 ```
 
-可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
+可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
 
-这个适配器通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具。所有调用的宿主 Shell 都是只读文件系统，网络只放行 `127.0.0.1` 和 `localhost`，不注入也不放行 Codex Socket。Codex 子进程环境按变量名筛选，Provider 凭证不放进 Shell 环境。macOS 的 Codex 沙箱不拦截 Unix Socket 连接，同一用户的进程若自行找到 Socket 路径仍可连接，不能把它当作隔离不可信模型或插件的边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺相同的系统隔离。
+Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，工具令牌和地址经线程的 Shell 环境传入，Provider 凭证不放进 Shell 环境。Cursor SDK 与 Codex 的工具运行方式不同，不承诺相同的系统隔离。
 
 ## 添加自己的设备
 
@@ -308,7 +306,7 @@ vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
 - **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。任何入口都能停止其他设备上的工作。目标离线时页面显示“已请求、等待设备确认”，入口继续投递 30 秒，仍未送达则显示“设备没有确认停止”。请求发出后仍需核对实际终态。
 
-Cursor SDK 和 Codex SDK 都提供进度和取消请求，当前都没有管理轮的原生 steer。立即调整须先核对取消结果，再提交新一轮。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 在停止时记录 CLI 进程树中的全部子进程及其进程组，逐组终止并确认这些进程都已退出后才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
+Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“已并入当前回复”，该回复未正常完成时显示“已并入，回复未完成”，无法确认时显示“不确定是否已并入”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机：CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
@@ -371,7 +369,7 @@ vibeface service restart --data-dir "$HOME/.vibeface"
 
 macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
-后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
+后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 

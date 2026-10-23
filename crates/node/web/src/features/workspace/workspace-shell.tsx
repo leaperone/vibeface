@@ -6,8 +6,9 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { EmptyState, Skeleton, toast } from "@/components/app/kit"
+import { dismissToast, EmptyState, Skeleton, toast } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
+import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
@@ -67,12 +68,19 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     const timer = setInterval(refresh, 30_000)
     return () => clearInterval(timer)
   }, [device.ready])
+  // A request that was answered or expired takes its toast with it.
+  const joinToasts = useRef(new Map<string, number>())
   useEffect(() => {
     for (const join of joins) {
       if (announced.current.has(join.join_id)) continue
       announced.current.add(join.join_id)
       if (joinsOnScreen()) continue
-      toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } })
+      joinToasts.current.set(join.join_id, toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } }))
+    }
+    for (const [joinId, toastId] of joinToasts.current) {
+      if (joins.some((join) => join.join_id === joinId)) continue
+      dismissToast(toastId)
+      joinToasts.current.delete(joinId)
     }
   }, [joins.map((join) => join.join_id).join()])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
@@ -121,6 +129,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="shrink-0 gap-1 px-2 py-3">
+          <SecondDeviceHint />
           <ConnectionCapsule />
           <SidebarMenu>
             <NavItem to="/devices" icon={MonitorSmartphone} label="设备" active={pathname.startsWith("/devices")} dot={devicesAttention} />

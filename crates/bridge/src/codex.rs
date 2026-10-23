@@ -22,6 +22,9 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 pub struct CodexError {
     pub uncertain: bool,
+    /// The App Server itself answered with this error, as for a thread it does not know; a lost
+    /// connection or timeout is not an answer.
+    pub answered: bool,
     pub message: String,
 }
 
@@ -59,6 +62,15 @@ fn server_error(error: &Value) -> String {
 fn rejected(message: impl Into<String>) -> CodexError {
     CodexError {
         uncertain: false,
+        answered: false,
+        message: message.into(),
+    }
+}
+
+fn answered(message: impl Into<String>) -> CodexError {
+    CodexError {
+        uncertain: false,
+        answered: true,
         message: message.into(),
     }
 }
@@ -112,6 +124,7 @@ impl CodexClient {
         response.await.unwrap_or_else(|_| {
             Err(CodexError {
                 uncertain,
+                answered: false,
                 message: "Codex adapter stopped before returning a result".into(),
             })
         })
@@ -711,6 +724,8 @@ impl Session {
             PendingKind::Request(execute) => {
                 let _ = execute.reply.send(Err(CodexError {
                     uncertain: uncertain && pending.uncertain,
+                    // Only a reply error is failed as certain.
+                    answered: !uncertain,
                     message: reason.into(),
                 }));
             }
@@ -867,7 +882,7 @@ async fn run_session(
                         };
                         let message = response(&respond.id, &respond.result);
                         if writer.send(Write::Message(Message::Text(message.to_string().into()))).is_err() {
-                            let _ = respond.reply.send(Err(CodexError { uncertain: true, message: "Codex writer stopped".into() }));
+                            let _ = respond.reply.send(Err(CodexError { uncertain: true, answered: false, message: "Codex writer stopped".into() }));
                             break "Codex writer stopped".into();
                         }
                         observed_cache.replied(request["method"].as_str().unwrap_or_default(), request["params"]["threadId"].as_str(), &respond.decision);
@@ -1004,6 +1019,8 @@ pub struct DirectSession {
     /// Threads started on this connection. They have no rollout before their first turn, so they
     /// are not resumed.
     started: HashSet<String>,
+    /// Notifications that arrived while a request waited for its answer, oldest first.
+    arrived: VecDeque<Value>,
     /// The `userAgent` the App Server answered `initialize` with.
     pub user_agent: String,
 }
@@ -1015,6 +1032,7 @@ impl DirectSession {
             stream,
             next_id: 0,
             started: HashSet::new(),
+            arrived: VecDeque::new(),
             user_agent: String::new(),
         };
         let initialized = session
@@ -1061,7 +1079,11 @@ impl DirectSession {
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
         let uncertain = methods::access(method) != methods::Access::Read;
-        let lost = |message: String| CodexError { uncertain, message };
+        let lost = |message: String| CodexError {
+            uncertain,
+            answered: false,
+            message,
+        };
         self.next_id += 1;
         let id = RpcId::String(format!("vibeface-cli-{}", self.next_id));
         self.stream
@@ -1096,6 +1118,10 @@ impl DirectSession {
             if request_id(&message).is_some() {
                 continue;
             }
+            if message["method"].is_string() {
+                push_ring(&mut self.arrived, message);
+                continue;
+            }
             if message
                 .get("id")
                 .and_then(|got| serde_json::from_value::<RpcId>(got.clone()).ok())
@@ -1104,7 +1130,7 @@ impl DirectSession {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                return Err(rejected(server_error(error)));
+                return Err(answered(server_error(error)));
             }
             return message
                 .get("result")
@@ -1115,6 +1141,9 @@ impl DirectSession {
 
     /// The next notification or server request on this connection.
     pub async fn notification(&mut self) -> Result<Value, CodexError> {
+        if let Some(message) = self.arrived.pop_front() {
+            return Ok(message);
+        }
         loop {
             let text = match self.stream.next().await {
                 Some(Ok(Message::Text(text))) => text,
@@ -1543,6 +1572,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_server_error_reply_is_an_answer() {
+        let mut state = Session::default();
+        let (writer, _reader) = mpsc::unbounded_channel();
+        let read = |state: &mut Session| {
+            let (reply, result) = oneshot::channel();
+            state
+                .command(
+                    &writer,
+                    Execute {
+                        call: NativeCall {
+                            method: "thread/read".into(),
+                            params: json!({"threadId":"t"}),
+                        },
+                        reply,
+                    },
+                )
+                .unwrap();
+            result
+        };
+        let rejected = read(&mut state);
+        let (_, pending) = state.pending.drain().next().unwrap();
+        state.fail(pending, "thread not found", false);
+        let error = rejected.await.unwrap().unwrap_err();
+        assert!(error.answered && !error.uncertain);
+        let lost = read(&mut state);
+        state.disconnect("socket closed");
+        let error = lost.await.unwrap().unwrap_err();
+        assert!(
+            !error.answered && !error.uncertain,
+            "a lost read is neither an answer nor a write"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_fails_pending_mutation_as_uncertain_and_clears_live_state() {
         let mut state = Session::default();
         let (writer, _reader) = mpsc::unbounded_channel();
@@ -1561,7 +1624,8 @@ mod tests {
             .unwrap();
         state.subscribed.insert("t".into());
         state.disconnect("socket closed");
-        assert!(result.await.unwrap().unwrap_err().uncertain);
+        let lost = result.await.unwrap().unwrap_err();
+        assert!(lost.uncertain && !lost.answered);
         assert!(state.pending.is_empty());
         assert!(state.subscribed.is_empty());
         let mut cache = Cache::default();

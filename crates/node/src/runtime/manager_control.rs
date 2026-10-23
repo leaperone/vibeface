@@ -1,7 +1,7 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
-use crate::scheduling::{JobState, PendingCheck, TaskJobChange, task_work_signal};
-use crate::work::WorkState;
+use crate::scheduling::{JobState, PendingCheck, ReplyTurn, TaskJobChange, task_work_signal};
+use crate::work::{Probe, WorkState};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::sync::{
@@ -195,13 +195,19 @@ impl Runtime {
         Ok(json!({"job":job,"cancel_requested":cancel_requested}))
     }
 
-    /// A coordination process left over from a crash is checked by its recorded process groups.
-    /// Once every group has exited the check resolves itself; an agent task waiting on it ends
-    /// as interrupted. Only a group that is still alive leaves a card for the user.
+    /// A coordination turn left over from a crash is checked by its recorded process groups and
+    /// App Server turn. Once every group has exited and the turn has ended the check resolves
+    /// itself; an agent task waiting on it ends as interrupted. Only a group that is still alive
+    /// leaves a card for the user.
     pub(super) async fn reconcile_checks(self: &Arc<Self>, network: &str) -> Result<()> {
         let checks = self.store.lock().await.pending_checks()?;
         for check in checks {
             if check.process_groups.iter().any(|group| group_alive(*group)) {
+                continue;
+            }
+            if let Some(turn) = &check.codex_turn
+                && !self.codex_turn_ended(turn, &check.attempt_id).await
+            {
                 continue;
             }
             self.close_check(network, &check).await?;
@@ -220,6 +226,30 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    /// Whether a reply's App Server turn has ended. One still running is interrupted, since its
+    /// reply was already recorded as interrupted; an unreachable App Server, or another one than
+    /// the turn ran on, leaves it unknown.
+    async fn codex_turn_ended(&self, turn: &ReplyTurn, attempt_id: &str) -> bool {
+        if turn.server != self.codex.server() {
+            return false;
+        }
+        let thread = turn.thread.as_str();
+        match self
+            .codex
+            .probe(thread, turn.turn.as_deref(), attempt_id, 0)
+            .await
+        {
+            Ok(Probe::Running { turn_id, .. }) => {
+                if let Err(error) = self.codex.interrupt(thread, &turn_id).await {
+                    tracing::debug!(%error, "interrupting a reply turn left running is pending");
+                }
+                false
+            }
+            Ok(Probe::Terminal { .. } | Probe::NotStarted | Probe::Missing) => true,
+            Err(_) => false,
+        }
     }
 
     async fn close_check(&self, network: &str, check: &PendingCheck) -> Result<()> {

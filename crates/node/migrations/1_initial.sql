@@ -23,7 +23,7 @@ CREATE INDEX `pending_events_missing` ON `pending_events` (`network_id`, `missin
 -- Create "conversations" table
 CREATE TABLE `conversations` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `title` text NULL, `title_rank` text NULL, `owner` text NULL, `owner_epoch` integer NOT NULL DEFAULT 0, `owner_key` text NOT NULL DEFAULT '', PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "messages" table
-CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `attachments` text NOT NULL, `sender` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
+CREATE TABLE `messages` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `message_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `role` text NOT NULL, `text` text NOT NULL, `created_at_ms` integer NOT NULL, `in_reply_to` text NULL, `status` text NULL, `report_results` integer NULL, `answers` text NULL, `attachments` text NOT NULL, `sender` text NULL, `steered_into` text NULL, PRIMARY KEY (`network_id`, `conversation_id`, `message_id`));
 -- Create index "messages_order" to table: "messages"
 CREATE INDEX `messages_order` ON `messages` (`network_id`, `conversation_id`, `rank`);
 -- Create index "messages_answers" to table: "messages"
@@ -32,6 +32,8 @@ CREATE INDEX `messages_answers` ON `messages` (`network_id`, `answers`);
 CREATE TABLE `bots` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `bot_id` text NOT NULL, `name` text NOT NULL, `instructions` text NOT NULL, `project` text NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, `cause` text NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "bot_profiles" table
 CREATE TABLE `bot_profiles` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `field` text NOT NULL, `value` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `field`));
+-- Create "bot_models" table
+CREATE TABLE `bot_models` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `provider` text NOT NULL, `model` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `provider`));
 -- Create "bot_deletions" table
 CREATE TABLE `bot_deletions` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `event_hash` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`));
 -- Create "skills" table
@@ -76,6 +78,8 @@ CREATE TABLE `triage_handled` (`event_id` text NOT NULL, `ts_ms` integer NOT NUL
 CREATE TABLE `triage_outbox` (`event_id` text NOT NULL, `body` text NOT NULL, `state` text NOT NULL, `attempts` integer NOT NULL, `next_ms` integer NOT NULL, `created_ms` integer NOT NULL, `last_error` text NULL, PRIMARY KEY (`event_id`));
 -- Create "triage_scans" table
 CREATE TABLE `triage_scans` (`rollout` text NOT NULL, `scanned_to` integer NOT NULL, PRIMARY KEY (`rollout`));
+-- Create "coordination_threads" table
+CREATE TABLE `coordination_threads` (`thread_id` text NOT NULL, `created_ms` integer NOT NULL, PRIMARY KEY (`thread_id`));
 -- Create "addresses" table
 CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`device_id`));
 -- Create "blob_offsets" table
@@ -87,7 +91,7 @@ CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `e
 -- Create index "invites_invite_hash" to table: "invites"
 CREATE UNIQUE INDEX `invites_invite_hash` ON `invites` (`invite_hash`);
 -- Create "scheduler_sessions" table
-CREATE TABLE `scheduler_sessions` (`conversation_id` text NOT NULL, `next_sequence` integer NOT NULL, `active` text NULL, `native_id` text NULL, `covers` text NOT NULL, `owner_epoch` integer NOT NULL, `sdk_config` text NULL, `permission_version` integer NOT NULL, PRIMARY KEY (`conversation_id`));
+CREATE TABLE `scheduler_sessions` (`conversation_id` text NOT NULL, `next_sequence` integer NOT NULL, `active` text NULL, `native_id` text NULL, `native_token` text NULL, `covers` text NOT NULL, `owner_epoch` integer NOT NULL, `sdk_config` text NULL, `permission_version` integer NOT NULL, `shown` text NOT NULL, PRIMARY KEY (`conversation_id`));
 -- Create "scheduler_jobs" table
 CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, `kind` text NOT NULL, `sequence` integer NOT NULL, `basis` text NOT NULL, `reply_to` text NOT NULL, `message_id` text NOT NULL, `state` text NOT NULL, `attempt_id` text NULL, `attempt_boot` text NULL, `attempt_permission` integer NULL, `detail` text NULL, PRIMARY KEY (`conversation_id`, `trigger`));
 -- Create index "scheduler_jobs_state" to table: "scheduler_jobs"
@@ -100,6 +104,8 @@ CREATE TABLE `schedule_claims` (`network_id` text NOT NULL, `conversation_id` te
 CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
 -- Create "manager_processes" table
 CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` integer NOT NULL, PRIMARY KEY (`attempt_id`, `process_group`));
+-- Create "manager_turns" table
+CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `server` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
 -- Create "work_runs" table
 CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
 -- Create "work_dispatches" table
