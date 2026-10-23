@@ -22,8 +22,8 @@ function share(invitation: Invitation): Share {
   return { ...invitation, qr }
 }
 
-/** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. */
-export function AddDevice() {
+/** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
+export function AddDevice({ opening = false, onOpened }: { opening?: boolean; onOpened?(): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
@@ -55,7 +55,6 @@ export function AddDevice() {
     const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 3000)
     return () => clearInterval(timer)
   }, [result, ready])
-  if (!ready?.principal.can_manage) return null
 
   // Bound to the connection generation so a late clipboard or invite can't release a newer action.
   async function run(action: () => Promise<void>, success: string) {
@@ -73,10 +72,17 @@ export function AddDevice() {
     if (connection?.isCurrent()) setResult(share(invitation))
   }, "") }
   const copy = (value: string) => void run(async () => { await navigator.clipboard.writeText(value); if (ready?.isCurrent()) setCopied(true) }, "")
+  const show = () => { setOpen(true); if (!result && !requests) generate() }
+  useEffect(() => {
+    if (!opening || !ready?.principal.can_manage) return
+    show()
+    onOpened?.()
+  }, [opening, ready])
   const local = result ? isLoopback(result.link) : false
+  if (!ready?.principal.can_manage) return null
 
   return <>
-    <Button type="button" variant={requests ? "outline" : "default"} onClick={() => { setOpen(true); if (!result && !requests) generate() }}><Plus aria-hidden="true" />添加设备</Button>
+    <Button type="button" variant={requests ? "outline" : "default"} onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>

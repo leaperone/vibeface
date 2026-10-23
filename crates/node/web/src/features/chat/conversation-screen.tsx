@@ -157,6 +157,7 @@ export function ConversationScreen() {
   const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
+  const setupTo = managerOffline || !ready ? '/devices' : '/devices/$deviceId'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -192,9 +193,10 @@ export function ConversationScreen() {
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <Bot aria-hidden="true" className="size-8 text-muted-foreground" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
-          <div className="flex flex-wrap justify-center gap-2">
-            {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
-          </div>
+          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }}><Bot aria-hidden="true" />{managerOffline ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            : <div className="flex flex-wrap justify-center gap-2">
+              {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+            </div>}
         </div> : null}
       />
       <PromptInput
@@ -214,7 +216,7 @@ export function ConversationScreen() {
       >
         <InlineError error={sendError} />
         {cards.length || asked ? <button type="button" className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-4 max-md:min-h-11" onClick={toCards}>去处理</button> : null}
-        {needsSetup ? <Link to={managerOffline || !ready ? '/devices' : '/devices/$deviceId'} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
+        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
   )

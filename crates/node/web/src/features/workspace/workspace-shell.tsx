@@ -8,6 +8,7 @@ import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { dismissToast, EmptyState, Skeleton, toast } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
+import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
 import { Button } from "@/components/ui/button"
@@ -128,6 +129,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="shrink-0 gap-1 px-2 py-3">
+          <SecondDeviceHint />
           <ConnectionCapsule />
           <SidebarMenu>
             <NavItem to="/devices" icon={MonitorSmartphone} label="设备" active={pathname.startsWith("/devices")} dot={devicesAttention} />

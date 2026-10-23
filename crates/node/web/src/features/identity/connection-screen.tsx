@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -178,7 +178,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const [notice, setNotice] = useState('')
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(firstLane ?? null)
-  const [names, setNames] = useState<{ computer: string; browser: string } | null>(null)
+  const [names, setNames] = useState<Names | null>(null)
+  // Going back from the password keeps what was typed.
+  const [draftNames, setDraftNames] = useState<Names | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
   // A removed computer that started over keeps its old name, and joining again is its next step.
@@ -251,8 +253,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
-  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} onNext={setNames} />
-  else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => setNames(null)} run={run} />
+  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} initial={draftNames} onNext={setNames} />
+  else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title="这台电脑">
     {device.localSetup.kind === 'initialized'
       ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
@@ -313,11 +315,22 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </main>
 }
 
-function NamesStep({ computer, onNext }: { computer?: string; onNext(names: { computer: string; browser: string }): void }) {
-  return <Panel icon={Laptop} title="给设备起名">
-    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() }) }}>
-      <Field label="这台电脑叫什么？"><Input key={computer} name="computer" required maxLength={128} autoComplete="off" defaultValue={computer || defaultComputerName()} /></Field>
-      <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName()} /></Field>
+type Names = { computer: string; browser: string }
+
+/** The browser's suggested name is usually fine, so only the computer's name asks for a thought. */
+function NamesStep({ computer, initial, onNext }: { computer?: string; initial: Names | null; onNext(names: Names): void }) {
+  const [browser, setBrowser] = useState(initial?.browser ?? defaultBrowserName())
+  const [renaming, setRenaming] = useState(false)
+  return <Panel icon={Laptop} title="给这台电脑起名">
+    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: browser.trim() || defaultBrowserName() }) }}>
+      <Input key={computer} name="computer" aria-label="这台电脑叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
+      {renaming
+        ? <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" autoFocus value={browser} onChange={(event) => setBrowser(event.target.value)} /></Field>
+        : <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
+          <Monitor aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">这个浏览器：</span>
+          <span className="min-w-0 truncate" title={browser}>{browser}</span>
+          <Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="改浏览器名称" title="改浏览器名称" onClick={() => setRenaming(true)}><Pencil aria-hidden="true" /></Button>
+        </p>}
       <Button type="submit" className="w-fit justify-self-end">下一步</Button>
     </form>
   </Panel>
@@ -326,7 +339,7 @@ function NamesStep({ computer, onNext }: { computer?: string; onNext(names: { co
 type Run = (action: () => Promise<void>) => Promise<void>
 
 /** Step 2a: the recovery password; the file is sealed with it right away. */
-function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: { computer: string; browser: string }; onBack(): void; run: Run }) {
+function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
   const [show, setShow] = useState(false)
   const [short, setShort] = useState(false)
@@ -344,9 +357,9 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
-          <span className="flex gap-2">
-            <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-            <Button type="button" variant="ghost" size="icon" aria-label={show ? '隐藏密码' : '显示密码'} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+          <span className="relative">
+            <Input type={show ? 'text' : 'password'} name="password" className="pe-9 max-md:pe-11" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
+            <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={show ? '隐藏密码' : '显示密码'} aria-pressed={show} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
           </span>
           <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
         </Field>
