@@ -24,8 +24,9 @@ export default function JoinScreen() {
   const session = workspace.session
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
   const choosing = device.phase !== 'key_lost' && !device.review && session.phase !== 'joining'
-  return <SafeAreaView className="flex-1 bg-background">
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="gap-8 px-6 py-10" contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
+  // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
+  return <SafeAreaView style={{ flex: 1 }}>
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
         <Text role="heading" className="text-[40px] leading-[44px] font-bold tracking-tighter">Vibeface</Text>
@@ -83,9 +84,9 @@ function JoinForm() {
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
+      {ready ? null : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
-      </Button>
+      </Button>}
     </View>
     {ready ? <>
       <Input accessibilityLabel="设备名称" placeholder="设备名称" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />

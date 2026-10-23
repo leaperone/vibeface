@@ -54,7 +54,7 @@ function Row({ href, avatar, name, mark, preview, unread, time }: { href: Href; 
           <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
             <Text numberOfLines={1} className="shrink font-medium">{name}</Text>{mark}
           </View>
-          {time ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
+          {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">
           <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{preview}</Text>

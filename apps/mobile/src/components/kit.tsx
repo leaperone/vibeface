@@ -47,7 +47,7 @@ export function SafetyCode({ code }: { code: string }) {
 export function Badge({ count }: { count: number }) {
   if (!count) return null
   return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-foreground px-1.5">
-    <Text className="text-[11px] leading-5 font-semibold text-background" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text>
+    <Text maxFontSizeMultiplier={1.4} className="text-[11px] leading-5 font-semibold text-background" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text>
   </View>
 }
 
@@ -60,6 +60,6 @@ export function Monogram({ name, seed }: { name: string; seed: string }) {
   const hue = (hash % 8) * 45
   const dark = theme === 'dark'
   return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
-    <Text className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
+    <Text maxFontSizeMultiplier={1} className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
   </View>
 }

@@ -35,7 +35,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, onSend, onS
           </Pressable>
         </View>)}
       </ScrollView> : null}
-      <TextInput accessibilityLabel="给 bot 发消息" placeholder="发消息" placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+      <TextInput maxFontSizeMultiplier={2} accessibilityLabel="给 bot 发消息" placeholder="发消息" placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
         className="max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-base text-foreground" value={value} onChangeText={onChange} />
       <View className="flex-row items-center justify-between px-1.5 pb-1.5">
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>

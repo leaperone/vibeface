@@ -10,8 +10,7 @@ import { useWorkspace } from '@/data/context'
 import { LiveWorkspace } from '@/data/live'
 
 export default function RootLayout() {
-  const [background] = useCSSVariable(['--background']) as [string]
-  return <GestureHandlerRootView style={{ flex: 1, backgroundColor: background }}>
+  return <GestureHandlerRootView style={{ flex: 1 }}>
     <KeyboardProvider>
       <LiveWorkspace>
         <Screens />
@@ -32,8 +31,7 @@ function Screens() {
       headerTintColor: foreground,
       headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16, color: foreground },
       headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '700', color: foreground },
-      // A reading column on iPad; phones are narrower than the cap.
-      contentStyle: { backgroundColor: background, width: '100%', maxWidth: 760, alignSelf: 'center' },
+      contentStyle: { backgroundColor: background },
     }}>
       <Stack.Protected guard={!ready}>
         <Stack.Screen name="join" options={{ headerShown: false }} />
