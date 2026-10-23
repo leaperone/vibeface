@@ -1831,8 +1831,6 @@ mod tests {
                 workspace: workspace.clone(),
                 model: "auto".into(),
                 cursor_sdk_bin: dir.join("missing-cursor-sdk"),
-                node_bin: "node".into(),
-                codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
             }),
         };
         let refused = dispatch(

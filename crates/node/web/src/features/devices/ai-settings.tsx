@@ -20,10 +20,7 @@ const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon:
 // Names come from runtime/settings.rs readiness.missing.
 const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> = {
   codex: [
-    { key: "Node.js", label: "缺少 Node.js 18 以上", doc: "node.md#使用-codex-sdk" },
     { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
-    { key: "Codex SDK sidecar", label: "Vibeface 安装不完整，请重新安装", doc: "install.md" },
-    { key: "Codex SDK dependencies", label: "Bot 组件还没装好", doc: "install.md#npm-nightly" },
   ],
   cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
 }
@@ -294,7 +291,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   </li>
 }
 
-const botFields = ["model", "workspace", "cursor_sdk_bin", "node_bin", "codex_sdk_script"] as const
+const botFields = ["model", "workspace", "cursor_sdk_bin"] as const
 
 /** The bot's model, folder and programs, inside the settings of the provider it runs on. */
 function BotDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
@@ -306,12 +303,12 @@ function BotDetails({ manager, fixBin, working, busy, save }: { manager: Manager
       placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim(), node_bin: draft.node_bin.trim(), codex_sdk_script: draft.codex_sdk_script.trim() })
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim() })
   }}>
     <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
     {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
     {field("workspace", "Bot 工作文件夹")}
-    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : <>{field("node_bin", "Node.js")}{field("codex_sdk_script", "Codex 组件")}</>}
+    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }

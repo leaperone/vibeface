@@ -11,7 +11,6 @@ import { gunzipSync } from 'node:zlib';
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
 const required = ['vibeface', 'BUILD-INFO.json', 'README.md', 'RUNTIME-REQUIREMENTS.md',
-  'sidecars/package.json', 'sidecars/package-lock.json', 'sidecars/codex-manager.mjs',
   'scripts/install-node-service.sh', 'docs/node.md', 'docs/releasing.md',
   'web/vibeface_secure.js', 'web/vibeface_secure_bg.wasm'];
 const run = (program, args, options = {}) => execFileSync(program, args, {
@@ -49,7 +48,6 @@ function nativePackage(directory, version, target, sourceCommit) {
     const file = fs.lstatSync(path.join(directory, entry));
     assert(file.isFile() && file.size > 0, `missing package file: ${entry}`);
   }
-  assert(!fs.existsSync(path.join(directory, 'sidecars/node_modules')), 'SDK dependencies must not be bundled');
   const info = JSON.parse(fs.readFileSync(path.join(directory, 'BUILD-INFO.json'), 'utf8'));
   assert.deepEqual([info.version, info.target, info.source_commit, info.update_protocol],
     [version, target, sourceCommit, 1], 'native package identity mismatch');

@@ -57,13 +57,11 @@
 	"provider": "cursor_sdk",
 	"workspace": "/absolute/manager-workspace",
 	"model": "auto",
-	"cursor_sdk_bin": "/absolute/bin/cursor-sdk-bridge",
-	"node_bin": "/absolute/bin/node",
-	"codex_sdk_script": "/absolute/sidecars/codex-manager.mjs"
+	"cursor_sdk_bin": "/absolute/bin/cursor-sdk-bridge"
 }
 ```
 
-`provider` 也可为 `codex_sdk`，此时 Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID），`node_bin` 与 `codex_sdk_script` 不再使用。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，只有 Codex 支持原生 steer，均不支持 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
+`provider` 也可为 `codex_sdk`，此时 Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，只有 Codex 支持原生 steer，均不支持 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
 
 ## 数据目录
 

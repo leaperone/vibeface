@@ -23,13 +23,7 @@ vibeface service stop
 npm install -g @leaperone/vibeface@nightly
 ```
 
-若使用随包 Codex SDK 管理 Agent，首次安装及每次升级后都需为新包安装锁定依赖。将下面的 `<target>` 替换为本机平台：macOS ARM64 使用 `aarch64-apple-darwin`，Linux x64 使用 `x86_64-unknown-linux-gnu`，Linux ARM64 使用 `aarch64-unknown-linux-gnu`。隔离安装时，改用对应 prefix 下的包路径。
-
-```sh
-npm ci --prefix "$(npm root -g)/@leaperone/vibeface/vendor/<target>/sidecars" --omit=dev --ignore-scripts
-```
-
-完成所需依赖安装后，再启动服务并核对状态：
+再启动服务并核对状态：
 
 ```sh
 vibeface service start

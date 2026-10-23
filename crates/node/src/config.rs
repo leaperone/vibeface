@@ -91,8 +91,6 @@ pub struct ManagerSettings {
     pub workspace: PathBuf,
     pub model: String,
     pub cursor_sdk_bin: PathBuf,
-    pub node_bin: PathBuf,
-    pub codex_sdk_script: PathBuf,
 }
 impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {

@@ -928,7 +928,7 @@ mod tests {
         assert_eq!(partial.text(), "hello\n\nworld");
     }
 
-    /// codex-manager.mjs `managerPrompt` puts its CLI instructions (about 1.5 KB with the
+    /// `manager::codex_prompt` puts its CLI instructions (about 1.5 KB with the
     /// executable path) and one catalog entry per tool before the prompt, all within 65536
     /// bytes; a full prompt must fit beside the largest catalog.
     #[test]

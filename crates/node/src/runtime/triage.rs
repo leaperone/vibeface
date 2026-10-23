@@ -1576,8 +1576,6 @@ mod tests {
             workspace: "/tmp".into(),
             model: "fixture".into(),
             cursor_sdk_bin: "/nonexistent".into(),
-            node_bin: "/nonexistent".into(),
-            codex_sdk_script: "/nonexistent".into(),
         });
     }
 

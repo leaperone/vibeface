@@ -664,7 +664,7 @@ def fixture_wrapper(run, name, mode):
 def fixture_manager_settings(run, workspace):
     """Bot turns run on the fixture App Server, so `codex_bin` must be the `--fixture-codex` wrapper."""
     return {"provider": "codex_sdk", "workspace": str(workspace), "model": "controlled-fixture",
-            "cursor_sdk_bin": "unused-fixture", "node_bin": "unused-fixture", "codex_sdk_script": "unused-fixture"}
+            "cursor_sdk_bin": "unused-fixture"}
 
 
 def fixture_record(run, filename, record):

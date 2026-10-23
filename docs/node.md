@@ -13,7 +13,7 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内包括 Rust 程序、SDK sidecar 源码、文档和用户级服务安装脚本，不包含模型凭证、Provider 程序或 npm 依赖。若使用 Codex SDK 管理 Agent，先安装 Node.js 18+，然后在 `sidecars/` 运行 `npm ci --omit=dev`。仅使用 Cursor SDK 管理 Agent 时，无需 Node.js。
+包内包括 Rust 程序、文档和用户级服务安装脚本，不包含模型凭证或 Provider 程序。
 
 从源码生成包时，先构建同一 Rust 密码学模块的浏览器资源。发布包已包含资源，安装发布包不需要这些构建工具。
 
@@ -27,7 +27,7 @@ bash scripts/build-web.sh
 
 `--target` 指定 Rust target，仍需本机具备相应工具链。此选项不保证跨平台编译成功。`--skip-build` 使用已有 release 程序，不能用于证明程序与当前源码一致。
 
-验收制品时，密码学资源、网页、Rust 程序和 SDK sidecar 必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
+验收制品时，密码学资源、网页和 Rust 程序必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
 
 ## 初始化首台设备
 
@@ -98,21 +98,19 @@ Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `
 
 ### 使用 Codex SDK
 
-Codex 官方 SDK 是 TypeScript 库。Rust Node 通过随包 sidecar 调用它，需要 Node.js 18+、已安装的锁定 npm 依赖和已登录的 Codex CLI。
+Codex Bot 的回合在本机 Codex App Server 上运行，只需要已登录的 Codex CLI。
 
 ```sh
 ./vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects \
 	--manager codex_sdk \
-	--workspace /absolute/path/to/manager-workspace \
-	--node-bin /absolute/path/to/node \
-	--codex-sdk-script /absolute/path/to/sidecars/codex-manager.mjs
+	--workspace /absolute/path/to/manager-workspace
 ```
 
-可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。源码运行时先在 `crates/node/sdk/` 安装依赖，将 `--codex-sdk-script` 指向该目录的入口。
+可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
 
-这个适配器通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具。所有调用的宿主 Shell 都是只读文件系统，网络只放行 `127.0.0.1` 和 `localhost`，不注入也不放行 Codex Socket。Codex 子进程环境按变量名筛选，Provider 凭证不放进 Shell 环境。macOS 的 Codex 沙箱不拦截 Unix Socket 连接，同一用户的进程若自行找到 Socket 路径仍可连接，不能把它当作隔离不可信模型或插件的边界。Cursor SDK 与 Codex SDK 的工具运行方式不同，不承诺相同的系统隔离。
+Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，工具令牌和地址经线程的 Shell 环境传入，Provider 凭证不放进 Shell 环境。Cursor SDK 与 Codex 的工具运行方式不同，不承诺相同的系统隔离。
 
 ## 添加自己的设备
 
@@ -371,7 +369,7 @@ vibeface service restart --data-dir "$HOME/.vibeface"
 
 macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
 
-后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 和 sidecar 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
+后台服务不保证继承终端的 PATH 或临时环境变量。在 `config.json` 使用 Provider 的绝对路径，并通过对应服务管理器配置模型凭证。安装脚本不保存或复制密钥。
 
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 

@@ -792,7 +792,6 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "executable was not found",
             "command not found",
             "no cursor sdk bridge",
-            "sidecar is missing",
             "enoent",
         ],
         "这台设备上找不到 AI 服务的程序。去「设备 → AI」检查后再发一次。",
