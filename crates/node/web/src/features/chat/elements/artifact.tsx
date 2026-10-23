@@ -1,4 +1,4 @@
-import { File } from 'lucide-react'
+import { Download, Eye, EyeOff, File } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -34,14 +34,15 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
   }
   return <Card className="w-full min-w-0 gap-0 py-0">
     <CardContent className="space-y-3 p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="mr-auto flex min-w-0 flex-1 basis-40 items-center gap-1.5 text-sm">
+      <div className="flex items-center gap-1">
+        <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5 text-sm">
           <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
           <span className="min-w-0 truncate" title={name}>{name}</span>
           <span className="shrink-0 text-meta text-muted-foreground">{formatSize(size)}</span>
         </span>
-        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}>打开</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起</Button>}
-        <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
+        {!opened ? <ActionButton variant="ghost" label="打开" disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}><Eye aria-hidden="true" /></ActionButton>
+          : <Button type="button" variant="ghost" size="icon" aria-label="收起" title="收起" onClick={() => setOpened(false)}><EyeOff aria-hidden="true" /></Button>}
+        <ActionButton variant="ghost" label="下载" disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
           const parts: Uint8Array<ArrayBuffer>[] = []
           let offset: number | null = 0
           while (offset !== null) {
@@ -61,7 +62,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
           link.download = name
           link.click()
           window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-        }, '下载')}>下载</ActionButton>
+        }, '下载')}><Download aria-hidden="true" /></ActionButton>
       </div>
       {opened ? <>
         <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '文件是空的'}</pre>

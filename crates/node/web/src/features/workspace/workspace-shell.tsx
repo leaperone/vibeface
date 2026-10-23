@@ -6,7 +6,7 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { EmptyState, Skeleton, toast } from "@/components/app/kit"
+import { dismissToast, EmptyState, Skeleton, toast } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@/features/identity/context"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
@@ -67,12 +67,19 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     const timer = setInterval(refresh, 30_000)
     return () => clearInterval(timer)
   }, [device.ready])
+  // A request that was answered or expired takes its toast with it.
+  const joinToasts = useRef(new Map<string, number>())
   useEffect(() => {
     for (const join of joins) {
       if (announced.current.has(join.join_id)) continue
       announced.current.add(join.join_id)
       if (joinsOnScreen()) continue
-      toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } })
+      joinToasts.current.set(join.join_id, toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } }))
+    }
+    for (const [joinId, toastId] of joinToasts.current) {
+      if (joins.some((join) => join.join_id === joinId)) continue
+      dismissToast(toastId)
+      joinToasts.current.delete(joinId)
     }
   }, [joins.map((join) => join.join_id).join()])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
