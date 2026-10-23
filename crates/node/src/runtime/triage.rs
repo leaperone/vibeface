@@ -2047,6 +2047,102 @@ mod tests {
         result
     }
 
+    /// Posts the user's message `id` in `c` and starts its reply; returns its trigger and attempt.
+    async fn start_reply(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        id: &str,
+    ) -> Result<(String, String)> {
+        let network = node.network_id().await?;
+        let posted = admin.attest(
+            &network,
+            "c",
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: crate::model::Role::User,
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+            },
+        )?;
+        let signed = posted.attestation().cloned().context("signed")?;
+        let mut store = node.store.lock().await;
+        store.accept_message(
+            &node.identity,
+            &network,
+            "c",
+            id,
+            id,
+            vec![],
+            true,
+            signed,
+            now_ms(),
+        )?;
+        let claimed = store
+            .claim_next(&node.identity, &network, "c", "boot", "cfg")?
+            .context("job")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        store.mark_started("c", &trigger, &attempt)?;
+        Ok((trigger, attempt))
+    }
+
+    /// A pending check closes only from the App Server its turn ran on: after a switch to
+    /// another one, the old turn is unknown there, not missing.
+    #[tokio::test]
+    async fn a_check_from_another_app_server_stays_pending() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let _requests = answering_app_server(&node)?;
+            while node.codex.status().await["connection"]["state"] != "connected" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let network = node.network_id().await?;
+            assert_eq!(node.codex.server(), "system");
+            for (id, server) in [("m1", "own:"), ("m2", "system")] {
+                let (trigger, attempt) = start_reply(&node, &admin, id).await?;
+                let mut store = node.store.lock().await;
+                store.record_manager_turn(&attempt, server, "thread", Some("turn"))?;
+                let interrupted = crate::scheduling::JobOutcome::Interrupted {
+                    detail: "lost".into(),
+                    process_unconfirmed: true,
+                };
+                store.finish_job(
+                    &node.identity,
+                    &network,
+                    "c",
+                    &trigger,
+                    &attempt,
+                    interrupted,
+                    "",
+                    now_ms(),
+                )?;
+            }
+            node.reconcile_checks(&network).await?;
+            let left = node.store.lock().await.pending_checks()?;
+            let servers: Vec<_> = left
+                .iter()
+                .filter_map(|check| check.codex_turn.as_ref())
+                .map(|turn| turn.server.as_str())
+                .collect();
+            assert_eq!(
+                servers,
+                ["own:"],
+                "only the turn on this App Server was found gone"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
     /// A bot's own reply thread belongs to its chat: triage never asks whose it is, and no
     /// bot sends work into it.
     #[tokio::test]
@@ -2056,51 +2152,15 @@ mod tests {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
-            let posted = admin.attest(
-                &network,
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            node.store.lock().await.save_scheduler_native_id(
                 "c",
-                EventBody::MessagePosted {
-                    message_id: "m1".into(),
-                    role: crate::model::Role::User,
-                    text: "go".into(),
-                    attachments: vec![],
-                    report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: None,
-                },
+                &trigger,
+                &attempt,
+                "bot-thread",
+                "token",
+                false,
             )?;
-            let signed = posted.attestation().cloned().context("signed")?;
-            let (trigger, attempt) = {
-                let mut store = node.store.lock().await;
-                store.accept_message(
-                    &node.identity,
-                    &network,
-                    "c",
-                    "m1",
-                    "go",
-                    vec![],
-                    true,
-                    signed,
-                    now_ms(),
-                )?;
-                let claimed = store
-                    .claim_next(&node.identity, &network, "c", "boot", "cfg")?
-                    .context("job")?;
-                let trigger = claimed.job.trigger.clone();
-                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-                store.mark_started("c", &trigger, &attempt)?;
-                store.save_scheduler_native_id(
-                    "c",
-                    &trigger,
-                    &attempt,
-                    "bot-thread",
-                    "token",
-                    false,
-                )?;
-                (trigger, attempt)
-            };
             let event = node
                 .ingest_agent_event(turn("bot-thread", "t1", "/w"))
                 .await?;

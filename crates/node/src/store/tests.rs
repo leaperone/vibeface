@@ -613,9 +613,9 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     say(&mut store, &net, "quiet", false)?;
     let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "thread", None)?;
+    store.record_manager_turn(&attempt, "system", "thread", None)?;
     assert!(candidates(&store)?.is_empty());
-    store.record_manager_turn(&attempt, "thread", Some("turn"))?;
+    store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
     // A reply left running by an earlier process is never a target.
     assert!(
         store
@@ -694,7 +694,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     // Stopping a steered message stops the reply it went into.
     let attempt = next.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &next.job.trigger, &attempt)?;
-    store.record_manager_turn(&attempt, "thread", Some("turn-2"))?;
+    store.record_manager_turn(&attempt, "system", "thread", Some("turn-2"))?;
     say(&mut store, &net, "m3", true)?;
     let found = candidates(&store)?;
     assert_eq!(found.len(), 1);
@@ -3913,9 +3913,9 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
             let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
             store.mark_started("c", &trigger, &attempt)?;
             store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
-            store.record_manager_turn(&attempt, "thread", None)?;
+            store.record_manager_turn(&attempt, "system", "thread", None)?;
             let outcome = if started {
-                store.record_manager_turn(&attempt, "thread", Some("turn"))?;
+                store.record_manager_turn(&attempt, "system", "thread", Some("turn"))?;
                 JobOutcome::Completed
             } else {
                 JobOutcome::Failed("the model is unknown".into())
@@ -3982,7 +3982,7 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
             .map(|e| e.trigger)
             .collect())
     };
-    assert_eq!(handed(&store)?, [trigger.clone()]);
+    assert_eq!(handed(&store)?, std::slice::from_ref(&trigger));
     assert!(
         store
             .claim_next(&net.a, &net.network, "c", "boot", "cfg")?

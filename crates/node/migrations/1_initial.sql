@@ -101,7 +101,7 @@ CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` tex
 -- Create "manager_processes" table
 CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` integer NOT NULL, PRIMARY KEY (`attempt_id`, `process_group`));
 -- Create "manager_turns" table
-CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
+CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `server` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
 -- Create "work_runs" table
 CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
 -- Create "work_dispatches" table

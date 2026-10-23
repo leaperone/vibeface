@@ -1,6 +1,6 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
-use crate::scheduling::{JobState, PendingCheck, TaskJobChange, task_work_signal};
+use crate::scheduling::{JobState, PendingCheck, ReplyTurn, TaskJobChange, task_work_signal};
 use crate::work::{Probe, WorkState};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -205,10 +205,8 @@ impl Runtime {
             if check.process_groups.iter().any(|group| group_alive(*group)) {
                 continue;
             }
-            if let Some((thread, turn)) = &check.codex_turn
-                && !self
-                    .codex_turn_ended(thread, turn.as_deref(), &check.attempt_id)
-                    .await
+            if let Some(turn) = &check.codex_turn
+                && !self.codex_turn_ended(turn, &check.attempt_id).await
             {
                 continue;
             }
@@ -231,9 +229,18 @@ impl Runtime {
     }
 
     /// Whether a reply's App Server turn has ended. One still running is interrupted, since its
-    /// reply was already recorded as interrupted; an unreachable App Server leaves it unknown.
-    async fn codex_turn_ended(&self, thread: &str, turn: Option<&str>, attempt_id: &str) -> bool {
-        match self.codex.probe(thread, turn, attempt_id, 0).await {
+    /// reply was already recorded as interrupted; an unreachable App Server, or another one than
+    /// the turn ran on, leaves it unknown.
+    async fn codex_turn_ended(&self, turn: &ReplyTurn, attempt_id: &str) -> bool {
+        if turn.server != self.codex.server() {
+            return false;
+        }
+        let thread = turn.thread.as_str();
+        match self
+            .codex
+            .probe(thread, turn.turn.as_deref(), attempt_id, 0)
+            .await
+        {
             Ok(Probe::Running { turn_id, .. }) => {
                 if let Err(error) = self.codex.interrupt(thread, &turn_id).await {
                     tracing::debug!(%error, "interrupting a reply turn left running is pending");

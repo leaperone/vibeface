@@ -248,7 +248,7 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
     let mut statement = connection.prepare(
         "SELECT c.attempt_id,c.conversation_id,c.trigger,c.detail,c.created_at_ms,
             (SELECT json_group_array(process_group) FROM manager_processes p WHERE p.attempt_id=c.attempt_id),
-            t.thread_id,t.turn_id
+            t.server,t.thread_id,t.turn_id
          FROM pending_checks c LEFT JOIN manager_turns t ON t.attempt_id=c.attempt_id
          ORDER BY c.created_at_ms",
     )?;
@@ -263,6 +263,7 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
                 r.get::<_, String>(5)?,
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, Option<String>>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -275,6 +276,7 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
                 detail,
                 created_at_ms,
                 groups,
+                server,
                 thread,
                 turn,
             )| {
@@ -285,7 +287,11 @@ pub(crate) fn pending_checks_from(connection: &Connection) -> Result<Vec<Pending
                     attempt_id,
                     detail,
                     process_groups: serde_json::from_str(&groups)?,
-                    codex_turn: thread.map(|thread| (thread, turn)),
+                    codex_turn: server.zip(thread).map(|(server, thread)| ReplyTurn {
+                        server,
+                        thread,
+                        turn,
+                    }),
                     created_at_ms,
                 })
             },
@@ -1617,6 +1623,7 @@ impl Store {
     pub fn record_manager_turn(
         &mut self,
         attempt_id: &str,
+        server: &str,
         thread_id: &str,
         turn_id: Option<&str>,
     ) -> Result<()> {
@@ -1624,8 +1631,8 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT OR REPLACE INTO manager_turns(attempt_id,thread_id,turn_id) VALUES(?,?,?)",
-            params![attempt_id, thread_id, turn_id],
+            "INSERT OR REPLACE INTO manager_turns(attempt_id,server,thread_id,turn_id) VALUES(?,?,?,?)",
+            params![attempt_id, server, thread_id, turn_id],
         )?;
         if turn_id.is_some()
             && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()

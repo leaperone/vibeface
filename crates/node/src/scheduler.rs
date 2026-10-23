@@ -162,10 +162,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         .get()
         .context("local tool listener is not ready")?;
     // A Codex thread keeps the Shell environment it was created with, tool URL included: when
-    // the Node could not get its earlier tool port back, a new thread starts.
+    // the Node could not get its earlier tool port back, a new thread starts. It lives on one
+    // App Server; another one starts a new thread too.
+    let server = node.codex.server();
     let sdk_config = digest(&serde_json::to_vec(&(
         &settings,
-        (kind == manager::ManagerKind::CodexSdk).then_some(tool_url),
+        (kind == manager::ManagerKind::CodexSdk).then_some((tool_url, &server)),
     ))?);
     let claimed = {
         let mut store = node.store.lock().await;
@@ -236,7 +238,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             tool_cli: Some(std::env::current_exe()?),
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
-            codex_turn: Some(turn_recorder(&node, &attempt.id)),
+            codex_turn: Some(turn_recorder(&node, &attempt.id, &server)),
             ..node.manager_config(settings)
         };
         config.tool_env.extend([
@@ -421,19 +423,23 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
     })
 }
 
-fn turn_recorder(node: &Arc<Runtime>, attempt: &str) -> manager::CodexTurn {
+fn turn_recorder(node: &Arc<Runtime>, attempt: &str, server: &str) -> manager::CodexTurn {
     let node = node.clone();
     let attempt = attempt.to_owned();
+    let server = server.to_owned();
     manager::CodexTurn {
         client_id: attempt.clone(),
         record: Arc::new(move |thread, turn| {
             let node = node.clone();
             let attempt = attempt.clone();
+            let server = server.clone();
             Box::pin(async move {
-                node.store
-                    .lock()
-                    .await
-                    .record_manager_turn(&attempt, &thread, turn.as_deref())
+                node.store.lock().await.record_manager_turn(
+                    &attempt,
+                    &server,
+                    &thread,
+                    turn.as_deref(),
+                )
             })
         }),
     }
