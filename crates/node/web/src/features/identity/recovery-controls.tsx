@@ -132,8 +132,8 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
-        <Label label="新密码（至少 12 个字符）"><Input type="password" name="password" minLength={12} autoComplete="new-password" required /></Label>
-        <Label label="再输一次"><Input type="password" name="confirmation" minLength={12} autoComplete="new-password" required /></Label>
+        <Label label="新密码（至少 8 个字符）"><Input type="password" name="password" minLength={8} autoComplete="new-password" required /></Label>
+        <Label label="再输一次"><Input type="password" name="confirmation" minLength={8} autoComplete="new-password" required /></Label>
         <div className="flex flex-wrap gap-2"><Button type="submit" variant="outline"><BusyIcon busy={busy} />下载新文件</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
     </section> : null}

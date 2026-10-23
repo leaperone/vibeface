@@ -337,7 +337,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
       event.preventDefault()
       const form = event.currentTarget
       const input = form.elements.namedItem('password') as HTMLInputElement
-      if ([...input.value].length < 12) { setShort(true); input.focus(); return }
+      if ([...input.value].length < 8) { setShort(true); input.focus(); return }
       void run(async () => {
         try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password'), value(form, 'password')), names.computer) }
         finally { form.reset() }
@@ -349,7 +349,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
             <Input type={show ? 'text' : 'password'} name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
             <Button type="button" variant="ghost" size="icon" aria-label={show ? '隐藏密码' : '显示密码'} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
           </span>
-          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 12 个字符，忘了就无法找回</span>
+          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
