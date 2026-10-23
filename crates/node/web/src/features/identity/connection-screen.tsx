@@ -90,13 +90,17 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
       {copied ? <CircleCheck aria-hidden="true" /> : null}{copied ? '已复制' : '复制命令'}
     </Button>
   </>
+  // On its own local page the rejoin first opens this computer, then carries on there.
+  const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
+  const here = Boolean(setup)
+  const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
   return <Panel icon={MonitorX} title="这台设备已被移出">
-    {device.removedLocally ? <>
+    {canRejoin ? <>
       <p className="text-muted-foreground">旧数据会改名保留，不会删除。</p>
       <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       <Details label="用命令重新加入">{commands}</Details>
     </> : <>
-      <p className="text-muted-foreground">在它的本机页面点“重新加入”。</p>
+      {here ? null : <p className="text-muted-foreground">在它的本机页面点“重新加入”。</p>}
       <Details label="用命令重新加入">{commands}</Details>
     </>}
   </Panel>
