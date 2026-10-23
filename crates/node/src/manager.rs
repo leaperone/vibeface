@@ -56,6 +56,9 @@ pub type TurnRecorder = Arc<
 pub struct CodexTurn {
     pub client_id: String,
     pub record: TurnRecorder,
+    /// The prompt for a new thread, sent instead when the resumed thread is gone: the turn's
+    /// own prompt then leaves out what only the old thread had seen.
+    pub fresh_prompt: Option<String>,
 }
 
 #[derive(Clone)]
@@ -448,6 +451,17 @@ where
         }
         None => None,
     };
+    let prompt = match (&resumed, previous, &config.codex_turn) {
+        (
+            None,
+            Some(_),
+            Some(CodexTurn {
+                fresh_prompt: Some(fresh),
+                ..
+            }),
+        ) => fresh.as_str(),
+        _ => prompt,
+    };
     let thread = match resumed {
         Some(id) => id,
         None => {
@@ -776,6 +790,11 @@ mod tests {
                         if method == "turn/start" && turn == Turn::Drops {
                             return;
                         }
+                        if method == "thread/resume" && request["params"]["threadId"] == "gone" {
+                            let error = json!({"id":request["id"],"error":{"code":-32600,"message":"no rollout found"}});
+                            let _ = server.send(Message::Text(error.to_string().into())).await;
+                            continue;
+                        }
                         let result = match method {
                             "thread/start" => json!({"thread":{"id":"thread-1"}}),
                             "turn/start" => json!({"turn":{"id":"turn-1"}}),
@@ -864,6 +883,7 @@ mod tests {
                     record.lock().unwrap().push((thread, turn));
                     Box::pin(async { Ok(()) })
                 }),
+                fresh_prompt: None,
             }),
             ..codex(workspace(), fake.socket.clone())
         };
@@ -950,6 +970,37 @@ mod tests {
             assert_eq!(fake.calls("thread/resume").len(), 1);
             assert_eq!(fake.calls("turn/interrupt").len(), 1);
         }
+    }
+
+    /// When the resumed thread is gone, the new thread's first turn gets the fresh prompt with
+    /// the full context, not the resumed turn's delta.
+    #[tokio::test]
+    async fn a_new_thread_in_place_of_a_lost_one_gets_the_full_prompt() {
+        let fake = fake_app_server(Turn::Answers);
+        let config = ManagerConfig {
+            codex_turn: Some(CodexTurn {
+                client_id: "attempt-1".into(),
+                record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                fresh_prompt: Some("full context".into()),
+            }),
+            ..codex(workspace(), fake.socket.clone())
+        };
+        let result = run_manager(
+            &config,
+            "delta only",
+            Some("gone"),
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("thread-1"));
+        assert_eq!(fake.calls("thread/start").len(), 1);
+        assert_eq!(
+            fake.calls("turn/start")[0]["input"][0]["text"],
+            "full context"
+        );
     }
 
     /// A `turn/start` whose answer is lost is looked up by its client ID, never sent again.

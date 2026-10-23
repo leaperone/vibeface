@@ -242,7 +242,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     let mut registered = false;
     let mut sdk_live = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
-        let (prompt, shown_now) = {
+        let ((prompt, shown_now), fresh) = {
             let store = node.store.lock().await;
             let context = store.context(&network, &conversation, Some(&job.basis))?;
             let works = store.works(&network, &conversation)?;
@@ -259,8 +259,16 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 TriggerKind::Route => Some(route_context(&store, &network, &conversation, &job.reply_to)?),
                 _ => None,
             };
-            materialize(&context, &job, &works, bot, schedule.as_ref(), route, &local_settings.roots, claimed.covers.as_ref(), codex.then_some(&claimed.shown))?
+            let render = |resumed, thread| materialize(&context, &job, &works, bot.clone(), schedule.as_ref(), route.clone(), &local_settings.roots, resumed, thread);
+            let turn = render(claimed.covers.as_ref(), codex.then_some(&claimed.shown))?;
+            // A resumed thread Codex no longer has is replaced by a new one, which needs it all.
+            let fresh = match (codex, &claimed.previous_native_id) {
+                (true, Some(_)) => Some(render(None, Some(&Shown::default()))?),
+                _ => None,
+            };
+            (turn, fresh)
         };
+        let (fresh_prompt, fresh_shown) = fresh.unzip();
         let shown = Arc::new(Mutex::new(shown_now));
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
         if kind == manager::ManagerKind::CodexSdk {
@@ -273,7 +281,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             instructions: if codex { thread_instructions() } else { String::new() },
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
-            codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone())),
+            codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
             ..node.manager_config(settings)
         };
         config.tool_env.extend([
@@ -311,10 +319,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             &prompt,
             claimed.previous_native_id.as_deref(),
             move |id| async move {
-                // A new thread in place of the resumed one has seen none of this prompt's
-                // omissions; its next turn is shown everything again.
-                if resumed_thread.is_some_and(|resumed| resumed != id) {
-                    *shown.lock().expect("shown") = Shown::default();
+                // A new thread in place of the resumed one gets the fresh prompt.
+                if resumed_thread.is_some_and(|resumed| resumed != id)
+                    && let Some(fresh) = fresh_shown
+                {
+                    *shown.lock().expect("shown") = fresh;
                 }
                 persist_node.store.lock().await.save_scheduler_native_id(
                     &persist_conversation,
@@ -469,12 +478,14 @@ fn turn_recorder(
     attempt: &str,
     server: &str,
     shown: Arc<Mutex<Shown>>,
+    fresh_prompt: Option<String>,
 ) -> manager::CodexTurn {
     let node = node.clone();
     let attempt = attempt.to_owned();
     let server = server.to_owned();
     manager::CodexTurn {
         client_id: attempt.clone(),
+        fresh_prompt,
         record: Arc::new(move |thread, turn| {
             let node = node.clone();
             let attempt = attempt.clone();
