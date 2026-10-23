@@ -91,6 +91,7 @@ export default function ChatScreen() {
       scrollEdgeEffects: { top: 'hidden', bottom: 'hidden', left: 'hidden', right: 'hidden' },
       // With the edge effects off, the bar keeps its own blur so messages scrolled under it stay behind frosted glass.
       headerTransparent: ios,
+      headerShadowVisible: false,
       ...ios ? { headerStyle: { backgroundColor: 'transparent' } } : {},
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',

@@ -54,8 +54,10 @@ export function Badge({ count }: { count: number }) {
 /** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
 export function Monogram({ name, seed }: { name: string; seed: string }) {
   const { theme } = useUniwind()
-  let hash = 0
-  for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  // FNV-1a: a plain `* 31` hash leaves `% 8` set by the last characters, so similar ids shared a tint.
+  let hash = 2166136261
+  for (const char of seed) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619)
+  hash = (hash ^ (hash >>> 16)) >>> 0
   // Eight hues 45° apart, so neighbouring bots never land on near-identical tints.
   const hue = (hash % 8) * 45
   const dark = theme === 'dark'
