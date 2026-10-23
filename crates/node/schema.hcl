@@ -249,7 +249,7 @@ table "messages" {
     null = true
     type = text
   }
-  column "blobs" {
+  column "attachments" {
     null = false
     type = text
   }
@@ -1038,8 +1038,12 @@ table "scheduler_outbox" {
     columns = [column.conversation_id, column.trigger]
   }
 }
-table "schedule_runs" {
+table "schedule_claims" {
   schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
   column "conversation_id" {
     null = false
     type = text
@@ -1052,8 +1056,16 @@ table "schedule_runs" {
     null = false
     type = integer
   }
+  column "owner_epoch" {
+    null = false
+    type = integer
+  }
+  column "author" {
+    null = false
+    type = text
+  }
   primary_key {
-    columns = [column.conversation_id, column.schedule_id]
+    columns = [column.network_id, column.conversation_id, column.schedule_id, column.slot_ms]
   }
 }
 table "pending_checks" {

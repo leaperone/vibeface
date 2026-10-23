@@ -984,6 +984,77 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     Ok(())
 }
 
+/// A move stops the old owner's running turn: its tools lose permission at once, it is fenced
+/// for cancelling once, and moving back later does not revive it.
+#[test]
+fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = claimed.job.trigger.clone();
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    assert!(store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        3,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.a, 3)?,
+        vec![],
+        4,
+    )?;
+    assert!(!store.manager_attempt_allowed(&net.network, &local, "c", &trigger, &attempt)?);
+    assert_eq!(
+        store.fence_moved_turns(&net.network, &local)?,
+        vec![("c".to_owned(), trigger.clone(), attempt.clone())]
+    );
+    assert!(matches!(
+        store.scheduler_job("c", &trigger)?.context("job")?.state,
+        JobState::Cancelling { .. }
+    ));
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Cancelled("会话已移到另一台设备".into()),
+        "partial",
+        5,
+    )?;
+    let reply = store
+        .message(&net.network, "c", &claimed.job.message_id)?
+        .context("reply")?;
+    assert_eq!(reply.status, Some(ReplyStatus::Stopped));
+    Ok(())
+}
+
 fn owner(net: &Net, node: &LocalIdentity, epoch: u64) -> Result<EventBody> {
     net.a.fixture_admin().attest(
         &net.network,
@@ -1608,7 +1679,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
                 .is_empty()
         );
     }
-    // A fresh store keeps no run records; the reply in the history stops a second run.
+    // A fresh store keeps no run records; the claim in the history stops a second run.
     let mut restored = store(&net)?;
     all_accepted(&mut restored, &net, &origin)?;
     assert!(
@@ -1623,6 +1694,175 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
             .iter()
             .all(|entry| !crate::scheduling::ahead(&entry.schedule, at + 1))
     );
+    Ok(())
+}
+
+/// Conversation `c` owned by a, with a schedule from 1000; both sides hold it.
+fn scheduled_on_both(net: &Net, every_minutes: u32) -> Result<(Store, Store, String)> {
+    let mut a_side = store(net)?;
+    conversation(&mut a_side, net)?;
+    a_side.append_event(&net.a, &net.network, "c", user(net, "m1", "x"), vec![], 2)?;
+    let (saved, _) = a_side.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", every_minutes),
+        3,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
+    };
+    let mut b_side = store(net)?;
+    sync(&a_side, &mut b_side, net)?;
+    Ok((a_side, b_side, schedule_id))
+}
+
+fn claim_winner(store: &Store, net: &Net, schedule_id: &str, slot: i64) -> Result<(u64, String)> {
+    Ok(store.connection.query_row(
+        "SELECT owner_epoch,author FROM schedule_claims WHERE network_id=? AND conversation_id='c' AND schedule_id=? AND slot_ms=?",
+        params![net.network, schedule_id, slot],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+/// Two owners that each claimed the same time, one not yet aware of the move, run it once:
+/// every arrival order picks the newer owner's claim, and the stale owner, owning again by
+/// the time it would run, drops its unstarted job. A time already claimed is never run again.
+#[test]
+fn a_schedule_time_runs_once_across_owners() -> Result<()> {
+    let net = net()?;
+    let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 5)?;
+    let every = 5 * 60_000;
+    let slot = 1_000 + 3 * every;
+    let trigger = schedule_trigger(&schedule_id, slot);
+    let due = vec![("c".to_owned(), trigger.clone())];
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        4,
+    )?;
+    assert_eq!(
+        a_side.admit_due_schedules(&net.a, &net.network, slot + 10)?,
+        due
+    );
+    assert_eq!(
+        b_side.admit_due_schedules(&net.b, &net.network, slot + 20)?,
+        due
+    );
+    let running = b_side
+        .claim_next(&net.b, &net.network, "c", "boot", "cfg")?
+        .context("b runs the time")?;
+    assert_eq!(running.job.trigger, trigger);
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.a, 3)?,
+        vec![],
+        5,
+    )?;
+
+    let a_log = a_side.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+    let b_log = b_side.events_from(&net.network, &net.b.device_id()?, 1, 500)?;
+    let mut winners = Vec::new();
+    for order in [[&a_log, &b_log], [&b_log, &a_log]] {
+        let mut replica = store(&net)?;
+        for log in order {
+            replica.ingest_events(&net.network, log)?;
+        }
+        winners.push(claim_winner(&replica, &net, &schedule_id, slot)?);
+    }
+    sync(&b_side, &mut a_side, &net)?;
+    winners.push(claim_winner(&a_side, &net, &schedule_id, slot)?);
+    assert_eq!(winners, vec![(2, net.b.device_id()?); 3]);
+
+    assert!(
+        a_side
+            .admit_due_schedules(&net.a, &net.network, slot + 30)?
+            .is_empty()
+    );
+    assert!(
+        a_side
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(matches!(
+        a_side.scheduler_job("c", &trigger)?.context("job")?.state,
+        JobState::Cancelled { ref evidence, .. } if evidence.contains("另一台设备")
+    ));
+    Ok(())
+}
+
+/// A time found too late is claimed as skipped, so a new owner whose clock still sees it in
+/// time does not run it either. Only the owner claims, and at the epoch it knew.
+#[test]
+fn a_skipped_late_time_is_not_run_by_the_next_owner() -> Result<()> {
+    let net = net()?;
+    let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 60)?;
+    let every = 60 * 60_000;
+    let slot = 1_000 + 3 * every;
+    let late = slot + crate::store::scheduler::MAX_LATE_MS + 1;
+    assert!(
+        a_side
+            .admit_due_schedules(&net.a, &net.network, late)?
+            .is_empty()
+    );
+    assert!(a_side.scheduler_jobs("c")?.is_empty());
+    assert_eq!(
+        claim_winner(&a_side, &net, &schedule_id, slot)?,
+        (1, net.a.device_id()?)
+    );
+
+    let stale = b_side
+        .append_event(
+            &net.b,
+            &net.network,
+            "c",
+            EventBody::ScheduleRunClaimed {
+                schedule_id: schedule_id.clone(),
+                slot_ms: slot,
+                owner_epoch: 1,
+            },
+            vec![],
+            4,
+        )
+        .unwrap_err();
+    assert!(stale.to_string().contains("scheduling Node"), "{stale}");
+    sync(&a_side, &mut b_side, &net)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        5,
+    )?;
+    let misnamed = b_side
+        .append_event(
+            &net.b,
+            &net.network,
+            "c",
+            EventBody::ScheduleRunClaimed {
+                schedule_id: schedule_id.clone(),
+                slot_ms: slot + every,
+                owner_epoch: 1,
+            },
+            vec![],
+            6,
+        )
+        .unwrap_err();
+    assert!(misnamed.to_string().contains("owner epoch"), "{misnamed}");
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, slot + 60_000)?
+            .is_empty()
+    );
+    assert!(b_side.scheduler_jobs("c")?.is_empty());
     Ok(())
 }
 

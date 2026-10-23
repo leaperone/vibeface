@@ -10,14 +10,15 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder,
 } from "./model.ts"
+import type { Attachment } from "../chat/types.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
 import { answerBody, answerId, answerScope } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, BlobRef, WriteState, WriteStatus, OpenWork, ScheduleAction,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction,
 } from "./types.ts"
 
 /** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
@@ -30,7 +31,7 @@ const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
 export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 
 /** A file the person attached: a browser `File` or a picked document on a phone. */
-export type Attachment = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
+export type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 type NotificationButton = { label: string; disabled: boolean }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
@@ -422,7 +423,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
   /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
-  const uploadAttachment = async (id: string, file: Attachment): Promise<BlobRef> => {
+  const uploadAttachment = async (id: string, file: AttachmentFile): Promise<Attachment> => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
     const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
@@ -433,11 +434,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       let binary = ""
       for (let index = 0; index < chunk.length; index += 0x8000) binary += String.fromCharCode(...chunk.subarray(index, index + 0x8000))
       const reply = record(await connection.rpc("upload_attachment", { conversation_id: id, hash, size: bytes.length, offset, data: btoa(binary) }))
-      if (reply.complete === true) return { hash, size: bytes.length }
+      if (reply.complete === true) return { hash, size: bytes.length, name: attachmentName(file.name) }
       offset = Number(reply.offset)
     }
   }
-  const submitMessage = async (text: string, files: Attachment[] = []) => {
+  const submitMessage = async (text: string, files: AttachmentFile[] = []) => {
     requireContext()
     const id = activeId.current
     const prior = messagesRef.current.find((item) => item.conversation_id === id) ?? null
@@ -447,11 +448,9 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     let item = prior ? (await outbox.all()).find((entry) => entry.key === key) : undefined
     if (!item) {
       const { body } = prepared
-      const uploaded: BlobRef[] = []
+      const uploaded: Attachment[] = []
       for (const file of files) uploaded.push(await uploadAttachment(id, file))
-      // Signed in the Node's order: by hash then size, without duplicates.
-      const attachments = uploaded.sort((a, b) => a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : a.size - b.size)
-        .filter((blob, index, all) => index === 0 || blob.hash !== all[index - 1].hash || blob.size !== all[index - 1].size)
+      const attachments = signedOrder(uploaded)
       const extra = attachments.length ? { attachments } : {}
       const attestation = await attest(body.conversation_id, { type: "message_posted", message_id: body.message_id, role: "user", text: body.text, ...extra, report_results: body.report_results })
       item = await enqueue(outbox, { key, method: "message", params: { ...body, ...extra, attestation }, created_at_ms: Date.now() })
@@ -503,7 +502,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     selectConversation(bot.conversation_id)
     await refreshRef.current()
   }
-  const sendMessage = (input: string, files: Attachment[] = []) => withMutation(`message:${activeId.current}`, async () => {
+  const sendMessage = (input: string, files: AttachmentFile[] = []) => withMutation(`message:${activeId.current}`, async () => {
     if (!bots.some((bot) => bot.conversation_id === activeId.current)) throw new Error("请先选一个 Bot。")
     const text = inputText(input, "消息内容", 65536)
     setMessageBusy(true)

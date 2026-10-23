@@ -148,11 +148,7 @@ impl Runtime {
         let deliveries = deliveries(&store, scope, &works)?;
         let conversation = store.conversation(network, scope)?;
         let bot = store.bot_for_conversation(network, scope)?;
-        let messages = store
-            .messages(network, scope)?
-            .into_iter()
-            .map(|message| message_value(&store, network, message))
-            .collect::<Result<Vec<_>>>()?;
+        let messages = store.messages(network, scope)?;
         let changes = store.bot_changes(network, scope)?;
         let sent = store.sent_bot_messages(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
@@ -240,9 +236,7 @@ impl Runtime {
             Some(_) => store.last_messages(network)?.remove(scope),
             None => None,
         };
-        let messages = message
-            .map(|message| message_value(&store, network, message))
-            .transpose()?;
+        let messages = message.map(|message| json!(message));
         let works = store.works(network, scope)?;
         let changed: Vec<_> = works
             .iter()
@@ -312,13 +306,4 @@ fn deliveries(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<Ve
         }
     }
     Ok(deliveries)
-}
-
-fn message_value(store: &Store, network: &str, message: Message) -> Result<Value> {
-    let attachments = store.event_blobs(network, &message.event_hash)?;
-    let mut value = json!(message);
-    if !attachments.is_empty() {
-        value["blobs"] = json!(attachments);
-    }
-    Ok(value)
 }

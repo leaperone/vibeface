@@ -48,7 +48,7 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 14] = [
+pub(crate) const TABLES: [&str; 15] = [
     "conversations",
     "messages",
     "bots",
@@ -56,6 +56,7 @@ pub(crate) const TABLES: [&str; 14] = [
     "bot_deletions",
     "skills",
     "schedules",
+    "schedule_claims",
     "memories",
     "bot_changes",
     "works",
@@ -140,10 +141,11 @@ pub(crate) fn apply(
             in_reply_to,
             status,
             answers,
+            attachments,
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,blobs=excluded.blobs WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
@@ -159,7 +161,7 @@ pub(crate) fn apply(
                     status.map(text).transpose()?,
                     report_results,
                     answers,
-                    serde_json::to_string(&event.blobs)?
+                    serde_json::to_string(attachments)?
                 ],
             )?;
             if *role == Role::Assistant {
@@ -402,6 +404,16 @@ pub(crate) fn apply(
                 event.created_at_ms,
             )?,
         },
+        EventBody::ScheduleRunClaimed {
+            schedule_id,
+            slot_ms,
+            owner_epoch,
+        } => {
+            connection.execute(
+                "INSERT INTO schedule_claims(network_id,conversation_id,schedule_id,slot_ms,owner_epoch,author) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,schedule_id,slot_ms) DO UPDATE SET owner_epoch=excluded.owner_epoch,author=excluded.author WHERE excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.author<author)",
+                params![network, scope, schedule_id, slot_ms, owner_epoch, event.author],
+            )?;
+        }
         EventBody::BotMessaged {
             message_id,
             from,
@@ -409,7 +421,7 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,blobs,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
                 params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
             )?;
         }

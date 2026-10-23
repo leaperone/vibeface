@@ -204,9 +204,11 @@
 
 会话负责人由 `ConversationOwner` 决定。入口不是负责人时，消息写入入口自己的日志并留在本机 outbox，回执 `state=pending_delivery`，入口每 3 秒经 `vibeface/rpc/1` 的 `deliver` 投递一次，负责人按触发事件幂等接纳。投递时才解析负责人，所以换负责人后旧负责人尚未开始的 job 交给新负责人。浏览器收到入口回执即删除自己的 outbox 项。
 
+回合以 `owner_epoch` 为 fence。领取 job 时记下当时的 `owner_epoch`，之后工具调用的权限检查要求本机仍是负责人且 epoch 未变，换走再换回也算失效。旧负责人收到更高 epoch 的 `conversation_owner` 后立即拒绝该回合的后续工具写入，并走停止回复的取消路径结束它：取消得到确认时回复状态为已停止，未确认时记为中断并留待核对，不重做也不交给新负责人重放。Agent 任务在工作所在设备运行，不受负责人 fence。
+
 每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果、schedule 和 bot 消息。每轮按领取时固定的版本向量 `basis` 准备上下文。排在后面的消息因此能读到前一条的回复。提示总长不超过 50000 字节，给 Codex 在前面拼接的工具目录（约 10 KB）留出 65536 字节内的空间；bot 指令和 schedule prompt 各以 8 KB 封顶并计入总长。超出时依次收缩工作列表、检查点和较早的消息，不让这一轮失败。工作列表、记忆和消息都从新到旧取到各自预算为止，再按时间顺序给出，并附省略条数。
 
-负责人每 30 秒检查本机负责的会话中已启用的 schedule，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。这个时刻已过去超过 10 分钟（设备关机或休眠）时也不运行，本机把它记为已触发并写一条 `schedule.skipped_late` 日志。一次性提醒只有一个时刻，运行过就不再运行。本机记下已触发的最近时刻；DAG 中已有该 trigger 的回复（`message_id` 由会话和 trigger 派生）或同一 schedule 仍在排队时跳过。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。schedule 轮可以派发工作和设提醒，不提供修改 bot 的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前 schedule 已暂停或删除时 job 取消。换负责人时未开始的 schedule job 直接丢弃，由新负责人按自己的检查运行。
+负责人每 30 秒检查本机负责的会话中已启用的 schedule，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。运行前负责人写一条 `schedule_run_claimed` 领取这个时刻；时刻已过去超过 10 分钟（设备关机或休眠）时同样写领取，但不运行，只记一条 `schedule.skipped_late` 日志。任何 Node 已领取的时刻都不再排队，所以重启、同步和换负责人都不会重跑或补跑，一次性提醒也只运行一次。同一 schedule 仍在排队时不领取下一个时刻。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。schedule 轮可以派发工作和设提醒，不提供修改 bot 的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前 schedule 已暂停或删除，或这个时刻的领取胜者不是本机时，job 取消。换负责人时未开始的 schedule job 直接丢弃，由新负责人按自己的检查运行。
 
 `bot_message:<message_id>` 由写入 `BotMessaged` 的发送方负责人接纳（对方会话也归它调度时），否则进 outbox，经 `deliver` 交给对方负责人。同步只存消息，不排 job。每个轮次有深度：本人消息、回答和路由为 0，schedule 轮取其 `depth`，bot 消息轮取 `hops`，工作结果和 Agent 任务沿派发链继承；提醒和 bot 消息的深度为当前加一，超过 4 时拒绝。
 
@@ -274,10 +276,11 @@ Event {
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary`、`question_id` | 运行该会话的 Node，写在被认领 Bot 的会话 |
 | `bot_changed` | `change_id`、`cause`、`change` | 负责人 |
 | `context_checkpoint` | `covers`、`summary`、`recent_user_requests`、`open_work`、`decisions` | 负责人 |
+| `schedule_run_claimed` | `schedule_id`、`slot_ms`、`owner_epoch` | 负责人，写在 schedule 所在会话 |
 
 `bot_changed.change` 按 `kind` 区分：`profile { name?, instructions? }` 的每项为 `{ before, after }`；`skill { skill_id, before, after }`、`schedule { schedule_id, before, after }` 与 `memory { memory_id, before, after }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；schedule 为 `{ name, prompt, first_run_at_ms, every_minutes?, enabled, depth? }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320，省略时只运行一次。说明（instructions）最多 8192 字节。这个事件不带 `attestation`。`cause` 为 `{ conversation_id, message_id }`，入库时要求 `prev` 或 `deps` 中有该会话、该 `message_id` 且带 `attestation` 的本人消息，否则拒绝；带 `cause` 的 `conversation_owner` 与 `bot_created` 按同一规则核对，`conversation_owner` 还必须是 epoch 1 且 `prev` 是同一会话的 `conversation_created`。没有 `cause` 的只能是新建的一次性 schedule，且 `depth` 至少为 1。投影只比较 rank：名称和说明逐项后写者胜并合并进机器人定义，skill 全网按 `skill_id`、schedule 按 `schedule_id`、笔记按 `memory_id` 后写者胜并保留删除，`schedule_controlled` 按 rank 改 `enabled` 或删除，修改记录按 `change_id` 取 rank 最小者。
 
-`context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）和 `bot_messaged` 只能由对应会话的负责人写：前两者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。
+`context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）、`schedule_run_claimed` 和 `bot_messaged` 只能由对应会话的负责人写：前三者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。`schedule_run_claimed` 的 `owner_epoch` 还必须等于这个最大 epoch。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。同一 `(会话, schedule_id, slot_ms)` 的领取投影为 `schedule_claims`，`owner_epoch` 大者胜，相同时作者较小者胜，与到达顺序无关。
 
 通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`，先到者胜。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
@@ -287,7 +290,7 @@ Event {
 
 入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；工作状态只前进。负责人同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 
-事件上限为 1 MiB。附件使用 `BlobRef { hash, size }`，单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
+事件上限为 1 MiB。事件的 `blobs` 使用 `BlobRef { hash, size }`；本人消息的 `attachments` 为 `{ hash, size, name }`，按哈希升序、每个文件一次，与事件 `blobs` 一一对应，`name` 为 1 至 255 字节、不含路径分隔符和控制字符的文件名。附件单件上限 64 MiB，正文是 `blobs/sha256/<前两位>/<hash>` 文件，按网络和会话引用授权读取。
 
 ## 写入保护
 

@@ -1067,6 +1067,10 @@ impl Runtime {
                         {
                             self.bot_deleted(network, &body.scope_id, &event.hash);
                         }
+                        // A move stops this Node's turn in that conversation without delay.
+                        if matches!(body.body, EventBody::ConversationOwner { .. }) {
+                            self.schedule_wakeup.notify_one();
+                        }
                         scopes.insert((body.scope_id, event.hash.clone()));
                     }
                 }
@@ -1703,7 +1707,7 @@ mod tests {
         identity: &LocalIdentity,
         network: &str,
         id: &str,
-        attachments: Vec<BlobRef>,
+        attachments: Vec<Attachment>,
     ) -> Result<Attestation> {
         identity
             .fixture_admin()
@@ -1963,13 +1967,14 @@ mod tests {
                 hash: crate::crypto::digest(&content),
                 size: content.len() as u64,
             };
+            let attached = Attachment { hash: blob.hash.clone(), size: blob.size, name: "notes.bin".into() };
             {
                 let mut store = a.store.lock().await;
                 let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
                 store.create_conversation(&ia, &network, "c", "Sync", owner, now_ms())?;
                 store.put_blob(&blob, &content)?;
-                store.accept_message(&ia, &network, "c", "m1", "m1", vec![blob.clone()], true,
-                    user_with(&ia, &network, "m1", vec![blob.clone()])?, now_ms())?;
+                store.accept_message(&ia, &network, "c", "m1", "m1", vec![attached.clone()], true,
+                    user_with(&ia, &network, "m1", vec![attached.clone()])?, now_ms())?;
             }
             b.net()?.learn(&a.net()?.addr()).await;
             b.refresh_own_address(&network).await?;
@@ -1989,6 +1994,8 @@ mod tests {
             let heads = a.store.lock().await.heads(&network)?;
             assert_eq!(b.store.lock().await.heads(&network)?, heads);
             assert!(b.store.lock().await.missing_blobs(&network)?.is_empty());
+            let synced = b.store.lock().await.message(&network, "c", "m1")?.context("m1 synced")?;
+            assert_eq!(synced.attachments, vec![attached], "the file name syncs with the message");
             assert!(b.store.lock().await.scheduler_jobs("c")?.is_empty());
             assert!(b.store.lock().await.scheduler_outbox()?.is_empty());
 

@@ -79,6 +79,24 @@ impl Runtime {
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
+        // A conversation that moved to a newer owner stops its turn here; a cancel the SDK does
+        // not confirm ends as interrupted and waits for reconciliation like any other.
+        let moved = self
+            .store
+            .lock()
+            .await
+            .fence_moved_turns(&network, &self.identity.device_id()?)?;
+        for (scope, trigger, attempt) in moved {
+            tracing::info!(
+                event = "agent.turn.fenced",
+                conversation_id = scope,
+                trigger,
+                attempt,
+                "the conversation moved to another owner; its turn here stops"
+            );
+            self.fence_manager_attempt(&attempt).await?;
+            self.publish_changed(&network, &scope, Changed::Job(&trigger));
+        }
         let workers = self.schedule_workers.lock().await.clone();
         // A consumer that ended without a terminal outcome leaves its job claimed; settle it.
         let abandoned = {
@@ -187,7 +205,7 @@ impl Runtime {
         self.require_scope(access, &scope).await?;
         let message_id = id(input, "message_id")?;
         let report_results = input["report_results"].as_bool().unwrap_or(true);
-        let attachments: Vec<BlobRef> = match input.get("attachments") {
+        let attachments: Vec<Attachment> = match input.get("attachments") {
             Some(value) => serde_json::from_value(value.clone()).context("invalid attachments")?,
             None => vec![],
         };

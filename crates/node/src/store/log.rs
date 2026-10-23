@@ -313,12 +313,12 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
 }
 
 /// The conversation whose scheduling Node alone makes this write: a checkpoint, a reminder its
-/// bot set itself, or its bot's message to another bot.
+/// bot set itself, a schedule time it takes, or its bot's message to another bot.
 fn owner_scope(event: &Event) -> Option<&str> {
     match &event.body {
-        EventBody::ContextCheckpoint { .. } | EventBody::BotChanged { cause: None, .. } => {
-            Some(&event.scope_id)
-        }
+        EventBody::ContextCheckpoint { .. }
+        | EventBody::BotChanged { cause: None, .. }
+        | EventBody::ScheduleRunClaimed { .. } => Some(&event.scope_id),
         EventBody::BotMessaged { from, .. } => Some(&from.conversation_id),
         _ => None,
     }
@@ -327,8 +327,8 @@ fn owner_scope(event: &Event) -> Option<&str> {
 /// An owner-only write must come from the owner its author knew when writing: of the owner
 /// records the event's parents hold (its author's earlier events, and each dependency's log up
 /// to that dependency), those of the highest epoch must name the author. An owner change the
-/// author had not seen yet does not count against it. The parents are stored before an event
-/// is placed, so every replica reads the same records.
+/// author had not seen yet does not count against it. A schedule claim names that epoch. The
+/// parents are stored before an event is placed, so every replica reads the same records.
 fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Result<()> {
     let Some(scope) = owner_scope(event) else {
         return Ok(());
@@ -369,10 +369,15 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
             _ => Some((epoch, named)),
         };
     }
-    ensure!(
-        newest.is_some_and(|(_, named)| named),
-        "only the conversation's scheduling Node makes this write"
-    );
+    let Some((epoch, true)) = newest else {
+        bail!("only the conversation's scheduling Node makes this write");
+    };
+    if let EventBody::ScheduleRunClaimed { owner_epoch, .. } = &event.body {
+        ensure!(
+            *owner_epoch == epoch,
+            "a schedule claim names its author's owner epoch"
+        );
+    }
     Ok(())
 }
 

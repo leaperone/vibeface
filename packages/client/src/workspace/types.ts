@@ -53,8 +53,6 @@ export type SchedulerSnapshot = {
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
 }
-/** An attachment by content: hex SHA-256 and byte size. */
-export type BlobRef = { hash: string; size: number }
 /** A coordination process still alive after its turn ended; the Node closes it once the process exits. */
 export type CoordinationCheck = {
   check_id: string
