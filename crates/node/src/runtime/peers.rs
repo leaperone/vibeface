@@ -1046,7 +1046,7 @@ impl Runtime {
             .unwrap_or(0))
     }
 
-    async fn ingest(&self, network: &str, events: &[SignedEvent]) -> Result<()> {
+    async fn ingest(self: &Arc<Self>, network: &str, events: &[SignedEvent]) -> Result<()> {
         let (statuses, rebuilt) = {
             let mut store = self.store.lock().await;
             let ingested = store.ingest_events(network, events)?;
@@ -1062,6 +1062,11 @@ impl Runtime {
             match status {
                 IngestStatus::Accepted | IngestStatus::Pending => {
                     if let Ok(body) = serde_json::from_str::<Event>(&event.canonical_body) {
+                        if *status == IngestStatus::Accepted
+                            && matches!(body.body, EventBody::BotDeleted { .. })
+                        {
+                            self.bot_deleted(network, &body.scope_id, &event.hash);
+                        }
                         scopes.insert((body.scope_id, event.hash.clone()));
                     }
                 }

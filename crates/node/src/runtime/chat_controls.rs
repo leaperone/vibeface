@@ -158,9 +158,11 @@ impl Runtime {
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
+        let enabled = bot.as_ref().and_then(|bot| bot.skills.as_ref());
         let skills: Vec<_> = store
             .skills(network)?
             .into_iter()
+            .filter(|entry| enabled.is_none_or(|set| set.contains(&entry.skill_id)))
             .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name,"description":entry.skill.description}))
             .collect();
         let schedules: Vec<_> = store

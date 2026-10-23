@@ -111,6 +111,85 @@ impl Runtime {
         Ok(json!({"written":written.is_some()}))
     }
 
+    /// The user deletes a bot from the web. Deleting one already gone writes nothing.
+    pub(super) async fn delete_bot(
+        self: &Arc<Self>,
+        access: &Access,
+        input: &Value,
+    ) -> Result<Value> {
+        ensure!(access.human, "only the user deletes a bot here");
+        let scope = id(input, "conversation_id")?;
+        if let Some(allowed) = &access.conversation_id {
+            ensure!(allowed == &scope, "outside this client's conversation");
+        }
+        let network = &access.network_id;
+        let written = self.store.lock().await.delete_bot(
+            &self.identity,
+            network,
+            &scope,
+            attestation(input)?,
+            now_ms(),
+        )?;
+        if let Some(event) = &written {
+            self.bot_deleted(network, &scope, &event.hash);
+        }
+        Ok(
+            json!({"written":written.is_some(),"primary":self.store.lock().await.primary_bot(network)?}),
+        )
+    }
+
+    /// Stops what a deleted bot was doing here, apart from the caller, which may be another
+    /// bot's tool call: its running turn ends as a stopped reply (an unknown outcome goes to
+    /// the pending check) and its queued turns are cancelled when claimed.
+    pub(crate) fn bot_deleted(self: &Arc<Self>, network: &str, scope: &str, hash: &str) {
+        tracing::info!(
+            event = "bot.deleted",
+            conversation_id = scope,
+            "bot deleted"
+        );
+        self.publish_changed(network, scope, Changed::Event(hash));
+        let (node, network, scope) = (self.clone(), network.to_owned(), scope.to_owned());
+        tokio::spawn(async move {
+            if let Err(error) = node.stop_bot_turns(&network, &scope).await {
+                tracing::warn!(event = "bot.stop_failed", conversation_id = scope, error = %format!("{error:#}"), "a deleted bot's turn could not be stopped");
+            }
+            node.schedule_wakeup.notify_one();
+        });
+    }
+
+    async fn stop_bot_turns(&self, network: &str, scope: &str) -> Result<()> {
+        let running: Vec<String> = self
+            .store
+            .lock()
+            .await
+            .scheduler_jobs(scope)?
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    crate::scheduling::JobState::Claimed { .. }
+                        | crate::scheduling::JobState::Running { .. }
+                )
+            })
+            .map(|job| job.trigger)
+            .collect();
+        for trigger in running {
+            let job = self.store.lock().await.request_manager_cancel(
+                &self.identity,
+                network,
+                scope,
+                &trigger,
+            )?;
+            if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
+                job.map(|job| job.state)
+            {
+                self.fence_manager_attempt(&attempt.id).await?;
+            }
+            self.publish_changed(network, scope, Changed::Job(&trigger));
+        }
+        Ok(())
+    }
+
     /// The user's choice of the bot that judges what comes in without an owner.
     pub(super) async fn set_primary_bot(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "only the user picks the primary bot");

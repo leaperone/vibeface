@@ -244,11 +244,14 @@ fn place(
 }
 
 /// The user's device signature on `cause` is what authorizes a write a bot makes for the user:
-/// a bot change, or a bot it creates. One of the event's stored parents must be that
+/// a bot change, or a bot it creates or deletes. One of the event's stored parents must be that
 /// signed user message. The one change without a cause is a new one-shot schedule: a reminder
 /// the bot sets itself.
 fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
     let cause = match &event.body {
+        EventBody::BotDeleted {
+            cause: Some(cause), ..
+        } => cause,
         EventBody::BotChanged {
             cause: None,
             change,
@@ -613,6 +616,9 @@ pub(crate) fn append_from(
         cause: Some(cause), ..
     }
     | EventBody::BotCreated {
+        cause: Some(cause), ..
+    }
+    | EventBody::BotDeleted {
         cause: Some(cause), ..
     }
     | EventBody::ConversationOwner {

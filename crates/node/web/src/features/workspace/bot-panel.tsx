@@ -1,7 +1,8 @@
 "use client"
 
 import { useRef, useState, type ReactNode } from "react"
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
+import { useNavigate } from "@tanstack/react-router"
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "./bot-settings"
@@ -13,13 +14,15 @@ import type { ScheduleView } from "./types"
 type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
 const GAP_MS = 4000
 
-/** Header button for the chat route; opens a view of the bot where only schedules can be paused, resumed or deleted (docs/design/bot-config.md section 5). */
+/** Header button for the chat route; opens a view of the bot where schedules can be paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
   const [open, setOpen] = useState(false)
   const trigger = useRef<HTMLButtonElement>(null)
   const [gaps, setGaps] = useState<Gap[]>([])
   const [confirming, setConfirming] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const navigate = useNavigate()
   const bot = workspace.selectedBot
   const view = workspace.data?.bot_settings
   if (!bot) return null
@@ -41,7 +44,7 @@ export function BotPanelButton() {
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
       <Bot aria-hidden="true" />
     </Button>
-    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null) }}>
+    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle className="break-words">{bot.name}</SheetTitle>
@@ -49,6 +52,7 @@ export function BotPanelButton() {
           {workspace.primary === bot.conversation_id
             ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主 Bot</p>
             : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
+          <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title="模型"><Cpu aria-hidden="true" className="size-3.5 shrink-0" /><span className="min-w-0 [overflow-wrap:anywhere]">{bot.model || "跟随设备"}</span></p>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           {empty ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有设置</p> : null}
@@ -91,12 +95,21 @@ export function BotPanelButton() {
           {view.memory.length ? <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
             <ul className="grid gap-2">{view.memory.map((note) => <li key={note.memory_id} className="line-clamp-2 text-meta [overflow-wrap:anywhere]" title={note.text}>{note.text}</li>)}</ul>
           </Section> : null}
-          {view.skills.length ? <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
+          {view.skills.length ? <Section icon={BookOpen} title={bot.skills === null ? "skill · 全部" : "skill"} count={view.skills.length}>
             <ul className="grid gap-3">{view.skills.map((skill) => <li key={skill.skill_id} className="grid gap-0.5">
               <p className="font-medium [overflow-wrap:anywhere]">{skill.name}</p>
               {skill.description ? <p className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{skill.description}</p> : null}
             </li>)}</ul>
           </Section> : null}
+          <section className="grid gap-3 rounded-xl border border-danger-border p-4">
+            {deleting ? <>
+              <p>删除后这个 bot 不再回复，定时任务停止，聊天记录保留。</p>
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
+                <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); setOpen(false); void navigate({ to: "/" }) }}><Trash2 aria-hidden="true" />删除 bot</ActionButton>
+              </div>
+            </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" disabled={!workspace.writable} onClick={() => setDeleting(true)}><Trash2 aria-hidden="true" />删除 bot</Button>}
+          </section>
         </div> : null}
       </SheetContent>
     </Sheet>

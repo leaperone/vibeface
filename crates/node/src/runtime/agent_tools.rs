@@ -175,8 +175,8 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"schedules":schedules,
-                        "this_bot":bot.conversation_id == scope}),
+                        "project":bot.project,"model":bot.model,"skills":bot.skills,
+                        "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
                 Ok(json!({ "bots": bots }))
@@ -191,10 +191,40 @@ impl Runtime {
                     .map(|entry| crate::scheduler::schedule_row(entry, now))
                     .collect();
                 let memory = store.memories(network, &bot.conversation_id)?;
+                let library = store.skills(network)?;
+                let skills = bot.skills.as_ref().map(|set| {
+                    library
+                        .iter()
+                        .filter(|entry| set.contains(&entry.skill_id))
+                        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
+                        .collect::<Vec<_>>()
+                });
                 Ok(
                     json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
                     "instructions":bot.instructions,"project":bot.project,
+                    "model":bot.model,"skills":skills,"uses_all_skills":bot.skills.is_none(),
                     "schedules":schedules,"memory":memory}),
+                )
+            }
+            Tool::DeleteBot => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("deleting a bot requires an agent invocation")?;
+                let (deleted, event) = self.store.lock().await.delete_bot_in_turn(
+                    &self.identity,
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    field(&args, "bot")?,
+                    now_ms(),
+                )?;
+                if let Some(event) = &event {
+                    self.bot_deleted(network, &deleted, &event.hash);
+                }
+                Ok(
+                    json!({"conversation_id":deleted,"deleted":true,"written":event.is_some(),
+                    "primary":self.store.lock().await.primary_bot(network)?}),
                 )
             }
             Tool::CreateBot => {
@@ -304,7 +334,7 @@ impl Runtime {
                 fields.remove("call_ref");
                 fields.insert("tool".into(), json!(name));
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
-                    anyhow::anyhow!("{error}. Model, provider and folders change only in Settings")
+                    anyhow::anyhow!("{error}. Provider and folders change only in Settings")
                 })?;
                 let (record, written) = self.store.lock().await.change_bot(
                     &self.identity,
