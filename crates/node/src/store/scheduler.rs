@@ -432,6 +432,33 @@ fn steerable_text(
     )
 }
 
+fn pending_conversations_from(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT conversation_id FROM scheduler_jobs WHERE state='queued' ORDER BY conversation_id",
+    )?;
+    Ok(statement
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// The user moved the conversation: what never started here goes to the new owner, which runs
+/// schedules by its own clock. An agent task stays with its work's device.
+fn hand_off_from(connection: &Connection, network: &str, conversation: &str) -> Result<()> {
+    for job in queued_jobs(connection, conversation)? {
+        if job.kind == TriggerKind::AgentTask {
+            continue;
+        }
+        connection.execute(
+            "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
+            params![conversation, job.trigger],
+        )?;
+        if job.kind != TriggerKind::Schedule {
+            queue_delivery_from(connection, network, conversation, &job.trigger)?;
+        }
+    }
+    Ok(())
+}
+
 fn reply_message_id(conversation: &str, trigger: &str) -> String {
     format!(
         "reply-{}",
@@ -1142,12 +1169,7 @@ impl Store {
     }
 
     pub fn pending_scheduler_conversations(&self) -> Result<Vec<String>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT conversation_id FROM scheduler_jobs WHERE state='queued' ORDER BY conversation_id",
-        )?;
-        Ok(statement
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
+        pending_conversations_from(&self.connection)
     }
 
     pub fn recover_scheduler_jobs(
@@ -1200,22 +1222,10 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         }
-        let mut queued = Vec::new();
-        for job in queued_jobs(&tx, conversation)? {
-            // The user moved the conversation: what never started goes to the new owner, which
-            // runs schedules by its own clock.
-            if !owned && job.kind != TriggerKind::AgentTask {
-                tx.execute(
-                    "DELETE FROM scheduler_jobs WHERE conversation_id=? AND trigger=?",
-                    params![conversation, job.trigger],
-                )?;
-                if job.kind != TriggerKind::Schedule {
-                    queue_delivery_from(&tx, network, conversation, &job.trigger)?;
-                }
-                continue;
-            }
-            queued.push(job);
+        if !owned {
+            hand_off_from(&tx, network, conversation)?;
         }
+        let mut queued = queued_jobs(&tx, conversation)?;
         queued.sort_by_key(|job| {
             (
                 !matches!(job.kind, TriggerKind::Human | TriggerKind::Answer),
@@ -1461,7 +1471,8 @@ impl Store {
     }
 
     /// Stops the turns of conversations that moved to a newer owner: each becomes cancelling
-    /// and loses its tool permission here, before the runtime cancels its SDK call. Returns
+    /// and loses its tool permission here, before the runtime cancels its SDK call. What never
+    /// started there goes to the new owner, whether or not a bot runs here. Returns
     /// `(conversation, trigger, attempt_id)` per fenced turn.
     pub fn fence_moved_turns(
         &mut self,
@@ -1471,6 +1482,15 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for conversation in pending_conversations_from(&tx)? {
+            if conversation_from(&tx, network, &conversation)?
+                .and_then(|c| c.owner)
+                .as_deref()
+                != Some(local)
+            {
+                hand_off_from(&tx, network, &conversation)?;
+            }
+        }
         let mut fenced = Vec::new();
         for mut session in query_sessions(&tx, "active IS NOT NULL", [])? {
             let Some(trigger) = session.active.clone() else {

@@ -3951,3 +3951,44 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
     );
     Ok(())
 }
+
+/// The scheduling tick hands a moved conversation's queue on even when no bot runs here to
+/// claim it, and the later claim finds nothing left to hand on twice.
+#[test]
+fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut store, &net, "m1", true)?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    let trigger = message_trigger("m1");
+    assert!(store.scheduler_job("c", &trigger)?.is_some());
+    assert!(store.scheduler_outbox()?.is_empty());
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        3,
+    )?;
+    assert!(store.fence_moved_turns(&net.network, &local)?.is_empty());
+    assert!(store.scheduler_job("c", &trigger)?.is_none());
+    let handed = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .scheduler_outbox()?
+            .into_iter()
+            .map(|e| e.trigger)
+            .collect())
+    };
+    assert_eq!(handed(&store)?, [trigger.clone()]);
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    store.fence_moved_turns(&net.network, &local)?;
+    assert_eq!(handed(&store)?, [trigger]);
+    Ok(())
+}
