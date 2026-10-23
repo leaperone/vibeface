@@ -1,3 +1,4 @@
+use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -201,6 +202,20 @@ pub struct Edit {
     pub after: String,
 }
 
+/// A bot's model on one provider, set from a device running that provider; an empty `after`
+/// follows the device's default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEdit {
+    pub provider: Provider,
+    pub before: String,
+    pub after: String,
+}
+
+/// A bot's model per provider. The provider is device-local, so a device runs the entry of its
+/// own provider or, without one, its default model.
+pub type BotModels = BTreeMap<Provider, String>;
+
 /// A saved workflow in the library every bot of the network shares.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -261,14 +276,13 @@ pub struct Sender {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BotChange {
-    /// An empty `model` follows the default of the device that runs the bot.
     Profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Edit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<Edit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<Edit>,
+        model: Option<ModelEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<SkillsEdit>,
     },
@@ -794,10 +808,16 @@ pub struct Bot {
     pub name: String,
     pub instructions: String,
     pub project: Option<BotProject>,
-    /// Empty: the default of the device that runs it.
-    pub model: String,
+    pub models: BotModels,
     pub skills: SkillSet,
     pub event_hash: EventHash,
+}
+
+impl Bot {
+    /// The model this bot runs on `provider`; `None` follows the device's default.
+    pub fn model(&self, provider: Provider) -> Option<&str> {
+        self.models.get(&provider).map(String::as_str)
+    }
 }
 
 /// The earliest `BotChanged` of one `change_id`; the chat shows it as a card.

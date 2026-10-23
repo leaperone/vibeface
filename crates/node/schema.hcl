@@ -335,6 +335,32 @@ table "bot_profiles" {
     columns = [column.network_id, column.conversation_id, column.field]
   }
 }
+table "bot_models" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "provider" {
+    null = false
+    type = text
+  }
+  column "model" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.provider]
+  }
+}
 table "bot_deletions" {
   schema = schema.main
   column "network_id" {

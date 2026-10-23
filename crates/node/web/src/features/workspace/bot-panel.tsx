@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router"
 import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { providerNames, type ProviderId } from "@/lib/node"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "./bot-settings"
 import { useWorkspace } from "./context"
 import { ActionButton } from "./present"
@@ -39,6 +40,7 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
+  const models = Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
@@ -52,7 +54,9 @@ export function BotPanelButton() {
           {workspace.primary === bot.conversation_id
             ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主 Bot</p>
             : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
-          <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title="模型"><Cpu aria-hidden="true" className="size-3.5 shrink-0" /><span className="min-w-0 [overflow-wrap:anywhere]">{bot.model || "跟随设备"}</span></p>
+          <p className="flex items-start gap-1.5 text-meta text-muted-foreground" title="模型"><Cpu aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" /><span className="grid min-w-0 [overflow-wrap:anywhere]">
+            {models.length ? models.map(([provider, model]) => <span key={provider}>{model} <span className="opacity-70">{providerNames[provider]}</span></span>) : "跟随设备"}
+          </span></p>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           {empty ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有设置</p> : null}

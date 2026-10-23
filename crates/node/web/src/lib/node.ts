@@ -31,6 +31,7 @@ export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capabi
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor'
+export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor' }
 export type ProviderRole = 'agent' | 'execution'
 export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
   | { code: 'app_server_not_found' } | { code: 'app_server_unreachable'; detail: string }

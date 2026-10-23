@@ -175,7 +175,7 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"model":bot.model,"skills":bot.skills,
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
@@ -202,7 +202,7 @@ impl Runtime {
                 Ok(
                     json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
                     "instructions":bot.instructions,"project":bot.project,
-                    "model":bot.model,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+                    "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
                     "schedules":schedules,"memory":memory}),
                 )
             }
@@ -336,6 +336,12 @@ impl Runtime {
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
                     anyhow::anyhow!("{error}. Provider and folders change only in Settings")
                 })?;
+                let provider = crate::providers::Provider::of(
+                    self.settings_snapshot()
+                        .manager
+                        .context("this Node has no configured management SDK")?
+                        .provider,
+                );
                 let (record, written) = self.store.lock().await.change_bot(
                     &self.identity,
                     network,
@@ -343,6 +349,7 @@ impl Runtime {
                     &manager.trigger,
                     &call_ref,
                     request,
+                    provider,
                     now_ms(),
                 )?;
                 if written {

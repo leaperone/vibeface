@@ -6,6 +6,7 @@ use super::{Store, bots::bot_for_conversation_from, log, message_from};
 use crate::{
     crypto::digest,
     model::*,
+    providers::Provider,
     scheduling::{AdmissionReceipt, TriggerKind, ahead, bot_message_trigger},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -32,8 +33,8 @@ pub enum ChangeRequest {
         instructions: Option<String>,
     },
     /// A bot's profile, this one's or another's; `bot` is its conversation ID, bot ID or name.
-    /// An empty `model` follows the device's default; `all_skills` uses every shared skill
-    /// again, `skills` only those.
+    /// `model` is the one for the writing device's provider, empty for its default;
+    /// `all_skills` uses every shared skill again, `skills` only those.
     ConfigureBot {
         bot: String,
         name: Option<String>,
@@ -82,7 +83,7 @@ pub enum ChangeRequest {
 struct ProfileRequest {
     name: Option<String>,
     instructions: Option<String>,
-    model: Option<String>,
+    model: Option<(Provider, String)>,
     skills: Option<SkillSet>,
 }
 
@@ -92,7 +93,8 @@ impl ChangeRequest {
         !matches!(self, Self::Remind { .. })
     }
 
-    fn profile(&self) -> Result<Option<ProfileRequest>> {
+    /// A model applies to `provider`, the one the writing device runs bots on.
+    fn profile(&self, provider: Provider) -> Result<Option<ProfileRequest>> {
         Ok(Some(match self {
             Self::UpdateProfile { name, instructions } => ProfileRequest {
                 name: name.clone(),
@@ -110,7 +112,9 @@ impl ChangeRequest {
             } => ProfileRequest {
                 name: name.clone(),
                 instructions: instructions.clone(),
-                model: model.as_ref().map(|model| model.trim().to_owned()),
+                model: model
+                    .as_ref()
+                    .map(|model| (provider, model.trim().to_owned())),
                 skills: match (skills, all_skills) {
                     (Some(_), Some(true)) => bail!("give skills or all_skills, not both"),
                     (_, Some(true)) => Some(None),
@@ -124,13 +128,13 @@ impl ChangeRequest {
 
     /// Whether `change` already sets what this request asks for. A retry compares this, because
     /// the first write changed the values a new `before` would read.
-    fn matches(&self, change: &BotChange) -> bool {
+    fn matches(&self, change: &BotChange, provider: Provider) -> bool {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
-        if let Ok(Some(wanted)) = self.profile() {
+        if let Ok(Some(wanted)) = self.profile(provider) {
             return matches!(change, BotChange::Profile { name, instructions, model, skills }
                 if wanted.name == after(name)
                     && wanted.instructions == after(instructions)
-                    && wanted.model == after(model)
+                    && wanted.model == model.as_ref().map(|edit| (edit.provider, edit.after.clone()))
                     && wanted.skills == skills.as_ref().map(|edit| edit.after.clone()));
         }
         match (self, change) {
@@ -498,6 +502,10 @@ fn next_depth(depth: u8) -> Result<u8> {
 
 /// Turns the request into a change against the current projection. A change must set something
 /// new, and an update or removal must name something that exists here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the turn, its request and the writer's provider"
+)]
 fn resolve(
     connection: &Connection,
     network: &str,
@@ -505,6 +513,7 @@ fn resolve(
     trigger: &str,
     digest: &str,
     request: ChangeRequest,
+    provider: Provider,
     now: i64,
 ) -> Result<BotChange> {
     if let Some(ProfileRequest {
@@ -512,7 +521,7 @@ fn resolve(
         instructions,
         model,
         skills,
-    }) = request.profile()?
+    }) = request.profile(provider)?
     {
         ensure!(
             name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
@@ -534,10 +543,10 @@ fn resolve(
                 "the instructions already read like this; nothing to change"
             );
         }
-        if let Some(model) = &model {
+        if let Some((provider, model)) = &model {
             validate_model(model)?;
             ensure!(
-                *model != bot.model,
+                model != bot.model(*provider).unwrap_or_default(),
                 "the bot already uses this model; nothing to change"
             );
         }
@@ -557,6 +566,11 @@ fn resolve(
                 "the bot already uses these skills; nothing to change"
             );
         }
+        let model = model.map(|(provider, after)| ModelEdit {
+            provider,
+            before: bot.model(provider).unwrap_or_default().to_owned(),
+            after,
+        });
         let change = BotChange::Profile {
             name: name.map(|after| Edit {
                 before: bot.name,
@@ -566,10 +580,7 @@ fn resolve(
                 before: bot.instructions,
                 after,
             }),
-            model: model.map(|after| Edit {
-                before: bot.model,
-                after,
-            }),
+            model,
             skills: skills.map(|after| SkillsEdit {
                 before: bot.skills,
                 after,
@@ -785,6 +796,7 @@ impl Store {
         trigger: &str,
         call_ref: &str,
         request: ChangeRequest,
+        provider: Provider,
         at: i64,
     ) -> Result<(ChangeRecord, bool)> {
         vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
@@ -801,12 +813,14 @@ impl Store {
         let change_id = format!("change-{digest}");
         if let Some(existing) = change_from(&tx, network, &change_id)? {
             ensure!(
-                request.matches(&existing.change),
+                request.matches(&existing.change, provider),
                 "call_ref {call_ref} already made a different change; use a new call_ref for a new change"
             );
             return Ok((existing, false));
         }
-        let change = resolve(&tx, network, &target, trigger, &digest, request, at)?;
+        let change = resolve(
+            &tx, network, &target, trigger, &digest, request, provider, at,
+        )?;
         log::append_from(
             &tx,
             &self.blob_dir,

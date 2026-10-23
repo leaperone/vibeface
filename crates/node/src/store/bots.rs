@@ -68,7 +68,7 @@ fn validate_definition(
     Ok(())
 }
 
-type BotRow = (Bot, Option<String>, Option<String>);
+type BotRow = (Bot, Option<String>, String, Option<String>);
 
 fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
     Ok((
@@ -78,23 +78,27 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
             name: r.get(2)?,
             instructions: r.get(3)?,
             project: None,
-            model: r.get(6)?,
+            models: BotModels::new(),
             skills: None,
             event_hash: r.get(5)?,
         },
         r.get(4)?,
+        r.get(6)?,
         r.get(7)?,
     ))
 }
 
 /// `BotCreated` gives the first name and instructions; a chat change with a later rank replaces
-/// each. A bot follows its device's model and uses every shared skill until the chat sets them.
+/// each. A bot follows its device's model and uses every shared skill until the chat sets them;
+/// an emptied model stays as a row so it outranks the one it replaced.
 const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
     CASE WHEN n.rank>b.rank THEN n.value ELSE b.name END,
     CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
-    b.project,b.event_hash,COALESCE(m.value,''),s.value";
+    b.project,b.event_hash,
+    (SELECT json_group_object(m.provider,m.model) FROM bot_models m WHERE m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.model<>''),
+    s.value";
 const CREATED_COLUMNS: &str =
-    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'',NULL";
+    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'{}',NULL";
 
 /// Bots not deleted.
 fn bots_where(
@@ -140,14 +144,14 @@ fn select_bots(
         "SELECT {columns} FROM bots b
          LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
          LEFT JOIN bot_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
-         LEFT JOIN bot_profiles m ON m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.field='model'
          LEFT JOIN bot_profiles s ON s.network_id=b.network_id AND s.conversation_id=b.conversation_id AND s.field='skills'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
-        let (mut bot, project, skills) = row?;
+        let (mut bot, project, models, skills) = row?;
         bot.project = project.map(|p| serde_json::from_str(&p)).transpose()?;
+        bot.models = serde_json::from_str(&models)?;
         bot.skills = skills
             .map(|s| serde_json::from_str(&s))
             .transpose()?

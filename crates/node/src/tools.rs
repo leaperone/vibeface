@@ -276,7 +276,7 @@ impl Tool {
                 &["call_ref", "name"],
             ),
             Tool::ConfigureBot => (
-                "Change a bot's name, standing instructions, model or skills because the user's own message asked; bot is this or another bot's conversation_id, bot_id or name. instructions replaces the whole text, so keep what should stay. model is the model name the bot runs with; an empty string follows its device's default. skills lists the shared skill_ids it uses from now on; all_skills=true uses every shared skill again, new ones included. Provider and folders change only in Settings. Reuse call_ref only to retry the same change.",
+                "Change a bot's name, standing instructions, model or skills because the user's own message asked; bot is this or another bot's conversation_id, bot_id or name. instructions replaces the whole text, so keep what should stay. model is the model name the bot runs with on this device's provider (models lists one per provider); an empty string follows the device's default. skills lists the shared skill_ids it uses from now on; all_skills=true uses every shared skill again, new ones included. Provider and folders change only in Settings. Reuse call_ref only to retry the same change.",
                 json!({"call_ref":string(),"bot":string(),"name":string(),"instructions":{"type":"string"},
                 "model":{"type":"string","maxLength":MAX_MODEL_CHARS},
                 "skills":{"type":"array","items":string(),"maxItems":MAX_BOT_SKILLS,"uniqueItems":true},
