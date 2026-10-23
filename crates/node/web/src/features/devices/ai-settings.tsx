@@ -9,7 +9,7 @@ import { terms } from "@/lib/glossary"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@/lib/node"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
-const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
 const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
@@ -194,7 +194,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
   change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
-  const name = providerNames[item.provider], Icon = icons[item.provider]
+  const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const manager = bot ? response.settings.manager : null
   const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, Laptop, Link2, LoaderCircle, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, MonitorSmartphone, MonitorX, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@/features/workspace/labels'
 import { messageOf, parseEntry, type ConnectionEntry } from '@/lib/node'
-import { passphrase } from '@/lib/secure'
+import { passphrase, recoveryCode, recoveryFileStem } from '@/lib/secure'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from './connection-lane'
@@ -283,9 +283,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
-    {publicEntry || thisComputer
-      ? <p className="text-meta text-muted-foreground">链接来自{thisComputer ? '已有设备' : '你的电脑'}上的“添加设备”</p>
-      : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
+    <p className="text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>
+    {publicEntry || thisComputer ? null : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
@@ -331,7 +330,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const device = useDevice()
   const [show, setShow] = useState(false)
   const [short, setShort] = useState(false)
-  return <Panel icon={FileKey} title="设置恢复">
+  return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
@@ -365,8 +364,21 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const [downloaded, setDownloaded] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [file, setFile] = useState('')
+  const networkId = device.review?.networkId
+  useEffect(() => {
+    if (!networkId) return
+    let live = true
+    void recoveryCode(networkId).then((code) => { if (live) setFile(recoveryFileStem(code)) })
+    return () => { live = false }
+  }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
-    <Button type="button" variant={downloaded ? 'outline' : 'default'} className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}>{downloaded ? <><CircleCheck aria-hidden="true" className="text-success" />已下载</> : <><Download aria-hidden="true" />下载恢复文件</>}</Button>
+    <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />文件用恢复密码加密，没有密码打不开</p>
+    {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
+      <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
+      <span className="min-w-0 flex-1 py-2 font-mono [overflow-wrap:anywhere]">{file}</span>
+      <Button type="button" variant="ghost" disabled={busy} onClick={() => void run(async () => device.downloadBackup())}>重新下载</Button>
+    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}><Download aria-hidden="true" />下载恢复文件</Button>}
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>

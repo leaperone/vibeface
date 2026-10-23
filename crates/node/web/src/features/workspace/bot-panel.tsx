@@ -8,6 +8,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { providerNames, type ProviderId } from "@/lib/node"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "./bot-settings"
 import { useDevice } from "@/features/identity/context"
+import { providerIcons } from "@/features/devices/ai-settings"
 import { useWorkspace } from "./context"
 import { nodeName } from "./labels"
 import { ActionButton } from "./present"
@@ -59,16 +60,19 @@ export function BotPanelButton() {
           {workspace.primary === bot.conversation_id
             ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground" title={primaryHint}><Star aria-hidden="true" className="size-3.5 fill-current" />主 Bot</p>
             : <ActionButton className="justify-self-start" title={primaryHint} disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}><Star aria-hidden="true" />设为主 Bot</ActionButton>}
-          <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-meta text-muted-foreground">
-            {owner ? <span className="inline-flex min-w-0 items-center gap-1.5" title="运行在">
+          <ul className="grid gap-1 text-meta text-muted-foreground">
+            {owner ? <li className="flex min-w-0 items-center gap-1.5" title="运行在">
               {owner === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-3.5 shrink-0" /> : <Server aria-hidden="true" className="size-3.5 shrink-0" />}
               <span className="sr-only">运行在 </span><span className="min-w-0 truncate">{nodeName(owner, { nodes: workspace.nodes, directory })}</span>
               {ownerNode && !ownerNode.online ? <span className="shrink-0 text-warning">离线</span> : null}
-            </span> : null}
-            <span className="inline-flex min-w-0 items-start gap-1.5" title="模型"><Cpu aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" /><span className="sr-only">模型 </span><span className="grid min-w-0 [overflow-wrap:anywhere]">
-              {models.length ? models.map(([provider, model]) => <span key={provider}>{model} <span className="opacity-70">{providerNames[provider]}</span></span>) : "跟随设备"}
-            </span></span>
-          </p>
+            </li> : null}
+            {models.length ? models.map(([provider, model]) => {
+              const Icon = providerIcons[provider]
+              return <li key={provider} className="flex min-w-0 items-center gap-1.5" title={providerNames[provider]}>
+                <Icon aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">{providerNames[provider]} 模型 </span><span className="min-w-0 [overflow-wrap:anywhere]">{model}</span>
+              </li>
+            }) : <li className="flex items-center gap-1.5"><Cpu aria-hidden="true" className="size-3.5 shrink-0" />设备默认模型</li>}
+          </ul>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           {empty ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有设置</p> : null}

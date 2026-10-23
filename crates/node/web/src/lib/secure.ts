@@ -86,12 +86,14 @@ export async function recoveryCode(recoveryKey: string): Promise<string> {
   const key = Uint8Array.from(recoveryKey.match(/../g) ?? [], (pair) => parseInt(pair, 16))
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', key)).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, '0')).join('').toUpperCase()
 }
+/** The recovery file's name stem: the code people match against the file they kept. */
+export const recoveryFileStem = (code: string) => `vibeface-recovery-${code}`
 export function downloadPackage(bytes: Uint8Array, code: string) {
   const copy = new Uint8Array(bytes)
   const url = URL.createObjectURL(new Blob([copy.buffer], { type: 'application/json' }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `vibeface-recovery-${code}-${new Date().toLocaleDateString('sv')}.json`
+  link.download = `${recoveryFileStem(code)}-${new Date().toLocaleDateString('sv')}.json`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }

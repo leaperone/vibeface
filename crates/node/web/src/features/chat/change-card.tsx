@@ -36,7 +36,7 @@ function ChangeRows({ change, schedules }: { change: BotChange; schedules: reado
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
-    {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '跟随设备'} after={change.model.after || '跟随设备'} /></Row> : null}
+    {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} /></Row> : null}
     {change.skills ? <Row icon={BookOpen} label='skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
