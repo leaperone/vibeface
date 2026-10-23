@@ -612,19 +612,8 @@ impl Runtime {
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
-            kind: settings.provider,
-            workspace: settings.workspace,
-            model: settings.model,
-            timeout_secs: self.config.timeout_secs,
-            cursor_sdk_bin: settings.cursor_sdk_bin,
-            node_bin: settings.node_bin,
-            codex_bin: self.providers().codex_bin,
-            codex_sdk_script: settings.codex_sdk_script,
-            provider_env: self.provider_env(settings.provider),
             tool_cli: Some(program),
-            tool_env: self.agent_env(),
-            cursor: self.cursor.get().cloned(),
-            ..Default::default()
+            ..self.manager_config(settings)
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         manager::run_manager(

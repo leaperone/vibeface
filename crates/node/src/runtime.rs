@@ -150,7 +150,7 @@ pub struct Runtime {
     /// Shared by every Cursor turn, so it only proves the bridge called; the agent picks the attempt.
     cursor_callback_token: String,
     /// Cursor agent id → token of the attempt running it.
-    pub(crate) cursor_agents: Mutex<HashMap<String, String>>,
+    pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
     codex_epoch: std::sync::atomic::AtomicU64,
@@ -274,7 +274,7 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             cursor: std::sync::OnceLock::new(),
             cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
-            cursor_agents: Mutex::new(HashMap::new()),
+            cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             codex_epoch: std::sync::atomic::AtomicU64::new(0),
