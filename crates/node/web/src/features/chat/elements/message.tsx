@@ -5,8 +5,11 @@ import { messageKey, replyStatusLabel } from '../protocol.ts'
 import type { TranscriptMessage } from '../types.ts'
 import { Artifact } from './artifact'
 import { useWorkspace } from '@/features/workspace/context'
+import type { SteerOutcome } from '@/features/workspace/types'
 
-export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merged' }
+export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merged'; merged?: SteerOutcome }
+
+const mergedLabels: Record<SteerOutcome, string> = { answered: '已并入当前回复', unfinished: '已并入，回复未完成', unknown: '不确定是否已并入' }
 
 /** Today shows the time only; older messages also show the day. */
 function shortTime(when: Date) {
@@ -49,7 +52,7 @@ export function Message({ message, schedule, last = true }: { message: ChatMessa
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     <div title={full} className="min-w-0 max-w-[85%] rounded-2xl bg-primary px-4 py-2 text-primary-foreground [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div>
     {message.attachments?.map((file) => <div key={file.hash} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} /></div>)}
-    {message.state === 'queued' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />排队中</span> : message.state === 'merged' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />已并入当前回复</span> : time}
+    {message.state === 'queued' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Clock aria-hidden="true" className="size-3.5" />排队中</span> : message.state === 'merged' ? <span className="flex items-center gap-1 px-1 text-meta text-muted-foreground"><Merge aria-hidden="true" className="size-3.5" />{mergedLabels[message.merged ?? 'answered']}</span> : time}
   </div>
   if (message.role === 'bot') return <div className="flex min-w-0 flex-col items-start gap-1" data-message-id={messageKey(message)}>
     <span className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">

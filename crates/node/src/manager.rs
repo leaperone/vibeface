@@ -399,6 +399,17 @@ where
     let failed = |session_id: Option<&str>, message: String| {
         error(ManagerFailure::Failed, session_id, message)
     };
+    // A stop before the turn started ends the reply as stopped; nothing ran.
+    let stopped = |session_id: Option<&str>| {
+        error(
+            ManagerFailure::Cancelled,
+            session_id,
+            "stopped before the Codex turn started".into(),
+        )
+    };
+    if *cancel.borrow() {
+        return Err(stopped(previous));
+    }
     let text = codex_prompt(prompt, config.tool_cli.as_deref(), &config.custom_tools)
         .map_err(|e| failed(previous, e.to_string()))?;
     let mut session = DirectSession::connect(socket)
@@ -443,9 +454,14 @@ where
         }
     };
     let native = Some(thread.as_str());
-    persist_session(thread.clone())
-        .await
-        .map_err(|e| failed(native, format!("persist the Codex thread: {e}")))?;
+    if let Err(e) = persist_session(thread.clone()).await {
+        // A stop fences the attempt, so saving its thread fails then.
+        return Err(if *cancel.borrow() {
+            stopped(native)
+        } else {
+            failed(native, format!("persist the Codex thread: {e}"))
+        });
+    }
     let client_id = match &config.codex_turn {
         Some(turn) => {
             (turn.record)(thread.clone(), None)
@@ -459,6 +475,9 @@ where
         "input":[{"type":"text","text":text,"text_elements":[]}]});
     if !config.model.is_empty() {
         turn_params["model"] = json!(config.model);
+    }
+    if *cancel.borrow() {
+        return Err(stopped(native));
     }
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),

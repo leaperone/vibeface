@@ -74,12 +74,11 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
             attempt: attempt_or()?,
             detail,
         },
-        "steering" => JobState::Steering {
-            into: serde_json::from_str(&detail)?,
-        },
-        "steered" => JobState::Steered {
-            into: serde_json::from_str(&detail)?,
-        },
+        "steering" | "steered" => {
+            let steer: JobState = serde_json::from_str(&detail)?;
+            ensure!(steer.name() == state, "scheduler job steer state mismatch");
+            steer
+        }
         other => bail!("unknown scheduler job state {other}"),
     };
     Ok(SchedulerJob {
@@ -152,8 +151,8 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
             Some(detail.clone())
         }
         JobState::Cancelled { evidence, .. } => Some(evidence.clone()),
-        JobState::Steering { into } | JobState::Steered { into } => {
-            Some(serde_json::to_string(into)?)
+        JobState::Steering { .. } | JobState::Steered { .. } => {
+            Some(serde_json::to_string(&job.state)?)
         }
         _ => None,
     };
@@ -380,12 +379,13 @@ fn holds_turn(
     )
 }
 
-/// The turn a user message may join: the session's running reply to a user message, still held
-/// by this Node, on an App Server turn.
+/// The turn a user message may join: the session's running reply to a user message, started by
+/// this process and still held by this Node, on an App Server turn.
 fn steer_target(
     connection: &Connection,
     network: &str,
     local: &str,
+    boot: &str,
     session: &SchedulerSession,
 ) -> Result<Option<SteerTarget>> {
     let Some(trigger) = &session.active else {
@@ -398,6 +398,7 @@ fn steer_target(
         return Ok(None);
     };
     if job.kind != TriggerKind::Human
+        || attempt.boot != boot
         || attempt.permission_version != session.permission_version
         || !holds_turn(connection, network, local, session, &job)?
     {
@@ -1181,23 +1182,25 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut session = load_session(&tx, conversation)?;
         recover_session(&tx, &self.blob_dir, identity, network, &mut session, boot)?;
-        // A message whose steer is unsettled keeps its place; nothing behind it runs first.
+        let local = identity.device_id()?;
+        let current = conversation_from(&tx, network, conversation)?;
+        let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
+        let owned = current.and_then(|c| c.owner) == Some(local.clone());
+        // A message whose steer is unsettled keeps its place here; nothing behind it runs first.
+        // A conversation that moved away still hands its queue on.
         if session.active.is_some()
-            || !query_jobs(
-                &tx,
-                "conversation_id=? AND state='steering'",
-                [conversation],
-            )?
-            .is_empty()
+            || owned
+                && !query_jobs(
+                    &tx,
+                    "conversation_id=? AND state='steering'",
+                    [conversation],
+                )?
+                .is_empty()
         {
             save_session(&tx, &session)?;
             tx.commit()?;
             return Ok(None);
         }
-        let local = identity.device_id()?;
-        let current = conversation_from(&tx, network, conversation)?;
-        let owner_epoch = current.as_ref().map_or(0, |c| c.owner_epoch);
-        let owned = current.and_then(|c| c.owner) == Some(local.clone());
         let mut queued = Vec::new();
         for job in queued_jobs(&tx, conversation)? {
             // The user moved the conversation: what never started goes to the new owner, which
@@ -1391,6 +1394,16 @@ impl Store {
         let Some(mut job) = load_job(&tx, conversation, trigger)? else {
             return Ok(None);
         };
+        if let JobState::Steering { into, .. } = &job.state
+            && let Some(host) = query_jobs(
+                &tx,
+                "conversation_id=? AND attempt_id=?",
+                params![conversation, into.attempt_id],
+            )?
+            .pop()
+        {
+            job = host;
+        }
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
             let change = TaskJobChange::Ended {
@@ -1414,7 +1427,7 @@ impl Store {
             };
         } else if let JobState::Claimed { attempt } | JobState::Running { attempt } = &job.state {
             ensure!(
-                session.active.as_deref() == Some(trigger),
+                session.active.as_deref() == Some(job.trigger.as_str()),
                 "management reply changed; refresh before stopping"
             );
             job.state = JobState::Cancelling {
@@ -1576,10 +1589,15 @@ impl Store {
 
     /// Queued user messages that may join the running reply of their conversation: plain text
     /// while a reply to a user message runs on an App Server turn this Node holds.
-    pub fn steer_candidates(&self, network: &str, local: &str) -> Result<Vec<SteerCandidate>> {
+    pub fn steer_candidates(
+        &self,
+        network: &str,
+        local: &str,
+        boot: &str,
+    ) -> Result<Vec<SteerCandidate>> {
         let mut candidates = Vec::new();
         for session in query_sessions(&self.connection, "active IS NOT NULL", [])? {
-            if let Some(target) = steer_target(&self.connection, network, local, &session)? {
+            if let Some(target) = steer_target(&self.connection, network, local, boot, &session)? {
                 for job in queued_jobs(&self.connection, &session.conversation_id)? {
                     if let Some(text) = steerable_text(&self.connection, network, &job)? {
                         candidates.push(SteerCandidate {
@@ -1602,6 +1620,7 @@ impl Store {
         &mut self,
         network: &str,
         local: &str,
+        boot: &str,
         conversation: &str,
         trigger: &str,
         into: &SteerTarget,
@@ -1615,33 +1634,56 @@ impl Store {
         };
         if job.state != JobState::Queued
             || steerable_text(&tx, network, &job)?.is_none()
-            || steer_target(&tx, network, local, &session)?.as_ref() != Some(into)
+            || steer_target(&tx, network, local, boot, &session)?.as_ref() != Some(into)
         {
             return Ok(false);
         }
-        job.state = JobState::Steering { into: into.clone() };
+        job.state = JobState::Steering {
+            into: into.clone(),
+            unread_since_ms: None,
+        };
         save_job(&tx, &job)?;
         tx.commit()?;
         Ok(true)
     }
 
-    /// Ends a steer: joined, or back in the queue when nothing reached the turn.
-    pub fn settle_steer(&mut self, conversation: &str, trigger: &str, joined: bool) -> Result<()> {
+    /// Moves a steering message on: back to the queue when nothing reached the turn, steered,
+    /// or still steering with when its thread first could not be read. Anything else is left.
+    pub fn settle_steer(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        next: JobState,
+    ) -> Result<()> {
+        ensure!(
+            matches!(
+                next,
+                JobState::Queued | JobState::Steering { .. } | JobState::Steered { .. }
+            ),
+            "a steer settles only into the queue or a steer state"
+        );
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
-        let JobState::Steering { into } = &job.state else {
+        if !matches!(job.state, JobState::Steering { .. }) {
             return Ok(());
-        };
-        job.state = if joined {
-            JobState::Steered { into: into.clone() }
-        } else {
-            JobState::Queued
-        };
+        }
+        job.state = next;
         save_job(&tx, &job)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether the reply attempt a message was steered into is still claimed or running.
+    pub fn steer_host_active(&self, conversation: &str, attempt_id: &str) -> Result<bool> {
+        Ok(query_jobs(
+            &self.connection,
+            "conversation_id=? AND attempt_id=?",
+            params![conversation, attempt_id],
+        )?
+        .iter()
+        .any(|job| !job.state.terminal()))
     }
 
     pub fn steering_jobs(&self) -> Result<Vec<SchedulerJob>> {

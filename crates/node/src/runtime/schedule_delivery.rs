@@ -1,7 +1,9 @@
 //! Local scheduling: the owner Node drains its durable admissions one conversation at a time.
 //! A message for another owner waits in the outbox until `peers` delivers it.
 use super::*;
-use crate::scheduling::{JobOutcome, JobState, PendingCheck, SchedulerJob, SteerCandidate};
+use crate::scheduling::{
+    JobOutcome, JobState, PendingCheck, SchedulerJob, SteerCandidate, SteerOutcome, SteerTarget,
+};
 use futures_util::FutureExt;
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
@@ -97,7 +99,6 @@ impl Runtime {
             self.fence_manager_attempt(&attempt).await?;
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
-        self.steer_messages(&network).await?;
         let workers = self.schedule_workers.lock().await.clone();
         // A consumer that ended without a terminal outcome leaves its job claimed; settle it.
         let abandoned = {
@@ -137,6 +138,8 @@ impl Runtime {
             self.finish_manager_attempt(&attempt).await;
             self.publish_changed(&network, &scope, Changed::Job(&trigger));
         }
+        // After recovery, so a reply left running by an earlier process is never a target.
+        self.steer_messages(&network).await?;
         if self.manager().is_some() {
             let scopes = self.store.lock().await.pending_scheduler_conversations()?;
             for scope in scopes {
@@ -187,21 +190,27 @@ impl Runtime {
     }
 
     /// A queued user message joins the running Codex reply of its conversation through
-    /// `turn/steer`, keyed by its message ID. The job is marked steering before the request, so
-    /// an unknown result is read back from the thread and never sent again; a refused steer
-    /// leaves the message queued for its own reply.
+    /// `turn/steer`, keyed by its message ID. The job is marked steering before the request and
+    /// stays so until that reply's attempt ended; it is then settled from the thread and never
+    /// sent again. A refused steer leaves the message queued for its own reply.
     async fn steer_messages(self: &Arc<Self>, network: &str) -> Result<()> {
         let local = self.identity.device_id()?;
+        let boot = crate::scheduler::boot_id();
         let steering = self.store.lock().await.steering_jobs()?;
         for job in steering {
             self.settle_steer(network, &job).await?;
         }
-        let candidates = self.store.lock().await.steer_candidates(network, &local)?;
+        let candidates = self
+            .store
+            .lock()
+            .await
+            .steer_candidates(network, &local, boot)?;
         for candidate in candidates {
             let (scope, trigger) = (&candidate.conversation_id, &candidate.trigger);
             if !self.store.lock().await.begin_steer(
                 network,
                 &local,
+                boot,
                 scope,
                 trigger,
                 &candidate.into,
@@ -209,14 +218,13 @@ impl Runtime {
                 continue;
             }
             self.publish_changed(network, scope, Changed::Job(trigger));
-            match self
+            let steer = self
                 .codex
                 .client()
-                .request("turn/steer", steer_params(&candidate))
-                .await
-            {
-                Ok(_) => self.store.lock().await.settle_steer(scope, trigger, true)?,
-                Err(error) if !error.uncertain => {
+                .request("turn/steer", steer_params(&candidate));
+            match tokio::time::timeout(STEER_WAIT, steer).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) if !error.uncertain => {
                     tracing::info!(
                         event = "agent.turn.steer_refused",
                         conversation_id = scope,
@@ -227,16 +235,15 @@ impl Runtime {
                     self.store
                         .lock()
                         .await
-                        .settle_steer(scope, trigger, false)?;
+                        .settle_steer(scope, trigger, JobState::Queued)?;
                     self.schedule_wakeup.notify_one();
                 }
-                Err(error) => {
+                Ok(Err(_)) | Err(_) => {
                     tracing::warn!(
                         event = "agent.turn.steer_unknown",
                         conversation_id = scope,
                         trigger,
-                        error = error.message,
-                        "the steer is read back from the thread"
+                        "the steer is read back from the thread once the reply ends"
                     );
                 }
             }
@@ -245,52 +252,71 @@ impl Runtime {
         Ok(())
     }
 
-    /// A steer with an unknown result joined the turn when the thread holds its message. Codex
-    /// takes steered input into the running turn, so once that turn ended without it, it never
-    /// will and the message is queued again.
+    /// Settles a steer once the reply it targeted ended. Codex takes steered input only into a
+    /// running turn, so the thread says where the message went: in a completed turn it was
+    /// answered, in one that stopped it was not; absent from the thread while the target turn
+    /// ended, it never arrived and waits for its own reply. Only a read that succeeded moves it
+    /// back to the queue; a thread that stays unreadable ends it as unknown, never resent.
     async fn settle_steer(&self, network: &str, job: &SchedulerJob) -> Result<()> {
-        let JobState::Steering { into } = &job.state else {
+        let JobState::Steering {
+            into,
+            unread_since_ms,
+        } = &job.state
+        else {
             return Ok(());
         };
-        let joined = match self
-            .codex
-            .client()
-            .request(
-                "thread/read",
-                json!({"threadId":into.thread_id,"includeTurns":true}),
-            )
+        if self
+            .store
+            .lock()
             .await
+            .steer_host_active(&job.conversation_id, &into.attempt_id)?
         {
-            Err(error) if error.uncertain => return Ok(()),
-            Err(_) => false,
-            Ok(reply) => {
-                let turns = reply["thread"]["turns"]
+            return Ok(());
+        }
+        let read = self.codex.client().request(
+            "thread/read",
+            json!({"threadId":into.thread_id,"includeTurns":true}),
+        );
+        let turns = match tokio::time::timeout(STEER_WAIT, read).await {
+            Ok(Ok(reply)) => Some(
+                reply["thread"]["turns"]
                     .as_array()
                     .cloned()
-                    .unwrap_or_default();
-                if turns
-                    .iter()
-                    .any(|turn| codex_server::sent_by(turn, &job.reply_to))
-                {
-                    true
-                } else if turns
-                    .iter()
-                    .any(|turn| turn["id"] == into.turn_id && turn["status"] == "inProgress")
-                {
-                    return Ok(());
+                    .unwrap_or_default(),
+            ),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        let next = match turns {
+            Some(turns) => match steer_settlement(&turns, &job.reply_to, into) {
+                Some(next) => next,
+                None => return Ok(()),
+            },
+            None => {
+                let since = unread_since_ms.unwrap_or_else(now_ms);
+                if now_ms().saturating_sub(since) >= STEER_UNREAD_LIMIT_MS {
+                    JobState::Steered {
+                        into: into.clone(),
+                        outcome: SteerOutcome::Unknown,
+                    }
+                } else if unread_since_ms.is_none() {
+                    JobState::Steering {
+                        into: into.clone(),
+                        unread_since_ms: Some(since),
+                    }
                 } else {
-                    false
+                    return Ok(());
                 }
             }
         };
+        let settled = !matches!(next, JobState::Steering { .. });
         self.store
             .lock()
             .await
-            .settle_steer(&job.conversation_id, &job.trigger, joined)?;
-        if !joined {
+            .settle_steer(&job.conversation_id, &job.trigger, next)?;
+        if settled {
             self.schedule_wakeup.notify_one();
+            self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
         }
-        self.publish_changed(network, &job.conversation_id, Changed::Job(&job.trigger));
         Ok(())
     }
 
@@ -399,4 +425,75 @@ fn steer_params(candidate: &SteerCandidate) -> Value {
     json!({"threadId":candidate.into.thread_id,"expectedTurnId":candidate.into.turn_id,
         "clientUserMessageId":candidate.message_id,
         "input":[{"type":"text","text":text,"text_elements":[]}]})
+}
+
+/// How long one steer or read waits for the App Server inside the scheduling tick; a steer that
+/// times out is unknown and read back later.
+const STEER_WAIT: Duration = Duration::from_secs(5);
+/// How long a steered message waits for its thread to become readable after its reply ended.
+const STEER_UNREAD_LIMIT_MS: i64 = 10 * 60 * 1000;
+
+/// Where a message steered into `into` went, from its thread's turns, or `None` while it may
+/// still arrive.
+fn steer_settlement(turns: &[Value], message_id: &str, into: &SteerTarget) -> Option<JobState> {
+    if let Some(turn) = turns
+        .iter()
+        .find(|turn| codex_server::sent_by(turn, message_id))
+    {
+        let outcome = match turn["status"].as_str() {
+            Some("inProgress") => return None,
+            Some("completed") => SteerOutcome::Answered,
+            _ => SteerOutcome::Unfinished,
+        };
+        return Some(JobState::Steered {
+            into: into.clone(),
+            outcome,
+        });
+    }
+    let target_running = turns
+        .iter()
+        .any(|turn| turn["id"] == into.turn_id && turn["status"] == "inProgress");
+    (!target_running).then_some(JobState::Queued)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_steered_message_settles_only_from_what_its_thread_shows() {
+        let into = SteerTarget {
+            attempt_id: "a".into(),
+            thread_id: "t".into(),
+            turn_id: "r".into(),
+        };
+        let turn = |status: &str, sent: bool| {
+            let items = if sent {
+                json!([{"type":"userMessage","clientId":"m"}])
+            } else {
+                json!([])
+            };
+            json!({"id":"r","status":status,"items":items})
+        };
+        let steered = |outcome| {
+            Some(JobState::Steered {
+                into: into.clone(),
+                outcome,
+            })
+        };
+        let settle = |turn: Value| steer_settlement(&[turn], "m", &into);
+        assert_eq!(settle(turn("inProgress", true)), None);
+        assert_eq!(settle(turn("inProgress", false)), None);
+        assert_eq!(
+            settle(turn("completed", true)),
+            steered(SteerOutcome::Answered)
+        );
+        assert_eq!(
+            settle(turn("interrupted", true)),
+            steered(SteerOutcome::Unfinished)
+        );
+        assert_eq!(settle(turn("interrupted", false)), Some(JobState::Queued));
+        assert_eq!(steer_settlement(&[], "m", &into), Some(JobState::Queued));
+    }
 }

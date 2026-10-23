@@ -159,18 +159,34 @@ pub struct SteerTarget {
     pub turn_id: String,
 }
 
+/// How the reply a message joined ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerOutcome {
+    /// The turn holding the message completed.
+    Answered,
+    /// The message is in a turn that stopped, failed or was interrupted.
+    Unfinished,
+    /// The thread could not be read in time; whether it joined is unknown.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     Queued,
-    /// Sent as `turn/steer` with an outcome not yet known; it is settled from the thread, never
-    /// sent again.
+    /// Sent, or about to be sent, as `turn/steer` into `into`. It is settled from the thread
+    /// once that reply's attempt ended, never sent again. `unread_since_ms` is when reading the
+    /// thread first failed after that.
     Steering {
         into: SteerTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unread_since_ms: Option<i64>,
     },
-    /// Joined the running reply `into`; it gets no reply of its own.
+    /// Joined the reply `into`; it gets no reply of its own.
     Steered {
         into: SteerTarget,
+        outcome: SteerOutcome,
     },
     Claimed {
         attempt: ManagerAttempt,

@@ -46,7 +46,10 @@ export type ManagerJob = {
   reply_message_id?: string
   error?: string
   pending_check?: boolean
+  /** How the reply a steered message joined ended. */
+  outcome?: SteerOutcome
 }
+export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
   provider?: string

@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types"
 import type {
   AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ConfirmReason, ConversationRecords, OpenWork, SkillSet,
+  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome,
 } from "./types"
 import { answerId } from "./questions.ts"
 
@@ -76,7 +76,7 @@ function optionalText(value: unknown): string | undefined { return value == null
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
+  return { jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
 }
 function workState(value: unknown): WorkState {
   switch (value) {

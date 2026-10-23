@@ -156,11 +156,17 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         settings.model = model.clone();
     }
     let kind = settings.provider;
-    let sdk_config = digest(&serde_json::to_vec(&settings)?);
     // Claiming before the tool listener exists would turn a startup race into a failed job.
-    node.tool_url
+    let tool_url = node
+        .tool_url
         .get()
         .context("local tool listener is not ready")?;
+    // A Codex thread keeps the Shell environment it was created with, tool URL included, and
+    // that URL changes with every start: a new one starts a new thread.
+    let sdk_config = digest(&serde_json::to_vec(&(
+        &settings,
+        (kind == manager::ManagerKind::CodexSdk).then_some(tool_url),
+    ))?);
     let claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
