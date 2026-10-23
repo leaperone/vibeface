@@ -94,8 +94,8 @@ CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text N
 CREATE INDEX `scheduler_jobs_state` ON `scheduler_jobs` (`state`, `conversation_id`);
 -- Create "scheduler_outbox" table
 CREATE TABLE `scheduler_outbox` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, PRIMARY KEY (`conversation_id`, `trigger`));
--- Create "schedule_runs" table
-CREATE TABLE `schedule_runs` (`conversation_id` text NOT NULL, `schedule_id` text NOT NULL, `slot_ms` integer NOT NULL, PRIMARY KEY (`conversation_id`, `schedule_id`));
+-- Create "schedule_claims" table
+CREATE TABLE `schedule_claims` (`network_id` text NOT NULL, `conversation_id` text NOT NULL, `schedule_id` text NOT NULL, `slot_ms` integer NOT NULL, `owner_epoch` integer NOT NULL, `author` text NOT NULL, PRIMARY KEY (`network_id`, `conversation_id`, `schedule_id`, `slot_ms`));
 -- Create "pending_checks" table
 CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
 -- Create "manager_processes" table

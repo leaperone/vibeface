@@ -139,12 +139,17 @@ impl Runtime {
                 && active.access.conversation_id == access.conversation_id,
             "management invocation scope mismatch"
         );
-        Self::check_manager_permission(&*self.store.lock().await, access)?;
+        Self::check_manager_permission(
+            &*self.store.lock().await,
+            &self.identity.device_id()?,
+            access,
+        )?;
         Ok(Some(guard))
     }
 
     pub(super) fn check_manager_permission(
         store: &crate::store::Store,
+        local: &str,
         access: &Access,
     ) -> Result<()> {
         let Some(manager) = &access.manager else {
@@ -155,7 +160,13 @@ impl Runtime {
             .as_deref()
             .context("missing management scope")?;
         ensure!(
-            store.manager_attempt_allowed(scope, &manager.trigger, &manager.attempt_id,)?,
+            store.manager_attempt_allowed(
+                &access.network_id,
+                local,
+                scope,
+                &manager.trigger,
+                &manager.attempt_id,
+            )?,
             "management invocation permission is no longer valid"
         );
         Ok(())

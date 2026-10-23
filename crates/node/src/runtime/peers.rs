@@ -1067,6 +1067,10 @@ impl Runtime {
                         {
                             self.bot_deleted(network, &body.scope_id, &event.hash);
                         }
+                        // A move stops this Node's turn in that conversation without delay.
+                        if matches!(body.body, EventBody::ConversationOwner { .. }) {
+                            self.schedule_wakeup.notify_one();
+                        }
                         scopes.insert((body.scope_id, event.hash.clone()));
                     }
                 }
