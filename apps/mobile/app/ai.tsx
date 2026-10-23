@@ -133,7 +133,8 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
       <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:assistant`} disabled={busy !== ''} onPress={() => void change('assistant', { assistant: !assistant })} />
-      {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
+      {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
+      {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
     {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 pb-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
@@ -161,7 +162,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
 }
 
 function Toggle({ icon, label, pressed, busy, disabled, onPress }: { icon: LucideIcon; label: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
-  return <Button variant={pressed ? 'secondary' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed }} disabled={disabled} onPress={onPress}>
+  return <Button variant={pressed ? 'default' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed }} disabled={disabled} onPress={onPress}>
     <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
   </Button>
 }
