@@ -3,7 +3,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::{Path, PathBuf},
     process::Stdio,
@@ -13,7 +13,7 @@ use std::{
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
-    sync::watch,
+    sync::{Mutex, watch},
 };
 pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
 use vibeface_bridge::agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn};
@@ -29,51 +29,38 @@ pub enum ManagerKind {
     CodexSdk,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// The SDK a turn runs in, with only what that SDK needs.
+#[derive(Clone)]
+pub enum Sdk {
+    /// Turns share the Node's resident bridge. A tool callback names its agent, so the turn's
+    /// tool token is filed under the agent's ID in `agents` once the SDK reports it.
+    Cursor {
+        bridge: Option<Arc<SdkBridge>>,
+        sdk_bin: PathBuf,
+        agents: Arc<Mutex<HashMap<String, String>>>,
+    },
+    /// Each turn runs its own sidecar; `vibeface tool` reads the turn from its environment.
+    Codex {
+        node_bin: PathBuf,
+        codex_bin: PathBuf,
+        sdk_script: PathBuf,
+    },
+}
+
+#[derive(Clone)]
 pub struct ManagerConfig {
-    pub kind: ManagerKind,
+    pub sdk: Sdk,
     pub workspace: PathBuf,
     pub model: String,
     pub timeout_secs: u64,
-    pub cursor_sdk_bin: PathBuf,
-    pub node_bin: PathBuf,
-    pub codex_bin: PathBuf,
-    pub codex_sdk_script: PathBuf,
-    #[serde(default)]
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
-    #[serde(skip)]
     pub tool_env: BTreeMap<String, String>,
-    /// The variables this Node set for the provider of `kind`, over its own environment.
-    #[serde(skip)]
+    /// Lets this turn's tool calls act as it; without one they are refused.
+    pub tool_token: Option<String>,
+    /// The variables this Node set for the provider of `sdk`, over its own environment.
     pub provider_env: BTreeMap<String, String>,
-    #[serde(skip)]
     pub process_started: Option<agent::ProcessStarted>,
-    #[serde(skip)]
-    pub cursor: Option<Arc<SdkBridge>>,
-}
-
-impl Default for ManagerConfig {
-    fn default() -> Self {
-        Self {
-            kind: ManagerKind::CursorSdk,
-            workspace: ".".into(),
-            model: "auto".into(),
-            timeout_secs: 600,
-            cursor_sdk_bin: "cursor-sdk-bridge".into(),
-            node_bin: "node".into(),
-            codex_bin: "codex".into(),
-            codex_sdk_script: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("sdk/codex-manager.mjs"),
-            custom_tools: BTreeMap::new(),
-            tool_cli: None,
-            tool_env: BTreeMap::new(),
-            provider_env: BTreeMap::new(),
-            process_started: None,
-            cursor: None,
-        }
-    }
 }
 
 impl ManagerKind {
@@ -144,15 +131,18 @@ where
         }
         .into());
     }
-    match config.kind {
-        ManagerKind::CursorSdk => {
+    match &config.sdk {
+        Sdk::Cursor {
+            bridge,
+            sdk_bin,
+            agents,
+        } => {
             let not_started = |message: &str| ManagerError {
                 kind: ManagerFailure::Failed,
                 session_id: previous_session_id.map(str::to_owned),
                 message: message.into(),
             };
-            let bridge = config
-                .cursor
+            let bridge = bridge
                 .as_ref()
                 .ok_or_else(|| not_started("this Node has no Cursor SDK bridge yet"))?;
             let (api_key, env) = crate::providers::cursor_launch(&config.provider_env);
@@ -160,7 +150,7 @@ where
                 not_started("CURSOR_API_KEY is required for the Cursor SDK manager")
             })?;
             let turn = SdkTurn {
-                executable: config.cursor_sdk_bin.clone(),
+                executable: sdk_bin.clone(),
                 workspace: config.workspace.clone(),
                 api_key,
                 env,
@@ -168,6 +158,14 @@ where
                 timeout_secs: config.timeout_secs,
                 custom_tools: config.custom_tools.clone(),
                 process_started: config.process_started.clone(),
+            };
+            let (agents, token) = (agents.clone(), config.tool_token.clone());
+            let persist_session = move |id: String| async move {
+                persist_session(id.clone()).await?;
+                if let Some(token) = token {
+                    agents.lock().await.insert(id, token);
+                }
+                Ok(())
             };
             bridge
                 .run(
@@ -188,9 +186,14 @@ where
                     .into()
                 })
         }
-        ManagerKind::CodexSdk => {
+        Sdk::Codex {
+            node_bin,
+            codex_bin,
+            sdk_script,
+        } => {
             run_codex(
                 config,
+                (node_bin, codex_bin, sdk_script),
                 prompt,
                 previous_session_id,
                 persist_session,
@@ -204,6 +207,7 @@ where
 
 async fn run_codex<F, P, PF>(
     config: &ManagerConfig,
+    (node_bin, codex_bin, sdk_script): (&PathBuf, &PathBuf, &PathBuf),
     prompt: &str,
     session_id: Option<&str>,
     persist_session: impl FnOnce(String) -> F,
@@ -219,11 +223,12 @@ where
         config.workspace.is_absolute() && config.workspace.is_dir(),
         "manager workspace must be an existing absolute directory"
     );
-    ensure!(
-        config.codex_sdk_script.is_file(),
-        "Codex SDK sidecar is missing"
-    );
-    let codex = resolve_executable(&config.codex_bin)?;
+    ensure!(sdk_script.is_file(), "Codex SDK sidecar is missing");
+    let codex = resolve_executable(codex_bin)?;
+    let mut tool_env = config.tool_env.clone();
+    if let Some(token) = &config.tool_token {
+        tool_env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
+    }
     let tool_cli = config
         .tool_cli
         .as_ref()
@@ -240,7 +245,7 @@ where
                 message: format!("persist Codex SDK session before resume: {error}"),
             })?;
     }
-    let mut command = Command::new(&config.node_bin);
+    let mut command = Command::new(node_bin);
     // The sidecar hands Codex only the variables it is told about.
     let mut provider_keys = provider_environment_keys(&config.provider_env)?;
     provider_keys.extend(config.provider_env.keys().cloned());
@@ -248,7 +253,7 @@ where
     provider_keys.dedup();
     command
         .envs(&config.provider_env)
-        .arg(&config.codex_sdk_script)
+        .arg(sdk_script)
         .env(
             "VIBEFACE_CODEX_PROVIDER_ENV_KEYS",
             serde_json::to_string(&provider_keys)?,
@@ -301,7 +306,7 @@ where
     let mut reader = BufReader::new(stdout);
     let operation = async {
         write_message(&mut stdin,&json!({"type":"init","prompt":prompt,"session_id":native,"cwd":config.workspace,"model":config.model,"codex_path":codex,
-            "tool_cli":tool_cli,"tool_env":config.tool_env,"custom_tools":config.custom_tools})).await?;
+            "tool_cli":tool_cli,"tool_env":tool_env,"custom_tools":config.custom_tools})).await?;
         let ready = read_message(&mut reader).await?;
         ensure!(
             ready["type"] == "ready" && ready["session_id"].as_str() == native.as_deref(),
@@ -551,6 +556,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
         .tool_env
         .values()
+        .chain(&config.tool_token)
         .chain(config.provider_env.values())
         .filter(|value| value.len() >= 8)
         .cloned()
@@ -566,7 +572,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
             })
             .map(|(_, value)| value),
     );
-    if config.kind == ManagerKind::CodexSdk
+    if matches!(config.sdk, Sdk::Codex { .. })
         && let Ok(keys) = provider_environment_keys(&config.provider_env)
     {
         values.extend(
@@ -672,6 +678,26 @@ fn redact(value: Value, secrets: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Codex turn whose sidecar is the shell script `script`.
+    fn codex(workspace: PathBuf, script: PathBuf) -> ManagerConfig {
+        ManagerConfig {
+            sdk: Sdk::Codex {
+                node_bin: "/bin/sh".into(),
+                codex_bin: "/usr/bin/true".into(),
+                sdk_script: script,
+            },
+            workspace,
+            model: String::new(),
+            timeout_secs: 5,
+            custom_tools: BTreeMap::new(),
+            tool_cli: None,
+            tool_env: BTreeMap::new(),
+            tool_token: None,
+            provider_env: BTreeMap::new(),
+            process_started: None,
+        }
+    }
     #[test]
     fn provider_environment_uses_only_selected_profile_and_header_keys() -> Result<()> {
         let config = "model_provider='unused'\nprofile='local'\n[profiles.local]\nmodel_provider='active'\n[model_providers.active]\nenv_key='CUSTOM_API_KEY'\nenv_http_headers={X-Test='HEADER_TOKEN'}\n[model_providers.unused]\nenv_key='UNRELATED_SECRET'";
@@ -723,15 +749,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture-native","final_response":"
         )
         .await
         .unwrap();
-        let config = ManagerConfig {
-            kind: ManagerKind::CodexSdk,
-            workspace: directory.clone(),
-            node_bin: "/bin/sh".into(),
-            codex_bin: "/usr/bin/true".into(),
-            codex_sdk_script: script,
-            timeout_secs: 5,
-            ..ManagerConfig::default()
-        };
+        let config = codex(directory.clone(), script);
         let marker = directory.join("persisted");
         let result = run_manager(
             &config,
@@ -824,15 +842,7 @@ printf '%s\n' '{reply}'
 "#
             );
             tokio::fs::write(&script, fixture).await.unwrap();
-            let config = ManagerConfig {
-                kind: ManagerKind::CodexSdk,
-                workspace: directory.clone(),
-                node_bin: "/bin/sh".into(),
-                codex_bin: "/usr/bin/true".into(),
-                codex_sdk_script: script.clone(),
-                timeout_secs: 5,
-                ..ManagerConfig::default()
-            };
+            let config = codex(directory.clone(), script.clone());
             let (cancel_tx, cancel_rx) = watch::channel(false);
             let error = run_manager(
                 &config,
@@ -855,16 +865,18 @@ printf '%s\n' '{reply}'
     }
 
     #[test]
-    fn tool_credentials_are_not_serialized() {
+    fn tool_credentials_are_redacted() {
         let config = ManagerConfig {
             tool_env: BTreeMap::from([("TOKEN".into(), "other-secret".into())]),
-            ..ManagerConfig::default()
+            tool_token: Some("turn-token-secret".into()),
+            ..codex(".".into(), "fixture.sh".into())
         };
-        let encoded = serde_json::to_string(&config).unwrap();
-        assert!(!encoded.contains("other-secret"));
         assert_eq!(
-            redact(json!({"nested":["other-secret"]}), &secret_values(&config)),
-            json!({"nested":["[redacted]"]})
+            redact(
+                json!({"nested":["other-secret","turn-token-secret"]}),
+                &secret_values(&config)
+            ),
+            json!({"nested":["[redacted]","[redacted]"]})
         );
     }
 }

@@ -585,7 +585,8 @@ pub enum EventBody {
     ContextCheckpoint {
         covers: VersionVector,
         summary: String,
-        standing_instructions: Vec<String>,
+        /// Excerpts of the newest user messages it covers; history, not instructions to keep.
+        recent_user_requests: Vec<String>,
         open_work: Vec<OpenWork>,
         decisions: Vec<String>,
     },

@@ -227,6 +227,10 @@ fn place(
     if let Err(error) = authorize_cause(connection, network, event) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
+    if let Err(error) = authorize_owner(connection, network, event) {
+        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected a write only the conversation's scheduling Node makes");
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
     let main = match &event.prev {
         Some(prev) => *prev == head_hash,
         None => max == 0,
@@ -303,6 +307,70 @@ fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Res
         }
     }
     bail!("a bot's write for the user must follow the user's own signed message")
+}
+
+/// The conversation whose scheduling Node alone makes this write: a checkpoint, a reminder its
+/// bot set itself, or its bot's message to another bot.
+fn owner_scope(event: &Event) -> Option<&str> {
+    match &event.body {
+        EventBody::ContextCheckpoint { .. } | EventBody::BotChanged { cause: None, .. } => {
+            Some(&event.scope_id)
+        }
+        EventBody::BotMessaged { from, .. } => Some(&from.conversation_id),
+        _ => None,
+    }
+}
+
+/// An owner-only write must come from the owner its author knew when writing: of the owner
+/// records the event's parents hold (its author's earlier events, and each dependency's log up
+/// to that dependency), those of the highest epoch must name the author. An owner change the
+/// author had not seen yet does not count against it. The parents are stored before an event
+/// is placed, so every replica reads the same records.
+fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    let Some(scope) = owner_scope(event) else {
+        return Ok(());
+    };
+    let mut seen = BTreeMap::from([(event.author.clone(), event.seq - 1)]);
+    for dep in &event.deps {
+        let (author, seq): (String, u64) = connection.query_row(
+            "SELECT author,seq FROM events WHERE network_id=? AND hash=?",
+            params![network, dep],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let known = seen.entry(author).or_default();
+        *known = (*known).max(seq);
+    }
+    let mut statement = connection.prepare(
+        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+    )?;
+    let mut rows = statement.query(params![network, scope])?;
+    let mut newest: Option<(u64, bool)> = None;
+    while let Some(row) = rows.next()? {
+        let (author, seq): (String, u64) = (row.get(0)?, row.get(1)?);
+        if seen.get(&author).is_none_or(|known| seq > *known) {
+            continue;
+        }
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let EventBody::ConversationOwner {
+            scheduler_node,
+            epoch,
+            ..
+        } = serde_json::from_str::<Event>(&envelope.canonical_body)?.body
+        else {
+            continue;
+        };
+        let named = scheduler_node == event.author;
+        newest = match newest {
+            Some((best, any)) if best == epoch => Some((best, any || named)),
+            Some((best, _)) if best > epoch => newest,
+            _ => Some((epoch, named)),
+        };
+    }
+    ensure!(
+        newest.is_some_and(|(_, named)| named),
+        "only the conversation's scheduling Node makes this write"
+    );
+    Ok(())
 }
 
 fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
@@ -522,12 +590,17 @@ pub(crate) fn append_from(
         .prepare("SELECT author FROM log_heads WHERE network_id=? AND author<>?")?
         .query_map(params![network, author], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
+    // A bot's message also follows its own conversation, where its sender's ownership is.
+    let sender = match &body {
+        EventBody::BotMessaged { from, .. } => from.conversation_id.as_str(),
+        _ => scope,
+    };
     let mut deps = Vec::new();
     for other in authors {
         if let Some(hash) = connection
             .query_row(
-                "SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND main=1 ORDER BY seq DESC LIMIT 1",
-                params![network, scope, other],
+                "SELECT hash FROM events WHERE network_id=? AND scope_id IN (?,?) AND author=? AND main=1 ORDER BY seq DESC LIMIT 1",
+                params![network, scope, sender, other],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
@@ -571,6 +644,7 @@ pub(crate) fn append_from(
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
     authorize_cause(connection, network, &event)?;
+    authorize_owner(connection, network, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, true)?,
         "this Node's log has forked and it no longer writes"

@@ -3,7 +3,7 @@
 //! as its own `work:` trigger, so nothing waits on background work here.
 use crate::{
     crypto::digest,
-    manager::{self, ManagerConfig, ManagerError, ManagerKind},
+    manager::{self, ManagerConfig, ManagerError},
     model::{
         Context, Event, EventBody, HashedEvent, MAX_INSTRUCTIONS_BYTES, MAX_SCHEDULE_PROMPT_BYTES,
         OpenWork, Role, ScheduleEntry, VersionVector, WorkProjection,
@@ -205,32 +205,20 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             materialize(&context, &job, &works, bot, schedule.as_ref(), route, &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        let mut tool_env = node.agent_env();
-        // The `vibeface tool` CLI of the Codex path reads its turn from here; Cursor calls back.
-        tool_env.extend([
+        let mut config = ManagerConfig {
+            custom_tools: tools(job.kind),
+            tool_cli: Some(std::env::current_exe()?),
+            tool_token: Some(token.clone()),
+            process_started: Some(process_recorder(&node, &attempt.id)),
+            ..node.manager_config(settings)
+        };
+        config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
-            ("VIBEFACE_TOOL_TOKEN".into(), token.clone()),
             ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
             ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
             ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()),
             ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
         ]);
-        let config = ManagerConfig {
-            kind,
-            workspace: settings.workspace,
-            model: settings.model,
-            timeout_secs: node.config.timeout_secs,
-            cursor_sdk_bin: settings.cursor_sdk_bin,
-            node_bin: settings.node_bin,
-            codex_bin: node.providers().codex_bin,
-            codex_sdk_script: settings.codex_sdk_script,
-            provider_env: node.provider_env(kind),
-            custom_tools: tools(job.kind),
-            tool_cli: Some(std::env::current_exe()?),
-            tool_env,
-            process_started: Some(process_recorder(&node, &attempt.id)),
-            cursor: node.cursor.get().cloned(),
-        };
         if matches!(
             job.kind,
             TriggerKind::WorkResult | TriggerKind::AgentTask | TriggerKind::Schedule | TriggerKind::BotMessage
@@ -245,8 +233,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
             .await?;
         registered = true;
-        let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
-            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
+        let (persist_node, persist_conversation, persist_trigger, persist_attempt) =
+            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let (progress_node, progress_network, progress_conversation, progress_trigger, progress_attempt) =
             (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let progress_text = partial.clone();
@@ -265,11 +253,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     &persist_trigger,
                     &persist_attempt,
                     &id,
-                )?;
-                if kind == ManagerKind::CursorSdk {
-                    persist_node.cursor_agents.lock().await.insert(id, persist_token);
-                }
-                Ok(())
+                )
             },
             cancel,
             move |progress| {
@@ -515,7 +499,7 @@ const MESSAGE_BUDGET: usize = 20_000;
 const CHECKPOINT_BUDGET: usize = 8_000;
 const WORK_BUDGET: usize = 8_000;
 const SUMMARY_LIMIT: usize = 6_000;
-const STANDING_LIMIT: usize = 20;
+const RECENT_REQUESTS_LIMIT: usize = 20;
 const DECISION_LIMIT: usize = 30;
 
 fn covered(event: &Event, covers: &VersionVector) -> bool {
@@ -588,11 +572,11 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             covers,
             EventBody::ContextCheckpoint {
                 summary,
-                standing_instructions,
+                recent_user_requests,
                 decisions,
                 ..
             },
-        )) => (covers, Some((summary, standing_instructions, decisions))),
+        )) => (covers, Some((summary, recent_user_requests, decisions))),
         _ => (&empty, None),
     };
     let events = &context.events;
@@ -618,9 +602,9 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
         cut = *offset;
     }
     let mut covers = since.clone();
-    let (mut lines, mut standing, mut decisions) = match previous {
-        Some((summary, standing, decisions)) => {
-            (vec![summary.clone()], standing.clone(), decisions.clone())
+    let (mut lines, mut requests, mut decisions) = match previous {
+        Some((summary, requests, decisions)) => {
+            (vec![summary.clone()], requests.clone(), decisions.clone())
         }
         None => (vec![], vec![], vec![]),
     };
@@ -640,7 +624,7 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
                 let speaker = if *role == Role::User { "用户" } else { "Bot" };
                 lines.push(format!("{speaker}：{}", prefix(text, 280)));
                 if *role == Role::User && answers.is_none() {
-                    standing.push(prefix(text, 300).to_owned());
+                    requests.push(prefix(text, 300).to_owned());
                 }
             }
             EventBody::BotMessaged { from, text, .. } => {
@@ -665,7 +649,7 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
     Some(EventBody::ContextCheckpoint {
         covers,
         summary,
-        standing_instructions: tail(standing, STANDING_LIMIT),
+        recent_user_requests: tail(requests, RECENT_REQUESTS_LIMIT),
         open_work: works
             .iter()
             .filter(|work| work.outcome.is_none())

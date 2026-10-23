@@ -719,16 +719,13 @@ fn end_job_from(
     } else {
         text.to_owned()
     };
-    if job.kind == TriggerKind::AgentTask {
-        super::work::finish_agent_work_from(
-            connection,
-            blob_dir,
-            identity,
-            network,
-            &job.reply_to,
-            &outcome,
-            &text,
-            at,
+    let change = TaskJobChange::Ended {
+        outcome: &outcome,
+        text: &text,
+    };
+    if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
+        super::work::apply_signal_from(
+            connection, blob_dir, identity, network, work_id, signal, at,
         )?;
     } else if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_none() {
         log::append_from(
@@ -753,7 +750,11 @@ fn end_job_from(
         )?;
         let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
-        if let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
+        // A Node the conversation moved away from mid-turn leaves condensing to the new owner.
+        let owned = conversation_from(connection, network, &job.conversation_id)?
+            .and_then(|c| c.owner)
+            == Some(identity.device_id()?);
+        if owned && let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
             log::append_from(
                 connection,
                 blob_dir,
@@ -1197,15 +1198,18 @@ impl Store {
         };
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
-            if job.kind == TriggerKind::AgentTask {
-                super::work::finish_agent_work_from(
+            let change = TaskJobChange::Ended {
+                outcome: &JobOutcome::Cancelled(evidence.clone()),
+                text: "",
+            };
+            if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
+                super::work::apply_signal_from(
                     &tx,
                     &self.blob_dir,
                     identity,
                     network,
-                    &job.reply_to,
-                    &JobOutcome::Cancelled(evidence.clone()),
-                    "",
+                    work_id,
+                    signal,
                     crate::runtime::now_ms(),
                 )?;
             }

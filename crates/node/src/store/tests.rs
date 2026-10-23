@@ -896,7 +896,7 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
         crate::scheduler::checkpoint(&context, &works).context("history is over budget")?;
     let EventBody::ContextCheckpoint {
         covers,
-        standing_instructions,
+        recent_user_requests,
         ..
     } = &checkpoint
     else {
@@ -912,7 +912,7 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
         "covers is a prefix"
     );
     assert!(flags.iter().any(|f| *f) && flags.iter().any(|f| !*f));
-    assert!(!standing_instructions.is_empty());
+    assert!(!recent_user_requests.is_empty());
     store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 100)?;
     let context = store.context(&net.network, "c", None)?;
     assert!(crate::scheduler::checkpoint(&context, &works).is_none());
@@ -981,6 +981,143 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
         outbox.iter().map(|e| e.trigger.clone()).collect::<Vec<_>>(),
         vec![trigger]
     );
+    Ok(())
+}
+
+fn owner(net: &Net, node: &LocalIdentity, epoch: u64) -> Result<EventBody> {
+    net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::ConversationOwner {
+            scheduler_node: node.device_id()?,
+            epoch,
+            attestation: None,
+            cause: None,
+        },
+    )
+}
+
+fn checkpoint_body(summary: &str) -> EventBody {
+    EventBody::ContextCheckpoint {
+        covers: VersionVector::new(),
+        summary: summary.into(),
+        recent_user_requests: vec![],
+        open_work: vec![],
+        decisions: vec![],
+    }
+}
+
+fn checkpoints(store: &Store, net: &Net) -> Result<Vec<String>> {
+    Ok(store
+        .context(&net.network, "c", None)?
+        .events
+        .into_iter()
+        .filter_map(|event| match event.event.body {
+            EventBody::ContextCheckpoint { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .collect())
+}
+
+/// A checkpoint counts when its author owned the conversation as far as it knew, whatever order
+/// the logs arrive in and whether a later move reached it; one written after the author saw the
+/// move is refused.
+#[test]
+fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
+    let net = net()?;
+    let mut a_side = store(&net)?;
+    conversation(&mut a_side, &net)?;
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    // The user moves the conversation to b and back to a, both times through b.
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        2,
+    )?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.a, 3)?,
+        vec![],
+        3,
+    )?;
+    sync(&b_side, &mut a_side, &net)?;
+    a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        checkpoint_body("back"),
+        vec![],
+        4,
+    )?;
+
+    let mut replica = store(&net)?;
+    let a_log = |side: &Store| side.events_from(&net.network, &net.a.device_id().unwrap(), 1, 500);
+    let statuses = replica.ingest_events(&net.network, &a_log(&a_side)?)?.0;
+    assert_eq!(statuses.last(), Some(&IngestStatus::Pending));
+    let b_log = b_side.events_from(&net.network, &net.b.device_id()?, 1, 500)?;
+    replica.ingest_events(&net.network, &b_log)?;
+    assert_eq!(checkpoints(&replica, &net)?, ["back"]);
+
+    // b takes the conversation again while a, not yet aware, ends a turn with a checkpoint.
+    let moved = b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 4)?,
+        vec![],
+        5,
+    )?;
+    let late = a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        checkpoint_body("late"),
+        vec![],
+        6,
+    )?;
+    replica.ingest_events(&net.network, std::slice::from_ref(&moved))?;
+    assert_eq!(
+        replica
+            .ingest_events(&net.network, std::slice::from_ref(&late))?
+            .0,
+        [IngestStatus::Accepted]
+    );
+
+    sync(&b_side, &mut a_side, &net)?;
+    let refused = a_side
+        .append_event(
+            &net.a,
+            &net.network,
+            "c",
+            checkpoint_body("stale"),
+            vec![],
+            7,
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains("scheduling Node"), "{refused}");
+    let forged = net.a.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.a.device_id()?,
+        seq: seq_of(&late)? + 1,
+        prev: Some(late.hash.clone()),
+        deps: vec![moved.hash.clone()],
+        scope_id: "c".into(),
+        created_at_ms: 7,
+        body: checkpoint_body("stale"),
+        blobs: vec![],
+    })?;
+    assert!(matches!(
+        &replica.ingest_events(&net.network, &[forged])?.0[0],
+        IngestStatus::Rejected(error) if error.contains("scheduling Node")
+    ));
+    assert_eq!(checkpoints(&replica, &net)?, ["back", "late"]);
     Ok(())
 }
 
