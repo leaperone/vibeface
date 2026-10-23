@@ -75,7 +75,8 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => setDraft({ text, files }))
   }
   const rows = chat ? entries(chat, extras) : []
-  return <View className="flex-1 bg-background">
+  // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
+  return <View className="flex-1">
     <Stack.Screen options={{
       title: bot.name,
       // iOS 26 measures the edge blur on the un-inverted list and covers every message once the chat outgrows the screen.
