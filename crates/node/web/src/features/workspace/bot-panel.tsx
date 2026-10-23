@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router"
 import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Server, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
+import { providerNames, type ProviderId } from "@/lib/node"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "./bot-settings"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "./context"
@@ -44,6 +45,7 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
+  const models = Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
@@ -63,7 +65,9 @@ export function BotPanelButton() {
               <span className="sr-only">运行在 </span><span className="min-w-0 truncate">{nodeName(owner, { nodes: workspace.nodes, directory })}</span>
               {ownerNode && !ownerNode.online ? <span className="shrink-0 text-warning">离线</span> : null}
             </span> : null}
-            <span className="inline-flex min-w-0 items-center gap-1.5" title="模型"><Cpu aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">模型 </span><span className="min-w-0 [overflow-wrap:anywhere]">{bot.model || "跟随设备"}</span></span>
+            <span className="inline-flex min-w-0 items-start gap-1.5" title="模型"><Cpu aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" /><span className="sr-only">模型 </span><span className="grid min-w-0 [overflow-wrap:anywhere]">
+              {models.length ? models.map(([provider, model]) => <span key={provider}>{model} <span className="opacity-70">{providerNames[provider]}</span></span>) : "跟随设备"}
+            </span></span>
           </p>
         </SheetHeader>
         {view ? <div className="grid gap-8 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">

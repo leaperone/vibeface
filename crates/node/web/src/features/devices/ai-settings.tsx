@@ -6,10 +6,9 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@/features/identity/context"
 import { terms } from "@/lib/glossary"
-import { parseAppServerLink, parseNodeSettings, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@/lib/node"
+import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@/lib/node"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
-const providerNames: Record<ProviderId, string> = { codex: "Codex", cursor: "Cursor" }
 const icons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
 const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },

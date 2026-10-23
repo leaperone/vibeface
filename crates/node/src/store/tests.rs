@@ -1,6 +1,7 @@
 use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
+    providers::Provider,
     scheduling::{
         JobOutcome, JobState, SchedulerJob, Shown, SteerOutcome, TriggerKind, bot_message_trigger,
         message_trigger, schedule_trigger, work_trigger,
@@ -1542,7 +1543,16 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     // The local writer takes the cause from the trigger and refuses anything but a user message.
     for trigger in ["work:w1", "message:a1"] {
         let error = origin
-            .change_bot(&net.a, &net.network, "c", trigger, "r1", rename("Nova"), 6)
+            .change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                trigger,
+                "r1",
+                rename("Nova"),
+                Provider::Codex,
+                6,
+            )
             .unwrap_err();
         assert!(
             error.to_string().contains(bot_settings::NOT_FROM_USER),
@@ -1562,7 +1572,16 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     origin.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
     origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 3)?;
     let change = |store: &mut Store, identity, trigger, call_ref, request, at| {
-        store.change_bot(identity, &net.network, "c", trigger, call_ref, request, at)
+        store.change_bot(
+            identity,
+            &net.network,
+            "c",
+            trigger,
+            call_ref,
+            request,
+            Provider::Codex,
+            at,
+        )
     };
     let (renamed, written) = change(&mut origin, &net.a, "message:m1", "r1", rename("Nova"), 4)?;
     assert!(written);
@@ -1697,6 +1716,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -1762,6 +1782,7 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
             every_minutes: Some(5),
             enabled: Some(false),
         },
+        Provider::Codex,
         5,
     )?;
     assert!(
@@ -1844,6 +1865,7 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
             in_minutes: Some(1),
             at_ms: None,
         },
+        Provider::Codex,
         now,
     )?;
     let BotChange::Schedule {
@@ -1918,6 +1940,7 @@ fn scheduled_on_both(net: &Net, every_minutes: u32) -> Result<(Store, Store, Str
         "message:m1",
         "r1",
         save_schedule(None, "Digest", every_minutes),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -2096,6 +2119,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r",
             remind(format!("step {depth}")),
+            Provider::Codex,
             now,
         )?;
         assert_eq!(saved.cause.is_some(), depth == 1);
@@ -2119,6 +2143,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r",
             remind("again".into()),
+            Provider::Codex,
             now,
         )
         .unwrap_err();
@@ -2131,6 +2156,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
             &trigger,
             "r2",
             rename("Nova"),
+            Provider::Codex,
             now,
         )
         .unwrap_err();
@@ -2181,6 +2207,7 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -2428,6 +2455,7 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             skills: None,
             all_skills: None,
         },
+        Provider::Codex,
         11,
     )?;
     assert_eq!(changed.conversation_id, "d");
@@ -2507,6 +2535,7 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
             "message:m1",
             call_ref,
             request,
+            Provider::Codex,
             5,
         )
     };
@@ -2544,9 +2573,9 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
             .find(|bot| bot.name == "Helper")
             .context("helper")?;
         let ops = bots.iter().find(|bot| bot.name == "Ops").context("ops")?;
-        assert_eq!(helper.model, "");
+        assert!(helper.models.is_empty());
         assert_eq!(helper.skills, Some([skill_id.clone()].into()));
-        assert_eq!(ops.model, "gpt-x");
+        assert_eq!(ops.model(Provider::Codex), Some("gpt-x"));
         assert_eq!(ops.skills, None, "all_skills hands back every skill");
     }
     let prompt = |scope| crate::scheduler::bot_value(&other, &net.network, scope, 0);
@@ -2554,7 +2583,69 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
     assert_eq!(helper["skills"].as_array().map(Vec::len), Some(1));
     assert_eq!(helper["skills"][0]["skill_id"], skill_id.as_str());
     assert_eq!(ops["skills"].as_array().map(Vec::len), Some(2));
-    assert_eq!(ops["configured_bot"]["model"], "gpt-x");
+    assert_eq!(ops["configured_bot"]["models"]["codex"], "gpt-x");
+    Ok(())
+}
+
+/// The provider is device-local, so each device writes and runs the model of its own
+/// provider; a device whose provider has none runs its default, and clearing one model keeps
+/// the other.
+#[test]
+fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let change = |store: &mut Store, call_ref: &str, model: &str, provider| {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            configure("Helper", Some(model), None, None),
+            provider,
+            5,
+        )
+    };
+    let runs = |store: &Store, provider: Provider| -> Result<Option<String>> {
+        let device = crate::config::ManagerSettings {
+            provider: provider.manager_kind(),
+            workspace: "/w".into(),
+            model: "auto".into(),
+            cursor_sdk_bin: "/sdk".into(),
+        };
+        let bot = store.bot_for_conversation(&net.network, "c")?;
+        Ok(crate::scheduler::bot_model(&device, bot.as_ref()))
+    };
+    let (set, _) = change(&mut origin, "k1", "gpt-x", Provider::Codex)?;
+    assert!(matches!(
+        set.change,
+        BotChange::Profile { model: Some(ModelEdit { provider: Provider::Codex, ref before, ref after }), .. }
+            if before.is_empty() && after == "gpt-x"
+    ));
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    assert_eq!(runs(&other, Provider::Codex)?.as_deref(), Some("gpt-x"));
+    assert_eq!(
+        runs(&other, Provider::Cursor)?,
+        None,
+        "cursor runs its default"
+    );
+
+    change(&mut origin, "k2", "composer-1", Provider::Cursor)?;
+    change(&mut origin, "k3", "", Provider::Codex)?;
+    let same = change(&mut origin, "k4", "", Provider::Codex).unwrap_err();
+    assert!(same.to_string().contains("nothing to change"), "{same}");
+    let mut later = store(&net)?;
+    all_accepted(&mut later, &net, &origin)?;
+    assert_eq!(
+        runs(&later, Provider::Codex)?,
+        None,
+        "an emptied model follows the default"
+    );
+    assert_eq!(
+        runs(&later, Provider::Cursor)?.as_deref(),
+        Some("composer-1")
+    );
     Ok(())
 }
 
@@ -2582,6 +2673,7 @@ fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 5),
+        Provider::Codex,
         4,
     )?;
     let delete = |store: &mut Store, trigger: &str, wanted: &str| {
@@ -2717,6 +2809,7 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
                 memory_id: None,
                 text: text.into(),
             },
+            Provider::Codex,
             10,
         )
     };
@@ -2758,6 +2851,7 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
         "message:m1",
         "k3",
         ChangeRequest::Forget { memory_id },
+        Provider::Codex,
         11,
     )?;
     let mut other = store(&net)?;
@@ -3797,6 +3891,7 @@ fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
                 memory_id: None,
                 text: format!("Note {i:02}: {}", "keep replies short. ".repeat(20)),
             },
+            Provider::Codex,
             10 + i,
         )?;
     }
@@ -3829,6 +3924,7 @@ fn a_schedule_time_found_too_late_is_skipped() -> Result<()> {
         "message:m1",
         "r1",
         save_schedule(None, "Digest", 60),
+        Provider::Codex,
         3,
     )?;
     let BotChange::Schedule { schedule_id, .. } = saved.change else {
@@ -4245,6 +4341,7 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             memory_id: None,
             text: "prefers short replies".into(),
         },
+        Provider::Codex,
         22,
     )?;
     store.append_event(

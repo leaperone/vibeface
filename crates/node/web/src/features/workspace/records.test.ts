@@ -55,7 +55,7 @@ test("pushed records update the network-wide lists for their conversation only",
   assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "sessions", questions: [] }).map((item) => item.question_id), ["other", "open"])
   const notifications = mergeNotifications([{ notification_id: "n1", kind: "question", text: "", conversation_id: "chat" }, { notification_id: "x", kind: "question", text: "", conversation_id: "other" }], pushed)
   assert.deepEqual(notifications.map((item) => item.notification_id), ["x", "n2"])
-  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", model: "", skills: null, event_hash: "", last_message: null }], pushed)
+  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, event_hash: "", last_message: null }], pushed)
   assert.equal(bots[0].last_message?.text, "hi")
 })
 

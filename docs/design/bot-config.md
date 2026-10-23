@@ -24,11 +24,12 @@ BotChanged {
 }
 
 BotChange =
-	| Profile { name, instructions, model: Option<Edit>, skills: Option<SkillsEdit> }   // 目标 bot；skills 为 null 表示全部
+	| Profile { name, instructions, model: Option<ModelEdit>, skills: Option<SkillsEdit> }   // 目标 bot；skills 为 null 表示全部
 	| Skill { skill_id, before: Option<Skill>, after: Option<Skill> }     // after 为空表示删除
 	| Schedule { schedule_id, before: Option<Schedule>, after: Option<Schedule> }
 
 Edit { before: String, after: String }
+ModelEdit { provider, before: String, after: String }   // 写入设备的 Provider；after 为空跟随设备默认
 SkillsEdit { before: Option<Set<skill_id>>, after: Option<Set<skill_id>> }
 Skill { name, description, body }
 Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth }
@@ -42,7 +43,9 @@ Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth 
 
 **幂等。** 工具带 `call_ref`。`change_id` 已存在且内容相同时返回原结果，不写第二条；内容不同时拒绝。调用结果不明时，Agent 用同一 `call_ref` 重试或用 `call_lookup` 查询。修改只在调度 Node 本机追加，不跨网络写，所以不存在需要对账的远端写入。
 
-**模型密钥。** 事件只含名称、说明、模型名称、skill 正文和例行任务说明，不含 Provider 或任何凭证字段。
+**模型。** Provider 是设备本地配置，所以模型按 Provider 各存一项。设备运行 bot 时取自己 Provider 的那一项，没有就用设备默认模型；聊天修改模型时写入当前设备 Provider 的那一项。
+
+**模型密钥。** 事件只含名称、说明、Provider 名称与模型名称、skill 正文和例行任务说明，不含任何凭证字段。
 
 ## 3. 投影
 
