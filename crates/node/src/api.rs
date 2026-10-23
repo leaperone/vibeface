@@ -143,8 +143,24 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     node.local_access
         .publish_listener(local_url.clone(), node.identity.device_id()?)?;
     let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
-    let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let tool_url = format!("http://{}", tools.local_addr()?);
+    // Codex threads keep the tool URL they were created with, so the port is reused across
+    // starts when free; a new port means new threads.
+    let port_file = node.data_dir.join("tool-port");
+    let previous = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|port| port.trim().parse::<u16>().ok());
+    let tools = match previous {
+        Some(port) => match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => listener,
+            Err(_) => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+        },
+        None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+    };
+    let tool_addr = tools.local_addr()?;
+    if previous != Some(tool_addr.port()) {
+        std::fs::write(&port_file, tool_addr.port().to_string())?;
+    }
+    let tool_url = format!("http://{tool_addr}");
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
     node.tools_ready(tool_url)?;
     tokio::try_join!(

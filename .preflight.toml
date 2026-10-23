@@ -18,8 +18,8 @@ command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && carg
 
 [[domain_check]]
 name = "JavaScript syntax"
-trigger_paths = ["crates/node/sdk/**", "crates/node/web/**", "scripts/crypto-client.mjs", "npm/**", "scripts/package-npm.mjs"]
-command = "node --check crates/node/sdk/codex-manager.mjs && node --check crates/node/web/transport.js && node --check scripts/crypto-client.mjs && node --check npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
+trigger_paths = ["crates/node/web/**", "scripts/crypto-client.mjs", "npm/**", "scripts/package-npm.mjs"]
+command = "node --check crates/node/web/transport.js && node --check scripts/crypto-client.mjs && node --check npm/bin/vibeface.mjs && node --check scripts/package-npm.mjs && node scripts/package-npm.mjs --self-test"
 
 [[domain_check]]
 name = "Delivery scripts and workflow"

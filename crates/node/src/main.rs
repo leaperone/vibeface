@@ -172,10 +172,6 @@ struct Init {
     model: Option<String>,
     #[arg(long, default_value = "cursor-sdk-bridge")]
     cursor_sdk_bin: PathBuf,
-    #[arg(long, default_value = "node")]
-    node_bin: PathBuf,
-    #[arg(long)]
-    codex_sdk_script: Option<PathBuf>,
     /// The system Codex App Server's socket, when discovery should not choose it.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
@@ -862,14 +858,6 @@ fn init(options: Init) -> Result<()> {
                 }
             }),
             cursor_sdk_bin: options.cursor_sdk_bin,
-            node_bin: options.node_bin,
-            codex_sdk_script: match options.codex_sdk_script {
-                Some(path) => path,
-                None => std::env::current_exe()?
-                    .parent()
-                    .context("node executable has no parent directory")?
-                    .join("sidecars/codex-manager.mjs"),
-            },
         });
     }
     initialize_announced(dir, configuration, entry_token)

@@ -2,8 +2,8 @@ use super::{bot_settings::ChangeRequest, *};
 use crate::{
     crypto::LocalIdentity,
     scheduling::{
-        JobOutcome, JobState, SchedulerJob, TriggerKind, bot_message_trigger, message_trigger,
-        schedule_trigger, work_trigger,
+        JobOutcome, JobState, SchedulerJob, SteerOutcome, TriggerKind, bot_message_trigger,
+        message_trigger, schedule_trigger, work_trigger,
     },
     work::{Signal, WorkSpec},
 };
@@ -558,6 +558,186 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
             .context("job")?
             .state,
         JobState::Interrupted { .. }
+    ));
+    Ok(())
+}
+
+fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<()> {
+    let signed = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::MessagePosted {
+            message_id: id.into(),
+            role: Role::User,
+            text: id.into(),
+            attachments: vec![],
+            report_results: Some(report_results),
+            in_reply_to: None,
+            status: None,
+            answers: None,
+            attestation: None,
+        },
+    )?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        id,
+        id,
+        vec![],
+        report_results,
+        signed.attestation().cloned().context("signed message")?,
+        2,
+    )?;
+    Ok(())
+}
+
+/// A message steers only the running reply to a user message once its App Server turn is
+/// known; it is marked before the steer and either joins (no reply of its own) or queues again.
+#[test]
+fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let local = net.a.device_id()?;
+    say(&mut store, &net, "m1", true)?;
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let (trigger, attempt) = (
+        claimed.job.trigger.clone(),
+        claimed.job.state.attempt().context("attempt")?.id.clone(),
+    );
+    store.mark_started("c", &trigger, &attempt)?;
+    say(&mut store, &net, "m2", true)?;
+    say(&mut store, &net, "quiet", false)?;
+    let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
+    assert!(candidates(&store)?.is_empty());
+    store.record_manager_turn(&attempt, "thread", None)?;
+    assert!(candidates(&store)?.is_empty());
+    store.record_manager_turn(&attempt, "thread", Some("turn"))?;
+    // A reply left running by an earlier process is never a target.
+    assert!(
+        store
+            .steer_candidates(&net.network, &local, "later")?
+            .is_empty()
+    );
+    let found = candidates(&store)?;
+    let ids: Vec<_> = found.iter().map(|c| c.message_id.as_str()).collect();
+    assert_eq!(ids, ["m2"]);
+    let into = found[0].into.clone();
+    assert_eq!(
+        (into.thread_id.as_str(), into.turn_id.as_str()),
+        ("thread", "turn")
+    );
+    let m2 = message_trigger("m2");
+    let begin = |store: &mut Store, trigger: &str| {
+        store.begin_steer(&net.network, &local, "boot", "c", trigger, &into)
+    };
+
+    assert!(begin(&mut store, &m2)?);
+    assert!(!begin(&mut store, &m2)?);
+    assert!(candidates(&store)?.is_empty());
+    store.settle_steer("c", &m2, JobState::Queued)?;
+    assert_eq!(
+        store.scheduler_job("c", &m2)?.context("job")?.state,
+        JobState::Queued
+    );
+
+    assert!(begin(&mut store, &m2)?);
+    assert!(store.steer_host_active("c", &attempt)?);
+    // The reply ends while the steer is unsettled: nothing behind the message runs first.
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        3,
+    )?;
+    assert!(!store.steer_host_active("c", &attempt)?);
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(store.scheduler_maintenance_idle().is_err());
+    // An unreadable thread keeps the message waiting with the time it was first unreadable.
+    let unread = JobState::Steering {
+        into: into.clone(),
+        unread_since_ms: Some(7),
+    };
+    store.settle_steer("c", &m2, unread.clone())?;
+    assert_eq!(store.scheduler_job("c", &m2)?.context("job")?.state, unread);
+    let answered = JobState::Steered {
+        into: into.clone(),
+        outcome: SteerOutcome::Answered,
+    };
+    store.settle_steer("c", &m2, answered.clone())?;
+    // Only an unsettled steer settles.
+    store.settle_steer("c", &m2, JobState::Queued)?;
+    let steered = store.scheduler_job("c", &m2)?.context("job")?;
+    assert_eq!(steered.state, answered);
+    assert!(
+        store
+            .message(&net.network, "c", &steered.message_id)?
+            .is_none()
+    );
+    let next = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    assert_eq!(next.job.trigger, message_trigger("quiet"));
+
+    // Stopping a steered message stops the reply it went into.
+    let attempt = next.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &next.job.trigger, &attempt)?;
+    store.record_manager_turn(&attempt, "thread", Some("turn-2"))?;
+    say(&mut store, &net, "m3", true)?;
+    let found = candidates(&store)?;
+    assert_eq!(found.len(), 1);
+    let m3 = message_trigger("m3");
+    assert!(store.begin_steer(&net.network, &local, "boot", "c", &m3, &found[0].into)?);
+    say(&mut store, &net, "m4", true)?;
+    store.request_manager_cancel(&net.a, &net.network, "c", &m3)?;
+    assert!(matches!(
+        store
+            .scheduler_job("c", &next.job.trigger)?
+            .context("job")?
+            .state,
+        JobState::Cancelling { .. }
+    ));
+    assert!(candidates(&store)?.is_empty());
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &next.job.trigger,
+        &attempt,
+        JobOutcome::Cancelled("stopped".into()),
+        "",
+        4,
+    )?;
+
+    // A conversation that moved away hands its queue on while a steer is unsettled.
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        5,
+    )?;
+    assert!(
+        store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(store.scheduler_job("c", &message_trigger("m4"))?.is_none());
+    assert!(matches!(
+        store.scheduler_job("c", &m3)?.context("job")?.state,
+        JobState::Steering { .. }
     ));
     Ok(())
 }

@@ -28,7 +28,7 @@ export type JoinRequest = {
   admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string; name?: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
-export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string; node_bin: string; codex_sdk_script: string }
+export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor'
 export type ProviderRole = 'agent' | 'execution'
@@ -52,7 +52,7 @@ export type ProviderStatus = {
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
-  defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin' | 'node_bin' | 'codex_sdk_script'>
+  defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin'>
   readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
   providers: ProviderStatus[]
 }
@@ -153,12 +153,12 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   if (settings.manager !== null) {
     const m = record(settings.manager)
     if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('Bot 设置格式不对。')
-    manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin), node_bin: text(m.node_bin), codex_sdk_script: text(m.codex_sdk_script) }
+    manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin) }
   }
   if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
-    defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin), node_bin: text(defaults.node_bin), codex_sdk_script: text(defaults.codex_sdk_script) },
+    defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin) },
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
     providers: array(v.providers).map(parseProvider),
   }

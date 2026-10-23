@@ -156,11 +156,17 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         settings.model = model.clone();
     }
     let kind = settings.provider;
-    let sdk_config = digest(&serde_json::to_vec(&settings)?);
     // Claiming before the tool listener exists would turn a startup race into a failed job.
-    node.tool_url
+    let tool_url = node
+        .tool_url
         .get()
         .context("local tool listener is not ready")?;
+    // A Codex thread keeps the Shell environment it was created with, tool URL included: when
+    // the Node could not get its earlier tool port back, a new thread starts.
+    let sdk_config = digest(&serde_json::to_vec(&(
+        &settings,
+        (kind == manager::ManagerKind::CodexSdk).then_some(tool_url),
+    ))?);
     let claimed = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
@@ -189,7 +195,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         tracing::Span::current().record("work_id", work_id);
     }
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?kind, "agent turn started");
-    let token = uuid::Uuid::new_v4().to_string();
+    // A resumed Codex thread keeps the Shell environment it was created with, so its token
+    // carries over; it acts only while an attempt has it registered.
+    let token = claimed
+        .previous_token
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let partial = Arc::new(Mutex::new(PartialText::default()));
     let mut started = false;
     let mut tools_fenced = false;
@@ -216,19 +227,22 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             materialize(&context, &job, &works, bot, schedule.as_ref(), route, &local_settings.roots, claimed.covers.as_ref())?
         };
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
+        if kind == manager::ManagerKind::CodexSdk {
+            // The turn runs on the App Server, which may still be starting with the Node.
+            node.codex.ready().await;
+        }
         let mut config = ManagerConfig {
             custom_tools: tools(job.kind),
             tool_cli: Some(std::env::current_exe()?),
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
+            codex_turn: Some(turn_recorder(&node, &attempt.id)),
             ..node.manager_config(settings)
         };
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
             ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
             ("VIBEFACE_NODE_NETWORK".into(), network.clone()),
-            ("VIBEFACE_NODE_TRIGGER".into(), trigger.clone()),
-            ("VIBEFACE_MANAGER_ATTEMPT".into(), attempt.id.clone()),
         ]);
         if matches!(
             job.kind,
@@ -244,8 +258,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
             .await?;
         registered = true;
-        let (persist_node, persist_conversation, persist_trigger, persist_attempt) =
-            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
+        let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
+            (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
         let (progress_node, progress_network, progress_conversation, progress_trigger, progress_attempt) =
             (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
         let progress_text = partial.clone();
@@ -264,6 +278,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     &persist_trigger,
                     &persist_attempt,
                     &id,
+                    &persist_token,
                 )
             },
             cancel,
@@ -401,6 +416,24 @@ fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agen
                 .record_manager_process(&attempt, group)
         })
     })
+}
+
+fn turn_recorder(node: &Arc<Runtime>, attempt: &str) -> manager::CodexTurn {
+    let node = node.clone();
+    let attempt = attempt.to_owned();
+    manager::CodexTurn {
+        client_id: attempt.clone(),
+        record: Arc::new(move |thread, turn| {
+            let node = node.clone();
+            let attempt = attempt.clone();
+            Box::pin(async move {
+                node.store
+                    .lock()
+                    .await
+                    .record_manager_turn(&attempt, &thread, turn.as_deref())
+            })
+        }),
+    }
 }
 
 /// Bytes each index of the bot's skills, schedules, notes and the other bots takes in the
@@ -895,7 +928,7 @@ mod tests {
         assert_eq!(partial.text(), "hello\n\nworld");
     }
 
-    /// codex-manager.mjs `managerPrompt` puts its CLI instructions (about 1.5 KB with the
+    /// `manager::codex_prompt` puts its CLI instructions (about 1.5 KB with the
     /// executable path) and one catalog entry per tool before the prompt, all within 65536
     /// bytes; a full prompt must fit beside the largest catalog.
     #[test]

@@ -1831,8 +1831,6 @@ mod tests {
                 workspace: workspace.clone(),
                 model: "auto".into(),
                 cursor_sdk_bin: dir.join("missing-cursor-sdk"),
-                node_bin: "node".into(),
-                codex_sdk_script: dir.join("sidecars/codex-manager.mjs"),
             }),
         };
         let refused = dispatch(
@@ -2082,11 +2080,10 @@ mod tests {
         assert!(codex["env"].as_array().unwrap().contains(
             &json!({"name":"FIXTURE_PROVIDER_KEY","set":false,"inherited":false,"required":true})
         ));
-        assert_eq!(codex["state"], "needs_setup");
         assert_eq!(
-            codex["issues"],
-            json!([{"code":"bin_missing","path":"/fixture/codex"},
-                {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+            (codex["state"].clone(), codex["issues"].clone()),
+            (json!("starting"), json!([])),
+            "the system App Server runs with its own program and variables"
         );
         assert_eq!(read["providers"][1]["env"][0]["set"], true);
         assert_eq!(
@@ -2102,6 +2099,11 @@ mod tests {
         let spawn = json!({"provider":"codex","app_server":{"mode":"spawn","socket":null}});
         let moved = dispatch(&node, &mut owner, "configure_provider", spawn).await?;
         assert_eq!(moved["providers"][0]["app_server"]["mode"], "spawn");
+        assert_eq!(
+            moved["providers"][0]["issues"],
+            json!([{"code":"bin_missing","path":"/fixture/codex"},
+                {"code":"env_missing","name":"FIXTURE_PROVIDER_KEY"}])
+        );
         assert_eq!(
             Config::load(&dir)?.providers.codex_app_server.mode,
             crate::providers::AppServerMode::Spawn

@@ -74,11 +74,6 @@ impl Runtime {
                 ManagerKind::CodexSdk => String::new(),
             },
             cursor_sdk_bin: DEFAULT_CURSOR_BIN.into(),
-            node_bin: "node".into(),
-            codex_sdk_script: std::env::current_exe()?
-                .parent()
-                .context("Node executable has no directory")?
-                .join("sidecars/codex-manager.mjs"),
         })
     }
 
@@ -110,9 +105,7 @@ impl Runtime {
                 agents: self.cursor_agents.clone(),
             },
             ManagerKind::CodexSdk => Sdk::Codex {
-                node_bin: settings.node_bin,
-                codex_bin: self.providers().codex_bin,
-                sdk_script: settings.codex_sdk_script,
+                socket: self.codex.socket(),
             },
         };
         ManagerConfig {
@@ -126,6 +119,7 @@ impl Runtime {
             tool_token: None,
             provider_env: self.provider_env(settings.provider),
             process_started: None,
+            codex_turn: None,
         }
     }
 
@@ -151,10 +145,9 @@ impl Runtime {
             .into_iter()
             .filter_map(|(serves, role)| serves.then_some(role))
             .collect();
-        // The system App Server runs with its own program and variables; the bot still
-        // runs the Codex program with them.
-        let launches =
-            provider == Provider::Cursor || bot || app_server.mode == AppServerMode::Spawn;
+        // Codex bots run on the App Server; the system one runs with its own program and
+        // variables.
+        let launches = provider == Provider::Cursor || app_server.mode == AppServerMode::Spawn;
         let mut issues = Vec::new();
         let (bin, required) = match provider {
             Provider::Codex => {
@@ -194,20 +187,16 @@ impl Runtime {
                     issues.push(json!({"code":"env_missing","name":name}));
                 }
             }
-            if execution {
-                match &link {
-                    Some(Link::LaunchFailed { reason }) if issues.is_empty() => {
-                        issues.push(json!({"code":"launch_failed","detail":reason}))
-                    }
-                    Some(Link::NotFound { .. }) => {
-                        issues.push(json!({"code":"app_server_not_found"}))
-                    }
-                    Some(Link::HandshakeFailed { reason, .. }) => {
-                        issues.push(json!({"code":"app_server_unreachable","detail":reason}))
-                    }
-                    Some(Link::Starting) => starting = true,
-                    _ => {}
+            match &link {
+                Some(Link::LaunchFailed { reason }) if issues.is_empty() => {
+                    issues.push(json!({"code":"launch_failed","detail":reason}))
                 }
+                Some(Link::NotFound { .. }) => issues.push(json!({"code":"app_server_not_found"})),
+                Some(Link::HandshakeFailed { reason, .. }) => {
+                    issues.push(json!({"code":"app_server_unreachable","detail":reason}))
+                }
+                Some(Link::Starting) => starting = true,
+                _ => {}
             }
         }
         let state = if roles.is_empty() {
@@ -240,7 +229,6 @@ impl Runtime {
         let default = self.default_manager(ManagerKind::CodexSdk)?;
         let defaults = json!({
             "workspace":default.workspace, "cursor_sdk_bin":default.cursor_sdk_bin,
-            "node_bin":default.node_bin, "codex_sdk_script":default.codex_sdk_script,
         });
         let local = self.providers();
         let mut missing = Vec::new();
@@ -249,21 +237,10 @@ impl Runtime {
                 if !executable(&manager.cursor_sdk_bin) {
                     missing.push("Cursor SDK Bridge");
                 }
-            } else {
-                if !executable(&manager.node_bin) {
-                    missing.push("Node.js");
-                }
-                if !executable(&local.codex_bin) {
-                    missing.push("Codex CLI");
-                }
-                if !manager.codex_sdk_script.is_file() {
-                    missing.push("Codex SDK sidecar");
-                }
-                if !manager.codex_sdk_script.parent().is_some_and(|directory| {
-                    directory.join("node_modules/@openai/codex-sdk").is_dir()
-                }) {
-                    missing.push("Codex SDK dependencies");
-                }
+            } else if local.switches.codex_app_server.mode == AppServerMode::Spawn
+                && !executable(&local.codex_bin)
+            {
+                missing.push("Codex CLI");
             }
         }
         let readiness = if settings.manager.is_none() {
@@ -451,16 +428,10 @@ impl Runtime {
                 manager.provider != ManagerKind::CursorSdk || !manager.model.trim().is_empty(),
                 "Cursor SDK requires a model"
             );
-            for path in [
-                &manager.cursor_sdk_bin,
-                &manager.node_bin,
-                &manager.codex_sdk_script,
-            ] {
-                ensure!(
-                    !path.as_os_str().is_empty(),
-                    "manager program paths must not be empty"
-                );
-            }
+            ensure!(
+                !manager.cursor_sdk_bin.as_os_str().is_empty(),
+                "manager program paths must not be empty"
+            );
             self.ensure_default_workspace(&manager.workspace)?;
             manager.workspace = manager
                 .workspace

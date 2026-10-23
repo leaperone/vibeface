@@ -25,7 +25,7 @@ import './chat.css'
 
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 const replyStates: Record<string, string> = { failed: '回复失败', rejected: '没有处理' }
-const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
+const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 
 export function ConversationScreen() {
   const workspace = useWorkspace()
@@ -84,7 +84,8 @@ export function ConversationScreen() {
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
-  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued'].includes(job.state)).map((job) => job.message_id) : [])
+  const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
+  const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const entries: ChatEntry[] = []
   const waiting: ChatEntry[] = []
   for (const message of threadReplies(data?.messages ?? [])) {
@@ -95,7 +96,7 @@ export function ConversationScreen() {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(message))
+    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message))
     const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.error
     if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
     for (const job of jobs) {

@@ -76,7 +76,6 @@ jobs:
           bash install.sh --self-test
       - name: Check JavaScript syntax
         run: |
-          node --check crates/node/sdk/codex-manager.mjs
           node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
           node --check npm/bin/vibeface.mjs
@@ -389,12 +388,6 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-phase5 --phase5
-      - name: Verify packaged SDK lockfile without model calls
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        working-directory: ${{ steps.unpack.outputs.package }}/sidecars
-        run: |
-          npm ci --ignore-scripts --no-audit --no-fund
-          node --input-type=module -e 'import { Codex } from "@openai/codex-sdk"; if (typeof Codex !== "function") process.exit(1)'
       - name: Upload verified package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

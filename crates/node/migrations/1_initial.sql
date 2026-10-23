@@ -87,7 +87,7 @@ CREATE TABLE `invites` (`join_id` text NOT NULL, `invite_hash` text NOT NULL, `e
 -- Create index "invites_invite_hash" to table: "invites"
 CREATE UNIQUE INDEX `invites_invite_hash` ON `invites` (`invite_hash`);
 -- Create "scheduler_sessions" table
-CREATE TABLE `scheduler_sessions` (`conversation_id` text NOT NULL, `next_sequence` integer NOT NULL, `active` text NULL, `native_id` text NULL, `covers` text NOT NULL, `owner_epoch` integer NOT NULL, `sdk_config` text NULL, `permission_version` integer NOT NULL, PRIMARY KEY (`conversation_id`));
+CREATE TABLE `scheduler_sessions` (`conversation_id` text NOT NULL, `next_sequence` integer NOT NULL, `active` text NULL, `native_id` text NULL, `native_token` text NULL, `covers` text NOT NULL, `owner_epoch` integer NOT NULL, `sdk_config` text NULL, `permission_version` integer NOT NULL, PRIMARY KEY (`conversation_id`));
 -- Create "scheduler_jobs" table
 CREATE TABLE `scheduler_jobs` (`conversation_id` text NOT NULL, `trigger` text NOT NULL, `kind` text NOT NULL, `sequence` integer NOT NULL, `basis` text NOT NULL, `reply_to` text NOT NULL, `message_id` text NOT NULL, `state` text NOT NULL, `attempt_id` text NULL, `attempt_boot` text NULL, `attempt_permission` integer NULL, `detail` text NULL, PRIMARY KEY (`conversation_id`, `trigger`));
 -- Create index "scheduler_jobs_state" to table: "scheduler_jobs"
@@ -100,6 +100,8 @@ CREATE TABLE `schedule_claims` (`network_id` text NOT NULL, `conversation_id` te
 CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` text NOT NULL, `trigger` text NOT NULL, `detail` text NOT NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`attempt_id`));
 -- Create "manager_processes" table
 CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` integer NOT NULL, PRIMARY KEY (`attempt_id`, `process_group`));
+-- Create "manager_turns" table
+CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
 -- Create "work_runs" table
 CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
 -- Create "work_dispatches" table

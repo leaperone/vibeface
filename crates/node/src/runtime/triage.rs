@@ -609,6 +609,9 @@ impl Runtime {
         let Some(settings) = self.manager() else {
             return Ok(());
         };
+        if settings.provider == manager::ManagerKind::CodexSdk {
+            self.codex.ready().await;
+        }
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
@@ -1573,8 +1576,6 @@ mod tests {
             workspace: "/tmp".into(),
             model: "fixture".into(),
             cursor_sdk_bin: "/nonexistent".into(),
-            node_bin: "/nonexistent".into(),
-            codex_sdk_script: "/nonexistent".into(),
         });
     }
 

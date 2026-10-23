@@ -67,8 +67,9 @@ impl CodexServer {
             .await
         {
             Ok(reply) => reply,
-            Err(error) if error.uncertain => return Err(error),
-            Err(_) => return Ok(Probe::Missing),
+            // Only the App Server saying it has no such thread makes the turn missing.
+            Err(error) if error.answered => return Ok(Probe::Missing),
+            Err(error) => return Err(error),
         };
         let turns = reply["thread"]["turns"]
             .as_array()

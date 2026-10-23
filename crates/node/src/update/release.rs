@@ -594,11 +594,6 @@ struct BuildInfo {
 }
 
 fn verify_build(package: &Path, release: &Release) -> Result<()> {
-    ensure!(
-        fs::symlink_metadata(package.join("sidecars/node_modules"))
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
-        "release package must not bundle generated SDK dependencies"
-    );
     let metadata = fs::metadata(package.join("BUILD-INFO.json"))?;
     ensure!(metadata.len() <= 4096, "BUILD-INFO exceeds limit");
     let build: BuildInfo = serde_json::from_slice(&fs::read(package.join("BUILD-INFO.json"))?)
@@ -618,9 +613,6 @@ fn verify_build(package: &Path, release: &Release) -> Result<()> {
         "vibeface",
         "README.md",
         "RUNTIME-REQUIREMENTS.md",
-        "sidecars/package.json",
-        "sidecars/package-lock.json",
-        "sidecars/codex-manager.mjs",
         "scripts/install-node-service.sh",
         "docs/node.md",
         "docs/releasing.md",
@@ -699,13 +691,6 @@ fn tree(root: &Path) -> Result<BTreeMap<PathBuf, TreeEntry>> {
                 "existing release contains too many entries"
             );
             let metadata = entry.path().symlink_metadata()?;
-            if relative == Path::new("sidecars/node_modules") {
-                ensure!(
-                    metadata.file_type().is_dir(),
-                    "generated SDK dependency path must be a regular directory"
-                );
-                continue;
-            }
             let kind = if metadata.file_type().is_dir() {
                 pending.push(relative.clone());
                 TreeEntry::Directory
@@ -940,9 +925,6 @@ mod tests {
             for file in [
                 "README.md",
                 "RUNTIME-REQUIREMENTS.md",
-                "sidecars/package.json",
-                "sidecars/package-lock.json",
-                "sidecars/codex-manager.mjs",
                 "scripts/install-node-service.sh",
                 "docs/node.md",
                 "docs/releasing.md",
@@ -967,21 +949,7 @@ mod tests {
             .await
             .unwrap();
         assert!(tree(&package).unwrap() == tree(&copy).unwrap());
-        let dependencies = copy.join("sidecars/node_modules");
-        fs::create_dir(&dependencies).unwrap();
-        fs::write(dependencies.join("generated.js"), b"npm ci output").unwrap();
-        assert!(tree(&package).unwrap() == tree(&copy).unwrap());
-        fs::remove_dir_all(&dependencies).unwrap();
-        symlink(&package, &dependencies).unwrap();
-        assert!(tree(&copy).is_err());
-        fs::remove_file(&dependencies).unwrap();
-        fs::write(&dependencies, b"not a directory").unwrap();
-        assert!(tree(&copy).is_err());
-        fs::remove_file(&dependencies).unwrap();
-        fs::create_dir(package.join("sidecars/node_modules")).unwrap();
-        assert!(verify_build(&package, &release).is_err());
-        fs::remove_dir(package.join("sidecars/node_modules")).unwrap();
-        fs::write(copy.join("sidecars/codex-manager.mjs"), b"corrupt").unwrap();
+        fs::write(copy.join("docs/node.md"), b"corrupt").unwrap();
         assert!(tree(&package).unwrap() != tree(&copy).unwrap());
         symlink(package.join("README.md"), copy.join("unexpected-link")).unwrap();
         assert!(tree(&copy).is_err());

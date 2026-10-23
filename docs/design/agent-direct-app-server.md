@@ -143,7 +143,7 @@ Node 对每个未结束工作的线程保持 `thread/resume` 订阅（重连后�
 
 其余 App Server 操作（插话、读线程、模型列表、review、fork 等）都用 `vibeface codex`，Node 不再提供 `codex`、`steer_work` 这类包装工具。
 
-Codex SDK sidecar 的协调回合总是用 `sandboxMode=danger-full-access`、`approvalPolicy=never`，没有只读回合和 `vibeface_manager` 权限配置。
+Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-access`、`approvalPolicy=never`，没有只读回合和 `vibeface_manager` 权限配置。
 
 ## 3. 网页的会话控制
 

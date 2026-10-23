@@ -150,10 +150,44 @@ pub struct ManagerAttempt {
     pub permission_version: u64,
 }
 
+/// The running Codex turn a user message was steered into.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteerTarget {
+    /// The attempt of the reply the message joined.
+    pub attempt_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+/// How the reply a message joined ended.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerOutcome {
+    /// The turn holding the message completed.
+    Answered,
+    /// The message is in a turn that stopped, failed or was interrupted.
+    Unfinished,
+    /// The thread could not be read in time; whether it joined is unknown.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobState {
     Queued,
+    /// Sent, or about to be sent, as `turn/steer` into `into`. It is settled from the thread
+    /// once that reply's attempt ended, never sent again. `unread_since_ms` is when reading the
+    /// thread first failed after that.
+    Steering {
+        into: SteerTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unread_since_ms: Option<i64>,
+    },
+    /// Joined the reply `into`; it gets no reply of its own.
+    Steered {
+        into: SteerTarget,
+        outcome: SteerOutcome,
+    },
     Claimed {
         attempt: ManagerAttempt,
     },
@@ -185,6 +219,8 @@ impl JobState {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::Steering { .. } => "steering",
+            Self::Steered { .. } => "steered",
             Self::Claimed { .. } => "claimed",
             Self::Running { .. } => "running",
             Self::Cancelling { .. } => "cancelling",
@@ -196,7 +232,7 @@ impl JobState {
     }
     pub fn attempt(&self) -> Option<&ManagerAttempt> {
         match self {
-            Self::Queued => None,
+            Self::Queued | Self::Steering { .. } | Self::Steered { .. } => None,
             Self::Cancelled { attempt, .. } => attempt.as_ref(),
             Self::Claimed { attempt }
             | Self::Running { attempt }
@@ -210,6 +246,7 @@ impl JobState {
         matches!(
             self,
             Self::Completed { .. }
+                | Self::Steered { .. }
                 | Self::Failed { .. }
                 | Self::Cancelled { .. }
                 | Self::Interrupted { .. }
@@ -276,10 +313,22 @@ impl OutboxEntry {
     }
 }
 
+/// A queued user message that can join the running reply `into`.
+#[derive(Debug, Clone)]
+pub struct SteerCandidate {
+    pub conversation_id: String,
+    pub trigger: String,
+    pub message_id: String,
+    pub text: String,
+    pub into: SteerTarget,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
     pub job: SchedulerJob,
     pub previous_native_id: Option<String>,
+    /// The tool token the resumed native session's Shell already carries.
+    pub previous_token: Option<String>,
     /// What the resumed native session has already seen; the prompt carries only the rest.
     pub covers: Option<VersionVector>,
 }
@@ -305,6 +354,9 @@ pub(crate) struct SchedulerSession {
     /// The SDK's own session, cached for this conversation on this Node only. `covers` is the
     /// basis it has seen and `owner_epoch` the ownership it was built under.
     pub native_id: Option<String>,
+    /// The tool token set in the native session's Shell when it was created. A Codex thread
+    /// keeps the environment it was loaded with, so every turn of it presents this token.
+    pub native_token: Option<String>,
     pub covers: VersionVector,
     pub owner_epoch: u64,
     pub sdk_config: Option<String>,
@@ -318,6 +370,7 @@ impl SchedulerSession {
             next_sequence: 1,
             active: None,
             native_id: None,
+            native_token: None,
             covers: VersionVector::new(),
             owner_epoch: 0,
             sdk_config: None,
@@ -326,8 +379,9 @@ impl SchedulerSession {
     }
 }
 
-/// A coordination process whose exit this Node has not seen. The runtime resolves it once every
-/// recorded process group is gone; only a group that stays alive needs the user.
+/// A coordination turn whose end this Node has not seen. The runtime resolves it once every
+/// recorded process group is gone and its App Server turn has ended; only a group that stays
+/// alive needs the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCheck {
     pub check_id: String,
@@ -336,6 +390,8 @@ pub struct PendingCheck {
     pub attempt_id: String,
     pub detail: String,
     pub process_groups: Vec<u32>,
+    /// `(thread, turn)` of a reply that ran on the App Server; the turn may be unknown.
+    pub codex_turn: Option<(String, Option<String>)>,
     pub created_at_ms: i64,
 }
 
