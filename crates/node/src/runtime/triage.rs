@@ -174,10 +174,14 @@ fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
 }
 
 /// The bot that owns this device's session. A thread this device's work bound counts at
-/// once: the App Server can ask before the turn's start is recorded.
+/// once: the App Server can ask before the turn's start is recorded. A bot's own reply thread
+/// belongs to its conversation.
 fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Result<Option<String>> {
     if let Some(owner) = store.session_owner(network, &event.node, &event.session_id)? {
         return Ok(Some(owner));
+    }
+    if let Some(conversation) = store.native_thread_conversation(&event.session_id)? {
+        return Ok(Some(conversation));
     }
     Ok(store
         .connection
@@ -2036,6 +2040,99 @@ mod tests {
             let chat = node.store.lock().await.conversation_questions(&network, "c")?;
             assert_eq!(chat.len(), 1);
             assert_eq!((chat[0]["bot"]["name"].clone(), chat[0]["about"]["session_id"].clone()), (json!("前端"), json!("s1")));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// A bot's own reply thread belongs to its chat: triage never asks whose it is, and no
+    /// bot sends work into it.
+    #[tokio::test]
+    async fn a_bots_reply_thread_is_its_chats_and_takes_no_work() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let posted = admin.attest(
+                &network,
+                "c",
+                EventBody::MessagePosted {
+                    message_id: "m1".into(),
+                    role: crate::model::Role::User,
+                    text: "go".into(),
+                    attachments: vec![],
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                },
+            )?;
+            let signed = posted.attestation().cloned().context("signed")?;
+            let (trigger, attempt) = {
+                let mut store = node.store.lock().await;
+                store.accept_message(
+                    &node.identity,
+                    &network,
+                    "c",
+                    "m1",
+                    "go",
+                    vec![],
+                    true,
+                    signed,
+                    now_ms(),
+                )?;
+                let claimed = store
+                    .claim_next(&node.identity, &network, "c", "boot", "cfg")?
+                    .context("job")?;
+                let trigger = claimed.job.trigger.clone();
+                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                store.mark_started("c", &trigger, &attempt)?;
+                store.save_scheduler_native_id(
+                    "c",
+                    &trigger,
+                    &attempt,
+                    "bot-thread",
+                    "token",
+                    false,
+                )?;
+                (trigger, attempt)
+            };
+            let event = node
+                .ingest_agent_event(turn("bot-thread", "t1", "/w"))
+                .await?;
+            assert_eq!(event["status"], "accepted");
+            assert!(
+                unanswered(&node).await?.is_empty(),
+                "no question about a bot's own thread"
+            );
+
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
+                .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let args = json!({"thread":"bot-thread","call_ref":"r1","title":"t","prompt":"p"});
+            let refused = node.tool(access, "track_work", args).await;
+            node.finish_manager_attempt(&attempt).await;
+            let refused = refused.expect_err("work into a bot's reply thread");
+            assert!(
+                refused.to_string().contains("own reply thread"),
+                "{refused:#}"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

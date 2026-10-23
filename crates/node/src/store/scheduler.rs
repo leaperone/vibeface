@@ -1641,6 +1641,22 @@ impl Store {
         Ok(())
     }
 
+    /// The conversation whose own reply thread this is: its session's native thread, or the
+    /// thread a reply or agent task runs on now.
+    pub fn native_thread_conversation(&self, thread_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT conversation_id FROM scheduler_sessions WHERE native_id=?1
+                 UNION SELECT j.conversation_id FROM manager_turns t
+                    JOIN scheduler_jobs j ON j.attempt_id=t.attempt_id WHERE t.thread_id=?1
+                 LIMIT 1",
+                [thread_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Queued user messages that may join the running reply of their conversation: plain text
     /// while a reply to a user message runs on an App Server turn this Node holds.
     pub fn steer_candidates(
