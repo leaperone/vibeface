@@ -38,7 +38,8 @@ function Screens() {
         <Stack.Screen name="join" options={{ headerShown: false }} />
       </Stack.Protected>
       <Stack.Protected guard={ready}>
-        <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true }} />
+        {/* iOS 26 hides a large title drawn on a coloured bar, so home keeps the system glass bar. */}
+        <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true, headerStyle: {} }} />
         <Stack.Screen name="b/[botId]" options={{ title: '' }} />
         <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
         <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />

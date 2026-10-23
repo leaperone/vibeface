@@ -26,7 +26,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, onSend, onS
     onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
   }
   return <View className="gap-2 bg-background px-4 pt-2 pb-3">
-    <View className="w-full max-w-3xl self-center rounded-3xl border border-border bg-card">
+    <View className="w-full max-w-[736px] self-center rounded-3xl border border-border bg-card">
       {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
         {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
           <Text numberOfLines={1} className="shrink text-meta">{file.name}</Text>
