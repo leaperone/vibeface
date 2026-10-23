@@ -637,6 +637,14 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    /// Written only by the owner when it takes a schedule's due time, whether it runs or skips
+    /// it as too late; no Node takes a time someone already claimed. Of concurrent claims the
+    /// highest `owner_epoch` wins, ties pick the smaller author.
+    ScheduleRunClaimed {
+        schedule_id: String,
+        slot_ms: i64,
+        owner_epoch: u64,
+    },
     /// In the receiving bot's conversation, written by the sender's scheduling Node.
     /// `message_id` derives from the sending turn and the tool's `call_ref`.
     BotMessaged {

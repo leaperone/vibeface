@@ -623,6 +623,13 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             change.validate()?;
         }
         EventBody::ScheduleControlled { schedule_id, .. } => id(schedule_id)?,
+        EventBody::ScheduleRunClaimed { schedule_id, .. } => {
+            id(schedule_id)?;
+            ensure!(
+                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                "a schedule runs in its bot's conversation"
+            );
+        }
         EventBody::BotMessaged {
             message_id,
             from,

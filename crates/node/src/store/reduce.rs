@@ -48,7 +48,7 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 14] = [
+pub(crate) const TABLES: [&str; 15] = [
     "conversations",
     "messages",
     "bots",
@@ -56,6 +56,7 @@ pub(crate) const TABLES: [&str; 14] = [
     "bot_deletions",
     "skills",
     "schedules",
+    "schedule_claims",
     "memories",
     "bot_changes",
     "works",
@@ -401,6 +402,16 @@ pub(crate) fn apply(
                 event.created_at_ms,
             )?,
         },
+        EventBody::ScheduleRunClaimed {
+            schedule_id,
+            slot_ms,
+            owner_epoch,
+        } => {
+            connection.execute(
+                "INSERT INTO schedule_claims(network_id,conversation_id,schedule_id,slot_ms,owner_epoch,author) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,schedule_id,slot_ms) DO UPDATE SET owner_epoch=excluded.owner_epoch,author=excluded.author WHERE excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.author<author)",
+                params![network, scope, schedule_id, slot_ms, owner_epoch, event.author],
+            )?;
+        }
         EventBody::BotMessaged {
             message_id,
             from,
