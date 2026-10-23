@@ -39,7 +39,7 @@ export default function NewBot() {
   })
   const locked = Boolean(pending) || busy !== null
   const disabled = busy !== null || !shared.writable || !(pending?.name ?? name).trim()
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-6 p-4 pb-10">
     {/* In the header, so the keyboard never covers it. */}
     <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="min-h-11 px-3" disabled={disabled} onPress={() => void create()}>
       {busy ? <Icon as={LoaderCircle} /> : null}<Text className="font-semibold">{pending ? '再试一次' : '创建'}</Text>

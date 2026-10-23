@@ -25,7 +25,7 @@ export default function Settings() {
   const [leaving, setLeaving] = useState(false)
   const requests = useOpenJoins().length > 0
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-8 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
       <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
         {themes.map(([value, label]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: current === value }}
@@ -99,9 +99,12 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
     <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
       <View className="min-w-0 flex-1 flex-row flex-wrap items-center gap-x-1.5">
-        <Text numberOfLines={2} className="shrink font-medium">{member.name}</Text>
+        {/* The crown rides with the name, so a wrapped row never leaves it alone on a line. */}
+        <View className="min-w-0 shrink flex-row items-center gap-1.5">
+          <Text numberOfLines={2} className="shrink font-medium">{member.name}</Text>
+          {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
+        </View>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
-        {member.admin ? <Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" /> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
       <Icon as={ChevronRight} className="size-4 text-muted-foreground" />

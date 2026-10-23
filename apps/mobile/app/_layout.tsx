@@ -3,6 +3,7 @@ import '../global.css'
 
 import { Stack } from 'expo-router'
 import { StatusBar } from 'expo-status-bar'
+import { Platform } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
@@ -26,7 +27,9 @@ function Screens() {
   return <>
     <StatusBar style="auto" />
     <Stack screenOptions={{
-      headerStyle: { backgroundColor: background },
+      headerShadowVisible: false,
+      // iOS draws its glass bar with a soft scroll edge; Android's bar is a plain surface in the page colour.
+      ...Platform.OS === 'android' ? { headerStyle: { backgroundColor: background } } : {},
       headerBackButtonDisplayMode: 'minimal',
       headerTintColor: foreground,
       headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16, color: foreground },
@@ -37,8 +40,7 @@ function Screens() {
         <Stack.Screen name="join" options={{ headerShown: false }} />
       </Stack.Protected>
       <Stack.Protected guard={ready}>
-        {/* iOS 26 hides a large title drawn on a coloured bar, so home keeps the system glass bar. */}
-        <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true, headerStyle: {}, headerShadowVisible: false }} />
+        <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true }} />
         <Stack.Screen name="b/[botId]" options={{ title: '' }} />
         <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
         <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />

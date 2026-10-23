@@ -38,7 +38,7 @@ export default function TaskDetail() {
   // Stopping one input steered into a turn stops every work sharing that turn.
   const sharing = work.turn_id ? data!.works.filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const active = taskActive(state)
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-5 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-5 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="flex-row flex-wrap items-center gap-x-2">
       <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>

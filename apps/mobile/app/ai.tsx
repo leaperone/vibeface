@@ -23,7 +23,7 @@ export default function AiScreen() {
   const { ready } = useDevice()
   if (!ready) return null
   if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理员能修改" />
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-10 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-10 p-4 pb-10">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
     <Section icon={Bell} title="会话等你时"><Triage /></Section>
   </KeyboardAwareScrollView>

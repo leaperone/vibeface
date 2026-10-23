@@ -45,7 +45,7 @@ export default function AddDevice() {
       if (connection.isCurrent()) setResult(invitation)
     })
   }
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-5 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-5 p-4 pb-10">
     {added && !requests ? <View className="gap-3">
       <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>
       <Button variant="outline" className="min-h-11 self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>

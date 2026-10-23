@@ -19,7 +19,7 @@ export default function BotAbout() {
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
   const empty = view && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-8 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
     <View className="gap-3">
       <Text className="text-muted-foreground">在聊天里说一声就能改</Text>
