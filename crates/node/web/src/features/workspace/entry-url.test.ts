@@ -669,10 +669,10 @@ test("connection form keeps current errors and busy ownership when an earlier co
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
     connectionGeneration: () => generation, entries: [{ address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
-    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
+    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '', entryName: () => '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address } })
+  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ props }) => props.children === '连接')?.props
   try {

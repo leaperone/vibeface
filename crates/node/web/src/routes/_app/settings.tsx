@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { ArchiveRestore, Bell, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
+import { Bell, FileKey, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
@@ -39,7 +39,7 @@ function SettingsPage() {
       <ConnectionSettings />
     </section>
     {device.ready?.principal.can_manage ? <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5" />恢复</h2>
+      <h2 className="flex items-center gap-2 text-heading font-semibold"><FileKey aria-hidden="true" className="size-5" />恢复文件</h2>
       <RecoveryControls />
     </section> : null}
     {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">

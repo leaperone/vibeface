@@ -5,11 +5,10 @@ import { Details, DetailRow, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { ConnectionEntry } from '@/lib/node'
-import { addressName } from '@/features/workspace/labels'
+import { addressName, hostOf } from '@/features/workspace/labels'
 import { useWorkspace } from '@/features/workspace/context'
 import { useDevice } from './context'
 
-const hostOf = (address: string) => { try { return new URL(address).host } catch { return '' } }
 const keyOf = (entry: ConnectionEntry) => `${entry.address}|${entry.device_id}|${entry.local === true}`
 
 /** Settings → 连接: where this browser connects, other saved addresses and the raw ids. */

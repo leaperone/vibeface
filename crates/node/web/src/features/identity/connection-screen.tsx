@@ -5,7 +5,7 @@ import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } fro
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { addressName } from '@/features/workspace/labels'
+import { addressName, hostOf } from '@/features/workspace/labels'
 import { messageOf, parseEntry, type ConnectionEntry } from '@/lib/node'
 import { passphrase } from '@/lib/secure'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
@@ -184,7 +184,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   // A removed computer that started over keeps its old name, and joining again is its next step.
   const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
   const hostName = useComputerName(device.localSetup?.kind === 'uninitialized' && !formerName ? device.localSetup.entry : undefined)
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName) })
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName), removed: device.error === BROWSER_REMOVED })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -260,7 +260,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
-      <span className="min-w-0 flex-1 truncate" title={entry.address}>{addressName(entry.address)}</span>
+      <span className="min-w-0 flex-1 truncate" title={entry.address}>{device.entryName(entry) || addressName(entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(entry.address)}</span></span>
       <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
     </li>)}</ul>
   </Panel>

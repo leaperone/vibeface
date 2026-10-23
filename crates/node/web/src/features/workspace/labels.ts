@@ -72,6 +72,8 @@ export function addressName(address: string) {
   try { return new URL(address).hostname } catch { return address }
 }
 
+export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
+
 const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",

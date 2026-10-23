@@ -86,7 +86,8 @@ export function downloadPackage(bytes: Uint8Array) {
   const url = URL.createObjectURL(new Blob([copy.buffer], { type: 'application/json' }))
   const link = document.createElement('a')
   link.href = url
-  link.download = `vibeface-recovery-${new Date().toLocaleDateString("sv")}.json`
+  // Minutes in the name: a replaced file must not share its name with the newer one that still works.
+  link.download = `vibeface-recovery-${new Date().toLocaleString("sv").slice(0, 16).replace(" ", "-").replace(":", "")}.json`
   link.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
