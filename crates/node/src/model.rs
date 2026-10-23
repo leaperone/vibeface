@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type NetworkId = String;
 pub type DeviceId = String;
@@ -149,6 +149,19 @@ pub const MAX_BOT_MESSAGE_BYTES: usize = 4000;
 pub const BOT_MESSAGES_PER_HOUR: usize = 10;
 /// Bots one message of the user may have a bot create.
 pub const BOTS_PER_TURN: usize = 3;
+pub const MAX_MODEL_CHARS: usize = 256;
+pub const MAX_BOT_SKILLS: usize = 200;
+
+/// The shared skills a bot uses: `None` is every skill in the library, later ones included.
+pub type SkillSet = Option<BTreeSet<String>>;
+
+/// A bot's skill set before and after a change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsEdit {
+    pub before: SkillSet,
+    pub after: SkillSet,
+}
 
 /// One setting's value before and after a change; `before` is what the writer saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -218,11 +231,16 @@ pub struct Sender {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BotChange {
+    /// An empty `model` follows the default of the device that runs the bot.
     Profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Edit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<Edit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<Edit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<SkillsEdit>,
     },
     Skill {
         skill_id: String,
@@ -256,6 +274,30 @@ pub fn validate_bot_name(name: &str) -> anyhow::Result<()> {
         !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
         "invalid Bot name"
     );
+    Ok(())
+}
+
+/// Empty means the device's default model.
+pub fn validate_model(model: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        model.trim() == model
+            && model.chars().count() <= MAX_MODEL_CHARS
+            && !model.chars().any(char::is_control),
+        "a model is one line of at most {MAX_MODEL_CHARS} characters, or empty for the device's default"
+    );
+    Ok(())
+}
+
+pub fn validate_skill_set(skills: &SkillSet) -> anyhow::Result<()> {
+    if let Some(skills) = skills {
+        anyhow::ensure!(
+            skills.len() <= MAX_BOT_SKILLS,
+            "a bot uses at most {MAX_BOT_SKILLS} skills"
+        );
+        for skill in skills {
+            vibeface_protocol::validate_id(skill).map_err(anyhow::Error::msg)?;
+        }
+    }
     Ok(())
 }
 
@@ -378,11 +420,24 @@ impl BotChange {
     pub fn validate(&self) -> anyhow::Result<()> {
         let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
         match self {
-            Self::Profile { name, instructions } => {
+            Self::Profile {
+                name,
+                instructions,
+                model,
+                skills,
+            } => {
                 anyhow::ensure!(
-                    name.is_some() || instructions.is_some(),
+                    name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
                     "a profile change names a field"
                 );
+                if let Some(model) = model {
+                    validate_model(&model.after)?;
+                    anyhow::ensure!(model.before != model.after, "the model is unchanged");
+                }
+                if let Some(skills) = skills {
+                    validate_skill_set(&skills.after)?;
+                    anyhow::ensure!(skills.before != skills.after, "the skills are unchanged");
+                }
                 if let Some(name) = name {
                     validate_bot_name(&name.after)?;
                     anyhow::ensure!(name.before != name.after, "the name is unchanged");
@@ -566,6 +621,15 @@ pub enum EventBody {
         cause: Option<Cause>,
         change: BotChange,
     },
+    /// In the deleted bot's conversation: signed by the user on the web, or written in another
+    /// bot's turn the user's message `cause` started, with that message among its parents.
+    /// Nothing brings the bot back.
+    BotDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
+    },
     /// The user pauses, resumes or deletes a schedule of this conversation from the web.
     ScheduleControlled {
         schedule_id: String,
@@ -585,7 +649,8 @@ pub enum EventBody {
     ContextCheckpoint {
         covers: VersionVector,
         summary: String,
-        standing_instructions: Vec<String>,
+        /// Excerpts of the newest user messages it covers; history, not instructions to keep.
+        recent_user_requests: Vec<String>,
         open_work: Vec<OpenWork>,
         decisions: Vec<String>,
     },
@@ -597,6 +662,7 @@ impl EventBody {
         match self {
             Self::ConversationOwner { attestation, .. }
             | Self::BotCreated { attestation, .. }
+            | Self::BotDeleted { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
@@ -690,6 +756,9 @@ pub struct Bot {
     pub name: String,
     pub instructions: String,
     pub project: Option<BotProject>,
+    /// Empty: the default of the device that runs it.
+    pub model: String,
+    pub skills: SkillSet,
     pub event_hash: EventHash,
 }
 

@@ -101,7 +101,7 @@
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 回调带 Node 级令牌，按 `agentId` 找到所属管理轮 |
 
-网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, local_launch? }`。该响应不授予成员资格。
+网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, removed, local_launch? }`，`removed` 表示这台电脑已被移出。该响应不授予成员资格。
 
 独立回环 listener（`local_listen`）提供 `/api/local/info`、`/api/local/launch`、`/api/local/exchange` 和 `/api/local/ws`。`launch` 只接受本机私有启动凭据，`exchange` 消费 URL fragment 中的单次 token 后签发绑定浏览器公钥的 HttpOnly Cookie，`ws` 仍执行 Noise 握手。公开 router 不挂这些入口。关闭 `local_auto_access` 会撤销本机会话、待兑换 token 和连接。
 
@@ -147,7 +147,7 @@
 
 加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 
-浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、`ConversationOwner`、本人结清的 `WorkFinished` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
+浏览器代本人写入时，`MessagePosted(user)`、`BotCreated`、网页删除的 `BotDeleted`、`ConversationOwner`、本人结清的 `WorkFinished` 和 `NotificationAcked` 的 body 带 `attestation { device_id, signature }`；回答提问的 `MessagePosted(user, answers)` 签名可选，Grok 经 decision token 的回答由 Node 无签名写入。签名输入为 `vibeface:message:v1:attestation:` 加 `SHA256(canonical_json({network_id, scope_id, body}))` 的十六进制，body 去掉 `attestation`，所以签名绑定网络、会话、事件类型和业务 ID。签名设备必须是未撤销的客户端成员。除回答外，Node 和协调 Agent 不能代写这些事件。
 
 恢复包外层为 `{ version, network_id, envelope }`，加密正文为 `{ version, network_id, root_secret_key, genesis, checkpoints }`，`root_secret_key` 是当前恢复私钥，使用 Argon2id 与 XChaCha20-Poly1305。口令和明文恢复私钥不发给 Node。根恢复默认保留现有管理设备。根恢复和换恢复密码都先下载新恢复文件再提交，完成后旧文件失效。业务正文和项目文件不在恢复包中。
 
@@ -221,7 +221,7 @@ queued → claimed → running ─→ completed | failed
 
 Node 每隔几秒用 signal 0 检查待核对记下的进程组。全部退出时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
-负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。
+负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。`recent_user_requests` 是被覆盖的最近 20 条本人消息摘录，只是历史，不代表需要长期遵守的指令。
 
 本机调度 job、outbox、工作状态日志和原生 SDK 会话不进入事件日志。
 
@@ -231,7 +231,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组。全部退出�
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 
-修改 bot 的工具为 `update_profile { call_ref, name?, instructions? }`、`save_skill { call_ref, skill_id?, name, description, body }`、`remove_skill { call_ref, skill_id }`、`save_schedule { call_ref, schedule_id?, name, prompt, first_run_at_ms, every_minutes?, enabled? }`、`remove_schedule { call_ref, schedule_id }`、`remember { call_ref, memory_id?, text }`、`forget { call_ref, memory_id }`、`create_bot { call_ref, name, instructions?, project_node?, project_cwd? }` 和 `configure_bot { call_ref, bot, name?, instructions? }`，只提供给本人消息触发的轮次。Node 再核对 trigger 是 `message:<id>` 且该消息是本会话的本人消息，`cause` 取自 trigger，`change_id` 由 `(会话, trigger, call_ref)` 派生，同一 `call_ref` 同内容返回原记录，换内容拒绝，`call_lookup` 也能查到修改。改前值取自投影，没有变化的修改被拒绝。参数不接受其他字段，模型、AI 服务和文件夹只能在设置里改。修改名称和说明需要会话有机器人；schedule 只能由创建它的会话修改。每个 bot 最多 20 个活动 schedule、50 条笔记，笔记每条最多 500 字符，像密钥的内容被拒绝。一条本人消息最多建 3 个 bot，不能删除 bot。
+修改 bot 的工具为 `update_profile { call_ref, name?, instructions? }`、`save_skill { call_ref, skill_id?, name, description, body }`、`remove_skill { call_ref, skill_id }`、`save_schedule { call_ref, schedule_id?, name, prompt, first_run_at_ms, every_minutes?, enabled? }`、`remove_schedule { call_ref, schedule_id }`、`remember { call_ref, memory_id?, text }`、`forget { call_ref, memory_id }`、`create_bot { call_ref, name, instructions?, project_node?, project_cwd? }`、`configure_bot { call_ref, bot, name?, instructions?, model?, skills?, all_skills? }` 和 `delete_bot { bot }`，只提供给本人消息触发的轮次。Node 再核对 trigger 是 `message:<id>` 且该消息是本会话的本人消息，`cause` 取自 trigger，`change_id` 由 `(会话, trigger, call_ref)` 派生，同一 `call_ref` 同内容返回原记录，换内容拒绝，`call_lookup` 也能查到修改。改前值取自投影，没有变化的修改被拒绝。参数不接受其他字段，AI 服务和文件夹只能在设置里改。`model` 为空表示跟随设备默认；`skills` 是启用的 skill ID 集合，必须都在库里，`all_skills: true` 恢复全部，两者不能同时给。修改名称和说明需要会话有机器人；schedule 只能由创建它的会话修改。每个 bot 最多 20 个活动 schedule、50 条笔记，笔记每条最多 500 字符，像密钥的内容被拒绝。一条本人消息最多建 3 个 bot。`delete_bot` 在被删 bot 的会话写 `BotDeleted { cause }`，不能删除发起轮次的 bot 自己，重复删除不写新事件；网页由本人签名写 `BotDeleted { attestation }`，RPC 为 `delete_bot { conversation_id, attestation }`，返回 `{ written, primary }`。
 
 Node 接纳工作时核对派发方是成员 Node 且处于进行中的调度轮次，并核对 `cwd` 位于自己的 `roots` 内。本机工作（`kind=codex`）：`track_work` 写 `WorkDispatched` 并返回 `{work_id, call_ref, state, may_send, send_by_ms, cwd, thread_id?}`，只有第一次登记 `may_send=true`；CLI 用 `thread/start`（`approvalPolicy=never`、`danger-full-access`）开线程，`bind_work {work_id, thread_id}` 绑定后才发 `turn/start`，`clientUserMessageId` 为 `work_id`，再 `bind_work {work_id, turn_id | unknown | failed}`。`send_by_ms` 为登记后 60 秒，之后不再发送；再过 30 秒仍没有回合时 Node 按 `clientId` 复查线程，找不到就记为 `rejected`。`target_node` 是其他设备时，任务（`kind=task`）作为那台设备协调 Agent 的一轮执行，由它在本机直连派发。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。`thread` 是本机已有的 App Server 线程（`vibeface codex send`）：CLI 先 `thread/read` 取 `cwd`，Node 登记时即为 `starting`，不核对 `roots`，与 `continues` 互斥；发送时回合进行中则 `turn/steer`，否则 `turn/start`。几项工作可共用一个回合，各自结束并各自回报。
 
@@ -273,9 +273,11 @@ Event {
 | `question_asked` | `question_id`、`severity`、`text`、`choices: [{label, conversation_id?}]`、`about {node, agent, session_id, cwd, summary, request_id?}` | 提问的 Node；写在拥有该会话的 Bot 会话，外来会话写在 `sessions` |
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary`、`question_id` | 运行该会话的 Node，写在被认领 Bot 的会话 |
 | `bot_changed` | `change_id`、`cause`、`change` | 负责人 |
-| `context_checkpoint` | `covers`、`summary`、`standing_instructions`、`open_work`、`decisions` | 负责人 |
+| `context_checkpoint` | `covers`、`summary`、`recent_user_requests`、`open_work`、`decisions` | 负责人 |
 
 `bot_changed.change` 按 `kind` 区分：`profile { name?, instructions? }` 的每项为 `{ before, after }`；`skill { skill_id, before, after }`、`schedule { schedule_id, before, after }` 与 `memory { memory_id, before, after }` 的 `after` 为 `null` 表示删除。skill 为 `{ name, description, body }`，名称最多 64 字符，说明最多 512 字节，正文最多 16 KiB；schedule 为 `{ name, prompt, first_run_at_ms, every_minutes?, enabled, depth? }`，名称最多 120 字符，说明最多 8 KiB，`every_minutes` 为 5 至 40320，省略时只运行一次。说明（instructions）最多 8192 字节。这个事件不带 `attestation`。`cause` 为 `{ conversation_id, message_id }`，入库时要求 `prev` 或 `deps` 中有该会话、该 `message_id` 且带 `attestation` 的本人消息，否则拒绝；带 `cause` 的 `conversation_owner` 与 `bot_created` 按同一规则核对，`conversation_owner` 还必须是 epoch 1 且 `prev` 是同一会话的 `conversation_created`。没有 `cause` 的只能是新建的一次性 schedule，且 `depth` 至少为 1。投影只比较 rank：名称和说明逐项后写者胜并合并进机器人定义，skill 全网按 `skill_id`、schedule 按 `schedule_id`、笔记按 `memory_id` 后写者胜并保留删除，`schedule_controlled` 按 rank 改 `enabled` 或删除，修改记录按 `change_id` 取 rank 最小者。
+
+`context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）和 `bot_messaged` 只能由对应会话的负责人写：前两者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。
 
 通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`，先到者胜。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 

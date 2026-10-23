@@ -14,7 +14,8 @@ export type Notifier = {
   request(): Promise<Permission>
   show(alert: { title: string; body: string; tag: string }, open: () => void): void
 }
-export type LocalLaunch = { token: string; deviceId: string }
+/** `rejoin`: a removed device asked to join again once the launch connects. */
+export type LocalLaunch = { token: string; deviceId: string; rejoin: boolean }
 /** A browser page served by a Node itself: only it may set up, launch or join that computer. */
 export type LocalPage = {
   origin: string

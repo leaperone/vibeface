@@ -1,6 +1,9 @@
 //! Local scheduling state is never reconstructed by importing shared conversation history.
 //! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
-use crate::model::{Schedule, VersionVector};
+use crate::{
+    model::{Schedule, VersionVector, WorkOutcome},
+    work::Signal,
+};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_PENDING_JOBS: usize = 256;
@@ -37,6 +40,55 @@ pub fn work_trigger(work_id: &str) -> String {
 
 pub fn task_trigger(work_id: &str) -> String {
     format!("task:{work_id}")
+}
+
+/// What an agent task's coordination job did that its work must follow.
+pub(crate) enum TaskJobChange<'a> {
+    /// The turn ended, or was cancelled before it started; the reply is the result.
+    Ended {
+        outcome: &'a JobOutcome,
+        text: &'a str,
+    },
+    /// Every process of a turn that ended unconfirmed has exited.
+    ProcessExited,
+}
+
+/// The one place an agent task's job state reaches its work: the work and the signal a change
+/// of job `trigger` implies, or `None` when the job runs no agent task.
+pub(crate) fn task_work_signal<'a>(
+    trigger: &'a str,
+    change: TaskJobChange,
+) -> Option<(&'a str, Signal)> {
+    let work_id = trigger.strip_prefix("task:")?;
+    let signal = match change {
+        TaskJobChange::Ended { outcome, text } => {
+            let (outcome, reason) = match outcome {
+                JobOutcome::Completed => (WorkOutcome::Completed, None),
+                JobOutcome::Failed(detail) => (WorkOutcome::Failed, Some(detail.clone())),
+                JobOutcome::Cancelled(evidence) => {
+                    (WorkOutcome::Interrupted, Some(evidence.clone()))
+                }
+                JobOutcome::Interrupted {
+                    detail,
+                    process_unconfirmed,
+                } => (
+                    if *process_unconfirmed {
+                        WorkOutcome::Unverified
+                    } else {
+                        WorkOutcome::Interrupted
+                    },
+                    Some(detail.clone()),
+                ),
+            };
+            Signal::Concluded {
+                outcome,
+                text: text.into(),
+                reason,
+            }
+        }
+        TaskJobChange::ProcessExited => Signal::ProcessExited,
+    };
+    Some((work_id, signal))
 }
 
 /// A message another bot wrote to this conversation.

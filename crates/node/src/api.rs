@@ -547,6 +547,8 @@ enum LocalSetup {
     },
     Initialized {
         entry: LocalEntry,
+        /// Lets a browser that never joined show this computer as removed instead of not joined.
+        removed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_launch: Option<LocalLaunch>,
     },
@@ -586,20 +588,19 @@ async fn local_setup(
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {
+        let state = app.node.membership_state().await.map_err(ApiError::bad)?;
+        let removed = state
+            .project()
+            .map_err(ApiError::bad)?
+            .revocation(&device_id)
+            .is_some();
         let local_launch = if app.node.local_access.enabled() {
             match app.node.local_access.origin() {
                 Ok(url) => {
-                    let network_id = app
-                        .node
-                        .membership_state()
-                        .await
-                        .map_err(ApiError::bad)?
-                        .genesis
-                        .network_id;
                     let token = app
                         .node
                         .local_access
-                        .issue_from_local_setup(&device_id, &network_id)
+                        .issue_from_local_setup(&device_id, &state.genesis.network_id)
                         .map_err(ApiError::bad)?;
                     Some(LocalLaunch {
                         url,
@@ -617,6 +618,7 @@ async fn local_setup(
                 address: origin.into(),
                 device_id,
             },
+            removed,
             local_launch,
         }));
     }
@@ -958,7 +960,7 @@ mod tests {
         use crate::{
             config::{self, Config},
             crypto::LocalIdentity,
-            identity::{Genesis, Member, NetworkState},
+            identity::{Genesis, GovernanceEvent, Member, NetworkState, Revocation},
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1027,7 +1029,7 @@ mod tests {
             )?)?;
             node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
             let initialized: Value = request().send().await?.json().await?;
-            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?}}));
+            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
             let local_origin = "http://127.0.0.1:4791";
@@ -1046,6 +1048,12 @@ mod tests {
             node.local_access.set_enabled(false)?;
             assert_eq!(request().send().await?.json::<Value>().await?, initialized);
             assert!(node.local_access.session(&cookie, &node.identity.device_id()?, &network_id).is_err());
+            let mut removed = node.membership_state().await?;
+            removed.append(GovernanceEvent::revoke(&admin, &removed.project()?, Revocation::new(&node.identity.device_id()?, None)?)?)?;
+            node.install_membership(removed).await?;
+            let after_removal: Value = request().send().await?.json().await?;
+            assert_eq!(after_removal["kind"], "initialized");
+            assert_eq!(after_removal["removed"], true);
             Ok::<(), anyhow::Error>(())
         }.await;
         server.abort();

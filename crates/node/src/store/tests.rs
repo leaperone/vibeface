@@ -896,7 +896,7 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
         crate::scheduler::checkpoint(&context, &works).context("history is over budget")?;
     let EventBody::ContextCheckpoint {
         covers,
-        standing_instructions,
+        recent_user_requests,
         ..
     } = &checkpoint
     else {
@@ -912,7 +912,7 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
         "covers is a prefix"
     );
     assert!(flags.iter().any(|f| *f) && flags.iter().any(|f| !*f));
-    assert!(!standing_instructions.is_empty());
+    assert!(!recent_user_requests.is_empty());
     store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 100)?;
     let context = store.context(&net.network, "c", None)?;
     assert!(crate::scheduler::checkpoint(&context, &works).is_none());
@@ -981,6 +981,143 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
         outbox.iter().map(|e| e.trigger.clone()).collect::<Vec<_>>(),
         vec![trigger]
     );
+    Ok(())
+}
+
+fn owner(net: &Net, node: &LocalIdentity, epoch: u64) -> Result<EventBody> {
+    net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::ConversationOwner {
+            scheduler_node: node.device_id()?,
+            epoch,
+            attestation: None,
+            cause: None,
+        },
+    )
+}
+
+fn checkpoint_body(summary: &str) -> EventBody {
+    EventBody::ContextCheckpoint {
+        covers: VersionVector::new(),
+        summary: summary.into(),
+        recent_user_requests: vec![],
+        open_work: vec![],
+        decisions: vec![],
+    }
+}
+
+fn checkpoints(store: &Store, net: &Net) -> Result<Vec<String>> {
+    Ok(store
+        .context(&net.network, "c", None)?
+        .events
+        .into_iter()
+        .filter_map(|event| match event.event.body {
+            EventBody::ContextCheckpoint { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .collect())
+}
+
+/// A checkpoint counts when its author owned the conversation as far as it knew, whatever order
+/// the logs arrive in and whether a later move reached it; one written after the author saw the
+/// move is refused.
+#[test]
+fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
+    let net = net()?;
+    let mut a_side = store(&net)?;
+    conversation(&mut a_side, &net)?;
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    // The user moves the conversation to b and back to a, both times through b.
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        2,
+    )?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.a, 3)?,
+        vec![],
+        3,
+    )?;
+    sync(&b_side, &mut a_side, &net)?;
+    a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        checkpoint_body("back"),
+        vec![],
+        4,
+    )?;
+
+    let mut replica = store(&net)?;
+    let a_log = |side: &Store| side.events_from(&net.network, &net.a.device_id().unwrap(), 1, 500);
+    let statuses = replica.ingest_events(&net.network, &a_log(&a_side)?)?.0;
+    assert_eq!(statuses.last(), Some(&IngestStatus::Pending));
+    let b_log = b_side.events_from(&net.network, &net.b.device_id()?, 1, 500)?;
+    replica.ingest_events(&net.network, &b_log)?;
+    assert_eq!(checkpoints(&replica, &net)?, ["back"]);
+
+    // b takes the conversation again while a, not yet aware, ends a turn with a checkpoint.
+    let moved = b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 4)?,
+        vec![],
+        5,
+    )?;
+    let late = a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        checkpoint_body("late"),
+        vec![],
+        6,
+    )?;
+    replica.ingest_events(&net.network, std::slice::from_ref(&moved))?;
+    assert_eq!(
+        replica
+            .ingest_events(&net.network, std::slice::from_ref(&late))?
+            .0,
+        [IngestStatus::Accepted]
+    );
+
+    sync(&b_side, &mut a_side, &net)?;
+    let refused = a_side
+        .append_event(
+            &net.a,
+            &net.network,
+            "c",
+            checkpoint_body("stale"),
+            vec![],
+            7,
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains("scheduling Node"), "{refused}");
+    let forged = net.a.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.a.device_id()?,
+        seq: seq_of(&late)? + 1,
+        prev: Some(late.hash.clone()),
+        deps: vec![moved.hash.clone()],
+        scope_id: "c".into(),
+        created_at_ms: 7,
+        body: checkpoint_body("stale"),
+        blobs: vec![],
+    })?;
+    assert!(matches!(
+        &replica.ingest_events(&net.network, &[forged])?.0[0],
+        IngestStatus::Rejected(error) if error.contains("scheduling Node")
+    ));
+    assert_eq!(checkpoints(&replica, &net)?, ["back", "late"]);
     Ok(())
 }
 
@@ -1094,6 +1231,8 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
                         after: "Nova".into(),
                     }),
                     instructions: None,
+                    model: None,
+                    skills: None,
                 },
             },
             blobs: vec![],
@@ -1154,7 +1293,9 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
                 before: "Helper".into(),
                 after: "Nova".into()
             }),
-            instructions: None
+            instructions: None,
+            model: None,
+            skills: None
         }
     );
     assert_eq!(
@@ -1566,6 +1707,8 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
                     after: "Nova".into(),
                 }),
                 instructions: None,
+                model: None,
+                skills: None,
             },
         },
         blobs: vec![],
@@ -1832,6 +1975,9 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             bot: "Ops".into(),
             name: Some("Backup".into()),
             instructions: None,
+            model: None,
+            skills: None,
+            all_skills: None,
         },
         11,
     )?;
@@ -1878,6 +2024,231 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
         &other.ingest_events(&net.network, &[hijack])?.0[0],
         IngestStatus::Rejected(error) if error.contains("follows its creation")
     ));
+    Ok(())
+}
+
+fn configure(
+    bot: &str,
+    model: Option<&str>,
+    skills: Option<&[&str]>,
+    all_skills: Option<bool>,
+) -> ChangeRequest {
+    ChangeRequest::ConfigureBot {
+        bot: bot.into(),
+        name: None,
+        instructions: None,
+        model: model.map(Into::into),
+        skills: skills.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
+        all_skills,
+    }
+}
+
+/// A chat sets a bot's model and the shared skills it uses; a retry writes nothing, an
+/// unknown skill is refused and every device ends with the same bot.
+#[test]
+fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    let mut change = |call_ref: &str, request: ChangeRequest| {
+        origin.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            request,
+            5,
+        )
+    };
+    let (saved, _) = change("s1", save_skill(None, "Digest", "List the commits."))?;
+    let BotChange::Skill { skill_id, .. } = saved.change else {
+        panic!("skill change")
+    };
+    change("s2", save_skill(None, "Review", "Review the diff."))?;
+    let (modeled, written) = change("k1", configure("Ops", Some(" gpt-x "), None, None))?;
+    assert!(written && modeled.conversation_id == "d");
+    assert_eq!(
+        change("k1", configure("Ops", Some("gpt-x"), None, None))?,
+        (modeled, false)
+    );
+    let same = change("k2", configure("Ops", Some("gpt-x"), None, None)).unwrap_err();
+    assert!(same.to_string().contains("nothing to change"), "{same}");
+    let only = [skill_id.as_str()];
+    change("k3", configure("Helper", None, Some(&only), None))?;
+    let unknown = change("k4", configure("Helper", None, Some(&["skill-x"]), None)).unwrap_err();
+    assert!(
+        unknown.to_string().contains("skill-x not found"),
+        "{unknown}"
+    );
+    let both = change("k5", configure("Ops", None, Some(&only), Some(true))).unwrap_err();
+    assert!(both.to_string().contains("skills"), "{both}");
+    change("k6", configure("Ops", None, Some(&[]), None))?;
+    change("k7", configure("Ops", None, None, Some(true)))?;
+
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    for store in [&origin, &other] {
+        let bots = store.bots(&net.network)?;
+        let helper = bots
+            .iter()
+            .find(|bot| bot.name == "Helper")
+            .context("helper")?;
+        let ops = bots.iter().find(|bot| bot.name == "Ops").context("ops")?;
+        assert_eq!(helper.model, "");
+        assert_eq!(helper.skills, Some([skill_id.clone()].into()));
+        assert_eq!(ops.model, "gpt-x");
+        assert_eq!(ops.skills, None, "all_skills hands back every skill");
+    }
+    let prompt = |scope| crate::scheduler::bot_value(&other, &net.network, scope, 0);
+    let (helper, ops) = (prompt("c")?, prompt("d")?);
+    assert_eq!(helper["skills"].as_array().map(Vec::len), Some(1));
+    assert_eq!(helper["skills"][0]["skill_id"], skill_id.as_str());
+    assert_eq!(ops["skills"].as_array().map(Vec::len), Some(2));
+    assert_eq!(ops["configured_bot"]["model"], "gpt-x");
+    Ok(())
+}
+
+/// Deleting a bot is final on every device: it leaves the list, takes no messages, runs no
+/// schedule or queued turn, and the primary role moves on. Only the user's signature, or a
+/// tool call the user's message started, deletes; a bot never deletes itself.
+#[test]
+fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    let (created, _) = origin.create_bot_in_turn(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "b1",
+        ("Watcher", "Watch the logs.", None),
+        4,
+    )?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", 5),
+        4,
+    )?;
+    let delete = |store: &mut Store, trigger: &str, wanted: &str| {
+        store.delete_bot_in_turn(&net.a, &net.network, "c", trigger, wanted, 5)
+    };
+    let itself = delete(&mut origin, "message:m1", "Helper").unwrap_err();
+    assert!(
+        itself.to_string().contains("does not delete itself"),
+        "{itself}"
+    );
+    let unasked = delete(&mut origin, "work:w1", "Watcher").unwrap_err();
+    assert!(
+        unasked.to_string().contains(bot_settings::NOT_FROM_USER),
+        "{unasked}"
+    );
+    let (gone, event) = delete(&mut origin, "message:m1", "Watcher")?;
+    assert!(gone == created.conversation_id && event.is_some());
+    assert_eq!(
+        delete(&mut origin, "message:m1", "Watcher")?,
+        (created.conversation_id.clone(), None)
+    );
+
+    origin.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m2",
+        "hi",
+        vec![],
+        true,
+        signature(&net, "m2", "hi")?,
+        6,
+    )?;
+    let signed = net
+        .a
+        .fixture_admin()
+        .attest(
+            &net.network,
+            "c",
+            EventBody::BotDeleted {
+                attestation: None,
+                cause: None,
+            },
+        )?
+        .attestation()
+        .cloned()
+        .context("signed")?;
+    assert!(
+        origin
+            .delete_bot(&net.a, &net.network, "c", signed.clone(), 7)?
+            .is_some()
+    );
+    assert!(
+        origin
+            .delete_bot(&net.a, &net.network, "c", signed, 8)?
+            .is_none()
+    );
+    assert!(
+        origin
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .is_none()
+    );
+    assert!(
+        origin
+            .scheduler_jobs("c")?
+            .iter()
+            .all(|job| matches!(job.state, JobState::Cancelled { .. }))
+    );
+    let refused = origin
+        .accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            "m3",
+            "again",
+            vec![],
+            true,
+            signature(&net, "m3", "again")?,
+            9,
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains("deleted"), "{refused}");
+    assert!(origin.schedules(&net.network, "c")?.is_empty());
+    assert!(
+        origin
+            .admit_due_schedules(&net.a, &net.network, 10_000_000)?
+            .is_empty()
+    );
+
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    for store in [&origin, &other] {
+        let names: Vec<_> = store
+            .bots(&net.network)?
+            .into_iter()
+            .map(|bot| bot.name)
+            .collect();
+        assert_eq!(names, ["Ops"]);
+        assert_eq!(store.primary_bot(&net.network)?.as_deref(), Some("d"));
+    }
+    let unsigned = net.b.sign_event(Event {
+        version: WIRE_VERSION,
+        network_id: net.network.clone(),
+        author: net.b.device_id()?,
+        seq: 1,
+        prev: None,
+        deps: vec![],
+        scope_id: "d".into(),
+        created_at_ms: 11,
+        body: EventBody::BotDeleted {
+            attestation: None,
+            cause: None,
+        },
+        blobs: vec![],
+    });
+    assert!(unsigned.is_err(), "deleting needs the user's signature");
     Ok(())
 }
 

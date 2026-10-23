@@ -274,7 +274,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
     setDirectory(view); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
-    setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry } : local)
+    setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
     if (principal.source === 'membership') void refreshEntrances(active, view)
   }
@@ -410,16 +410,18 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       throw cause
     }
   }
+  /** Resolves true when the device turned out to be removed. */
   async function connect(candidate: ConnectionEntry) {
     const active = await open(candidate)
     const pinned = load(`network-for.${active.entry.device_id}`)
     const auth = record(await scoped(active)('authenticate', { network_id: pinned ?? '' }))
-    if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return
+    if (removed(auth, active, typeof pinned === 'string' ? pinned : '')) return true
     if (auth.principal === null) {
       setError(auth.revoked === true ? removedText(self) : auth.initialized === false ? '这台电脑还没设置。请在它的本机页面完成设置。' : notJoined(self))
-      return
+      return false
     }
     await authenticate(auth, active)
+    return false
   }
   /** A device removed from the network shows only that, once its signed removal checks out. */
   function removed(auth: unknown, active: Session, networkId: string) {
@@ -428,8 +430,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     return true
   }
   /** Sets this removed computer's data aside and waits for it to come back fresh, then offers the join. */
-  async function rejoin() {
-    const entry = removedFrom
+  async function rejoin(entry = removedFrom) {
+    // Without a local session yet, open one first; the launched page carries on with the rejoin.
+    if (!entry?.local && localSetup?.kind === 'initialized' && localSetup.removed) return openLocalAccess(true)
     if (!entry?.local) throw new Error('请在这台电脑上打开它的本机页面，再重新加入。')
     try { await callSession(await open(entry, true), 'rejoin') }
     catch (cause) { resetConnection(); setPhase('removed'); throw cause }
@@ -686,19 +689,19 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     }
     sensitive.current = flow; setReview({ kind: 'bootstrap', networkId })
   }
-  async function openLocalAccess() {
+  async function openLocalAccess(thenRejoin = false) {
     if (localSetup?.kind !== 'initialized') throw new Error('请先打开这台电脑的本机页面。')
     const version = generation.current, controller = new AbortController(); connecting.current = controller
     const setup = await discoverLocalSetup(controller.signal)
     if (version !== generation.current) throw changed()
     if (setup?.kind !== 'initialized' || setup.entry.device_id !== localSetup.entry.device_id) throw new Error('本机页面对应的电脑已变化，请刷新页面。')
     setLocalSetup(setup)
-    launchLocal(setup)
+    launchLocal(setup, thenRejoin)
   }
-  function launchLocal(setup: Extract<LocalSetup, { kind: 'initialized' }>) {
+  function launchLocal(setup: Extract<LocalSetup, { kind: 'initialized' }>, thenRejoin = false) {
     if (!setup.local_launch) throw new Error('本机免确认打开已关闭。请用加入链接或恢复文件。')
     const url = new URL(setup.local_launch.url)
-    url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id }).toString()
+    url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id, ...thenRejoin ? { rejoin: '1' } : {} }).toString()
     if (!page) throw new Error('请在这台电脑上打开它的本机页面。')
     page.open(url.href)
   }
@@ -827,7 +830,12 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         const local = await localEntry(me, launch)
         if (!mounted || version !== generation.current) return
         // Kept while the Node is down, so the next load on this origin still asks it.
-        if (local) { store('local-origin', true); const opening = connect(local); version = generation.current; await opening; return }
+        if (local) {
+          store('local-origin', true)
+          const opening = connect(local); version = generation.current
+          if (await opening && launch?.rejoin) await rejoin(local).catch(cause => { if (mounted) setError(messageOf(cause)) })
+          return
+        }
       }
       const pending = invitation ? null : loadJoining()
       if (pending) {
@@ -844,6 +852,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         setLocalSetup(local)
         if (launch && local?.kind === 'initialized' && local.local_launch) { launchLocal(local); return }
         if (local?.kind === 'uninitialized') { setPhase('disconnected'); return }
+        if (local?.kind === 'initialized' && local.removed) { setPhase('removed'); setRemovedFrom(local.entry); return }
         if (local?.kind === 'initialized') {
           const opening = connect(local.entry); version = generation.current
           void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
@@ -909,7 +918,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('初始化确认已失效。'); await sensitive.current.bootstrap(saved) },

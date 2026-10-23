@@ -1,7 +1,7 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::model::{WorkKind, WorkOutcome, WorkProjection};
-use crate::scheduling::{JobState, PendingCheck};
-use crate::work::{Signal, WorkState};
+use crate::scheduling::{JobState, PendingCheck, TaskJobChange, task_work_signal};
+use crate::work::WorkState;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::sync::{
@@ -194,7 +194,8 @@ impl Runtime {
                 continue;
             }
             self.close_check(network, &check).await?;
-            if let Some(work_id) = check.trigger.strip_prefix("task:")
+            if let Some((work_id, signal)) =
+                task_work_signal(&check.trigger, TaskJobChange::ProcessExited)
                 && self
                     .store
                     .lock()
@@ -204,8 +205,7 @@ impl Runtime {
                         matches!(record.state, WorkState::Unverified { handle: None, .. })
                     })
             {
-                self.signal_work(network, work_id, Signal::ProcessExited)
-                    .await?;
+                self.signal_work(network, work_id, signal).await?;
             }
         }
         Ok(())

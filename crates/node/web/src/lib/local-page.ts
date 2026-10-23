@@ -10,7 +10,7 @@ export const localPage: LocalPage = {
     const fragment = new URLSearchParams(location.hash.slice(1))
     const invitation = location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.href : ''
     const localToken = fragment.get('local')
-    const localLaunch = localToken ? { token: localToken, deviceId: fragment.get('node') ?? '' } : null
+    const localLaunch = localToken ? { token: localToken, deviceId: fragment.get('node') ?? '', rejoin: fragment.get('rejoin') === '1' } : null
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     return { invitation, localLaunch }
   },

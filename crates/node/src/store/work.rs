@@ -4,7 +4,7 @@ use super::{Store, enum_from, enum_text, log, reduce, scheduler};
 use crate::{
     crypto::LocalIdentity,
     model::*,
-    scheduling::{AdmissionReceipt, JobOutcome, TriggerKind, task_trigger},
+    scheduling::{AdmissionReceipt, TriggerKind, task_trigger},
     work::{
         Dispatch, DispatchState, Handle, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
         accept, transition,
@@ -154,7 +154,7 @@ fn save_run(connection: &Connection, record: &WorkRecord) -> Result<()> {
 
 /// Applies one signal inside the caller's transaction; a finished result is admitted after the
 /// append, so it is inside the reporting turn's basis.
-fn apply_signal_from(
+pub(super) fn apply_signal_from(
     connection: &Connection,
     blob_dir: &Path,
     identity: &LocalIdentity,
@@ -197,50 +197,6 @@ fn apply_signal_from(
         }
     }
     Ok((record, receipt))
-}
-
-/// Ends an agent task's work with its coordination turn; the reply becomes the result.
-#[expect(clippy::too_many_arguments, reason = "the turn's end and its result")]
-pub(crate) fn finish_agent_work_from(
-    connection: &Connection,
-    blob_dir: &Path,
-    identity: &LocalIdentity,
-    network: &str,
-    work_id: &str,
-    outcome: &JobOutcome,
-    text: &str,
-    at: i64,
-) -> Result<()> {
-    let (outcome, reason) = match outcome {
-        JobOutcome::Completed => (WorkOutcome::Completed, None),
-        JobOutcome::Failed(detail) => (WorkOutcome::Failed, Some(detail.clone())),
-        JobOutcome::Cancelled(evidence) => (WorkOutcome::Interrupted, Some(evidence.clone())),
-        JobOutcome::Interrupted {
-            detail,
-            process_unconfirmed,
-        } => (
-            if *process_unconfirmed {
-                WorkOutcome::Unverified
-            } else {
-                WorkOutcome::Interrupted
-            },
-            Some(detail.clone()),
-        ),
-    };
-    apply_signal_from(
-        connection,
-        blob_dir,
-        identity,
-        network,
-        work_id,
-        Signal::Concluded {
-            outcome,
-            text: text.into(),
-            reason,
-        },
-        at,
-    )?;
-    Ok(())
 }
 
 impl Store {

@@ -146,7 +146,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         return { ok: true, json: async () => ({ network_id: network, entry: sessionEntry }) }
       }
       calls.push('local_setup'); setupRequests.push({ path, options })
-      const value = holds.has('local_setup') ? await holds.get('local_setup')?.promise : localState.setup ?? (local === 'fresh' ? { kind: 'uninitialized', invitation: localInvitation } : { kind: 'initialized', entry: localEntry })
+      const value = holds.has('local_setup') ? await holds.get('local_setup')?.promise : localState.setup ?? (local === 'fresh' ? { kind: 'uninitialized', invitation: localInvitation } : { kind: 'initialized', removed: false, entry: localEntry })
       return { status: 200, ok: true, json: async () => value }
     },
     setTimeout: timer, clearTimeout: (id: number) => timers.delete(id), setInterval: timer, clearInterval: (id: number) => timers.delete(id),
@@ -240,7 +240,7 @@ test('a revoked browser learns it was removed instead of retrying', async () => 
 
 test('initialized localhost authenticates the signed manager on its original entry before offering local access', async () => {
   const app = deviceHarness({ local: 'initialized', management: true })
-  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
   try {
     app.render(); await settle()
     assert.equal(app.render().ready?.principal.source, 'membership')
@@ -256,7 +256,7 @@ test('initialized localhost authenticates the signed manager on its original ent
 
 test('opening local access requires a click and fetches a fresh launcher before changing origin', async () => {
   const app = deviceHarness({ local: 'initialized' }), auth = deferred()
-  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
   app.holds.set('authenticate', auth)
   try {
     app.render(); await settle()
@@ -266,7 +266,7 @@ test('opening local access requires a click and fetches a fresh launcher before 
     assert.equal(app.navigations.length, 0)
     assert.equal(app.calls.includes('local-exchange'), false)
     const fresh = { ...localLaunch, token: '1'.repeat(64) }
-    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: fresh }
+    app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: fresh }
     await app.render().openLocalAccess()
     assert.equal(app.setupRequests.length, 2)
     assert.equal(app.navigations.length, 1)
@@ -280,16 +280,32 @@ test('opening local access requires a click and fetches a fresh launcher before 
 
 test('disabling local automatic access before the click prevents launching its stale token', async () => {
   const app = deviceHarness({ local: 'initialized' }), auth = deferred()
-  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
   app.holds.set('authenticate', auth)
   try {
     app.render(); await settle()
     auth.resolve(notMember); await settle()
-    app.localState.setup = { kind: 'initialized', entry: localEntry }
+    app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry }
     await assert.rejects(app.render().openLocalAccess(), /免确认打开已关闭/)
     assert.equal(app.navigations.length, 0)
     const setup = app.render().localSetup
     assert.equal(setup?.kind === 'initialized' && setup.local_launch, undefined)
+  } finally { app.close() }
+})
+
+test('a removed computer shows removed on its local page, and rejoining opens it to carry on there', async () => {
+  const app = deviceHarness({ local: 'initialized' })
+  app.localState.setup = { kind: 'initialized', removed: true, entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().phase, 'removed')
+    assert.equal(app.render().error, '')
+    assert.deepEqual(app.calls, ['local_setup'])
+    await app.render().rejoin()
+    assert.equal(app.navigations.length, 1)
+    const opened = new URLSearchParams(new URL(app.navigations[0]).hash.slice(1))
+    assert.equal(opened.get('local'), localLaunch.token)
+    assert.equal(opened.get('rejoin'), '1')
   } finally { app.close() }
 })
 
@@ -302,7 +318,7 @@ test('local launch metadata rejects an unrelated node, unsafe address, or malfor
   ]
   for (const launch of invalid) {
     const app = deviceHarness({ local: 'initialized' })
-    app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: launch }
+    app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: launch }
     try {
       app.render(); await settle()
       assert.equal(app.render().localSetup, null)
@@ -353,7 +369,7 @@ test('a local setup response cannot redirect onboarding to another origin', asyn
 
 test('local setup cannot silently select the cookie channel instead of the ordinary member entry', async () => {
   const app = deviceHarness({ local: 'initialized' })
-  app.localState.setup = { kind: 'initialized', entry: { ...localEntry, local: true }, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: { ...localEntry, local: true }, local_launch: localLaunch }
   try {
     app.render(); await settle()
     assert.equal(app.render().localSetup, null)
@@ -575,7 +591,7 @@ test('the launcher fragment is cleared before its token is exchanged for the bro
 
 test('a launch link on the localhost page sends an unjoined browser on to the launcher origin', async () => {
   const app = deviceHarness({ local: 'initialized', fragment: `#local=${'f'.repeat(64)}&node=${target}` })
-  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
   try {
     app.render(); await settle()
     assert.equal(app.calls.includes('local-exchange'), false)
@@ -589,7 +605,7 @@ test('a launch link on the localhost page sends an unjoined browser on to the la
 test('a launch link on the localhost page keeps a browser already joined there', async () => {
   const storage = new Map([['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
   const app = deviceHarness({ local: 'initialized', storage, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
-  app.localState.setup = { kind: 'initialized', entry: localEntry, local_launch: localLaunch }
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
   try {
     app.render(); await settle()
     assert.equal(app.location.hash, '')

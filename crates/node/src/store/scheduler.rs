@@ -318,6 +318,8 @@ fn fence(session: &mut SchedulerSession) -> Result<()> {
     Ok(())
 }
 
+const BOT_DELETED: &str = "bot 已删除";
+
 fn reply_message_id(conversation: &str, trigger: &str) -> String {
     format!(
         "reply-{}",
@@ -338,8 +340,12 @@ pub(crate) fn admit_from(
         return Ok(job.receipt(network));
     }
     let mut session = load_session(connection, conversation)?;
+    // What reaches a deleted bot is recorded as cancelled, so a sender's retry reads it back.
+    // An agent task waits for `claim_next`, which also ends its work.
+    let deleted = kind != TriggerKind::AgentTask
+        && super::bots::bot_deleted_from(connection, network, conversation)?;
     ensure!(
-        queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
+        deleted || queued_jobs(connection, conversation)?.len() < MAX_PENDING_JOBS,
         "scheduler inbox is full; trigger was not admitted"
     );
     let job = SchedulerJob {
@@ -350,7 +356,14 @@ pub(crate) fn admit_from(
         basis: log::version_vector_from(connection, network)?,
         reply_to: reply_to.into(),
         message_id: reply_message_id(conversation, trigger),
-        state: JobState::Queued,
+        state: if deleted {
+            JobState::Cancelled {
+                attempt: None,
+                evidence: BOT_DELETED.into(),
+            }
+        } else {
+            JobState::Queued
+        },
     };
     session.next_sequence = session
         .next_sequence
@@ -719,16 +732,13 @@ fn end_job_from(
     } else {
         text.to_owned()
     };
-    if job.kind == TriggerKind::AgentTask {
-        super::work::finish_agent_work_from(
-            connection,
-            blob_dir,
-            identity,
-            network,
-            &job.reply_to,
-            &outcome,
-            &text,
-            at,
+    let change = TaskJobChange::Ended {
+        outcome: &outcome,
+        text: &text,
+    };
+    if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
+        super::work::apply_signal_from(
+            connection, blob_dir, identity, network, work_id, signal, at,
         )?;
     } else if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_none() {
         log::append_from(
@@ -753,7 +763,11 @@ fn end_job_from(
         )?;
         let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
-        if let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
+        // A Node the conversation moved away from mid-turn leaves condensing to the new owner.
+        let owned = conversation_from(connection, network, &job.conversation_id)?
+            .and_then(|c| c.owner)
+            == Some(identity.device_id()?);
+        if owned && let Some(checkpoint) = crate::scheduler::checkpoint(&context, &works) {
             log::append_from(
                 connection,
                 blob_dir,
@@ -868,6 +882,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_node_from(&tx, network, &local)?;
+        ensure!(
+            !super::bots::bot_deleted_from(&tx, network, conversation)?,
+            "this bot was deleted"
+        );
         let owner = conversation_from(&tx, network, conversation)?
             .context("conversation not found")?
             .owner
@@ -1052,9 +1070,29 @@ impl Store {
                 job.sequence,
             )
         });
+        let deleted = super::bots::bot_deleted_from(&tx, network, conversation)?;
         let mut selected = None;
         for mut job in queued {
+            if deleted {
+                let outcome = JobOutcome::Cancelled(BOT_DELETED.into());
+                let change = TaskJobChange::Ended {
+                    outcome: &outcome,
+                    text: "",
+                };
+                if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
+                    super::work::apply_signal_from(
+                        &tx,
+                        &self.blob_dir,
+                        identity,
+                        network,
+                        work_id,
+                        signal,
+                        crate::runtime::now_ms(),
+                    )?;
+                }
+            }
             let evidence = match job.kind {
+                _ if deleted => Some(BOT_DELETED),
                 TriggerKind::Schedule if live_schedule(&tx, network, &job)?.is_none() => {
                     Some("定时任务已暂停或删除")
                 }
@@ -1197,15 +1235,18 @@ impl Store {
         };
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
-            if job.kind == TriggerKind::AgentTask {
-                super::work::finish_agent_work_from(
+            let change = TaskJobChange::Ended {
+                outcome: &JobOutcome::Cancelled(evidence.clone()),
+                text: "",
+            };
+            if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
+                super::work::apply_signal_from(
                     &tx,
                     &self.blob_dir,
                     identity,
                     network,
-                    &job.reply_to,
-                    &JobOutcome::Cancelled(evidence.clone()),
-                    "",
+                    work_id,
+                    signal,
                     crate::runtime::now_ms(),
                 )?;
             }

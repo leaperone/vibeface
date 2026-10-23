@@ -59,14 +59,14 @@ function LogsPage() {
   }
   if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
   return <div className="mx-auto grid w-full max-w-3xl gap-4">
-    <div className="flex items-center justify-end gap-2">
+    <div className="flex items-center gap-2">
+      <div className="relative min-w-0 flex-1">
+        <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input type="search" aria-label="搜索日志" placeholder="搜索内容或编号" className="h-10 ps-9 max-md:h-11" value={query} onChange={(event) => setQuery(event.target.value)} />
+      </div>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
-    </div>
-    <div className="relative">
-      <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input type="search" aria-label="搜索日志" placeholder="搜索内容或编号" className="h-10 ps-9" value={query} onChange={(event) => setQuery(event.target.value)} />
     </div>
     <div role="radiogroup" aria-label="级别" className="flex w-full gap-1 rounded-lg bg-muted p-1 sm:w-fit">
       {levelChoices.map(([value, label, Icon]) => <Button key={label} type="button" role="radio" aria-checked={level === value} variant={level === value ? 'outline' : 'ghost'} className="flex-1 sm:flex-none" onClick={() => setLevel(value)}>
@@ -77,7 +77,7 @@ function LogsPage() {
       {sourceChoices.map(([value, label, Icon]) => {
         const on = sources.includes(value)
         return <button key={value} type="button" aria-pressed={on} onClick={() => setSources(on ? sources.filter((item) => item !== value) : [...sources, value])}
-          className={cn('inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-10 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
+          className={cn('inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-11 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
             on ? 'border-primary bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-muted hover:text-foreground')}>
           <Icon aria-hidden="true" className="size-3.5" />{label}
         </button>

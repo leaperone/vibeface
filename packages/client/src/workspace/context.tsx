@@ -317,6 +317,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const recorded = async (item: OutboxItem) => {
     if (item.method === "ack") return !parseNotifications(await connection.rpc("notifications")).some((note) => note.notification_id === item.params.notification_id)
     if (item.method === "create_bot") return parseBots(await connection.rpc("bots")).some((bot) => bot.bot_id === item.params.bot_id)
+    if (item.method === "delete_bot") return !parseBots(await connection.rpc("bots")).some((bot) => bot.conversation_id === item.params.conversation_id)
     // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "set_primary_bot") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
@@ -584,6 +585,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()
+    }),
+    deleteBot: (id: string) => withMutation(`bot-delete:${id}`, async () => {
+      const attestation = await attest(id, { type: "bot_deleted" })
+      try { await signedWrite("bot-delete", id, "delete_bot", { conversation_id: id, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      await reloadScope(id)
     }),
     controlSchedule: (scheduleId: string, action: ScheduleAction) => withMutation(`schedule:${scheduleId}`, async () => {
       const id = activeId.current

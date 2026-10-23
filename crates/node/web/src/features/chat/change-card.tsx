@@ -1,9 +1,9 @@
 import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { Details } from '@/components/app/kit'
 import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
-import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView } from '@vibeface/client/workspace/types.ts'
+import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
 function cardTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind
@@ -35,11 +35,15 @@ function ChangeRows({ change, schedules }: { change: BotChange; schedules: reado
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
+    {change.model ? <Row icon={Cpu} label='模型'><BeforeAfter before={change.model.before || '跟随设备'} after={change.model.after || '跟随设备'} /></Row> : null}
+    {change.skills ? <Row icon={BookOpen} label='skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
   if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
   return <ScheduleRow before={change.before} after={change.after} current={schedules.find((schedule) => schedule.schedule_id === change.schedule_id)} />
 }
+
+const skillCount = (set: SkillSet) => set === null ? '全部' : `${set.length} 个`
 
 function Row({ icon: Icon, label, tag, removed, children }: { icon: LucideIcon; label: ReactNode; tag?: string; removed?: boolean; children?: ReactNode }) {
   return <li className="grid grid-cols-[1rem_minmax(0,1fr)] gap-x-3">

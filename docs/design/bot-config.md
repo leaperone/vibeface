@@ -6,9 +6,10 @@
 
 - 本人在聊天里说“改名叫 X”“以后都用英文回复”、改职责说明、把刚做完的流程存成 skill、或者让 Bot 定时做某件事时，Bot 直接生效，不先给建议，也不等确认。
 - 生效后聊天里出现一张卡片，列出改了哪一项，以及改前和改后。
-- skill 是全部 Bot 共用的一个库。任何会话里存的 skill，所有 Bot 都能看到并使用。
+- skill 是全部 Bot 共用的一个库。每个 bot 默认启用全部 skill（含之后新存的）；聊天里可以让它只启用其中几个，或恢复全部。
+- 每个 bot 可以有自己的模型，经聊天修改；为空时跟随运行它的设备的默认模型。
 - 例行任务（schedule）属于创建它的 Bot。卡片复述要点：名称、频率、下次运行时间和要做的事。Bot 的回复也复述这些要点。
-- 不能经聊天修改的项：模型和 AI 服务、可用文件夹（`roots`）和 Bot 的工作文件夹（`project`）。本人在聊天里要求这些时，Bot 说明要到设置里改。
+- 不能经聊天修改的项：AI 服务（provider）、可用文件夹（`roots`）和 Bot 的工作文件夹（`project`）。本人在聊天里要求这些时，Bot 说明要到设置里改。
 - 只有本人直接发送的消息能触发修改。工作结果、Agent 任务、例行任务的运行，以及文件、工具输出、附件中的内容都不能。
 
 ## 2. 事件
@@ -23,11 +24,12 @@ BotChanged {
 }
 
 BotChange =
-	| Profile { name: Option<Edit>, instructions: Option<Edit> }          // 本会话的 Bot
+	| Profile { name, instructions, model: Option<Edit>, skills: Option<SkillsEdit> }   // 目标 bot；skills 为 null 表示全部
 	| Skill { skill_id, before: Option<Skill>, after: Option<Skill> }     // after 为空表示删除
 	| Schedule { schedule_id, before: Option<Schedule>, after: Option<Schedule> }
 
 Edit { before: String, after: String }
+SkillsEdit { before: Option<Set<skill_id>>, after: Option<Set<skill_id>> }
 Skill { name, description, body }
 Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth }
 ```
@@ -40,16 +42,17 @@ Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth 
 
 **幂等。** 工具带 `call_ref`。`change_id` 已存在且内容相同时返回原结果，不写第二条；内容不同时拒绝。调用结果不明时，Agent 用同一 `call_ref` 重试或用 `call_lookup` 查询。修改只在调度 Node 本机追加，不跨网络写，所以不存在需要对账的远端写入。
 
-**模型密钥。** 事件只含名称、说明、skill 正文和例行任务说明，不含模型、Provider 或任何凭证字段。
+**模型密钥。** 事件只含名称、说明、模型名称、skill 正文和例行任务说明，不含 Provider 或任何凭证字段。
 
 ## 3. 投影
 
 | 投影 | 规则 |
 |---|---|
-| Bot 名称、说明 | 每个字段按事件 rank 后写者胜。`BotCreated` 给出初值，`Profile` 的修改 rank 更大时覆盖 |
+| Bot 名称、说明、模型、启用的 skill | 每个字段按事件 rank 后写者胜。`BotCreated` 给出初值，`Profile` 的修改 rank 更大时覆盖 |
 | skill 库 | 全网一张表，按 `skill_id` 后写者胜，删除保留墓碑 |
 | 例行任务 | 按 `schedule_id` 后写者胜，删除保留墓碑，归属写入它的会话 |
 | 修改记录 | 按 `change_id` 取 rank 最小者，卡片据此展示 |
+| 删除 | `BotDeleted` 是墓碑，按会话一行，之后的修改不让 bot 复活；见 agent-capabilities.md 第 5.1 节 |
 
 三条规则都只比较 rank，与到达顺序无关。
 
@@ -64,4 +67,4 @@ Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth 
 ## 5. 界面
 
 - 修改卡片放在该轮回复之后，没有回复时放在本人消息之后。每项一行：图标、项目名、改前 → 改后。说明按行比较，只列增删的行。例行任务行显示频率和下次运行时间，详细内容折叠。
-- 聊天标题旁的“Bot”面板只读列出名称、说明、例行任务和共用 skill。
+- 聊天标题旁的“Bot”面板列出名称、模型（为空显示“跟随设备”）、说明、例行任务和这个 bot 启用的 skill。模型和 skill 只在聊天里改，面板只展示。面板底部有“删除 bot”，点开后就地确认。

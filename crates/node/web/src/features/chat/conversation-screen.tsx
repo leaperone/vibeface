@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
+import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
@@ -75,7 +76,7 @@ export function ConversationScreen() {
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
-    ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <QuestionCard question={question} answer={folded.answers.get(question.question_id)} /> })),
+    ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
     ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个 Bot' }} /> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
@@ -142,7 +143,9 @@ export function ConversationScreen() {
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达' : ''
-  const toCards = () => document.getElementById('chat-waiting')?.scrollIntoView({ block: 'end', behavior: 'smooth' })
+  // Questions sit where they were asked, so an older one scrolls away; 去处理 brings back the first still open.
+  const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
+  const toCards = () => document.getElementById(asked ? `question-${asked.question_id}` : 'chat-waiting')?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })
   const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
@@ -202,7 +205,7 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} />
-        {cards.length ? <button type="button" className="w-fit font-medium text-foreground underline underline-offset-4" onClick={toCards}>去处理</button> : null}
+        {cards.length || asked ? <button type="button" className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-4 max-md:min-h-11" onClick={toCards}>去处理</button> : null}
         {needsSetup ? <Link to={managerOffline || !ready ? '/devices' : '/devices/$deviceId'} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
@@ -223,7 +226,8 @@ function TaskCard({ task, botId, device, open, live }: { task: TaskRow; botId: s
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
   return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
-    {task.state === 'waiting' || task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
+    {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
+      : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} state={task.state} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>

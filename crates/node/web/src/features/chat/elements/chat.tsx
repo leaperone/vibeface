@@ -54,7 +54,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
             })}
           </MessageScrollerContent>
         </MessageScrollerViewport>
-        <MessageScrollerButton aria-label="回到最新消息" />
+        <MessageScrollerButton aria-label="回到最新消息" className="max-md:size-11" />
       </MessageScroller>
     </MessageScrollerProvider>
   )

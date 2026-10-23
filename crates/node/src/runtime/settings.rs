@@ -1,7 +1,7 @@
 use super::Runtime;
 use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
-use crate::manager::ManagerKind;
+use crate::manager::{ManagerConfig, ManagerKind, Sdk};
 use crate::providers::{self, AppServer, AppServerMode, Provider, Role};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,35 @@ impl Runtime {
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    /// A turn of the bot `settings` describe, in its provider's SDK on this Node. Its tools see
+    /// the Node-wide shell environment; the caller adds what belongs to the turn.
+    pub(crate) fn manager_config(&self, settings: ManagerSettings) -> ManagerConfig {
+        let sdk = match settings.provider {
+            ManagerKind::CursorSdk => Sdk::Cursor {
+                bridge: self.cursor.get().cloned(),
+                sdk_bin: settings.cursor_sdk_bin,
+                agents: self.cursor_agents.clone(),
+            },
+            ManagerKind::CodexSdk => Sdk::Codex {
+                node_bin: settings.node_bin,
+                codex_bin: self.providers().codex_bin,
+                sdk_script: settings.codex_sdk_script,
+            },
+        };
+        ManagerConfig {
+            sdk,
+            workspace: settings.workspace,
+            model: settings.model,
+            timeout_secs: self.config.timeout_secs,
+            custom_tools: BTreeMap::new(),
+            tool_cli: None,
+            tool_env: self.agent_env(),
+            tool_token: None,
+            provider_env: self.provider_env(settings.provider),
+            process_started: None,
+        }
     }
 
     /// The variables this Node sets for the provider behind `kind`, and only that provider.
