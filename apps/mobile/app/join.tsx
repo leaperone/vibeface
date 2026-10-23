@@ -6,6 +6,7 @@ import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
+import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { SafetyCode } from '@/components/kit'
@@ -29,7 +30,9 @@ export default function JoinScreen() {
     <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
-        <Text role="heading" className="text-[40px] leading-[44px] font-bold tracking-tighter">Vibeface</Text>
+        <Animated.View layout={LinearTransition.reduceMotion(ReduceMotion.System)}>
+          <Text role="heading" className="text-[40px] leading-[44px] font-bold tracking-tighter">Vibeface</Text>
+        </Animated.View>
       </View>
       {device.phase === 'key_lost' ? <LostKey />
         : device.review?.kind === 'recovery' ? <RecoveryReview />

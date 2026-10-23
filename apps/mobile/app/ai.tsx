@@ -1,5 +1,5 @@
 import * as Clipboard from 'expo-clipboard'
-import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, KeyRound, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, Webhook, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -300,7 +300,7 @@ function Triage() {
         }}
         onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
     </Field>
-    <Field label="把提醒发给机器人" icon={Webhook}>
+    <Field label="把提醒发给机器人">
       <Input accessibilityLabel="机器人地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
       <View className="flex-row gap-2">
         <Input secureTextEntry accessibilityLabel="机器人密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '机器人密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
@@ -325,7 +325,7 @@ function Triage() {
           count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
       </View> : null}
     </Field>
-    <Field label="让机器人代你回答" icon={KeyRound}>
+    <Field label="让机器人代你回答">
       <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
       {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
         <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
@@ -376,12 +376,9 @@ function SaveRow({ value, saved, placeholder, mono, working, onChange, onSave }:
   </View>
 }
 
-function Field({ label, icon, children }: { label: string; icon?: LucideIcon; children: ReactNode }) {
+function Field({ label, children }: { label: string; children: ReactNode }) {
   return <View className="gap-2">
-    <View className="flex-row items-center gap-2">
-      {icon ? <Icon as={icon} className="size-4 text-muted-foreground" /> : null}
-      <Text className="text-meta font-medium text-muted-foreground">{label}</Text>
-    </View>
+    <Text className="text-meta font-medium text-muted-foreground">{label}</Text>
     {children}
   </View>
 }

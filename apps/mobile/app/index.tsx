@@ -19,7 +19,7 @@ export default function Home() {
   const now = Date.now()
   const shared = useLive()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl grow self-center gap-2 px-2 pb-8">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl grow self-center gap-2 px-1 pb-8">
     <Stack.Screen options={{
       headerRight: () => <Link href="/settings" asChild>
         <Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button>

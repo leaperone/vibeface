@@ -11,6 +11,7 @@ import type { BotChange, BotChangeRecord, PendingCheck, ScheduleView, WorkRecord
 import { ActionButton } from '@/components/action'
 import { ActionCard } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
+import { caret } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
@@ -129,7 +130,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     <ActionButton disabled={!shared.writable} action={answer('completed')}>做完了</ActionButton>
   </>}>
     <Text>{confirmText(check, nodeName(check.target_node, lookup))}它实际做完了吗？</Text>
-    <TextInput accessibilityLabel="补充说明" placeholder="补充说明（可选）" placeholderTextColorClassName="accent-muted-foreground" maxLength={2000}
+    <TextInput {...caret} accessibilityLabel="补充说明" placeholder="补充说明（可选）" placeholderTextColorClassName="accent-muted-foreground" maxLength={2000}
       className="min-h-11 rounded-lg border border-border bg-background px-3 font-sans text-base text-foreground" value={note} onChangeText={setNote} />
   </ActionCard>
 }

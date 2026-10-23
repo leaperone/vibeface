@@ -1,5 +1,6 @@
 import { cn } from '@/lib/utils';
 import { Platform, TextInput } from 'react-native';
+import { caret } from '@/components/ui/input';
 
 function Textarea({
   className,
@@ -18,6 +19,7 @@ function Textarea({
         className
       )}
       placeholderTextColorClassName="accent-muted-foreground"
+      {...caret}
       multiline={multiline}
       numberOfLines={numberOfLines}
       textAlignVertical="top"

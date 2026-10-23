@@ -30,6 +30,7 @@ export type Conversation = {
   status: string | null
   stoppable: boolean
   blocked: string | null
+  sending: boolean
 }
 
 /** A file picked for the next message. */

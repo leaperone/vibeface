@@ -109,7 +109,7 @@ export default function ChatScreen() {
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
       renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
-      contentContainerClassName="w-full max-w-3xl self-center px-4 py-6"
+      contentContainerClassName="w-full max-w-2xl self-center px-4 py-6"
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
       ItemSeparatorComponent={() => <View className="h-6" />}
@@ -128,7 +128,7 @@ export default function ChatScreen() {
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} />
+          blocked={blocked} sending={chat?.sending ?? false} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} />
         {noAgent ? <Link href="/ai" asChild>
           <Button variant="link" className="-mt-2 min-h-11 self-start px-6"><Text>去配置</Text></Button>
         </Link> : null}

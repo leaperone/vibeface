@@ -34,7 +34,7 @@ export default function Settings() {
       </View>
     </Section>
     <Section icon={Globe} title="连接">
-      <ConnectionPill connection={workspace.connection} />
+      <View className="-mx-2"><ConnectionPill connection={workspace.connection} /></View>
     </Section>
     <Section icon={MonitorSmartphone} title="我的设备" action={device.ready?.principal.can_manage ? <Link href="/add-device" asChild>
       <Button variant={requests ? 'outline' : 'default'} className="min-h-11"><Icon as={Plus} /><Text>添加设备</Text></Button>

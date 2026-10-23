@@ -1,6 +1,11 @@
 import { cn } from '@/lib/utils';
 import { Platform, TextInput } from 'react-native';
 
+/** Caret and selection in the ink colour; Android's highlight is a tint so the selected text stays readable. */
+export const caret = Platform.OS === 'ios'
+  ? { selectionColorClassName: 'accent-foreground' }
+  : { cursorColorClassName: 'accent-foreground', selectionHandleColorClassName: 'accent-foreground', selectionColorClassName: 'accent-foreground/25' };
+
 function Input({
   className,
   ...props
@@ -24,6 +29,7 @@ function Input({
         className
       )}
       placeholderTextColorClassName="accent-muted-foreground"
+      {...caret}
       {...props}
     />
   );

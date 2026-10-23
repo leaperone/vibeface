@@ -34,6 +34,6 @@ export function Message({ message, last }: { message: ChatMessage; last: boolean
     {message.text ? <Markdown text={message.text} /> : null}
     {message.state === 'streaming' ? <Icon as={LoaderCircle} accessibilityLabel="正在回复" className="size-4 text-muted-foreground" /> : null}
     {stopped ? <View className="flex-row items-center gap-1"><Icon as={CirclePause} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{stopped}</Text></View> : null}
-    {time}
+    {time ? <View className="-mt-1.5">{time}</View> : null}
   </Rise>
 }

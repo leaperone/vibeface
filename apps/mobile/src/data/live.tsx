@@ -88,8 +88,8 @@ function Live({ children }: { children: ReactNode }) {
       status: shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
       blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '')
-        || (!agentReady ? (nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? '能运行 bot 的设备离线了' : '暂时没有能运行 bot 的设备') : '')
-        || (shared.messageBusy ? '正在发送' : '') || null,
+        || (!agentReady ? (nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? '能运行 bot 的设备离线了' : '暂时没有能运行 bot 的设备') : '') || null,
+      sending: shared.messageBusy,
     }
   }
 

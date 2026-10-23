@@ -35,7 +35,10 @@ export default function DeviceDetail() {
         </View>
       </View>
     </View>
-    <Text selectable className="font-mono text-meta text-muted-foreground">{member.device_id}</Text>
+    <View className="gap-1">
+      <Text className="text-meta text-muted-foreground">设备编号</Text>
+      <Text selectable className="font-mono text-meta">{member.device_id}</Text>
+    </View>
     {removable ? <View className="gap-3 rounded-xl border border-danger-border p-4">
       {removing ? <>
         <Text>移除后这台设备无法再连接，已有的对话记录会保留。</Text>
