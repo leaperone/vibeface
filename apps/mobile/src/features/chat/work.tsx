@@ -98,7 +98,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
   }
   return <Link href={href} asChild>
     <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 active:bg-muted/60">
-      <Icon as={active ? LoaderCircle : CircleQuestionMark} className={cn('size-5', active ? 'text-info' : 'text-warning')} />
+      <Icon as={active ? LoaderCircle : CircleQuestionMark} className={cn('size-5', active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}

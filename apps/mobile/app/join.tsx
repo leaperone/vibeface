@@ -2,6 +2,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
 import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, type LucideIcon } from 'lucide-react-native'
+import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -24,8 +25,11 @@ export default function JoinScreen() {
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
   const choosing = device.phase !== 'key_lost' && !device.review && session.phase !== 'joining'
   return <SafeAreaView className="flex-1 bg-background">
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow justify-center gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
-      <Text role="heading" className="text-[34px] leading-[40px] font-bold tracking-tight">Vibeface</Text>
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="gap-8 px-6 py-10" contentContainerStyle={{ flexGrow: 1 }} keyboardShouldPersistTaps="handled">
+      {/* The name holds the open space; the actions sit low, where the thumb is. */}
+      <View className="min-h-24 flex-1 justify-center">
+        <Text role="heading" className="text-[40px] leading-[44px] font-bold tracking-tighter">Vibeface</Text>
+      </View>
       {device.phase === 'key_lost' ? <LostKey />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
         : session.phase === 'joining' ? <Waiting code={session.code} name={session.deviceName} onCancel={workspace.actions.cancelJoin} />
@@ -33,8 +37,8 @@ export default function JoinScreen() {
         : <JoinForm />}
       {choosing ? <View className="border-t border-border pt-4">
         {lane === 'recovery'
-          ? <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>用加入链接</Text></Button>
-          : <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
+          ? <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>用加入链接</Text></Button>
+          : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
       </View> : null}
     </KeyboardAwareScrollView>
   </SafeAreaView>
@@ -47,7 +51,7 @@ function LostKey() {
   return <Panel icon={ShieldAlert} title="需要重新加入">
     <Text className="text-muted-foreground">这台手机保存的登录信息不见了。</Text>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-    <Button className="h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
+    <Button className="min-h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
   </Panel>
 }
 
@@ -68,25 +72,25 @@ function JoinForm() {
     setError('')
     setBusy(true)
     try { await workspace.actions.join(invitation.trim(), name.trim()) }
-    catch (caught) { setError(caught instanceof Error ? caught.message : '没能加入，请再试一次。') }
+    catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
   if (scanning) return <Scanner onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
   const ready = invitation.trim() !== ''
   // Scanning leads; the name and 加入 only appear once there is a link to join with.
   return <View className="gap-4">
-    <Button className="h-12 rounded-xl" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    <Button variant={ready ? 'outline' : 'default'} className="min-h-12 rounded-xl" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
+      <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
     </View>
     {ready ? <>
-      <Input accessibilityLabel="设备名称" placeholder="设备名称" className="h-11" value={name} onChangeText={setName} maxLength={64} />
+      <Input accessibilityLabel="设备名称" placeholder="设备名称" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
       {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-      <Button className="h-12 rounded-xl" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+      <Button className="min-h-12 rounded-xl" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
     </> : null}
   </View>
 }
@@ -97,15 +101,15 @@ function Scanner({ onScanned, onCancel }: { onScanned: (link: string) => void; o
   if (!permission.granted) return <Panel icon={Camera} title="扫码加入">
     <Text className="text-muted-foreground">需要相机权限才能扫码，也可以粘贴链接。</Text>
     <View className="flex-row gap-2">
-      <Button variant="ghost" className="h-11" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
-      <Button className="h-11" onPress={request}><Text>允许使用相机</Text></Button>
+      <Button variant="ghost" className="min-h-11" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
+      <Button className="min-h-11" onPress={request}><Text>允许使用相机</Text></Button>
     </View>
   </Panel>
   return <Panel icon={Camera} title="扫码加入">
     <View className="aspect-square overflow-hidden rounded-xl bg-muted">
       <CameraView style={{ flex: 1 }} barcodeScannerSettings={{ barcodeTypes: ['qr'] }} onBarcodeScanned={({ data }) => onScanned(data)} />
     </View>
-    <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
+    <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
   </Panel>
 }
 
@@ -113,7 +117,7 @@ function Waiting({ code, name, onCancel }: { code: string | null; name: string; 
   return <Panel icon={Hourglass} title="等待批准">
     <Text className="text-muted-foreground">{code ? `在管理设备上核对「${name}」的安全码` : '等管理设备开始核对'}</Text>
     {code ? <SafetyCode code={code} /> : <View className="h-8 w-40 rounded-md bg-muted" />}
-    <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={onCancel}><Text>取消</Text></Button>
+    <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={onCancel}><Text>取消</Text></Button>
   </Panel>
 }
 

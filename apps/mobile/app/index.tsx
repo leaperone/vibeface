@@ -39,7 +39,7 @@ export default function Home() {
         unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
         preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
     }) : <EmptyState icon={Bot} title="还没有 bot" action={canCreate ? <Link href="/new-bot" asChild>
-      <Button className="h-11"><Icon as={Plus} /><Text>新建 bot</Text></Button>
+      <Button className="min-h-11"><Icon as={Plus} /><Text>新建 bot</Text></Button>
     </Link> : undefined} />}
     <View className="mt-6 border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView>

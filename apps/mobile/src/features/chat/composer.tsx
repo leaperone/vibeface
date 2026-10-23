@@ -25,7 +25,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, onSend, onS
     if (picked.canceled) return
     onFiles([...files, ...picked.assets.map((asset) => ({ uri: asset.uri, name: asset.name, size: asset.size ?? null, mimeType: asset.mimeType ?? null }))])
   }
-  return <View className="gap-2 px-4 pt-2 pb-3">
+  return <View className="gap-2 bg-background px-4 pt-2 pb-3">
     <View className="rounded-3xl border border-border bg-card">
       {files.length ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerClassName="gap-2 px-3 pt-3">
         {files.map((file, index) => <View key={`${file.uri}:${index}`} className="max-w-48 flex-row items-center rounded-full bg-muted ps-3">
@@ -43,7 +43,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, onSend, onS
         </Button>
         {onStop
           ? <Button variant="outline" size="icon" className="size-11 rounded-full" accessibilityLabel="停止" onPress={onStop}><Icon as={Square} className="size-4 fill-foreground" /></Button>
-          : <Button size="icon" className="size-11 rounded-full" accessibilityLabel="发送" disabled={!canSend} onPress={onSend}><Icon as={ArrowUp} /></Button>}
+          : <Button size="icon" variant={canSend ? 'default' : 'secondary'} className="size-11 rounded-full" accessibilityLabel="发送" disabled={!canSend} onPress={onSend}><Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} /></Button>}
       </View>
     </View>
     {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}

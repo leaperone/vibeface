@@ -1,4 +1,5 @@
 import * as Haptics from 'expo-haptics'
+import { humanError } from '@vibeface/client/lib/errors.ts'
 import { CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, SendHorizontal, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
@@ -36,7 +37,7 @@ export function QuestionCard({ question }: { question: Question }) {
       await workspace.actions.answer(question, value)
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : '没能送达，请再试一次。')
+      setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次回答'))
     } finally { setBusy(null) }
   }
   const typed = () => {
@@ -65,7 +66,7 @@ export function QuestionCard({ question }: { question: Question }) {
       <View className={cn(row, 'pe-1', busy !== null && 'opacity-50')}>
         <View className={cn(badge, 'bg-muted')}><Icon as={PencilLine} className="size-4 text-muted-foreground" /></View>
         <TextInput accessibilityLabel="其他回答" placeholder={question.choices.length ? '其他回答' : '输入回答'} placeholderTextColorClassName="accent-muted-foreground"
-          className="h-11 min-w-0 flex-1 font-sans text-base text-foreground" value={text} maxLength={4000} editable={busy === null}
+          className="min-h-11 min-w-0 flex-1 font-sans text-base text-foreground" value={text} maxLength={4000} editable={busy === null}
           returnKeyType="send" submitBehavior="blurAndSubmit" onChangeText={setText} onSubmitEditing={() => { if (text.trim()) typed() }} />
         <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={busy !== null || !text.trim()} onPress={typed}>
           <Icon as={busy === 'text' ? LoaderCircle : SendHorizontal} />
@@ -76,8 +77,8 @@ export function QuestionCard({ question }: { question: Question }) {
   </ActionCard>
 }
 
-const row = 'min-h-12 flex-row items-center gap-3 rounded-lg border border-border bg-background px-3 py-2'
-const badge = 'size-7 items-center justify-center rounded-md'
+const row = 'min-h-12 flex-row items-center gap-3 rounded-lg border border-border bg-card px-3 py-2'
+const badge = 'min-h-7 min-w-7 items-center justify-center rounded-md'
 
 function Meta({ icon, label, children }: { icon: LucideIcon; label: string; children: string }) {
   return <View accessible accessibilityLabel={`${label} ${children}`} className="min-w-0 flex-row items-center gap-1">

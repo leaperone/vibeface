@@ -25,7 +25,7 @@ export default function BotAbout() {
       <Text className="text-muted-foreground">在聊天里说一声就能改</Text>
       {shared.primary === bot.conversation_id
         ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 bot</Text></View>
-        : <ActionButton variant="outline" className="h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 bot</ActionButton>}
+        : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 bot</ActionButton>}
     </View>
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
     {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
@@ -41,8 +41,8 @@ export default function BotAbout() {
           </View>
           <Text numberOfLines={2} className="text-meta text-muted-foreground">{scheduleDetail(schedule) || schedule.prompt}</Text>
           <View className="flex-row gap-2 pt-1">
-            <ActionButton variant="outline" size="sm" className="h-9" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
-            <Button variant="outline" size="sm" className="h-9" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
+            <ActionButton variant="outline" size="sm" className="min-h-9" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
+            <Button variant="outline" size="sm" className="min-h-9" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
               { text: '取消', style: 'cancel' },
               { text: '删除', style: 'destructive', onPress: () => void shared.controlSchedule(schedule.schedule_id, 'delete').catch((error: unknown) => Alert.alert('删除失败', error instanceof Error ? error.message : String(error))) },
             ])}>

@@ -21,7 +21,7 @@ export function FilePick({ picked, onPick, disabled }: { picked: PickedFile | nu
     const asset = result.assets?.[0]
     if (!result.canceled && asset) onPick({ name: asset.name, file: new File(asset.uri) })
   }
-  return <Button variant="outline" className="h-11 self-start" disabled={disabled} onPress={() => void choose()}>
+  return <Button variant="outline" className="min-h-11 self-start" disabled={disabled} onPress={() => void choose()}>
     <Icon as={picked ? FileCheck : FileKey} className={picked ? 'text-success' : undefined} />
     <Text numberOfLines={1} className="shrink">{picked ? picked.name : '选择恢复文件'}</Text>
   </Button>
@@ -52,14 +52,14 @@ export function RecoveryRestore() {
     <Text className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</Text>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />
-    <Input accessibilityLabel="设备名称" placeholder="这台手机叫什么" className="h-11" value={name} onChangeText={setName} maxLength={128} editable={!locked} />
+    <Input accessibilityLabel="设备名称" placeholder="这台手机叫什么" className="min-h-11" value={name} onChangeText={setName} maxLength={128} editable={!locked} />
     <View className="gap-2">
       <Text className="text-meta font-medium">连接到哪台电脑</Text>
-      <Input accessibilityLabel="访问地址" placeholder="https://" className="h-11" keyboardType="url" autoCapitalize="none" autoCorrect={false} value={address} onChangeText={setAddress} editable={!locked} />
-      <Input accessibilityLabel="设备编号" placeholder="设备编号" className="h-11 font-mono text-meta" autoCapitalize="none" autoCorrect={false} value={deviceId} onChangeText={setDeviceId} editable={!locked} />
+      <Input accessibilityLabel="访问地址" placeholder="https://" className="min-h-11" keyboardType="url" autoCapitalize="none" autoCorrect={false} value={address} onChangeText={setAddress} editable={!locked} />
+      <Input accessibilityLabel="设备编号" placeholder="设备编号" className="min-h-11 font-mono" autoCapitalize="none" autoCorrect={false} value={deviceId} onChangeText={setDeviceId} editable={!locked} />
     </View>
     {errorText(error)}
-    <Button className="h-11" disabled={locked || !picked || !password || !name.trim() || !address.trim() || !deviceId.trim()} onPress={submit}>
+    <Button className="min-h-11" disabled={locked || !picked || !password || !name.trim() || !address.trim() || !deviceId.trim()} onPress={submit}>
       <Text>{busy ? '打开中' : '下一步'}</Text>
     </Button>
   </View>
@@ -106,8 +106,8 @@ export function RecoveryReview() {
     <Text className="text-meta text-muted-foreground">这台手机会成为管理员，并保存新的恢复文件</Text>
     {errorText(error)}
     <View className="flex-row justify-between gap-2">
-      <Button variant="ghost" className="-ms-3 h-11" onPress={device.cancelSensitive}><Text>取消</Text></Button>
-      <Button className="h-11" disabled={busy !== null} onPress={recover}><Text>{busy ? '恢复中' : '恢复'}</Text></Button>
+      <Button variant="ghost" className="-ms-3 min-h-11" onPress={device.cancelSensitive}><Text>取消</Text></Button>
+      <Button className="min-h-11" disabled={busy !== null} onPress={recover}><Text>{busy ? '恢复中' : '恢复'}</Text></Button>
     </View>
     {busy ? <Text className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</Text> : null}
   </View>
@@ -136,7 +136,7 @@ export function ReplaceRecovery() {
     <Input {...passwordProps} accessibilityLabel="再输一次" placeholder="再输一次" value={confirmation} onChangeText={setConfirmation} editable={!locked} />
     {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
     {errorText(error)}
-    <Button className="h-11" disabled={locked || !picked || !oldPassword || !password || !confirmation} onPress={submit}>
+    <Button className="min-h-11" disabled={locked || !picked || !oldPassword || !password || !confirmation} onPress={submit}>
       <Text>{busy ? '处理中' : '保存新文件'}</Text>
     </Button>
   </View>

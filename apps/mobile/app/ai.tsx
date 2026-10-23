@@ -143,8 +143,8 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
-        ? <Button variant="link" className="h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
-        : <Button variant="link" className="h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
+        ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
+        : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 pb-2">
       <Icon as={CircleX} className="size-4 text-danger" /><Text className="shrink text-meta">{check.label}</Text>
     </View>)}
@@ -192,14 +192,14 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   return <Field label="连接方式">
     <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
       {modes.map(([mode, text, modeIcon]) => <Button key={mode} accessibilityRole="radio" accessibilityState={{ checked: server.mode === mode }} disabled={working}
-        variant={server.mode === mode ? 'outline' : 'ghost'} className="h-11" onPress={() => { if (mode !== server.mode) void save('app_server', { app_server: { mode, socket: server.socket } }) }}>
+        variant={server.mode === mode ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { if (mode !== server.mode) void save('app_server', { app_server: { mode, socket: server.socket } }) }}>
         <Icon as={modeIcon} /><Text>{text}</Text>
       </Button>)}
     </View>
     <View className="flex-row flex-wrap items-center gap-2">
       <Icon as={icon} className={cn('size-4', tone)} />
       <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}{shown.state === 'connected' && shown.user_agent ? ` · ${shown.user_agent}` : ''}</Text>
-      <Button variant="ghost" className="h-11" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
+      <Button variant="ghost" className="min-h-11" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
         <Icon as={testing ? LoaderCircle : PlugZap} /><Text>测试连接</Text>
       </Button>
     </View>
@@ -225,7 +225,7 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
     {field('model', '模型', cursor ? 'auto' : '默认')}
     {field('workspace', 'bot 工作文件夹')}
     {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : <>{field('node_bin', 'Node.js')}{field('codex_sdk_script', 'Codex 组件')}</>}
-    {dirty ? <Button variant="outline" className="h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
+    {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>
 }
@@ -249,16 +249,16 @@ function Variables({ item, working, change }: { item: ProviderStatus; working: b
           {row.set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
         </View>
         {editing === row.name ? <View className="flex-row gap-2 pe-2 pb-1">
-          <Input secureTextEntry autoFocus accessibilityLabel={`${row.name} 的值`} className="h-11 min-w-0 flex-1" maxLength={4096} value={value} onChangeText={setValue} />
-          <Button variant="outline" className="h-11" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
+          <Input secureTextEntry autoFocus accessibilityLabel={`${row.name} 的值`} className="min-h-11 min-w-0 flex-1" maxLength={4096} value={value} onChangeText={setValue} />
+          <Button variant="outline" className="min-h-11" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
           <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
         </View> : null}
       </View>
     })}
-    <Input accessibilityLabel="变量名" placeholder="变量名" className="h-11 font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
+    <Input accessibilityLabel="变量名" placeholder="变量名" className="min-h-11 font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
     <View className="flex-row gap-2">
-      <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="h-11 min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
-      <Button variant="outline" className="h-11" disabled={working || !addName || !newValue} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
+      <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-h-11 min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
+      <Button variant="outline" className="min-h-11" disabled={working || !addName || !newValue} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
@@ -289,7 +289,7 @@ function Triage() {
   return <View className="gap-6">
     <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
       {outlets.map(([value, text, icon]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: config.default_outlet === value }} disabled={busy !== ''}
-        variant={config.default_outlet === value ? 'outline' : 'ghost'} className="h-11" onPress={() => { if (value !== config.default_outlet) void save('default', { default_outlet: value }) }}>
+        variant={config.default_outlet === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { if (value !== config.default_outlet) void save('default', { default_outlet: value }) }}>
         <Icon as={icon} /><Text>{text}</Text>
       </Button>)}
     </View>
@@ -298,23 +298,23 @@ function Triage() {
         trailing={(prefix) => {
           const project = config.projects.find((item) => item.prefix === prefix)!
           const [, text] = outlets.find(([value]) => value === project.outlet)!
-          return <Button variant="ghost" className="h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
+          return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
             onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
         }}
         onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
     </Field>
     <Field label="把提醒发给机器人" icon={Webhook}>
-      <Input accessibilityLabel="机器人地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="h-11 font-mono" value={url} onChangeText={setUrl} />
+      <Input accessibilityLabel="机器人地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
       <View className="flex-row gap-2">
-        <Input secureTextEntry accessibilityLabel="机器人密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '机器人密钥'} maxLength={512} className="h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+        <Input secureTextEntry accessibilityLabel="机器人密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '机器人密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
         {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
       </View>
       <View className="flex-row flex-wrap items-center gap-2">
-        <Button variant="outline" className="h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
+        <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
           onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
           {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
         </Button>
-        <Button variant="ghost" className="h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
+        <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
           setTest(null)
           void call('test', 'test_webhook').then((result) => {
             const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
@@ -341,8 +341,8 @@ function Triage() {
         <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
       </View>)}
       <View className="flex-row gap-2">
-        <Input accessibilityLabel="授权码名称" placeholder="聊天机器人" maxLength={64} className="h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-        <Button variant="outline" className="h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '聊天机器人' }).then((result) => {
+        <Input accessibilityLabel="授权码名称" placeholder="聊天机器人" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
+        <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '聊天机器人' }).then((result) => {
           const value = (result as { token?: unknown } | null)?.token
           if (typeof value === 'string') { setToken(value); setLabel('') }
         })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
@@ -364,9 +364,9 @@ function PathList({ label, items, busy, trailing, onChange }: { label: string; i
       <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`移除 ${item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
     </View>)}
     <View className="flex-row gap-2">
-      <Input accessibilityLabel="文件夹路径" placeholder="/Users/me/project" autoCapitalize="none" autoCorrect={false} className="h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
+      <Input accessibilityLabel="文件夹路径" placeholder="/Users/me/project" autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
         returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />
-      <Button variant="outline" className="h-11" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
+      <Button variant="outline" className="min-h-11" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
     </View>
   </>
   return label ? <Field label={label}>{body}</Field> : <View className="gap-2">{body}</View>
@@ -375,7 +375,7 @@ function PathList({ label, items, busy, trailing, onChange }: { label: string; i
 function SaveRow({ value, saved, placeholder, mono, working, onChange, onSave }: { value: string; saved: string; placeholder: string; mono?: boolean; working: boolean; onChange(value: string): void; onSave(): void }) {
   return <View className="flex-row gap-2">
     <Input accessibilityLabel={placeholder} placeholder={placeholder} autoCapitalize="none" autoCorrect={false} className={cn('h-11 min-w-0 flex-1', mono && 'font-mono')} value={value} editable={!working} onChangeText={onChange} />
-    {value.trim() !== saved ? <Button variant="outline" className="h-11" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
+    {value.trim() !== saved ? <Button variant="outline" className="min-h-11" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
   </View>
 }
 
@@ -390,7 +390,7 @@ function Field({ label, icon, children }: { label: string; icon?: LucideIcon; ch
 }
 
 function Retry({ error, onRetry }: { error: string; onRetry(): void }) {
-  return <View className="gap-2"><ErrorText error={error} /><Button variant="outline" className="h-11 self-start" onPress={onRetry}><Text>重试</Text></Button></View>
+  return <View className="gap-2"><ErrorText error={error} /><Button variant="outline" className="min-h-11 self-start" onPress={onRetry}><Text>重试</Text></Button></View>
 }
 
 function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {

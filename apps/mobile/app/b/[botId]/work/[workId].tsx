@@ -58,10 +58,10 @@ export default function TaskDetail() {
         <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
       </View>)}
     </Section> : null}
-    {canStop ? <ActionButton variant="destructive" className="h-11 self-start" icon={Square} disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
+    {canStop ? <ActionButton variant="destructive" className="min-h-11 self-start" icon={Square} disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="h-11 self-start" icon={RotateCw} disabled={!shared.writable}
+    {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="min-h-11 self-start" icon={RotateCw} disabled={!shared.writable}
       action={async () => { if (await shared.sendMessage(`再试一次「${work.title || '这个任务'}」`)) router.back() }}>让 bot 再试</ActionButton> : null}
     <Section title="详情">
       {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}

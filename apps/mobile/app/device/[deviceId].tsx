@@ -40,13 +40,13 @@ export default function DeviceDetail() {
       {removing ? <>
         <Text>移除后这台设备无法再连接，已有的对话记录会保留。</Text>
         <View className="flex-row flex-wrap justify-end gap-2">
-          <Button variant="ghost" className="h-11" onPress={() => setRemoving(false)}><Text>取消</Text></Button>
-          <Button variant="destructive" className="h-11" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>
+          <Button variant="ghost" className="min-h-11" onPress={() => setRemoving(false)}><Text>取消</Text></Button>
+          <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>
             <Icon as={Trash2} className="text-white" /><Text>{busy ? '移除中' : '移除设备'}</Text>
           </Button>
         </View>
         {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-      </> : <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setRemoving(true)}>
+      </> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setRemoving(true)}>
         <Icon as={Trash2} className="text-danger" /><Text className="text-danger">移除设备</Text>
       </Button>}
     </View> : null}

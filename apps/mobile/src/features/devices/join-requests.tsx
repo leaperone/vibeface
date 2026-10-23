@@ -50,10 +50,10 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const asking = request.status === 'pending' && !auto
   const allow = (manage: boolean) => run(manage ? 'admin' : 'allow', async () => { await device.approveJoin(request.join_id, manage); onAllowed?.(request.name || '新设备') })
   return <ActionCard icon={request.kind === 'node' ? Laptop : Smartphone} tone="info" title={`${request.name || '新设备'} 想加入`} actions={<>
-    <Button variant="ghost" className="h-11" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
-    {asking ? <Button className="h-11" disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
-      {request.kind === 'client' ? <Button variant="outline" className="h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理员'}</Text></Button> : null}
-      <Button className="h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
+    <Button variant="ghost" className="min-h-11" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
+    {asking ? <Button className="min-h-11" disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
+      {request.kind === 'client' ? <Button variant="outline" className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理员'}</Text></Button> : null}
+      <Button className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
     <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的安全码比对' : '等新设备显示安全码'}</Text>

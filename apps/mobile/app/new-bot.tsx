@@ -41,13 +41,13 @@ export default function NewBot() {
   const disabled = busy !== null || !shared.writable || !(pending?.name ?? name).trim()
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-6 p-4 pb-10">
     {/* In the header, so the keyboard never covers it. */}
-    <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="h-11 px-3" disabled={disabled} onPress={() => void create()}>
+    <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="min-h-11 px-3" disabled={disabled} onPress={() => void create()}>
       {busy ? <Icon as={LoaderCircle} /> : null}<Text className="font-semibold">{pending ? '再试一次' : '创建'}</Text>
     </Button> }} />
     {pending ? <Text role="status" className="rounded-lg bg-muted p-3 text-meta">{pending.submission?.state === 'rejected' ? '上次没建成，确认后可以修改。' : '上次没确认是否建好，内容保持不变。'}</Text> : null}
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">名称</Text>
-      <Input accessibilityLabel="名称" placeholder="例如：项目 bot" className="h-11" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
+      <Input accessibilityLabel="名称" placeholder="例如：项目 bot" className="min-h-11" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">它负责什么 <Text className="text-meta text-muted-foreground/70">可选</Text></Text>

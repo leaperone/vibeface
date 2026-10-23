@@ -48,8 +48,8 @@ export default function AddDevice() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-5 p-4 pb-10">
     {added && !requests ? <View className="gap-3">
       <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>
-      <Button variant="outline" className="h-11 self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
-    </View> : !result || used && !requests ? <Button variant={requests ? 'outline' : 'default'} className="h-11 self-start" disabled={busy !== null} onPress={generate}>
+      <Button variant="outline" className="min-h-11 self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
+    </View> : !result || used && !requests ? <Button variant={requests ? 'outline' : 'default'} className="min-h-11 self-start" disabled={busy !== null} onPress={generate}>
       <Icon as={Link2} /><Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button> : null}
     <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
@@ -57,10 +57,10 @@ export default function AddDevice() {
       <QrCode value={result.publicEntry ? result.link : result.ticket} label={result.publicEntry ? '用手机相机扫码打开' : '在新设备的 Vibeface 里扫码'} />
       {result.publicEntry ? null : <Text className="text-center text-meta text-muted-foreground">在新设备的 Vibeface 里点“扫码”</Text>}
       <View className="flex-row flex-wrap gap-2">
-        <Button variant={requests ? 'outline' : 'default'} className="h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
+        <Button variant={requests ? 'outline' : 'default'} className="min-h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
           <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>
         </Button>
-        <Button variant="outline" className="h-11" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
+        <Button variant="outline" className="min-h-11" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
           <Icon as={Share2} /><Text>分享</Text>
         </Button>
       </View>

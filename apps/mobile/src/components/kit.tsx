@@ -56,9 +56,10 @@ export function Monogram({ name, seed }: { name: string; seed: string }) {
   const { theme } = useUniwind()
   let hash = 0
   for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
-  const hue = hash % 360
+  // Eight hues 45° apart, so neighbouring bots never land on near-identical tints.
+  const hue = (hash % 8) * 45
   const dark = theme === 'dark'
-  return <View className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
+  return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
     <Text className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
   </View>
 }

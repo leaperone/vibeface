@@ -27,16 +27,16 @@ export default function Settings() {
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
+      <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
         {themes.map(([value, label]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: current === value }}
-          variant={current === value ? 'outline' : 'ghost'} className="h-11" onPress={() => Uniwind.setTheme(value)}><Text>{label}</Text></Button>)}
+          variant={current === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => Uniwind.setTheme(value)}><Text>{label}</Text></Button>)}
       </View>
     </Section>
     <Section icon={Globe} title="连接">
       <ConnectionPill connection={workspace.connection} />
     </Section>
     <Section icon={MonitorSmartphone} title="我的设备" action={device.ready?.principal.can_manage ? <Link href="/add-device" asChild>
-      <Button variant={requests ? 'outline' : 'default'} className="h-11"><Icon as={Plus} /><Text>添加设备</Text></Button>
+      <Button variant={requests ? 'outline' : 'default'} className="min-h-11"><Icon as={Plus} /><Text>添加设备</Text></Button>
     </Link> : null}>
       <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">
@@ -46,22 +46,22 @@ export default function Settings() {
     {device.ready ? <Notifications /> : null}
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
       <Link href="/ai" asChild>
-        <Button variant="outline" className="h-11 self-start"><Text>AI 设置</Text><Icon as={ChevronRight} /></Button>
+        <Button variant="outline" className="min-h-11 self-start"><Text>AI 设置</Text><Icon as={ChevronRight} /></Button>
       </Link>
     </Section> : null}
     <Section icon={FileKey} title="恢复文件">
       <Link href="/recovery" asChild>
-        <Button variant="outline" className="h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text></Button>
+        <Button variant="outline" className="min-h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text></Button>
       </Link>
     </Section>
     <View className="border-t border-border pt-6">
       {leaving ? <View className="gap-3">
         <Text>断开后，要用加入链接才能回来。</Text>
         <View className="flex-row gap-2">
-          <Button variant="ghost" className="h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
-          <Button variant="destructive" className="h-11" onPress={workspace.actions.disconnect}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
+          <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
+          <Button variant="destructive" className="min-h-11" onPress={workspace.actions.disconnect}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
         </View>
-      </View> : <Button variant="ghost" className="-ms-3 h-11 self-start" onPress={() => setLeaving(true)}>
+      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLeaving(true)}>
         <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开这台手机</Text>
       </Button>}
     </View>
@@ -74,7 +74,7 @@ function Notifications() {
   const { busy, error, run } = useRun()
   const button = shared.notificationButton
   return <Section icon={Bell} title="通知">
-    <Button variant="outline" className="h-11 self-start" disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
+    <Button variant="outline" className="min-h-11 self-start" disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
       <Text>{button.label}</Text>
     </Button>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
@@ -83,9 +83,9 @@ function Notifications() {
 
 function Section({ icon, title, action, children }: { icon: LucideIcon; title: string; action?: ReactNode; children: ReactNode }) {
   return <View className="gap-3">
-    <View className="min-h-11 flex-row items-center gap-2">
+    <View className="min-h-11 flex-row flex-wrap items-center gap-2">
       <Icon as={icon} />
-      <Text role="heading" className="flex-1 text-heading font-semibold">{title}</Text>
+      <Text role="heading" className="min-w-32 flex-1 text-heading font-semibold">{title}</Text>
       {action}
     </View>
     {children}

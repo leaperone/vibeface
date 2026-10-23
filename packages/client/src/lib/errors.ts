@@ -34,6 +34,7 @@ const patterns: [RegExp, string][] = [
   [/network has not started|maintenance lease|another maintenance/i, '这台设备正在启动或维护，请稍后再试。'],
   [/another personal network|wrong personal network|wrong membership network|unknown network|network mismatch/i, '这台设备属于另一组设备。'],
   [/not a member of (the|this) personal network|client identity missing/i, '这台设备还不在我的设备里。'],
+  [/already a member or was revoked/i, '这台设备已经加入过或被移除过，这个链接用不了。'],
   [/too many devices are joining|too many pending invites/i, '同时加入的设备太多，请稍后再试。'],
   [/has not confirmed its short code/i, '新设备还没显示安全码，等它显示后再比对。'],
   [/only the manager that started the confirmation/i, '请在发出加入链接的那台设备上批准。'],

@@ -127,7 +127,7 @@ export default function ChatScreen() {
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
           blocked={blocked} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} />
         {noAgent ? <Link href="/ai" asChild>
-          <Button variant="link" className="-mt-2 h-11 self-start px-6"><Text>去配置</Text></Button>
+          <Button variant="link" className="-mt-2 min-h-11 self-start px-6"><Text>去配置</Text></Button>
         </Link> : null}
       </View>
     </KeyboardStickyView>
