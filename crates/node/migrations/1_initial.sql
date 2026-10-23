@@ -76,6 +76,8 @@ CREATE TABLE `triage_handled` (`event_id` text NOT NULL, `ts_ms` integer NOT NUL
 CREATE TABLE `triage_outbox` (`event_id` text NOT NULL, `body` text NOT NULL, `state` text NOT NULL, `attempts` integer NOT NULL, `next_ms` integer NOT NULL, `created_ms` integer NOT NULL, `last_error` text NULL, PRIMARY KEY (`event_id`));
 -- Create "triage_scans" table
 CREATE TABLE `triage_scans` (`rollout` text NOT NULL, `scanned_to` integer NOT NULL, PRIMARY KEY (`rollout`));
+-- Create "coordination_threads" table
+CREATE TABLE `coordination_threads` (`thread_id` text NOT NULL, `created_ms` integer NOT NULL, PRIMARY KEY (`thread_id`));
 -- Create "addresses" table
 CREATE TABLE `addresses` (`device_id` text NOT NULL, `record` text NOT NULL, PRIMARY KEY (`device_id`));
 -- Create "blob_offsets" table
