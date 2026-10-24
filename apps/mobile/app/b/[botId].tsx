@@ -77,6 +77,16 @@ export default function ChatScreen() {
   const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
+  // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is
+  // cleared if untouched, so a second tap never posts it twice. Until then a resend reuses the pending message.
+  const unsettled = useRef<{ text: string; seen: number } | null>(null)
+  const sent = (text: string) => chat?.messages.filter((message) => message.role === 'user' && message.state !== 'sending' && message.text === text).length ?? 0
+  const landed = unsettled.current !== null && sent(unsettled.current.text) > unsettled.current.seen
+  useEffect(() => {
+    if (!landed || !unsettled.current) return
+    if (draft.text.trim() === unsettled.current.text) setDraft({ text: '', files: [] })
+    unsettled.current = null
+  }, [landed])
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
@@ -85,8 +95,9 @@ export default function ChatScreen() {
   const send = () => {
     const { text, files } = draft
     setDraft({ text: '', files: [] })
-    list.current?.scrollToOffset({ offset: 0, animated: true })
-    workspace.actions.send(id, text.trim(), files).catch(() => setDraft({ text, files }))
+    // iOS makes room for the keyboard with an inset, so the newest message rests at a negative offset, not at 0.
+    list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
+    workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) })
   }
   const rows = chat ? entries(chat, extras) : []
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
