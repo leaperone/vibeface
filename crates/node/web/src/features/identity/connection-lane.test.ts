@@ -611,6 +611,19 @@ test('after 断开 a member on the localhost page reconnects as itself when 打�
   } finally { app.close() }
 })
 
+test('a removed browser on the localhost page opens a local session instead of being refused again', async () => {
+  const storage = new Map([['vibeface.connections', JSON.stringify([localEntry])], [`vibeface.network-for.${target}`, JSON.stringify(network)]])
+  const app = deviceHarness({ local: 'initialized', removed: true, storage })
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.match(app.render().error, /已被移除/)
+    await app.render().openLocalAccess(); await settle()
+    assert.equal(app.navigations.length, 1)
+    assert.equal(new URL(app.navigations[0]).origin, localLaunch.url)
+  } finally { app.close() }
+})
+
 test('a signed management browser keeps its permissions through the local cookie channel, reconnect, and reload', async () => {
   const storage = new Map<string, string>()
   for (let reload = 0; reload < 2; reload++) {

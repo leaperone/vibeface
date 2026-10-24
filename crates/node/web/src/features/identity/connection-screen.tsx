@@ -189,6 +189,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
   useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
+  // A link is single-use: once its request ends without joining, offering 继续 again only leads to "已用过".
+  const wasJoining = useRef(false)
+  useEffect(() => {
+    if (device.joining) wasJoining.current = true
+    else if (wasJoining.current) { wasJoining.current = false; if (!device.ready) setInvitation('') }
+  }, [device.joining, device.ready])
 
   function chooseLane(next: Lane) {
     if (!device.entry || next !== 'recovery') device.disconnect()

@@ -67,7 +67,7 @@ export function CurrentRecoveryFile() {
 export function RecoveredCard() {
   const { recoverySince, acknowledgeRecovery } = useDevice()
   const navigate = useNavigate()
-  return <ActionCard icon={ShieldAlert} title="网络刚用恢复文件找回过" actions={<>
+  return <ActionCard icon={ShieldAlert} title="有设备刚用了恢复文件" actions={<>
     <Button type="button" variant="ghost" onClick={() => { acknowledgeRecovery(); void navigate({ to: '/devices' }) }}>不是我</Button>
     <Button type="button" onClick={acknowledgeRecovery}>是我</Button>
   </>}>

@@ -25,7 +25,7 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
-  if (device.recoveredElsewhere) items.push({ key: "recovered", icon: ShieldAlert, title: "网络刚用恢复文件找回过", to: "/inbox", kind: "recovered" })
+  if (device.recoveredElsewhere) items.push({ key: "recovered", icon: ShieldAlert, title: "有设备刚用了恢复文件", to: "/inbox", kind: "recovered" })
   if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
