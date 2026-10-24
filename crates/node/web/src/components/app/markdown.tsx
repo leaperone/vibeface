@@ -10,6 +10,8 @@ export function Markdown({ text, className }: { text: string; className?: string
     className={cn("md", className)}
     dangerouslySetInnerHTML={{ __html: html }}
     onClick={(event) => {
+      const fold = (event.target as HTMLElement).closest("button[data-fold]")
+      if (fold) return fold.setAttribute("aria-expanded", String(fold.getAttribute("aria-expanded") !== "true"))
       const button = (event.target as HTMLElement).closest("button[data-copy]")
       const code = button?.closest(".md-code")?.querySelector("code")?.textContent
       if (code != null) void navigator.clipboard?.writeText(code).then(() => toast("已复制", { tone: "success" }))

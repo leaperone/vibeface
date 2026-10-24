@@ -13,7 +13,15 @@ import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vib
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
-/** /b/:botId/work/:workId — desktop side panel beside the chat, full screen on phones. */
+// The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
+function holdFocus(node: HTMLElement | null) {
+  if (!node) return
+  const opener = node.ownerDocument.activeElement
+  node.focus({ preventScroll: true })
+  return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true }) }
+}
+
+/** /b/:botId/work/:workId — side panel beside the chat on wide screens, an overlay on tablets, full screen on phones. */
 export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
@@ -42,7 +50,9 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
-  return <aside aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background md:static md:z-auto md:w-[420px] md:shrink-0 md:border-l">
+  return <>
+  <div aria-hidden="true" onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
+  <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:shadow-none">
     <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
       <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       <h2 className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
@@ -82,4 +92,5 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       </Details>
     </div>}
   </aside>
+  </>
 }
