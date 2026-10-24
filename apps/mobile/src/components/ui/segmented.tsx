@@ -19,7 +19,10 @@ type Option<T> = { value: T; label: string; icon?: LucideIcon }
 export function Segmented<T extends string>({ options, value, onChange, disabled }: { options: readonly Option<T>[]; value: T; onChange: (value: T) => void; disabled?: boolean }) {
   const stacked = useWindowDimensions().fontScale >= 1.3
   const [frames, setFrames] = useState<Partial<Record<T, LayoutRectangle>>>({})
-  const frame = frames[value]
+  // The thumb follows the tap at once; the owner may apply the choice later or put it back.
+  const [shown, setShown] = useState(value)
+  useEffect(() => setShown(value), [value])
+  const frame = frames[shown]
   const x = useSharedValue(0), y = useSharedValue(0), width = useSharedValue(0), height = useSharedValue(0)
   const placed = useRef(false)
   useEffect(() => {
@@ -29,12 +32,12 @@ export function Segmented<T extends string>({ options, value, onChange, disabled
     placed.current = true
   }, [frame?.x, frame?.y, frame?.width, frame?.height])
   const thumb = useAnimatedStyle(() => ({ width: width.value, height: height.value, transform: [{ translateX: x.value }, { translateY: y.value }] }))
-  return <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', stacked ? 'self-stretch' : 'flex-row self-start')}>
+  return <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', stacked ? 'self-stretch' : 'flex-row self-start', disabled && 'opacity-50')}>
     <Thumb pointerEvents="none" style={thumb} className={cn('absolute top-0 left-0 rounded-md border border-border bg-background shadow-sm shadow-black/5 dark:border-input dark:bg-input/30', !frame && 'opacity-0')} />
-    {options.map((option) => <Button key={option.value} variant="ghost" accessibilityRole="radio" accessibilityState={{ checked: option.value === value }} disabled={disabled}
-      className={cn('min-h-11 active:bg-transparent dark:active:bg-transparent', stacked && 'justify-start')}
+    {options.map((option) => <Button key={option.value} variant="ghost" accessibilityRole="radio" accessibilityState={{ checked: option.value === shown }} disabled={disabled}
+      className={cn('min-h-11 border border-transparent opacity-100 active:bg-transparent dark:active:bg-transparent', stacked && 'justify-start')}
       onLayout={(event) => { const next = event.nativeEvent.layout; setFrames((all) => ({ ...all, [option.value]: next })) }}
-      onPress={() => { if (option.value === value) return; void Haptics.selectionAsync(); onChange(option.value) }}>
+      onPress={() => { if (option.value === shown) return; void Haptics.selectionAsync(); setShown(option.value); onChange(option.value) }}>
       {option.icon ? <Icon as={option.icon} /> : null}<Text>{option.label}</Text>
     </Button>)}
   </View>

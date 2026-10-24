@@ -28,7 +28,8 @@ export default function Settings() {
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      <Segmented options={themes} value={current} onChange={(value) => Uniwind.setTheme(value)} />
+      {/* The whole app repaints on a theme change, so it waits for the thumb to land instead of tearing its slide. */}
+      <Segmented options={themes} value={current} onChange={(value) => setTimeout(() => Uniwind.setTheme(value), 350)} />
     </Section>
     <Section icon={Globe} title="连接">
       <View className="-mx-2 -my-3"><ConnectionPill connection={workspace.connection} /></View>
