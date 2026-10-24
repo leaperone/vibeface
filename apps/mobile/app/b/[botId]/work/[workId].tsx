@@ -40,12 +40,14 @@ export default function TaskDetail() {
   const active = taskActive(state)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
-    <View className="flex-row flex-wrap items-center gap-x-2">
-      <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>
-      {device ? <Text className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</Text> : null}
+    <View className="gap-1">
+      <View className="flex-row flex-wrap items-center gap-x-2">
+        <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>
+        {device ? <Text className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</Text> : null}
+      </View>
+      {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}
+      {!progress?.text && work.summary && active ? <Text selectable className="mt-2">{work.summary}</Text> : null}
     </View>
-    {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}
-    {!progress?.text && work.summary && active ? <Text selectable>{work.summary}</Text> : null}
     {progress?.text ? <ScrollView nestedScrollEnabled className="max-h-96 rounded-xl bg-muted" contentContainerClassName="p-3">
       <Text selectable className="font-mono text-meta">{progress.text}</Text>
     </ScrollView> : null}

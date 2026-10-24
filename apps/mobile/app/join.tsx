@@ -83,7 +83,7 @@ function JoinForm() {
   const ready = invitation.trim() !== ''
   // Scanning leads; the name and 加入 only appear once there is a link to join with.
   return <View className="gap-4">
-    <Button variant={ready ? 'outline' : 'default'} className="min-h-12 rounded-xl" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    <Button variant={ready ? 'outline' : 'default'} className="min-h-12" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
@@ -94,7 +94,7 @@ function JoinForm() {
     {ready ? <>
       <Input accessibilityLabel="设备名称" placeholder="设备名称" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
       {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-      <Button className="min-h-12 rounded-xl" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+      <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
     </> : null}
   </View>
 }

@@ -47,7 +47,7 @@ export default function Home() {
 
 function Row({ href, avatar, name, mark, preview, unread, time }: { href: Href; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }) {
   return <Link href={href} asChild>
-    <Pressable className="min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted/60">
+    <Pressable className="min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted">
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">

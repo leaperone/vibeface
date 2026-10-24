@@ -67,7 +67,7 @@ export function QuestionCard({ question }: { question: Question }) {
       <View className={cn(row, 'pe-1', busy !== null && 'opacity-50')}>
         <View className={cn(badge, 'bg-muted')}><Icon as={PencilLine} className="size-4 text-muted-foreground" /></View>
         <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="其他回答" placeholder={question.choices.length ? '其他回答' : '输入回答'} placeholderTextColorClassName="accent-muted-foreground"
-          className="min-h-11 min-w-0 flex-1 font-sans text-base text-foreground" value={text} maxLength={4000} editable={busy === null}
+          className="min-h-11 min-w-0 flex-1 font-sans text-body text-foreground" value={text} maxLength={4000} editable={busy === null}
           returnKeyType="send" submitBehavior="blurAndSubmit" onChangeText={setText} onSubmitEditing={() => { if (text.trim()) typed() }} />
         <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={busy !== null || !text.trim()} onPress={typed}>
           <Icon as={busy === 'text' ? LoaderCircle : ArrowUp} />

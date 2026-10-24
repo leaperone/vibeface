@@ -60,7 +60,7 @@ export default function NewBot() {
           const selected = same(item.project)
           return <Pressable key={item.project ? `${item.project.target_node}:${item.project.cwd}` : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}
             disabled={locked} onPress={() => setProject(item.project)}
-            className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted/60', index > 0 && 'border-t border-border', locked && !selected && 'opacity-50')}>
+            className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted', index > 0 && 'border-t border-border', locked && !selected && 'opacity-50')}>
             <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
             <Text numberOfLines={1} className="min-w-0 flex-1">{item.label}</Text>
             {selected ? <Icon as={Check} className="size-4" /> : null}

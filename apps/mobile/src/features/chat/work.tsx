@@ -86,7 +86,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
     const result = (work.result_text || (work.failure_reason ? humanError(work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
     const icon = state === 'abandoned' ? Ban : state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
-      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-start gap-2 rounded-lg py-2 active:bg-muted/60">
+      <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
         <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted-foreground')} />
         <View className="min-w-0 flex-1">
           <Text numberOfLines={1} className="text-meta text-muted-foreground">{title}</Text>
@@ -98,7 +98,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
     </Link>
   }
   return <Link href={href} asChild>
-    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 active:bg-muted/60">
+    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 active:bg-muted">
       <Icon as={active ? LoaderCircle : CircleQuestionMark} className={cn('size-5', active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
@@ -131,7 +131,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   </>}>
     <Text>{confirmText(check, nodeName(check.target_node, lookup))}它实际做完了吗？</Text>
     <TextInput {...caret} accessibilityLabel="补充说明" placeholder="补充说明（可选）" placeholderTextColorClassName="accent-muted-foreground" maxLength={2000}
-      className="min-h-11 rounded-lg border border-border bg-background px-3 font-sans text-base text-foreground" value={note} onChangeText={setNote} />
+      className="min-h-11 rounded-lg border border-border bg-background px-3 font-sans text-body text-foreground" value={note} onChangeText={setNote} />
   </ActionCard>
 }
 
