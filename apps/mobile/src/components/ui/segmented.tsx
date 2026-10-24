@@ -24,13 +24,15 @@ export function Segmented<T extends string>({ options, value, onChange, disabled
   useEffect(() => setShown(value), [value])
   const frame = frames[shown]
   const x = useSharedValue(0), y = useSharedValue(0), width = useSharedValue(0), height = useSharedValue(0)
-  const placed = useRef(false)
-  useEffect(() => {
-    if (!frame) return
-    const to = (shared: SharedValue<number>, next: number) => { shared.value = placed.current ? withSpring(next, slide) : next }
-    to(x, frame.x); to(y, frame.y); to(width, frame.width); to(height, frame.height)
-    placed.current = true
-  }, [frame?.x, frame?.y, frame?.width, frame?.height])
+  const placed = useRef<LayoutRectangle>(undefined)
+  const move = (next: LayoutRectangle) => {
+    const at = placed.current
+    if (at && at.x === next.x && at.y === next.y && at.width === next.width && at.height === next.height) return
+    const to = (shared: SharedValue<number>, value: number) => { shared.value = at ? withSpring(value, slide) : value }
+    to(x, next.x); to(y, next.y); to(width, next.width); to(height, next.height)
+    placed.current = next
+  }
+  useEffect(() => { if (frame) move(frame) }, [frame?.x, frame?.y, frame?.width, frame?.height])
   const thumb = useAnimatedStyle(() => ({ width: width.value, height: height.value, transform: [{ translateX: x.value }, { translateY: y.value }] }))
   // A quick save never dims the group; only a wait long enough to notice does.
   const dim = { transitionProperty: 'opacity', transitionDuration: 150, transitionDelay: disabled ? 300 : 0 } as const
@@ -39,7 +41,8 @@ export function Segmented<T extends string>({ options, value, onChange, disabled
     {options.map((option) => <Button key={option.value} variant="ghost" accessibilityRole="radio" accessibilityState={{ checked: option.value === shown }} disabled={disabled}
       className={cn('min-h-11 opacity-100 active:bg-transparent dark:active:bg-transparent', stacked && 'justify-start')}
       onLayout={(event) => { const next = event.nativeEvent.layout; setFrames((all) => ({ ...all, [option.value]: next })) }}
-      onPress={() => { if (option.value === shown) return; void Haptics.selectionAsync(); setShown(option.value); onChange(option.value) }}>
+      // The thumb starts on the tap itself, not after a render that a theme repaint can hold up.
+      onPress={() => { if (option.value === shown) return; void Haptics.selectionAsync(); const next = frames[option.value]; if (next) move(next); setShown(option.value); onChange(option.value) }}>
       {option.icon ? <Icon as={option.icon} /> : null}<Text>{option.label}</Text>
     </Button>)}
   </AnimatedView>
