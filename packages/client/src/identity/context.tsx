@@ -673,7 +673,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     }
     if (status.status === 'rejected' || status.status === 'expired') {
       // The join is gone, so the poller can no longer tell it apart from a stale one; say why here.
-      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : '管理设备拒绝了这次加入。')
+      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : '这次加入被拒绝了。要再试，请在已有设备上重新添加。')
       setJoin(null); setError(failure.message)
       throw failure
     }
@@ -717,8 +717,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   async function openLocalAccess(thenRejoin = false) {
     if (localSetup?.kind !== 'initialized') throw new Error('请先打开这台电脑的本机页面。')
     // A member browser reconnects as itself; the launcher would start a separate local session on another origin.
+    // A removed browser would only be refused again, so it takes the local session.
     const computer = localSetup.entry
-    if (!thenRejoin && savedEntries().some(item => entryKey(item) === entryKey(computer))) { await connect(computer); return }
+    if (!thenRejoin && error !== removedText(self) && savedEntries().some(item => entryKey(item) === entryKey(computer))) { await connect(computer); return }
     const version = generation.current, controller = new AbortController(); connecting.current = controller
     const setup = await discoverLocalSetup(controller.signal)
     if (version !== generation.current) throw changed()
