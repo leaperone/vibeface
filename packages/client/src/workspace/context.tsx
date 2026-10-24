@@ -467,10 +467,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
         return false
       }
+      // History first, so the sent message is shown from it before its pending copy goes and never blinks out between.
+      if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
       await outbox.delete(key)
       await outboxChanged()
       setNoticeText("")
-      if (activeId.current === id) await refreshRef.current().catch(showRefreshError)
       return true
     } catch (caught) {
       if (current() && responded(caught)) {
