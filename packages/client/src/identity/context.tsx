@@ -168,7 +168,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [directory, setDirectory] = useState<MembershipView | null>(null)
   const [recoverySince, setRecoverySince] = useState<number | null>(null)
   const [recovery, setRecovery] = useState<RecoveryWait | null>(null)
-  const [recovered, setRecovered] = useState(false)
+  // Kept so a reload before the new file is confirmed still lands on it; the wait record goes, so a reload resumes as usual.
+  const [recovered, setRecovered] = useState(load('recovered') === true)
   const [, setDismissals] = useState(0)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
@@ -858,10 +859,11 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   async function recoveredAs(auth: unknown, active: Session, wait: WaitRecord) {
     const view = await authenticate(auth, active, { kind: 'root', networkId: wait.networkId, genesis: wait.genesis, checkpoint: wait.checkpoint })
-    if (view.recovery_key === record(wait.checkpoint).recovery_key) { setRecovery(null); setRecovered(true); return }
-    // A manager still in the directory waits there, without a card asking whether this was them.
-    try { if (view.pending) store(`recovery-ok.${wait.networkId}`, view.pending.checkpoint) } catch {}
     dismissRecovery()
+    // Still a member of the directory in effect, it follows the wait on the card every manager sees.
+    if (view.recovery_key !== record(wait.checkpoint).recovery_key) return
+    try { store('recovered', true) } catch {}
+    setRecovered(true)
   }
   /** Asks the Node holding this browser's recovery how it stands; once it took effect, connects as the manager it made. */
   async function checkRecovery(wait: WaitRecord) {
@@ -1038,7 +1040,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     pendingRecovery, vetoRecovery,
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered,
-    finishRecovered() { dismissRecovery(); setRecovered(false) },
+    finishRecovered() { try { store('recovered', null) } catch {} setRecovered(false) },
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>
 }

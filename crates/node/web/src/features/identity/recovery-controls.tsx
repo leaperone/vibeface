@@ -163,11 +163,7 @@ export function RecoveryReview() {
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
-      <Button type="button" disabled={busy} onClick={() => void run(async () => {
-        await device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)))
-        // A connected manager stays on this page; anyone else moves on to the waiting screen.
-        if (device.ready) toast('已提交，2 天后生效', { tone: 'success' })
-      })}><BusyIcon busy={busy} />恢复</Button>
+      <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回。</p> : null}
   </Panel>
