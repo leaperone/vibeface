@@ -50,7 +50,11 @@ type DeviceContextValue = {
   /** When the Node first saw the current recovery key, if it knows. */
   recoverySince: number | null
   /** A recovery waiting to replace this directory, unless this manager said it was them. */
-  pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void; vetoRecovery(): Promise<void>
+  pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
+  /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
+  vetoRecovery(checkpoint: string): Promise<void>
+  /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
+  nodeClockOffset: number
   /** This browser's own recovery while it waits, or once a device stopped it. */
   recovery: RecoveryWait | null; dismissRecovery(): void
   /** This browser's recovery took effect; its new file still waits to be confirmed as saved. */
@@ -167,6 +171,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [info, setInfo] = useState<EntryInfo | null>(null)
   const [directory, setDirectory] = useState<MembershipView | null>(null)
   const [recoverySince, setRecoverySince] = useState<number | null>(null)
+  const [nodeClockOffset, setNodeClockOffset] = useState(0)
   const [recovery, setRecovery] = useState<RecoveryWait | null>(null)
   // Kept so a reload before the new file is confirmed still lands on it; the wait record goes, so a reload resumes as usual.
   const [recovered, setRecovered] = useState(load('recovered') === true)
@@ -298,7 +303,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
     noteNames(principal.network_id, view.members)
-    setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
+    setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setNodeClockOffset((nodeNow(verified.auth) ?? Date.now()) - Date.now()); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
     if (principal.source === 'membership') void refreshEntrances(active, view)
@@ -520,7 +525,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
     noteNames(ready.principal.network_id, view.members)
-    setDirectory(view); setRecoverySince(sinceOf(response)); setJoins(pending)
+    setDirectory(view); setRecoverySince(sinceOf(response)); setNodeClockOffset((nodeNow(response) ?? Date.now()) - Date.now()); setJoins(pending)
   }
   /** A revocation carries no name, so the removed list names a device by what this browser saw while it was a member. */
   function noteNames(networkId: string, members: Member[]) {
@@ -624,20 +629,39 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     await request('revoke', { event }); await refreshDirectory()
     for (const entry of savedEntries().filter(item => item.device_id === deviceId)) removeEntry(entry)
   }
-  /** Stops the recovery waiting to replace this directory. The directory is read first, so a veto whose answer got lost is not signed again. */
-  async function vetoRecovery() {
+  /**
+   * Stops the recovery `checkpoint` names. The directory is read first, and again when the answer is lost, so a veto
+   * that landed is not signed again and a recovery that got stopped is told apart from one that took effect.
+   */
+  async function vetoRecovery(checkpoint: string) {
     const connection = managing(), request = scoped()
-    const response = record(await request('directory'))
-    const now = nodeNow(response) ?? Date.now()
-    const verified = verifyState(response.state, connection.principal.network_id, now)
-    let event: Record<string, unknown>
-    try {
-      const { pending } = parseView(JSON.parse(verified.viewJson()))
-      if (!pending) throw new Error('没有正在等待的找回，可能已生效或已被拦下。')
-      event = JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'veto', checkpoint: pending.checkpoint, at_ms: now })))
-    } finally { verified.free() }
+    const read = async () => {
+      const response = record(await request('directory'))
+      const now = nodeNow(response) ?? Date.now()
+      const verified = verifyState(response.state, connection.principal.network_id, now)
+      try {
+        const view = parseView(JSON.parse(verified.viewJson()))
+        const event = view.pending?.checkpoint === checkpoint ? JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'veto', checkpoint, at_ms: now }))) as Record<string, unknown> : null
+        return { event, stopped: view.stopped.includes(checkpoint) }
+      } finally { verified.free() }
+    }
+    const done = async (stopped: boolean) => {
+      // In effect, the recovery may have removed this device, so the refresh may fail; the outcome is what counts.
+      const refreshed = refreshDirectory()
+      if (!stopped) { refreshed.catch(() => {}); throw new Error('这次找回已经生效，没能拦下。') }
+      await refreshed
+    }
+    const { event, stopped } = await read()
+    if (!event) return done(stopped)
     event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
-    await request('veto', { event }); await refreshDirectory()
+    try { await request('veto', { event }) }
+    catch (cause) {
+      // Whether it landed is unknown; the directory tells, and only a recovery still waiting keeps the error.
+      const after = await read().catch(() => null)
+      if (!after || after.event) throw cause
+      return done(after.stopped)
+    }
+    await refreshDirectory()
   }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
   async function join(linkText: string, nameValue: string) {
@@ -1037,7 +1061,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
-    pendingRecovery, vetoRecovery,
+    pendingRecovery, vetoRecovery, nodeClockOffset,
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered,
     finishRecovered() { try { store('recovered', null) } catch {} setRecovered(false) },

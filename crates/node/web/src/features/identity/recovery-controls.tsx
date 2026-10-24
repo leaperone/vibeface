@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, CircleCheck, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
 import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -63,7 +63,7 @@ export function CurrentRecoveryFile() {
   </SettingsRow>
 }
 
-/** Hours until `at`, at least one while it has not passed. */
+/** Hours until `at` on this browser's clock, at least one while it has not passed. */
 export const hoursUntil = (at: number) => Math.max(1, Math.ceil((at - Date.now()) / 3_600_000))
 
 /** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
@@ -73,18 +73,31 @@ export function RecoveryPendingCard() {
   const { busy, error, run } = useGenerationRun()
   const pending = device.pendingRecovery
   if (!pending) return null
-  const known = new Set(device.directory?.members.map((member) => member.device_id))
-  return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms)} 小时后生效`} actions={<>
+  const current = device.directory?.members ?? []
+  const kept = new Set(pending.members.map((member) => member.device_id))
+  const known = new Set(current.map((member) => member.device_id))
+  // What decides it: who comes in, and which devices here, this one included, go out.
+  const changes = [
+    ...pending.members.filter((member) => !known.has(member.device_id)).map((member) => ({ member, added: true })),
+    ...current.filter((member) => !kept.has(member.device_id)).map((member) => ({ member, added: false })),
+  ]
+  return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms - device.nodeClockOffset)} 小时后生效`} actions={<>
     <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我</Button>
     <Button type="button" variant="destructive" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
-      await device.vetoRecovery()
+      await device.vetoRecovery(pending.checkpoint)
       toast('已拦下。恢复文件可能泄露了，换个恢复密码更稳妥', { tone: 'success', action: { label: '去换', onClick: () => void navigate({ to: '/settings' }) } })
     })}><BusyIcon busy={busy} icon={Hand} />拦下</Button>
   </>}>
-    {pending.members.filter((member) => !known.has(member.device_id)).map((member) => {
+    {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
-      return <p key={member.device_id} className="flex min-w-0 items-center gap-2"><Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{member.name}</span></p>
-    })}
+      const Change = added ? CirclePlus : CircleMinus
+      return <li key={member.device_id} className="flex min-w-0 items-center gap-2">
+        <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
+        <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <span className={cn('truncate', !added && 'text-muted-foreground line-through')}>{member.name}</span>
+        {member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
+      </li>
+    })}</ul> : null}
     <InlineError error={error || null} />
   </ActionCard>
 }
