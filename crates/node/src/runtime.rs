@@ -224,6 +224,7 @@ impl Runtime {
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
+        store.start_membership_clock(&identity.device_id()?)?;
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -359,6 +360,22 @@ impl Runtime {
     pub async fn membership_state(&self) -> Result<NetworkState> {
         self.store.lock().await.public_state()
     }
+    /// The directory in effect by this Node's membership clock (`store::membership_clock`).
+    pub async fn membership_view(&self) -> Result<AuthorizationView> {
+        Ok(self.store.lock().await.membership_now()?.2)
+    }
+    /// The history, this Node's membership time and the directory in effect then.
+    pub async fn membership_now(&self) -> Result<(NetworkState, u64, AuthorizationView)> {
+        self.store.lock().await.membership_now()
+    }
+    /// Notes a finished membership exchange with `peer`, which may put a recovery in effect.
+    pub(crate) async fn note_membership_exchange(&self, peer: &str) -> Result<()> {
+        let noted = self.store.lock().await.note_membership_exchange(peer)?;
+        if noted {
+            self.settle_recovery().await?;
+        }
+        Ok(())
+    }
     pub async fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
         self.store.lock().await.recovery_since_ms(recovery_key)
     }
@@ -405,7 +422,9 @@ impl Runtime {
     /// A recovery takes effect with time alone and no new record, so this installs the history
     /// again whenever another directory is in effect: at start, after each membership change, and
     /// when a waiting recovery is due. It wakes at least every 15 minutes and checks the wall
-    /// clock again, since a monotonic sleep stops while the computer sleeps.
+    /// clock again, since a monotonic sleep stops while the computer sleeps. A recovery due by
+    /// the wall clock but not by the membership clock waits for the next membership exchange,
+    /// which settles it itself.
     fn start_recovery_timer(self: &Arc<Self>) {
         let node = Arc::downgrade(self);
         let mut membership = self.membership.subscribe();
@@ -422,7 +441,10 @@ impl Runtime {
                 let wait = async {
                     match due {
                         Some(due) => {
-                            let left = due.saturating_sub(now_ms() as u64).min(15 * 60_000);
+                            let left = match due.saturating_sub(now_ms() as u64) {
+                                0 => 15 * 60_000,
+                                left => left.min(15 * 60_000),
+                            };
                             tokio::time::sleep(Duration::from_millis(left)).await
                         }
                         None => std::future::pending().await,
@@ -440,8 +462,7 @@ impl Runtime {
         if !self.has_membership().await? {
             return Ok(None);
         }
-        let state = self.membership_state().await?;
-        let view = state.project()?;
+        let (state, _, view) = self.membership_now().await?;
         if self.recovery_since_ms(&view.recovery_key).await?.is_none() {
             self.install_membership(state).await?;
         }
@@ -592,7 +613,7 @@ impl Runtime {
                 let local = self.identity.device_id()?;
                 let heads = self.store.lock().await.heads(network)?;
                 let mut nodes = vec![];
-                let view = bundle.project()?;
+                let view = self.membership_view().await?;
                 let display_names = node_display_names(&bundle);
                 let members: Vec<_> = view
                     .members

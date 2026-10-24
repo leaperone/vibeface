@@ -181,7 +181,7 @@ impl Runtime {
         }
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
-            let view = self.membership_state().await?.project()?;
+            let view = self.membership_view().await?;
             for signed in self.store.lock().await.address_book()? {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
@@ -232,9 +232,8 @@ impl Runtime {
     }
 
     async fn removed_here(&self, device: &str) -> bool {
-        self.membership_state()
+        self.membership_view()
             .await
-            .and_then(|state| state.project())
             .is_ok_and(|view| view.revocation(device).is_some())
     }
 
@@ -551,6 +550,7 @@ impl Runtime {
                     "wrong membership network"
                 );
                 self.install_membership(incoming).await?;
+                self.note_membership_exchange(origin).await?;
                 Ok(json!({"state":self.membership_state().await?}))
             }
             "forks" => {
@@ -635,10 +635,9 @@ impl Runtime {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                 _ = self.sync_wakeup.notified() => {},
             }
-            let Ok(state) = self.membership_state().await else {
+            let Ok(view) = self.membership_view().await else {
                 continue;
             };
-            let Ok(view) = state.project() else { continue };
             let local = self.identity.device_id().unwrap_or_default();
             if view.revocation(&local).is_some() {
                 continue;
@@ -735,6 +734,8 @@ impl Runtime {
             let incoming: NetworkState = serde_json::from_value(reply["state"].clone())?;
             self.install_membership(incoming).await?;
         }
+        // Both now hold the same membership, or this one holds the union of both.
+        self.note_membership_exchange(peer).await?;
         if let Err(error) = self.exchange_addresses(network, peer).await {
             tracing::debug!(%peer, %error, "address book exchange pending");
         }
@@ -938,11 +939,7 @@ impl Runtime {
     /// The write state, and the conflicts kept aside here, for the web.
     /// Each other member Node with whether the last sync reached it and when one last finished.
     pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
-        let Ok(view) = self
-            .membership_state()
-            .await
-            .and_then(|state| state.project())
-        else {
+        let Ok(view) = self.membership_view().await else {
             return Vec::new();
         };
         let local = self.identity.device_id().unwrap_or_default();
@@ -1098,10 +1095,9 @@ impl Runtime {
         loop {
             self.have_wakeup.notified().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let Ok(state) = self.membership_state().await else {
+            let Ok(view) = self.membership_view().await else {
                 continue;
             };
-            let Ok(view) = state.project() else { continue };
             let Ok(local) = self.identity.device_id() else {
                 continue;
             };
@@ -1140,7 +1136,7 @@ impl Runtime {
 
     /// Other member Nodes this one can ask right now.
     async fn member_peers(&self) -> Result<(String, Vec<String>)> {
-        let view = self.membership_state().await?.project()?;
+        let view = self.membership_view().await?;
         let local = self.identity.device_id()?;
         let peers = view
             .members
@@ -1220,11 +1216,7 @@ impl Runtime {
     /// Work on removed devices that never reported is recorded as abandoned by the owner, and
     /// requests still waiting for those devices are dropped.
     pub(super) async fn abandon_revoked_works(&self, network: &str) {
-        let Ok(view) = self
-            .membership_state()
-            .await
-            .and_then(|state| state.project())
-        else {
+        let Ok(view) = self.membership_view().await else {
             return;
         };
         let removed: Vec<String> = view
@@ -1326,7 +1318,7 @@ impl Runtime {
         network: &str,
         records: Vec<SignedAddress>,
     ) -> Result<()> {
-        let view = self.membership_state().await?.project()?;
+        let view = self.membership_view().await?;
         let local = self.identity.device_id()?;
         let mut learned = false;
         for signed in records.into_iter().take(MAX_ADDRESS_RECORDS) {
@@ -1354,7 +1346,7 @@ impl Runtime {
 
     /// Signed records of current member Nodes that serve browsers.
     pub(crate) async fn entrances(&self, network: &str) -> Result<Vec<SignedAddress>> {
-        let view = self.membership_state().await?.project()?;
+        let view = self.membership_view().await?;
         Ok(self
             .store
             .lock()
@@ -1858,6 +1850,116 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(*a.membership.borrow(), installs + 1, "installed once");
+            anyhow::Ok(())
+        }
+        .await;
+        drop(a);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    /// A recovery `issued` long enough ago to be due by the wall clock, adding `attacker` as a
+    /// manager, on top of `state`.
+    fn due_recovery(
+        ia: &LocalIdentity,
+        state: &NetworkState,
+        attacker: &LocalIdentity,
+    ) -> Result<(NetworkState, crate::identity::RootCheckpoint, String, u64)> {
+        use crate::identity::{Member, RECOVERY_DELAY_MS, RootCheckpoint};
+        let mut members = state.project()?.members;
+        members.push(Member::client(attacker, "attacker", true)?);
+        let next = LocalIdentity::generate().device_id()?;
+        let issued = now_ms() as u64 - RECOVERY_DELAY_MS - 1_000;
+        let checkpoint = RootCheckpoint::recovery(
+            state,
+            &ia.fixture_root_at(2),
+            &next,
+            members,
+            vec![],
+            issued,
+        )?;
+        let mut waiting = state.clone();
+        waiting.recover(checkpoint.clone())?;
+        Ok((waiting, checkpoint, next, issued))
+    }
+
+    /// A Node that slept through a recovery's wait puts it in effect only after another member
+    /// Node could hand it the veto it missed; the veto then keeps it stopped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_slept_through_a_recovery_waits_for_a_peer() -> Result<()> {
+        use crate::identity::{GovernanceAction, GovernanceEvent};
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+            }
+            let attacker = LocalIdentity::generate();
+            let (waiting, checkpoint, next, issued) = due_recovery(&ia, &state, &attacker)?;
+            a.install_membership(waiting.clone()).await?;
+            a.settle_recovery().await?;
+            let held = a.membership_view().await?;
+            assert_eq!(held.epoch, 2, "not in effect before an exchange");
+            assert_eq!(
+                held.pending.as_ref().map(|p| &p.checkpoint),
+                Some(&checkpoint.hash()?)
+            );
+            assert!(held.client(&attacker.device_id()?).is_err());
+            assert!(a.recovery_since_ms(&next).await?.is_none());
+            let (_, now, _) = a.membership_now().await?;
+            assert!(now < checkpoint.effective_at_ms());
+
+            let veto = GovernanceEvent::unsigned(
+                &waiting.project_at(issued)?,
+                &ia.fixture_admin().device_id()?,
+                GovernanceAction::Veto {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: issued + 1,
+                },
+            )?
+            .sign(&ia.fixture_admin())?;
+            let mut vetoed = waiting.clone();
+            vetoed.append(veto)?;
+            b.install_membership(vetoed).await?;
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            a.sync_peer(&network, &ib.device_id()?).await?;
+            let view = a.membership_view().await?;
+            assert_eq!(view.epoch, 2);
+            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
+            assert!(view.client(&attacker.device_id()?).is_err());
+            assert!(a.recovery_since_ms(&next).await?.is_none());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        drop((a, b));
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
+
+    /// With no other Node to ask, the wall clock decides.
+    #[tokio::test]
+    async fn a_single_node_puts_a_due_recovery_in_effect_by_the_wall_clock() -> Result<()> {
+        let ia = LocalIdentity::generate();
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?])?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            let attacker = LocalIdentity::generate();
+            let (waiting, _, next, _) = due_recovery(&ia, &state, &attacker)?;
+            a.install_membership(waiting).await?;
+            assert_eq!(a.membership_view().await?.epoch, 3);
+            assert!(a.recovery_since_ms(&next).await?.is_some());
             anyhow::Ok(())
         }
         .await;

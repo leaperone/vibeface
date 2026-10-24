@@ -3,7 +3,7 @@
 //! events when governance or fork evidence changes which events count.
 use crate::{
     crypto::{LocalIdentity, digest},
-    identity::{AuthorizationView, Member, NetworkState},
+    identity::{AuthorizationView, IdentityKind, Member, NetworkState, RECOVERY_SKEW_MS},
     model::*,
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -60,13 +60,76 @@ pub struct Store {
     process_lock: Option<Arc<std::fs::File>>,
 }
 
+/// When this Node reads its membership, and the directory in effect then.
+///
+/// The membership clock is the wall clock held back to `RECOVERY_SKEW_MS` after this Node last
+/// exchanged membership with another Node of the directory in effect here, and never before the
+/// recovery it already saw in effect. A recovery that came due while this Node slept or was off
+/// takes effect only once such a peer could hand it the veto it missed. The clock lives in this
+/// connection's memory, so after a restart a recovery waits for one exchange. A Node with no other
+/// Node in that directory, one that never saw a directory in effect (it takes the history it
+/// first receives), and a store no Runtime opened read the wall clock.
+pub(crate) fn membership_clock(
+    connection: &Connection,
+    state: &NetworkState,
+) -> Result<(u64, AuthorizationView)> {
+    let wall = crate::runtime::now_ms() as u64;
+    let clock: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT device_id,synced_ms FROM temp.membership_clock",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let (Some((device, synced)), Some(key)) = (clock, recovery_since_key(connection)?) else {
+        return Ok((wall, state.project_at(wall)?));
+    };
+    // The key seen in effect, a rotation included, stands on every directory up to its epoch.
+    let seen = state
+        .checkpoints
+        .iter()
+        .position(|checkpoint| checkpoint.recovery_key == key)
+        .and_then(|at| {
+            state.checkpoints[..=at]
+                .iter()
+                .filter(|checkpoint| checkpoint.directory.is_some())
+                .map(|checkpoint| checkpoint.effective_at_ms())
+                .max()
+        })
+        .unwrap_or(0);
+    let held = wall.min((synced.max(0) as u64 + RECOVERY_SKEW_MS).max(seen));
+    if held == wall {
+        return Ok((wall, state.project_at(wall)?));
+    }
+    let view = state.project_at(held)?;
+    let peers = view.members.iter().any(|member| {
+        member.kind == IdentityKind::Node
+            && member.device_id != device
+            && view.cutoff(&member.device_id).is_none()
+    });
+    let current = state.project_at(wall)?;
+    Ok(if !peers || current == view {
+        (wall, current)
+    } else {
+        (held, view)
+    })
+}
+
+/// The directory in effect by this Node's membership clock.
+pub(crate) fn project_in(
+    connection: &Connection,
+    state: &NetworkState,
+) -> Result<AuthorizationView> {
+    Ok(membership_clock(connection, state)?.1)
+}
+
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 ///
 /// A recovery takes effect with time alone, so this also rebuilds when the same history now has
-/// another recovery key in effect; that voids every invite and join request. A key in effect here
-/// stays in effect: history that would stop it (a veto or rotation that arrives after the
-/// recovery's time) is refused, so the epoch in effect only moves forward and what moving forward
-/// does runs once.
+/// another recovery key in effect by the membership clock; that voids every invite and join
+/// request. A key in effect here stays in effect: history that would stop it (a veto or rotation
+/// that arrives after the recovery's time) is refused, so the epoch in effect only moves forward
+/// and what moving forward does runs once.
 pub(crate) fn install_trust_bundle_in(
     connection: &Connection,
     network_id: &str,
@@ -84,21 +147,21 @@ pub(crate) fn install_trust_bundle_in(
             |r| r.get(0),
         )
         .optional()?;
-    let now = crate::runtime::now_ms() as u64;
     let merged = match &previous {
         Some(previous) => {
             let previous = serde_json::from_str::<NetworkState>(previous)?;
             let merged = previous.merge(state)?;
-            merged.keeps(&previous.project_at(now)?.recovery_key, now)?;
+            let (now, view) = membership_clock(connection, &previous)?;
+            merged.keeps(&view.recovery_key, now)?;
             merged
         }
         None => state.clone(),
     };
+    let (now, view) = membership_clock(connection, &merged)?;
     if let Some(key) = recovery_since_key(connection)? {
         merged.keeps(&key, now)?;
     }
     let encoded = serde_json::to_string(&merged)?;
-    let view = merged.project_at(now)?;
     let changed = previous.as_ref() != Some(&encoded);
     let flipped = recovery_since_ms(connection, &view.recovery_key)?.is_none();
     if !changed && !flipped {
@@ -110,7 +173,7 @@ pub(crate) fn install_trust_bundle_in(
     if flipped {
         connection.execute(
             "INSERT INTO identity_meta(key,value) VALUES('recovery_since',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("{}:{}", view.recovery_key, crate::runtime::now_ms())],
+            [format!("{}:{now}", view.recovery_key)],
         )?;
         connection.execute("DELETE FROM invites", [])?;
     }
@@ -248,7 +311,8 @@ impl Store {
         }
         store.connection.execute_batch(
             "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
-            CREATE TEMP TABLE write_gate(state TEXT NOT NULL); INSERT INTO write_gate VALUES('writable');",
+            CREATE TEMP TABLE write_gate(state TEXT NOT NULL); INSERT INTO write_gate VALUES('writable');
+            CREATE TEMP TABLE membership_clock(device_id TEXT NOT NULL, synced_ms INTEGER NOT NULL);",
         )?;
         Ok(store)
     }
@@ -259,6 +323,36 @@ impl Store {
         let changed = install_trust_bundle_in(&tx, network_id, state)?;
         tx.commit()?;
         Ok(changed)
+    }
+    /// Starts this Node's membership clock; see `membership_clock`.
+    pub(crate) fn start_membership_clock(&self, device_id: &str) -> Result<()> {
+        self.connection
+            .execute_batch("DELETE FROM temp.membership_clock")?;
+        self.connection
+            .execute("INSERT INTO temp.membership_clock VALUES(?,0)", [device_id])?;
+        Ok(())
+    }
+    /// Records a finished membership exchange with `peer`. Only another Node of the directory in
+    /// effect here counts; a Node a waiting recovery would add does not.
+    pub(crate) fn note_membership_exchange(&self, peer: &str) -> Result<bool> {
+        let Some(network) = self.network()? else {
+            return Ok(false);
+        };
+        let view = membership_from(&self.connection, &network)?;
+        if view.node(peer).is_err() || view.cutoff(peer).is_some() {
+            return Ok(false);
+        }
+        let updated = self.connection.execute(
+            "UPDATE temp.membership_clock SET synced_ms=? WHERE device_id<>?",
+            params![crate::runtime::now_ms(), peer],
+        )?;
+        Ok(updated > 0)
+    }
+    /// The stored history, this Node's membership time and the directory in effect then.
+    pub(crate) fn membership_now(&self) -> Result<(NetworkState, u64, AuthorizationView)> {
+        let state = self.public_state()?;
+        let (now, view) = membership_clock(&self.connection, &state)?;
+        Ok((state, now, view))
     }
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -779,7 +873,7 @@ pub(crate) fn membership_from(
         )
         .optional()?
         .context("unknown network")?;
-    let view = serde_json::from_str::<NetworkState>(&encoded)?.project()?;
+    let view = project_in(connection, &serde_json::from_str::<NetworkState>(&encoded)?)?;
     ensure!(
         view.network_id == network_id,
         "stored membership network mismatch"

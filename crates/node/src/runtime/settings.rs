@@ -279,7 +279,7 @@ impl Runtime {
         subject: &str,
         local_cookie: Option<&str>,
     ) -> Result<()> {
-        let view = self.membership_state().await?.project()?;
+        let view = self.membership_view().await?;
         if let Some(cookie) = local_cookie {
             let device_id = self.identity.device_id()?;
             view.node(&device_id)?;

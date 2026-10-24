@@ -438,7 +438,7 @@ async fn serve_session(
     .await
     .context("client handshake timed out")??;
     if let Some(cookie) = &cookie {
-        let view = node.membership_state().await?.project()?;
+        let view = node.membership_view().await?;
         if view.client(&device_id).is_err() {
             let local =
                 node.local_access
@@ -595,8 +595,9 @@ async fn dispatch(
             let (network_id, name) = match node.has_membership().await? {
                 true => {
                     let state = node.membership_state().await?;
-                    let name = state
-                        .project()?
+                    let name = node
+                        .membership_view()
+                        .await?
                         .members
                         .into_iter()
                         .find(|m| m.device_id == device_id)
@@ -621,9 +622,7 @@ async fn dispatch(
             Ok(authenticated)
         }
         "directory" => {
-            let state = node.membership_state().await?;
-            let now = crate::runtime::now_ms();
-            let view = state.project_at(now as u64)?;
+            let (state, now, view) = node.membership_now().await?;
             let since = node.recovery_since_ms(&view.recovery_key).await?;
             Ok(json!({"view":view,"state":state,"recovery_since_ms":since,"now_ms":now}))
         }
@@ -951,8 +950,12 @@ async fn dispatch(
                     .is_ok()
                 })
                 .context("recovery key does not own this personal network")?;
-            state.check_root(key, now as u64, false)?;
-            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
+            let (heads, now) = {
+                let store = node.store.lock().await;
+                let now = crate::store::membership_clock(&store.connection, &state)?.0;
+                (store.heads(&state.genesis.network_id)?, now)
+            };
+            state.check_root(key, now, false)?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1147,7 +1150,7 @@ fn notify_join(node: &Runtime, request: &JoinRequest) {
 
 /// Reads membership; a member wins over a local cookie.
 async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
-    let view = node.membership_state().await?.project()?;
+    let view = node.membership_view().await?;
     let node_id = node.identity.device_id()?;
     ensure!(
         view.revocation(&node_id).is_none(),
@@ -1185,7 +1188,7 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
 
 /// Starting over is for the owner at this computer, once the signed removal is installed here.
 async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
-    let view = node.membership_state().await?.project()?;
+    let view = node.membership_view().await?;
     let node_id = node.identity.device_id()?;
     ensure!(
         view.revocation(&node_id).is_some(),
@@ -1209,9 +1212,8 @@ async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
     Ok(session.cookie.is_some()
         && (!node.has_membership().await?
             || node
-                .membership_state()
+                .membership_view()
                 .await?
-                .project()?
                 .client(&session.device_id)
                 .is_err()))
 }
@@ -1226,7 +1228,7 @@ async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
 }
 
 async fn manager_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
-    let view = node.membership_state().await?.project()?;
+    let view = node.membership_view().await?;
     view.manager(&session.device_id)?;
     Ok(view)
 }
@@ -1237,10 +1239,9 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     if !node.has_membership().await? {
         return Ok(json!({"principal":null,"initialized":false,"revoked":false}));
     }
-    let state = node.membership_state().await?;
-    // The browser checks the view against the state at this same time.
-    let now = crate::runtime::now_ms();
-    let view = state.project_at(now as u64)?;
+    // The browser checks the view against the state at this same time: this Node's membership
+    // time, which lags the wall clock while a recovery due here waits for another Node.
+    let (state, now, view) = node.membership_now().await?;
     match principal(node, session).await {
         Ok(principal) => Ok(
             json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled(),"now_ms":now}),

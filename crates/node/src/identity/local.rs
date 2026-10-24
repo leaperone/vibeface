@@ -111,7 +111,7 @@ impl Store {
         capability: &str,
         client: &str,
     ) -> Result<AuthorizationView> {
-        let view = state.project()?;
+        let view = crate::store::project_in(&self.connection, &state)?;
         // A recovery here waits like any other; its new manager is in the waiting directory.
         let members = view.pending.as_ref().map_or(&view.members, |p| &p.members);
         ensure!(
@@ -131,7 +131,7 @@ impl Store {
     }
 
     pub fn init_network(&self, state: NetworkState) -> Result<AuthorizationView> {
-        let view = state.project()?;
+        let view = crate::store::project_in(&self.connection, &state)?;
         self.transaction(|tx| {
             ensure!(!has_network_in(tx)?, "network already installed");
             save_state(tx, &state)?;
@@ -163,7 +163,7 @@ impl Store {
             } else {
                 incoming
             };
-            let view = next.project()?;
+            let view = crate::store::project_in(tx, &next)?;
             let rebuilt = save_state(tx, &next)?;
             Ok((view, rebuilt))
         })
@@ -184,7 +184,7 @@ impl Store {
         );
         let join_id = invite_id(&record.invite_hash)?;
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             ensure!(record.network_id == view.network_id, "invite belongs to another network");
             view.manager(issuer)?;
             let encoded = serde_json::to_string(record)?;
@@ -231,7 +231,7 @@ impl Store {
         let kind = kind.as_str().context("invalid device kind")?;
         let now = now_ms();
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             let row = load_request(tx, "invite_hash", &invite_hash)?
                 .context("ticket is unknown or already expired")?;
             if row.status.is_some() {
@@ -268,7 +268,7 @@ impl Store {
     ) -> Result<JoinRequest> {
         let now = now_ms();
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
             ensure!(row.device_id.as_deref() == Some(device), "join request belongs to another device");
             let current = row.view(&view, now)?;
@@ -299,7 +299,7 @@ impl Store {
 
     /// Requests a management device may approve; any manager may answer any request.
     pub fn pending_joins(&self, admin: &str) -> Result<Vec<JoinRequest>> {
-        let view = load_state(&self.connection)?.project()?;
+        let view = crate::store::project_in(&self.connection, &load_state(&self.connection)?)?;
         view.manager(admin)?;
         let now = now_ms();
         let mut statement = self.connection.prepare(
@@ -324,7 +324,7 @@ impl Store {
     pub fn withdraw_join(&self, join_id: &str, device: &str) -> Result<JoinRequest> {
         let now = now_ms();
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
             ensure!(
                 row.device_id.as_deref() == Some(device),
@@ -349,7 +349,7 @@ impl Store {
         super::validate_hash(nonce)?;
         let now = now_ms();
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             view.manager(admin)?;
             let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
             let current = row.view(&view, now)?;
@@ -385,7 +385,7 @@ impl Store {
         let hash = event.hash()?;
         self.transaction(|tx| {
             let mut state = load_state(tx)?;
-            let view = state.project()?;
+            let view = crate::store::project_in(tx, &state)?;
             let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
             let current = row.view(&view, now)?;
             if current.status == JoinStatus::Joined {
@@ -418,7 +418,9 @@ impl Store {
             );
             state.append(event)?;
             ensure!(
-                state.project()?.member(&current.device_id).is_ok(),
+                crate::store::project_in(tx, &state)?
+                    .member(&current.device_id)
+                    .is_ok(),
                 "grant did not admit the device"
             );
             save_state(tx, &state)?;
@@ -428,7 +430,7 @@ impl Store {
             )?;
             let joined = load_request(tx, "join_id", join_id)?
                 .context("join request vanished")?
-                .view(&state.project()?, now)?;
+                .view(&crate::store::project_in(tx, &state)?, now)?;
             Ok((joined, state))
         })
     }
@@ -441,7 +443,7 @@ impl Store {
     pub fn reject_join(&self, join_id: &str, admin: &str) -> Result<JoinRequest> {
         let now = now_ms();
         self.transaction(|tx| {
-            let view = load_state(tx)?.project()?;
+            let view = crate::store::project_in(tx, &load_state(tx)?)?;
             view.manager(admin)?;
             let row = load_request(tx, "join_id", join_id)?.context("join request not found")?;
             match row.view(&view, now)?.status {
