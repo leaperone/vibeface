@@ -812,10 +812,10 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
   const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
   const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
   let messages: object[] = [ask]
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => ({
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
-  }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint, threadReplies }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")
@@ -856,8 +856,8 @@ test("a link no phone can open shows no QR code", async () => {
   const shown = async (link: string, publicEntry: boolean) => {
     const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
-      '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
-      '@/lib/node': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+      '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
     }, { setInterval: () => 0, clearInterval: () => {} })
     try {
       app.render('AddDevice'); app.render('AddDevice').find(({ props }) => [props.children].flat().includes('生成链接'))?.props.onClick?.(); await settleComponent()
