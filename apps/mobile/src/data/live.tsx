@@ -73,11 +73,15 @@ function Live({ children }: { children: ReactNode }) {
   const conversations: Record<string, Conversation> = {}
   if (data && conversationId) {
     const jobs = data.scheduler?.jobs ?? []
-    // A streamed reply gives way once its job ends or its final reply is in the history, even before the job names it.
-    const live = shared.liveProgress.find((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text
-      && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || data.messages.some((message) => message.message_id === job.reply_message_id
-        || message.role === 'assistant' && message.in_reply_to !== undefined && message.in_reply_to === job.message_id))))
-    const liveTrigger = live?.kind === 'manager' ? jobs.find((job) => job.trigger === live.trigger)?.message_id : undefined
+    // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
+    // streaming, which can land a frame or two before the job names it.
+    const newest = data.messages.at(-1)
+    const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
+    const handedOver = newest?.role === 'assistant' && streamed.some((progress) => newest.text.startsWith(progress.text.trim()))
+    const live = streamed.find((progress) => !(newest?.role === 'assistant' && newest.text.startsWith(progress.text.trim()))
+      && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
+    // The message it answers, so the streamed row and the final reply share a row; a reply answers the latest user message.
+    const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? data.messages.findLast((message) => message.role === 'user')?.message_id)
     const messages: ChatMessage[] = threadReplies(data.messages)
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
@@ -89,7 +93,7 @@ function Live({ children }: { children: ReactNode }) {
       messages, questions: data.questions, works: data.works,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
-      replying: Boolean(live) || jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
+      replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
         || job.reply_message_id && job.message_id
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
