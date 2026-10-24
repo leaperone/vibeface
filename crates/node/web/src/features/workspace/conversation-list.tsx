@@ -47,7 +47,7 @@ export function ConversationList() {
 type RowProps = { icon: LucideIcon; avatar?: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string } & ({ to: "/inbox"; params?: never } | { to: "/b/$botId"; params: { botId: string } })
 
 function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }: RowProps) {
-  return <Link {...link} className="flex min-h-16 items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-muted/70 focus-visible:bg-muted/70 active:bg-muted">
+  return <Link {...link} className="flex min-h-16 items-center gap-3 interactive-row rounded-xl px-3 py-2.5">
     {avatar ?? <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-5" /></span>}
     <span className="grid min-w-0 flex-1 gap-0.5">
       <span className="flex min-w-0 items-center gap-2">

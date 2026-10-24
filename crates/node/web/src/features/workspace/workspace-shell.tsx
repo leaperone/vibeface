@@ -166,7 +166,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"} title="待处理">
               <Inbox aria-hidden="true" />
-              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 md:-top-0.5 md:-right-0.5" /> : null}
+              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
           </div>
@@ -225,7 +225,7 @@ export function ConnectionCapsule() {
         : { label: "在线", icon: Wifi, tone: "text-success" }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
         <span className="min-w-0 flex-1 truncate">{name}</span>
         <span className={cn("shrink-0", state.tone)}>{state.label}</span>
@@ -242,7 +242,7 @@ export function ConnectionCapsule() {
         {others.length ? <>
           <p className="mt-1 font-medium">换一台设备</p>
           <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={`${item.address}:${item.device_id}`}>
-            <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
+            <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted active:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
               <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(item.address)}</span>
               <ArrowRightLeft aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             </button>

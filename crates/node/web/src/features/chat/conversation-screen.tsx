@@ -219,8 +219,8 @@ export function ConversationScreen() {
         </div> : null}
       />
       <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-10 max-md:ps-3"
-          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-10 max-md:ps-3"
+          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
           <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
@@ -266,12 +266,12 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
-  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
     <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
@@ -322,7 +322,7 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
           <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
         </span>
       </span>
-      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/40 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
+      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
         <ArrowRightLeft aria-hidden="true" className="size-4" />
         <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
           <option value="" disabled>转给…</option>

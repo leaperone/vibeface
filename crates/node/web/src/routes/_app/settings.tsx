@@ -52,7 +52,7 @@ function SettingsPage() {
       <RecoveryControls />
     </SettingsGroup> : null}
     {operator ? <SettingsGroup title="排障" footer="诊断包不含登录信息和加入链接">
-      <Link to="/settings/logs" className="block transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60">
+      <Link to="/settings/logs" className="interactive-row block">
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
       <SettingsRow icon={Download} label="诊断包">
