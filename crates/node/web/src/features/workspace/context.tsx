@@ -574,10 +574,17 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
       requireBotContext(id)
       const receipt = record(await connection.rpc("cancel_manager", { conversation_id: id, trigger }))
       requireCurrent()
+      const stopped = (state: unknown) => state === "cancelled" ? "已停止回复，已开始的任务会继续。" : "已请求停止回复，已开始的任务会继续。"
+      if (receipt.unconfirmed === true) {
+        // The owner did not answer in time; the stop is not sent again, the owner's state settles it.
+        if (activeId.current === id) await refreshRef.current()
+        const job = dataRef.current?.scheduler?.jobs.find((item) => item.trigger === trigger)
+        setNoticeText(job && ["cancelling", "cancelled"].includes(job.state) ? stopped(job.state) : "停止未确认")
+        return
+      }
       const job = record(receipt.job)
       if (receipt.publication_pending === true) setNoticeText("本轮已有结果，正在补齐发布；未提交停止请求。")
-      else if (receipt.cancel_requested === true && job.state === "cancelled") setNoticeText("已停止回复，已开始的任务会继续。")
-      else if (receipt.cancel_requested === true) setNoticeText("已请求停止回复，已开始的任务会继续。")
+      else if (receipt.cancel_requested === true) setNoticeText(stopped(job.state))
       else setNoticeText("现在停不了，请再查一次。")
       if (activeId.current === id) await refreshRef.current()
     }),

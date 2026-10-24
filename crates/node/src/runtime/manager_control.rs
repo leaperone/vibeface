@@ -16,6 +16,9 @@ pub struct ManagerAccess {
     pub trigger: String,
 }
 
+/// How long a stop waits for the conversation's owner, which first drains the reply's tools.
+const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(super) struct ActiveManager {
     access: Access,
     token: String,
@@ -172,18 +175,65 @@ impl Runtime {
         Ok(())
     }
 
+    /// The user's stop. A reply this Node does not hold is stopped by the conversation's owner;
+    /// an unanswered request there is reported unconfirmed and never sent again.
     pub(super) async fn cancel_manager(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "only the user stops a management reply");
         let scope = super::field(input, "conversation_id")?;
         let trigger = super::field(input, "trigger")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let job = self
-            .store
-            .lock()
+        let local = self.identity.device_id()?;
+        let remote = {
+            let store = self.store.lock().await;
+            let held = store
+                .scheduler_job(scope, trigger)?
+                .is_some_and(|job| !job.state.terminal());
+            let owner = store
+                .conversation(network, scope)?
+                .and_then(|conversation| conversation.owner);
+            owner.filter(|owner| !held && owner != &local)
+        };
+        let Some(owner) = remote else {
+            return self
+                .cancel_local_manager(network, scope, trigger)
+                .await?
+                .context("this reply is no longer queued here; refresh the conversation");
+        };
+        let request =
+            json!({"type":"cancel_manager","human":true,"conversation_id":scope,"trigger":trigger});
+        match tokio::time::timeout(OWNER_STOP_WAIT, self.peer_request(network, &owner, request))
             .await
-            .request_manager_cancel(&self.identity, network, scope, trigger)?
-            .context("this reply is scheduled on another device; stop it there")?;
+        {
+            Ok(Ok(mut receipt)) => {
+                receipt["owner"] = json!(owner);
+                Ok(receipt)
+            }
+            outcome => {
+                if let Ok(Err(error)) = outcome {
+                    tracing::debug!(%error, "stop sent to the conversation's owner is unconfirmed");
+                }
+                Ok(json!({"cancel_requested":false,"unconfirmed":true,"owner":owner}))
+            }
+        }
+    }
+
+    /// Stops a reply this Node schedules; `None` when it holds no such job.
+    pub(super) async fn cancel_local_manager(
+        &self,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+    ) -> Result<Option<Value>> {
+        let Some(job) = self.store.lock().await.request_manager_cancel(
+            &self.identity,
+            network,
+            scope,
+            trigger,
+        )?
+        else {
+            return Ok(None);
+        };
         if let JobState::Cancelling { attempt } = &job.state {
             self.fence_manager_attempt(&attempt.id).await?;
         }
@@ -192,7 +242,7 @@ impl Runtime {
             JobState::Cancelling { .. } | JobState::Cancelled { .. }
         );
         self.publish_changed(network, scope, Changed::Job(trigger));
-        Ok(json!({"job":job,"cancel_requested":cancel_requested}))
+        Ok(Some(json!({"job":job,"cancel_requested":cancel_requested})))
     }
 
     /// A coordination turn left over from a crash is checked by its recorded process groups and

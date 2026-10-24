@@ -76,8 +76,13 @@ function attachments(value: unknown) { return value == null ? undefined : list(v
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
-  const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities)
-  return { unanswered: list(data.unanswered).map(text), jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined } }), provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined }
+  const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities), remote = data.remote == null ? null : record(data.remote)
+  return {
+    unanswered: list(data.unanswered).map(text),
+    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined,
+    remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
+  }
 }
 function workState(value: unknown): WorkState {
   switch (value) {

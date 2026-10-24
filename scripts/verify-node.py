@@ -2543,13 +2543,16 @@ def phase1_acceptance(options):
                 and {job["trigger"] for job in completed_jobs} == {call["trigger"] for call in calls(name)},
                 "each uncancelled trigger invokes once and queued cancellation remains terminal")
         replies = [message for message in snapshot["messages"] if message["role"] == "assistant"]
+        stopped_replies = [message for message in replies if message.get("in_reply_to") == "queue-cancelled"]
+        require(len(stopped_replies) == 1 and stopped_replies[0]["status"] == "stopped"
+                and stopped_replies[0]["message_id"] == cancelled_job["reply_message_id"]
+                and sum(message["message_id"] == "queue-cancelled" for message in snapshot["messages"]) == 1,
+                "cancelled queued work keeps its user message and gets one stopped reply without an SDK call")
+        replies = [message for message in replies if message not in stopped_replies]
         require(len(replies) == 6 and all(sum(message["message_id"] == job["reply_message_id"] for message in replies) == 1
                 and next(message for message in replies if message["message_id"] == job["reply_message_id"])["in_reply_to"]
                 == job["message_id"] for job in completed_jobs),
                 "each completed job has exactly one bot reply pointing at its message")
-        require(not any(message.get("in_reply_to") == "queue-cancelled" for message in replies)
-                and sum(message["message_id"] == "queue-cancelled" for message in snapshot["messages"]) == 1,
-                "cancelled queued work keeps its user message without an SDK call or reply")
         require(calls(name)[1]["resumed"] and calls(name)[0]["native_session_id"] == calls(name)[1]["native_session_id"],
                 "consecutive calls preserve the local native session")
         passed("busy messages persist, retry deduplicates, queued cancellation is final and replies match",
@@ -2894,6 +2897,47 @@ def acceptance(options):
                  if row["role"] == "user"]
         require(sorted(shown) == ["m1", "m2-delivered", "m3", "m4"], "each message appears once after failover")
         passed("entrance-switch", heads=final, messages=shown)
+
+        at_c = browser(c, a.client)
+        at_c.connect(c.device_id)
+        at_c.authenticate()
+        at_c.call("subscribe")
+        directive = json.dumps({"label": "remote-stop", "gate": str(run / "never-release-remote-stop")})
+        held = at_c.call("rpc", signed_message(at_c, conversation, "m5-stop", directive))
+
+        def owner_job(state):
+            view = at_c.rpc("conversation", conversation_id=conversation)
+            job = next((row for row in view["scheduler"]["jobs"] if row["trigger"] == held["trigger"]), None)
+            return view if job and job["state"] == state and job.get("source_node") == a.device_id \
+                and view["scheduler"]["remote"] == {"owner": a.device_id, "reachable": True} else None
+        view = wait_for("C shows A's running reply", lambda: owner_job("running"), timeout=60)
+        require(view["observation_targets"] == [a.device_id] and view["scheduler"]["capabilities"]["cancel"] is True,
+                "C follows A's progress and offers A's stop")
+        wait_for("C receives the text A's reply streams", lambda: [
+            event for event in at_c.command("events") if event.get("payload", {}).get("type") == "manager_progress"
+            and event["payload"].get("trigger") == held["trigger"] and event["payload"].get("source_node") == a.device_id])
+        receipt = at_c.rpc("cancel_manager", conversation_id=conversation, trigger=held["trigger"])
+        require(receipt.get("cancel_requested") is True and receipt.get("owner") == a.device_id, "C's stop is carried out by A")
+        wait_for("A stops its reply", lambda: (scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled")
+        stopped = wait_for("C shows the stopped reply", lambda: [
+            row for row in at_c.rpc("conversation", conversation_id=conversation)["messages"]
+            if row.get("in_reply_to") == "m5-stop" and row.get("status") == "stopped"])
+        require(len(invocations(run, "remote-stop")) == 1 and scheduler_records(c, network) == [],
+                "the reply ran once on A and C stored none of its jobs")
+        a.stop()
+        unconfirmed = at_c.rpc("cancel_manager", conversation_id=conversation, trigger=held["trigger"])
+        require(unconfirmed == {"cancel_requested": False, "unconfirmed": True, "owner": a.device_id},
+                "a stop A does not answer is unconfirmed")
+        away = at_c.rpc("conversation", conversation_id=conversation)["scheduler"]
+        require(away["remote"] == {"owner": a.device_id, "reachable": False}
+                and not any(row.get("source_node") for row in away["jobs"]), "C shows A's state as unknown, not stale")
+        a.start()
+        a.client.connect()
+        a.client.authenticate()
+        wait_for("the Nodes converge after A returns", lambda: converged(members, network), timeout=60)
+        require((scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled"
+                and len(invocations(run, "remote-stop")) == 1, "the unconfirmed stop changed nothing on A")
+        passed("cross-device-stop", trigger=held["trigger"], reply=stopped[0]["message_id"])
 
         a.client.revoke(c.device_id, head(a, network, c.device_id))
         wait_for("P drops C's entrance after the revocation", lambda: all(

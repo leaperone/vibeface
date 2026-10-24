@@ -462,7 +462,10 @@ impl Runtime {
         match change {
             Changed::Event(hash) => payload["event_hash"] = json!(hash),
             Changed::Work(work_id) => payload["work_id"] = json!(work_id),
-            Changed::Job(trigger) => payload["trigger"] = json!(trigger),
+            Changed::Job(trigger) => {
+                payload["trigger"] = json!(trigger);
+                self.hint_job_changed(network, scope);
+            }
             Changed::Reload => {}
         }
         let _ = self.events.send(Update {
