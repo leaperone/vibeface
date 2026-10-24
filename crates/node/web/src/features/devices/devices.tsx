@@ -65,7 +65,7 @@ function Hint({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
   return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className="size-4 text-muted-foreground" /><span className="sr-only">{label}</span></span>
 }
 
-export function DevicesPage({ actions }: { actions?: ReactNode }) {
+export function DevicesPage() {
   const device = useDevice()
   const rows = useDeviceRows()
   const { nodes } = useWorkspace()
@@ -73,7 +73,6 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
   return <div className="mx-auto grid w-full max-w-3xl gap-6">
-    {actions ? <div className="flex justify-end">{actions}</div> : null}
     <JoinRequests />
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>

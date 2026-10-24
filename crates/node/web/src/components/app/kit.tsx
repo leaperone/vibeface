@@ -1,6 +1,7 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
+import { createPortal } from "react-dom"
 import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
@@ -57,6 +58,14 @@ export function CountBadge({ count, label, className }: { count: number; label?:
 /** Brand for news; warning for something that needs a look. */
 export function Dot({ tone = "brand", label, className }: { tone?: "brand" | "warning"; label?: string; className?: string }) {
   return <span aria-label={label} className={cn("size-2 shrink-0 rounded-full", tone === "brand" ? "bg-brand" : "bg-warning", className)} />
+}
+
+/** The header's trailing slot, set by the shell. */
+export const PageActionsSlot = createContext<HTMLElement | null>(null)
+/** Puts a page's own actions on the right of the page header, next to the shell's buttons. */
+export function PageActions({ children }: { children: ReactNode }) {
+  const slot = useContext(PageActionsSlot)
+  return slot ? createPortal(children, slot) : null
 }
 
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
@@ -175,16 +184,19 @@ export function StatusPill({ tone = "neutral", icon: Icon, children, className }
   </span>
 }
 
-/** Shared by approvals, join requests and confirmations, in chat and in /inbox. */
-export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, children, actions, className }: {
-  icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; menu?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
+/**
+ * Shared by approvals, join requests and confirmations, in chat and in /inbox.
+ * `trailing`: a card with a single action keeps it on the title row instead of a footer of its own.
+ */
+export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing, children, actions, className }: {
+  icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; trailing?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
 }) {
   return <section className={cn("grid gap-3 rounded-xl border p-4 shadow-xs", toneCard[tone], className)}>
     <header className="flex min-w-0 flex-wrap items-center gap-2.5">
       <span className={cn("grid size-7 shrink-0 place-items-center rounded-lg", toneChip[tone])}><Icon aria-hidden="true" className="size-4" /></span>
       <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
       {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-9.5">{meta}</span> : null}
-      {menu}
+      {trailing ? <div className="-my-1 shrink-0">{trailing}</div> : null}
     </header>
     {children ? <div className="grid min-w-0 gap-2">{children}</div> : null}
     {actions ? <div className="flex flex-wrap justify-end gap-2">{actions}</div> : null}

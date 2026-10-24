@@ -6,8 +6,8 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { BotAvatar, CountBadge, dismissToast, Dot, EmptyState, Skeleton, toast, Wordmark } from "@/components/app/kit"
-import { joinsOnScreen, onJoinCardShown, useOpenJoins } from "@/features/devices/join"
+import { BotAvatar, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
@@ -46,7 +46,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const device = useDevice()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = useInbox().filter((item) => !item.done).length
-  const { setOpenMobile } = useSidebar()
+  const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const back = backTo(pathname)
@@ -56,7 +56,10 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? "我的设备" : "")
   const navigate = useNavigate()
   const joins = useOpenJoins()
-  const announced = useRef(new Set<string>())
+  const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
+  // The phone's home lists 待处理 itself; elsewhere the header carries it whenever the sidebar is out of sight.
+  const phoneHome = isMobile && pathname === "/"
+  const inboxInHeader = (isMobile || !sidebarOpen) && !phoneHome && pathname !== "/inbox"
   const devicesAttention = joins.length > 0 || workspace.nodes.some((node) => !node.revoked && !node.online)
 
   useEffect(() => { setOpenMobile(false) }, [pathname, setOpenMobile])
@@ -68,25 +71,6 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     const timer = setInterval(refresh, 30_000)
     return () => clearInterval(timer)
   }, [device.ready])
-  // A request that was answered or expired takes its toast with it.
-  const joinToasts = useRef(new Map<string, number>())
-  useEffect(() => {
-    for (const join of joins) {
-      if (announced.current.has(join.join_id)) continue
-      announced.current.add(join.join_id)
-      if (joinsOnScreen()) continue
-      joinToasts.current.set(join.join_id, toast(`${join.name || "新设备"} 想加入`, { action: { label: "查看", onClick: () => { void navigate({ to: "/inbox" }) } } }))
-    }
-    for (const [joinId, toastId] of joinToasts.current) {
-      if (joins.some((join) => join.join_id === joinId)) continue
-      dismissToast(toastId)
-      joinToasts.current.delete(joinId)
-    }
-  }, [joins.map((join) => join.join_id).join()])
-  useEffect(() => onJoinCardShown(() => {
-    for (const toastId of joinToasts.current.values()) dismissToast(toastId)
-    joinToasts.current.clear()
-  }), [])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
 
@@ -96,7 +80,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   }
 
   return (
-    <CreateBot.Provider value={openCreator}>
+    <CreateBot.Provider value={openCreator}><PageActionsSlot.Provider value={actionsSlot}>
       <a className="skip-link" href="#main">跳到主要内容</a>
       <Sidebar aria-label="导航">
         <SidebarHeader className="shrink-0 px-4 pt-4 pb-2">
@@ -151,12 +135,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
             {chatRoute ? <BotPanelButton /> : null}
             <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
           </div>
-          {back ? pathname === "/inbox" ? null : <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">
-            <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
-              <Inbox aria-hidden="true" />
-              {waiting ? <CountBadge count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background" /> : null}
-            </Link>
-          </Button> : <div className="-me-3 flex md:hidden">
+          <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
+          {phoneHome ? <div className="-me-3 flex">
             <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
                 <MonitorSmartphone aria-hidden="true" />
@@ -164,7 +144,12 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
               </Link>
             </Button>
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
-          </div>}
+          </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
+            <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"} title="待处理">
+              <Inbox aria-hidden="true" />
+              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 md:-top-0.5 md:-right-0.5" /> : null}
+            </Link>
+          </Button> : null}
         </header>
         {workspace.joined ? null : <LocalSession onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
@@ -180,7 +165,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         if (target?.isConnected && target.getClientRects().length) target.focus()
         else document.getElementById("main")?.focus()
       }} />
-    </CreateBot.Provider>
+    </PageActionsSlot.Provider></CreateBot.Provider>
   )
 }
 
