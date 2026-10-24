@@ -898,7 +898,13 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const active = await open(wait.entry)
     await recoveredAs(await callSession(active, 'authenticate', { network_id: wait.networkId }), active, wait)
   }
-  function dismissRecovery() { try { store('recovery-wait', null) } catch {} setRecovery(null) }
+  /** Forgets this browser's recovery; with no connection open, the Node it went through stays the one to try again on. */
+  function dismissRecovery() {
+    const wait = loadWait()
+    try { store('recovery-wait', null) } catch {}
+    setRecovery(null)
+    if (wait && !session.current) setEntry(wait.entry)
+  }
   /** A new recovery file under a new password. Recovery moves to its key, so every older file stops working. */
   async function replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }) {
     const connection = ready
