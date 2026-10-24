@@ -59,6 +59,12 @@ type DeviceContextValue = {
   recovery: RecoveryWait | null; dismissRecovery(): void
   /** This browser's recovery took effect; its new file still waits to be confirmed as saved. */
   recovered: boolean; finishRecovered(): void
+  /** A new recovery file not yet confirmed as saved; `attempted` once a download was handed to the platform. */
+  unsavedRecovery: UnsavedRecovery | null
+  /** Hands the kept file to the platform again, from a tap, for when the first download was blocked or lost. */
+  downloadUnsavedRecovery(): Promise<void>
+  /** Drops the kept file once the person confirmed it is saved, or it no longer matters. */
+  forgetUnsavedRecovery(): void
   /** The name this browser last saw a device listed under, kept past its removal. */
   knownName(deviceId: string): string | null
   joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
@@ -75,6 +81,21 @@ type DeviceContextValue = {
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
 }
 const DeviceContext = createContext<DeviceContextValue | null>(null)
+export type UnsavedRecovery = { name: string; code: string; attempted: boolean }
+type KeptRecovery = UnsavedRecovery & { bytes: Uint8Array }
+const UNSAVED_KEY = 'vibeface.unsaved-recovery'
+/** This tab's session storage, where it exists: a reload keeps the sealed file, closing the tab drops it. */
+function tabStorage(): Storage | null { try { return globalThis.sessionStorage ?? null } catch { return null } }
+const toBase64 = (bytes: Uint8Array) => { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary) }
+const fromBase64 = (text: string) => Uint8Array.from(atob(text), char => char.charCodeAt(0))
+function loadKept(): KeptRecovery | null {
+  try {
+    const value: unknown = JSON.parse(tabStorage()?.getItem(UNSAVED_KEY) ?? 'null')
+    if (!value || typeof value !== 'object') return null
+    const { name, code, attempted, data } = value as Record<string, unknown>
+    return typeof name === 'string' && typeof code === 'string' && typeof data === 'string' ? { name, code, attempted: attempted === true, bytes: fromBase64(data) } : null
+  } catch { return null }
+}
 class AuthenticationError extends Error {}
 const sinceOf = (response: Record<string, unknown>) => typeof response.recovery_since_ms === 'number' ? response.recovery_since_ms : null
 const INVITE_TTL_MS = 10 * 60 * 1000
@@ -175,6 +196,11 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [recovery, setRecovery] = useState<RecoveryWait | null>(null)
   // Kept so a reload before the new file is confirmed still lands on it; the wait record goes, so a reload resumes as usual.
   const [recovered, setRecovered] = useState(load('recovered') === true)
+  const kept = useRef<KeptRecovery | null>(null)
+  const [unsavedRecovery, setUnsavedRecovery] = useState<UnsavedRecovery | null>(() => {
+    kept.current = loadKept()
+    return kept.current && { name: kept.current.name, code: kept.current.code, attempted: kept.current.attempted }
+  })
   const [, setDismissals] = useState(0)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
@@ -787,6 +813,27 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     if (!page) throw new Error('请在这台电脑上打开它的本机页面。')
     page.open(url.href)
   }
+  function setKept(next: KeptRecovery | null) {
+    if (kept.current && kept.current.bytes !== next?.bytes) kept.current.bytes.fill(0)
+    kept.current = next
+    try { if (next) tabStorage()?.setItem(UNSAVED_KEY, JSON.stringify({ name: next.name, code: next.code, attempted: next.attempted, data: toBase64(next.bytes) })); else tabStorage()?.removeItem(UNSAVED_KEY) } catch {}
+    setUnsavedRecovery(next && { name: next.name, code: next.code, attempted: next.attempted })
+  }
+  /**
+   * Keeps a new recovery file until the person confirms it is saved, then tries the download once. A browser may block
+   * or drop a download that does not follow a tap, so the page offers it again from the kept copy.
+   */
+  async function keepRecoveryFile(bytes: Uint8Array, code: string) {
+    const file: KeptRecovery = { name: recoveryFileName(code), code, attempted: false, bytes: bytes.slice() }
+    setKept(file)
+    try { await platform.saveRecovery(file.bytes, file.name); if (kept.current === file) setKept({ ...file, attempted: true }) } catch {}
+  }
+  async function downloadUnsavedRecovery() {
+    const file = kept.current
+    if (!file) throw new Error('这份恢复文件已清除。')
+    await platform.saveRecovery(file.bytes, file.name)
+    if (kept.current === file) setKept({ ...file, attempted: true })
+  }
   /**
    * Root recovery keeps every current member by default, adds this device as a manager and hands recovery to a new
    * file. It takes effect two days later unless a manager it would replace stops it; this browser keeps a record of it
@@ -852,7 +899,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
               const checkpoint: unknown = JSON.parse(verified.createRecoveryCheckpoint(opened.root, next.deviceId(), JSON.stringify(selected), JSON.stringify(heads)))
               const checkpoints = [...chain, checkpoint]
               const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints, events }, next, password)
-              try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
+              try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
               prepared = { checkpoints, checkpoint }
             } finally { next.free(); verified?.free() }
             password = ''
@@ -927,7 +974,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, next.deviceId()))
         checkpoints = [...array(state.checkpoints), checkpoint]
         const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints, events: array(state.events) }, next, password)
-        try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
+        try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
       await connection.request('recover', { genesis: state.genesis, checkpoints, events: state.events })
       await refreshDirectory()
@@ -1069,7 +1116,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     cancelSensitive,
     pendingRecovery, vetoRecovery, nodeClockOffset,
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
-    recovery, dismissRecovery, recovered,
+    recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
+    forgetUnsavedRecovery() { setKept(null) },
     finishRecovered() { try { store('recovered', null) } catch {} setRecovered(false) },
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>

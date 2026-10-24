@@ -67,6 +67,14 @@ export function CurrentRecoveryFile() {
   </SettingsRow>
 }
 
+/** A time within the next days as people say it: 今天、明天、后天 and the clock, later ones with their date. */
+export function whenText(at: number, now = Date.now()) {
+  const day = (time: number) => { const date = new Date(time); return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000 }
+  const clock = new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  const ahead = day(at) - day(now)
+  return ahead >= 0 && ahead <= 2 ? `${['今天', '明天', '后天'][ahead]} ${clock}` : `${new Date(at).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })} ${clock}`
+}
+
 /** Hours until `at` on this browser's clock, at least one while it has not passed. */
 export const hoursUntil = (at: number) => Math.max(1, Math.ceil((at - Date.now()) / 3_600_000))
 
@@ -137,32 +145,52 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   </>
 }
 
+/**
+ * A new recovery file this page made and still holds: downloaded once on its own, offered again from a tap until the
+ * person confirms it is kept apart from its password, which drops the copy.
+ */
+export function UnsavedRecoveryFile() {
+  const { unsavedRecovery: file, downloadUnsavedRecovery, forgetUnsavedRecovery } = useDevice()
+  const [error, setError] = useState('')
+  if (!file) return null
+  return <>
+    <SaveRecoveryFile code={file.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }}
+      download={{ done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } }} />
+    <InlineError error={error || null} />
+  </>
+}
+
 /** This browser's recovery while it waits on the Node, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
-  const { recovery, dismissRecovery } = useDevice()
+  const { recovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
     <p className="text-muted-foreground">刚下载的新文件用不了</p>
-    <Button type="button" className="w-fit justify-self-end" onClick={dismissRecovery}>知道了</Button>
+    <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
   return <Panel icon={Hourglass} title="等待生效">
     {at === null ? null : <>
       <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{at > Date.now() ? `剩余 ${hoursUntil(at)} 小时` : '马上生效'}</p>
-      <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{new Date(at).toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>生效后自动进入</p>
+      <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>生效后自动进入</p>
     </>}
     <p className="flex items-center gap-2 text-muted-foreground"><ShieldAlert aria-hidden="true" className="size-4 shrink-0" />期间你的其他设备可以拦下</p>
+    <UnsavedRecoveryFile />
   </Panel>
 }
 
 /** After a recovery took effect, before anything else: its new file was downloaded unasked, so it gets confirmed here. */
 export function RecoveredStep() {
-  const { directory, finishRecovered } = useDevice()
+  const { directory, finishRecovered, unsavedRecovery: file, downloadUnsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   const [saved, setSaved] = useState(false)
+  const [error, setError] = useState('')
+  // Ticking 已分开保存 drops the copy this page held for another download.
   return <Panel icon={FileKey} title="保存新的恢复文件">
     <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已找回，旧文件已作废</p>
-    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={setSaved} />
-    <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={finishRecovered}>完成</Button>
+    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={(value) => { setSaved(value); if (value) forgetUnsavedRecovery() }}
+      download={file ? { done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } } : undefined} />
+    <InlineError error={error || null} />
+    <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={() => { forgetUnsavedRecovery(); finishRecovered() }}>完成</Button>
   </Panel>
 }
 
@@ -250,7 +278,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           await work
           if (device.ready) setRotateHint(device.ready.principal.network_id, false)
           if (!only) setOpen(undefined)
-        }, '已下载新文件，旧恢复文件已失效')
+        }, '已换密码，旧恢复文件已失效')
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
@@ -260,6 +288,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       </fieldset></form>
     </>, PASSWORD_HASH) : null
   const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null
+  const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile /></section> : null
   if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
   return <>
     <SettingsRow icon={ArchiveRestore} label="用恢复文件找回" expanded={open === 'restore'} className={open === 'restore' ? 'border-b-0' : undefined} onClick={() => toggle('restore')} />
@@ -267,5 +296,6 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     <SettingsRow icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => toggle('passphrase')} />
     {passphraseForm}
     {done}
+    {unsaved}
   </>
 }
