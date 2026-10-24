@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArchiveRestore, FileKey, KeyRound } from 'lucide-react'
-import { BusyIcon, Details, DetailRow, FilePicker, InlineError, toast } from '@/components/app/kit'
+import { BusyIcon, Details, DetailRow, FilePicker, InlineError, SettingsRow, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Member } from '@/lib/node'
@@ -52,11 +52,9 @@ export function CurrentRecoveryFile() {
     return () => { live = false }
   }, [key])
   if (!key || code?.key !== key) return null
-  return <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-lg bg-muted/60 px-3 py-2 text-meta">
-    <span className="flex min-w-0 items-center gap-2"><FileKey aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="sr-only">有效的文件 </span><span className="min-w-0 font-mono [overflow-wrap:anywhere]">{recoveryFileStem(code.value)}</span></span>
-    {recoverySince ? <time className="text-muted-foreground tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time> : null}
-    <span className="text-muted-foreground">只有这份有效，丢了不能补</span>
-  </p>
+  return <SettingsRow icon={FileKey} label="恢复文件" description={<span className="font-mono">{recoveryFileStem(code.value)}</span>}>
+    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time> : null}
+  </SettingsRow>
 }
 
 /** After unlocking a recovery file: keep every device except the lost ones. */
@@ -110,13 +108,11 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const { busy, error, status, run } = useGenerationRun()
   const [open, setOpen] = useState(only)
   if (device.review?.kind === 'recovery') return <RecoveryReview />
-  if (!open) return <div className="flex flex-wrap gap-2">
-    <Button type="button" variant="outline" onClick={() => setOpen('restore')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button>
-    <Button type="button" variant="outline" onClick={() => setOpen('passphrase')}><KeyRound aria-hidden="true" />换恢复密码</Button>
-  </div>
-  return <div className="grid gap-4">
-    {open === 'restore' ? <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />用恢复文件找回</h2>
+  // In settings each action is a row that folds its form out below itself; alone, the form stands as a card.
+  const frame = only ? 'grid gap-4 rounded-xl border bg-card shadow-xs p-5' : 'grid gap-4 px-4 pt-1 pb-5 sm:ps-15'
+  const toggle = (mode: 'restore' | 'passphrase') => setOpen(open === mode ? undefined : mode)
+  const restoreForm = open === 'restore' ? <section className={frame}>
+      {only ? <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />用恢复文件找回</h2> : null}
       <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
@@ -137,9 +133,9 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <InlineError error={error || null} />
         <div className="flex flex-wrap gap-2"><Button type="submit"><BusyIcon busy={busy} />下一步</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
-    </section> : null}
-    {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
+    </section> : null
+  const passphraseForm = open === 'passphrase' ? <section className={frame}>
+      {only ? <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2> : null}
       <p className="text-meta text-muted-foreground">换完后旧文件失效</p>
       <form className="grid gap-4" onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
@@ -157,7 +153,14 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <InlineError error={error || null} />
         <div className="flex flex-wrap gap-2"><Button type="submit" variant="outline"><BusyIcon busy={busy} />下载新文件</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
-    </section> : null}
-    {status ? <p role="status" className="text-meta text-success">{status}</p> : null}
-  </div>
+    </section> : null
+  const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null
+  if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
+  return <>
+    <SettingsRow icon={ArchiveRestore} label="用恢复文件找回" expanded={open === 'restore'} className={open === 'restore' ? 'border-b-0' : undefined} onClick={() => toggle('restore')} />
+    {restoreForm}
+    <SettingsRow icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => toggle('passphrase')} />
+    {passphraseForm}
+    {done}
+  </>
 }

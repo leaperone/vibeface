@@ -81,7 +81,7 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
-  const [notificationButton, setNotificationButton] = useState({ label: "开启浏览器提醒", disabled: false })
+  const [notificationButton, setNotificationButton] = useState({ label: "开启", disabled: false })
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
@@ -210,12 +210,12 @@ function useWorkspaceState(connection: ReadyConnection, openConversation: (conve
     return next
   }
   const refreshNotificationButton = () => {
-    if (!("Notification" in window)) { setNotificationButton({ label: "浏览器不支持提醒", disabled: true }); return }
+    if (!("Notification" in window)) { setNotificationButton({ label: "浏览器不支持", disabled: true }); return }
     const enabled = readStorage(networkKey("notify", networkId), false)
     setNotificationButton(Notification.permission === "granted"
-      ? { label: enabled ? "浏览器提醒已开启" : "启用此网络提醒", disabled: enabled }
-      : Notification.permission === "denied" ? { label: "请在浏览器设置允许提醒", disabled: true }
-      : { label: "开启浏览器提醒", disabled: false })
+      ? { label: enabled ? "已开启" : "开启", disabled: enabled }
+      : Notification.permission === "denied" ? { label: "已被浏览器阻止", disabled: true }
+      : { label: "开启", disabled: false })
   }
   const notifyBrowser = (items: NotificationRecord[]) => {
     if (!("Notification" in window) || Notification.permission !== "granted" || !readStorage(networkKey("notify", networkId), false)) return

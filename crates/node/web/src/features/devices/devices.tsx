@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Globe, Info, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { Details, DetailRow, EmptyState, InlineError, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
+import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@/features/identity/context"
 import { useWorkspace } from "@/features/workspace/context"
@@ -165,20 +165,22 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
-    <Details>
-      <DetailRow label="设备编号" value={row.id} mono />
-      {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
-    </Details>
-
-    {canManage && row.member && !row.entry && !row.browser ? removing ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
-      <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
-      <div className="flex flex-wrap justify-end gap-2">
-        <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
-        <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
-          <RemoveIcon aria-hidden="true" />{action.busy === "remove" ? "移除中" : "移除设备"}
-        </Button>
-      </div>
-      {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
-    </section> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button> : null}
+    <SettingsGroup>
+      <SettingsDisclosure icon={Info} label="详细信息">
+        <div className="grid gap-3 text-meta text-muted-foreground">
+          <DetailRow label="设备编号" value={row.id} mono />
+          {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
+        </div>
+      </SettingsDisclosure>
+      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label="移除设备" description={removing ? "移除后这台设备无法再连接，已有的对话记录会保留" : undefined} onClick={removing ? undefined : () => setRemoving(true)}>
+        {removing ? <>
+          <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
+          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
+            <BusyIcon busy={action.busy === "remove"} />移除
+          </Button>
+        </> : null}
+      </SettingsRow> : null}
+      {action.errorKey === "remove" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
+    </SettingsGroup>
   </div>
 }

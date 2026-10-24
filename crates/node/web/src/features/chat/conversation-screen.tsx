@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@/features/identity/context'
@@ -67,6 +67,8 @@ export function ConversationScreen() {
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
+    // A task held on an approval shows as that approval card, which names and links the task.
+    if (task.state === 'waiting') return []
     return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
   }
 
@@ -161,9 +163,11 @@ export function ConversationScreen() {
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达' : ''
-  // Questions sit where they were asked, so an older one scrolls away; 去处理 brings back the first still open.
+  // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
-  const toCards = () => document.getElementById(asked ? `question-${asked.question_id}` : 'chat-waiting')?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })
+  const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
+  const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
+  const targetHidden = useOffscreen(waitingTarget, entries.length)
   const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
@@ -210,6 +214,10 @@ export function ConversationScreen() {
         </div> : null}
       />
       <PromptInput
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-9"
+          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
+          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+        </button> : null}
         value={text}
         hint={hint}
         disabled={sendDisabled}
@@ -225,11 +233,23 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} />
-        {cards.length || asked ? <button type="button" className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-4 max-md:min-h-11" onClick={toCards}>去处理</button> : null}
         {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
       </PromptInput>
     </section>
   )
+}
+
+/** Whether the element with `id` is out of view; rechecked as the list grows. */
+function useOffscreen(id: string | null, revision: number) {
+  const [hidden, setHidden] = useState(false)
+  useEffect(() => {
+    const target = id && typeof IntersectionObserver !== 'undefined' ? document.getElementById(id) : null
+    if (!target) { setHidden(false); return }
+    const observer = new IntersectionObserver(([entry]) => setHidden(!entry.isIntersecting))
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [id, revision])
+  return hidden
 }
 
 type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord; joined?: string }

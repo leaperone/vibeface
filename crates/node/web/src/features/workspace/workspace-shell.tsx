@@ -6,7 +6,7 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { BotAvatar, dismissToast, EmptyState, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { BotAvatar, CountBadge, dismissToast, Dot, EmptyState, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@/features/identity/context"
@@ -120,7 +120,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                         <BotAvatar id={bot.bot_id} name={bot.name} size="sm" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
                         {workspace.primary === bot.conversation_id ? <span title="主 Bot" className="inline-flex shrink-0"><Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
-                        {marked ? <span aria-label="有新进展" className="size-2 shrink-0 rounded-full bg-warning" /> : null}
+                        {marked ? <Dot label="有新进展" /> : null}
                       </Link>
                     </SidebarMenuButton>
                   </SidebarMenuItem>
@@ -150,13 +150,13 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           {back ? pathname === "/inbox" ? null : <Button asChild variant="ghost" size="icon" className="relative -me-3 md:hidden">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"}>
               <Inbox aria-hidden="true" />
-              {waiting ? <span className="absolute top-1 right-1 grid min-w-4 place-items-center rounded-full bg-warning px-1 text-[11px] leading-4 font-semibold text-background">{waiting}</span> : null}
+              {waiting ? <CountBadge count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background" /> : null}
             </Link>
           </Button> : <div className="-me-3 flex md:hidden">
             <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
                 <MonitorSmartphone aria-hidden="true" />
-                {devicesAttention ? <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-warning" /> : null}
+                {devicesAttention ? <Dot tone="warning" className="absolute top-1.5 right-1.5 ring-2 ring-background" /> : null}
               </Link>
             </Button>
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
@@ -186,8 +186,8 @@ function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; ic
       <Link to={to} aria-current={active ? "page" : undefined}>
         <Icon aria-hidden="true" />
         <span className="flex-1">{label}</span>
-        {badge ? <span className="grid min-w-5 place-items-center rounded-full bg-warning px-1.5 text-meta font-semibold text-background tabular-nums">{badge}</span> : null}
-        {dot ? <span aria-label="需要留意" className="size-2 rounded-full bg-warning" /> : null}
+        {badge ? <CountBadge count={badge} /> : null}
+        {dot ? <Dot tone="warning" label="需要留意" /> : null}
       </Link>
     </SidebarMenuButton>
   </SidebarMenuItem>

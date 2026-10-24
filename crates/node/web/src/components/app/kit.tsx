@@ -49,6 +49,16 @@ export function BotAvatar({ id, name, size = "md", className }: { id: string; na
     size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
 
+/** Unread or waiting count, in the brand violet. */
+export function CountBadge({ count, label, className }: { count: number; label?: string; className?: string }) {
+  return <span aria-label={label} className={cn("grid h-5 min-w-5 shrink-0 place-items-center rounded-full bg-brand px-1.5 text-[11px] leading-none font-semibold text-brand-foreground tabular-nums", className)}>{count}</span>
+}
+
+/** Brand for news; warning for something that needs a look. */
+export function Dot({ tone = "brand", label, className }: { tone?: "brand" | "warning"; label?: string; className?: string }) {
+  return <span aria-label={label} className={cn("size-2 shrink-0 rounded-full", tone === "brand" ? "bg-brand" : "bg-warning", className)} />
+}
+
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
   return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center animate-in fade-in-0 duration-300", className)}>
     <span className="mb-1 grid size-12 place-items-center rounded-2xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
@@ -72,6 +82,66 @@ export function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title
     <h2 className="flex items-center gap-2.5 text-heading font-semibold"><span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-4" /></span>{title}</h2>
     {children}
   </section>
+}
+
+/** A settings section: a short caption over one card of rows, with an optional note under it. */
+export function SettingsGroup({ title, footer, children, className }: { title?: string; footer?: ReactNode; children: ReactNode; className?: string }) {
+  return <section className={cn("grid gap-2", className)}>
+    {title ? <h2 className="px-1 text-meta font-medium text-muted-foreground">{title}</h2> : null}
+    <div className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{children}</div>
+    {footer ? <p className="px-1 text-meta text-muted-foreground">{footer}</p> : null}
+  </section>
+}
+
+const rowTile: Record<"neutral" | "danger", string> = { neutral: "bg-muted text-muted-foreground", danger: "bg-danger-soft text-danger" }
+const rowLayout = "flex min-h-14 w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 text-start"
+
+function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger" }) {
+  return <>
+    <span className={cn("grid size-8 shrink-0 place-items-center rounded-lg", rowTile[tone])}><Icon aria-hidden="true" className="size-4" /></span>
+    <span className="grid min-w-0 flex-1 basis-32">
+      <span className={cn("truncate", tone === "danger" && "text-danger")}>{label}</span>
+      {description ? <span className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{description}</span> : null}
+    </span>
+  </>
+}
+
+/** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
+export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className }: {
+  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger"; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
+}) {
+  const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
+  if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60", className)}>
+    <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
+    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", expanded && "rotate-90")} />
+  </button>
+  return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
+}
+
+/** A row that folds out what it holds below itself, inside the same card. */
+export function SettingsDisclosure({ icon, label, value, open, children }: { icon: LucideIcon; label: ReactNode; value?: ReactNode; open?: boolean; children: ReactNode }) {
+  return <details open={open} className="group/disclosure">
+    <summary className={cn(rowLayout, "cursor-pointer list-none flex-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60 [&::-webkit-details-marker]:hidden")}>
+      <RowLead icon={icon} label={label} />
+      {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
+      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90" />
+    </summary>
+    <div className="grid gap-3 px-4 pb-4 sm:ps-15">{children}</div>
+  </details>
+}
+
+/** A short set of mutually exclusive options on a muted track. */
+export function Segmented<T extends string>({ label, value, options, onChange, disabled }: {
+  label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean
+}) {
+  return <div role="radiogroup" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} disabled={disabled}
+      onClick={() => { if (option !== value) onChange(option) }}
+      className={cn("inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+        value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
+      {Icon ? <Icon aria-hidden="true" className="size-4" /> : null}{text}
+    </button>)}
+  </div>
 }
 
 /** Same shape as the real layout; fades in only after 300ms to avoid flicker. */
@@ -172,12 +242,32 @@ export function toast(text: string, options: { tone?: Tone; action?: ToastItem["
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
+/** The visible `[data-toast-anchor]` (the composer), if any. A `[data-toast-above]` inside it floats over the page and counts too. */
+const toastAnchor = () => [...document.querySelectorAll<HTMLElement>("[data-toast-anchor]")].find((anchor) => !anchor.closest("[inert]") && anchor.getBoundingClientRect().height > 0)
+function anchorSpace(anchor: HTMLElement | undefined) {
+  if (!anchor) return 0
+  const tops = [anchor, ...anchor.querySelectorAll<HTMLElement>("[data-toast-above]")].map((element) => element.getBoundingClientRect()).filter((rect) => rect.height > 0).map((rect) => rect.top)
+  return Math.max(0, window.innerHeight - Math.min(...tops))
+}
+
+/** Toasts rise from the bottom edge, above the composer when one is on screen, so they never cover the header or the first card. */
 export function Toaster() {
   const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }, () => toasts, () => toasts)
-  return <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4rem)] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:top-auto md:right-6 md:bottom-24 md:items-end">
+  const [space, setSpace] = useState(0)
+  useEffect(() => {
+    if (!items.length || typeof window === "undefined") return
+    const anchor = toastAnchor()
+    const measure = () => setSpace(anchorSpace(anchor))
+    measure()
+    const observer = new ResizeObserver(measure)
+    for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) observer.observe(element)
+    window.addEventListener("resize", measure)
+    return () => { observer.disconnect(); window.removeEventListener("resize", measure) }
+  }, [items])
+  return <div aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {
       const Icon = toastIcon[item.tone]
-      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-top-2 md:slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
+      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
         {item.action ? <Button type="button" size="sm" variant="ghost" className="-my-2 h-11 px-3 md:my-0 md:h-7 md:px-2.5" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}

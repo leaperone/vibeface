@@ -1,12 +1,13 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { Bell, BellRing, FileKey, ChevronRight, Download, Globe, LifeBuoy, LogOut, Palette, ScrollText } from 'lucide-react'
+import { Bell, ChevronRight, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { Segmented, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@/features/identity/context'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
-import { CurrentRecoveryFile, RecoveryControls } from '@/features/identity/recovery-controls'
+import { CurrentRecoveryFile, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@/features/workspace/context'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -14,7 +15,7 @@ export const Route = createFileRoute('/_app/settings')({ component: SettingsPage
 
 const ranges: Array<[number, string]> = [[3_600_000, '最近 1 小时'], [86_400_000, '最近 1 天'], [7 * 86_400_000, '最近 7 天']]
 
-const themes: Array<[Theme, string]> = [['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']]
+const themes: Array<{ value: Theme; label: string; icon: LucideIcon }> = [{ value: 'system', label: '跟随系统', icon: Monitor }, { value: 'light', label: '浅色', icon: Sun }, { value: 'dark', label: '深色', icon: Moon }]
 
 function SettingsPage() {
   const workspace = useWorkspace()
@@ -22,49 +23,45 @@ function SettingsPage() {
   const [theme, setThemeState] = useState(readTheme)
   const [leaving, setLeaving] = useState(false)
   const [range, setRange] = useState(86_400_000)
-  return <div className="mx-auto grid w-full max-w-3xl gap-8">
-    <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><Bell aria-hidden="true" className="size-5" />提醒</h2>
-      <Button type="button" variant="secondary" className="w-fit" disabled={workspace.notificationButton.disabled} onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}><BellRing aria-hidden="true" />{workspace.notificationButton.label}</Button>
-      {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <TriageSettings /> : null}
-    </section>
-    <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><Palette aria-hidden="true" className="size-5" />外观</h2>
-      <div role="radiogroup" aria-label="外观" className="flex w-fit gap-1 rounded-lg bg-muted p-1">
-        {themes.map(([value, label]) => <Button key={value} type="button" role="radio" aria-checked={theme === value} variant={theme === value ? 'outline' : 'ghost'} onClick={() => { setTheme(value); setThemeState(value) }}>{label}</Button>)}
-      </div>
-    </section>
-    <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><Globe aria-hidden="true" className="size-5" />连接</h2>
-      <ConnectionSettings />
-    </section>
-    {device.ready?.principal.can_manage ? <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><FileKey aria-hidden="true" className="size-5" />恢复文件</h2>
+  const principal = device.ready?.principal
+  const operator = principal?.can_manage || principal?.source === 'local_session'
+  return <div className="mx-auto grid w-full max-w-2xl gap-8">
+    <SettingsGroup title="提醒">
+      <SettingsRow icon={Bell} label="浏览器提醒">
+        {workspace.notificationButton.disabled ? workspace.notificationButton.label
+          : <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>}
+      </SettingsRow>
+      {operator ? <TriageSettings /> : null}
+    </SettingsGroup>
+    <SettingsGroup title="外观">
+      <SettingsRow icon={Palette} label="主题">
+        <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
+      </SettingsRow>
+    </SettingsGroup>
+    <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
+    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : <SettingsGroup title="恢复" footer="恢复文件只有一份有效，丢了不能补">
       <CurrentRecoveryFile />
       <RecoveryControls />
-    </section> : null}
-    {device.ready?.principal.can_manage || device.ready?.principal.source === 'local_session' ? <section className="grid gap-3">
-      <h2 className="flex items-center gap-2 text-heading font-semibold"><LifeBuoy aria-hidden="true" className="size-5" />排障</h2>
-      <Button asChild variant="outline" className="h-auto justify-start gap-3 py-3 max-md:h-auto">
-        <Link to="/settings/logs"><ScrollText aria-hidden="true" /><span className="flex-1 text-left">日志</span><ChevronRight aria-hidden="true" className="text-muted-foreground" /></Link>
-      </Button>
-      <p className="text-meta text-muted-foreground">诊断包不含登录信息和加入链接</p>
-      <div className="flex flex-wrap items-center gap-2">
-        <NativeSelect aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))} className="[&_select]:h-9 max-md:[&_select]:h-11">
+    </SettingsGroup> : null}
+    {operator ? <SettingsGroup title="排障" footer="诊断包不含登录信息和加入链接">
+      <Link to="/settings/logs" className="block transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60">
+        <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
+      </Link>
+      <SettingsRow icon={Download} label="诊断包">
+        <NativeSelect size="sm" aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))}>
           {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
         </NativeSelect>
-        <Button type="button" variant="secondary" className="w-fit" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}><Download aria-hidden="true" />导出诊断包</Button>
-      </div>
-    </section> : null}
-    <section className="grid gap-3 border-t pt-6">
-      {leaving ? <>
-        <p>断开后，要重新打开本机页面或用加入链接才能回来。</p>
-        <div className="flex flex-wrap gap-2">
-          <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
-          <Button type="button" variant="destructive" onClick={() => device.disconnect()}><LogOut aria-hidden="true" />断开</Button>
-        </div>
-      </> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setLeaving(true)}><LogOut aria-hidden="true" />断开这个浏览器</Button>}
-    </section>
+        <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}>导出</Button>
+      </SettingsRow>
+    </SettingsGroup> : null}
+    <SettingsGroup>
+      <SettingsRow icon={LogOut} tone="danger" label="断开这个浏览器" description={leaving ? '断开后，要重新打开本机页面或用加入链接才能回来' : undefined} onClick={leaving ? undefined : () => setLeaving(true)}>
+        {leaving ? <>
+          <Button type="button" size="sm" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
+          <Button type="button" size="sm" variant="destructive" onClick={() => device.disconnect()}>断开</Button>
+        </> : null}
+      </SettingsRow>
+    </SettingsGroup>
   </div>
 }
 

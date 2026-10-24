@@ -5,7 +5,8 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import ts from "typescript"
 
-// Copy rules from docs/design/web-ux.md section 6: jargon may only appear inside <Details>.
+// Copy rules from docs/design/web-ux.md section 6: jargon may only appear inside a folded <Details> or <SettingsDisclosure>.
+const folded = ["Details", "SettingsDisclosure"]
 const banned = [
   "节点", "Node", "Gateway", "网关", "入口", "Relay", "中继", "同步角色", "调度", "Peer ID", "设备编号", "公钥", "私钥", "Noise", "握手",
   "capability", "凭证", "签名", "成员目录", "授权记录", "个人网络", "恢复包", "口令", "管理 Agent", "协调 Agent", "原生工作", "原生会话",
@@ -19,7 +20,7 @@ export function violations(source: string, file = "x.tsx") {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
   const inDetails = (node: ts.Node): boolean => {
     for (let p = node.parent; p; p = p.parent) {
-      if (ts.isJsxElement(p) && p.openingElement.tagName.getText(sf) === "Details") return true
+      if (ts.isJsxElement(p) && folded.includes(p.openingElement.tagName.getText(sf))) return true
     }
     return false
   }

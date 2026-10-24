@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router"
 import { Bot, Inbox, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
-import { BotAvatar, EmptyState, Skeleton } from "@/components/app/kit"
+import { BotAvatar, CountBadge, EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "./context"
@@ -56,7 +56,7 @@ function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }:
       </span>
       <span className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-meta text-muted-foreground">{preview}</span>
-        {unread ? <span aria-label={`${unread} 条未读`} className="grid min-w-5 shrink-0 place-items-center rounded-full bg-warning px-1.5 text-[11px] leading-5 font-semibold text-background tabular-nums">{unread}</span> : null}
+        {unread ? <CountBadge count={unread} label={`${unread} 条未读`} /> : null}
       </span>
     </span>
   </Link>

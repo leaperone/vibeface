@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, CircleX, Clock, Copy, Inbox, KeyRound, Layers, Plus, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
+import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { BusyIcon, Details, InlineError, Skeleton } from "@/components/app/kit"
+import { BusyIcon, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
@@ -46,7 +46,7 @@ export function TriageSettings() {
   }
   useEffect(() => { setSettings(null); void call("load", "triage_settings"); return () => { sequence.current += 1 } }, [ready])
 
-  if (!settings) return error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-24" />
+  if (!settings) return <div className="px-4 py-3">{error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-8" />}</div>
   const config: Config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions }
   const save = (key: string, patch: Partial<Config>, extra: Record<string, unknown> = {}) => {
     const next = { ...config, ...patch }
@@ -60,17 +60,12 @@ export function TriageSettings() {
   }
   const { pending, delivered, dead } = settings.outbox
 
-  return <div className="grid gap-3">
-    <fieldset disabled={Boolean(busy)} className="grid gap-2">
-      <legend className="mb-2 text-meta font-medium text-muted-foreground">会话等你时</legend>
-      <div role="radiogroup" aria-label="会话等你时" className="flex w-fit flex-wrap gap-1 rounded-lg bg-muted p-1">
-        {outlets.map(([value, text, Icon]) => <Button key={value} type="button" role="radio" aria-checked={config.default_outlet === value}
-          variant={config.default_outlet === value ? "outline" : "ghost"} className={cn(config.default_outlet === value && "shadow-xs")}
-          onClick={() => { if (value !== config.default_outlet) void save("default", { default_outlet: value }) }}><Icon aria-hidden="true" />{text}</Button>)}
-      </div>
-    </fieldset>
+  return <>
+    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时">
+      <Segmented label="会话等你时" value={config.default_outlet} disabled={Boolean(busy)} options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} onChange={(value) => void save("default", { default_outlet: value })} />
+    </SettingsRow>
 
-    <Details label="按文件夹另设" open={config.projects.length > 0}>
+    <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>
       {config.projects.length ? <ul className="grid gap-1">{config.projects.map((project) => <li key={project.prefix} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
         <span className="min-w-0 flex-1 truncate font-mono text-meta" title={project.prefix}>{project.prefix.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || project.prefix}</span>
         <NativeSelect size="sm" aria-label={`${project.prefix} 的去向`} value={project.outlet} disabled={Boolean(busy)}
@@ -83,11 +78,11 @@ export function TriageSettings() {
         <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/Users/me/project" value={prefix} disabled={Boolean(busy)} onChange={(event) => setPrefix(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addProject() } }} />
         <Button type="button" variant="outline" disabled={Boolean(busy) || !prefix.trim()} onClick={addProject}><Plus aria-hidden="true" />添加</Button>
       </div>
-    </Details>
+    </SettingsDisclosure>
 
-    <Details label="连接聊天机器人" open={!settings.webhook_url && config.default_outlet === "both"}>
+    <SettingsDisclosure icon={Webhook} label="聊天机器人" value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
-        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Webhook aria-hidden="true" className="size-4" />把提醒发给机器人</p>
+        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给机器人</p>
         <Input aria-label="机器人地址" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
         <div className="flex min-w-0 gap-2">
           <Input aria-label="机器人密钥" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : "机器人密钥"} value={secret} onChange={(event) => setSecret(event.target.value)} />
@@ -131,7 +126,7 @@ export function TriageSettings() {
           })}><BusyIcon busy={busy === "token"} icon={Plus} />生成授权码</Button>
         </div>
       </div>
-    </Details>
-    <InlineError error={error} />
-  </div>
+    </SettingsDisclosure>
+    {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
+  </>
 }
