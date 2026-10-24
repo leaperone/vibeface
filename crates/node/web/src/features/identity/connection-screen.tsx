@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleAlert, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleAlert, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { cn } from 'cn'
 import { AuthPage, Details, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -86,9 +86,10 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
   const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
-  return <Panel icon={MonitorX} title="这台设备已被移出">
+  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '这台设备已被移出'}>
     {canRejoin ? <>
-      <p className="text-muted-foreground">旧数据会改名保留，不会删除。</p>
+      <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
+      <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
       <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
       <Details label="用命令重新加入">{commands}</Details>
     </> : <>
@@ -248,7 +249,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
   </Panel>
   else if (device.phase === 'removed') body = <Removed busy={busy} run={run} />
-  else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} title="正在重新开始">
+  else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} busy title="正在重新开始">
     <p className="text-muted-foreground">旧数据已改名保留。这台电脑重启好后，用加入链接把它加回来。</p>
   </Panel>
   else if (device.nodeJoining) body = <NodeJoin />
