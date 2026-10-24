@@ -33,8 +33,8 @@ type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 export type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
-/** A fresh invitation; without a public HTTPS entry a phone scans `ticket` from its public entry's page. */
-export type Invitation = { link: string; ticket: string; publicEntry: boolean; expiresAt: number }
+/** A fresh invitation; `publicEntry`: a phone's camera can open `link`. */
+export type Invitation = { link: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
 export type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
@@ -537,7 +537,7 @@ export function DeviceProvider({ children }: { children: ReactNode }) {
     const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
     const ticket = ticketEncode(entryId, hex(secret), relay, direct)
     secret.fill(0)
-    return { link: `${origin}/join#${ticket}`, ticket, publicEntry: isPublicUrl(origin), expiresAt }
+    return { link: `${origin}/join#${ticket}`, publicEntry: isPublicUrl(origin), expiresAt }
   }
   async function startApproval(joinId: string) {
     managing()

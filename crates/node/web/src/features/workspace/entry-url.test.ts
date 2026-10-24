@@ -801,6 +801,23 @@ test("conversation blocks sending until an online node can run the manager Agent
   } finally { app.close() }
 })
 
+test("an owner's reply on its way keeps its streamed text until the reply lands", () => {
+  const job = { trigger: "message:m1", state: "publishing", message_id: "m1", reply_message_id: "r1", source_node: "owner" }
+  const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
+  const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
+  let messages: object[] = [ask]
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => ({
+    generation: 1, isCurrent: () => true, conversationId: 'chat', data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+  }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint, threadReplies }, '@/features/workspace/bot-settings': { placeChanges, scheduleName, scheduleTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
+  try {
+    assert.equal(streamed(), "partial answer")
+    messages = [ask, { message_id: "r1", event_hash: "r1", role: "assistant", text: "full answer", created_at_ms: 2, in_reply_to: "m1" }]
+    assert.equal(streamed(), "")
+  } finally { app.close() }
+})
+
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
   const invitation = { link: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
@@ -827,6 +844,25 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
     creation.resolve(invitation); await settleComponent()
     assert.equal(labelled('复制链接')?.disabled, false)
   } finally { app.close() }
+})
+
+test("a link no phone can open shows no QR code", async () => {
+  const shown = async (link: string, publicEntry: boolean) => {
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+    const app = componentHarness('../devices/add-device.tsx', {
+      '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+      '@/lib/node': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
+    }, { setInterval: () => 0, clearInterval: () => {} })
+    try {
+      app.render('AddDevice'); app.render('AddDevice').find(({ props }) => [props.children].flat().includes('生成链接'))?.props.onClick?.(); await settleComponent()
+      return app.render('AddDevice')
+    } finally { app.close() }
+  }
+  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', false)
+  assert.equal(local.some(({ type }) => type === 'img'), false)
+  assert.ok(local.some(({ props }) => [props.children].flat().includes('手机打不开本机地址')))
+  const open = await shown('https://node.example/join#vibeface1test', true)
+  assert.equal(open.find(({ type }) => type === 'img')?.props.src, 'data:qr')
 })
 
 test("device id boundaries require the device_id field", () => {
