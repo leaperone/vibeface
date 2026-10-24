@@ -12,7 +12,7 @@ import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
-import { JoinRequests, useOpenJoins } from '@/features/devices/join-requests'
+import { JoinRequests } from '@/features/devices/join-requests'
 import { cn } from '@/lib/utils'
 import { useRun } from '@/lib/use-run'
 
@@ -24,7 +24,6 @@ export default function Settings() {
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
-  const requests = useOpenJoins().length > 0
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
@@ -34,15 +33,16 @@ export default function Settings() {
       </View>
     </Section>
     <Section icon={Globe} title="连接">
-      <View className="-mx-2"><ConnectionPill connection={workspace.connection} /></View>
+      <View className="-mx-2 -mt-3 -mb-4"><ConnectionPill connection={workspace.connection} /></View>
     </Section>
-    <Section icon={MonitorSmartphone} title="我的设备" action={device.ready?.principal.can_manage ? <Link href="/add-device" asChild>
-      <Button variant={requests ? 'outline' : 'default'} className="min-h-11"><Icon as={Plus} /><Text>添加设备</Text></Button>
-    </Link> : null}>
+    <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">
         {workspace.members.map((member, index) => <MemberRow key={member.device_id} member={member} first={index === 0} />)}
       </View>
+      {device.ready?.principal.can_manage ? <Link href="/add-device" asChild>
+        <Button variant="outline" className="min-h-11 self-start"><Icon as={Plus} /><Text>添加设备</Text></Button>
+      </Link> : null}
     </Section>
     {device.ready ? <Notifications /> : null}
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
@@ -82,12 +82,11 @@ function Notifications() {
   </Section>
 }
 
-function Section({ icon, title, action, children }: { icon: LucideIcon; title: string; action?: ReactNode; children: ReactNode }) {
+function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
   return <View className="gap-3">
-    <View className="min-h-11 flex-row flex-wrap items-center gap-2">
+    <View className="flex-row items-center gap-2">
       <Icon as={icon} />
-      <Text role="heading" className="min-w-32 flex-1 text-heading font-semibold">{title}</Text>
-      {action}
+      <Text role="heading" className="min-w-0 flex-1 text-heading font-semibold">{title}</Text>
     </View>
     {children}
   </View>

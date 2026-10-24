@@ -8,6 +8,8 @@ import { withUniwind } from 'uniwind';
 const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
 // Critically damped and quick, so the press lands on touch-down and settles without a bounce.
 const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
+// Fills ease when a control changes state; the press itself still answers at once through the scale.
+const fade = { transitionProperty: ['backgroundColor', 'borderColor', 'opacity'], transitionDuration: 150 } as const;
 
 const buttonVariants = cva(
   cn(
@@ -108,7 +110,7 @@ function Button({ className, variant, size, onPressIn, onPressOut, ...props }: B
         className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
         role="button"
         {...props}
-        style={pressed}
+        style={[pressed, fade]}
         onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
         onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
       />

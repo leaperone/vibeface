@@ -32,7 +32,7 @@ function Screens() {
       ...Platform.OS === 'android' ? { headerStyle: { backgroundColor: background } } : {},
       headerBackButtonDisplayMode: 'minimal',
       headerTintColor: foreground,
-      headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: 16, color: foreground },
+      headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: Platform.OS === 'ios' ? 17 : 20, color: foreground },
       headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '700', color: foreground },
       contentStyle: { backgroundColor: background },
     }}>

@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Pressable, View } from 'react-native'
+import { Pressable, useWindowDimensions, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
@@ -23,7 +23,7 @@ export default function AiScreen() {
   const { ready } = useDevice()
   if (!ready) return null
   if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理员能修改" />
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-10 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
     <Section icon={Bell} title="会话等你时"><Triage /></Section>
   </KeyboardAwareScrollView>
@@ -274,6 +274,7 @@ function Triage() {
   const [label, setLabel] = useState('')
   const [token, setToken] = useState('')
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
+  const { fontScale } = useWindowDimensions()
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
   if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-24 rounded-xl bg-muted" />
   const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions }
@@ -284,9 +285,9 @@ function Triage() {
   const other = (outlet: Outlet): Outlet => outlet === 'both' ? 'record' : 'both'
   const { pending, delivered, dead } = settings.outbox
   return <View className="gap-6">
-    <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
+    <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', fontScale >= 1.3 ? 'self-stretch' : 'flex-row self-start')}>
       {outlets.map(([value, text, icon]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: config.default_outlet === value }} disabled={busy !== ''}
-        variant={config.default_outlet === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { if (value !== config.default_outlet) void save('default', { default_outlet: value }) }}>
+        variant={config.default_outlet === value ? 'outline' : 'ghost'} className={cn('min-h-11', fontScale >= 1.3 && 'justify-start')} onPress={() => { if (value !== config.default_outlet) void save('default', { default_outlet: value }) }}>
         <Icon as={icon} /><Text>{text}</Text>
       </Button>)}
     </View>
@@ -388,7 +389,7 @@ function Retry({ error, onRetry }: { error: string; onRetry(): void }) {
 }
 
 function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <View className="gap-4">
+  return <View className="gap-3">
     <View className="flex-row items-center gap-2">
       <Icon as={icon} />
       <Text role="heading" numberOfLines={1} className="shrink text-heading font-semibold">{title}</Text>

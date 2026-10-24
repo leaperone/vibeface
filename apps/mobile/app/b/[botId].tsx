@@ -22,7 +22,7 @@ import { useChatExtras, type Row } from '@/features/chat/work'
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 
 /** One row of the chat: a message, or a question or status line between them. */
-type Entry = { key: string; message: ChatMessage; last: boolean } | Row
+type Entry = { key: string; message: ChatMessage; last: boolean } | (Row & { attached?: boolean })
 
 /**
  * Questions sit right before the first message written after them, tasks and changes right after the message that caused
@@ -39,7 +39,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): 
     const next = chat.messages[index + 1]
     // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
     rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000 })
-    rows.push(...extras.after.get(message.message_id) ?? [])
+    rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   })
   for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
   rows.push(...extras.rest)
@@ -112,7 +112,8 @@ export default function ChatScreen() {
       contentContainerClassName="w-full max-w-2xl self-center px-4 py-6"
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
-      ItemSeparatorComponent={() => <View className="h-6" />}
+      // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
+      ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
       renderItem={({ item }) => 'message' in item ? <Message message={item.message} last={item.last} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>

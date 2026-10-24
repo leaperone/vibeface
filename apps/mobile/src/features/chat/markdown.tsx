@@ -12,7 +12,7 @@ export function Markdown({ text }: { text: string }) {
     const heading = { ...body, fontSize: 16, fontWeight: '600' as const, marginTop: 4 }
     return {
       text: body, paragraph: { marginVertical: 0, paddingVertical: 6 }, li: { ...body, fontVariant: ['tabular-nums'] }, strong: { ...body, fontWeight: '600' },
-      h1: heading, h2: heading, h3: heading, h4: heading,
+      h1: { ...heading, fontSize: 20, lineHeight: 28, marginTop: 12 }, h2: { ...heading, fontSize: 17, lineHeight: 26, marginTop: 12 }, h3: heading, h4: heading,
       link: { ...body, textDecorationLine: 'underline' },
       codespan: { fontFamily: 'Geist Mono', fontSize: 13.5, fontStyle: 'normal', fontWeight: '400', backgroundColor: muted, color: foreground },
       code: { padding: 12 },

@@ -29,7 +29,7 @@ export default function Home() {
     <View className="flex-row items-center justify-between ps-3 pt-2">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">bot</Text>
       <Link href="/new-bot" asChild>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="新建 bot" disabled={!canCreate}><Icon as={Plus} /></Button>
+        <Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="新建 bot" disabled={!canCreate}><Icon as={Plus} /></Button>
       </Link>
     </View>
     {bots.length ? bots.map((bot) => {

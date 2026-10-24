@@ -19,7 +19,7 @@ export default function DeviceDetail() {
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这台设备" />
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-6 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
     <View className="flex-row items-center gap-4">
       <View className="size-12 items-center justify-center rounded-xl bg-muted"><Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-6" /></View>
