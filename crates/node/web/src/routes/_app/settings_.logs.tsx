@@ -107,7 +107,7 @@ function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord
   const look = levelLook[record.level]
   const ids: Array<[string, string | undefined]> = [['对话', chat ?? record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]
   return <li>
-    <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-muted/50 focus-visible:bg-muted/50 outline-none">
+    <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
       <look.icon aria-label={look.label} className={cn('mt-0.5 size-4 shrink-0', look.tone)} />
       <span className="grid min-w-0 flex-1 gap-1">
         <span className={cn('break-words', !open && 'line-clamp-2')}>{record.message || record.event}</span>

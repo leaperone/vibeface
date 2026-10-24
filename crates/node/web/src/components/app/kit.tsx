@@ -71,7 +71,7 @@ export function PageActions({ children }: { children: ReactNode }) {
 }
 
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
-  return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center animate-in fade-in-0 duration-300", className)}>
+  return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center animate-in fade-in-0 duration-200 ease-out", className)}>
     <span className="mb-1 grid size-12 place-items-center rounded-2xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
     <h2 className="text-heading font-semibold">{title}</h2>
     {description ? <p className="text-meta text-muted-foreground">{description}</p> : null}
@@ -82,14 +82,14 @@ export function EmptyState({ icon: Icon, title, description, action, className }
 /** Progress through first-time setup, shared by the connection screen and onboarding. */
 export function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-300", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
     <span className="sr-only">第 {step} 步，共 4 步</span>
   </div>
 }
 
 /** One step of first-time setup: a raised card under an icon title. */
 export function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-2xl border bg-card p-5 shadow-sm animate-in fade-in-0 slide-in-from-bottom-1 duration-300 ease-(--ease-out-quint) sm:p-6">
+  return <section className="grid gap-4 rounded-2xl border bg-card p-5 shadow-sm animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:p-6">
     <h2 className="flex items-center gap-2.5 text-heading font-semibold"><span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-4" /></span>{title}</h2>
     {children}
   </section>
@@ -122,7 +122,7 @@ export function SettingsRow({ icon, label, description, tone, children, onClick,
   icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
 }) {
   const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
-  if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60", className)}>
+  if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
     <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
   </button>
@@ -132,7 +132,7 @@ export function SettingsRow({ icon, label, description, tone, children, onClick,
 /** A row that folds out what it holds below itself, inside the same card. */
 export function SettingsDisclosure({ icon, label, value, open, children }: { icon: LucideIcon; label: ReactNode; value?: ReactNode; open?: boolean; children: ReactNode }) {
   return <details open={open} className="group/disclosure">
-    <summary className={cn(rowLayout, "cursor-pointer list-none flex-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60 [&::-webkit-details-marker]:hidden")}>
+    <summary className={cn(rowLayout, "interactive-row cursor-pointer list-none flex-nowrap [&::-webkit-details-marker]:hidden")}>
       <RowLead icon={icon} label={label} />
       {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
       <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90", !value && "ms-auto")} />
@@ -152,7 +152,7 @@ export function Segmented<T extends string>({ label, value, options, onChange, d
   return <div role="radiogroup" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
     {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined} disabled={disabled}
       onClick={() => { if (option !== value) onChange(option) }}
-      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 disabled:opacity-50 max-md:h-10 max-md:px-3",
         Icon && !labels && "max-sm:w-10 max-sm:px-0",
         value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
       {Icon ? <><Icon aria-hidden="true" className="size-4" /><span className={labels ? undefined : "max-sm:hidden"}>{text}</span></> : text}
@@ -218,7 +218,7 @@ export function SafetyCode({ code, label = "安全码" }: { code: string; label?
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
     <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
-      <ChevronRight aria-hidden="true" className="size-4 transition-transform" />{label}
+      <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-150" />{label}
     </summary>
     <div className="grid gap-2 break-all pt-2 text-muted-foreground">{children}</div>
   </details>

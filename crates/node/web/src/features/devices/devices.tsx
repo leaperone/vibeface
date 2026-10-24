@@ -79,7 +79,7 @@ export function DevicesPage() {
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
       : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {
         const Icon = deviceIcon(row)
-        return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
+        return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="interactive-row flex min-h-14 items-center gap-3 px-4 py-2">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           <span className="flex min-w-0 flex-1 items-center gap-2"><span className="truncate font-medium">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
           {row.bot ? <Hint icon={Bot} label={row.bot === "ready" ? "能运行 Bot" : "Bot 需设置"} warning={row.bot === "needs_setup"} /> : null}
