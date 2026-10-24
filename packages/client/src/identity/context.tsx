@@ -5,6 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryKey, messageOf, parseEntry, parseInfo, parseJoinRequest, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
+import { recoveryCheck } from './recovery-notice.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
 import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
@@ -44,7 +45,10 @@ type DeviceContextValue = {
   localAutoAccess: boolean | null; setLocalAutoAccess(enabled: boolean): Promise<void>
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null
   /** When the Node first saw the current recovery key, if it knows. */
-  recoverySince: number | null; joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
+  recoverySince: number | null
+  /** Someone else took the network over with a recovery file since this browser last looked; settled by `acknowledgeRecovery`. */
+  recoveredElsewhere: boolean; acknowledgeRecovery(): void
+  joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
@@ -151,6 +155,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [info, setInfo] = useState<EntryInfo | null>(null)
   const [directory, setDirectory] = useState<MembershipView | null>(null)
   const [recoverySince, setRecoverySince] = useState<number | null>(null)
+  const [recoveredElsewhere, setRecoveredElsewhere] = useState(false)
   const [joins, setJoins] = useState<JoinRequest[]>([])
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
@@ -204,7 +209,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     connecting.current?.abort(); connecting.current = null
     const previous = session.current; session.current = null
     previous?.channel.close()
-    listeners.current.clear(); setReady(null); setDirectory(null); setJoins([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
+    listeners.current.clear(); setReady(null); setDirectory(null); setRecoveredElsewhere(false); setJoins([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
     joiningRef.current = null; setJoining(null); setPhase('disconnected'); setError('')
     step({ type: 'left' })
   }, [releaseSensitive])
@@ -277,6 +282,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       isCurrent: () => session.current === active && generation.current === active.generation,
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
+    noteRecoveryKey(principal.network_id, verified.auth.state, view.recovery_key)
     setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
@@ -497,8 +503,22 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const me = own().deviceId
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
+    noteRecoveryKey(ready.principal.network_id, response.state, view.recovery_key)
     setDirectory(view); setRecoverySince(sinceOf(response)); setJoins(pending)
   }
+  function acceptRecoveryKey(networkId: string, key: string) {
+    try { store(`recovery-seen.${networkId}`, key); store(`recovery-own.${networkId}`, null) } catch {}
+  }
+  /** Compares the verified recovery key with the one this browser accepted; see `recoveryCheck`. */
+  function noteRecoveryKey(networkId: string, state: unknown, key: string) {
+    const seen = load(`recovery-seen.${networkId}`), own = load(`recovery-own.${networkId}`)
+    let result: ReturnType<typeof recoveryCheck> = 'adopt'
+    try { result = recoveryCheck(state, networkId, key, { seen: typeof seen === 'string' ? seen : null, own: typeof own === 'string' ? own : null }) } catch {}
+    if (result === 'adopt') acceptRecoveryKey(networkId, key)
+    setRecoveredElsewhere(result === 'notice')
+  }
+  /** Marks the key this browser is about to hand recovery to, so its own change raises no notice. */
+  function markOwnRecoveryKey(networkId: string, key: string) { store(`recovery-own.${networkId}`, key) }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
     if (!connection?.isCurrent() || !connection.principal.can_manage && !(connection.principal.source === 'local_session' && !enabled)) throw new Error('此连接不能变更本机自动访问设置。')
@@ -755,7 +775,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       if (!members.some(member => member.device_id === active.entry.device_id)) members.push({ device_id: active.entry.device_id, kind: 'node', name: active.info.name, manage: false })
       const newManager: Member = { device_id: me, kind: 'client', name, manage: true }
       const allowed = new Map(members.map(member => [member.device_id, member]))
-      let prepared: { checkpoints: unknown[]; checkpoint: unknown } | null = null
+      let prepared: { checkpoints: unknown[]; checkpoint: unknown; key: string } | null = null
       const flow: Sensitive = {
         cancel: release,
         async recover(selectedInput) {
@@ -776,10 +796,11 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
               const checkpoints = [...chain, checkpoint]
               const bytes = sealPackage({ networkId: opened.networkId, genesis, checkpoints }, next, password)
               try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
-              prepared = { checkpoints, checkpoint }
+              prepared = { checkpoints, checkpoint, key: next.deviceId() }
             } finally { next.free() }
             password = ''
           }
+          markOwnRecoveryKey(opened.networkId, prepared.key)
           let auth: unknown
           try { auth = await request('recover', { genesis, checkpoints: prepared.checkpoints, ...(fresh ? { capability } : {}) }) }
           catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“恢复”会重试同一次恢复，不会再下载文件。`) }
@@ -807,14 +828,16 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       verified = verifyState(state, opened.networkId)
       if (verifiedView(state, opened.networkId).recovery_key !== opened.root.deviceId()) throw superseded()
       const next = Identity.generate()
-      let checkpoints: unknown[]
+      let checkpoints: unknown[], nextKey: string
       try {
-        const code = await recoveryCode(next.deviceId())
-        const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, next.deviceId()))
+        nextKey = next.deviceId()
+        const code = await recoveryCode(nextKey)
+        const checkpoint: unknown = JSON.parse(verified.createKeyRotation(opened.root, nextKey))
         checkpoints = [...array(state.checkpoints), checkpoint]
         const bytes = sealPackage({ networkId: opened.networkId, genesis: state.genesis, checkpoints }, next, password)
         try { await platform.saveRecovery(bytes, recoveryFileName(code)) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
+      markOwnRecoveryKey(opened.networkId, nextKey)
       await connection.request('recover', { genesis: state.genesis, checkpoints })
       await refreshDirectory()
     } finally { opened.release(); verified?.free() }
@@ -930,7 +953,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }, [ready])
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
-    identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    identity, ready, entries, phase, error, entry, info, directory, recoverySince, recoveredElsewhere, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
@@ -938,6 +961,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
+    acknowledgeRecovery() { if (ready && directory) acceptRecoveryKey(ready.principal.network_id, directory.recovery_key); setRecoveredElsewhere(false) },
   }
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>
 }

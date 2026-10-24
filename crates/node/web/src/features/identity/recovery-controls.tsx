@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
-import { ArchiveRestore, CircleCheck, Download, FileKey, KeyRound, LockKeyhole, type LucideIcon } from 'lucide-react'
+import { useNavigate } from '@tanstack/react-router'
+import { ArchiveRestore, CircleCheck, Download, FileKey, KeyRound, LockKeyhole, ShieldAlert, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
-import { BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow } from '@/components/app/kit'
+import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
@@ -60,6 +61,18 @@ export function CurrentRecoveryFile() {
   return <SettingsRow icon={FileKey} label="恢复文件" description={recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</time> : undefined}>
     <code title={recoveryFileStem(code)} className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-meta text-foreground"><span className="sr-only">{recoveryFileStem("")}</span>{code}</code>
   </SettingsRow>
+}
+
+/** Another browser or device used a recovery file; this one asks whether that was the person. */
+export function RecoveredCard() {
+  const { recoverySince, acknowledgeRecovery } = useDevice()
+  const navigate = useNavigate()
+  return <ActionCard icon={ShieldAlert} title="网络刚用恢复文件找回过" actions={<>
+    <Button type="button" variant="ghost" onClick={() => { acknowledgeRecovery(); void navigate({ to: '/devices' }) }}>不是我</Button>
+    <Button type="button" onClick={acknowledgeRecovery}>是我</Button>
+  </>}>
+    {recoverySince ? <time className="text-muted-foreground tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleString('zh-CN', { dateStyle: 'long', timeStyle: 'short' })}</time> : null}
+  </ActionCard>
 }
 
 /** Shared by creating and recovering: the sealed file, then the promise it is kept apart from its password. */

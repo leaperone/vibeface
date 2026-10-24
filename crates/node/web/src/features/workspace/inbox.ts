@@ -1,4 +1,4 @@
-import { CircleQuestionMark, Copy, Lock, MessageCircleQuestionMark, MonitorSmartphone, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
+import { CircleQuestionMark, Copy, Lock, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
@@ -9,7 +9,7 @@ import type { PendingCheck, Question } from "@vibeface/client/workspace/types.ts
 import type { WriteCardKind } from "./write-card"
 
 /** `done`: a question this browser just answered, shown collapsed until the network's list drops it. */
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
+export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write" | "recovered"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
 
 /**
  * Everything waiting on the person: write state, then every unanswered question newest first, then the rest.
@@ -25,6 +25,7 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
+  if (device.recoveredElsewhere) items.push({ key: "recovered", icon: ShieldAlert, title: "网络刚用恢复文件找回过", to: "/inbox", kind: "recovered" })
   if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
