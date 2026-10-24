@@ -155,10 +155,11 @@ export default function ChatScreen() {
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={chat?.sending ?? false} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} />
-        {noAgent ? <Link href="/ai" asChild>
-          <Button variant="link" className="-mt-2 min-h-11 self-start px-6"><Text>去配置</Text></Button>
-        </Link> : null}
+          blocked={blocked} sending={chat?.sending ?? false} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined}>
+          {noAgent ? <Link href="/ai" asChild>
+            <Button variant="link" className="min-h-11 self-start px-2"><Text>去配置</Text></Button>
+          </Link> : null}
+        </Composer>
       </View>
     </KeyboardStickyView>
   </View>

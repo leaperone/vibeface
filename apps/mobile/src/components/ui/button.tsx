@@ -48,10 +48,11 @@ const buttonVariants = cva(
         link: '',
       },
       size: {
-        default: cn('min-h-10 px-4 py-2 sm:min-h-9', Platform.select({ web: 'has-[>svg]:px-3' })),
-        sm: cn('min-h-9 gap-1.5 rounded-md px-3 sm:min-h-8', Platform.select({ web: 'has-[>svg]:px-2.5' })),
-        lg: cn('min-h-11 rounded-md px-6 sm:min-h-10', Platform.select({ web: 'has-[>svg]:px-4' })),
-        icon: 'min-h-10 w-10 sm:min-h-9 sm:w-9',
+        default: cn('min-h-10 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
+        sm: cn('min-h-9 gap-1.5 rounded-md px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
+        lg: cn('min-h-11 rounded-md px-6', Platform.select({ web: 'has-[>svg]:px-4' })),
+        // No sm: steps; on iPad widths they would override a caller's size-11.
+        icon: 'min-h-10 w-10',
       },
     },
     defaultVariants: {

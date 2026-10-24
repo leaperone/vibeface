@@ -1,6 +1,7 @@
 import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
+import type { ReactNode } from 'react'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
 import Animated, { useReducedMotion } from 'react-native-reanimated'
 import { Button } from '@/components/ui/button'
@@ -27,9 +28,11 @@ type Props = {
   onSend: () => void
   /** Present while a reply runs and can be cancelled: the send button becomes stop. */
   onStop?: () => void
+  /** A follow-up under the blocked note, kept on the composer's column. */
+  children?: ReactNode
 }
 
-export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop }: Props) {
+export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children }: Props) {
   const canSend = !blocked && !sending && value.trim().length > 0
   // A CSS animation starts in the same commit as the new fill, so the first live frame is already small; an effect-driven spring lands a frame late.
   const still = useReducedMotion()
@@ -64,6 +67,9 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         </Animated.View>
       </View>
     </View>
-    {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+    {blocked || children ? <View className="w-full max-w-[640px] self-center">
+      {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+      {children}
+    </View> : null}
   </View>
 }
