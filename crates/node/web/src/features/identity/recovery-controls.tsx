@@ -52,8 +52,8 @@ export function CurrentRecoveryFile() {
     return () => { live = false }
   }, [key])
   if (!key || code?.key !== key) return null
-  return <SettingsRow icon={FileKey} label="恢复文件" description={<span className="font-mono">{recoveryFileStem(code.value)}</span>}>
-    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time> : null}
+  return <SettingsRow icon={FileKey} label="恢复文件" description={recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString()}</time> : undefined}>
+    <code title={recoveryFileStem(code.value)} className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-meta text-foreground"><span className="sr-only">{recoveryFileStem("")}</span>{code.value}</code>
   </SettingsRow>
 }
 
