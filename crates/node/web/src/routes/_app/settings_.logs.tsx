@@ -58,7 +58,7 @@ function LogsPage() {
     } catch (cause) { setError(cause) }
   }
   if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
-  return <div className="mx-auto grid w-full max-w-3xl gap-4">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-4">
     <div className="flex items-center gap-2">
       <div className="relative min-w-0 flex-1">
         <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
