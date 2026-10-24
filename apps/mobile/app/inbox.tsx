@@ -30,14 +30,16 @@ export default function Inbox() {
     groups.set(key, [...groups.get(key) ?? [], question])
   }
   const open = [...groups].sort(([a], [b]) => latest.get(b)! - latest.get(a)!).map(([, questions]) => questions)
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl grow self-center gap-4 p-4 pb-10">
-    {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
+  // Empty, it is a plain centred view like the home placeholder; a growing scroll container also counts the header inset.
+  if (!open.length) return <View className="flex-1 justify-center"><EmptyState icon={InboxIcon} title="没有要你决定的事" /></View>
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
+    {open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} replace={wide} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
           <Icon as={Bot} className="size-4" /><Text className="font-medium">{questions[0].bot.name}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" />
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : <View className="flex-1 justify-center"><EmptyState icon={InboxIcon} title="没有要你决定的事" /></View>}
+    </Group>)}
   </KeyboardAwareScrollView>
 }
