@@ -381,6 +381,7 @@ impl Runtime {
         if self.config.public_entry {
             return self.start_network().await;
         }
+        self.start_recovery_timer();
         if self.align_on_start().await? {
             self.start_writers(events);
         } else {
@@ -400,6 +401,50 @@ impl Runtime {
             });
         }
         self.start_network().await
+    }
+    /// A recovery takes effect, or a late veto undoes it, with time alone and no new record, so
+    /// this installs the history again whenever another directory is in effect: at start, after
+    /// each membership change, and when a waiting recovery is due.
+    fn start_recovery_timer(self: &Arc<Self>) {
+        let node = Arc::downgrade(self);
+        let mut membership = self.membership.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let Some(runtime) = node.upgrade() else {
+                    return;
+                };
+                let due = runtime.settle_recovery().await.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "installing the directory in effect is pending");
+                    Some(now_ms() as u64 + 60_000)
+                });
+                drop(runtime);
+                let wait = async {
+                    match due {
+                        Some(due) => {
+                            let left = due.saturating_sub(now_ms() as u64);
+                            tokio::time::sleep(Duration::from_millis(left)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = wait => {}
+                    changed = membership.changed() => if changed.is_err() { return },
+                }
+            }
+        });
+    }
+    /// Returns when the waiting recovery is due.
+    async fn settle_recovery(&self) -> Result<Option<u64>> {
+        if !self.has_membership().await? {
+            return Ok(None);
+        }
+        let state = self.membership_state().await?;
+        let view = state.project()?;
+        if self.recovery_since_ms(&view.recovery_key).await?.is_none() {
+            self.install_membership(state).await?;
+        }
+        Ok(view.pending.map(|pending| pending.effective_at_ms))
     }
     /// Work, scheduling and observation append to the log, so they wait for `writable`.
     /// ponytail: a Node that forks later keeps these running and its appends fail; stop them

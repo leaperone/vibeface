@@ -1823,6 +1823,49 @@ mod tests {
         Ok(())
     }
 
+    /// Nothing new arrives when a recovery's wait ends, so the Node installs the history again
+    /// itself, once.
+    #[tokio::test]
+    async fn a_waiting_recovery_is_installed_once_when_due() -> Result<()> {
+        use crate::identity::{RECOVERY_DELAY_MS, RootCheckpoint};
+        let ia = LocalIdentity::generate();
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?])?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            let next = LocalIdentity::generate().device_id()?;
+            let members = state.project()?.members;
+            let issued = now_ms() as u64 + 1_000 - RECOVERY_DELAY_MS;
+            let mut waiting = state.clone();
+            waiting.recover(RootCheckpoint::recovery(
+                &state,
+                &ia.fixture_root_at(2),
+                &next,
+                members,
+                vec![],
+                issued,
+            )?)?;
+            a.install_membership(waiting).await?;
+            a.start_recovery_timer();
+            let installs = *a.membership.borrow();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while a.recovery_since_ms(&next).await?.is_none() {
+                ensure!(
+                    Instant::now() < deadline,
+                    "the recovery was not installed when due"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(*a.membership.borrow(), installs + 1, "installed once");
+            anyhow::Ok(())
+        }
+        .await;
+        drop(a);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
     #[tokio::test]
     async fn alignment_waits_for_every_member_node_to_confirm() -> Result<()> {
         use crate::identity::{GovernanceEvent, Revocation};

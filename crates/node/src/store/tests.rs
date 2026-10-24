@@ -3178,6 +3178,7 @@ fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
             &fleet.x.device_id()?,
             Some((3, &x_writes[2].hash)),
         )?],
+        0,
     )?)?;
     let pieces = [
         Piece::Events([vec![created], x_writes.clone(), vec![z_write.clone()]].concat()),
@@ -3285,6 +3286,7 @@ fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result
             &fleet.x.device_id()?,
             Some((5, &writes[4].hash)),
         )?],
+        0,
     )?)?;
     let view = recovered.project()?;
     assert!(view.client(&fleet.admin.device_id()?).is_err());

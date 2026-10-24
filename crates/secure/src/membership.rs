@@ -2,9 +2,14 @@
 //!
 //! A `DeviceId` and a `network_id` are Ed25519 public keys. The recovery root signs
 //! only `Genesis` and `RootCheckpoint`; management clients sign `GovernanceEvent`s.
+//!
+//! A checkpoint that replaces the directory waits `RECOVERY_DELAY_MS` from its signed time;
+//! until then any manager of the epoch it would end can stop it with a signed veto. Signed times
+//! and causality decide the outcome, so every replica reaches the same one; a local clock only
+//! decides when a replica sees it.
 
 use crate::{Identity, validate_device_id};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,7 +21,25 @@ pub const GENESIS_DOMAIN: &str = "identity-genesis";
 pub const RECOVERY_DOMAIN: &str = "identity-recovery";
 /// A recovery file whose key a later recovery replaced.
 pub const SUPERSEDED: &str = "this recovery key was replaced by a newer recovery";
+pub const RECOVERY_WAITING: &str = "another recovery is waiting to take effect";
+/// A recovery file whose recovery a device stopped, or one built on it.
+pub const RECOVERY_STOPPED: &str = "one of your devices stopped this recovery";
+pub const NO_RECOVERY_WAITING: &str = "no recovery is waiting";
 pub const GOVERNANCE_DOMAIN: &str = "identity-governance";
+/// How long a recovery that replaces the directory waits for a veto.
+pub const RECOVERY_DELAY_MS: u64 = 48 * 60 * 60 * 1000;
+/// How far a new recovery's or veto's signed time may be from the clock of the Node taking it.
+pub const RECOVERY_SKEW_MS: u64 = 10 * 60 * 1000;
+
+/// This process's clock.
+pub fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    return js_sys::Date::now() as u64;
+    #[cfg(not(target_arch = "wasm32"))]
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
 
 /// A key held in this process: a Node device key or an unlocked recovery root.
 pub trait MembershipSigner {
@@ -207,8 +230,8 @@ pub struct Directory {
 }
 
 /// The only record the recovery key signs after genesis. Each one names the next recovery key,
-/// so the key that signed it stops working: a superseded recovery file signs nothing a replica
-/// that has seen this checkpoint accepts.
+/// so the key that signed it stops working once it takes effect: a key signs again only after
+/// every recovery it signed was stopped.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RootCheckpoint {
@@ -217,9 +240,11 @@ pub struct RootCheckpoint {
     pub epoch: u64,
     /// The key that signs the next checkpoint.
     pub recovery_key: String,
-    /// `None` only rotates the key: the epoch starts from everything the previous epoch
-    /// decided, including its events that arrive later, so no concurrent revocation is lost.
+    /// `None` only rotates the key, at once: the epoch starts from everything the previous
+    /// epoch decided, including its events that arrive later, so no concurrent revocation is lost.
     pub directory: Option<Directory>,
+    /// When the root signed it; a new directory takes effect `RECOVERY_DELAY_MS` later.
+    pub issued_at_ms: u64,
     pub signature: String,
 }
 
@@ -231,11 +256,20 @@ impl RootCheckpoint {
         next: &str,
         mut members: Vec<Member>,
         mut retired: Vec<Revocation>,
+        issued_at_ms: u64,
     ) -> Result<Self> {
         members.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         retired.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         let directory = Some(Directory { members, retired });
-        Self::create(state.network_id(), state.epoch() + 1, root, next, directory)
+        let epoch = state.epoch() + 1;
+        Self::create(
+            state.network_id(),
+            epoch,
+            root,
+            next,
+            directory,
+            issued_at_ms,
+        )
     }
 
     /// The next checkpoint of `state`: hands recovery to `next` and keeps the directory.
@@ -244,7 +278,8 @@ impl RootCheckpoint {
         root: &impl MembershipSigner,
         next: &str,
     ) -> Result<Self> {
-        Self::create(state.network_id(), state.epoch() + 1, root, next, None)
+        let epoch = state.epoch() + 1;
+        Self::create(state.network_id(), epoch, root, next, None, now_ms())
     }
 
     fn create(
@@ -253,6 +288,7 @@ impl RootCheckpoint {
         root: &impl MembershipSigner,
         next: &str,
         directory: Option<Directory>,
+        issued_at_ms: u64,
     ) -> Result<Self> {
         let mut checkpoint = Self {
             version: IDENTITY_VERSION,
@@ -260,6 +296,7 @@ impl RootCheckpoint {
             epoch,
             recovery_key: next.to_owned(),
             directory,
+            issued_at_ms,
             signature: String::new(),
         };
         checkpoint.validate_shape()?;
@@ -329,6 +366,16 @@ impl RootCheckpoint {
             &self.signature,
         )
         .context("recovery checkpoint is not signed by the current recovery key")
+    }
+
+    /// What a veto names.
+    pub fn hash(&self) -> Result<String> {
+        Ok(digest(&canonical_json(self)?))
+    }
+
+    /// When a new directory takes effect unless vetoed.
+    pub fn effective_at_ms(&self) -> u64 {
+        self.issued_at_ms.saturating_add(RECOVERY_DELAY_MS)
     }
 }
 
@@ -407,8 +454,15 @@ fn widen(revoked: &mut BTreeMap<String, Revocation>, revocation: &Revocation) {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernanceAction {
-    Grant { member: Member },
+    Grant {
+        member: Member,
+    },
     Revoke(Revocation),
+    /// Stops the recovery waiting on this epoch; counts only if signed before it takes effect.
+    Veto {
+        checkpoint: String,
+        at_ms: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -437,6 +491,10 @@ impl GovernanceEvent {
         match &action {
             GovernanceAction::Grant { member } => member.validate()?,
             GovernanceAction::Revoke(revocation) => revocation.validate()?,
+            GovernanceAction::Veto { checkpoint, .. } => ensure!(
+                view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
+                NO_RECOVERY_WAITING
+            ),
         }
         Ok(Self {
             version: IDENTITY_VERSION,
@@ -512,6 +570,7 @@ pub enum WriteBound<'a> {
     Cutoff(&'a Revocation),
 }
 
+/// The directory as of one time: the last epoch in effect.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationView {
@@ -524,8 +583,20 @@ pub struct AuthorizationView {
     /// Every former device with its final write bound: this epoch's revocations and the ones
     /// the last recovery retired.
     pub revoked: Vec<Revocation>,
-    /// Every device that was a client in any epoch; their signatures on history stay valid.
+    /// Every device that was a client in any epoch in effect; their signatures on history stay valid.
     pub attesters: Vec<String>,
+    /// The recovery waiting to replace this epoch's directory.
+    pub pending: Option<PendingRecovery>,
+    /// Hashes of the checkpoints a veto stopped, and of any signed on top of them.
+    pub stopped: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingRecovery {
+    pub checkpoint: String,
+    pub effective_at_ms: u64,
+    pub members: Vec<Member>,
 }
 
 impl AuthorizationView {
@@ -622,7 +693,48 @@ struct EpochView {
     heads: Vec<String>,
     members: BTreeMap<String, Member>,
     revoked: BTreeMap<String, Revocation>,
-    granted_clients: Vec<String>,
+    /// Its base's clients and every client granted in it.
+    clients: Vec<String>,
+    /// The earliest signed time of each veto here, by the checkpoint it names.
+    vetoes: BTreeMap<String, u64>,
+}
+
+/// Where an epoch stands at one time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    Live,
+    /// A new directory waiting for its time.
+    Pending,
+    /// Signed on top of an epoch not in effect yet.
+    Waiting,
+    Vetoed,
+    /// Signed on top of a vetoed epoch.
+    Void,
+}
+
+struct Epoch {
+    key: String,
+    /// The epoch whose key signed this one's checkpoint.
+    parent: Option<usize>,
+    checkpoint: Option<String>,
+    effective_at_ms: u64,
+    vetoed: bool,
+    standing: Standing,
+    view: EpochView,
+}
+
+/// The last epoch in effect; the genesis epoch always is.
+fn live(epochs: &[Epoch]) -> usize {
+    epochs
+        .iter()
+        .rposition(|epoch| epoch.standing == Standing::Live)
+        .expect("the genesis epoch is in effect")
+}
+
+fn pending(epochs: &[Epoch], live: usize) -> Option<usize> {
+    epochs
+        .iter()
+        .position(|epoch| epoch.parent == Some(live) && epoch.standing == Standing::Pending)
 }
 
 impl NetworkState {
@@ -639,6 +751,7 @@ impl NetworkState {
         &self.genesis.network_id
     }
 
+    /// The highest checkpoint epoch, whether or not it is in effect.
     pub fn epoch(&self) -> u64 {
         self.checkpoints
             .last()
@@ -660,45 +773,53 @@ impl NetworkState {
         Ok(true)
     }
 
-    /// The key the next checkpoint must be signed with.
-    pub fn recovery_key(&self) -> &str {
-        self.checkpoints
-            .last()
-            .map_or(&self.genesis.network_id, |checkpoint| {
-                &checkpoint.recovery_key
-            })
-    }
-
-    /// Every key that held recovery here and a later checkpoint replaced.
-    pub fn superseded_keys(&self) -> impl Iterator<Item = &str> {
+    /// Every key that held or holds recovery here, oldest first.
+    pub fn recovery_keys(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.genesis.network_id.as_str())
             .chain(self.checkpoints.iter().map(|c| c.recovery_key.as_str()))
-            .take(self.checkpoints.len())
     }
 
-    pub fn superseded(&self, key: &str) -> bool {
-        self.superseded_keys().any(|old| old == key)
+    /// Why `key` cannot sign the next checkpoint at `now_ms`, if it cannot.
+    pub fn check_root(&self, key: &str, now_ms: u64) -> Result<()> {
+        let epochs = self.epochs(now_ms)?;
+        let live = live(&epochs);
+        let index = epochs
+            .iter()
+            .position(|epoch| epoch.key == key)
+            .context("recovery key does not own this personal network")?;
+        match epochs[index].standing {
+            Standing::Vetoed | Standing::Void => bail!(RECOVERY_STOPPED),
+            Standing::Pending | Standing::Waiting => bail!(RECOVERY_WAITING),
+            Standing::Live if index < live => bail!(SUPERSEDED),
+            Standing::Live => ensure!(pending(&epochs, live).is_none(), RECOVERY_WAITING),
+        }
+        Ok(())
     }
 
-    /// Returns false when this exact checkpoint is already current. Earlier history is kept.
     pub fn recover(&mut self, checkpoint: RootCheckpoint) -> Result<bool> {
-        if self.checkpoints.last() == Some(&checkpoint) {
+        self.recover_at(checkpoint, now_ms())
+    }
+
+    /// Returns false when this exact checkpoint is already here. Earlier history is kept.
+    pub fn recover_at(&mut self, checkpoint: RootCheckpoint, now_ms: u64) -> Result<bool> {
+        if self.checkpoints.contains(&checkpoint) {
             return Ok(false);
         }
         ensure!(
             checkpoint.epoch == self.epoch() + 1,
             "recovery epoch rollback or conflict"
         );
-        if let Err(error) = checkpoint.verify(&self.genesis, self.recovery_key()) {
-            let stale = self
-                .superseded_keys()
-                .any(|key| checkpoint.verify(&self.genesis, key).is_ok());
-            ensure!(!stale, SUPERSEDED);
-            return Err(error);
+        match self
+            .recovery_keys()
+            .find(|key| checkpoint.verify(&self.genesis, key).is_ok())
+        {
+            Some(signer) => self.check_root(signer, now_ms)?,
+            // Not ours, or malformed: the reason against the current key.
+            None => checkpoint.verify(&self.genesis, &self.project_at(now_ms)?.recovery_key)?,
         }
         let mut next = self.clone();
         next.checkpoints.push(checkpoint);
-        next.project()?;
+        next.project_at(now_ms)?;
         *self = next;
         Ok(true)
     }
@@ -728,8 +849,47 @@ impl NetworkState {
         Ok(merged)
     }
 
-    /// Checks every epoch against its own base and returns the current directory.
+    /// The directory in effect now.
     pub fn project(&self) -> Result<AuthorizationView> {
+        self.project_at(now_ms())
+    }
+
+    /// Checks every epoch against its own base and returns the directory in effect at `now_ms`.
+    pub fn project_at(&self, now_ms: u64) -> Result<AuthorizationView> {
+        let mut epochs = self.epochs(now_ms)?;
+        let live = live(&epochs);
+        let pending = pending(&epochs, live).map(|index| PendingRecovery {
+            checkpoint: epochs[index].checkpoint.clone().unwrap_or_default(),
+            effective_at_ms: epochs[index].effective_at_ms,
+            members: epochs[index].view.members.values().cloned().collect(),
+        });
+        let stopped = epochs
+            .iter()
+            .filter(|epoch| matches!(epoch.standing, Standing::Vetoed | Standing::Void))
+            .filter_map(|epoch| epoch.checkpoint.clone())
+            .collect();
+        let attesters: BTreeSet<String> = epochs
+            .iter()
+            .filter(|epoch| epoch.standing == Standing::Live)
+            .flat_map(|epoch| epoch.view.clients.iter().cloned())
+            .collect();
+        let current = epochs.swap_remove(live);
+        Ok(AuthorizationView {
+            network_id: self.genesis.network_id.clone(),
+            epoch: live as u64 + 1,
+            recovery_key: current.key,
+            heads: current.view.heads,
+            members: current.view.members.into_values().collect(),
+            revoked: current.view.revoked.into_values().collect(),
+            attesters: attesters.into_iter().collect(),
+            pending,
+            stopped,
+        })
+    }
+
+    /// Every epoch checked against its own base, and where each stands at `now_ms`. Only the
+    /// standing depends on the time; whether the history is valid does not.
+    fn epochs(&self, now_ms: u64) -> Result<Vec<Epoch>> {
         self.genesis.verify()?;
         ensure!(
             self.checkpoints.len() <= MAX_CHECKPOINTS
@@ -747,50 +907,87 @@ impl NetworkState {
             keys.windows(2).all(|pair| pair[0] < pair[1]),
             "duplicate or noncanonical management events"
         );
-        let mut attesters = BTreeSet::from([self.genesis.first_client.device_id.clone()]);
-        let mut signer = self.genesis.network_id.as_str();
-        let genesis_members = self.genesis.members();
-        let mut current =
-            self.project_epoch(1, &genesis_members, &[], signer, &self.epoch_events(1))?;
-        attesters.extend(current.granted_clients.iter().cloned());
-        let mut checked = self.epoch_events(1).len();
+        let root = &self.genesis.network_id;
+        let events = self.epoch_events(1);
+        let mut checked = events.len();
+        let view = self.project_epoch(1, &self.genesis.members(), &[], root, &events)?;
+        let mut epochs = vec![Epoch {
+            key: root.clone(),
+            parent: None,
+            checkpoint: None,
+            effective_at_ms: 0,
+            vetoed: false,
+            standing: Standing::Live,
+            view,
+        }];
         for (index, checkpoint) in self.checkpoints.iter().enumerate() {
             ensure!(
                 checkpoint.epoch == index as u64 + 2,
                 "recovery checkpoints must follow each other epoch by epoch"
             );
-            checkpoint.verify(&self.genesis, signer)?;
-            signer = &checkpoint.recovery_key;
+            ensure!(
+                epochs
+                    .iter()
+                    .all(|epoch| epoch.key != checkpoint.recovery_key),
+                "a recovery key cannot be used twice"
+            );
+            let parent = (0..epochs.len())
+                .rev()
+                .find(|parent| {
+                    checkpoint
+                        .verify(&self.genesis, &epochs[*parent].key)
+                        .is_ok()
+                })
+                .context("recovery checkpoint is not signed by a recovery key of this network")?;
+            ensure!(
+                epochs
+                    .iter()
+                    .all(|epoch| epoch.parent != Some(parent) || epoch.vetoed),
+                "a recovery key signs again only after its earlier recoveries were vetoed"
+            );
+            let hash = checkpoint.hash()?;
+            let effective_at_ms = checkpoint.effective_at_ms();
+            let vetoed = checkpoint.directory.is_some()
+                && epochs[parent]
+                    .view
+                    .vetoes
+                    .get(&hash)
+                    .is_some_and(|at| *at < effective_at_ms);
+            let standing = match epochs[parent].standing {
+                Standing::Vetoed | Standing::Void => Standing::Void,
+                Standing::Pending | Standing::Waiting => Standing::Waiting,
+                Standing::Live if vetoed => Standing::Vetoed,
+                Standing::Live if checkpoint.directory.is_none() || now_ms >= effective_at_ms => {
+                    Standing::Live
+                }
+                Standing::Live => Standing::Pending,
+            };
             let (base, retired) = match &checkpoint.directory {
                 Some(directory) => (directory.members.clone(), directory.retired.clone()),
                 None => (
-                    current.members.into_values().collect(),
-                    current.revoked.into_values().collect(),
+                    epochs[parent].view.members.values().cloned().collect(),
+                    epochs[parent].view.revoked.values().cloned().collect(),
                 ),
             };
-            attesters.extend(
-                base.iter()
-                    .filter(|member| member.kind == IdentityKind::Client)
-                    .map(|member| member.device_id.clone()),
-            );
             let events = self.epoch_events(checkpoint.epoch);
             checked += events.len();
-            current = self.project_epoch(checkpoint.epoch, &base, &retired, signer, &events)?;
-            attesters.extend(current.granted_clients.iter().cloned());
+            let key = &checkpoint.recovery_key;
+            let view = self.project_epoch(checkpoint.epoch, &base, &retired, key, &events)?;
+            epochs.push(Epoch {
+                key: key.clone(),
+                parent: Some(parent),
+                checkpoint: Some(hash),
+                effective_at_ms,
+                vetoed,
+                standing,
+                view,
+            });
         }
         ensure!(
             checked == self.events.len(),
             "management event epoch has no recovery checkpoint"
         );
-        Ok(AuthorizationView {
-            network_id: self.genesis.network_id.clone(),
-            epoch: self.epoch(),
-            recovery_key: signer.to_owned(),
-            heads: current.heads,
-            members: current.members.into_values().collect(),
-            revoked: current.revoked.into_values().collect(),
-            attesters: attesters.into_iter().collect(),
-        })
+        Ok(epochs)
     }
 
     fn epoch_events(&self, epoch: u64) -> Vec<&GovernanceEvent> {
@@ -819,7 +1016,12 @@ impl NetworkState {
             .iter()
             .map(|member| (member.device_id.as_str(), member.kind))
             .collect();
-        let mut granted_clients = Vec::new();
+        let mut clients: Vec<String> = base
+            .iter()
+            .filter(|member| member.kind == IdentityKind::Client)
+            .map(|member| member.device_id.clone())
+            .collect();
+        let mut vetoes = BTreeMap::new();
         for event in events {
             ensure!(
                 event.version == IDENTITY_VERSION
@@ -847,10 +1049,15 @@ impl NetworkState {
                         );
                     }
                     if member.kind == IdentityKind::Client {
-                        granted_clients.push(member.device_id.clone());
+                        clients.push(member.device_id.clone());
                     }
                 }
                 GovernanceAction::Revoke(revocation) => revocation.validate()?,
+                GovernanceAction::Veto { checkpoint, at_ms } => {
+                    validate_hash(checkpoint)?;
+                    let earliest = vetoes.entry(checkpoint.clone()).or_insert(*at_ms);
+                    *earliest = (*earliest).min(*at_ms);
+                }
             }
             pending.insert(event.hash()?, (*event).clone());
         }
@@ -919,7 +1126,8 @@ impl NetworkState {
             heads: heads.into_iter().collect(),
             members,
             revoked,
-            granted_clients,
+            clients,
+            vetoes,
         })
     }
 }
@@ -942,6 +1150,7 @@ fn project_members(
     let mut candidates: BTreeMap<String, Vec<&String>> = BTreeMap::new();
     for hash in basis {
         match &events[hash].event.action {
+            GovernanceAction::Veto { .. } => {}
             GovernanceAction::Revoke(revocation) => widen(&mut revoked, revocation),
             GovernanceAction::Grant { member } => {
                 candidates
@@ -1057,12 +1266,16 @@ pub fn governance_payload(event_json: &str) -> crate::Result<Vec<u8>> {
 pub struct VerifiedMembership {
     state: NetworkState,
     view: AuthorizationView,
+    now: u64,
 }
 
+/// `now`: the Node's clock as its last answer gave it, so both sides see the same epoch in
+/// effect; this process's clock when absent.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = verifyMembership))]
 pub fn verify_membership(
     state_json: &str,
     expected_network: &str,
+    now: Option<f64>,
 ) -> crate::Result<VerifiedMembership> {
     js((|| {
         ensure!(
@@ -1074,8 +1287,9 @@ pub fn verify_membership(
             state.genesis.network_id == expected_network,
             "membership belongs to another personal network"
         );
-        let view = state.project()?;
-        Ok(VerifiedMembership { state, view })
+        let now = now.map_or_else(now_ms, |now| now as u64);
+        let view = state.project_at(now)?;
+        Ok(VerifiedMembership { state, view, now })
     })())
 }
 
@@ -1091,7 +1305,8 @@ impl VerifiedMembership {
         Ok(serde_json::to_string(&self.state)?)
     }
 
-    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}` or `{"type":"revoke",...}`.
+    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}`, `{"type":"revoke",...}` or
+    /// `{"type":"veto","checkpoint":...,"at_ms":...}`.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = governanceTemplate))]
     pub fn governance_template(&self, issuer: &str, action_json: &str) -> crate::Result<String> {
         js((|| {
@@ -1118,8 +1333,11 @@ impl VerifiedMembership {
             let retired = self
                 .view
                 .retire(&members, &serde_json::from_str(heads_json)?)?;
-            let checkpoint = RootCheckpoint::recovery(&self.state, root, next, members, retired)?;
-            self.state.clone().recover(checkpoint.clone())?;
+            let checkpoint =
+                RootCheckpoint::recovery(&self.state, root, next, members, retired, self.now)?;
+            self.state
+                .clone()
+                .recover_at(checkpoint.clone(), self.now)?;
             Ok(serde_json::to_string(&checkpoint)?)
         })())
     }
@@ -1130,19 +1348,15 @@ impl VerifiedMembership {
         js((|| {
             self.current_root(root)?;
             let checkpoint = RootCheckpoint::rotation(&self.state, root, next)?;
-            self.state.clone().recover(checkpoint.clone())?;
+            self.state
+                .clone()
+                .recover_at(checkpoint.clone(), self.now)?;
             Ok(serde_json::to_string(&checkpoint)?)
         })())
     }
 
     fn current_root(&self, root: &Identity) -> Result<()> {
-        let key = root.device_id();
-        ensure!(!self.state.superseded(&key), SUPERSEDED);
-        ensure!(
-            key == self.state.recovery_key(),
-            "recovery key does not own this personal network"
-        );
-        Ok(())
+        self.state.check_root(&root.device_id(), self.now)
     }
 }
 
@@ -1381,7 +1595,8 @@ mod tests {
                 &root,
                 &id(&next),
                 keeps(Member::client(&next, "n", true)?)?,
-                vec![]
+                vec![],
+                0
             )
             .is_err(),
             "the next recovery key cannot be a daily device"
@@ -1392,6 +1607,7 @@ mod tests {
             &id(&next),
             keeps(Member::client(&root, "r", true)?)?,
             vec![],
+            0,
         )?;
         assert!(state.clone().recover(keeps_root).is_err());
         assert!(RootCheckpoint::rotation(&state, &root, &id(&root)).is_err());
@@ -1409,7 +1625,7 @@ mod tests {
         ];
         let next = identity();
         let checkpoint =
-            RootCheckpoint::recovery(&state, &root, &id(&next), members.clone(), vec![])?;
+            RootCheckpoint::recovery(&state, &root, &id(&next), members.clone(), vec![], 0)?;
         assert!(state.recover(checkpoint.clone())?);
         assert!(!state.recover(checkpoint)?);
         assert!(state.project()?.manager(&id(&recovered)).is_ok());
@@ -1424,6 +1640,7 @@ mod tests {
             &id(&identity()),
             vec![Member::client(&a, "conflicting", true)?],
             vec![],
+            0,
         )?)?;
         assert!(state.merge(&conflict).is_err());
         let foreign = identity();
@@ -1434,7 +1651,8 @@ mod tests {
                     &foreign,
                     &id(&identity()),
                     members.clone(),
-                    vec![]
+                    vec![],
+                    0
                 )?)
                 .is_err()
         );
@@ -1444,7 +1662,8 @@ mod tests {
                 &next,
                 &id(&identity()),
                 vec![Member::node(&node, "n")?],
-                vec![]
+                vec![],
+                0
             )
             .is_err()
         );
@@ -1454,7 +1673,8 @@ mod tests {
                 &next,
                 &id(&identity()),
                 members.clone(),
-                vec![cut(&node, 2)]
+                vec![cut(&node, 2)],
+                0
             )
             .is_err(),
             "a retired device cannot stay a member"
@@ -1468,7 +1688,8 @@ mod tests {
                     &root,
                     &id(&next),
                     renamed,
-                    vec![]
+                    vec![],
+                    0
                 )?)
                 .is_err()
         );
@@ -1487,9 +1708,13 @@ mod tests {
             &id(&next),
             keep.clone(),
             vec![],
+            0,
         )?)?;
-        assert!(state.superseded(&id(&root)) && !state.superseded(&id(&next)));
-        assert!(!state.superseded(&id(&identity())));
+        let now = now_ms();
+        let refused = state.check_root(&id(&root), now).unwrap_err();
+        assert!(format!("{refused:#}").contains(SUPERSEDED));
+        state.check_root(&id(&next), now)?;
+        assert!(state.check_root(&id(&identity()), now).is_err());
 
         let stolen = RootCheckpoint::rotation(&state, &root, &id(&identity()))?;
         let refused = state.clone().recover(stolen.clone()).unwrap_err();
@@ -1505,16 +1730,17 @@ mod tests {
             &id(&identity()),
             keep.clone(),
             vec![],
+            0,
         )?)?;
         assert!(state.merge(&rival).is_err() && rival.merge(&state).is_err());
 
-        let skip = RootCheckpoint::create(state.network_id(), 4, &next, &id(&identity()), None)?;
+        let skip = RootCheckpoint::create(state.network_id(), 4, &next, &id(&identity()), None, 0)?;
         assert!(state.clone().recover(skip.clone()).is_err());
         let mut gap = state.clone();
         gap.checkpoints.push(skip);
         assert!(gap.project().is_err());
 
-        let verified = verify_membership(&serde_json::to_string(&state)?, &id(&root))?;
+        let verified = verify_membership(&serde_json::to_string(&state)?, &id(&root), None)?;
         let error = verified
             .create_key_rotation(&root, &id(&identity()))
             .unwrap_err();
@@ -1527,7 +1753,8 @@ mod tests {
         let rotated: RootCheckpoint =
             serde_json::from_str(&verified.create_key_rotation(&next, &id(&identity()))?)?;
         assert!(state.recover(rotated)?);
-        assert!(state.superseded(&id(&next)));
+        let refused = state.check_root(&id(&next), now_ms()).unwrap_err();
+        assert!(format!("{refused:#}").contains(SUPERSEDED));
         Ok(())
     }
 
@@ -1551,8 +1778,10 @@ mod tests {
         let view = state.project()?;
         assert_eq!(
             (view.epoch, view.recovery_key.as_str()),
-            (2, id(&next).as_str())
+            (2, id(&next).as_str()),
+            "a rotation takes effect at once"
         );
+        assert!(view.pending.is_none());
         assert!(view.manager(&id(&b)).is_ok() && view.node(&id(&node)).is_ok());
 
         state.append(GovernanceEvent::grant(
@@ -1609,11 +1838,11 @@ mod tests {
     fn browser_helpers_verify_before_building_or_signing() -> Result<()> {
         let (root, a, node, state) = setup()?;
         let state_json = serde_json::to_string(&state)?;
-        let verified = verify_membership(&state_json, &id(&root))?;
-        assert!(verify_membership(&state_json, &id(&a)).is_err());
+        let verified = verify_membership(&state_json, &id(&root), None)?;
+        assert!(verify_membership(&state_json, &id(&a), None).is_err());
         let mut forged = state.clone();
         forged.genesis.signature = "00".repeat(64);
-        assert!(verify_membership(&serde_json::to_string(&forged)?, &id(&root)).is_err());
+        assert!(verify_membership(&serde_json::to_string(&forged)?, &id(&root), None).is_err());
 
         let action = serde_json::json!({"type":"revoke","device_id":id(&node),
             "cutoff_seq":4,"cutoff_hash":hash(4)});
@@ -1701,6 +1930,7 @@ mod tests {
             &id(&identity()),
             vec![Member::client(&a, "a", true)?, Member::node(&node, "node")?],
             vec![],
+            0,
         )?)?;
         recovered.append(GovernanceEvent::grant(
             &a,
@@ -1755,7 +1985,7 @@ mod tests {
             Member::node(&kept, "kept")?,
         ];
         let heads = serde_json::json!({ id(&left): [5, hash(5)], id(&kept): [8, hash(8)] });
-        let verified = verify_membership(&serde_json::to_string(&state)?, &id(&root))?;
+        let verified = verify_membership(&serde_json::to_string(&state)?, &id(&root), Some(0.0))?;
         let checkpoint: RootCheckpoint =
             serde_json::from_str(&verified.create_recovery_checkpoint(
                 &root,
@@ -1811,6 +2041,231 @@ mod tests {
             merged.project()?.revocation(&id(&left)),
             Some(&cut(&left, 5))
         );
+        Ok(())
+    }
+
+    /// Signed at a fixed time, so each test picks the moment it projects at.
+    const T: u64 = 1_800_000_000_000;
+
+    /// A recovery of `state` that keeps only `node` and adds a new manager, signed at `issued`.
+    fn recovering(
+        state: &NetworkState,
+        root: &Identity,
+        node: &Identity,
+        issued: u64,
+    ) -> Result<(Identity, Identity, RootCheckpoint)> {
+        let (manager, next) = (identity(), identity());
+        let members = vec![
+            Member::client(&manager, "found", true)?,
+            Member::node(node, "node")?,
+        ];
+        let checkpoint =
+            RootCheckpoint::recovery(state, root, &id(&next), members, vec![], issued)?;
+        Ok((manager, next, checkpoint))
+    }
+
+    fn veto(
+        admin: &Identity,
+        view: &AuthorizationView,
+        checkpoint: &RootCheckpoint,
+        at_ms: u64,
+    ) -> Result<GovernanceEvent> {
+        let checkpoint = checkpoint.hash()?;
+        GovernanceEvent::unsigned(
+            view,
+            &id(admin),
+            GovernanceAction::Veto { checkpoint, at_ms },
+        )?
+        .sign(admin)
+    }
+
+    fn refused(result: Result<impl std::fmt::Debug>, reason: &str) {
+        let error = format!("{:#}", result.expect_err(reason));
+        assert!(error.contains(reason), "{error}");
+    }
+
+    #[test]
+    fn a_waiting_recovery_takes_effect_after_the_delay() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (found, next, checkpoint) = recovering(&state, &root, &node, T)?;
+        assert!(state.recover_at(checkpoint.clone(), T)?);
+        let due = T + RECOVERY_DELAY_MS;
+        let before = state.project_at(due - 1)?;
+        assert_eq!(
+            (before.epoch, before.recovery_key.as_str()),
+            (1, id(&root).as_str())
+        );
+        assert!(before.manager(&id(&a)).is_ok() && before.client(&id(&found)).is_err());
+        assert!(!before.attester(&id(&found)));
+        let pending = before.pending.context("the recovery waits")?;
+        assert_eq!(pending.checkpoint, checkpoint.hash()?);
+        assert_eq!(pending.effective_at_ms, due);
+        assert!(pending.members.iter().any(|m| m.device_id == id(&found)));
+
+        // Nothing more is signed while it waits: not by the old file, not by the new one.
+        refused(state.check_root(&id(&root), T), RECOVERY_WAITING);
+        refused(state.check_root(&id(&next), T), RECOVERY_WAITING);
+        let rotation = RootCheckpoint::rotation(&state, &root, &id(&identity()))?;
+        refused(
+            state.clone().recover_at(rotation.clone(), T),
+            RECOVERY_WAITING,
+        );
+        let stacked = RootCheckpoint::rotation(&state, &next, &id(&identity()))?;
+        refused(state.clone().recover_at(stacked, T), RECOVERY_WAITING);
+        let mut sibling = state.clone();
+        sibling.checkpoints.push(rotation);
+        assert!(
+            sibling.project_at(T).is_err(),
+            "a second branch fails closed"
+        );
+
+        let after = state.project_at(due)?;
+        assert_eq!(
+            (after.epoch, after.recovery_key.as_str()),
+            (2, id(&next).as_str())
+        );
+        assert!(after.manager(&id(&found)).is_ok() && after.client(&id(&a)).is_err());
+        assert!(after.pending.is_none() && after.stopped.is_empty());
+        assert!(after.attester(&id(&found)) && after.attester(&id(&a)));
+        state.check_root(&id(&next), due)?;
+        refused(state.check_root(&id(&root), due), SUPERSEDED);
+        Ok(())
+    }
+
+    #[test]
+    fn a_veto_keeps_the_directory_and_the_old_file() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (found, next, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        // The browser builds it from the Node's clock.
+        let verified =
+            verify_membership(&serde_json::to_string(&state)?, &id(&root), Some(T as f64))?;
+        let action =
+            serde_json::json!({"type":"veto","checkpoint":checkpoint.hash()?,"at_ms":T + 1});
+        let mut event: GovernanceEvent =
+            serde_json::from_str(&verified.governance_template(&id(&a), &action.to_string())?)?;
+        event.signature = a.sign_message(&crate::signing_message(
+            GOVERNANCE_DOMAIN,
+            &event.signing_bytes()?,
+        )?);
+        assert!(state.append(event)?);
+        for at in [T, T + RECOVERY_DELAY_MS, T * 2] {
+            let view = state.project_at(at)?;
+            assert_eq!(
+                (view.epoch, view.recovery_key.as_str()),
+                (1, id(&root).as_str())
+            );
+            assert!(view.manager(&id(&a)).is_ok() && view.client(&id(&found)).is_err());
+            assert!(view.pending.is_none() && !view.attester(&id(&found)));
+            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
+        }
+        state.check_root(&id(&root), T)?;
+        refused(state.check_root(&id(&next), T), RECOVERY_STOPPED);
+        let mut stacked = state.clone();
+        stacked
+            .checkpoints
+            .push(RootCheckpoint::rotation(&state, &next, &id(&identity()))?);
+        assert_eq!(
+            stacked.project_at(T + RECOVERY_DELAY_MS)?.stopped.len(),
+            2,
+            "built on it, void too"
+        );
+        refused(
+            state.clone().recover(stacked.checkpoints[1].clone()),
+            RECOVERY_STOPPED,
+        );
+
+        // The old file still rotates at once, or starts another recovery.
+        let mut rotated = state.clone();
+        rotated.recover_at(
+            RootCheckpoint::rotation(&state, &root, &id(&identity()))?,
+            T,
+        )?;
+        assert_eq!(rotated.project_at(T)?.epoch, 3);
+        let (_, _, again) = recovering(&state, &root, &node, T)?;
+        assert!(state.recover_at(again, T)?);
+        assert!(state.project_at(T)?.pending.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_manager_of_the_epoch_it_ends_vetoes_and_only_in_time() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (ordinary, removed, other) = (identity(), identity(), identity());
+        for member in [
+            Member::client(&ordinary, "ordinary", false)?,
+            Member::client(&removed, "removed", true)?,
+            Member::client(&other, "other", true)?,
+        ] {
+            state.append(GovernanceEvent::grant(&a, &state.project()?, member)?)?;
+        }
+        state.append(GovernanceEvent::revoke(
+            &a,
+            &state.project()?,
+            cut(&removed, 0),
+        )?)?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let view = state.project_at(T)?;
+        let signed_by = |device: &Identity| -> Result<GovernanceEvent> {
+            let mut event = veto(&a, &view, &checkpoint, T)?;
+            event.issuer = id(device);
+            event.sign(device)
+        };
+        refused(
+            state.clone().append(signed_by(&ordinary)?),
+            "management permission required",
+        );
+        refused(
+            state.clone().append(signed_by(&removed)?),
+            "management permission required",
+        );
+
+        let mut late = state.clone();
+        late.append(veto(&a, &view, &checkpoint, T + RECOVERY_DELAY_MS)?)?;
+        assert!(
+            late.project_at(T)?.pending.is_some(),
+            "a veto signed too late counts for nothing"
+        );
+        assert_eq!(late.project_at(T + RECOVERY_DELAY_MS)?.epoch, 2);
+
+        // Removing the device that vetoed, afterwards, brings nothing back.
+        state.append(veto(&a, &view, &checkpoint, T + RECOVERY_DELAY_MS - 1)?)?;
+        state.append(GovernanceEvent::revoke(
+            &other,
+            &state.project_at(T)?,
+            cut(&a, 0),
+        )?)?;
+        let view = state.project_at(T + RECOVERY_DELAY_MS)?;
+        assert_eq!(view.epoch, 1);
+        assert!(view.pending.is_none() && view.client(&id(&a)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn replicas_reach_the_same_outcome_in_any_order_and_replays_change_nothing() -> Result<()> {
+        let (root, a, node, base) = setup()?;
+        let (_, _, checkpoint) = recovering(&base, &root, &node, T)?;
+        let mut recovered = base.clone();
+        recovered.recover_at(checkpoint.clone(), T)?;
+        let event = veto(&a, &recovered.project_at(T)?, &checkpoint, T + 1)?;
+        let mut vetoed = recovered.clone();
+        assert!(vetoed.append(event.clone())?);
+        assert!(!vetoed.append(event)? && !vetoed.recover_at(checkpoint, T)?);
+        let parts = [&base, &recovered, &vetoed];
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]] {
+            let merged = order[1..]
+                .iter()
+                .try_fold(parts[order[0]].clone(), |state, index| {
+                    state.merge(parts[*index])
+                })?;
+            assert_eq!(merged, vetoed);
+        }
+        // Without the veto every replica flips at the same signed time; a veto that arrives
+        // later still wins, because it was signed in time.
+        let due = T + RECOVERY_DELAY_MS;
+        assert_eq!(recovered.merge(&base)?.project_at(due)?.epoch, 2);
+        assert_eq!(recovered.merge(&vetoed)?.project_at(due)?.epoch, 1);
         Ok(())
     }
 }
