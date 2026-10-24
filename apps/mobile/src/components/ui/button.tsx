@@ -8,8 +8,8 @@ import { withUniwind } from 'uniwind';
 const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
 // Critically damped and quick, so the press lands on touch-down and settles without a bounce.
 const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
-// Fills ease when a control changes state; the press itself still answers at once through the scale.
-const fade = { transitionProperty: ['backgroundColor', 'opacity'], transitionDuration: 150 } as const;
+// Disabling eases; fills change at once so a theme switch never leaves a stale colour behind.
+const fade = { transitionProperty: 'opacity', transitionDuration: 150 } as const;
 
 const buttonVariants = cva(
   cn(
@@ -48,10 +48,11 @@ const buttonVariants = cva(
         link: '',
       },
       size: {
-        default: cn('min-h-10 px-4 py-2 sm:min-h-9', Platform.select({ web: 'has-[>svg]:px-3' })),
-        sm: cn('min-h-9 gap-1.5 rounded-md px-3 sm:min-h-8', Platform.select({ web: 'has-[>svg]:px-2.5' })),
-        lg: cn('min-h-11 rounded-md px-6 sm:min-h-10', Platform.select({ web: 'has-[>svg]:px-4' })),
-        icon: 'min-h-10 w-10 sm:min-h-9 sm:w-9',
+        default: cn('min-h-10 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
+        sm: cn('min-h-9 gap-1.5 rounded-md px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
+        lg: cn('min-h-11 rounded-md px-6', Platform.select({ web: 'has-[>svg]:px-4' })),
+        // No sm: steps; on iPad widths they would override a caller's size-11.
+        icon: 'min-h-10 w-10',
       },
     },
     defaultVariants: {
@@ -77,9 +78,10 @@ const buttonTextVariants = cva(
         ),
         secondary: 'text-secondary-foreground',
         ghost: 'group-active:text-accent-foreground',
+        // Underlined at rest so a link reads apart from body text; Android draws the line in the text colour, so the press dims the text instead.
         link: cn(
-          'text-primary group-active:underline',
-          Platform.select({ web: 'underline-offset-4 hover:underline group-hover:underline' })
+          'text-primary underline decoration-muted-foreground group-active:text-primary/70',
+          Platform.select({ web: 'underline-offset-4 hover:text-primary/70 group-hover:text-primary/70' })
         ),
       },
       size: {
@@ -98,9 +100,12 @@ const buttonTextVariants = cva(
 
 type ButtonProps = React.ComponentProps<typeof Pressable> &
   React.RefAttributes<typeof Pressable> &
-  VariantProps<typeof buttonVariants>;
+  VariantProps<typeof buttonVariants> & {
+    /** Change fill on the same frame as the content, for buttons whose icon colour swaps with the fill. */
+    instant?: boolean;
+  };
 
-function Button({ className, variant, size, onPressIn, onPressOut, ...props }: ButtonProps) {
+function Button({ className, variant, size, instant, style, onPressIn, onPressOut, ...props }: ButtonProps) {
   const scale = useSharedValue(1);
   const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const muted = props.disabled && (variant ?? 'default') === 'default';
@@ -110,7 +115,7 @@ function Button({ className, variant, size, onPressIn, onPressOut, ...props }: B
         className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
         role="button"
         {...props}
-        style={[pressed, fade]}
+        style={[typeof style === 'function' ? undefined : style, pressed, !instant && fade]}
         onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
         onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
       />

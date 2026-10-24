@@ -73,18 +73,35 @@ function Live({ children }: { children: ReactNode }) {
   const conversations: Record<string, Conversation> = {}
   if (data && conversationId) {
     const jobs = data.scheduler?.jobs ?? []
-    const live = shared.liveProgress.find((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text
+    // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
+    // streaming, which can land a frame or two before the job names it.
+    const newest = data.messages.at(-1)
+    // Either side may be ahead by the last few characters, so one being the start of the other is the same reply.
+    // A message still on its way means the newest in the history is the last turn's reply, not this one's.
+    const sending = shared.messagePending && !data.messages.some((message) => message.message_id === shared.messagePending?.message_id)
+    const landed = (text: string) => !sending && newest?.role === 'assistant' && newest.text.trim() !== '' && text.trim() !== ''
+      && (newest.text.trim().startsWith(text.trim()) || text.trim().startsWith(newest.text.trim()))
+    const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
+    const handedOver = streamed.some((progress) => landed(progress.text))
+    const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
+    // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
+    // sending, or else the latest in the history.
+    const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
     const messages: ChatMessage[] = threadReplies(data.messages)
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
-    if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming' })
+    if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const agentReady = nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
       messages, questions: data.questions, works: data.works,
-      replying: Boolean(live) || jobs.some((job) => busyStates.includes(job.state)),
+      // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
+      // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
+      replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
+        || job.reply_message_id && job.message_id
+        && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
       blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '')
