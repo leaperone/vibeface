@@ -1,0 +1,7 @@
+{
+  "name": "@vibeface/theme",
+  "private": true,
+  "exports": {
+    "./theme.css": "./theme.css"
+  }
+}

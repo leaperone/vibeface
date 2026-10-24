@@ -5,9 +5,9 @@ import { BusyIcon, Details, InlineError, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
-import { useDevice } from "@/features/identity/context"
-import { parseTriageSettings } from "@/features/workspace/model"
-import type { Outlet, TriageSettings as Settings } from "@/features/workspace/types"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
+import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
 const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发到聊天机器人", Layers]]
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions">

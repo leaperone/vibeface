@@ -4,9 +4,9 @@ import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { useDevice } from "@/features/identity/context"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { terms } from "@/lib/glossary"
-import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@/lib/node"
+import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }

@@ -4,10 +4,10 @@ import type { ReactNode } from "react"
 import { EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { SecondDeviceHint } from "@/features/devices/second-device"
-import { useWorkspace } from "./context"
-import { byRecent, listTime } from "./home"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
-import { openQuestions } from "./questions"
+import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 
 /** The phone's home: 待处理 first, then every bot by its newest message. */

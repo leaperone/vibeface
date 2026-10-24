@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@import "uniwind";
+@import "@vibeface/theme/theme.css";
+
+@source "./app";
+@source "./src";
+
+@theme {
+  --font-sans: "Geist";
+  --font-mono: "Geist Mono";
+}

@@ -1,5 +1,5 @@
-import { boolean, entryKey, parseEntry, record, text } from './node'
-import type { ConnectionEntry, PublicIdentity } from './node'
+import { boolean, entryKey, parseEntry, record, text } from '@vibeface/client/lib/node.ts'
+import type { ConnectionEntry, PublicIdentity } from '@vibeface/client/lib/node.ts'
 
 type LocalLaunch = { token: string; deviceId: string }
 

@@ -12,21 +12,23 @@ import subprocess
 import tempfile
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi")
 DEPENDENTS = {
     "protocol": ("bridge", "node"),
     "bridge": ("node",),
-    "secure": ("node",),
+    "secure": ("node", "secure-ffi"),
     "node": (),
+    "secure-ffi": (),
 }
-CRATES = dict(zip(("protocol", "bridge", "secure", "node"), PACKAGES))
+CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi"), PACKAGES))
 PATH_RULES = (
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
-    ("web", ("crates/node/web/*", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
+    ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
 SLOW_TESTS = ("store::tests::append_100k_stays_flat",)
@@ -260,13 +262,16 @@ def self_test():
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/node/web/src/content.md"])["web"]
+    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web"]
+    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web"]
+    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
     docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["required_jobs"] == ["quick-check"]
     expected = {
         "node": ["vibeface"],
         "bridge": ["vibeface-bridge", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface"],
+        "secure": ["vibeface-secure", "vibeface", "vibeface-secure-ffi"],
     }
     for crate, packages in expected.items():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])

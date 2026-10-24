@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
-import { Script } from 'node:vm'
-import initCrypto, { Handshake, signingMessage, ticketDecode } from '../../generated/vibeface_secure.js'
+import { createTransport } from '@vibeface/client/lib/transport.ts'
+import type { SecureApi } from '@vibeface/client/secure-api.ts'
+import initCrypto, * as wasm from '../../generated/vibeface_secure.js'
+import { Handshake } from '../../generated/vibeface_secure.js'
 
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('')
 const prologue = new TextEncoder().encode('vibeface:client:v1')
@@ -62,11 +64,11 @@ async function harness({ local = false, refuse = '', impostor = false } = {}) {
       this.dispatchEvent(new Event('close'))
     }
   }
-  const source = readFileSync(new URL('../../transport.js', import.meta.url), 'utf8').replace(/^import .*\n/, '').replace(/^export /gm, '')
-  const runtime = new Script(`${source}\ndevice = testDevice; initializing = Promise.resolve({ deviceId: testDevice.deviceId }); ({ connectDevice, parseJoinLink });`).runInNewContext({
-    init: async () => {}, isSecureContext: true, indexedDB: {}, Handshake, signingMessage, ticketDecode, testDevice: browser,
-    TextEncoder, TextDecoder, Uint8Array, ArrayBuffer, WebSocket: GatewaySocket, URL, crypto: globalThis.crypto, CryptoKey,
-    location: { protocol: 'https:', origin: 'https://gateway.example' }, AbortController, setTimeout, clearTimeout,
+  Object.assign(globalThis, { WebSocket: GatewaySocket, location: { protocol: 'https:', origin: 'https://gateway.example' } })
+  const secure: SecureApi = wasm
+  const runtime = createTransport(secure, {
+    load: async () => ({ deviceId: browser.deviceId }), remove: async () => {},
+    sign: async (message) => hex(await crypto.subtle.sign({ name: 'Ed25519' }, browser.privateKey, new Uint8Array(message))),
   })
   const address = 'https://gateway.example'
   return {
@@ -81,7 +83,7 @@ test('the gateway receives a connect frame and the Noise session proves the targ
   assert.deepEqual(app.urls, ['wss://gateway.example/api/client'])
   assert.deepEqual(app.texts.map(text => JSON.parse(text)), [{ type: 'connect', target: app.target }])
   assert.equal(channel.deviceId, app.target)
-  assert.equal((await channel.request('info')).device_id, app.target)
+  assert.equal((await channel.request('info') as { device_id: string }).device_id, app.target)
   channel.close(); await settle()
   assert.equal(app.open(), 0)
 })

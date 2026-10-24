@@ -3,7 +3,7 @@ import { Link, useRouterState } from "@tanstack/react-router"
 import { Smartphone, X } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
-import { useDevice } from "@/features/identity/context"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"

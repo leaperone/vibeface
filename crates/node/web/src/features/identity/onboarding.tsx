@@ -5,7 +5,7 @@ import { BusyIcon, InlineError } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AiSettings } from "@/features/devices/ai-settings"
-import { useWorkspace } from "@/features/workspace/context"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
 
 function Dots({ step }: { step: number }) {
