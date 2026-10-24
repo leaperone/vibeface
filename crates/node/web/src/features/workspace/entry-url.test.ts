@@ -461,6 +461,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
   let cursor = 0
   const react = {
+    createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useState(initial: unknown) {

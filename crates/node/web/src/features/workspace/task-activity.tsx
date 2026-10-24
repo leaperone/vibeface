@@ -3,7 +3,7 @@
 import { useId, useState } from "react"
 import { Link } from "@tanstack/react-router"
 import { Bot, ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
-import { ActionCard, BotAvatar, Details, toast } from "@/components/app/kit"
+import { ActionCard, BotAvatar, DetailRow, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -40,12 +40,14 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const lookup = { nodes: workspace.nodes, directory }
   if (check.kind === "process") return <ActionCard
     icon={Cpu}
-    title="上次回复的程序还在运行"
-    meta={nodeName(workspace.data?.local_node, lookup)}
-    actions={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
+    title="程序还在运行"
+    trailing={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
   >
     <p className="text-muted-foreground">{checkReason(check)}程序退出后会自动处理。</p>
-    {check.detail ? <Details><span>{check.detail}</span></Details> : null}
+    <Details>
+      <DetailRow label="设备" value={nodeName(workspace.data?.local_node, lookup)} />
+      {check.detail ? <span>{check.detail}</span> : null}
+    </Details>
   </ActionCard>
   const settle = (work: WorkCheck, choice: "completed" | "interrupted", text = "") => async () => { await workspace.resolveCheck(work, choice, text); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = nodeName(check.target_node, lookup)

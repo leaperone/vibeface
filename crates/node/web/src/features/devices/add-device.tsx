@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { Link } from "@tanstack/react-router"
 import { CircleCheck, Copy, Link2, Plus, Smartphone } from "lucide-react"
 import qrcode from "qrcode-generator"
-import { BusyIcon, Details, InlineError } from "@/components/app/kit"
+import { BusyIcon, Details, InlineError, PageActions } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
@@ -81,7 +81,10 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
   if (!ready?.principal.can_manage) return null
 
   return <>
-    <Button type="button" variant={requests ? "outline" : "default"} onClick={show}><Plus aria-hidden="true" />添加设备</Button>
+    <PageActions>
+      <Button type="button" variant="ghost" size="icon" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
+      <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
+    </PageActions>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>

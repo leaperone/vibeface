@@ -11,13 +11,6 @@ export function useOpenJoins(): JoinRequest[] {
   return device.ready?.principal.can_manage ? device.joins.filter((request) => request.status === "pending" || request.status === "confirming") : []
 }
 
-let cardsOnScreen = 0
-/** While a join card is visible (sheet, device page or 待处理) the shell skips its "X 想加入" toast; the card already says it. */
-export const joinsOnScreen = () => cardsOnScreen > 0
-const shownListeners = new Set<() => void>()
-/** Called when a join card appears, so a toast that came first can go. */
-export function onJoinCardShown(listener: () => void) { shownListeners.add(listener); return () => { shownListeners.delete(listener) } }
-
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
 /**
  * `issuing`: this page just handed out a link, so it starts the comparison without a click.
@@ -50,7 +43,6 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
   const device = useDevice()
   const action = useAction()
   const [manage, setManage] = useState(false)
-  useEffect(() => { cardsOnScreen++; for (const listener of shownListeners) listener(); return () => { cardsOnScreen-- } }, [])
   // Opening the card is the admin's commitment; the new device then reveals and both sides show the code.
   useEffect(() => {
     if (!auto || request.status !== "pending" || started.has(request.join_id)) return
