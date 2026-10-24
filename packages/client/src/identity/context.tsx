@@ -861,6 +861,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     } finally { opened.release(); verified?.free() }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
+  useEffect(() => page?.watchInvitation(invitation => { setInitialInvitation(invitation); setError('') }), [])
   useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
   useEffect(() => {
     let mounted = true

@@ -187,7 +187,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
   const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
-  useEffect(() => { if (device.initialInvitation) setInvitation((current) => current.trim() ? current : device.initialInvitation) }, [device.initialInvitation])
+  // A newly opened link replaces whatever is here, including a spent one, and the failure that came with it.
+  useEffect(() => { if (device.initialInvitation) { setInvitation(device.initialInvitation); setError(''); setNotice('') } }, [device.initialInvitation])
   useEffect(() => { setError('') }, [generation])
   // A link is single-use: once its request ends without joining, offering 继续 again only leads to "已用过".
   const wasJoining = useRef(false)
