@@ -347,12 +347,15 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: |
+          set -o pipefail
           codesign --verify --strict "$PACKAGE/vibeface"
           details="$(codesign -dv "$PACKAGE/vibeface" 2>&1)"
+          printf '%s\n' "$details"
           grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
           grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
           grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
-          spctl -a -vvv -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | grep -qx 'source=Notarized Developer ID'
+          spctl -a -vvv -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | tee "$RUNNER_TEMP/gatekeeper-assessment.txt"
+          grep -qx 'source=Notarized Developer ID' "$RUNNER_TEMP/gatekeeper-assessment.txt"
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
