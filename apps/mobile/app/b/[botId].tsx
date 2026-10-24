@@ -79,6 +79,7 @@ export default function ChatScreen() {
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>({})
+  const [launching, setLaunching] = useState(false)
   const draft = (id && drafts[id]) || { text: '', files: [] }
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => ({ ...current, [id]: { ...draft, ...next } })) }
   useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
@@ -106,9 +107,11 @@ export default function ChatScreen() {
   const send = () => {
     const { text, files } = draft
     setDraft({ text: '', files: [] })
+    // Held from the tap itself: the shared sending flag lands a frame or two after the draft clears.
+    setLaunching(true)
     // iOS makes room for the keyboard with an inset, so the newest message rests at a negative offset, not at 0.
     list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
-    workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) })
+    workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras) : []
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
@@ -155,7 +158,7 @@ export default function ChatScreen() {
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={chat?.sending ?? false} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined}>
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined}>
           {noAgent ? <Link href="/ai" asChild>
             <Button variant="link" className="min-h-11 self-start px-2"><Text>去配置</Text></Button>
           </Link> : null}
