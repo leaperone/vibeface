@@ -85,8 +85,9 @@ function Live({ children }: { children: ReactNode }) {
     const handedOver = streamed.some((progress) => landed(progress.text))
     const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
-    // The message it answers, so the streamed row and the final reply share a row; a reply answers the latest user message.
-    const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? data.messages.findLast((message) => message.role === 'user')?.message_id)
+    // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
+    // sending, or else the latest in the history.
+    const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
     const messages: ChatMessage[] = threadReplies(data.messages)
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
