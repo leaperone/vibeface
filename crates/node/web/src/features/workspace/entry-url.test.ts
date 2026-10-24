@@ -718,7 +718,7 @@ test("artifact reads retain their offset while old responses cannot append or un
     work.resolve({ size: 5, next_offset: null, text: 'fresh' }); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'pre')?.props.children, 'fresh')
     assert.deepEqual(offsets, [0, 0])
-    assert.ok(render().some(({ type, props }) => type === 'span' && props.children === 'notes.txt' && props.title === 'notes.txt'), 'the card names the file')
+    assert.ok(render().some(({ type, props }) => type === 'span' && props.title === 'notes.txt' && (props.children as { props?: { name?: string } } | undefined)?.props?.name === 'notes.txt'), 'the card names the file')
   } finally { app.close() }
 })
 
@@ -802,7 +802,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     assert.equal(sent, 0)
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: false, roots: [] } }])
     assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
-    assert.match(String(composer()?.hint), /需设置/)
+    assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()

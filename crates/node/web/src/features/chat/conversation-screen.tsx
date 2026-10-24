@@ -163,13 +163,14 @@ export function ConversationScreen() {
   const notice = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : messagePending ? '上一条消息还没确认送达' : ''
+    : messagePending && messageBusy ? '上一条消息还没确认送达' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const hint = notice || (bot && !agentReady ? (unready ? '运行 Bot 的设备需设置' : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
+  // An empty chat already offers the setup button in its middle.
+  const hint = notice || (bot && !agentReady ? (unready ? (entries.length ? '运行 Bot 的设备需设置' : '') : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
@@ -237,7 +238,7 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput>
     </section>
   )
@@ -264,27 +265,28 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
-  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  // Breaks by the chat column, which a task panel beside it narrows, not by the window.
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
-  </Link>
-  return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
+  </Link></div>
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>
         : taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
-  </Link>
+  </Link></div>
 }
 
-/** Device and state never yield to a long title: below `sm` they take their own line. */
+/** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
 function TaskMeta({ device, here, state, className = '' }: { device: string; here: boolean; state: string; className?: string }) {
   const Icon = here ? Laptop : Server
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
-    <span aria-hidden="true" className="hidden sm:inline">·</span>
+    <span aria-hidden="true" className="hidden @sm:inline">·</span>
     <Icon aria-hidden="true" className="size-3.5 shrink-0" />
     <span className="truncate">{device}</span>
     <span aria-hidden="true">·</span>

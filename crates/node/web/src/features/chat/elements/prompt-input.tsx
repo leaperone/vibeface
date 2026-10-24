@@ -125,7 +125,7 @@ export function PromptInput({
 }
 
 /** The extension stays readable when a long name is cut. */
-function FileName({ name }: { name: string }) {
+export function FileName({ name }: { name: string }) {
   const dot = name.lastIndexOf('.')
   if (dot <= 0 || name.length - dot > 8) return <span className="truncate">{name}</span>
   return <span className="flex min-w-0"><span className="truncate">{name.slice(0, dot)}</span><span className="shrink-0">{name.slice(dot)}</span></span>

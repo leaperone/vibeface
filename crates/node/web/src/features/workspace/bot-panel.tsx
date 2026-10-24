@@ -88,10 +88,10 @@ export function BotPanelButton() {
               if (deleted) return <SettingsRow key={schedule.schedule_id} icon={Trash2} className="text-muted-foreground" label={<span role="status"><span className="line-through">{schedule.name}</span> 已删除</span>} />
               return <SettingsRow key={schedule.schedule_id} icon={once ? AlarmClock : Repeat}
                 label={<span title={name}>{name}</span>}
-                description={<span className="flex flex-wrap items-center gap-x-2 tabular-nums">
+                description={<span className="flex flex-wrap items-center gap-x-1.5 tabular-nums">
                   {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-3.5" />已暂停</span>
                     : schedule.next_run_at_ms !== null ? <time dateTime={new Date(schedule.next_run_at_ms).toISOString()} title={formatWhen(schedule.next_run_at_ms)}>{formatIn(schedule.next_run_at_ms)}</time> : null}
-                  <span>{scheduleFrequency(schedule)}</span>
+                  {!schedule.enabled || schedule.next_run_at_ms !== null ? <span aria-hidden="true">·</span> : null}<span>{scheduleFrequency(schedule)}</span>
                   {detail ? <span className="basis-full truncate" title={detail}>{detail}</span> : null}
                 </span>}>
                 {confirming === schedule.schedule_id ? <>
