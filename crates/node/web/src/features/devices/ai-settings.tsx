@@ -151,8 +151,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   }
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
-  const botReady = Boolean(response?.providers.some((item) => item.roles.includes("agent") && item.state === "ready") && !response?.readiness.missing.length)
-  useEffect(() => { onBot?.(botReady) }, [botReady])
+  useEffect(() => { onBot?.(botOn) }, [botOn])
   // During setup the first provider that works runs the bot, so "可用" never leaves the chat without one.
   const autoBot = useRef(false)
   useEffect(() => {
@@ -179,7 +178,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
-    {onboarding ? botReady ? null : <BotHint provider={response.providers.find((item) => item.roles.includes("agent"))?.provider} /> : <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding ? botOn ? null : <BotHint /> : <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -305,10 +304,10 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   </li>
 }
 
-/** Why setup cannot move on yet: no provider runs the bot, or the one that does is not ready. */
-function BotHint({ provider }: { provider?: ProviderId }) {
+/** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
+function BotHint() {
   return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
-    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />{provider ? `${providerNames[provider]} 需设置` : `打开「运行 ${terms.bot.label}」`}
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开「运行 {terms.bot.label}」
   </p>
 }
 

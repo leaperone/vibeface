@@ -66,7 +66,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (submitting.current || !event.currentTarget.reportValidity()) return
+    if (submitting.current) return
+    if (!pending && !name.trim()) { setError("请填写名称。"); return }
     const selected = selectedProject ? projects.find((item) => item.key === selectedProject) : undefined
     if (!pending && selectedProject && !selected) {
       setError("这个文件夹现在用不了，换一个或不选。")
@@ -77,7 +78,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
       const bot = await workspace.createBot(pending ? {
         name: pending.name, instructions: pending.instructions, project: pending.project,
       } : {
-        name, instructions, project: selected?.project,
+        name: name.trim(), instructions, project: selected?.project,
       })
       if (workspace.isCurrent()) { onOpenChange(false); if (bot) void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) }
     } catch (cause) { if (workspace.isCurrent()) setError(messageOf(cause)) }
@@ -91,7 +92,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
           <SheetTitle>{pending ? "再试一次" : "新 Bot"}</SheetTitle>
           <SheetDescription className={pending ? undefined : "sr-only"}>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>
         </SheetHeader>
-        <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" onSubmit={(event) => { void submit(event) }}>
+        <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" noValidate onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-lg bg-muted p-3 text-meta">上次没建成，确认后可以修改。</p> : null}
           <Field>
             <FieldLabel htmlFor="bot-name">名称</FieldLabel>
