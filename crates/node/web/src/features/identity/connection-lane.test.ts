@@ -557,6 +557,60 @@ test('a local browser reuses its cookie-bound identity and can disable its own a
   } finally { app.close() }
 })
 
+test('after 断开 a local browser stays disconnected until a launch opens it, then reloads connected again', async () => {
+  const storage = new Map<string, string>()
+  const first = deviceHarness({ localSession: true, storage })
+  try {
+    first.render(); await settle()
+    assert.equal(first.render().ready?.principal.source, 'local_session')
+    first.render().disconnect()
+  } finally { first.close() }
+  const reopened = deviceHarness({ localSession: true, storage })
+  try {
+    reopened.render(); await settle()
+    assert.equal(reopened.render().ready, null)
+    assert.equal(reopened.render().phase, 'disconnected')
+    assert.equal(reopened.calls.includes('local-info'), false)
+    assert.equal(reopened.sockets.length, 0)
+  } finally { reopened.close() }
+  const launched = deviceHarness({ localSession: true, storage, fragment: `#local=${'f'.repeat(64)}&node=${target}` })
+  try {
+    launched.render(); await settle()
+    assert.equal(launched.render().ready?.principal.source, 'local_session')
+  } finally { launched.close() }
+  const reloaded = deviceHarness({ localSession: true, storage })
+  try {
+    reloaded.render(); await settle()
+    assert.equal(reloaded.render().ready?.principal.source, 'local_session')
+  } finally { reloaded.close() }
+})
+
+test('after 断开 the localhost page shows its computer without opening it', async () => {
+  const app = deviceHarness({ local: 'initialized', storage: new Map([['vibeface.stay-disconnected', 'true']]) })
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.render().localSetup?.kind, 'initialized')
+    assert.equal(app.sockets.length, 0)
+    await app.render().openLocalAccess()
+    assert.equal(app.navigations.length, 1)
+  } finally { app.close() }
+})
+
+test('after 断开 a member on the localhost page reconnects as itself when 打开 is clicked', async () => {
+  const storage = new Map([['vibeface.stay-disconnected', 'true'], ['vibeface.connections', JSON.stringify([localEntry])], [`vibeface.network-for.${target}`, JSON.stringify(network)]])
+  const app = deviceHarness({ local: 'initialized', management: true, storage })
+  app.localState.setup = { kind: 'initialized', removed: false, entry: localEntry, local_launch: localLaunch }
+  try {
+    app.render(); await settle()
+    assert.equal(app.sockets.length, 0)
+    await app.render().openLocalAccess(); await settle()
+    assert.equal(app.navigations.length, 0)
+    assert.equal(app.render().ready?.principal.source, 'membership')
+    assert.equal(app.stored.get('vibeface.stay-disconnected'), 'null')
+  } finally { app.close() }
+})
+
 test('a signed management browser keeps its permissions through the local cookie channel, reconnect, and reload', async () => {
   const storage = new Map<string, string>()
   for (let reload = 0; reload < 2; reload++) {

@@ -250,15 +250,15 @@ export function FilePicker({ name, accept, required, disabled, label = "选择�
   </span>
 }
 
-type ToastItem = { id: number; text: string; tone: Tone; action?: { label: string; onClick: () => void } }
+type ToastItem = { id: number; text: string; tone: Tone; icon?: LucideIcon; action?: { label: string; onClick: () => void } }
 let toasts: ToastItem[] = []
 let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
 export function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
 /** `persist`: stays until closed, for a message the person must act on. Returns the id for `dismissToast`. */
-export function toast(text: string, options: { tone?: Tone; action?: ToastItem["action"]; persist?: boolean } = {}) {
-  const item = { id: ++toastId, text, tone: options.tone ?? "neutral", action: options.action }
+export function toast(text: string, options: { tone?: Tone; icon?: LucideIcon; action?: ToastItem["action"]; persist?: boolean } = {}) {
+  const item = { id: ++toastId, text, tone: options.tone ?? "neutral", icon: options.icon, action: options.action }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
   if (!options.persist) setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
@@ -306,7 +306,7 @@ export function Toaster() {
   }, [items])
   return <div aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {
-      const Icon = toastIcon[item.tone]
+      const Icon = item.icon ?? toastIcon[item.tone]
       return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
