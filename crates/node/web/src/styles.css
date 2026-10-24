@@ -77,6 +77,14 @@ body {
   --elevation-lg: 0 2px 4px oklch(0.2 0.02 270 / 0.04), 0 12px 32px -8px oklch(0.2 0.02 270 / 0.18);
 }
 
+/* Dark: the workspace sidebar is lifted a step above the page, as a card is, and a hairline parts them. Web only; the shared theme and the sign-in page keep theirs. */
+:root.dark .workspace-shell {
+  --sidebar: oklch(0.2 0.007 270);
+  --sidebar-accent: oklch(0.26 0.009 270);
+  --sidebar-border: oklch(1 0 0 / 10%);
+}
+.workspace-shell [data-slot="sidebar-container"] { border-color: var(--sidebar-border); }
+
 :root.dark {
   --elevation-xs: 0 1px 2px oklch(0 0 0 / 0.3);
   --elevation-sm: 0 1px 2px oklch(0 0 0 / 0.3), 0 2px 8px -2px oklch(0 0 0 / 0.3);
