@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useSyncExternalStore } from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
 import { Smartphone, X } from "lucide-react"
 import { cn } from "cn"
@@ -7,18 +7,26 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"
-const dismissedBefore = () => { try { return localStorage.getItem(key) === "dismissed" } catch { return false } }
+const listeners = new Set<() => void>()
+let closed = false
+const dismissedBefore = () => { try { return closed || localStorage.getItem(key) === "dismissed" } catch { return closed } }
+// The sidebar and the narrow-screen list each show the hint; closing one closes both, and other tabs.
+const subscribe = (listener: () => void) => {
+  listeners.add(listener); window.addEventListener("storage", listener)
+  return () => { listeners.delete(listener); window.removeEventListener("storage", listener) }
+}
 
 /** While a new network holds only this computer and this browser, a quiet way into 添加设备. */
 export function SecondDeviceHint({ className }: { className?: string }) {
   const { ready, directory } = useDevice()
   const rows = useDeviceRows()
   const onDevices = useRouterState({ select: (state) => state.location.pathname.startsWith("/devices") })
-  const [dismissed, setDismissed] = useState(dismissedBefore)
+  const dismissed = useSyncExternalStore(subscribe, dismissedBefore, () => false)
   if (dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
   function dismiss() {
+    closed = true
     try { localStorage.setItem(key, "dismissed") } catch {}
-    setDismissed(true)
+    listeners.forEach((listener) => listener())
   }
   return <div className={cn("flex min-w-0 items-center rounded-lg text-meta text-muted-foreground hover:bg-muted/50", className)}>
     <Link to="/devices" search={{ add: true }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 hover:text-foreground max-md:min-h-11">
