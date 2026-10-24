@@ -14,6 +14,7 @@ import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { JoinRequests } from '@/features/devices/join-requests'
+import { useWide } from '@/lib/layout'
 import { cn } from '@/lib/utils'
 import { useRun } from '@/lib/use-run'
 
@@ -26,15 +27,17 @@ export default function Settings() {
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
   const themeTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const wide = useWide()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
       {/* The whole app repaints on a theme change, so it waits for the thumb to land instead of tearing its slide. */}
       <Segmented options={themes} value={current} onChange={(value) => { clearTimeout(themeTimer.current); themeTimer.current = setTimeout(() => Uniwind.setTheme(value), 350) }} />
     </Section>
-    <Section icon={Globe} title="连接">
+    {/* Beside the sidebar its footer already shows the connection. */}
+    {wide ? null : <Section icon={Globe} title="连接">
       <View className="-mx-2 -my-3"><ConnectionPill connection={workspace.connection} /></View>
-    </Section>
+    </Section>}
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">

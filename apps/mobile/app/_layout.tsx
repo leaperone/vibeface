@@ -33,7 +33,8 @@ function Screens() {
   return <>
     <StatusBar style="auto" />
     <View className="flex-1 flex-row">
-      {wide && ready ? <View className="w-80 border-e border-border bg-background"><HomeList sidebar /></View> : null}
+      {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
+      {ready ? <View className="w-80 border-e border-border bg-background" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
       <View className="flex-1">
         <Stack screenOptions={{
           headerShadowVisible: false,

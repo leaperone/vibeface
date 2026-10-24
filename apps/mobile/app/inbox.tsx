@@ -1,10 +1,10 @@
 import { Link } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { Bot, ChevronRight, Inbox as InboxIcon } from 'lucide-react-native'
-import { useRef, useState } from 'react'
-import { Platform, Pressable, View } from 'react-native'
-import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
+import { useRef } from 'react'
+import { Pressable } from 'react-native'
+import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
+import Animated, { FadeIn, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { EmptyState } from '@/components/kit'
@@ -24,7 +24,7 @@ export default function Inbox() {
   const wide = useWide()
   const bar = useHeaderHeight()
   const insets = useSafeAreaInsets()
-  const [frame, setFrame] = useState(0)
+  const frame = useSafeAreaFrame()
   // Groups order by the newest question each bot has shown here. Answered questions leave the list, so the time is kept
   // and only rises: answering never reshuffles the groups, and only a new question lifts its bot to the top.
   const latest = useRef(new Map<string, number>()).current
@@ -36,11 +36,11 @@ export default function Inbox() {
   }
   const open = [...groups].sort(([a], [b]) => latest.get(b)! - latest.get(a)!).map(([, questions]) => questions)
   // The scroll view stays when empty: iOS tints the glass back button from it, and swapping it out flashes the button light.
-  // The empty state fills what shows below the bar, which on iOS the automatic inset leaves out of the view's own height.
+  // The empty state fills what shows below the bar, known from the first frame so it never starts at the top.
   // Its extra 24 on top evens out the container's 16 top and 40 bottom padding, so it centres in that area.
-  const below = Math.max(0, frame - (Platform.OS === 'ios' ? bar + insets.bottom : 0) - 56)
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10"
-    onLayout={(event) => setFrame(event.nativeEvent.layout.height)}>
+  const below = Math.max(0, frame.height - bar - insets.bottom - 56)
+  // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
+  return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} replace={wide} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
@@ -48,6 +48,8 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : <View style={{ minHeight: below, paddingTop: 24 }} className="justify-center"><EmptyState icon={InboxIcon} title="没有要你决定的事" /></View>}
-  </KeyboardAwareScrollView>
+    </Group>) : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
+      <EmptyState icon={InboxIcon} title="没有要你决定的事" />
+    </Animated.View>}
+  </KeyboardAwareScrollView></LayoutAnimationConfig>
 }
