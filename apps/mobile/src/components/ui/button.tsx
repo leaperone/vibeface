@@ -8,8 +8,8 @@ import { withUniwind } from 'uniwind';
 const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
 // Critically damped and quick, so the press lands on touch-down and settles without a bounce.
 const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
-// Fills ease when a control changes state; the press itself still answers at once through the scale.
-const fade = { transitionProperty: ['backgroundColor', 'opacity'], transitionDuration: 150 } as const;
+// Disabling eases; fills change at once so a theme switch never leaves a stale colour behind.
+const fade = { transitionProperty: 'opacity', transitionDuration: 150 } as const;
 
 const buttonVariants = cva(
   cn(
