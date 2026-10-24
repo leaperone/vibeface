@@ -7,7 +7,7 @@ import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
 import { BotAvatar, CountBadge, dismissToast, Dot, EmptyState, Skeleton, toast, Wordmark } from "@/components/app/kit"
-import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
+import { joinsOnScreen, onJoinCardShown, useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
@@ -83,6 +83,10 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       joinToasts.current.delete(joinId)
     }
   }, [joins.map((join) => join.join_id).join()])
+  useEffect(() => onJoinCardShown(() => {
+    for (const toastId of joinToasts.current.values()) dismissToast(toastId)
+    joinToasts.current.clear()
+  }), [])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
 

@@ -99,7 +99,7 @@ const rowLayout = "flex min-h-14 w-full min-w-0 flex-wrap items-center gap-x-3 g
 function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger" }) {
   return <>
     <span className={cn("grid size-8 shrink-0 place-items-center rounded-lg", rowTile[tone])}><Icon aria-hidden="true" className="size-4" /></span>
-    <span className="grid min-w-0 flex-1 basis-32">
+    <span className="grid min-w-0 flex-1 basis-28">
       <span className={cn("truncate", tone === "danger" && "text-danger")}>{label}</span>
       {description ? <span className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{description}</span> : null}
     </span>
@@ -130,18 +130,27 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
   </details>
 }
 
-/** A short set of mutually exclusive options on a muted track. */
+/**
+ * A short set of mutually exclusive options on a muted track.
+ * On a phone, options with icons show only the icon; pair it with `SegmentedValue` so the choice still reads in words.
+ */
 export function Segmented<T extends string>({ label, value, options, onChange, disabled }: {
   label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean
 }) {
   return <div role="radiogroup" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
-    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} disabled={disabled}
+    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} aria-label={Icon ? text : undefined} title={Icon ? text : undefined} disabled={disabled}
       onClick={() => { if (option !== value) onChange(option) }}
-      className={cn("inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+        Icon && "max-sm:w-10 max-sm:px-0",
         value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
-      {Icon ? <Icon aria-hidden="true" className="size-4" /> : null}{text}
+      {Icon ? <><Icon aria-hidden="true" className="size-4" /><span className="max-sm:hidden">{text}</span></> : text}
     </button>)}
   </div>
+}
+
+/** The chosen option of a `Segmented` in words, shown only where the control shrinks to icons. */
+export function SegmentedValue<T extends string>({ value, options }: { value: T; options: Array<{ value: T; label: string }> }) {
+  return <span aria-hidden="true" className="sm:hidden">{options.find((option) => option.value === value)?.label}</span>
 }
 
 /** Same shape as the real layout; fades in only after 300ms to avoid flicker. */
@@ -242,8 +251,14 @@ export function toast(text: string, options: { tone?: Tone; action?: ToastItem["
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
-/** The visible `[data-toast-anchor]` (the composer), if any. A `[data-toast-above]` inside it floats over the page and counts too. */
-const toastAnchor = () => [...document.querySelectorAll<HTMLElement>("[data-toast-anchor]")].find((anchor) => !anchor.closest("[inert]") && anchor.getBoundingClientRect().height > 0)
+/**
+ * The visible `[data-toast-anchor]` (the composer), if any. A `[data-toast-above]` inside it floats over the page and counts too.
+ * While a dialog or sheet is open, only an anchor inside it counts: the composer behind it is covered.
+ */
+const toastAnchor = () => {
+  const dialog = [...document.querySelectorAll<HTMLElement>("[role=dialog][data-state=open]")].at(-1)
+  return [...(dialog ?? document).querySelectorAll<HTMLElement>("[data-toast-anchor]")].find((anchor) => !anchor.closest("[inert]") && anchor.getBoundingClientRect().height > 0)
+}
 function anchorSpace(anchor: HTMLElement | undefined) {
   if (!anchor) return 0
   const tops = [anchor, ...anchor.querySelectorAll<HTMLElement>("[data-toast-above]")].map((element) => element.getBoundingClientRect()).filter((rect) => rect.height > 0).map((rect) => rect.top)
@@ -256,13 +271,23 @@ export function Toaster() {
   const [space, setSpace] = useState(0)
   useEffect(() => {
     if (!items.length || typeof window === "undefined") return
-    const anchor = toastAnchor()
-    const measure = () => setSpace(anchorSpace(anchor))
+    let anchor: HTMLElement | undefined
+    const resize = new ResizeObserver(() => setSpace(anchorSpace(anchor)))
+    // A sheet opening or closing changes which anchor counts, so the anchor is found again each time.
+    function measure() {
+      const next = toastAnchor()
+      if (next !== anchor) {
+        anchor = next
+        resize.disconnect()
+        for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) resize.observe(element)
+      }
+      setSpace(anchorSpace(anchor))
+    }
     measure()
-    const observer = new ResizeObserver(measure)
-    for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) observer.observe(element)
+    const dialogs = new MutationObserver(measure)
+    dialogs.observe(document.body, { childList: true, subtree: true, attributeFilter: ["data-state"] })
     window.addEventListener("resize", measure)
-    return () => { observer.disconnect(); window.removeEventListener("resize", measure) }
+    return () => { resize.disconnect(); dialogs.disconnect(); window.removeEventListener("resize", measure) }
   }, [items])
   return <div aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {

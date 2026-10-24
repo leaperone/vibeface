@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
@@ -215,7 +214,7 @@ export function ConversationScreen() {
         </div> : null}
       />
       <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-9"
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-10 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
           <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
@@ -307,20 +306,28 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
     finally { setBusy(false) }
   }
   const Icon = session.muted ? BellOff : ArrowDownToLine
-  return <div className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
-    <Icon aria-hidden="true" className="size-4 shrink-0" />
-    <span className="shrink-0 text-foreground">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-    <span aria-hidden="true">·</span>
-    <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
-    {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
-    <span className="ml-auto flex shrink-0 items-center gap-2">
-      {others.length ? <NativeSelect size="sm" aria-label="把会话转给其他 Bot" value="" disabled={disabled} onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
-        <NativeSelectOption value="">转给…</NativeSelectOption>
-        {others.map((bot) => <NativeSelectOption key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</NativeSelectOption>)}
-      </NativeSelect> : null}
-      <Button type="button" size="sm" variant="ghost" disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>{session.muted ? '重新关注' : '不再关注'}</Button>
-    </span>
-    <InlineError error={failure} />
+  const follow = session.muted ? '重新关注' : '不再关注'
+  return <div className="grid gap-1">
+    <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
+      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
+      <span className="grid min-w-0 flex-1">
+        <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
+        <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
+          <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
+        </span>
+      </span>
+      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/40 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
+        <ArrowRightLeft aria-hidden="true" className="size-4" />
+        <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
+          <option value="" disabled>转给…</option>
+          {others.map((bot) => <option key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</option>)}
+        </select>
+      </label> : null}
+      <Button type="button" variant="ghost" size="icon" className="size-9 text-muted-foreground max-md:size-10" aria-label={follow} title={follow} disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>
+        {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : session.muted ? <Bell aria-hidden="true" /> : <BellOff aria-hidden="true" />}
+      </Button>
+    </div>
+    <InlineError error={failure} className="ps-3" />
   </div>
 }
 
