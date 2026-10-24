@@ -424,7 +424,6 @@ async fn main() -> Result<()> {
                 _ = terminate.recv() => Ok(()),
                 _ = tokio::signal::ctrl_c() => Ok(()),
             };
-            // The App Server group must not outlive the Node that manages it.
             runtime.shutdown().await;
             if rejoin {
                 let name = runtime.member_name().await;
@@ -576,7 +575,6 @@ async fn logs(options: Logs) -> Result<()> {
             continue;
         };
         if now_inode != inode {
-            // The file rotated: finish the old one, now `node.log.1`, then start the new one.
             if identity(&rotated).is_some_and(|(old, _)| old == inode) {
                 for record in tail_records(&rotated, offset)?.0 {
                     filter
@@ -880,7 +878,6 @@ fn initialize_announced(
     Ok(())
 }
 
-/// Writes a fresh data directory.
 fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
@@ -1284,7 +1281,6 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
-        // The Agent needs the reason to correct the call, not just the status.
         let reason = serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|error| error["error"].as_str().map(str::to_owned))

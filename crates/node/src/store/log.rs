@@ -163,7 +163,6 @@ fn pending(
     connection: &Connection,
     network: &str,
     envelope: &SignedEvent,
-    event: &Event,
     missing: &str,
 ) -> Result<IngestStatus> {
     let count: i64 = connection.query_row(
@@ -175,8 +174,13 @@ fn pending(
         return Ok(IngestStatus::Rejected("too many pending events".into()));
     }
     connection.execute(
-        "INSERT INTO pending_events(network_id,hash,author,seq,envelope,missing) VALUES(?,?,?,?,?,?)",
-        params![network, envelope.hash, event.author, event.seq, serde_json::to_string(envelope)?, missing],
+        "INSERT INTO pending_events(network_id,hash,envelope,missing) VALUES(?,?,?,?)",
+        params![
+            network,
+            envelope.hash,
+            serde_json::to_string(envelope)?,
+            missing
+        ],
     )?;
     Ok(IngestStatus::Pending)
 }
@@ -202,7 +206,7 @@ fn place(
             None if event.seq <= max + 1
                 || exists(connection, "pending_events", network, prev)? =>
             {
-                return pending(connection, network, envelope, event, prev);
+                return pending(connection, network, envelope, prev);
             }
             None => {
                 return Ok(IngestStatus::Rejected(format!(
@@ -221,7 +225,7 @@ fn place(
     }
     for dep in &event.deps {
         if !exists(connection, "events", network, dep)? {
-            return pending(connection, network, envelope, event, dep);
+            return pending(connection, network, envelope, dep);
         }
     }
     if let Err(error) = authorize_cause(connection, network, event) {

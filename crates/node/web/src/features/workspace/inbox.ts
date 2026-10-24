@@ -9,7 +9,7 @@ import type { PendingCheck, Question } from "@vibeface/client/workspace/types.ts
 import type { WriteCardKind } from "./write-card"
 
 /** `done`: a question this browser just answered, shown collapsed until the network's list drops it. */
-export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write" | "recovered"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
+type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write" | "recovered"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
 
 /**
  * Everything waiting on the person: write state, then every unanswered question newest first, then the rest.

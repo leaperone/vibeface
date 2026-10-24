@@ -182,7 +182,6 @@ pub(super) fn apply_signal_from(
             vec![],
             at,
         )?;
-        // The user's settlement already reported this work; a late result stays on record only.
         if let Some(outcome) = finished
             && !reduce::settled_by_user(connection, network, work_id)?
         {
@@ -484,11 +483,9 @@ fn save_dispatch_row(connection: &Connection, dispatch: &Dispatch) -> Result<()>
         DispatchState::Rejected { reason } => ("rejected", Some(reason)),
     };
     connection.execute(
-        "INSERT OR REPLACE INTO work_dispatches(work_id,conversation_id,target_node,spec,state,reason) VALUES(?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO work_dispatches(work_id,spec,state,reason) VALUES(?,?,?,?)",
         params![
             dispatch.spec.work_id,
-            dispatch.spec.conversation,
-            dispatch.spec.target,
             serde_json::to_string(&dispatch.spec)?,
             state,
             reason,

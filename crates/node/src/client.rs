@@ -1988,8 +1988,6 @@ mod tests {
         Ok(())
     }
 
-    /// Provider keys are write-only: they reach the provider's own processes and nothing else,
-    /// not the replies, the shared store, the config or the log.
     #[tokio::test]
     async fn provider_keys_stay_in_the_private_file_and_one_call_chooses_what_providers_run()
     -> Result<()> {
@@ -2263,8 +2261,6 @@ mod tests {
         Ok(())
     }
 
-    /// Only the owner at the removed computer may start it over: a member browser elsewhere, or a
-    /// local page while this Node is still a member, is refused.
     #[tokio::test]
     async fn only_a_local_page_of_a_removed_node_can_rejoin() -> Result<()> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2348,8 +2344,6 @@ mod tests {
         result
     }
 
-    /// The local page's cancel ends a join still waiting for its entry, and forgets its
-    /// commitment; a join the manager already approved is reported as joined, never cancelled.
     #[tokio::test]
     async fn the_local_page_cancels_a_waiting_join_but_not_an_approved_one() -> Result<()> {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2690,8 +2684,6 @@ mod tests {
         result
     }
 
-    /// Genesis, join with commitment and short code, manage grant, voided requests,
-    /// revocation and root recovery, all over a real `/api/client` listener.
     #[tokio::test]
     async fn identity_rpcs_admit_exactly_the_confirmed_device_over_the_gateway() -> Result<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -2764,7 +2756,6 @@ mod tests {
                     request["admin_id"].as_str().context("admin")?, request["admin_nonce"].as_str().context("admin nonce")?, nonce)?)
             };
 
-            // A new browser joins and is granted management.
             let phone = LocalIdentity::generate();
             let join_id = manager.call("invite", invite([1; 32])?).await?["join_id"].clone();
             let mut joiner = connect(phone.clone()).await?;
@@ -2791,7 +2782,6 @@ mod tests {
             assert_eq!(joined["state"]["genesis"]["network_id"], network);
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
 
-            // A wrong reveal and an explicit rejection both void the request for good.
             let (liar, nonce) = (LocalIdentity::generate(), "33".repeat(32));
             let liar_id = manager.call("invite", invite([2; 32])?).await?["join_id"].clone();
             let mut liar_client = connect(liar.clone()).await?;
@@ -2806,7 +2796,6 @@ mod tests {
             assert_eq!(manager.call("approve", json!({"join_id":refused_id,"reject":true})).await?["status"], "rejected");
             assert!(manager.call("approve", json!({"join_id":refused_id,"admin_nonce":"66".repeat(32)})).await.is_err());
 
-            // Revocation takes effect on the open session, and a subscription ends with it.
             let mut watching = connect(phone.clone()).await?;
             watching.call("subscribe", json!({})).await?;
             let view = node.membership_state().await?.project()?;
@@ -2817,7 +2806,6 @@ mod tests {
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
             assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
 
-            // Root recovery from a device that holds only the recovery key.
             let replacement = LocalIdentity::generate();
             let before = node.membership_state().await?;
             let epoch = before.epoch() + 1;
@@ -2850,7 +2838,6 @@ mod tests {
             assert_eq!(retried["recovery_since_ms"], since, "a retry keeps the date");
             assert_eq!(manager.call("authenticate", json!({})).await?["principal"]["epoch"], epoch);
 
-            // The old recovery file is refused from now on; the new one reads and recovers.
             let refused = recovering.call("recovery_state", read(&root)?).await.unwrap_err();
             assert!(format!("{refused:#}").contains(vibeface_secure::membership::SUPERSEDED), "{refused:#}");
             let after = node.membership_state().await?;
@@ -2867,10 +2854,8 @@ mod tests {
             assert_eq!(node.membership_state().await?.recovery_key(), rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
-            // A target outside the personal network is refused.
             assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());
 
-            // `/api/client` takes the configured cross-origin page; other paths stay same-origin.
             let ws = |page: &str| -> Result<_> {
                 let mut request = format!("{}/api/client", origin.replace("http://", "ws://")).into_client_request()?;
                 request.headers_mut().insert("origin", page.parse()?);

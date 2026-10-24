@@ -29,7 +29,7 @@ const toneChip: Record<Tone, string> = {
 }
 
 /** The Vibeface "V" in its rounded tile, as on the app icon. */
-export function BrandMark({ className }: { className?: string }) {
+function BrandMark({ className }: { className?: string }) {
   return <svg viewBox="0 0 64 64" aria-hidden="true" className={cn("size-6 shrink-0", className)}>
     <rect width="64" height="64" rx="16" className="fill-foreground" />
     <path d="M19 21l13 24 13-24" fill="none" strokeWidth="6.5" strokeLinecap="round" strokeLinejoin="round" className="stroke-background" />
@@ -236,7 +236,7 @@ export function WaitingDot() {
   </span>
 }
 
-/** Collapsed by default. Jargon from docs/design/web-ux.md section 6 may only appear in here. */
+/** Collapsed by default. Jargon from docs/design/web-ux.md may only appear in here. */
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
     <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
@@ -277,14 +277,13 @@ let toasts: ToastItem[] = []
 let toastId = 0
 const toastListeners = new Set<() => void>()
 const emitToasts = () => { for (const listener of toastListeners) listener() }
-export function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
-/** `persist`: stays until closed, for a message the person must act on. Returns the id for `dismissToast`. */
+function dismissToast(id: number) { toasts = toasts.filter((item) => item.id !== id); emitToasts() }
+/** `persist` keeps the message until the person closes it. */
 export function toast(text: string, options: { tone?: Tone; icon?: LucideIcon; action?: ToastItem["action"]; persist?: boolean } = {}) {
   const item = { id: ++toastId, text, tone: options.tone ?? "neutral", icon: options.icon, action: options.action }
   toasts = [...toasts, item].slice(-2)
   emitToasts()
   if (!options.persist) setTimeout(() => dismissToast(item.id), item.action ? 8000 : 3000)
-  return item.id
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 

@@ -2,7 +2,7 @@ import type { MembershipView } from "../lib/node.ts"
 import { confirmReason } from "./model.ts"
 import type { NodeInfo, WorkRecord } from "./types.ts"
 
-export const stateNames: Record<string, string> = {
+const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",
   queued: "等待处理",
@@ -37,7 +37,7 @@ export const stateNames: Record<string, string> = {
   finishing: "收尾中",
 }
 
-export type NodeNameLookup = {
+type NodeNameLookup = {
   nodes?: readonly NodeInfo[]
   directory?: MembershipView | null
 }
@@ -54,12 +54,6 @@ export function nodeName(
   if (member?.name) return member.name
   if (node?.local) return "本机"
   return fallback ?? "另一台设备"
-}
-
-export function stateLabel(value: string | undefined, override?: string) {
-  if (override) return override
-  if (!value) return "未知"
-  return stateNames[value] || value
 }
 
 export function isLoopback(address: string) {

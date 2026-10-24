@@ -31,7 +31,7 @@ export type LocalPage = {
   open(url: string): void
 }
 /** Instances of the app on one device that share its storage; one leads and settles the outbox. */
-export type JoinTabs = <T>(name: string, handlers: { lead(): void | (() => void); message(value: T): void }) => { post(value: T): void; close(): void }
+type JoinTabs = <T>(name: string, handlers: { lead(): void | (() => void); message(value: T): void }) => { post(value: T): void; close(): void }
 
 /** What differs between the browser and the phone; everything else in this package is shared. */
 export type Platform = {

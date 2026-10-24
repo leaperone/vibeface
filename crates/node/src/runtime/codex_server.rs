@@ -719,7 +719,6 @@ mod tests {
         Ok(dir)
     }
 
-    /// A program that only records that it ran: `codex app-server` must never start.
     fn recording_codex(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         let (program, out) = (dir.join("fake-codex"), dir.join("ran"));
         std::fs::write(
@@ -733,8 +732,6 @@ mod tests {
         Ok((program, out))
     }
 
-    /// An App Server that answers `initialize` on every connection. Aborting it ends the
-    /// listener and every connection, as a stopped App Server would.
     fn system_app_server(socket: &Path, user_agent: &'static str) -> tokio::task::JoinHandle<()> {
         let listener = tokio::net::UnixListener::bind(socket).expect("fixture socket");
         tokio::spawn(async move {
@@ -760,7 +757,6 @@ mod tests {
         })
     }
 
-    /// A socket file nobody listens on, as a stopped App Server leaves it.
     fn stale_socket(path: &Path) -> Result<()> {
         drop(std::os::unix::net::UnixListener::bind(path)?);
         Ok(())
@@ -872,7 +868,6 @@ mod tests {
                 candidates: vec![missing.clone(), stale.clone()]
             }
         );
-        // Accepts, then closes before any handshake: something listens, but not an App Server.
         let listener = tokio::net::UnixListener::bind(&mute)?;
         let closer = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -938,7 +933,6 @@ mod tests {
             "the Agent's link names the system App Server"
         );
 
-        // Its owner restarts it onto another socket and moves the control link.
         fixture.abort();
         let _ = fixture.await;
         std::fs::remove_file(&first)?;

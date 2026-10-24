@@ -136,14 +136,6 @@ table "pending_events" {
     null = false
     type = text
   }
-  column "author" {
-    null = false
-    type = text
-  }
-  column "seq" {
-    null = false
-    type = integer
-  }
   column "envelope" {
     null = false
     type = text
@@ -375,14 +367,6 @@ table "bot_deletions" {
     null = false
     type = text
   }
-  column "event_hash" {
-    null = false
-    type = text
-  }
-  column "rank" {
-    null = false
-    type = text
-  }
   primary_key {
     columns = [column.network_id, column.conversation_id]
   }
@@ -453,9 +437,6 @@ table "schedules" {
   }
   primary_key {
     columns = [column.network_id, column.schedule_id]
-  }
-  index "schedules_conversation" {
-    columns = [column.network_id, column.conversation_id]
   }
 }
 table "memories" {
@@ -651,10 +632,6 @@ table "questions" {
     null = false
     type = text
   }
-  column "event_hash" {
-    null = false
-    type = text
-  }
   column "rank" {
     null = false
     type = text
@@ -826,14 +803,6 @@ table "triage_outbox" {
     null = false
     type = integer
   }
-  column "created_ms" {
-    null = false
-    type = integer
-  }
-  column "last_error" {
-    null = true
-    type = text
-  }
   primary_key {
     columns = [column.event_id]
   }
@@ -857,10 +826,6 @@ table "coordination_threads" {
   column "thread_id" {
     null = false
     type = text
-  }
-  column "created_ms" {
-    null = false
-    type = integer
   }
   primary_key {
     columns = [column.thread_id]
@@ -1252,14 +1217,6 @@ table "work_runs" {
 table "work_dispatches" {
   schema = schema.main
   column "work_id" {
-    null = false
-    type = text
-  }
-  column "conversation_id" {
-    null = false
-    type = text
-  }
-  column "target_node" {
     null = false
     type = text
   }

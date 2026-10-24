@@ -1,7 +1,7 @@
 import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import type { AnswerResult, BotRecord, Question, WorkRecord } from '@vibeface/client/workspace/types.ts'
 
-export type { AnswerResult, BotRecord, Question, WorkRecord }
+export type { Question }
 
 /** How this phone reaches its network right now. `entry`: the device it goes through, as the person named it. */
 export type Connection = { state: 'connecting' | 'online' | 'syncing' | 'offline'; entry: string }
@@ -38,7 +38,7 @@ export type Attachment = { uri: string; name: string; size: number | null; mimeT
 
 export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean; current: boolean; entry: boolean }
 
-export type WorkspaceSnapshot = {
+type WorkspaceSnapshot = {
   session: Session
   connection: Connection
   bots: BotRecord[]

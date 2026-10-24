@@ -13,9 +13,9 @@ export type ConversationSummary = { conversation_id: string; title: string; owne
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
 /** A dispatch this device still carries: the target has not taken it, or refused it. Not in the DAG yet. */
-export type DispatchState = "dispatch_waiting" | "dispatch_rejected"
+type DispatchState = "dispatch_waiting" | "dispatch_rejected"
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
-export type StopState = "stop_waiting" | "stop_timed_out"
+type StopState = "stop_waiting" | "stop_timed_out"
 /** `abandoned`: the device was removed before it reported; the work did not run. */
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
 export type WorkRecord = {
@@ -110,10 +110,10 @@ export type BotModels = Partial<Record<ProviderId, string>>
 export type BotSkill = { name: string; description: string; body: string }
 /** Runs at `first_run_at_ms`, then every `every_minutes` when set; without it, once. `depth` > 0 is a reminder the bot set itself. */
 export type BotSchedule = { name: string; prompt: string; first_run_at_ms: number; every_minutes?: number; enabled: boolean; depth?: number }
-export type MemoryEntry = { memory_id: string; text: string }
+type MemoryEntry = { memory_id: string; text: string }
 /** null: every shared skill, later ones included. */
 export type SkillSet = string[] | null
-export type SkillsEdit = { before: SkillSet; after: SkillSet }
+type SkillsEdit = { before: SkillSet; after: SkillSet }
 /** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
 export type BotChange =
   | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; skills?: SkillsEdit }
@@ -121,10 +121,10 @@ export type BotChange =
   | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
 /** The person's signed message a turn stood on; it may be in another bot's chat. */
-export type ChangeCause = { conversation_id: string; message_id: string }
+type ChangeCause = { conversation_id: string; message_id: string }
 /** A change to the bot of `conversation_id`, applied from `cause`; null when the bot's own turn made it with no message behind it. */
 export type BotChangeRecord = { change_id: string; conversation_id: string; cause: ChangeCause | null; event_hash: string; created_at_ms: number; change: BotChange }
-export type SkillSummary = { skill_id: string; name: string; description: string }
+type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
@@ -150,7 +150,7 @@ export type SentBotMessage = { message_id: string; to: string; text: string; cre
 export type WorkspaceView = "chat" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
 export type ConflictVersion = { hash: string; scope_id: string; created_at_ms: number; body: Record<string, unknown> }
-export type LogConflict = { author: string; seq: number; kept: ConflictVersion | null; other: ConflictVersion }
+type LogConflict = { author: string; seq: number; kept: ConflictVersion | null; other: ConflictVersion }
 export type WriteState = "aligning" | "read_only" | "writable" | "forked"
 export type WriteStatus = { state: WriteState; conflicts: LogConflict[] }
 export type { PendingMessage }
@@ -158,7 +158,7 @@ export type { PendingMessage }
 export type BotProject = { target_node: string; cwd: string }
 export type CreateBotRequest = { bot_id: string; conversation_id: string; name: string; instructions: string; project?: BotProject }
 /** A bot conversation's newest message, cut short by the Node for the conversation list. */
-export type LastMessage = { text: string; role: string; created_at_ms: number }
+type LastMessage = { text: string; role: string; created_at_ms: number }
 export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; event_hash: string; last_message: LastMessage | null }
 
 export type PendingBot = CreateBotRequest & {
@@ -168,8 +168,8 @@ export type PendingBot = CreateBotRequest & {
 export type Severity = "info" | "attention" | "urgent"
 /** The device, project and session a question is about. `agent` is "codex" or "claude". */
 export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
-export type QuestionChoice = { label: string }
-export type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
+type QuestionChoice = { label: string }
+type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
 /** Something only the person can settle, asked in a bot's chat. Text answers are always allowed; a choice answers with its label. */
 export type Question = {
   question_id: string

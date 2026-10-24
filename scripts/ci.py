@@ -40,24 +40,22 @@ PLATFORMS = (
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "package", "npm-package", "npm-smoke")
 
 
-def make_plan(paths, event="pull_request", draft=False, ref_type="branch", channel="nightly"):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
     scopes = {
         next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full")
         for path in paths
     }
-    return dict(scope_plan(scopes, event, draft, ref_type, channel), changed_files=len(paths))
+    return dict(scope_plan(scopes, event, ref_type, channel), changed_files=len(paths))
 
 
-def scope_plan(scopes, event, draft, ref_type, channel):
+def scope_plan(scopes, event, ref_type, channel):
     if (
         scopes - {"full", "docs", "web", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
-        or type(draft) is not bool
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
     ):
         raise ValueError("Invalid CI scopes or scenario")
-    draft = event == "pull_request" and draft
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
     full = "full" in scopes or extended or event == "merge_group"
     affected = set(DEPENDENTS) if full else scopes & set(DEPENDENTS)
@@ -77,7 +75,6 @@ def scope_plan(scopes, event, draft, ref_type, channel):
         "extended": extended,
         "check_msrv": bool(packages) and extended,
         "docs_only": not web and not packages,
-        "draft": draft,
         "event": event,
         "ref_type": ref_type,
         "channel": channel,
@@ -121,11 +118,10 @@ def event_plan(args):
     ref_type = os.environ.get("GITHUB_REF_TYPE", "branch")
     payload_path = os.environ.get("GITHUB_EVENT_PATH")
     payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
-    draft = args.draft
     base, head = args.base, args.head
     if not base and event == "pull_request":
         pr = payload["pull_request"]
-        base, head, draft = pr["base"]["sha"], pr["head"]["sha"], pr["draft"]
+        base, head = pr["base"]["sha"], pr["head"]["sha"]
     elif not base and event == "push":
         base, head = payload.get("before"), payload.get("after")
     forced = event in {"schedule", "workflow_dispatch", "merge_group"} or ref_type == "tag"
@@ -136,7 +132,7 @@ def event_plan(args):
     else:
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    plan = make_plan(paths, event, draft, ref_type, metadata["channel"])
+    plan = make_plan(paths, event, ref_type, metadata["channel"])
     plan.update(metadata)
     return plan
 
@@ -201,7 +197,7 @@ def gate(needs, plan=None):
         raise ValueError("CI plan did not succeed")
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
-    expected = scope_plan(set(plan["scopes"]), plan["event"], plan["draft"], plan["ref_type"], plan["channel"])
+    expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
     if any(plan[key] != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     required = expected["required_jobs"]
@@ -277,9 +273,6 @@ def self_test():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
-        draft = make_plan([f"crates/{crate}/src/lib.rs"], draft=True)
-        assert draft["rust_packages"] == packages and draft["test_tiers"] == ["fast"]
-        assert draft["package_matrix"]["include"] == list(PLATFORMS[:1])
     for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
@@ -292,7 +285,6 @@ def self_test():
     assert make_plan(["README.md"], "push", ref_type="tag")["test_tiers"] == ["fast", "slow"]
     assert make_plan(["README.md"], "push", ref_type="tag")["package_matrix"]["include"] == list(PLATFORMS)
     assert not make_plan(["crates/node/src/api.rs"])["npm"]
-    assert not make_plan(["crates/node/src/api.rs"], draft=True)["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="stable")["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="rc")["npm"]
     for event in ("pull_request", "push", "merge_group"):
@@ -366,7 +358,7 @@ def self_test():
         new_base = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         assert set(changed_paths(new_base, pr_head, "pull_request", cwd=directory)) == set(paths)
         event_file = Path(directory) / "event.json"
-        arguments = argparse.Namespace(event=None, base=new_base, head=pr_head, draft=False)
+        arguments = argparse.Namespace(event=None, base=new_base, head=pr_head)
         environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF_TYPE": "branch", "GITHUB_EVENT_PATH": str(event_file)}
         with patch.dict(os.environ, environment), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
             for draft in (True, False):
@@ -374,7 +366,7 @@ def self_test():
                 arguments.base = None
                 selected = event_plan(arguments)
                 diff.assert_called_with(new_base, pr_head, "pull_request")
-                assert selected["draft"] == draft
+                assert selected == make_plan(paths)
                 assert selected["test_tiers"] == ["fast"]
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
@@ -419,7 +411,6 @@ def main():
     plan.add_argument("--base")
     plan.add_argument("--head")
     plan.add_argument("--event", choices=("pull_request", "push", "schedule", "workflow_dispatch", "merge_group"))
-    plan.add_argument("--draft", action="store_true")
     plan.add_argument("--github-output")
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)

@@ -941,7 +941,6 @@ impl WorkStatus {
         match (outcome, phase) {
             (Some(WorkOutcome::Unverified), _) => Self::Unverified,
             (Some(_), _) => Self::Finished,
-            // An agent task runs as its device's coordination turn, without Codex phases.
             (None, _) if kind == WorkKind::Task => Self::Running,
             (None, Some(WorkPhase::Interrupting)) => Self::Interrupting,
             (None, Some(_)) => Self::Running,

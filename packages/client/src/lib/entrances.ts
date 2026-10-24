@@ -7,7 +7,7 @@ import type { ConnectionEntry, MembershipView } from './node.ts'
  */
 export type Entrance = { device_id: string; seq: number; gateway_url: string | null; public: boolean; last_ok_ms: number }
 export type OpenEntrance = Entrance & { gateway_url: string }
-export type SignedAddress = { payload: string; signature: string }
+type SignedAddress = { payload: string; signature: string }
 type Check = (deviceId: string, payload: string, signature: string) => boolean
 
 const devicePattern = /^[a-f0-9]{64}$/

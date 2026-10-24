@@ -13,7 +13,7 @@ import type { WorkCheck } from "@vibeface/client/workspace/model.ts"
 import type { PendingCheck } from "@vibeface/client/workspace/types.ts"
 
 /** Plain-language reason; the original text stays in the details. */
-export function checkReason(check: Pick<PendingCheck, "detail">): string {
+function checkReason(check: Pick<PendingCheck, "detail">): string {
   if (/restart/i.test(check.detail)) return "设备在 Bot 工作时重启了，系统不会自动重做。"
   if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return "和 Bot 的连接断了，系统不会自动重做。"
   return "这次的结果没法自动确认，系统不会自动重做。"

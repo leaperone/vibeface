@@ -1,7 +1,7 @@
 import { array, record } from '../lib/node.ts'
 
 /** Per network in this browser: the recovery key it last accepted, and the key it is itself handing recovery to. */
-export type RecoveryMarks = { seen: string | null; own: string | null }
+type RecoveryMarks = { seen: string | null; own: string | null }
 
 /**
  * What a verified network state means for this browser. `notice`: since the key it accepted, a recovery file took the

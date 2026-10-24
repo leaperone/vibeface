@@ -178,7 +178,6 @@ impl Runtime {
             .collect();
         let mut starting = false;
         let link = (provider == Provider::Codex).then_some(self.codex.link().await);
-        // A provider nothing runs on has nothing to set up; its checks start once it is used.
         if !roles.is_empty() {
             if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));

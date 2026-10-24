@@ -21,17 +21,16 @@ import type {
   PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, SessionHandoff, WriteState, WriteStatus, OpenWork, ScheduleAction,
 } from "./types.ts"
 
-/** Why this device does not write now (docs/design/unified-network.md 5.7 and 5.8). */
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
   read_only: "这台设备暂时只读。去待处理确认一下就能发送。",
   forked: "这台设备的数据被复制过，已暂停发送。去待处理看看。",
 }
 
-export type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
+type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
 
 /** A file the person attached: a browser `File` or a picked document on a phone. */
-export type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
+type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 /** `label` is a full sentence for a lone button; `state` lets a settings row word it shorter. */
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
@@ -45,7 +44,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** A local session reads this computer's records, but the network takes only a member's signature. */
   const joined = connection.principal.source === "membership"
   const prefix = `${networkId}.${clientId}:`
-  /** Signed writes this device has not seen confirmed, shared by every tab (docs/design/unified-network.md 4.5). */
   const outbox: OutboxStore = {
     all: async () => (await platform.outbox.all()).filter((item) => item.key.startsWith(prefix)),
     put: (item) => platform.outbox.put(item),

@@ -2,7 +2,7 @@
  * What the workspace routes may show for this browser. `resuming` holds saved credentials that are still
  * connecting, so the page stays put; only `auth` sends the browser to the connect page.
  */
-export type Access =
+type Access =
   | { kind: 'member' }
   | { kind: 'loading' }
   | { kind: 'resuming'; retryInSeconds: number | null }

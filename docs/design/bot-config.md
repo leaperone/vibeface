@@ -1,6 +1,6 @@
 # 在聊天中修改 Bot
 
-状态为实施中。本文在 `docs/design/unified-network.md` 的事件模型上增加 Bot 配置、共用 skill 库和例行任务，行为参照 Grok Bot（docs.x.ai/grok-bot/bots、skills-routines-and-automations）。项目尚未发布正式版，事件、表和 RPC 直接按最终形态修改，不做兼容。例行任务后来与一次性提醒合并为 schedule，见 [提醒、联网、记忆、bot 互发消息与 bot 管理](agent-capabilities.md)，下文的标识符已按该文更新。
+Bot 配置、共用 skill 库和 schedule 使用 [Node 协议](../node-protocol.md) 的事件模型。提醒和自动任务的规则见 [Agent 能力](agent-capabilities.md)。
 
 ## 1. 行为
 

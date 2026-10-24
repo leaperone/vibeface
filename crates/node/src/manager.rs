@@ -719,7 +719,6 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    /// A Codex turn on the App Server listening at `socket`.
     fn codex(workspace: PathBuf, socket: PathBuf) -> ManagerConfig {
         ManagerConfig {
             sdk: Sdk::Codex { socket },
@@ -737,14 +736,10 @@ mod tests {
         }
     }
 
-    /// How the fake App Server treats a turn.
     #[derive(Clone, Copy, PartialEq)]
     enum Turn {
-        /// Streams an answer and completes.
         Answers,
-        /// Runs until interrupted; `confirm` says whether the interrupt ends it.
         Runs { confirm: bool },
-        /// Closes the connection instead of answering `turn/start`.
         Drops,
     }
 
@@ -865,8 +860,6 @@ mod tests {
         Ok(())
     }
 
-    /// The thread is persisted and the turn recorded before it starts; the Shell carries the
-    /// turn's token; progress shows the answer and tools, never arguments or user messages.
     #[tokio::test]
     async fn a_turn_runs_on_the_app_server_and_is_recorded_before_it_starts() {
         let fake = fake_app_server(Turn::Answers);
@@ -972,8 +965,6 @@ mod tests {
         }
     }
 
-    /// When the resumed thread is gone, the new thread's first turn gets the fresh prompt with
-    /// the full context, not the resumed turn's delta.
     #[tokio::test]
     async fn a_new_thread_in_place_of_a_lost_one_gets_the_full_prompt() {
         let fake = fake_app_server(Turn::Answers);
@@ -1003,7 +994,6 @@ mod tests {
         );
     }
 
-    /// A `turn/start` whose answer is lost is looked up by its client ID, never sent again.
     #[tokio::test]
     async fn an_unknown_turn_start_is_not_sent_again() {
         let fake = fake_app_server(Turn::Drops);
