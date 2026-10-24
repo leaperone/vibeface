@@ -89,7 +89,7 @@ function LogsPage() {
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
-        <ul className="divide-y overflow-hidden rounded-xl border bg-card">
+        <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
           {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>
       </>}

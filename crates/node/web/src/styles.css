@@ -14,9 +14,11 @@
 
 body {
   margin: 0;
-  font-family: system-ui, sans-serif;
   font-size: 15px;
   line-height: 24px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 /* An iOS keyboard pans the visual viewport across a layout viewport that keeps its full height, so the app follows the visible area. */
@@ -30,7 +32,24 @@ body {
 
 @theme inline {
   --font-heading: var(--font-sans);
-  --font-sans: 'Geist Variable', sans-serif;
+  --font-sans: 'Geist Variable', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  --shadow-xs: var(--elevation-xs);
+  --shadow-sm: var(--elevation-sm);
+  --shadow-lg: var(--elevation-lg);
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  --elevation-xs: 0 1px 2px oklch(0.2 0.02 270 / 0.05);
+  --elevation-sm: 0 1px 2px oklch(0.2 0.02 270 / 0.05), 0 2px 8px -2px oklch(0.2 0.02 270 / 0.07);
+  --elevation-lg: 0 2px 4px oklch(0.2 0.02 270 / 0.04), 0 12px 32px -8px oklch(0.2 0.02 270 / 0.18);
+}
+
+:root.dark {
+  --elevation-xs: 0 1px 2px oklch(0 0 0 / 0.3);
+  --elevation-sm: 0 1px 2px oklch(0 0 0 / 0.3), 0 2px 8px -2px oklch(0 0 0 / 0.3);
+  --elevation-lg: 0 2px 4px oklch(0 0 0 / 0.25), 0 16px 40px -8px oklch(0 0 0 / 0.55);
 }
 
 @layer base {
@@ -42,9 +61,16 @@ body {
   }
   html {
     @apply font-sans;
-    color-scheme: light dark;
+    color-scheme: light;
     overflow-x: clip;
   }
+  :root.dark { color-scheme: dark; }
+  input[type=checkbox], input[type=radio] { accent-color: var(--brand); }
+  ::selection { background: color-mix(in oklch, var(--brand) 22%, transparent); }
+  code, kbd, pre, samp { font-family: var(--font-mono); }
+  h1, h2, h3 { letter-spacing: -0.011em; text-wrap: balance; }
+  p { text-wrap: pretty; }
+  * { scrollbar-width: thin; scrollbar-color: color-mix(in oklch, var(--foreground) 18%, transparent) transparent; }
   /* Grid items default to min-width:auto, so one long path or id would widen the whole card on phones. */
   :where(.grid) > * { min-width: 0; }
 }
@@ -92,3 +118,17 @@ svg.lucide { stroke-width: 1.75; }
 .switch:checked::before { transform: translateX(1rem); }
 .switch:disabled { cursor: not-allowed; opacity: .35; }
 .switch:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+.bot-avatar { background: oklch(0.94 0.045 var(--avatar-hue)); color: oklch(0.42 0.13 var(--avatar-hue)); box-shadow: inset 0 0 0 1px oklch(0.42 0.13 var(--avatar-hue) / 0.1); }
+.dark .bot-avatar { background: oklch(0.31 0.06 var(--avatar-hue)); color: oklch(0.9 0.08 var(--avatar-hue)); box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.06); }
+
+/* Streaming reply: three dots that breathe in turn. */
+.typing-dots { display: inline-flex; align-items: center; gap: 4px; height: 1.5rem; color: var(--muted-foreground); }
+.typing-dots > span { width: 6px; height: 6px; border-radius: 9999px; background: currentColor; animation: typing-dot 1.2s ease-in-out infinite; }
+.typing-dots > span:nth-child(2) { animation-delay: .15s; }
+.typing-dots > span:nth-child(3) { animation-delay: .3s; }
+.typing-dots[data-paused] > span { animation: none; opacity: .5; }
+@keyframes typing-dot { 0%, 60%, 100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
+@media (min-width: 64rem) {
+  .workspace-screen { padding: 2rem 2rem 2.5rem; }
+}

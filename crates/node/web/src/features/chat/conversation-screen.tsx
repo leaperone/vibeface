@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, Details, InlineError } from '@/components/app/kit'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -67,6 +67,8 @@ export function ConversationScreen() {
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
+    // A task held on an approval shows as that approval card, which names and links the task.
+    if (task.state === 'waiting') return []
     return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
   }
 
@@ -161,9 +163,11 @@ export function ConversationScreen() {
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending ? '上一条消息还没确认送达' : ''
-  // Questions sit where they were asked, so an older one scrolls away; 去处理 brings back the first still open.
+  // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
-  const toCards = () => document.getElementById(asked ? `question-${asked.question_id}` : 'chat-waiting')?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })
+  const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
+  const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
+  const targetHidden = useOffscreen(waitingTarget, entries.length)
   const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
@@ -201,15 +205,19 @@ export function ConversationScreen() {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <Bot aria-hidden="true" className="size-8 text-muted-foreground" />
+          <BotAvatar id={bot.bot_id} name={bot.name} size="lg" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
           {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }}><Bot aria-hidden="true" />{managerOffline ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
             : <div className="flex flex-wrap justify-center gap-2">
-              {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+              {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : null}
       />
       <PromptInput
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-9"
+          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
+          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+        </button> : null}
         value={text}
         hint={hint}
         disabled={sendDisabled}
@@ -224,12 +232,24 @@ export function ConversationScreen() {
           workspace.sendMessage(text, files).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles([]) } }).catch(setSendError)
         }}
       >
-        <InlineError error={sendError} />
-        {cards.length || asked ? <button type="button" className="inline-flex w-fit items-center font-medium text-foreground underline underline-offset-4 max-md:min-h-11" onClick={toCards}>去处理</button> : null}
-        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="w-fit font-medium text-foreground underline underline-offset-4">去配置</Link> : null}
+        <InlineError error={sendError} className="basis-full" />
+        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput>
     </section>
   )
+}
+
+/** Whether the element with `id` is out of view; rechecked as the list grows. */
+function useOffscreen(id: string | null, revision: number) {
+  const [hidden, setHidden] = useState(false)
+  useEffect(() => {
+    const target = id && typeof IntersectionObserver !== 'undefined' ? document.getElementById(id) : null
+    if (!target) { setHidden(false); return }
+    const observer = new IntersectionObserver(([entry]) => setHidden(!entry.isIntersecting))
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [id, revision])
+  return hidden
 }
 
 type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord; joined?: string }
@@ -245,7 +265,7 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
     <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link>
-  return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card px-4 py-2 hover:bg-muted/50">
+  return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}

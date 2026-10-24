@@ -21,7 +21,7 @@ function cardTitle(changes: BotChange[]) {
 export function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
-  return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card p-4">
+  return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card shadow-xs p-4">
     <header className="flex items-center gap-2">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
       <h3 id={id} className="text-meta font-medium text-muted-foreground">{cardTitle(changes)}</h3>

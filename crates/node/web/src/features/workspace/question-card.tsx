@@ -45,6 +45,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const approval = Boolean(question.about.request_id)
   const icon = approval ? terms.approval.icon : severityIcon
   const task = approval ? workspace.openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
+  const taskBot = task ? workspace.bots.find((bot) => bot.conversation_id === task.conversation_id)?.bot_id : undefined
   const disabled = !workspace.writable || action.busy !== null
   const session = question.conversation_id === null
   // 交给 the primary bot repeats 处理.
@@ -69,7 +70,9 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{question.text}</span></>}
   >
     <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-meta text-muted-foreground">
-      {task ? <Meta icon={ListChecks} label="任务">{task.title || "任务"}</Meta> : null}
+      {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
+        <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
+      </Link> : null}
       {session ? <Meta icon={SquareTerminal} label="会话">{agentName(question.about.agent)}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
@@ -99,7 +102,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
           </button>
         })}
       </div> : null}
-      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-background ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => {
+      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-card ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => {
         event.preventDefault()
         if (disabled || !text.trim()) return
         // A typed option number picks that option, as tapping its row would.
@@ -116,7 +119,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   </ActionCard>
 }
 
-const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-background px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
+const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-card px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
 const badge = "grid size-7 shrink-0 place-items-center rounded-md text-meta font-semibold tabular-nums"
 
 function Meta({ icon: Icon, label, title, children }: { icon: LucideIcon; label: string; title?: string; children: ReactNode }) {
