@@ -20,19 +20,12 @@ pub enum TriggerKind {
     AgentTask,
     /// A due time of a schedule of this conversation: a routine, or a reminder.
     Schedule,
-    /// The primary bot judges who owns a session the user chose to handle.
-    Route,
     /// Another bot's message to this one.
     BotMessage,
 }
 
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
-}
-
-/// The turn in which the primary bot routes the session a session question is about.
-pub fn route_trigger(question_id: &str) -> String {
-    format!("route:{question_id}")
 }
 
 pub fn work_trigger(work_id: &str) -> String {
@@ -262,7 +255,7 @@ impl JobState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerJob {
     pub conversation_id: String,
-    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`, `route:<question_id>`,
+    /// `message:<message_id>`, `work:<work_id>`, `task:<work_id>`,
     /// `bot_message:<message_id>` or `schedule:<schedule_id>:<slot_ms>`.
     pub trigger: String,
     pub kind: TriggerKind,

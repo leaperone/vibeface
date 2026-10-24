@@ -506,24 +506,6 @@ impl Store {
             .map(|row| row?)
             .collect()
     }
-    /// A conversation's latest messages other than answers, oldest first: `(role, text)`.
-    pub fn recent_messages(
-        &self,
-        network_id: &str,
-        scope_id: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>> {
-        let mut statement = self.connection.prepare(
-            "SELECT role,text FROM messages WHERE network_id=? AND conversation_id=? AND answers IS NULL ORDER BY rank DESC LIMIT ?",
-        )?;
-        let mut rows = statement
-            .query_map(params![network_id, scope_id, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.reverse();
-        Ok(rows)
-    }
     pub fn message(&self, network: &str, scope: &str, message_id: &str) -> Result<Option<Message>> {
         message_from(&self.connection, network, scope, message_id)
     }

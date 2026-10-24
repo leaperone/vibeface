@@ -445,12 +445,13 @@ impl Runtime {
                 self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
-            // Another device's routing turn hands over a session this device runs.
-            "triage_assign" => {
-                self.attribute_session(
+            // The user, on another device, hands over a session this device runs.
+            "session_owner" => {
+                ensure!(input["human"] == true, "only the user hands sessions over");
+                self.hand_over_session(
                     network,
-                    field(input, "question_id")?,
-                    field(input, "conversation_id")?,
+                    field(input, "session_id")?,
+                    input["conversation_id"].as_str(),
                 )
                 .await
             }

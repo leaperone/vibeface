@@ -349,14 +349,10 @@ pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) ->
     .context("the device signature does not match this write")
 }
 
-/// Bots' questions start with `q-`; questions about sessions no bot owns with `s-`.
-fn question_id(scope: &str, question: &str) -> Result<()> {
+/// Bots' questions start with `q-`.
+fn question_id(question: &str) -> Result<()> {
     vibeface_protocol::validate_id(question).map_err(anyhow::Error::msg)?;
-    let prefix = if scope == SESSIONS_SCOPE { "s-" } else { "q-" };
-    ensure!(
-        question.starts_with(prefix),
-        "a question ID in this scope starts with {prefix}"
-    );
+    ensure!(question.starts_with("q-"), "a question ID starts with q-");
     Ok(())
 }
 
@@ -441,10 +437,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             id(message_id)?;
-            ensure!(
-                answers.is_some() || event.scope_id != SESSIONS_SCOPE,
-                "only answers are posted to the sessions scope"
-            );
             match role {
                 Role::User => {
                     ensure!(
@@ -467,7 +459,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         "attachments are ordered by content, once each, with clean file names"
                     );
                     if let Some(question) = answers {
-                        question_id(&event.scope_id, question)?;
+                        question_id(question)?;
                         ensure!(
                             *message_id == format!("a-{question}"),
                             "an answer's message ID is derived from its question"
@@ -512,7 +504,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => cause_id(&event.scope_id, cause)?,
         EventBody::BotDeleted { cause, .. } => {
             ensure!(
-                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                event.scope_id != BOTS_SCOPE,
                 "a bot is deleted in its own conversation"
             );
             cause
@@ -549,8 +541,8 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(work_id)?
         }
         EventBody::ConversationCreated { .. } => ensure!(
-            event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
-            "the sessions and bots scopes are not conversations"
+            event.scope_id != BOTS_SCOPE,
+            "the bots scope is not a conversation"
         ),
         EventBody::PrimaryBotSet {
             conversation_id, ..
@@ -568,7 +560,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             about,
             ..
         } => {
-            question_id(&event.scope_id, question)?;
+            question_id(question)?;
             ensure!(
                 !text.trim().is_empty() && text.len() <= 1024,
                 "a question is 1-1024 bytes"
@@ -589,13 +581,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         && choices[..index].iter().all(|c| c.label != choice.label),
                     "choice labels are 1-120 characters and unique"
                 );
-                if let Some(conversation) = &choice.conversation_id {
-                    ensure!(
-                        event.scope_id == SESSIONS_SCOPE && conversation != SESSIONS_SCOPE,
-                        "only a session question hands a session to a bot"
-                    );
-                    id(conversation)?;
-                }
             }
         }
         EventBody::SessionAttributed {
@@ -604,18 +589,27 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             session_id,
             cwd,
             summary,
-            question_id: question,
         } => {
             ensure!(
-                event.scope_id != SESSIONS_SCOPE,
+                event.scope_id != BOTS_SCOPE,
                 "a session is attributed in its bot's conversation"
             );
             ensure!(
                 *node == event.author,
                 "only the device running a session hands it over"
             );
-            question_id(SESSIONS_SCOPE, question)?;
             subject(node, agent, session_id, cwd, summary)?;
+        }
+        EventBody::SessionMuted { node, session_id } => {
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a session is muted in its bot's conversation"
+            );
+            ensure!(
+                *node == event.author,
+                "only the device running a session mutes it"
+            );
+            subject(node, "-", session_id, "", "")?;
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {
@@ -639,14 +633,14 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(message_id)?;
             id(reply)?;
             ensure!(
-                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                event.scope_id != BOTS_SCOPE,
                 "a message is steered in its bot's conversation"
             );
         }
         EventBody::ScheduleRunClaimed { schedule_id, .. } => {
             id(schedule_id)?;
             ensure!(
-                event.scope_id != SESSIONS_SCOPE && event.scope_id != BOTS_SCOPE,
+                event.scope_id != BOTS_SCOPE,
                 "a schedule runs in its bot's conversation"
             );
         }
@@ -659,9 +653,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(message_id)?;
             id(&from.conversation_id)?;
             ensure!(
-                from.conversation_id != event.scope_id
-                    && event.scope_id != SESSIONS_SCOPE
-                    && event.scope_id != BOTS_SCOPE,
+                from.conversation_id != event.scope_id && event.scope_id != BOTS_SCOPE,
                 "a bot messages another bot's conversation"
             );
             ensure!(
@@ -885,12 +877,6 @@ mod tests {
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = answer("a-q-1", Role::Assistant, None, Some(ReplyStatus::Stopped));
         assert!(identity.sign_event(event.clone()).is_err());
-        event.scope_id = SESSIONS_SCOPE.into();
-        assert!(
-            identity.sign_event(event.clone()).is_err(),
-            "q- questions live in conversations"
-        );
-        event.scope_id = "conversation".into();
         event.body = message(Role::Assistant, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = message(Role::Assistant, None, Some(ReplyStatus::Stopped));

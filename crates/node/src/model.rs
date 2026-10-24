@@ -110,9 +110,6 @@ pub enum Severity {
     Urgent,
 }
 
-/// Scope of the questions about sessions no bot owns; they show only on the pending page.
-pub const SESSIONS_SCOPE: &str = "sessions";
-
 /// Scope of the user's choice of primary bot, the one that judges what comes in without an
 /// owner. Its latest event by rank stands; nothing projects it.
 pub const BOTS_SCOPE: &str = "bots";
@@ -138,9 +135,6 @@ pub struct Subject {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub label: String,
-    /// Session questions only: choosing it attributes the session to this bot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<ScopeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -629,8 +623,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// In the conversation of the bot that owns the session, or in `SESSIONS_SCOPE` for a
-    /// session no bot owns. Its one answer is the user message `a-<question_id>`.
+    /// In the conversation of the bot that owns the session. Its one answer is the user
+    /// message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
         severity: Severity,
@@ -639,15 +633,21 @@ pub enum EventBody {
         choices: Vec<Choice>,
         about: Subject,
     },
-    /// In the chosen bot's conversation: that bot owns the session from now on.
+    /// Written by the device running the session, in the conversation of the bot that owns
+    /// it from now on: the primary bot when the session first shows up without an owner, or
+    /// the bot the user hands it to. The latest by rank stands.
     SessionAttributed {
         node: DeviceId,
         agent: String,
         session_id: String,
         cwd: String,
         summary: String,
-        /// The session question that led to it.
-        question_id: String,
+    },
+    /// Written by the device running the session, in its owner's conversation: the user stopped
+    /// following it, and its events are dropped until it is handed to a bot again.
+    SessionMuted {
+        node: DeviceId,
+        session_id: String,
     },
     /// In `BOTS_SCOPE`: the user makes this conversation's bot the primary one.
     PrimaryBotSet {

@@ -15,34 +15,28 @@
 Codex 线程或 Claude Code 会话（统称 session）属于某个 Bot，只有两种已记录的事实：
 
 1. 工作记录：`WorkProgress { thread_id }` 由目标设备写入工作所在会话。派发即归属，不新增字段。App Server 的请求可能先于这条记录到达，所以运行它的设备在记录写入前以本机工作已绑定的线程为准。
-2. 认领：`SessionAttributed` 事件，写入被认领 Bot 的会话。只有运行该 session 的设备能写，签名形状要求 `node` 等于作者。
+2. 归属：`SessionAttributed` 事件，写入接手 Bot 的会话。只有运行该 session 的设备能写，签名形状要求 `node` 等于作者。
 
 `vibeface codex send` 是 Bot 在本聊天里登记的工作，`WorkDispatched.thread` 记下目标线程；它和其他工作一样经 `WorkProgress` 归属。
 
-两者都投影到 `session_owners`，主键 `(network_id, node, session_id)`，先到（rank 最小）者胜。没有归属的 session 是“外来会话”。
+两者都投影到 `session_owners`，主键 `(network_id, node, session_id)`。有 `SessionAttributed` 时 rank 最大的一条为准（本人后来的选择胜出），否则工作记录里 rank 最小者胜。没有归属的 session 是“外来会话”。
 
 外来会话：
 
-- 第一个事件到来时，运行它的 Node 直接写一个确定性的会话提问（不经 Agent），问题是“谁来接这个 Codex 会话？”，附 cwd 和一行摘要。选项为 `忽略`、`处理`，以及每个 Bot 一项 `交给 <Bot 名>`。它只出现在待处理页和 Grok，不进任何聊天。
-- 提问未回答或回答为 `忽略` 时，该 session 之后的事件静默丢弃。`忽略` 按 session 记住，因为问题 ID 由 session 派生。运行它的 Node 把已忽略的 session 记在内存里，事件不碰数据库就丢弃；认领或绑定工作时移出。重启后从数据库重新得知。
-- 回答 `交给 <Bot>` 时，Node 直接写 `SessionAttributed`。回答 `处理` 或其他文字时，交给主 Bot 判断。
-- 认领后该 session 的事件和提问都进入那个 Bot 的聊天，聊天里显示一张交接卡片。
+- 只看用户在用的会话。Codex rollout 首行 `session_meta` 的 `source` 为 `exec`/`mcp`、`source` 是子代理对象或 `originator` 以 `_exec` 结尾时跳过；App Server 的 `thread/started` 按同样规则记下后台线程；hook 进程按 rollout 首行（Codex）或 `CLAUDE_CODE_ENTRYPOINT=sdk-*`（Claude）在发出前跳过。普通 Stop 事件照常进分诊。
+- 第一个事件到来时，运行它的 Node 直接把它归给主 Bot，写一次 `SessionAttributed`，不提问。归属已存在（含不再关注）就不再写，所以重复事件、重启和同步都不会再写；之后按普通归属路由，App Server 请求交给该 Bot 处理。没有 Bot 时事件丢弃，请求立即按方法兜底。
+- 协调 Agent 自己的线程登记在 `coordination_threads`，永不清理，不会被归属。
+- Bot 聊天里列出归给它的会话，可以“转给…”另一个 Bot（写新的 `SessionAttributed`），或“不再关注”（写 `SessionMuted`）。两者都经 RPC `session_owner` 交给运行该会话的设备写入；请求的状态已成立时不写。不再关注后该会话的事件在分诊前丢弃，不进待处理；再转给某个 Bot（含“重新关注”给原 Bot）即恢复。
+- 不再关注存成 DAG 事件而不是本机表：归属本身是全网同步的事实，任一设备的网页都能操作、看到同一状态，重启和重建投影后仍在，也和归属一样只由运行设备写。
 
 主 Bot：
 
 - 每个个人网络一个，由用户在 Bot 页“设为主 Bot”选定，是同步的设置。未选或所选 Bot 已不存在时，用最早创建的 Bot。
-- 没有归属的东西都先交给主 Bot 判断。目前就是回答了 `处理` 的外来会话。
-- 判断在主 Bot 自己的聊天里跑一轮（触发类型 `route`，触发 ID `route:<问题 ID>`），用户能看到它的理由。这一轮拿到会话提问全文，以及其他每个 Bot 的名称、项目和最近 5 条消息摘要。
-- 它要么留下（`vibeface triage assign` 指向自己），要么交给另一个 Bot。交接卡片出现在双方聊天里，主 Bot 聊天里写明交给了谁。
-- 这一轮结束仍无人认领，或回答后 10 分钟内主 Bot 没有回复时，会话归主 Bot。不再按项目路径前缀兜底。
-- 换主 Bot 后，下一个外来会话的判断轮在新主 Bot 的聊天里跑。已经开始的判断轮不受影响。
-
-外来会话上的 App Server 请求不等人：Node 写会话提问（若尚无）并立即按方法回退应答。
+- 外来会话直接归主 Bot。换主 Bot 后，下一个外来会话归新主 Bot，已归属的不变。
 
 ## 3. 数据形状
 
 ```text
-const SESSIONS_SCOPE = "sessions"     // 外来会话的提问只住在这里
 const BOTS_SCOPE = "bots" // 网络级的 Bot 设置
 
 PrimaryBotSet {                 // 写在 BOTS_SCOPE，须本人签名
@@ -60,11 +54,10 @@ Subject {                             // 问题所涉的设备、项目和 sessi
 
 Choice {
 	label: String,                    // 1-120 字符，同一问题内唯一
-	conversation_id: Option<ScopeId>, // 仅会话提问：选它即认领给该 Bot
 }
 
-QuestionAsked {                       // 会话 scope = Bot 提问；SESSIONS_SCOPE = 外来会话提问
-	question_id: String,              // Bot 提问 "q-" + digest(node, event_id)；会话提问 "s-" + digest(node, session_id)
+QuestionAsked {                       // 写在拥有该 session 的 Bot 会话
+	question_id: String,              // "q-" + digest(node, event_id)
 	severity: Severity,               // info | attention | urgent
 	text: String,                     // 问题本身，≤1024 字节
 	choices: Vec<Choice>,             // ≤8；文字回答始终可用
@@ -76,13 +69,17 @@ MessagePosted {                       // 现有事件，新增一个字段
 	answers: Option<String>,          // 仅 role=user：所答问题；此时 message_id 必须等于 "a-" + question_id
 }
 
-SessionAttributed {                   // 写在被认领 Bot 的会话 scope
+SessionAttributed {                   // 写在接手 Bot 的会话 scope；rank 最大者为准
 	node: DeviceId,
 	agent: String,
 	session_id: String,
 	cwd: String,
 	summary: String,
-	question_id: String,              // 促成认领的会话提问
+}
+
+SessionMuted {                        // 写在当前接手 Bot 的会话 scope：不再关注
+	node: DeviceId,
+	session_id: String,
 }
 ```
 
@@ -94,7 +91,7 @@ SessionAttributed {                   // 写在被认领 Bot 的会话 scope
 |---|---|---|
 | `questions` | `(network_id, question_id)` | 先到者胜；存会话 ID、事件体、作者、时间 |
 | `messages.answers` | 新列，索引 `(network_id, answers)` | 回答即消息；同 ID 先到者胜 |
-| `session_owners` | `(network_id, node, session_id)` | 来自 `WorkProgress.thread_id` 与 `SessionAttributed`，先到者胜 |
+| `session_owners` | `(network_id, node, session_id)` | 来自 `WorkProgress.thread_id`（rank 最小者胜）与 `SessionAttributed`（rank 最大者胜，覆盖工作记录）；`muted` 由同一 Bot 会话里 rank 更大的 `SessionMuted` 置位，新的 `SessionAttributed` 清除 |
 
 未回答 = `questions` 左连接 `messages.answers` 为空。不另设“已回答”状态。
 
@@ -108,14 +105,14 @@ Agent 侧（CLI → `/api/triage`）：
 
 - `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。带 `--request-id` 时请求挂起到回答为止，回答后再给 Bot 120 秒应答，超时按方法回退。
 - `vibeface triage dismiss --event-id ID`：不变。
-- `vibeface triage assign --question QID --bot CONVERSATION_ID`：主 Bot 的判断轮认领外来会话，重复调用返回同一归属。会话不在本机时转给运行它的设备写入。
 - `vibeface codex respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
 
 用户侧 RPC：
 
 - `questions`：全网未回答问题，含所属会话与 Bot 名。
 - `answer { question_id, text, attestation }`：写回答消息。会话问题按普通消息准入或转交调度 Node；同一问题已有不同回答时返回已有回答，`status = "already_answered"`。
-- `conversation` 快照新增 `questions`（含回答）和 `sessions`（交接卡片，`conversation_id` 为认领方；主 Bot 聊天里也列出它交出去的会话）。
+- `conversation` 快照新增 `questions`（含回答）和 `sessions`（归给本 Bot 的外来会话 `{node, agent, session_id, cwd, summary, muted, created_at_ms}`）。
+- `session_owner { node, session_id, conversation_id | null }`：本人把会话转给某个 Bot，`null` 为不再关注；不在本机时经 peer RPC 交给运行它的设备。返回 `{session_id, conversation_id, muted, changed}`，状态已成立时 `changed = false`、不写事件。
 - `bots` 返回 `primary`，即主 Bot 的会话 ID，没有 Bot 时为 `null`。
 - `set_primary_bot { conversation_id, attestation }`：本人选定主 Bot，签名事件体为 `{"type":"primary_bot_set", conversation_id}`，scope 为 `bots`。
 

@@ -63,7 +63,7 @@ enum Action {
     Hook(Hook),
     /// Install, remove, check or test this Node's Codex and Claude Code hooks.
     Hooks(Hooks),
-    /// The coordination Agent's triage answers: list pending events, ask about, dismiss or assign one.
+    /// The coordination Agent's triage answers: list pending events, ask about or dismiss one.
     Triage(Triage),
     /// Add a record to this device's Node log, e.g. from the coordination Agent or a script.
     Log(LogRecord),
@@ -289,14 +289,6 @@ enum TriageAction {
     Dismiss {
         #[arg(long)]
         event_id: String,
-    },
-    /// Hand the session a session question is about to a bot; a repeat returns the owner.
-    Assign {
-        #[arg(long)]
-        question: String,
-        /// The bot's conversation ID.
-        #[arg(long)]
-        bot: String,
     },
 }
 
@@ -1369,6 +1361,34 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
+/// Whether a hook comes from a session the user drives: Codex tells by its rollout's first
+/// line, Claude Code by the entry point it hands its hooks.
+fn interactive_hook(agent: HookAgent, input: &Value) -> bool {
+    use vibeface::triage;
+    match agent {
+        HookAgent::Codex => {
+            let first = input["transcript_path"]
+                .as_str()
+                .and_then(|path| fs::File::open(path).ok())
+                .and_then(|file| {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(
+                        &mut std::io::BufReader::new(file.take(1 << 20)),
+                        &mut line,
+                    )
+                    .ok()
+                    .map(|_| line)
+                })
+                .unwrap_or_default();
+            let meta = triage::rollout_meta(&first);
+            triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+        }
+        HookAgent::Claude => {
+            triage::interactive_claude(std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref())
+        }
+    }
+}
+
 async fn hook(options: Hook) -> Result<()> {
     use vibeface::triage::{self, AgentEvent};
     let mut event = if options.test {
@@ -1384,6 +1404,9 @@ async fn hook(options: Hook) -> Result<()> {
         let mut input = Vec::new();
         std::io::stdin().take(1 << 20).read_to_end(&mut input)?;
         let input: Value = serde_json::from_slice(&input).context("hook input is not JSON")?;
+        if !interactive_hook(options.agent, &input) {
+            return Ok(());
+        }
         let event = match options.agent {
             HookAgent::Codex => triage::from_codex_hook(&input),
             HookAgent::Claude => triage::from_claude_hook(
@@ -1570,9 +1593,6 @@ async fn triage(options: Triage) -> Result<()> {
                 "request_id":request_id,"choices":choices})
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
-        TriageAction::Assign { question, bot } => {
-            json!({"action":"assign","question_id":question,"conversation_id":bot})
-        }
     };
     let result = post_local(
         &local_node_url(&options.local)?,

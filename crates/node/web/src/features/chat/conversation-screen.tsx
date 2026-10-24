@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Forward, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
@@ -82,7 +83,7 @@ export function ConversationScreen() {
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} owner={session.conversation_id === conversationId ? null : workspace.bots.find((bot) => bot.conversation_id === session.conversation_id) ?? { name: '另一个 Bot' }} /> })),
+    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} /> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
@@ -288,18 +289,39 @@ function TaskMeta({ device, here, state, className = '' }: { device: string; her
   </span>
 }
 
-/** A session handed to this bot, or by this primary bot to another one. */
-function HandoffRow({ session, owner }: { session: SessionHandoff; owner: { name: string; bot_id?: string } | null }) {
-  const Icon = owner ? Forward : ArrowDownToLine
-  return <p className="flex min-h-9 min-w-0 items-center gap-2 text-meta text-muted-foreground">
+/** A session no bot started that this bot looks after: hand it to another bot, or stop following it. */
+function HandoffRow({ session }: { session: SessionHandoff }) {
+  const workspace = useWorkspace()
+  const [busy, setBusy] = useState(false)
+  const [failure, setFailure] = useState<unknown>(null)
+  const others = workspace.bots.filter((bot) => bot.conversation_id !== workspace.conversationId)
+  const disabled = !workspace.writable || busy
+  const handTo = async (target: string | null) => {
+    setBusy(true)
+    setFailure(null)
+    try {
+      await workspace.setSessionOwner(session, target)
+      const bot = target && workspace.bots.find((item) => item.conversation_id === target)
+      toast(bot ? `已转给 ${bot.name}` : target ? '已重新关注' : '已不再关注', { tone: 'success' })
+    } catch (caught) { setFailure(caught) }
+    finally { setBusy(false) }
+  }
+  const Icon = session.muted ? BellOff : ArrowDownToLine
+  return <div className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
     <Icon aria-hidden="true" className="size-4 shrink-0" />
-    {owner ? <span className="shrink-0 text-foreground">{agentName(session.agent)} 会话交给了 {owner.bot_id
-      ? <Link to="/b/$botId" params={{ botId: owner.bot_id }} className="font-medium underline-offset-4 hover:underline">{owner.name}</Link> : owner.name}</span>
-      : <span className="shrink-0 text-foreground">接手 {agentName(session.agent)} 会话</span>}
+    <span className="shrink-0 text-foreground">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
     <span aria-hidden="true">·</span>
     <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
     {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
-  </p>
+    <span className="ml-auto flex shrink-0 items-center gap-2">
+      {others.length ? <NativeSelect size="sm" aria-label="把会话转给其他 Bot" value="" disabled={disabled} onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
+        <NativeSelectOption value="">转给…</NativeSelectOption>
+        {others.map((bot) => <NativeSelectOption key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</NativeSelectOption>)}
+      </NativeSelect> : null}
+      <Button type="button" size="sm" variant="ghost" disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>{session.muted ? '重新关注' : '不再关注'}</Button>
+    </span>
+    <InlineError error={failure} />
+  </div>
 }
 
 function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
