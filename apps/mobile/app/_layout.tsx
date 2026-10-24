@@ -27,6 +27,8 @@ function Screens() {
   const [background, foreground] = useCSSVariable(['--background', '--foreground']) as [string, string]
   const ready = workspace.session.phase === 'ready'
   const wide = useWide()
+  // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
+  const root = wide ? { headerBackVisible: false, gestureEnabled: false } : {}
   // The Stack keeps its place in the tree whether or not the sidebar shows, so a rotation never resets the route.
   return <>
     <StatusBar style="auto" />
@@ -48,13 +50,13 @@ function Screens() {
           </Stack.Protected>
           <Stack.Protected guard={ready}>
             <Stack.Screen name="index" options={{ title: '消息', headerLargeTitle: true }} />
-            <Stack.Screen name="b/[botId]" options={{ title: '' }} />
+            <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
             <Stack.Screen name="new-bot" options={{ title: '新建 bot', presentation: 'modal' }} />
             <Stack.Screen name="ai" options={{ title: 'AI' }} />
-            <Stack.Screen name="inbox" options={{ title: '待处理' }} />
-            <Stack.Screen name="settings" options={{ title: '设置' }} />
+            <Stack.Screen name="inbox" options={{ title: '待处理', ...root }} />
+            <Stack.Screen name="settings" options={{ title: '设置', ...root }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
             <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal' }} />
             <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />

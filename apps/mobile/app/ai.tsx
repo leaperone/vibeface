@@ -164,7 +164,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
 
 function Toggle({ icon, label, pressed, busy, disabled, onPress }: { icon: LucideIcon; label: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   // While a save runs the toggles keep their look and ignore taps; the spinner says which one is changing.
-  return <Button variant={pressed ? 'default' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
+  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
     <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
   </Button>
 }
