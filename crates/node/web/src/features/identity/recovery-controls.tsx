@@ -69,7 +69,7 @@ export function RecoveryReview() {
   if (review?.kind !== 'recovery') return null
   const managers = admins ?? review.members.filter((member) => member.manage).map((member) => member.device_id)
   const toggle = (list: string[], id: string, on: boolean) => on ? [...list, id] : list.filter((item) => item !== id)
-  return <section className="grid gap-4 rounded-xl border bg-card p-5">
+  return <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
     <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />哪台设备丢了？</h2>
     <fieldset disabled={busy} className="grid gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
@@ -115,7 +115,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     <Button type="button" variant="outline" onClick={() => setOpen('passphrase')}><KeyRound aria-hidden="true" />换恢复密码</Button>
   </div>
   return <div className="grid gap-4">
-    {open === 'restore' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
+    {open === 'restore' ? <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />用恢复文件找回</h2>
       <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
       <form className="grid gap-4" onSubmit={(event) => {
@@ -138,7 +138,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <div className="flex flex-wrap gap-2"><Button type="submit"><BusyIcon busy={busy} />下一步</Button>{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}</div>
       </fieldset></form>
     </section> : null}
-    {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card p-5">
+    {open === 'passphrase' ? <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
       <h2 className="flex items-center gap-2 text-heading font-semibold"><KeyRound aria-hidden="true" className="size-5 text-muted-foreground" />换恢复密码</h2>
       <p className="text-meta text-muted-foreground">换完后旧文件失效</p>
       <form className="grid gap-4" onSubmit={(event) => {

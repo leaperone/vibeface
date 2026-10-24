@@ -99,7 +99,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
           </button>
         })}
       </div> : null}
-      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-background ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => {
+      <form className="flex min-h-12 min-w-0 items-center gap-3 rounded-lg border bg-card ps-3 pe-1 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 has-[input:disabled]:opacity-50" onSubmit={(event) => {
         event.preventDefault()
         if (disabled || !text.trim()) return
         // A typed option number picks that option, as tapping its row would.
@@ -116,7 +116,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   </ActionCard>
 }
 
-const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-background px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
+const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-card px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
 const badge = "grid size-7 shrink-0 place-items-center rounded-md text-meta font-semibold tabular-nums"
 
 function Meta({ icon: Icon, label, title, children }: { icon: LucideIcon; label: string; title?: string; children: ReactNode }) {

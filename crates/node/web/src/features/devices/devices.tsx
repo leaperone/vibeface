@@ -77,7 +77,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
     <JoinRequests />
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
-      : <ul className="divide-y overflow-hidden rounded-xl border bg-card">{rows.map((row) => {
+      : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {
         const Icon = deviceIcon(row)
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
@@ -98,7 +98,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
 }
 
 function Section({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-xl border bg-card p-4">
+  return <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-4">
     <h3 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h3>
     {children}
   </section>
@@ -125,7 +125,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
   return <div className="mx-auto grid w-full max-w-3xl gap-6">
     <header className="flex items-center gap-4">
-      <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-muted"><Icon aria-hidden="true" className="size-6" /></span>
+      <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
         <h2 className="truncate text-title font-semibold" title={row.name}>{row.name}</h2>
         <div className="flex flex-wrap items-center gap-2">

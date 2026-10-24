@@ -53,7 +53,7 @@ export function PromptInput({
         onSubmit()
       }}
     >
-      <InputGroup>
+      <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
         <InputGroupTextarea
           id="message-text"
           name="text"
@@ -66,7 +66,7 @@ export function PromptInput({
           aria-describedby={hint ? 'manager-hint' : undefined}
           title="Enter 发送，Shift+Enter 换行"
           rows={1}
-          className={cn('px-4', open ? 'min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-11 min-h-11 overflow-hidden py-2.5')}
+          className={cn('px-4', open ? 'min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
           onFocus={() => setOpen(true)}
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
           onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -76,10 +76,10 @@ export function PromptInput({
             }
           }}
         />
-        <InputGroupAddon align={open ? 'block-end' : 'inline-end'} className={open ? 'flex-wrap ps-0.5 pt-1' : 'py-0 pe-0.5'}>
+        <InputGroupAddon align={open ? 'block-end' : 'inline-end'} className={open ? 'flex-wrap ps-1 pe-1.5 pt-1 pb-1.5' : 'py-0 pe-1.5'}>
           {onFiles ? <>
             <input ref={pickerRef} type="file" multiple hidden onChange={(event) => { onFiles([...files, ...event.target.files ?? []]); event.target.value = '' }} />
-            <InputGroupButton type="button" variant="ghost" size="icon-sm" className="relative size-11 rounded-full" aria-label={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} title="添加附件" disabled={disabled || busy} onMouseDown={keepFocus} onClick={() => pickerRef.current?.click()}>
+            <InputGroupButton type="button" variant="ghost" size="icon-sm" className="relative size-9 rounded-full text-muted-foreground hover:text-foreground max-md:size-11" aria-label={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} title="添加附件" disabled={disabled || busy} onMouseDown={keepFocus} onClick={() => pickerRef.current?.click()}>
               <PaperclipIcon aria-hidden="true" />
               {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[0.625rem] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
             </InputGroupButton>
@@ -89,7 +89,7 @@ export function PromptInput({
             </span>)}
           </> : null}
           <span className="ms-auto flex shrink-0 gap-1">
-            {drafting && onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-11 rounded-full" onMouseDown={keepFocus} onClick={onStop}>
+            {drafting && onStop ? <InputGroupButton type="button" variant="outline" size="icon-sm" aria-label="停止" title="停止" className="size-9 rounded-full max-md:size-11" onMouseDown={keepFocus} onClick={onStop}>
               <SquareIcon aria-hidden="true" className="fill-current" />
             </InputGroupButton> : null}
             <InputGroupButton
@@ -100,7 +100,7 @@ export function PromptInput({
               aria-busy={busy || undefined}
               aria-label={stop ? '停止' : '发送'}
               title={stop ? '停止' : '发送'}
-              className="size-11 rounded-full"
+              className="size-9 rounded-full transition-[background-color,transform,opacity] active:scale-95 max-md:size-11"
               onMouseDown={keepFocus}
               onClick={stop}
             >

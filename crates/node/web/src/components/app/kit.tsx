@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react"
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
 import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
@@ -16,14 +16,62 @@ const toneSurface: Record<Tone, string> = {
   neutral: "border-border bg-card", success: "border-success-border bg-success-soft", warning: "border-warning-border bg-warning-soft",
   danger: "border-danger-border bg-danger-soft", info: "border-info-border bg-info-soft",
 }
+/** A card keeps the page's surface; the tone washes in from its top edge and tints the border. */
+const toneCard: Record<Tone, string> = {
+  neutral: "border-border bg-card", success: "border-success-border bg-linear-to-b from-success-soft to-card to-[5rem]",
+  warning: "border-warning-border bg-linear-to-b from-warning-soft to-card to-[5rem]", danger: "border-danger-border bg-linear-to-b from-danger-soft to-card to-[5rem]",
+  info: "border-info-border bg-linear-to-b from-info-soft to-card to-[5rem]",
+}
+const toneChip: Record<Tone, string> = {
+  neutral: "bg-muted text-muted-foreground", success: "bg-success-soft text-success ring-1 ring-success-border", warning: "bg-warning-soft text-warning ring-1 ring-warning-border",
+  danger: "bg-danger-soft text-danger ring-1 ring-danger-border", info: "bg-info-soft text-info ring-1 ring-info-border",
+}
+
+/** The Vibeface "V" in its rounded tile, as on the app icon. */
+export function BrandMark({ className }: { className?: string }) {
+  return <svg viewBox="0 0 64 64" aria-hidden="true" className={cn("size-6 shrink-0", className)}>
+    <rect width="64" height="64" rx="16" className="fill-foreground" />
+    <path d="M19 21l13 24 13-24" fill="none" strokeWidth="6.5" strokeLinecap="round" strokeLinejoin="round" className="stroke-background" />
+  </svg>
+}
+
+export function Wordmark({ className }: { className?: string }) {
+  return <span className={cn("inline-flex items-center gap-2 text-heading font-semibold tracking-tight", className)}><BrandMark />Vibeface</span>
+}
+
+/** Each bot keeps one hue, picked from its id, so the same bot looks the same in the list, the header and the chat. */
+export function BotAvatar({ id, name, size = "md", className }: { id: string; name: string; size?: "sm" | "md" | "lg"; className?: string }) {
+  let hash = 2166136261
+  for (const char of id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0
+  const hue = Math.round((hash * 0.618033988749895 % 1) * 360)
+  const letter = [...name.trim()][0]?.toUpperCase() ?? "B"
+  return <span aria-hidden="true" style={{ "--avatar-hue": hue } as CSSProperties} className={cn("bot-avatar grid shrink-0 place-items-center font-semibold select-none",
+    size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
+}
 
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
-  return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center", className)}>
-    <Icon aria-hidden="true" className="size-8 text-muted-foreground" />
+  return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center animate-in fade-in-0 duration-300", className)}>
+    <span className="mb-1 grid size-12 place-items-center rounded-2xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
     <h2 className="text-heading font-semibold">{title}</h2>
     {description ? <p className="text-meta text-muted-foreground">{description}</p> : null}
     {action ? <div className="pt-1">{action}</div> : null}
   </div>
+}
+
+/** Progress through first-time setup, shared by the connection screen and onboarding. */
+export function Steps({ step }: { step: number }) {
+  return <div className="flex items-center gap-3 text-meta text-muted-foreground">
+    <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-300", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span className="sr-only">第 {step} 步，共 4 步</span>
+  </div>
+}
+
+/** One step of first-time setup: a raised card under an icon title. */
+export function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+  return <section className="grid gap-4 rounded-2xl border bg-card p-5 shadow-sm animate-in fade-in-0 slide-in-from-bottom-1 duration-300 ease-(--ease-out-quint) sm:p-6">
+    <h2 className="flex items-center gap-2.5 text-heading font-semibold"><span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-4" /></span>{title}</h2>
+    {children}
+  </section>
 }
 
 /** Same shape as the real layout; fades in only after 300ms to avoid flicker. */
@@ -52,11 +100,11 @@ export function StatusPill({ tone = "neutral", icon: Icon, children, className }
 export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, children, actions, className }: {
   icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; menu?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
 }) {
-  return <section className={cn("grid gap-3 rounded-xl border p-4", toneSurface[tone], className)}>
-    <header className="flex min-w-0 flex-wrap items-center gap-2">
-      <Icon aria-hidden="true" className={cn("size-5 shrink-0", toneText[tone])} />
+  return <section className={cn("grid gap-3 rounded-xl border p-4 shadow-xs", toneCard[tone], className)}>
+    <header className="flex min-w-0 flex-wrap items-center gap-2.5">
+      <span className={cn("grid size-7 shrink-0 place-items-center rounded-lg", toneChip[tone])}><Icon aria-hidden="true" className="size-4" /></span>
       <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
-      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-7">{meta}</span> : null}
+      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-9.5">{meta}</span> : null}
       {menu}
     </header>
     {children ? <div className="grid min-w-0 gap-2">{children}</div> : null}
@@ -126,10 +174,10 @@ const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleChec
 
 export function Toaster() {
   const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }, () => toasts, () => toasts)
-  return <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4rem)] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:top-auto md:right-6 md:bottom-6 md:items-end">
+  return <div aria-live="polite" className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+4rem)] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:top-auto md:right-6 md:bottom-24 md:items-end">
     {items.map((item) => {
       const Icon = toastIcon[item.tone]
-      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg">
+      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-top-2 md:slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
         {item.action ? <Button type="button" size="sm" variant="ghost" className="-my-2 h-11 px-3 md:my-0 md:h-7 md:px-2.5" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}

@@ -6,7 +6,7 @@ import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Pl
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
-import { dismissToast, EmptyState, Skeleton, toast } from "@/components/app/kit"
+import { BotAvatar, dismissToast, EmptyState, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { joinsOnScreen, useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@/features/identity/context"
@@ -97,7 +97,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       <Sidebar aria-label="导航">
         <SidebarHeader className="shrink-0 px-4 pt-4 pb-2">
           <div className="flex h-8 items-center">
-            <Link to="/" className="text-heading font-semibold tracking-tight">Vibeface</Link>
+            <Link to="/" className="rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring"><Wordmark /></Link>
           </div>
         </SidebarHeader>
         <SidebarContent className="gap-1 pb-3">
@@ -117,6 +117,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
+                        <BotAvatar id={bot.bot_id} name={bot.name} size="sm" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
                         {workspace.primary === bot.conversation_id ? <span title="主 Bot" className="inline-flex shrink-0"><Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
                         {marked ? <span aria-label="有新进展" className="size-2 shrink-0 rounded-full bg-warning" /> : null}
@@ -258,7 +259,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
     : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
   return <div className="flex h-dvh" aria-busy={retry === null}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
-      <span className="text-heading font-semibold">Vibeface</span>
+      <Wordmark />
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
       <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
     </div>

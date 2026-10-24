@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { cn } from 'cn'
-import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
+import { Details, DetailRow, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, Wordmark } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -60,20 +60,6 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
   </div>
 }
 
-
-function Steps({ step }: { step: number }) {
-  return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1.5" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn('size-2 rounded-full', item <= step ? 'bg-foreground' : 'bg-muted-foreground/30')} />)}</span>
-    <span className="sr-only">第 {step} 步，共 4 步</span>
-  </div>
-}
-
-function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-xl border bg-card p-5">
-    <h2 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h2>
-    {children}
-  </section>
-}
 
 const REJOIN = `vibeface service stop
 mv ~/.vibeface ~/.vibeface-removed-$(date +%Y%m%d-%H%M%S)
@@ -290,9 +276,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
-    <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
+    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:min-h-full sm:content-center sm:py-16">
       <header className="grid gap-3">
-        <span className="text-heading font-semibold tracking-tight">Vibeface</span>
+        <Wordmark />
         {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
         {step ? <Steps step={step} /> : null}
       </header>
