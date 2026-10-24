@@ -76,15 +76,18 @@ export function RecoveredCard() {
 }
 
 /** Shared by creating and recovering: the sealed file, then the promise it is kept apart from its password. */
-export function SaveRecoveryFile({ file, saved, onSaved, download, busy = false }: {
-  file: string; saved: boolean; onSaved(saved: boolean): void; download?: { done: boolean; run(): void }; busy?: boolean
+export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false }: {
+  code: string; saved: boolean; onSaved(saved: boolean): void; download?: { done: boolean; run(): void }; busy?: boolean
 }) {
   const downloaded = !download || download.done
   return <>
     <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />文件用恢复密码加密，没有密码打不开</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
-      <span className="min-w-0 flex-1 py-2 font-mono [overflow-wrap:anywhere]">{file}</span>
+      {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
+      <span title={code ? recoveryFileStem(code) : undefined} className="flex min-w-0 flex-1 py-2 font-mono whitespace-nowrap">
+        <span className="truncate text-muted-foreground">{recoveryFileStem('')}</span><span className="font-medium tracking-wide">{code}</span>
+      </span>
       {download ? <Button type="button" variant="ghost" disabled={busy} onClick={download.run}>重新下载</Button> : null}
     </p> : <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button>}
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />已把文件和密码分开保存</label>
@@ -112,7 +115,7 @@ export function RecoveredStep() {
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存新的恢复文件">
     <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已恢复，旧文件已失效</p>
-    <SaveRecoveryFile file={code ? recoveryFileStem(code) : ''} saved={saved} onSaved={setSaved} />
+    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={setSaved} />
     <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={() => markRecovered(false)}>完成</Button>
   </Panel>
 }
@@ -124,8 +127,7 @@ export function RecoveryReview() {
   const { busy, error, run } = useGenerationRun()
   const [lost, setLost] = useState<string[]>([])
   if (review?.kind !== 'recovery') return null
-  return <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-5">
-    <h2 className="flex items-center gap-2 text-heading font-semibold"><ArchiveRestore aria-hidden="true" className="size-5 text-muted-foreground" />哪台设备丢了？</h2>
+  return <Panel icon={ArchiveRestore} title="哪台设备丢了？">
     <fieldset disabled={busy} className="grid gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
@@ -145,7 +147,7 @@ export function RecoveryReview() {
     <p className="text-meta text-muted-foreground">恢复后会下载新的恢复文件，旧文件失效</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
-      <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
+      <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(async () => {
         // Set before the call: connecting again ends this review, and the connect page then asks for the new file first.
         markRecovered(true)
@@ -155,7 +157,7 @@ export function RecoveryReview() {
       })}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}
-  </section>
+  </Panel>
 }
 
 /** Find devices again with the recovery file, or re-seal that file with a new password. */

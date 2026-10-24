@@ -83,14 +83,29 @@ export function EmptyState({ icon: Icon, title, description, action, className }
 export function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
     <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span aria-hidden="true" className="tabular-nums">{step}/4</span>
     <span className="sr-only">第 {step} 步，共 4 步</span>
   </div>
 }
 
+/**
+ * The page around connecting, setup and recovery. On wider screens the card sits on a tinted page at a fixed height,
+ * so the brand and step bar stay put while cards of different heights follow one another.
+ */
+export function AuthPage({ header, children }: { header?: ReactNode; children: ReactNode }) {
+  return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain sm:bg-sidebar">
+    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 pt-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:pt-[min(14vh,8rem)] sm:pb-16">
+      <header className="grid gap-3"><Wordmark />{header}</header>
+      {children}
+    </div>
+  </main>
+}
+
 /** One step of first-time setup: a raised card under an icon title. */
 export function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-2xl border bg-card p-5 shadow-sm animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:p-6">
-    <h2 className="flex items-center gap-2.5 text-heading font-semibold"><span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-4" /></span>{title}</h2>
+  // A phone has no room for a frame inside the page's own margins, so there the card is only its content.
+  return <section className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:rounded-2xl sm:border sm:bg-card sm:p-6 sm:shadow-sm">
+    <h2 className="flex items-center gap-3 text-title font-semibold"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-[1.125rem]" /></span>{title}</h2>
     {children}
   </section>
 }
@@ -208,10 +223,17 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing
 
 export function SafetyCode({ code, label = "安全码" }: { code: string; label?: string }) {
   const groups = code.match(code.length === 6 ? /.{3}/g : /.{1,4}/g) ?? []
-  return <div className="flex flex-wrap items-center gap-3">
-    <span className="sr-only">{label}</span>
-    <output aria-label={`${label} ${code.split("").join(" ")}`} className="font-mono text-2xl tracking-[0.1em] tabular-nums">{groups.join(" ")}</output>
-  </div>
+  return <output aria-label={`${label} ${code.split("").join(" ")}`} className="flex flex-wrap justify-center gap-x-5 rounded-xl bg-muted/60 px-4 py-3 font-mono text-3xl font-semibold tracking-[0.12em] tabular-nums ring-1 ring-border">
+    {groups.map((group, index) => <span key={index}>{group}</span>)}
+  </output>
+}
+
+/** Waiting on another device: a soft brand ping, a still dot under reduced motion. */
+export function WaitingDot() {
+  return <span aria-hidden="true" className="relative grid size-4 shrink-0 place-items-center">
+    <span className="absolute size-2 animate-ping rounded-full bg-brand/60 motion-reduce:hidden" />
+    <span className="size-2 rounded-full bg-brand" />
+  </span>
 }
 
 /** Collapsed by default. Jargon from docs/design/web-ux.md section 6 may only appear in here. */
