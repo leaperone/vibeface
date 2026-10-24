@@ -72,7 +72,7 @@ export function DevicesPage() {
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
-  return <div className="mx-auto grid w-full max-w-3xl gap-6">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <JoinRequests />
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
@@ -118,12 +118,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
-  if (!row) return device.directory ? <EmptyState icon={MonitorSmartphone} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-3xl gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
+  if (!row) return device.directory ? <EmptyState icon={MonitorSmartphone} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry ? ready?.entry.address ?? "" : ""
   const saved = device.entries.find((item) => item.device_id === row.id)
 
-  return <div className="mx-auto grid w-full max-w-3xl gap-6">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <header className="flex items-center gap-4">
       <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">

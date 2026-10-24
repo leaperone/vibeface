@@ -102,10 +102,10 @@ export function SettingsGroup({ title, footer, children, className }: { title?: 
   </section>
 }
 
-const rowTile: Record<"neutral" | "danger", string> = { neutral: "bg-muted text-muted-foreground", danger: "bg-danger-soft text-danger" }
+const rowTile: Record<"neutral" | "success" | "danger", string> = { neutral: "bg-muted text-muted-foreground", success: "bg-success-soft text-success", danger: "bg-danger-soft text-danger" }
 const rowLayout = "flex min-h-14 w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 text-start"
 
-function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger" }) {
+function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile }) {
   return <>
     <span className={cn("grid size-8 shrink-0 place-items-center rounded-lg", rowTile[tone])}><Icon aria-hidden="true" className="size-4" /></span>
     <span className="grid min-w-0 flex-1 basis-28">
@@ -117,7 +117,7 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
 
 /** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
 export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className }: {
-  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger"; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
+  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
 }) {
   const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
   if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60", className)}>
@@ -192,10 +192,10 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing
   icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; trailing?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
 }) {
   return <section className={cn("grid gap-3 rounded-xl border p-4 shadow-xs", toneCard[tone], className)}>
-    <header className="flex min-w-0 flex-wrap items-center gap-2.5">
+    <header className="flex min-w-0 items-center gap-2.5">
       <span className={cn("grid size-7 shrink-0 place-items-center rounded-lg", toneChip[tone])}><Icon aria-hidden="true" className="size-4" /></span>
       <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
-      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-9.5">{meta}</span> : null}
+      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground">{meta}</span> : null}
       {trailing ? <div className="-my-1 shrink-0">{trailing}</div> : null}
     </header>
     {children ? <div className="grid min-w-0 gap-2">{children}</div> : null}

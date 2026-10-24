@@ -42,7 +42,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
     <MessageScrollerProvider autoScroll scrollEdgeThreshold={96}>
       <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
-          <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-0 px-4 py-6 sm:px-6 lg:px-8">
+          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 py-6 sm:px-6 lg:px-8">
             {entries.map((entry, index) => {
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)

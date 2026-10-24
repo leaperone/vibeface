@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArchiveRestore, Download, FileKey, KeyRound, type LucideIcon } from 'lucide-react'
-import { BusyIcon, Details, DetailRow, FilePicker, InlineError, Panel, SettingsRow, toast } from '@/components/app/kit'
+import { ArchiveRestore, CircleCheck, Download, FileKey, KeyRound, X, type LucideIcon } from 'lucide-react'
+import { BusyIcon, Details, DetailRow, FilePicker, InlineError, Panel, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { Member } from '@vibeface/client/lib/node.ts'
@@ -57,6 +57,20 @@ export function CurrentRecoveryFile() {
   </SettingsRow>
 }
 
+let recovered = false
+/** Whether a recovery just finished here; its result shows once in settings. */
+export function justRecovered() { return recovered }
+
+/** The one-time result of a recovery, at the top of the 恢复 group until closed or left. */
+export function RecoveredNotice() {
+  const [shown, setShown] = useState(recovered)
+  useEffect(() => { recovered = false }, [])
+  if (!shown) return null
+  return <SettingsRow icon={CircleCheck} tone="success" label="已恢复" description="旧文件已失效，请保存新下载的文件">
+    <Button type="button" variant="ghost" size="icon" className="-me-2 max-md:size-11" aria-label="知道了" title="知道了" onClick={() => setShown(false)}><X aria-hidden="true" /></Button>
+  </SettingsRow>
+}
+
 /** After unlocking a recovery file: keep every device except the lost ones. */
 export function RecoveryReview() {
   const device = useDevice()
@@ -89,10 +103,13 @@ export function RecoveryReview() {
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(async () => {
-        await device.confirmRecovery(review.members
-          .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
-          .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) })))
-        toast('已恢复。旧恢复文件已失效，请保存刚下载的新文件', { tone: 'warning', persist: true })
+        // Set before the call: connecting again ends this review, and the connect page then opens settings.
+        recovered = true
+        try {
+          await device.confirmRecovery(review.members
+            .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
+            .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) })))
+        } catch (cause) { recovered = false; throw cause }
       })}><BusyIcon busy={busy} />恢复</Button>
     </div>
     {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}

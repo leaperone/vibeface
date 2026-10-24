@@ -8,7 +8,7 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
-import { CurrentRecoveryFile, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
+import { CurrentRecoveryFile, RecoveredNotice, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -26,7 +26,7 @@ function SettingsPage() {
   const [range, setRange] = useState(86_400_000)
   const principal = device.ready?.principal
   const operator = principal?.can_manage || principal?.source === 'local_session'
-  return <div className="mx-auto grid w-full max-w-2xl gap-8">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
     <SettingsGroup title="提醒">
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
         <NotificationValue />
@@ -40,6 +40,7 @@ function SettingsPage() {
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : <SettingsGroup title="恢复" footer="恢复文件只有一份有效，丢了不能补">
+      <RecoveredNotice />
       <CurrentRecoveryFile />
       <RecoveryControls />
     </SettingsGroup> : null}

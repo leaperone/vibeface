@@ -127,15 +127,21 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         </SidebarFooter>
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
-        <header className="flex h-14 shrink-0 items-center gap-2 border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
-          {/* A page inside another page goes back from its header at any width; the sidebar covers the rest on wide screens. */}
-          {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
-          <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", !nested && "-ms-2.5")} />
-          <div className="flex min-w-0 flex-1 items-center gap-2">
-            {chatRoute ? <BotPanelButton /> : null}
-            <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+        {/* The middle column has the pages' width, so the title and the page's actions line up with the content below. */}
+        <header className="grid h-14 shrink-0 grid-cols-[minmax(max-content,1fr)_minmax(0,var(--page-width))_minmax(max-content,1fr)] items-center border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
+          <div className="flex items-center pe-2 empty:hidden">
+            {/* A page inside another page goes back from its header at any width; the sidebar covers the rest on wide screens. */}
+            {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
+            {isMobile ? null : <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", !nested && "-ms-2.5")} />}
           </div>
-          <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
+          <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              {chatRoute ? <BotPanelButton /> : null}
+              <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+            </div>
+            <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
+          </div>
+          <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {phoneHome ? <div className="-me-3 flex">
             <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
@@ -150,6 +156,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
               {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
+          </div>
         </header>
         {workspace.joined ? null : <LocalSession onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
@@ -267,7 +274,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
 }
 
 export function ChatSkeleton() {
-  return <div className="mx-auto grid w-full max-w-3xl gap-6 px-4 py-6 sm:px-6" aria-hidden="true">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6 px-4 py-6 sm:px-6" aria-hidden="true">
     <Skeleton className="ml-auto h-10 w-2/5 rounded-2xl" />
     <div className="grid gap-2"><Skeleton className="h-4 w-4/5" /><Skeleton className="h-4 w-3/5" /><Skeleton className="h-4 w-2/3" /></div>
     <Skeleton className="ml-auto h-10 w-1/3 rounded-2xl" />

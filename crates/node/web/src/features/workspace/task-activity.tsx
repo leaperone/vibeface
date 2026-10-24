@@ -2,7 +2,7 @@
 
 import { useId, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
+import { ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
 import { ActionCard, BotAvatar, DetailRow, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -57,7 +57,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title={`待确认 · ${check.works.length} 个任务`}
     meta={device}
   >
-    <p className="text-muted-foreground">{check.reason === "offline" ? `${device} 离线了` : `${device} 上的 Codex 断开了`}，这些任务做完了吗？</p>
+    <p className="text-muted-foreground">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，这些任务做完了吗？</p>
     <ul className="divide-y overflow-hidden rounded-lg border bg-card">
       {check.works.map((work) => {
         const bot = botOf(work)
@@ -80,14 +80,15 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.title || "任务结果"}`}
-    meta={bot ? <span className="flex min-w-0 items-center gap-3">{device}<Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
-      <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Link></span> : device}
+    meta={device}
     actions={<>
       <ActionButton disabled={disabled} action={settle(check, "interrupted", note)}>没做完</ActionButton>
       <ActionButton variant="default" disabled={disabled} action={settle(check, "completed", note)}>做完了</ActionButton>
     </>}
   >
     <p>{reason}那个任务实际做完了吗？</p>
+    {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline max-md:min-h-11">
+      <BotAvatar id={bot.bot_id} name={bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
