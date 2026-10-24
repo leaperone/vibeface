@@ -1,11 +1,35 @@
+<div align="center">
+
+<!-- Logo 占位：放入 docs/assets/logo.svg 后替换本行 -->
+
 # Vibeface
 
-在自己的 Mac 或 Linux 设备上运行 `vibeface`，创建有名称、职责和项目配置的机器人，直接在它的聊天中提出要求。协调 Agent 用宿主 SDK 的 Shell、文件工具和 Codex App Server 完成本机工作，也能向另一台设备的 Agent 发任务。机器人定义、聊天历史和任务结果在本人授权的节点间同步，换一个入口也能查询原来的工作。
+**把自己的每台 Mac 和 Linux 设备连成一张私有网络，在聊天里指挥本机的 Codex 与 Cursor Agent 干活。**
+
+[![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?logo=rust)](Cargo.toml)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Linux%20arm64-lightgrey)](docs/releasing.md)
+
+</div>
+
+> [!NOTE]
+> 项目处于 Nightly 阶段，尚无正式版。正式版发布前，协议、数据格式和 API 会直接改成最终形态，不做向后兼容。
+
+## ✨ 核心特性
+
+- 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用宿主 SDK 的 Shell 和文件工具读写本机，用 Codex App Server 改代码。
+- 🌐 **个人设备网络**。所有设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
+- 🔁 **换设备接着干**。任务、进度、审批和结果写进签名事件日志并同步到每台 Node。A 离线时，在 C 打开同一会话就能接手，已执行的副作用不会重放。
+- 🔐 **端到端加密入口**。浏览器用不可导出的设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入网络、不存数据。
+- 📦 **单个二进制**。网页是 React + TanStack Start 静态 SPA，内嵌在 Rust 程序里，生产环境不需要 Node.js Web 服务。
+
+## 🏗️ 工作原理
 
 ```mermaid
 flowchart LR
     U[本人的网页或手机浏览器]
-    G[PVE 公共入口<br>网页、relay 与密文转发]
+    G[公共入口<br>网页、relay 与密文转发]
     A[Mac mini Node<br>协调 Agent]
     B[Node B<br>协调 Agent 与本机工具]
     C[Node C<br>协调 Agent 与历史副本]
@@ -17,38 +41,121 @@ flowchart LR
     A <-->|iroh QUIC，直连或经 relay| C
 ```
 
-所有设备运行同一种 Node。公网 Server 是 Node 的一种部署方式：可以作为成员加入个人网络并按需启用 Agent，也可以作为公共入口只提供网页、relay 和密文转发，不加入网络、不保存数据。每个人拥有独立的设备网络，Node 之间经 iroh QUIC 直连或经 relay 互通，已投递任务的目标固定不变。
+| 层 | 职责 |
+|---|---|
+| **Node**（Rust） | 认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。 |
+| **协调 Agent** | Cursor SDK 或 Codex SDK 驱动。通过原生自定义工具回调 Node，不需要 MCP。 |
+| **执行** | 宿主命令和文件操作直接用 SDK 工具。Codex 经薄原生客户端连接本机 App Server。 |
+| **网页** | 内嵌静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
 
-网页使用 React 和 TanStack Start 构建静态 SPA，随 Rust 程序内嵌分发，生产运行不需要 Node.js Web 服务。浏览器用不可导出的设备密钥和 Noise 通道连接指定 Node，中间的入口只转发密文。
+几条设计约束值得先知道：
 
-Rust 核心负责认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。Cursor SDK 聊天 Agent 通过原生自定义工具回调协调 Node，不需要 MCP。宿主命令和文件操作直接使用 SDK 工具；Codex 使用薄原生客户端访问 App Server，不经过独立执行适配层。机器人定义和共享聊天历史独立于本机 SDK 缓存，创建机器人不会启动模型。
+- 每个人管理自己的设备网络，网络之间完全隔离。公网服务器只是 Node 的一种部署方式，可以作为成员加入网络，也可以只当公共入口。
+- bot 定义和共享聊天历史独立于本机 SDK 缓存。创建 bot 不会启动模型。
+- 写操作结果未知时先核对实际结果，不换 ID 或设备重发。
+- 数据目录带数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。同一网络里的节点使用同一版本。
 
-数据目录带有数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。个人网络中的节点使用同一版本。
+## 🚀 快速开始
 
-## 安装与开始
+### 前置条件
 
-主程序是 Rust 二进制 CLI `vibeface`，支持 macOS Apple Silicon、Linux x64 和 Linux ARM64（glibc）。npm 安装入口需要 Node.js 22+，网页仍由 Rust 程序提供。
+| 依赖 | 版本 | 用途 |
+|---|---|---|
+| macOS Apple Silicon、Linux x64 或 Linux ARM64（glibc） | | 运行平台 |
+| Node.js | 22+ | 仅 npm 安装入口需要 |
+| Codex CLI | 已安装并登录 | Codex bot 与执行任务 |
+| [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.0.37) | v1.0.37 | 可选，用 Cursor 作为协调 Agent 时需要 |
 
-npm Nightly 分发已配置，包尚未公开发布。首次发布后使用：
+### 安装
+
+npm Nightly 分发已配置，包尚未公开发布。首次发布后可以这样安装：
 
 ```sh
 npm install -g @leaperone/vibeface@nightly
 vibeface --version
 ```
 
-npm 包包含完整平台程序和服务脚本，不通过 postinstall 下载程序，不初始化身份或启动服务。发布前可从 PR 的 CI 下载 `.tgz`，在隔离 prefix 中安装验收。当前尚无正式版，GitHub 完整包安装入口见 [安装说明](docs/install.md)。
+npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载、初始化或启动服务。在此之前，可从 [Releases](https://github.com/leaperone/vibeface/releases) 下载 GitHub 完整包，步骤见 [安装说明](docs/install.md)。
 
-安装后直接启动：
+### 首次启动
 
 ```sh
 vibeface
 ```
 
-首次运行仅在不存在或为空的数据目录中初始化，默认使用 `~/.vibeface` 并监听 `127.0.0.1:4790`，不授予执行目录或启用管理 Agent。同一数据格式的节点重启保留原身份和配置。npm 安装由 npm 更新；后台节点先确认空闲并停止服务，再更新、重启和核对状态。GitHub 受管安装仍使用 `vibeface update apply`。安装、更新与 CLI 管理见 [安装说明](docs/install.md)。
+首次运行会在 `~/.vibeface` 初始化数据目录，并监听 `127.0.0.1:4790`。然后：
 
-## 从源码开始
+1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
+2. 填写浏览器名称和恢复包口令，下载并保存加密恢复包，创建个人网络。
+3. 在设备页的 **AI** 中打开 Codex 或 Cursor 的 Bot 开关，在 **可用文件夹** 里添加项目目录。
+4. 创建 bot，进入它的聊天开始提要求。
 
-从源码构建需要 Rust 1.91+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。运行任务前，安装并登录需要的 SDK 和 Codex CLI。
+### 配置
+
+日常配置都在网页里完成。也可以在初始化时用参数写入 `~/.vibeface/config.json`：
+
+```sh
+vibeface init \
+	--data-dir "$HOME/.vibeface" \
+	--root /absolute/path/to/projects \
+	--manager codex_sdk \
+	--workspace /absolute/path/to/manager-workspace
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--root` | 允许 Agent 访问的项目目录，可重复。 |
+| `--manager` | 协调 Agent 的 SDK，取值 `codex_sdk` 或 `cursor_sdk`。 |
+| `--workspace` | 协调 Agent 的工作目录，须与项目目录分开。 |
+| `--model` | 模型名。省略时 Codex 用自身默认配置，Cursor 默认 `auto`。 |
+| `--listen` | 监听地址，默认 `127.0.0.1:4790`。 |
+| `--relay` / `--relay-listen` | 连接其他 Node 的 relay，或在本机运行 relay。 |
+| `--public-entry` | 只做公共入口（网页、relay、密文转发），不加入网络。 |
+
+使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。全部字段见 [本机配置](docs/node-protocol.md#本机配置)。
+
+## 📖 使用指南
+
+### 添加另一台设备
+
+在新设备上初始化后加入网络：
+
+```sh
+vibeface init
+vibeface join '<加入链接>'
+```
+
+加入链接由管理设备的 **添加设备** 生成。终端会显示 6 位安全码，在管理设备上核对一致后批准。不要在新设备上另建个人网络。详见 [添加自己的设备](docs/node.md#添加自己的设备)。
+
+### 跨设备派活与接续
+
+- 在 A 的 bot 聊天里让它把任务交给 B。进度和结果会回到原聊天，协调 Agent 汇报后可继续派发。
+- A 离线时，在已同步的 C 打开同一会话，点 **交给这台设备处理**，由 C 的协调 Agent 接着回复。
+- 普通进度和通知不调用模型。客户端离线时保留未读通知，重连后补发。
+- Codex 默认 bypass。它发起的请求由协调 Agent 处理，需要本人拍板时才在 bot 聊天里提问，也可经 webhook 转发给 Grok Bot。
+
+### 常用命令
+
+| 命令 | 作用 |
+|---|---|
+| `vibeface` | 用默认数据目录初始化（如需要）并启动节点。 |
+| `vibeface serve` | 按已有配置启动节点。 |
+| `vibeface status` | 通过本机维护 socket 检查节点状态。 |
+| `vibeface access` | 显示本机浏览器入口。 |
+| `vibeface service` | 管理后台服务与更新定时器。 |
+| `vibeface update` | 选择更新渠道、检查或应用受管更新。 |
+| `vibeface hooks` | 安装、移除或测试 Codex 与 Claude Code hooks。 |
+| `vibeface logs` | 读取本机 Node 日志。 |
+
+完整说明运行 `vibeface --help`，或见 [安装与 CLI 管理](docs/install.md)。
+
+### 公网部署
+
+有公网地址的机器（例如 PVE）有两种用法。用 `init --public-entry` 运行公共入口，家里的 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
+
+## 🛠️ 从源码构建
+
+需要 Rust 1.91+、Node.js 22.12+、pnpm 11.9.0 和 wasm-bindgen-cli 0.2.129。
 
 ```sh
 rustup target add wasm32-unknown-unknown
@@ -61,40 +168,67 @@ cargo build --release -p vibeface --locked
 ./target/release/vibeface serve --data-dir "$HOME/.vibeface"
 ```
 
-`init` 要求数据目录为空或不存在，默认是 `$HOME/.vibeface`。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和单一 `node.sqlite3`，设备授权与业务记录使用同一个 Store。数据格式 epoch 为 1，数据库 `user_version` 为 1。运行时日志写在同一目录的 `node.log`。不注册网站账号，也不保存个人根私钥。`serve` 和 `join` 用目录锁独占该目录。
+`init` 要求数据目录为空或不存在。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和 `node.sqlite3`，运行日志写在 `node.log`。`serve` 和 `join` 用目录锁独占数据目录。
 
-在本机可信浏览器打开 `http://localhost:4790`，填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络。初始化材料由本机页面自动取得，无需运行 `access` 或复制邀请。已有网络的节点不会因浏览器未授权而另建网络；新浏览器可使用本机自动访问，永久成员授权仍需成员邀请或恢复包。`vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。
+`bash scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，输出到 `.artifacts/packages/`。
 
-保存密钥的页面需要安全上下文，推荐固定使用 `http://localhost:4790`。网络建立后，默认开启的本机自动访问可通过独立回环入口建立本机会话，不必重复配对；可在网页或 `config.json` 关闭。本机会话可配置本机 Agent 和项目目录，个人网络成员管理仍要求签名管理身份。公网访问验证设备身份。创建机器人后进入它的长期聊天，设备、连接和恢复放在设置中。聊天调度需要另外配置 [管理 Agent](docs/node.md#配置管理-agent)。启用 Codex SDK 时可启动私有 App Server；网页可用不代表 Codex 已安装、登录或模型可用。
+## 📁 目录结构
 
-Node 之间经 iroh QUIC 互连。有公网地址的机器（例如 PVE）有两种用法：用 `init --public-entry` 运行公共入口，家里的 Node 用 `--entry` 和入口令牌指向它，入口不加入网络；或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。浏览器可经任意一个入口访问其他设备。见 [配置公共入口](docs/node.md#配置公共入口)、[Node 之间的连接](docs/node.md#node-之间的连接) 和 [多个访问地址](docs/node.md#多个访问地址)。
+```text
+.
+├── crates/
+│   ├── node/        # vibeface 主程序：CLI、Node 运行时、存储、同步、调度
+│   │   └── web/     # React + TanStack Start 网页，构建后内嵌进二进制
+│   ├── bridge/      # Codex App Server 与 Agent 客户端
+│   ├── protocol/    # 共享 RPC 与消息类型
+│   └── secure/      # 设备签名、成员关系、浏览器到 Node 的 Noise 通道（含 wasm 构建）
+├── npm/             # npm 分发包
+├── scripts/         # 网页构建、打包、CI 与验收脚本
+├── docs/            # 用户文档、协议参考与设计文档
+└── install.sh       # GitHub 完整包安装脚本
+```
 
-另一台 Node 用 `vibeface init` 初始化后，执行 `vibeface join <加入链接>`。链接由管理设备的**添加设备**生成，终端显示 6 位安全码，在管理设备上核对一致后批准。Node 入网不授予浏览器管理权限；进入本机工作区可使用本机自动访问，管理网络成员须用加入链接或恢复包取得签名授权。不要用新建个人网络代替加入。操作步骤见 [添加自己的设备](docs/node.md#添加自己的设备)。
+## 🗺️ 路线图
 
-## 接续工作与通知
+已实现：
 
-A 把任务派发到 B 后，任务、进度、审批和结果写进签名日志并同步到每台 Node。A 离线时，可以在已同步的 C 打开同一会话，点**交给这台设备处理**，由 C 的管理 Agent 接着回复，已经执行过的工作不会重放。
+- [x] 统一 Node、iroh 网络、签名事件 DAG 同步与身份（[设计](docs/design/unified-network.md)）
+- [x] 网页配置本机 Provider，Codex 与 Cursor 协调 Agent
+- [x] 公共入口、relay、本机自动访问、恢复包
 
-普通进度和通知不调用管理模型。B 完成后保存结果和通知，通过可达节点同步到当前入口；客户端离线时保留未读通知，重连后补发。浏览器关闭后的系统推送不在当前范围内。
+实施中：
 
-结果回到聊天后，协调 Agent 以完整权限汇报，可以继续派发工作。一次 Codex turn 结束不等于用户目标已经达成。Codex 默认 bypass，它发起的请求由协调 Agent 处理，需要本人拍板时才在负责该会话的 Bot 聊天里提问，也可经 webhook 转发 Grok Bot。写操作结果未知时，在原聊天中核查实际结果，不换一个 ID 或设备重新派发。
+- [ ] 协调 Agent 直连 App Server 与本机会话分诊（[设计](docs/design/agent-direct-app-server.md)）
+- [ ] 在聊天中修改 bot 配置与共用 skill 库（[设计](docs/design/bot-config.md)）
+- [ ] 提醒、联网、记忆、bot 互发消息与 bot 管理（[设计](docs/design/agent-capabilities.md)）
+- [ ] 聊天里的提问与回答（[设计](docs/design/questions-in-chat.md)）
 
-## 安装、协议与验证
+当前不在范围内：原生手机 App、浏览器关闭后的系统推送。
 
-- [首次安装与 CLI 管理](docs/install.md) 包括 npm Nightly、GitHub 完整包、初始化、状态和后台服务命令。
-- [部署与使用 Node](docs/node.md) 包括局域网、公共入口、relay、SDK、后台运行和制品安装。
-- [Node 协议参考](docs/node-protocol.md) 包括配置、HTTP 与浏览器通道、业务 RPC、事件 DAG、写入保护和 iroh 传输。
-- [排障](docs/troubleshooting.md) 说明 `status`、`node.log`、诊断包，以及只读和分叉的处理。
-- [构建与发布](docs/releasing.md) 说明 Linux x64（`x86_64-unknown-linux-gnu`）、Linux ARM64（`aarch64-unknown-linux-gnu`）和 macOS Apple Silicon（`aarch64-apple-darwin`）三个包、SHA256、Stable 与 Nightly 更新渠道，以及 stable/nightly/rc tag 规则。PR 与 `main` 的 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 只生成 Actions 制品；公开版本见 [Releases](https://github.com/leaperone/vibeface/releases)，nightly 与 rc 为预发布。
-- [选择更新渠道](docs/node.md#选择更新渠道) 适用于 GitHub 受管安装，可开启空闲时的后台升级；npm 安装由 npm 更新。
-- `scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，默认输出到 `.artifacts/packages/`。
+## 📚 文档
 
-可在仓库根目录运行对应检查。命令本身不代表本次提交已经通过，实际结果以 PR 的验证记录为准。
+| 文档 | 内容 |
+|---|---|
+| [安装说明](docs/install.md) | npm Nightly、GitHub 完整包、初始化、状态和后台服务。 |
+| [部署与使用 Node](docs/node.md) | 局域网、公共入口、relay、SDK、后台运行、更新渠道、备份恢复。 |
+| [Node 协议参考](docs/node-protocol.md) | 配置、HTTP 与浏览器通道、业务 RPC、事件 DAG、写入保护、iroh 传输。 |
+| [排障](docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
+| [构建与发布](docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
+| [CI](docs/ci.md) | PR 核心检查与本地专项检查。 |
+
+## 🤝 参与贡献
+
+- **报告问题**：在 [Issues](https://github.com/leaperone/vibeface/issues) 附上 `vibeface --version`、平台和 `vibeface status` 输出。诊断方法见 [排障](docs/troubleshooting.md)。请勿粘贴密钥或恢复包。
+- **提交 PR**：从 `main` 拉独立分支，使用 Conventional Commits。PR 由 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 执行核心检查。改动同步、恢复、调度或工具执行时，按 [docs/ci.md](docs/ci.md) 补跑本地专项并在 PR 中记录结果。
+
+提交前可在仓库根目录运行：
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-当前没有原生手机 App。模型额度和计费由各 Provider 决定，每日决策次数限制不是 token 或费用上限。
+## 📄 License
+
+仓库尚未包含 LICENSE 文件，开源协议待定。在协议确定前，代码默认保留所有权利。
