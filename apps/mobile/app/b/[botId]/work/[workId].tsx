@@ -47,10 +47,10 @@ export default function TaskDetail() {
       </View>
       {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}
       {!progress?.text && work.summary && active ? <Text selectable className="mt-2">{work.summary}</Text> : null}
+      {progress?.text ? <ScrollView nestedScrollEnabled className="mt-3 max-h-96 rounded-xl bg-muted" contentContainerClassName="p-3">
+        <Text selectable className="font-mono text-meta">{progress.text}</Text>
+      </ScrollView> : null}
     </View>
-    {progress?.text ? <ScrollView nestedScrollEnabled className="max-h-96 rounded-xl bg-muted" contentContainerClassName="p-3">
-      <Text selectable className="font-mono text-meta">{progress.text}</Text>
-    </ScrollView> : null}
     {result && !active ? <Section title="结果"><Text selectable>{result}</Text></Section> : null}
     {state === 'awaiting_confirmation' ? <Text className="text-muted-foreground">
       {confirmText({ reason: confirmReason(work, shared.nodes) ?? 'unverified', detail: work.failure_reason ?? '' }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。
@@ -60,7 +60,7 @@ export default function TaskDetail() {
         <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
       </View>)}
     </Section> : null}
-    {canStop ? <ActionButton variant="destructive" className="min-h-11 self-start" icon={Square} iconClassName="fill-white" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
+    {canStop ? <ActionButton variant="outline" className="min-h-11 self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
     {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="min-h-11 self-start" icon={RotateCw} disabled={!shared.writable}

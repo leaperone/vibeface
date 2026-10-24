@@ -45,9 +45,10 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} />
         </Button>
-        {onStop
-          ? <Button variant="outline" size="icon" className="size-11 rounded-full" accessibilityLabel="停止" onPress={onStop}><Icon as={Square} className="size-4 fill-foreground" /></Button>
-          : <Button size="icon" variant={canSend ? 'default' : 'secondary'} className="size-11 rounded-full" accessibilityLabel="发送" disabled={!canSend} onPress={() => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() }}><Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} /></Button>}
+        <Button size="icon" variant={onStop ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full" accessibilityLabel={onStop ? '停止' : '发送'} disabled={!onStop && !canSend}
+          onPress={onStop ?? (() => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
+          {onStop ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} />}
+        </Button>
       </View>
     </View>
     {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}

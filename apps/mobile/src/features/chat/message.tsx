@@ -23,7 +23,7 @@ export function Message({ message, last }: { message: ChatMessage; last: boolean
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const entering = message.created_at_ms > Date.now() - 2000 ? FadeInDown.duration(220).reduceMotion(ReduceMotion.System) : undefined
-  const time = last && message.created_at_ms ? <Text className="text-meta text-muted-foreground">{shortTime(message.created_at_ms)}</Text> : null
+  const time = last && message.created_at_ms ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shortTime(message.created_at_ms)}</Text> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
     <View className="rounded-3xl bg-muted px-4 py-2.5">
       <Text selectable>{message.text}</Text>

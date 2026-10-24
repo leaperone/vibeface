@@ -89,7 +89,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
       <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
         <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted-foreground')} />
         <View className="min-w-0 flex-1">
-          <Text numberOfLines={1} className="text-meta text-muted-foreground">{title}</Text>
+          <Text numberOfLines={1} className="text-meta text-foreground">{title}</Text>
           {meta}
           {result ? <Text className="text-meta text-muted-foreground">{result}</Text> : null}
         </View>

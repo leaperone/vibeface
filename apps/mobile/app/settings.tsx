@@ -24,12 +24,13 @@ export default function Settings() {
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
+  const { fontScale } = useWindowDimensions()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      <View accessibilityRole="radiogroup" className="flex-row flex-wrap gap-1 self-start rounded-lg bg-muted p-1">
+      <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', fontScale >= 1.3 ? 'self-stretch' : 'flex-row self-start')}>
         {themes.map(([value, label]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: current === value }}
-          variant={current === value ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { void Haptics.selectionAsync(); Uniwind.setTheme(value) }}><Text>{label}</Text></Button>)}
+          variant={current === value ? 'outline' : 'ghost'} className={cn('min-h-11', fontScale >= 1.3 && 'justify-start')} onPress={() => { void Haptics.selectionAsync(); Uniwind.setTheme(value) }}><Text>{label}</Text></Button>)}
       </View>
     </Section>
     <Section icon={Globe} title="连接">

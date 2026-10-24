@@ -4,10 +4,10 @@ import { Bot, LoaderCircle } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
-import Animated, { useAnimatedStyle } from 'react-native-reanimated'
+import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { useUniwind } from 'uniwind'
-import { EmptyState } from '@/components/kit'
+import { useUniwind, withUniwind } from 'uniwind'
+import { EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -28,6 +28,8 @@ type Entry = { key: string; message: ChatMessage; last: boolean } | (Row & { att
  * Questions sit right before the first message written after them, tasks and changes right after the message that caused
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
+const Fade = withUniwind(Animated.View)
+
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
   const rows: Entry[] = []
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
@@ -45,7 +47,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): 
   rows.push(...extras.rest)
   if (chat.replying && !chat.messages.some((message) => message.state === 'streaming')) rows.push({
     key: 'activity',
-    node: <View accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><Icon as={LoaderCircle} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{chat.status ?? '思考中'}</Text></View>,
+    node: <Fade entering={FadeIn.duration(150).reduceMotion(ReduceMotion.System)} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><Icon as={LoaderCircle} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{chat.status ?? '思考中'}</Text></Fade>,
   })
   if (extras.cards.length) rows.push({ key: 'waiting-on-you', node: <View className="gap-3">{extras.cards}</View> })
   return rows.reverse()
@@ -118,7 +120,7 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <Icon as={Bot} className="size-8 text-muted-foreground" />
+        <Monogram name={bot.name} seed={bot.bot_id} />
         <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}

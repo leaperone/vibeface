@@ -26,7 +26,7 @@ export default function Home() {
       </Link>,
     }} />
     <Row href="/inbox" avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : '没有要你决定的事'} />
-    <View className="flex-row items-center justify-between ps-3 pt-2">
+    <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">bot</Text>
       <Link href="/new-bot" asChild>
         <Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="新建 bot" disabled={!canCreate}><Icon as={Plus} /></Button>
