@@ -24,8 +24,11 @@ type Reconnect = { entry: ConnectionEntry; networkId: string; attempt: number }
 type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
 /** This browser's own recovery as its Node last told: waiting until `effectiveAt` on this browser's clock, or stopped. */
 type RecoveryWait = { status: 'waiting'; effectiveAt: number | null } | { status: 'stopped' }
-/** What this browser keeps of a recovery it sent, to ask the Node how it stands and to trust the directory once it took effect. */
-type WaitRecord = { entry: ConnectionEntry; networkId: string; genesis: unknown; checkpoint: unknown }
+/**
+ * What this browser keeps of a recovery it sent, to ask the Node how it stands and to trust the directory once it took
+ * effect: `rootKey` is the key of the file it was sent with; `checkpoint`, when known, is the recovery itself.
+ */
+type WaitRecord = { entry: ConnectionEntry; networkId: string; genesis: unknown; rootKey: string; checkpoint?: unknown }
 /**
  * This device's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
  * network, manager and manager nonce seen before the reveal; the short code uses only these.
@@ -148,7 +151,10 @@ function deviceStore(storage: KeyValue, self: string) {
   function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
   const loadEntrances = (networkId: string): Entrance[] => { const value = load(`entrances.${networkId}`); return Array.isArray(value) ? value as Entrance[] : [] }
   function loadWait(): WaitRecord | null {
-    try { const v = record(load('recovery-wait')); return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId), genesis: record(v.genesis), checkpoint: record(v.checkpoint) } } catch { return null }
+    try {
+      const v = record(load('recovery-wait'))
+      return { entry: parseEntry(v.entry), networkId: validTarget(v.networkId), genesis: record(v.genesis), rootKey: validTarget(v.rootKey), checkpoint: v.checkpoint === undefined ? undefined : record(v.checkpoint) }
+    } catch { return null }
   }
   return { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadWait }
 }
@@ -865,7 +871,12 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         const expires = Date.now() + 60_000
         const proof = `{"device_id":"${me}","expires_at_ms":${expires},"network_id":"${opened.networkId}"}`
         const signature = opened.root.sign('identity-recovery-read', new TextEncoder().encode(proof))
-        const read = record(await request('recovery_state', { expires_at_ms: expires, signature, checkpoints: opened.material.checkpoints, events: opened.material.events }))
+        let read: Record<string, unknown>
+        try { read = record(await request('recovery_state', { expires_at_ms: expires, signature, checkpoints: opened.material.checkpoints, events: opened.material.events })) }
+        catch (cause) {
+          if (!(cause instanceof Error && /another recovery is waiting/i.test(cause.message)) || !await resumeWait(active, opened, password)) throw cause
+          release(); return
+        }
         state = read.state; heads = read.heads; offset = (nodeNow(read) ?? Date.now()) - Date.now()
       }
       if (session.current !== active || active.generation !== generation.current) throw changed()
@@ -904,7 +915,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
             } finally { next.free(); verified?.free() }
             password = ''
           }
-          const wait: WaitRecord = { entry: active.entry, networkId: opened.networkId, genesis, checkpoint: prepared.checkpoint }
+          const wait: WaitRecord = { entry: active.entry, networkId: opened.networkId, genesis, rootKey: view.recovery_key, checkpoint: prepared.checkpoint }
           store('recovery-wait', wait)
           let auth: Record<string, unknown>
           try { auth = record(await request('recover', { genesis, checkpoints: prepared.checkpoints, events, ...(fresh ? { capability } : {}) })) }
@@ -921,6 +932,30 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       setReview({ kind: 'recovery', networkId: opened.networkId, members, newManager, requiredNode: active.entry.device_id })
     } catch (cause) { release(); throw cause }
   }
+  /**
+   * Picks up a recovery this browser sent but lost its record of. The Node refused to read for this file's key because
+   * a recovery it signed is waiting; when that one names this browser as a manager, this browser goes back to waiting
+   * on it. A new file still kept in this tab, under the same password, names the exact recovery.
+   */
+  async function resumeWait(active: Session, opened: Awaited<ReturnType<typeof openPackage>>, password: string) {
+    const auth = record(await scoped(active)('authenticate', { network_id: opened.networkId }))
+    if (session.current !== active || auth.principal !== null || !auth.recovery || record(auth.recovery).status !== 'waiting') return false
+    let checkpoint: unknown
+    const file = kept.current
+    if (file) {
+      try {
+        const next = await openPackage({ size: file.bytes.length, text: async () => new TextDecoder().decode(file.bytes) }, password)
+        try {
+          const last = array(next.material.checkpoints).at(-1)
+          if (next.networkId === opened.networkId && last && record(last).recovery_key === next.root.deviceId()) checkpoint = last
+        } finally { next.release() }
+      } catch {}
+    }
+    if (session.current !== active) throw changed()
+    store('recovery-wait', { entry: active.entry, networkId: opened.networkId, genesis: opened.material.genesis, rootKey: opened.root.deviceId(), checkpoint } satisfies WaitRecord)
+    resetConnection(); noteRecovery(auth)
+    return true
+  }
   /** Where this browser's recovery stands, as a Node that does not count it a member yet answered. */
   function noteRecovery(auth: Record<string, unknown>) {
     const status = auth.recovery ? record(auth.recovery) : null
@@ -932,7 +967,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const view = await authenticate(auth, active, { kind: 'root', networkId: wait.networkId, genesis: wait.genesis, checkpoint: wait.checkpoint })
     dismissRecovery()
     // Still a member of the directory in effect, it follows the wait on the card every manager sees.
-    if (view.recovery_key !== record(wait.checkpoint).recovery_key) return
+    if (wait.checkpoint === undefined ? view.recovery_key === wait.rootKey : view.recovery_key !== record(wait.checkpoint).recovery_key) return
     try { store('recovered', true) } catch {}
     setRecovered(true)
   }

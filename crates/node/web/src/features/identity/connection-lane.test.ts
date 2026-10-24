@@ -584,6 +584,35 @@ test('a recovery that has to wait is remembered across a reload until a device s
   } finally { reloaded.close() }
 })
 
+test('the same file brings a browser that lost its wait record back to the wait', async () => {
+  const storage = new Map<string, string>(), app = deviceHarness({ storage }), refused = deferred(), waiting = deferred()
+  refused.promise.catch(() => {}); refused.reject(new Error('another recovery is waiting to take effect'))
+  waiting.resolve({ ...notMember, recovery: { status: 'waiting', effective_at_ms: 1000 + 48 * 3_600_000 }, now_ms: 1000 })
+  app.holds.set('recovery_state', refused); app.holds.set('authenticate', waiting)
+  try {
+    app.render(); await settle()
+    await app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry })
+    assert.equal(app.render().review, null)
+    assert.equal(app.render().recovery?.status, 'waiting')
+    assert.equal(app.released(), 1, 'the file is closed again')
+    const wait = JSON.parse(storage.get('vibeface.recovery-wait') ?? 'null')
+    assert.equal(wait?.rootKey, network)
+    assert.equal(app.calls.includes('recover'), false, 'nothing is sent again')
+  } finally { app.close() }
+})
+
+test('a file whose waiting recovery does not name this browser still reports the wait', async () => {
+  const app = deviceHarness({}), refused = deferred(), other = deferred()
+  refused.promise.catch(() => {}); refused.reject(new Error('another recovery is waiting to take effect'))
+  other.resolve({ ...notMember, recovery: null, now_ms: 1000 })
+  app.holds.set('recovery_state', refused); app.holds.set('authenticate', other)
+  try {
+    app.render(); await settle()
+    await assert.rejects(app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry }), /another recovery is waiting/)
+    assert.equal(app.render().recovery, null)
+  } finally { app.close() }
+})
+
 test('a local browser reuses its cookie-bound identity and can disable its own automatic access', async () => {
   const app = deviceHarness({ localSession: true })
   try {
