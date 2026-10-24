@@ -157,7 +157,6 @@ pub(crate) fn apply(
                     message_id,
                     hash,
                     rank,
-                    // A person's message is wrapped by the entry Node; the device that signed it wrote it.
                     event.body.attestation().map_or(event.author.as_str(), |attestation| attestation.device_id.as_str()),
                     text(role)?,
                     body,
@@ -234,7 +233,6 @@ pub(crate) fn apply(
             {
                 return Ok(());
             }
-            // A proven outcome beats an unverified one, and both beat an abandonment, in any order.
             let precedence = match outcome {
                 WorkOutcome::Unverified => 1,
                 WorkOutcome::Abandoned => 2,
@@ -272,8 +270,8 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO questions(network_id,question_id,conversation_id,event_hash,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
-                params![network, question_id, scope, hash, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
+                "INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
+                params![network, question_id, scope, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
             )?;
             notify(connection, network, hash, scope, "question", question, rank)?;
         }
@@ -395,8 +393,8 @@ pub(crate) fn apply(
         }
         EventBody::BotDeleted { .. } => {
             connection.execute(
-                "INSERT INTO bot_deletions(network_id,conversation_id,event_hash,rank) VALUES(?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank WHERE excluded.rank<rank",
-                params![network, scope, hash, rank],
+                "INSERT OR IGNORE INTO bot_deletions(network_id,conversation_id) VALUES(?,?)",
+                params![network, scope],
             )?;
         }
         EventBody::ScheduleControlled {

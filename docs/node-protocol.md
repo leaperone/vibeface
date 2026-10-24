@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=1`，数据库 `user_version=1`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。设计依据见 [统一网络设计](design/unified-network.md)。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=2`，数据库 `user_version=2`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -69,8 +69,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":1}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=1` |
+| `data-epoch.json` | `{"data_epoch":2}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=2` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -291,7 +291,7 @@ Event {
 
 入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
 
-`effective` 标记事件是否计入投影，只由签名证据决定：作者从分叉序号起两支都不计入；当前成员 Node 计入此前的主分支事件；被撤销设备计入不超过上限的事件，分叉后沿 `cutoff_hash` 往回的那一支也计入。依赖只决定顺序，不传递是否计入。成员目录变化或分叉证据到达时，同一事务内重新计算 `effective`，有变化时清空并按顺序重放 reducer 写的投影表，本机账本不变，不重放副作用，然后推送一条不带会话的 `changed`。详见 [统一网络设计](design/unified-network.md#55-入库与投影)。
+`effective` 标记事件是否计入投影，只由签名证据决定：作者从分叉序号起两支都不计入；当前成员 Node 计入此前的主分支事件；被撤销设备计入不超过上限的事件，分叉后沿 `cutoff_hash` 往回的那一支也计入。依赖只决定顺序，不传递是否计入。成员目录变化或分叉证据到达时，同一事务内重新计算 `effective`，有变化时清空并按顺序重放 reducer 写的投影表，本机账本不变，不重放副作用，然后推送一条不带会话的 `changed`。
 
 入库时计算 `lamport = 1 + max(prev, deps 的 lamport)`，读取顺序为 `(lamport, created_at_ms, hash)`。投影由 reducer 对每个事件增量执行一次：同一 `message_id` 取因果最早者；`ConversationOwner` 取 `epoch` 最大者；工作状态只前进。负责人同级再相同时取请求身份较小者，请求身份为 `SHA256(attestation 签名输入 ‖ 签名设备)`。同一份已签名请求经不同入口重试时请求身份相同，外层事件 hash 不参与仲裁，重试不会改变结果。
 

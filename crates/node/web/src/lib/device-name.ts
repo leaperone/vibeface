@@ -1,6 +1,6 @@
 // Suggested names from the user agent; the person can always edit them.
 const ua = () => typeof navigator === 'undefined' ? '' : navigator.userAgent
-export function platform() {
+function platform() {
   const value = ua()
   return /iPhone/.test(value) ? 'iPhone' : /iPad/.test(value) ? 'iPad' : /Android/.test(value) ? 'Android' : /Mac/.test(value) ? 'Mac' : /Windows/.test(value) ? 'Windows' : /Linux/.test(value) ? 'Linux' : '电脑'
 }

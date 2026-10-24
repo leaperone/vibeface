@@ -19,9 +19,9 @@ export type ReadyConnection = {
   catchingUp?(): boolean
 }
 export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
-export type Revocation = { device_id: string; cutoff_seq: number; cutoff_hash: string | null }
+type Revocation = { device_id: string; cutoff_seq: number; cutoff_hash: string | null }
 export type MembershipView = { network_id: string; epoch: number; recovery_key: string; heads: string[]; members: Member[]; revoked: Revocation[]; attesters: string[] }
-export type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn' | 'expired'
+type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn' | 'expired'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
@@ -32,7 +32,7 @@ export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace:
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor'
 export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor' }
-export type ProviderRole = 'agent' | 'execution'
+type ProviderRole = 'agent' | 'execution'
 export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
   | { code: 'app_server_not_found' } | { code: 'app_server_unreachable'; detail: string }
 /** The Codex App Server as the device sees it, live or from a fresh handshake. */
@@ -68,8 +68,8 @@ export function text(value: unknown, label = '文本'): string {
   return value
 }
 export function boolean(value: unknown): boolean { if (typeof value !== 'boolean') throw new Error('设备返回的状态格式无效。'); return value }
-export function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
-export function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
+function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
+function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
@@ -90,7 +90,7 @@ export function parseInfo(value: unknown): EntryInfo {
     ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }),
   }
 }
-export function parseMember(value: unknown): Member {
+function parseMember(value: unknown): Member {
   const v = record(value)
   if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
   const member: Member = { device_id: validTarget(v.device_id), kind: v.kind, name: text(v.name), manage: boolean(v.manage) }
@@ -208,7 +208,7 @@ function parseProvider(value: unknown): ProviderStatus {
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
   }
 }
-export function canonical(value: unknown): string {
+function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`

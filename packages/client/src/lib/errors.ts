@@ -1,5 +1,5 @@
 /**
- * The one place backend and protocol errors become words a person reads (docs/design/web-ux.md 4.7).
+ * The one place backend and protocol errors become words a person reads (docs/design/web-ux.md).
  * Nodes answer in English; the page never shows that text as the message, only under 详细信息.
  */
 const codes: Record<string, string> = {

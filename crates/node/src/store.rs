@@ -271,13 +271,6 @@ impl Store {
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
     }
-    /// A write signed by a device this network has admitted and not revoked.
-    pub fn authorize_attestation(&self, network_id: &str, body: &EventBody) -> Result<()> {
-        if let Some(attestation) = body.attestation() {
-            membership_from(&self.connection, network_id)?.client(&attestation.device_id)?;
-        }
-        Ok(())
-    }
     /// Stores each event or reports why not; one bad event never aborts the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards. Also returns
     /// whether the batch changed which events count and so rebuilt the projections.

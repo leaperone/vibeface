@@ -660,7 +660,6 @@ fn resolve(
                 }
                 None => (format!("schedule-{digest}"), None),
             };
-            // What the user asks for starts a new chain.
             let after = Schedule {
                 name,
                 prompt,

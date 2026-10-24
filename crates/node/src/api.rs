@@ -1125,7 +1125,6 @@ mod tests {
                     LOG => json!({"source":"node","records":[]}),
                     _ => event,
                 };
-                // Passes the boundary; this Node has no network yet.
                 assert_eq!(
                     status(client.post(&url).json(&body)).await?,
                     StatusCode::BAD_REQUEST

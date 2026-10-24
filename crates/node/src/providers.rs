@@ -275,8 +275,6 @@ impl Local {
 mod tests {
     use super::*;
 
-    /// The system App Server stays one server wherever its socket is; the Node's own is another,
-    /// told apart by the Codex home that keeps its threads.
     #[test]
     fn threads_belong_to_the_app_server_that_keeps_them() {
         let own = |home: Option<&str>| {

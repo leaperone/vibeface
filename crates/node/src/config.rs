@@ -7,11 +7,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 1;
+pub const DATA_EPOCH: u32 = 2;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "42439878eead97bcf16927648a90ff7f064d6fe6fe91b7c417ae8bbb93cf51d3";
+    "ecb4dc0c26094fa76ae457870c9d4603e5e0825438d847e54ab533035701f24a";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 /// The name a removed Node had, which its fresh data directory offers when it joins again.

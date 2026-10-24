@@ -27,16 +27,16 @@ type AuthenticatedEntry = Pick<Reconnect, 'entry' | 'networkId'>
  * This device's own join request; `nonce` stays here until the manager has committed its nonce. `pinned` holds the
  * network, manager and manager nonce seen before the reveal; the short code uses only these.
  */
-export type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
+type Joining = { entry: ConnectionEntry; join_id: string; invite_id: string; nonce: string; name: string; status: JoinRequest['status']; pinned?: JoinPin; code?: string; reason?: string | null }
 type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 /** This computer's own join, as the Node reports it while the manager approves. */
-export type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
+type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
 /** A fresh invitation; `publicEntry`: a phone's camera can open `link`, otherwise the Vibeface app scans `ticket`. */
 export type Invitation = { link: string; ticket: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
-export type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
+type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
 type DeviceContextValue = {
   connectionGeneration(): number

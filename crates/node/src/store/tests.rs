@@ -35,7 +35,6 @@ fn store(net: &Net) -> Result<Store> {
     Ok(store)
 }
 
-/// A user message in conversation `c`, signed by the network's client device.
 fn user(net: &Net, id: &str, text: &str) -> EventBody {
     net.a
         .fixture_admin()
@@ -81,7 +80,6 @@ fn projection(store: &Store, net: &Net, scope: &str) -> Result<Projection> {
     Ok((messages, order, store.conversation(&net.network, scope)?))
 }
 
-/// Two devices write concurrently; any interleaving of their logs converges to the same projections.
 #[test]
 fn out_of_order_delivery_converges() -> Result<()> {
     let net = net()?;
@@ -112,7 +110,6 @@ fn out_of_order_delivery_converges() -> Result<()> {
             b_events.push(event)
         }
     }
-    // Same message_id from both devices: the earlier one in the shared order wins everywhere.
     a_events.push(origin.append_event(
         &net.a,
         &net.network,
@@ -139,7 +136,6 @@ fn out_of_order_delivery_converges() -> Result<()> {
             .all(|s| matches!(s, IngestStatus::Pending | IngestStatus::Rejected(_)))
     );
     b_first.ingest_events(&net.network, &a_events)?;
-    // Events rejected for a gap are fetched again by sync; a second pass completes the log.
     b_first.ingest_events(&net.network, &b_events)?;
     assert_eq!(projection(&b_first, &net, "c")?, expected);
 
@@ -235,8 +231,6 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     Ok(())
 }
 
-/// A device that forks its own log stops counting from the fork on, without blocking the
-/// conversation for anyone else.
 #[test]
 fn a_forked_log_stops_counting_and_the_conversation_stays_appendable() -> Result<()> {
     let net = net()?;
@@ -371,8 +365,6 @@ fn conversation(store: &mut Store, net: &Net) -> Result<()> {
     Ok(())
 }
 
-/// A signed decision that another entry Node wraps again after a failover is the same decision:
-/// whatever outer hash the retry gets, it never overturns a conflict the original lost.
 #[test]
 fn a_retried_signed_decision_never_changes_the_outcome() -> Result<()> {
     let owner = |node: &LocalIdentity| -> Result<EventBody> {
@@ -546,7 +538,6 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
-    // The Node restarts mid-turn: the reply is recorded as interrupted and the process awaits a check.
     store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
     let reply = store
         .message(&net.network, "c", &claimed.job.message_id)?
@@ -621,8 +612,6 @@ fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<(
     Ok(())
 }
 
-/// A message steers only the running reply to a user message once its App Server turn is
-/// known; it is marked before the steer and either joins (no reply of its own) or queues again.
 #[test]
 fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     let net = net()?;
@@ -651,7 +640,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         Some("turn"),
         &Default::default(),
     )?;
-    // A reply left running by an earlier process is never a target.
     assert!(
         store
             .steer_candidates(&net.network, &local, "later")?
@@ -681,7 +669,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
 
     assert!(begin(&mut store, &m2)?);
     assert!(store.steer_host_active("c", &attempt)?);
-    // The reply ends while the steer is unsettled: nothing behind the message runs first.
     store.finish_job(
         &net.a,
         &net.network,
@@ -699,7 +686,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
             .is_none()
     );
     assert!(store.scheduler_maintenance_idle().is_err());
-    // An unreadable thread keeps the message waiting with the time it was first unreadable.
     let unread = JobState::Steering {
         into: into.clone(),
         unread_since_ms: Some(7),
@@ -712,7 +698,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         outcome: SteerOutcome::Answered,
     };
     store.settle_steer(&net.a, &net.network, "c", &m2, answered.clone())?;
-    // Only an unsettled steer settles.
     store.settle_steer(&net.a, &net.network, "c", &m2, JobState::Queued)?;
     let steered = store.scheduler_job("c", &m2)?.context("job")?;
     assert_eq!(steered.state, answered);
@@ -726,7 +711,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         .context("job")?;
     assert_eq!(next.job.trigger, message_trigger("quiet"));
 
-    // Stopping a steered message stops the reply it went into.
     let attempt = next.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &next.job.trigger, &attempt)?;
     store.record_manager_turn(
@@ -762,7 +746,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
         4,
     )?;
 
-    // A conversation that moved away hands its queue on while a steer is unsettled.
     store.append_event(
         &net.a,
         &net.network,
@@ -781,7 +764,6 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     else {
         bail!("m3 is no longer steering");
     };
-    // Stopping it once its reply ended settles it as unknown instead of reaching an ended reply.
     let stopped = store
         .request_manager_cancel(&net.a, &net.network, "c", &m3)?
         .context("job")?;
@@ -888,8 +870,6 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     Ok(())
 }
 
-/// A removed target's open work is abandoned by the owner, a late real result still wins, and
-/// only the user's signature settles an unverified result.
 #[test]
 fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
     let net = net()?;
@@ -1110,8 +1090,6 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
     Ok(())
 }
 
-/// Messages past the prompt budget condense into one checkpoint covering a prefix of the shared
-/// order; the newest messages stay verbatim and a covered history needs no second checkpoint.
 #[test]
 fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
     let net = net()?;
@@ -1178,8 +1156,6 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
     Ok(())
 }
 
-/// After the user moves a conversation, a turn that never started leaves the old owner's queue
-/// for the outbox, which delivers it to the new owner by its trigger.
 #[test]
 fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     let net = net()?;
@@ -1222,8 +1198,6 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     Ok(())
 }
 
-/// A move stops the old owner's running turn: its tools lose permission at once, it is fenced
-/// for cancelling once, and moving back later does not revive it.
 #[test]
 fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
     let net = net()?;
@@ -1328,9 +1302,6 @@ fn checkpoints(store: &Store, net: &Net) -> Result<Vec<String>> {
         .collect())
 }
 
-/// A checkpoint counts when its author owned the conversation as far as it knew, whatever order
-/// the logs arrive in and whether a later move reached it; one written after the author saw the
-/// move is refused.
 #[test]
 fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
     let net = net()?;
@@ -1338,7 +1309,6 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
     conversation(&mut a_side, &net)?;
     let mut b_side = store(&net)?;
     sync(&a_side, &mut b_side, &net)?;
-    // The user moves the conversation to b and back to a, both times through b.
     b_side.append_event(
         &net.b,
         &net.network,
@@ -1373,7 +1343,6 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
     replica.ingest_events(&net.network, &b_log)?;
     assert_eq!(checkpoints(&replica, &net)?, ["back"]);
 
-    // b takes the conversation again while a, not yet aware, ends a turn with a checkpoint.
     let moved = b_side.append_event(
         &net.b,
         &net.network,
@@ -1500,7 +1469,6 @@ fn bot_projection(store: &Store, net: &Net) -> Result<Value> {
     }))
 }
 
-/// Only the user's own signed message in the same conversation can be the cause a change follows.
 #[test]
 fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     let net = net()?;
@@ -1568,7 +1536,6 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     assert_eq!(target.bots(&net.network)?[0].name, "Nova");
     assert_eq!(target.bot_changes(&net.network, "c")?.len(), 1);
 
-    // The local writer takes the cause from the trigger and refuses anything but a user message.
     for trigger in ["work:w1", "message:a1"] {
         let error = origin
             .change_bot(
@@ -1590,8 +1557,6 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     Ok(())
 }
 
-/// Chat changes from two devices converge to the same bot in any arrival order, and a
-/// retried tool call writes nothing new.
 #[test]
 fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     let net = net()?;
@@ -1669,7 +1634,6 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
         panic!("schedule change")
     };
 
-    // Device b answers a later message concurrently with a's next edits.
     origin.append_event(&net.b, &net.network, "c", user(&net, "m2", "y"), vec![], 8)?;
     change(&mut origin, &net.b, "message:m2", "r1", rename("Orion"), 9)?;
     change(
@@ -1722,15 +1686,12 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     let mut b_first = store(&net)?;
     b_first.ingest_events(&net.network, &b_events)?;
     b_first.ingest_events(&net.network, &a_events)?;
-    // Events rejected for a gap are fetched again by sync.
     b_first.ingest_events(&net.network, &b_events)?;
     assert_eq!(bot_projection(&a_first, &net)?, expected);
     assert_eq!(bot_projection(&b_first, &net)?, expected);
     Ok(())
 }
 
-/// The owner runs a schedule's latest due time once, skips the times it missed and drops a
-/// queued run once the schedule is paused.
 #[test]
 fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     let net = net()?;
@@ -1764,7 +1725,6 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
             .admit_due_schedules(&net.a, &net.network, 1_000 + 3 * every + 20)?
             .is_empty()
     );
-    // The next time waits while this run is still queued.
     assert!(
         store
             .admit_due_schedules(&net.a, &net.network, 1_000 + 4 * every)?
@@ -1830,7 +1790,6 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     Ok(())
 }
 
-/// Conversation `c` with its bot and the user's message `m1`.
 fn bot_with_message(net: &Net) -> Result<(Store, String)> {
     let mut store = store(net)?;
     conversation(&mut store, net)?;
@@ -1839,7 +1798,6 @@ fn bot_with_message(net: &Net) -> Result<(Store, String)> {
     Ok((store, m1.hash))
 }
 
-/// A second bot, in conversation `d`, scheduled by device a.
 fn second_bot(store: &mut Store, net: &Net, name: &str) -> Result<()> {
     let owner = net
         .a
@@ -1875,8 +1833,6 @@ fn all_accepted(target: &mut Store, net: &Net, source: &Store) -> Result<()> {
     Ok(())
 }
 
-/// A reminder runs at its time once; neither a restart nor a device that syncs the history
-/// runs it again.
 #[test]
 fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
     let net = net()?;
@@ -1938,7 +1894,6 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
                 .is_empty()
         );
     }
-    // A fresh store keeps no run records; the claim in the history stops a second run.
     let mut restored = store(&net)?;
     all_accepted(&mut restored, &net, &origin)?;
     assert!(
@@ -1956,7 +1911,6 @@ fn a_reminder_runs_once_and_never_again_after_restart_or_sync() -> Result<()> {
     Ok(())
 }
 
-/// Conversation `c` owned by a, with a schedule from 1000; both sides hold it.
 fn scheduled_on_both(net: &Net, every_minutes: u32) -> Result<(Store, Store, String)> {
     let mut a_side = store(net)?;
     conversation(&mut a_side, net)?;
@@ -1987,9 +1941,6 @@ fn claim_winner(store: &Store, net: &Net, schedule_id: &str, slot: i64) -> Resul
     )?)
 }
 
-/// Two owners that each claimed the same time, one not yet aware of the move, run it once:
-/// every arrival order picks the newer owner's claim, and the stale owner, owning again by
-/// the time it would run, drops its unstarted job. A time already claimed is never run again.
 #[test]
 fn a_schedule_time_runs_once_across_owners() -> Result<()> {
     let net = net()?;
@@ -2058,8 +2009,6 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
     Ok(())
 }
 
-/// A time found too late is claimed as skipped, so a new owner whose clock still sees it in
-/// time does not run it either. Only the owner claims, and at the epoch it knew.
 #[test]
 fn a_skipped_late_time_is_not_run_by_the_next_owner() -> Result<()> {
     let net = net()?;
@@ -2126,8 +2075,6 @@ fn a_skipped_late_time_is_not_run_by_the_next_owner() -> Result<()> {
     Ok(())
 }
 
-/// Reminders a bot sets itself chain at most `MAX_CHAIN_DEPTH` deep after the user's message,
-/// and a change without the user's message is accepted only as a new one-time reminder.
 #[test]
 fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
     let net = net()?;
@@ -2223,7 +2170,6 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
     Ok(())
 }
 
-/// The user's signed pause holds on every device until a resume; a deletion is final.
 #[test]
 fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> {
     let net = net()?;
@@ -2316,8 +2262,6 @@ fn a_paused_schedule_is_not_run_and_a_deleted_one_stays_deleted() -> Result<()> 
     Ok(())
 }
 
-/// A bot's message lands in the other bot's chat with its sender and wakes it once; retries
-/// write nothing, replies count hops and each bot sends a bounded number per hour.
 #[test]
 fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     let net = net()?;
@@ -2404,7 +2348,6 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     assert!(limited.to_string().contains("last hour"), "{limited}");
     assert!(send(&mut origin, "s99", "d", "one more", 3_600_020).is_ok());
 
-    // Another device stores the messages and queues nothing from them.
     let mut other = store(&net)?;
     all_accepted(&mut other, &net, &origin)?;
     assert!(other.scheduler_jobs("d")?.is_empty() && other.scheduler_jobs("c")?.is_empty());
@@ -2435,8 +2378,6 @@ fn a_bot_message_wakes_the_other_bot_once() -> Result<()> {
     Ok(())
 }
 
-/// A bot creates and configures other bots only in a turn the user's message started; every
-/// device accepts them because that signed message stands behind each event.
 #[test]
 fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
     let net = net()?;
@@ -2504,7 +2445,6 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
         Some(net.a.device_id()?)
     );
 
-    // The user's message cannot hand an existing conversation a new first owner.
     let hijack = net.b.sign_event(Event {
         version: WIRE_VERSION,
         network_id: net.network.clone(),
@@ -2548,8 +2488,6 @@ fn configure(
     }
 }
 
-/// A chat sets a bot's model and the shared skills it uses; a retry writes nothing, an
-/// unknown skill is refused and every device ends with the same bot.
 #[test]
 fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
     let net = net()?;
@@ -2615,9 +2553,6 @@ fn a_bot_model_and_skills_follow_the_users_message() -> Result<()> {
     Ok(())
 }
 
-/// The provider is device-local, so each device writes and runs the model of its own
-/// provider; a device whose provider has none runs its default, and clearing one model keeps
-/// the other.
 #[test]
 fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Result<()> {
     let net = net()?;
@@ -2677,9 +2612,6 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
     Ok(())
 }
 
-/// Deleting a bot is final on every device: it leaves the list, takes no messages, runs no
-/// schedule or queued turn, and the primary role moves on. Only the user's signature, or a
-/// tool call the user's message started, deletes; a bot never deletes itself.
 #[test]
 fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
     let net = net()?;
@@ -2821,7 +2753,6 @@ fn a_deleted_bot_stops_everywhere_and_stays_deleted() -> Result<()> {
     Ok(())
 }
 
-/// Notes refuse credentials and over-long text, change only for the user's message and sync.
 #[test]
 fn notes_refuse_secrets_and_sync() -> Result<()> {
     let net = net()?;
@@ -2888,7 +2819,6 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
     Ok(())
 }
 
-/// Appending touches only indexed rows: no statement on the write path scans a table.
 #[test]
 fn append_path_uses_indexes_only() -> Result<()> {
     let net = net()?;
@@ -2922,7 +2852,6 @@ fn append_path_uses_indexes_only() -> Result<()> {
     Ok(())
 }
 
-/// `cargo test -p vibeface-node -- --ignored append_100k`: the last appends cost about the same as the first.
 #[test]
 #[ignore = "slow: 100k appends"]
 fn append_100k_stays_flat() -> Result<()> {
@@ -2965,7 +2894,6 @@ fn autonomy_is_not_an_event() {
     );
 }
 
-/// Nodes `a`, `b` and `x` under real signed governance, managed by the fixture admin.
 struct Fleet {
     net: Net,
     x: LocalIdentity,
@@ -2993,7 +2921,6 @@ fn seq_of(envelope: &SignedEvent) -> Result<u64> {
     Ok(serde_json::from_str::<Event>(&envelope.canonical_body)?.seq)
 }
 
-/// `state` plus the admin's revocation of `device`, counting its log up to `last`.
 fn revoke(
     fleet: &Fleet,
     state: &NetworkState,
@@ -3049,8 +2976,6 @@ enum Piece {
     Events(Vec<SignedEvent>),
 }
 
-/// Applies `pieces` in `order` to a fresh replica, then delivers every event once more, as sync
-/// fetches again what a gap or an unknown author refused earlier.
 fn replay(net: &Net, pieces: &[Piece], order: &[usize]) -> Result<Store> {
     let mut replica = store(net)?;
     let events = pieces
@@ -3069,7 +2994,6 @@ fn replay(net: &Net, pieces: &[Piece], order: &[usize]) -> Result<Store> {
     Ok(replica)
 }
 
-/// Every projection row (all columns) and the effective set, in a stable order.
 fn dump(store: &Store, network: &str) -> Result<Vec<String>> {
     let mut dump = Vec::new();
     for table in reduce::TABLES {
@@ -3112,8 +3036,6 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
     all
 }
 
-/// Every arrival order of the same evidence ends in the same place, and that is where a rebuild
-/// from scratch ends. Returns that reference replica.
 fn converges(net: &Net, pieces: &[Piece]) -> Result<Store> {
     let orders = permutations(pieces.len());
     let dumps = orders
@@ -3145,7 +3067,6 @@ fn converges(net: &Net, pieces: &[Piece]) -> Result<Store> {
     Ok(reference)
 }
 
-/// Whether each event is stored and counts.
 fn effective(store: &Store, net: &Net, events: &[&SignedEvent]) -> Result<Vec<bool>> {
     events
         .iter()
@@ -3163,8 +3084,6 @@ fn effective(store: &Store, net: &Net, events: &[&SignedEvent]) -> Result<Vec<bo
         .collect()
 }
 
-/// P holds x#1..#10 and Q only #1..#7 when the revocation that counts up to #7 arrives.
-/// After they sync, both count the same events, however the evidence arrived.
 #[test]
 fn a_revocation_cutoff_converges_whatever_arrived_first() -> Result<()> {
     let fleet = fleet()?;
@@ -3175,7 +3094,6 @@ fn a_revocation_cutoff_converges_whatever_arrived_first() -> Result<()> {
     for i in 1..=10 {
         writes.push(write(&mut origin, net, &fleet.x, &format!("x{i}"), 10 + i)?);
     }
-    // b answers after x#10, so it depends on an event that will not count.
     let answer = write(&mut origin, net, &net.b, "b1", 30)?;
     let revoked = revoke(&fleet, &net.state, &fleet.x, Some(&writes[6]))?;
     let pieces = [
@@ -3203,7 +3121,6 @@ fn a_revocation_cutoff_converges_whatever_arrived_first() -> Result<()> {
     Ok(())
 }
 
-/// A revocation issued without seeing the grant still wins when it arrives first or last.
 #[test]
 fn a_revocation_arriving_before_the_grant_still_wins() -> Result<()> {
     let fleet = fleet()?;
@@ -3232,8 +3149,6 @@ fn a_revocation_arriving_before_the_grant_still_wins() -> Result<()> {
     Ok(())
 }
 
-/// A root recovery that never saw a concurrent grant leaves the granted Node out, and the Node
-/// it retires counts up to its bound only.
 #[test]
 fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
     use crate::identity::{Revocation, RootCheckpoint};
@@ -3281,8 +3196,6 @@ fn a_checkpoint_racing_a_grant_converges() -> Result<()> {
     Ok(())
 }
 
-/// x forks at seq 3. Once a replica holds both branches nothing of x from seq 3 counts, while
-/// b's event that depends on branch a does. A later revocation naming b#4 makes branch b count.
 #[test]
 fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
     let fleet = fleet()?;
@@ -3346,8 +3259,6 @@ fn a_forked_log_converges_and_a_revocation_picks_a_branch() -> Result<()> {
     Ok(())
 }
 
-/// A recovery retires x at (5, h5). Installed before or after x#1..#8, the same five count,
-/// and messages the replaced client signed still verify.
 #[test]
 fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result<()> {
     use crate::identity::{Revocation, RootCheckpoint};
@@ -3407,8 +3318,6 @@ fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result
     Ok(())
 }
 
-/// A rebuild replaces projections only; scheduler jobs and every other local ledger stay as
-/// they were.
 #[test]
 fn a_rebuild_never_touches_local_ledgers() -> Result<()> {
     let fleet = fleet()?;
@@ -3492,7 +3401,6 @@ fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
     })
 }
 
-/// The client's signature on the one answer to `question`, as the web sends it.
 fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Result<Attestation> {
     net.a
         .fixture_admin()
@@ -3542,8 +3450,6 @@ fn unanswered(store: &Store, net: &Net) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// The web's signed answer, its retry, a webhook's different unsigned answer, a restart and a
-/// redelivery to the owner: one answer stands and one `answer` turn is admitted.
 #[test]
 fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> {
     let net = net()?;
@@ -3597,8 +3503,6 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
     result
 }
 
-/// An answer given through a device that does not schedule the conversation reaches its owner
-/// as an `answer` turn, and every reader sees the same answer.
 #[test]
 fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
@@ -3637,8 +3541,6 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     Ok(())
 }
 
-/// Answered and unanswered questions in two conversations: the pending list holds exactly the
-/// unanswered ones, and a chat shows its own with their answers.
 #[test]
 fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     let net = net()?;
@@ -3669,8 +3571,6 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     Ok(())
 }
 
-/// The device running a session writes its owner: the first attribution once, then the
-/// user's hand-overs and mute, each once. Another device syncing the log sees the same.
 #[test]
 fn a_session_owner_is_written_once_and_follows_the_users_latest_choice() -> Result<()> {
     let net = net()?;
@@ -3835,7 +3735,6 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
     Ok(())
 }
 
-/// The conversation list shows each bot's newest message, cut to a short preview.
 #[test]
 fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     let net = net()?;
@@ -3884,13 +3783,11 @@ fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     Ok(())
 }
 
-/// The data a turn prompt carries: the JSON after the instructions.
 fn prompt_data(prompt: &str) -> Result<Value> {
     let start = prompt.rfind("\n\n{").context("prompt data")?;
     Ok(serde_json::from_str(&prompt[start + 2..])?)
 }
 
-/// The `key` of each row of the list at `pointer`.
 fn listed(data: &Value, pointer: &str, key: &str) -> Vec<Value> {
     data.pointer(pointer)
         .and_then(Value::as_array)
@@ -3900,8 +3797,6 @@ fn listed(data: &Value, pointer: &str, key: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Over the prompt limit, works, the checkpoint and the oldest messages give way in that order,
-/// so a turn still runs and sees the newest of each, in reading order, with what was left out.
 #[test]
 fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
     let net = net()?;
@@ -4005,7 +3900,6 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
     Ok(())
 }
 
-/// The bot's notes in its prompt are the newest that fit, oldest of them first.
 #[test]
 fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
     let net = net()?;
@@ -4039,8 +3933,6 @@ fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
     Ok(())
 }
 
-/// A due time found more than the lateness window after it passed is skipped and recorded, so
-/// it never runs; the next time on schedule runs as usual.
 #[test]
 fn a_schedule_time_found_too_late_is_skipped() -> Result<()> {
     let net = net()?;
@@ -4080,8 +3972,6 @@ fn a_schedule_time_found_too_late_is_skipped() -> Result<()> {
     Ok(())
 }
 
-/// A queued message's turn reads the conversation as it is when the turn starts, so it sees
-/// the reply to the message ahead of it.
 #[test]
 fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
     let net = net()?;
@@ -4135,8 +4025,6 @@ fn a_queued_turn_reads_the_reply_ahead_of_it() -> Result<()> {
     Ok(())
 }
 
-/// A thread has seen a reply's messages only once its turn started: a refused `turn/start`
-/// leaves them for the next turn on that thread, a started one does not repeat them.
 #[test]
 fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
     let net = net()?;
@@ -4197,8 +4085,6 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
     Ok(())
 }
 
-/// The scheduling tick hands a moved conversation's queue on even when no bot runs here to
-/// claim it, and the later claim finds nothing left to hand on twice.
 #[test]
 fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     let net = net()?;
@@ -4238,9 +4124,6 @@ fn a_move_hands_the_queue_on_without_a_claim() -> Result<()> {
     Ok(())
 }
 
-/// After a move the new owner lists what the old one left unanswered, a stopped reply and a
-/// message still queued there, but not one answered inside the reply it was steered into. Only
-/// the user's request queues them, once, with replies of the new owner's own.
 #[test]
 fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> {
     let net = net()?;
@@ -4313,7 +4196,6 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
             .is_empty()
     );
 
-    // The old owner is offline: nothing it holds is handed on.
     let mut b_side = store(&net)?;
     sync(&a_side, &mut b_side, &net)?;
     b_side.append_event(
@@ -4373,8 +4255,6 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     Ok(())
 }
 
-/// Declining replies to what a former owner left ends them here before they start: they are
-/// no longer listed, never run, and neither a retry nor a later reply request queues them.
 #[test]
 fn a_new_owner_declines_what_the_old_one_left_unanswered_once() -> Result<()> {
     let net = net()?;
@@ -4437,9 +4317,6 @@ fn a_new_owner_declines_what_the_old_one_left_unanswered_once() -> Result<()> {
     Ok(())
 }
 
-/// A resumed Codex turn carries its role, the new messages, the works that changed and the bot
-/// only when it changed; the shared rules live in the thread's instructions. Cursor still
-/// reads everything in each prompt.
 #[test]
 fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     let net = net()?;
@@ -4544,8 +4421,6 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     Ok(())
 }
 
-/// A Codex thread keeps what its turns were shown while the session key holds; a new key, such
-/// as changed thread instructions, opens a new thread that is shown everything again.
 #[test]
 fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let net = net()?;

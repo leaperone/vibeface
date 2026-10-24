@@ -231,8 +231,8 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
     key.verify_strict(message, &signature)
         .context("invalid signature")
 }
-/// Checks the event and its author's signature; the author's `DeviceId` is its public key.
-pub fn verify_signed_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
+#[cfg(test)]
+fn verify_signed_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
     let body = check_event(network_id, event)?;
     verify_event_signature(event, &body.author)?;
     Ok(body)
@@ -828,7 +828,6 @@ mod tests {
         let verified = verify_signed_event(&event.network_id, &signed)?;
         assert_eq!(verified.deps.len(), 2);
         assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
-        // The Node cannot write the user's message alone, change it, or move it to another conversation.
         event.body = message(Role::User, Some(true), None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = signed_user.clone();
@@ -857,7 +856,6 @@ mod tests {
         );
         event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
-        // An answer may come unsigned through a decision token, under the ID its question fixes.
         let answer = |id: &str, role, report_results, status| {
             let mut body = message(role, report_results, status);
             if let EventBody::MessagePosted {

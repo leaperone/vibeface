@@ -14,7 +14,7 @@ import type { Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings, docs } from "./ai-settings"
 import { JoinRequests } from "./join"
 
-export type DeviceRow = {
+type DeviceRow = {
   id: string; name: string; kind: "node" | "client"; member?: Member; node?: NodeInfo
   /** The device this browser is connected through. */ entry: boolean
   browser: boolean; online?: boolean; bot: ReturnType<typeof botReadiness>; admin: boolean

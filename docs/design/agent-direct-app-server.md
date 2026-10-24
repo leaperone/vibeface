@@ -1,21 +1,8 @@
 # Agent 直连 App Server 与 Node 分诊
 
-状态为实施中。本文在 `docs/design/unified-network.md` 的 Work 模型上做两处改动。第一处，调度 Agent 直接连本机 Codex App Server 发起工作，默认完全访问，Node 不再替 Agent 发 `turn/start`，也不再转发审批。第二处，Node 先采集本机 Codex 与 Claude Code 会话的状态，由调度层判断是否需要本人，再写进网页的提醒卡片或签名转发给 Grok Bot。网页和 Grok Bot 用同一个“送决定回会话”接口。项目尚未发布正式版，事件、表、RPC 和工具直接改成最终形态。
+协调 Agent 直接连接本机 Codex App Server，默认完全访问。Node 负责跨设备派发、进展观察、记录和重启对账，并把需要用户处理的会话事件交给协调 Agent 分诊。提问和回答进入拥有该会话的 Bot 聊天，按项目设置同步发往 webhook。
 
-提醒卡片、`send_decision` 和 matter 合并已由 [聊天里的提问与回答](questions-in-chat.md) 取代：需要本人时，提问写进拥有该会话的 Bot 聊天，回答是那个聊天里的一条消息，由 Bot 执行。下文相应段落已按新形态改写。
-
-用户决定（2026-10-20）：
-
-- Agent 直连 `codex app-server --listen unix://...`，保留 Unix socket，不改 stdio，不加 socket 令牌。
-- 默认 `approvalPolicy=never`、`sandbox=danger-full-access`。删除审批转发和审批表单，网页不提示风险。
-- Node 继续负责跨设备派活、进展观察、记录和重启对账。跨设备派发要求目标设备配置了调度 Agent。
-- 每台设备只有一个完整的协调角色：协调 Agent 加确定性的运行时。没有单独的执行层，也没有 `executor` 角色。
-- 协调 Agent 的 Shell 完全访问（`danger-full-access`、`approvalPolicy=never`），能写状态、跑 git 和 gh，直接经 socket 驱动本机 Codex。Node 不替它包装方法、不限制路径。
-- App Server 客户端覆盖全部方法。执行的命令、命令输出、diff 和改动文件列表只进状态，不在网页显示。
-- 分诊在 Node 完成，目的是节省 Grok Bot 额度。网页和 Grok Bot 可以互相替代。
-- 删除会话自主度（`AutonomySet`、`off/report/continue`、只读汇报轮和只读 sidecar 配置）。协调 Agent 总是完全权限。
-- Codex 发起的服务端请求没有固定策略：Node 挂起请求，交给协调 Agent 处理；需要本人拍板时，Agent 在负责该会话的 Bot 聊天里提问，也可转发 Grok Bot。
-- 网页不再透传 App Server 方法，只读状态摘要；本人的决定是对提问的回答。
+工作记录与传输见 [Node 协议参考](../node-protocol.md)，聊天行为见 [提问与回答](questions-in-chat.md)。
 
 ## 1. App Server 客户端
 
@@ -233,22 +220,3 @@ vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
 `install` 修改 `~/.codex/hooks.json` 和 `~/.claude/settings.json`。先把原文件备份为 `<文件>.bak-vibeface-<时间>`，只追加本工具的条目，不改动其他 hook（如 orca、paseo），重复执行不会重复添加；写回时 JSON 键按字母排序，内容不变。`uninstall` 只删本工具的条目。未给 `--home` 时 Codex 的目录取 `$CODEX_HOME`。`--dry-run` 只打印将要追加的内容。`test` 发送一条 `test=true` 的事件，确认 Node 收到。Codex 还要求 `config.toml` 的 `[features] hooks = true`，未开启时 `install` 只提示，不改该文件；新 hook 第一次运行前 Codex 会请求信任。已经在跑的会话要重启或 resume 后才会触发 hook。
-
-## 7. 删除清单
-
-- `WorkState::WaitingApproval`、`PendingApproval`、`Signal::Approval*`、`work::request_id`。
-- 事件 `ApprovalRequested`、`ApprovalAnswered`，`approvals` 表，`ApprovalDecision`，`WorkProjection.open_approvals` 与 `answered_approvals`。
-- RPC `answer_approval`、`approval_forms`，`executor::validate_response`、`request_text`、`request_form`。
-- 执行层：`Executor` trait、`CodexExecutor`、`ExecutorHost`（改为 `runtime/codex_server.rs` 的 `CodexServer`）、Node 的 `start_work`、`start_thread`、`start_turn`、`answer`、路径限制。
-- `model::Executor` 改为 `WorkKind { codex, task }`，工作字段 `executor` 改为 `kind`；节点能力里的 `executor` 改为 `codex`。
-- 网页的审批卡片和表单（网页另行处理）。
-- 自主度：`AutonomySet` 事件、`autonomy` 表与投影、`set_autonomy` RPC、`off/report/continue`、只读汇报轮、`ManagerAttempt.read_only`、sidecar 的只读配置与只读工具集。
-- 服务端请求的固定回复策略（`methods::reply`、`bridge.codex_replied`）。
-- 网页的 `codex` 透传 RPC，`codex_state` 改为状态摘要。
-- 分诊的 `offered` 记录和待处理事件的 7 天过期。
-- 到“执行层”的跨设备派发：跨设备只有协调 Agent 之间的 `task`。
-
-## 8. 验证
-
-- Rust：方法表覆盖测试、归约函数对每类通知的测试、服务端请求的兜底回复、Agent 回答挂起请求、无 Agent 时拒绝并记录、提问挂住请求到回答为止、自主度已删除、`sanitize`、`track_work` 只允许发送一次、`clientId` 对账、回答只写一次、HMAC 签名、发件箱重试和死信、`event_id` 去重、hook 安装只追加。
-- 夹具：`scripts/verify-node.py` 的 App Server 夹具按方法名单实现全部客户端请求，启动时核对名单。`--chat-agent` 覆盖直连派发、插话、对账、分诊与 webhook、提问与回答、外来会话认领；`--public-entry` 覆盖经入口回答提问；`--phase4` 覆盖跨设备 Agent 任务。CI 不调用真实 Provider。

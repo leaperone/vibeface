@@ -1,8 +1,6 @@
 # 提醒、联网、记忆、bot 互发消息与 bot 管理
 
-状态为实施中。本文在 [在聊天中修改 Bot](bot-config.md) 的事件模型上给协调 Agent 增加六项能力：一次性提醒（与例行任务合并为 schedule）、联网搜索与读取网页、每个 bot 的长期记忆、bot 之间互发消息、bot 创建与配置其他 bot，以及网页上的 schedule 列表。项目尚未发布正式版，事件、表、工具和 RPC 直接改成最终形态，`routine` 一词在代码里全部换成 `schedule`。
-
-命名：这一层原来的“助手”已统一改叫 bot，代码、事件、表、RPC、提示词和界面文案都用 bot（`message_bot`、`TriggerKind::BotMessage`、`BotMessaged`、`BotChanged`、`Role::Bot`）。聊天消息自己的回复仍用 `Role::Assistant`（`role: "assistant"`），沿用模型对话的 user/assistant 角色，`Role::Bot` 专指另一个 bot 发来的消息。运行 bot 的进程仍叫 Manager。
+协调 Agent 支持提醒、联网搜索、读取网页、长期记忆、Bot 互发消息和 Bot 管理。配置事件见 [在聊天中修改 Bot](bot-config.md)。
 
 ## 1. Schedule
 
@@ -138,8 +136,3 @@ trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder
 - 聊天标题旁的 bot 面板列出这个 bot 的 schedule：图标区分一次与重复，名称、下次运行时间和频率；每行只有暂停或恢复、删除两个图标按钮，没有说明文字，也没有新建和编辑。
 - 变更卡片增加 schedule（频率、下次运行时间）和记忆（改前与改后）。
 - bot 消息显示为来自另一个 bot 的消息，带对方名称。
-
-## 9. 验证
-
-- Rust：schedule 投影的顺序无关性（启停与定义各自后写者胜、删除吸收）、一次性只排一次且重启后不再排、暂停不排、`remind` 门控与深度上限、无 `cause` 的修改只接受新建一次性、记忆的上限与凭证拒绝、互发消息幂等与跳数、限速、bot 创建的授权与上限、带 `cause` 的首个调度 Node 不能用于已有会话、`fetch_url` 拒绝各类私有地址。
-- `--chat-agent` 夹具：一次性提醒触发一次且重启后不重放、bot 消息唤醒对方一次、记忆在重启后保留、暂停后不排、`fetch_url` 拒绝私有地址；`--phase4` 覆盖记忆同步到另一台 Node。CI 只用夹具，不访问真实 Provider 或互联网。

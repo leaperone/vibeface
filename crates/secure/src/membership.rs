@@ -1245,7 +1245,6 @@ mod tests {
             &granted.project()?,
             Member::client(&b, "b", true)?,
         )?)?;
-        // b signs on the genesis heads, where b is not yet a member.
         let early = GovernanceEvent {
             version: 1,
             network_id: base.genesis.network_id.clone(),
@@ -1307,7 +1306,6 @@ mod tests {
             Member::node(&node, "rejoin")?,
         )?)?;
         assert!(merged.project()?.node(&id(&node)).is_err());
-        // A manager may revoke another manager and itself; later events by them fail.
         merged.append(GovernanceEvent::revoke(&b, &merged.project()?, cut(&a, 0))?)?;
         let view = merged.project()?;
         assert!(GovernanceEvent::revoke(&a, &view, cut(&b, 0)).is_err());
@@ -1493,7 +1491,6 @@ mod tests {
         assert!(state.superseded(&id(&root)) && !state.superseded(&id(&next)));
         assert!(!state.superseded(&id(&identity())));
 
-        // The old key signs the next epoch: wrong signer.
         let stolen = RootCheckpoint::rotation(&state, &root, &id(&identity()))?;
         let refused = state.clone().recover(stolen.clone()).unwrap_err();
         assert!(format!("{refused:#}").contains("replaced by a newer recovery"));
@@ -1501,7 +1498,6 @@ mod tests {
         forked.checkpoints.push(stolen);
         assert!(forked.project().is_err() && state.merge(&forked).is_err());
 
-        // The old key signs the epoch it already used: conflict.
         let mut rival = genesis_only.clone();
         rival.recover(RootCheckpoint::recovery(
             &genesis_only,
@@ -1512,7 +1508,6 @@ mod tests {
         )?)?;
         assert!(state.merge(&rival).is_err() && rival.merge(&state).is_err());
 
-        // No epoch can be skipped, so there is no gap for an old key to fill.
         let skip = RootCheckpoint::create(state.network_id(), 4, &next, &id(&identity()), None)?;
         assert!(state.clone().recover(skip.clone()).is_err());
         let mut gap = state.clone();
@@ -1727,7 +1722,6 @@ mod tests {
         assert_eq!(state.epoch(), 2);
         assert_eq!(state.events.len(), 3);
         let view = state.project()?;
-        // The racing epoch-1 grant and revoke stay history; epoch 2 starts from the checkpoint.
         assert!(view.client(&id(&b)).is_err() && view.attester(&id(&b)));
         assert_eq!(view.write_bound(&id(&node)), Some(WriteBound::Unlimited));
         assert!(view.client(&id(&c)).is_ok());
@@ -1798,7 +1792,6 @@ mod tests {
         assert!(!view.attester(&id(&kept)));
         assert!(view.client(&id(&a)).is_err());
 
-        // A retired Node granted again in the new epoch stays bounded.
         state.append(GovernanceEvent::grant(
             &recovered,
             &view,
@@ -1806,7 +1799,6 @@ mod tests {
         )?)?;
         assert!(state.project()?.node(&id(&left)).is_err());
 
-        // An old manager can still sign epoch-1 history, but it no longer moves current bounds.
         let mut late = epoch_one.clone();
         late.append(GovernanceEvent::revoke(
             &a,

@@ -363,7 +363,6 @@ impl Runtime {
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
             Tool::BindWork => self.bind_work(network, &scope, &args).await,
-            // The wait holds neither the invocation's admission nor maintenance.
             Tool::WaitCodex => {
                 drop((_lease, _work));
                 Ok(json!({"connected": self.codex.ready().await}))
@@ -432,7 +431,6 @@ impl Runtime {
         vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
         let local = self.identity.device_id()?;
         let optional = |key: &str| args[key].as_str().map(String::from);
-        // An agent task's turn only starts work here, as children of its task.
         let task = manager.trigger.strip_prefix("task:");
         let target = match task {
             Some(_) => local.clone(),

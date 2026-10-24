@@ -4,7 +4,7 @@ import {
   Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
 
-/** One icon and one word per concept, see docs/design/web-ux.md section 2. */
+/** One icon and one word per concept, see docs/design/web-ux.md. */
 export const terms = {
   myDevices: { label: "我的设备", icon: MonitorSmartphone },
   device: { label: "设备", icon: Server },

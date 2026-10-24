@@ -439,13 +439,11 @@ impl Runtime {
                 );
                 self.codex_state(network, input).await
             }
-            // Another device's coordination Agent answers a request this device holds.
             "codex_respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
                 self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
-            // The user, on another device, hands over a session this device runs.
             "session_owner" => {
                 ensure!(input["human"] == true, "only the user hands sessions over");
                 self.hand_over_session(
@@ -1054,7 +1052,6 @@ impl Runtime {
         let (statuses, rebuilt) = {
             let mut store = self.store.lock().await;
             let ingested = store.ingest_events(network, events)?;
-            // The user's choice on an unverified result may have arrived from another entry.
             store.settle_local_works(network)?;
             ingested
         };
@@ -1349,7 +1346,6 @@ impl Runtime {
             }
             learned |= changed;
         }
-        // Pass news on so a Node that only reaches this one hears it before the next Hello.
         if learned {
             self.wake_sync_all();
         }
@@ -1735,8 +1731,6 @@ mod tests {
             .context("signed message")
     }
 
-    /// Each side's copy of x's log split at seq 3. Walking back from the peer's head finds the
-    /// fork, and after one pass each way both hold the same evidence and count the same events.
     #[tokio::test]
     async fn diverged_logs_walk_back_to_the_fork_and_converge() -> Result<()> {
         use std::sync::Mutex;
@@ -1829,9 +1823,6 @@ mod tests {
         Ok(())
     }
 
-    /// Writes wait until every other member Node has confirmed this device's log since boot.
-    /// With the unconfirmed ones failing the Node turns read-only; a confirmation completing
-    /// the set, or revoking the Node still missing, lets it write.
     #[tokio::test]
     async fn alignment_waits_for_every_member_node_to_confirm() -> Result<()> {
         use crate::identity::{GovernanceEvent, Revocation};
@@ -1887,8 +1878,6 @@ mod tests {
         result
     }
 
-    /// A Node removed while away learns it from the next member Node it syncs with, and only from
-    /// history signed by a manager it already trusts.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_removed_node_learns_its_removal_only_from_signed_history() -> Result<()> {
         use crate::identity::{GovernanceAction, GovernanceEvent, Revocation};
@@ -1992,7 +1981,6 @@ mod tests {
             {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            // A second download of the same attachment waits instead of sharing its staging file.
             b.fetch_blobs(&network, &peer_a).await?;
             first.await??;
             let heads = a.store.lock().await.heads(&network)?;

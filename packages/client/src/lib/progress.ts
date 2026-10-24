@@ -1,10 +1,10 @@
-export type ProgressUpdate =
+type ProgressUpdate =
   | { type: 'text_snapshot' | 'text_delta'; item_id?: string; text: string }
   | { type: 'status' | 'tool'; item_id?: string; text?: string; status?: string; name?: string }
 
 type ProgressFields = { conversation_id: string; sequence: number; progress: ProgressUpdate }
-export type ManagerProgressEvent = ProgressFields & { type: 'manager_progress'; trigger: string; source_node: string; invocation_id?: string }
-export type NativeProgressEvent = ProgressFields & { type: 'native_progress'; work_id: string; target_node: string }
+type ManagerProgressEvent = ProgressFields & { type: 'manager_progress'; trigger: string; source_node: string; invocation_id?: string }
+type NativeProgressEvent = ProgressFields & { type: 'native_progress'; work_id: string; target_node: string }
 /**
  * `records`: what one change touched in a conversation, merged in place; `value` is parsed by the workspace.
  * `invalidate`: reload; with a conversation, only what that conversation shows.

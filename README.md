@@ -188,23 +188,6 @@ cargo build --release -p vibeface --locked
 └── install.sh       # GitHub 完整包安装脚本
 ```
 
-## 🗺️ 路线图
-
-已实现：
-
-- [x] 统一 Node、iroh 网络、签名事件 DAG 同步与身份（[设计](docs/design/unified-network.md)）
-- [x] 网页配置本机 Provider，Codex 与 Cursor 协调 Agent
-- [x] 公共入口、relay、本机自动访问、恢复包
-
-实施中：
-
-- [ ] 协调 Agent 直连 App Server 与本机会话分诊（[设计](docs/design/agent-direct-app-server.md)）
-- [ ] 在聊天中修改 bot 配置与共用 skill 库（[设计](docs/design/bot-config.md)）
-- [ ] 提醒、联网、记忆、bot 互发消息与 bot 管理（[设计](docs/design/agent-capabilities.md)）
-- [ ] 聊天里的提问与回答（[设计](docs/design/questions-in-chat.md)）
-
-当前不在范围内：原生手机 App、浏览器关闭后的系统推送。
-
 ## 📚 文档
 
 | 文档 | 内容 |

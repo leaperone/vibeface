@@ -306,7 +306,6 @@ for await (const line of createInterface({ input: process.stdin })) {
         if (input.op === 'request') result = await connection.request(input.method, input.params || {});
         else if (input.op === 'drop') result = connection.drop(input.method, input.params || {});
         else if (input.op === 'events') result = connection.events;
-        else if (input.op === 'close') { connection.close(); result = { closed: true }; }
         else throw new Error('unknown client command');
       }
     }
@@ -319,10 +318,9 @@ for (const key of roots.values()) key.free();
 
 
 class Client:
-    def __init__(self, url, helper, module, *, identity_file=None):
+    def __init__(self, url, helper, *, identity_file=None):
         self.url = url
         self.helper = helper
-        self.module = module
         self.identity_file = identity_file
         self.network_id = None
         self.principal = None
@@ -387,7 +385,6 @@ class Client:
             if arguments.get("project") is not None:
                 body["project"] = arguments["project"]
         elif method == "answer":
-            # The question's chat, or the sessions scope; the Node takes it from the question.
             scope = arguments.pop("scope_id")
             body = {"type": "message_posted", "message_id": "a-" + arguments["question_id"], "role": "user",
                     "text": arguments["text"], "report_results": True, "answers": arguments["question_id"]}
@@ -408,7 +405,6 @@ class Client:
 
     def rpc(self, method, *, status=200, unsigned=False, **arguments):
         if method in ("create_conversation", "create_bot") and not unsigned:
-            # The browser names the first scheduling Node, so a retry through any entry writes the same owner.
             arguments.setdefault("scheduler_node", self.device_id)
             arguments.setdefault("owner_attestation", self.command(
                 "attest", network_id=self.network_id, scope_id=arguments["conversation_id"],
@@ -418,7 +414,7 @@ class Client:
             arguments["attestation"] = attestation
         return self.call("rpc", {"method": method, **arguments}, status=status)
 
-    def request(self, path, payload=None, *, status=200, origin=True, headers=None, timeout=20, **unused):
+    def request(self, path, payload=None, *, status=200, origin=True, headers=None, timeout=20):
         request_headers = dict(headers or {})
         if origin:
             request_headers.setdefault("Origin", self.url)
@@ -516,14 +512,14 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, helper, module, *, init_args=None):
+    def __init__(self, run, name, binary, workspace, helper, *, init_args=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
         self.port = available_port()
         self.local_port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
-        self.client = Client(self.url, helper, module, identity_file=self.directory / "client-identity.json")
+        self.client = Client(self.url, helper, identity_file=self.directory / "client-identity.json")
         self.process = None
         self.log = None
         try:
@@ -759,7 +755,6 @@ DATA_EPOCH = int(re.search(r"^pub const DATA_EPOCH: u32 = (\d+);$",
 # These runs drive a fixture App Server the Node starts itself, not one already on the machine.
 SPAWN_APP_SERVER = {"mode": "spawn", "socket": None}
 APP_SERVER_SCHEMA = Path(__file__).resolve().parents[1] / "crates/bridge/schema/app-server-methods.json"
-# Methods whose answer depends on fixture thread state; every other client request gets a canned answer.
 FIXTURE_STATEFUL = {"initialize", "thread/start", "thread/resume", "thread/read", "thread/turns/list", "thread/list",
                     "thread/loaded/list", "turn/start", "turn/steer", "turn/interrupt", "thread/name/set",
                     "thread/archive", "thread/unarchive", "thread/fork", "thread/unsubscribe"}
@@ -1271,7 +1266,6 @@ def fixture_manager(run, initial, bot):
         return json.loads(completed.stdout) if accepted else None
 
     if kind == "answer":
-        # The user's answer goes where the question came from, once however often it is sent.
         question, answer = context["trigger"]["question"], body["text"]
         about = question["about"]
         if about.get("request_id"):
@@ -1340,7 +1334,6 @@ def fixture_manager(run, initial, bot):
         if not gate or Path(gate).exists():
             break
         if bot.stopped.wait(0.2):
-            # An unconfirmed stop ends only after the Node stopped waiting for it.
             if directive.get("cancel_unknown"):
                 time.sleep(10)
             bot.end("interrupted")
@@ -2339,7 +2332,7 @@ def chat_agent_acceptance(options):
 
     try:
         for name in ("A", "BOT-OTHER-NETWORK"):
-            node = Node(run, name, binary, workspace, helper, module)
+            node = Node(run, name, binary, workspace, helper)
             node.configure(timeout_secs=600, manager=fixture_manager_settings(run, workspace) if name == "A" else None,
                            codex_bin=str(codex) if name == "A" else sys.executable, app_server=SPAWN_APP_SERVER,
                            daily_decision_limit=100)
@@ -2473,7 +2466,7 @@ def phase1_acceptance(options):
         wait_for("A receives its client grant", lambda: a.client.authenticate())
 
     try:
-        a = Node(run, "A", binary, workspace, helper, module)
+        a = Node(run, "A", binary, workspace, helper)
         nodes.append(a)
         a.configure(timeout_secs=600, manager=manager, codex_bin=str(codex), app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
@@ -2672,7 +2665,7 @@ def web_acceptance(options):
               "not_checked": ["Node business tests", "provider behavior", "rendered browser UI"]}
     node = None
     try:
-        node = Node(run, "WEB", binary, workspace, None, module)
+        node = Node(run, "WEB", binary, workspace, None)
         node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
         node.start()
         verify_web_assets(node, module)
@@ -2748,7 +2741,7 @@ def acceptance(options):
 
     def browser(node, manager):
         """The manager's browser opening another member Gateway: same device key, another entrance."""
-        client = Client(node.url, helper, module, identity_file=manager.identity_file)
+        client = Client(node.url, helper, identity_file=manager.identity_file)
         client.network_id = manager.network_id
         clients.append(client)
         return client
@@ -2761,7 +2754,7 @@ def acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
-            nodes.append(Node(run, name, binary, workspace, helper, module))
+            nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
         a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
@@ -2929,9 +2922,9 @@ def acceptance(options):
         a.start()
         a.client.connect()
         a.client.authenticate()
-        failover.connect(a.device_id)
-        failover.authenticate()
         wait_for("the Nodes converge after A returns", lambda: converged(members, network), timeout=60)
+        failover.connect(p.device_id)
+        failover.authenticate()
         require((scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled"
                 and sum(row["label"] == "remote-stop" for row in fixture_records(run)) == 1, "the unconfirmed stop changed nothing on A")
         passed("cross-device-stop", trigger=held["trigger"], reply=stopped[0]["message_id"])
@@ -3000,7 +2993,7 @@ def phase4_acceptance(options):
         print("PASS " + name, flush=True)
 
     def browser(node):
-        client = Client(node.url, helper, module, identity_file=a.client.identity_file)
+        client = Client(node.url, helper, identity_file=a.client.identity_file)
         client.network_id = network
         clients.append(client)
         client.connect(node.device_id)
@@ -3055,7 +3048,7 @@ def phase4_acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         for name in ("A", "P", "B", "C"):
-            nodes.append(Node(run, name, binary, workspace, helper, module))
+            nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c = nodes
         for node in (a, b, c):
             root = roots[node.name] = run / ("fixture-" + node.name)
@@ -3194,7 +3187,6 @@ def phase4_acceptance(options):
         require(finished["outcome"] == "completed" and "p4-task:complete" in finished["result_text"], "the task reports B's Agent result")
         turn(a, "work:" + task)
         wait_for("B's events reach A", lambda: converged(members, network), timeout=60)
-        # B also entered the user's own signed message p4-m2; everything else it wrote is work or its question.
         by_b = {event["body"]["type"] for event in scope_events(a, network, conversation) if event["author"] == b.device_id
                 and not (event["body"]["type"] == "message_posted" and event["body"]["role"] == "user")}
         require(by_b and by_b <= {"work_dispatched", "work_progress", "work_finished", "question_asked"},
@@ -3236,7 +3228,6 @@ def phase4_acceptance(options):
                                                                        "native": {"gate": str(check_dir / "release")}}})
         done_id = dispatched(a, "p4-check-done")
         turn(a, r6a["trigger"])
-        # Sent while the first reply runs, the second message would only steer into it.
         r6b = send(a.client, "p4-m6b", {"label": "p4-m6b", "dispatch": {"label": "p4-check-not", "cwd": str(check_dir),
                                                                        "native": {"gate": str(check_dir / "release")}}})
         not_id = dispatched(a, "p4-check-not")
@@ -3393,7 +3384,7 @@ def public_entry_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        p = Node(run, "P", binary, workspace, helper, module,
+        p = Node(run, "P", binary, workspace, helper,
                  init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}"])
         nodes.append(p)
         token = p.directory / "entry-token"
@@ -3405,9 +3396,9 @@ def public_entry_acceptance(options):
         wrong.chmod(0o600)
         fixture = run / "fixture-M"
         fixture.mkdir(mode=0o700)
-        m = Node(run, "M", binary, workspace, helper, module, init_args=[
+        m = Node(run, "M", binary, workspace, helper, init_args=[
             "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(token)])
-        x = Node(run, "X", binary, workspace, helper, module, init_args=[
+        x = Node(run, "X", binary, workspace, helper, init_args=[
             "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(wrong)])
         nodes += [m, x]
         for node in (m, x):
@@ -3432,7 +3423,7 @@ def public_entry_acceptance(options):
         require(listed, "M's signed address names P")
         passed("member-names-the-public-entry", gateway_url=p.url)
 
-        phone = Client(p.url, helper, module, identity_file=run / "phone-identity.json")
+        phone = Client(p.url, helper, identity_file=run / "phone-identity.json")
         clients.append(phone)
         started = time.monotonic()
         phone.join(m.client, "phone", via=p.url)
@@ -3456,11 +3447,11 @@ def public_entry_acceptance(options):
                  phone.rpc("conversation", conversation_id=conversation)["messages"]) >= 2, timeout=60)
         passed("browser-reconnects-after-the-entry-restarts")
 
-        refused = Client(p.url, helper, module, identity_file=run / "outsider-identity.json")
+        refused = Client(p.url, helper, identity_file=run / "outsider-identity.json")
         clients.append(refused)
         outcome = refused.connect(x.device_id, check=False)
         require(not outcome.get("ok"), "P cannot reach a Node whose relay token is wrong")
-        direct = Client(x.url, helper, module, identity_file=run / "outsider-identity.json")
+        direct = Client(x.url, helper, identity_file=run / "outsider-identity.json")
         clients.append(direct)
         require(direct.connect(x.device_id, check=False).get("ok"), "X itself is running")
         passed("relay-refuses-a-wrong-token", error=str(outcome.get("error", ""))[:200])
@@ -3572,8 +3563,8 @@ def phase5_acceptance(options):
     try:
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
-        a = Node(run, "A", binary, workspace, helper, module)
-        b = Node(run, "B", binary, workspace, helper, module)
+        a = Node(run, "A", binary, workspace, helper)
+        b = Node(run, "B", binary, workspace, helper)
         nodes += [a, b]
         for node in nodes:
             node.configure(app_server={"mode": "system", "socket": str(run / "unavailable.sock")})
@@ -3583,7 +3574,7 @@ def phase5_acceptance(options):
         network = a.bootstrap()
         b.pair(a)
         b.start()
-        browser = Client(b.url, helper, module, identity_file=a.client.identity_file)
+        browser = Client(b.url, helper, identity_file=a.client.identity_file)
         browser.network_id = network
         clients.append(browser)
         wait_for("the browser is known at B", at_b)
@@ -3741,7 +3732,7 @@ def auto_route_acceptance(options):
         "not_checked": ["rendered browser UI", "production ingress", "provider models"]}
 
     def fresh(url):
-        client = Client(url, helper, module)
+        client = Client(url, helper)
         clients.append(client)
         return client
 
@@ -3750,7 +3741,7 @@ def auto_route_acceptance(options):
         print("PASS auto-route " + name, flush=True)
 
     try:
-        target = Node(run, "TARGET", binary, workspace, helper, module)
+        target = Node(run, "TARGET", binary, workspace, helper)
         nodes.append(target)
         target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
@@ -3865,7 +3856,7 @@ def auto_route_acceptance(options):
                       marker.read_text() == "once" and len(invocations(run, "auto-route")) == 1)
         passed("unknown-write-not-replayed", message_id=original["message_id"], trigger=trigger, invocations=1)
 
-        joining = Node(run, "CLI", binary, workspace, helper, module)
+        joining = Node(run, "CLI", binary, workspace, helper)
         nodes.append(joining)
         code = joining.pair(target)
         listed = target.client.call("directory")["view"]["members"]
@@ -3892,7 +3883,7 @@ def auto_route_acceptance(options):
         recovered = fresh(target.url)
         checkpoint = verify_recovery(target, recovered, network)
         passed("root-recovery-keeps-managers", epoch=checkpoint["epoch"])
-        blank = Node(run, "FRESH", binary, workspace, helper, module)
+        blank = Node(run, "FRESH", binary, workspace, helper)
         nodes.append(blank)
         fresh_checkpoint = recover_fresh_node(blank, target.backup, target.backup_password)
         passed("fresh-node-recovery", network=network, epoch=fresh_checkpoint["epoch"])
@@ -3912,9 +3903,6 @@ def auto_route_acceptance(options):
         report["cleanup"] = {"remaining_nodes": sum(node.process is not None for node in nodes),
                              "remaining_clients": sum(client.process is not None for client in clients)}
         private_json(run / "report.json", report)
-        if options.evidence_dir:
-            options.evidence_dir.mkdir(parents=True, exist_ok=True)
-            private_json(options.evidence_dir / "auto-route-process.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
@@ -3927,7 +3915,6 @@ if __name__ == "__main__":
         parser.add_argument("--binary", type=Path, required=True)
         parser.add_argument("--artifacts", type=Path, required=True)
         parser.add_argument("--crypto-module", type=Path, default=Path(__file__).resolve().parents[1] / "crates/node/web/generated/vibeface_secure.js")
-        parser.add_argument("--evidence-dir", type=Path, help="also save the --auto-route report here")
         modes = parser.add_mutually_exclusive_group()
         modes.add_argument("--web-only", action="store_true", help="check packaged Web resources without Node business or provider scenarios")
         modes.add_argument("--phase1", action="store_true", help="run focused durable Manager queue/follow-up process checks with controlled fixtures")

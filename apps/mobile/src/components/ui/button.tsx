@@ -118,5 +118,5 @@ function Button({ className, variant, size, onPressIn, onPressOut, ...props }: B
   );
 }
 
-export { Button, buttonTextVariants, buttonVariants };
+export { Button };
 export type { ButtonProps };

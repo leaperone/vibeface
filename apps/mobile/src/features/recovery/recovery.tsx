@@ -12,10 +12,10 @@ import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
 
-export type PickedFile = { name: string; file: RecoveryFile }
+type PickedFile = { name: string; file: RecoveryFile }
 
 /** Picks the recovery file from Files; the picked copy reads as the `RecoveryFile` the shared provider opens. */
-export function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onPick(file: PickedFile): void; disabled?: boolean }) {
+function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onPick(file: PickedFile): void; disabled?: boolean }) {
   const choose = async () => {
     const result = await DocumentPicker.getDocumentAsync({ type: ['application/json', 'public.json', '*/*'], copyToCacheDirectory: true })
     const asset = result.assets?.[0]
