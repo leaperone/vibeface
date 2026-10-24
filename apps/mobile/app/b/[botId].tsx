@@ -40,12 +40,16 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): 
     turns.add(message.in_reply_to)
     return `turn:${message.in_reply_to}`
   }
-  chat.messages.forEach((message, index) => {
+  // A streamed reply whose final text is already in the history is the same reply: draw it once, whichever side is behind.
+  const same = (a: string, b: string) => a.trim() !== '' && b.trim() !== '' && (a.trim().startsWith(b.trim()) || b.trim().startsWith(a.trim()))
+  const messages = chat.messages.filter((message) => message.state !== 'streaming' || !message.in_reply_to || !chat.messages.some((other) => other.role === 'assistant'
+    && other.state !== 'streaming' && other.in_reply_to === message.in_reply_to && same(other.text, message.text)))
+  messages.forEach((message, index) => {
     while (questions.length && questions[0].created_at_ms < message.created_at_ms) {
       const question = questions.shift()!
       rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
     }
-    const next = chat.messages[index + 1]
+    const next = messages[index + 1]
     // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.last && previous.message.role === message.role
