@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -162,7 +162,7 @@ impl Drop for ObservationGuard {
 fn valid_progress(event: &Value, scope: &str, source: &str) -> bool {
     matches!(
         event["type"].as_str(),
-        Some("manager_progress" | "native_progress")
+        Some("manager_progress" | "native_progress" | "job_changed")
     ) && event["conversation_id"].as_str() == Some(scope)
         && event["source_node"].as_str() == Some(source)
         && event["sequence"]
@@ -226,20 +226,33 @@ pub(crate) fn native_progress(event: &Value) -> Value {
 
 impl Runtime {
     /// Only locally produced progress enters this ring. Proxied reads use events.send directly.
-    pub(crate) fn publish_progress(&self, network: &str, mut payload: Value) {
-        let Ok(source) = self.identity.device_id() else {
-            return;
-        };
-        payload["source_node"] = json!(source);
-        let Some(scope) = payload["conversation_id"].as_str() else {
-            return;
-        };
-        if !valid_progress(&payload, scope, &source) {
-            return;
+    pub(crate) fn publish_progress(&self, network: &str, payload: Value) {
+        if let Some(payload) = self.record_progress(network, payload) {
+            let _ = self.events.send(Update {
+                network_id: network.into(),
+                payload,
+            });
         }
-        let Ok(bytes) = serde_json::to_vec(&payload) else {
-            return;
-        };
+    }
+
+    /// A job of this Node changed: devices following the conversation read it again. The hint
+    /// lives only in the ring; local clients get their own change.
+    pub(crate) fn hint_job_changed(&self, network: &str, scope: &str) {
+        let sequence = self.progress_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        self.record_progress(
+            network,
+            json!({"type":"job_changed","conversation_id":scope,"sequence":sequence}),
+        );
+    }
+
+    fn record_progress(&self, network: &str, mut payload: Value) -> Option<Value> {
+        let source = self.identity.device_id().ok()?;
+        payload["source_node"] = json!(source);
+        let scope = payload["conversation_id"].as_str()?;
+        if !valid_progress(&payload, scope, &source) {
+            return None;
+        }
+        let bytes = serde_json::to_vec(&payload).ok()?;
         if let Ok(mut state) = self.observation.lock() {
             state.prune();
             let key = (network.to_owned(), scope.to_owned());
@@ -259,10 +272,7 @@ impl Runtime {
                 .or_insert_with(Progress::new)
                 .push(payload.clone(), bytes.len());
         }
-        let _ = self.events.send(Update {
-            network_id: network.into(),
-            payload,
-        });
+        Some(payload)
     }
 
     pub(crate) async fn observe_conversation(
@@ -504,13 +514,16 @@ impl Runtime {
             }
         }
         // Forward locally only: capturing these frames would create proxy loops and false sources.
-        if reply["reset"].as_bool() == Some(true) {
+        let (hints, progress): (Vec<_>, Vec<_>) = events
+            .iter()
+            .partition(|event| event["type"] == "job_changed");
+        if reply["reset"].as_bool() == Some(true) || !hints.is_empty() {
             let _ = self.events.send(Update {
                 network_id: stream.network.clone(),
                 payload: json!({"type":"changed","conversation_id":stream.scope}),
             });
         }
-        for payload in events {
+        for payload in progress {
             let _ = self.events.send(Update {
                 network_id: stream.network.clone(),
                 payload: payload.clone(),
@@ -634,5 +647,8 @@ mod tests {
             "chat",
             "manager"
         ));
+        let hint = json!({"type":"job_changed","conversation_id":"chat","source_node":"manager","sequence":1});
+        assert!(valid_progress(&hint, "chat", "manager"));
+        assert!(!valid_progress(&hint, "chat", "proxy"));
     }
 }

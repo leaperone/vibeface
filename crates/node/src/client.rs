@@ -744,7 +744,8 @@ async fn dispatch(
             };
             let mut result = node.rpc(access.clone(), params).await?;
             if let Some(scope) = watched_scope {
-                session.observation.take();
+                // The old lease goes only after the new one holds, so a stream keeps its cursor.
+                let _previous = session.observation.take();
                 let targets = result["observation_targets"]
                     .as_array()
                     .into_iter()
