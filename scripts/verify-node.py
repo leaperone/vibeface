@@ -2545,7 +2545,7 @@ def phase1_acceptance(options):
         replies = [message for message in snapshot["messages"] if message["role"] == "assistant"]
         stopped_replies = [message for message in replies if message.get("in_reply_to") == "queue-cancelled"]
         require(len(stopped_replies) == 1 and stopped_replies[0]["status"] == "stopped"
-                and stopped_replies[0]["message_id"] == cancelled_job["reply_message_id"]
+                and stopped_replies[0]["message_id"] == cancelled_job["message_id"]
                 and sum(message["message_id"] == "queue-cancelled" for message in snapshot["messages"]) == 1,
                 "cancelled queued work keeps its user message and gets one stopped reply without an SDK call")
         replies = [message for message in replies if message not in stopped_replies]
@@ -2922,7 +2922,7 @@ def acceptance(options):
         stopped = wait_for("C shows the stopped reply", lambda: [
             row for row in at_c.rpc("conversation", conversation_id=conversation)["messages"]
             if row.get("in_reply_to") == "m5-stop" and row.get("status") == "stopped"])
-        require(len(invocations(run, "remote-stop")) == 1 and scheduler_records(c, network) == [],
+        require(sum(row["label"] == "remote-stop" for row in fixture_records(run)) == 1 and scheduler_records(c, network) == [],
                 "the reply ran once on A and C stored none of its jobs")
         a.stop()
         unconfirmed = at_c.rpc("cancel_manager", conversation_id=conversation, trigger=held["trigger"])
@@ -2934,9 +2934,11 @@ def acceptance(options):
         a.start()
         a.client.connect()
         a.client.authenticate()
+        failover.connect(a.device_id)
+        failover.authenticate()
         wait_for("the Nodes converge after A returns", lambda: converged(members, network), timeout=60)
         require((scheduler_record(a, network, held["trigger"]) or {}).get("state") == "cancelled"
-                and len(invocations(run, "remote-stop")) == 1, "the unconfirmed stop changed nothing on A")
+                and sum(row["label"] == "remote-stop" for row in fixture_records(run)) == 1, "the unconfirmed stop changed nothing on A")
         passed("cross-device-stop", trigger=held["trigger"], reply=stopped[0]["message_id"])
 
         a.client.revoke(c.device_id, head(a, network, c.device_id))
