@@ -1,12 +1,12 @@
 //! Triage workers (design 4): capture into one queue, hand batches to the coordination Agent,
 //! ask the user in the chat of the bot that owns each session, deliver webhooks from a
-//! local outbox, hold App Server requests for the Agent, and hand sessions no bot started
-//! to the bot the user chooses.
+//! local outbox, hold App Server requests for the Agent, and give sessions no bot started
+//! to the primary bot until the user hands them to another or stops following them.
 use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
     manager::{self, ManagerConfig},
-    model::{Choice, EventBody, SESSIONS_SCOPE, Subject},
+    model::{Choice, EventBody, Subject},
     net,
     triage::{self, AgentEvent, Delivery, OutboxEntry, Severity, TriageConfig},
 };
@@ -27,8 +27,8 @@ const BATCH: usize = 20;
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
-/// How long the primary bot has to route a session before it keeps the session itself.
-const ROUTE_WITHIN: Duration = Duration::from_secs(600);
+/// The session of an App Server request that belongs to no thread.
+const NO_THREAD: &str = "app-server";
 /// How long an App Server request waits for the coordination Agent before the fallback answer.
 pub(crate) const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
 const WEBHOOK_KEY: &str = "triage-webhook.key";
@@ -46,9 +46,8 @@ pub(crate) struct TriageState {
     outbox: tokio::sync::Notify,
     /// App Server threads' working directory and last answer, for their turn-end events.
     threads: std::sync::Mutex<HashMap<String, (String, String)>>,
-    /// This device's sessions the user chose to ignore, so their events drop without the store.
-    /// A restart learns them again from the answers.
-    ignored: std::sync::Mutex<HashSet<String>>,
+    /// App Server threads nobody drives (`codex exec`, sub-agents); no bot is given them.
+    background: std::sync::Mutex<HashSet<String>>,
     started_ms: i64,
 }
 
@@ -61,7 +60,7 @@ impl TriageState {
             wake: Default::default(),
             outbox: Default::default(),
             threads: Default::default(),
-            ignored: Default::default(),
+            background: Default::default(),
             started_ms: now_ms(),
         }
     }
@@ -128,10 +127,7 @@ struct DecisionInput {
     text: Option<String>,
 }
 
-const IGNORE: &str = "忽略";
-const HANDLE: &str = "处理";
-
-/// One line of what a session last said, for the question about it.
+/// One line of what a session last said.
 fn summary(event: &AgentEvent) -> String {
     [&event.last_message, &event.detail]
         .into_iter()
@@ -260,19 +256,15 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 impl Runtime {
-    /// A session that gained an owner is no longer ignored.
-    pub(super) fn forget_ignored(&self, session: &str) {
-        lock(&self.triage.ignored).remove(session);
-    }
-
     async fn network_id(&self) -> Result<String> {
         Ok(self.membership_state().await?.genesis.network_id)
     }
 
     /// Takes one event from a hook, a scan or the App Server. Test events are acknowledged and
-    /// dropped; so is everything while no coordination Agent is configured to judge it. An event
-    /// of a session no bot owns only asks the user, once per session, whether to handle
-    /// it. An event ID seen before is a duplicate, whichever source sent it first.
+    /// dropped; so is everything while no coordination Agent is configured to judge it, and
+    /// everything of a session the user stopped following. A session no bot owns goes to the
+    /// primary bot first; without a bot its events drop. An event ID seen before is a
+    /// duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
         self.queue_event(AgentEvent {
             request_id: None,
@@ -287,9 +279,6 @@ impl Runtime {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
         }
-        if lock(&self.triage.ignored).contains(&event.session_id) {
-            return Ok(json!({"status":"foreign","event_id":event.event_id}));
-        }
         // Nothing is triaged before the Node joins a network.
         let network = self.network_id().await?;
         if self.manager().is_none() {
@@ -299,19 +288,12 @@ impl Runtime {
         if own_turn(&store, &event)? {
             return Ok(json!({"status":"own","event_id":event.event_id}));
         }
-        if owner(&store, &network, &event)?.is_none() {
-            let question = self.ask_about_session(&mut store, &network, &event)?;
-            drop(store);
-            if let Some((question, hash)) = question {
-                tracing::info!(
-                    event = "session.foreign",
-                    thread_id = event.session_id,
-                    question_id = question["question_id"].as_str(),
-                    "asked whether to handle a session no bot started"
-                );
-                self.publish_changed(&network, SESSIONS_SCOPE, Changed::Event(&hash));
-                self.send_question(&question, &event.cwd).await?;
-            }
+        if store.session_muted(&network, &event.node, &event.session_id)? {
+            return Ok(json!({"status":"muted","event_id":event.event_id}));
+        }
+        if owner(&store, &network, &event)?.is_none()
+            && self.claim_session(&mut store, &network, &event)?.is_none()
+        {
             return Ok(json!({"status":"foreign","event_id":event.event_id}));
         }
         let first = store.connection.execute(
@@ -334,54 +316,40 @@ impl Runtime {
         Ok(json!({"status":"accepted","event_id":event.event_id}))
     }
 
-    /// The deterministic question about a session no bot owns, written once per session:
-    /// ignore it, handle it, or hand it to one bot.
-    fn ask_about_session(
+    /// Gives a session this device runs and no bot owns to the primary bot, written once.
+    /// Returns that bot's conversation, or `None` when there is no bot yet or nobody drives
+    /// the session.
+    fn claim_session(
         &self,
         store: &mut crate::store::Store,
         network: &str,
         event: &AgentEvent,
-    ) -> Result<Option<(Value, String)>> {
-        let question_id = triage::session_question_id(&event.node, &event.session_id);
-        if let Some(standing) = store.question(network, &question_id)? {
-            if standing["answer"]["text"] == IGNORE {
-                lock(&self.triage.ignored).insert(event.session_id.clone());
-            }
+    ) -> Result<Option<String>> {
+        if event.session_id == NO_THREAD
+            || lock(&self.triage.background).contains(&event.session_id)
+        {
             return Ok(None);
         }
-        let mut choices = [IGNORE, HANDLE]
-            .map(|label| Choice {
-                label: label.into(),
-                conversation_id: None,
-            })
-            .to_vec();
-        for bot in store.bots(network)? {
-            let label = format!("交给 {}", bot.name.chars().take(100).collect::<String>());
-            if choices.len() < 8 && choices.iter().all(|choice| choice.label != label) {
-                choices.push(Choice {
-                    label,
-                    conversation_id: Some(bot.conversation_id),
-                });
-            }
-        }
-        let agent = match event.agent {
-            triage::Agent::Codex => "Codex",
-            triage::Agent::Claude => "Claude Code",
+        let Some(primary) = store.primary_bot(network)? else {
+            return Ok(None);
         };
-        let (question, event) = store.ask(
+        let written = store.claim_session(
             &self.identity,
             network,
-            SESSIONS_SCOPE,
-            EventBody::QuestionAsked {
-                question_id,
-                severity: Severity::Info,
-                text: format!("谁来接这个 {agent} 会话？"),
-                choices,
-                about: subject(event, None)?,
-            },
+            &primary,
+            &subject(event, None)?,
             now_ms(),
         )?;
-        Ok(event.map(|event| (question, event.hash)))
+        if let Some(written) = written {
+            tracing::info!(
+                event = "session.attributed",
+                conversation_id = primary,
+                thread_id = event.session_id,
+                "a session no bot started went to the primary bot"
+            );
+            self.publish_changed(network, &primary, Changed::Event(&written.hash));
+        }
+        Ok(Some(primary))
     }
 
     /// A server request the bridge handed over: held for the coordination Agent, or answered by
@@ -411,7 +379,7 @@ impl Runtime {
             source: triage::Source::AppServer,
             agent: triage::Agent::Codex,
             event: triage::Kind::NeedsInput,
-            session_id: request.thread_id.clone().unwrap_or("app-server".into()),
+            session_id: request.thread_id.clone().unwrap_or(NO_THREAD.into()),
             turn_id: format!("request:{request_id}"),
             cwd,
             detail: describe(&request.method, &request.params),
@@ -545,6 +513,14 @@ impl Runtime {
         match event["method"].as_str().unwrap_or_default() {
             "thread/started" => {
                 entry.0 = params["thread"]["cwd"].as_str().unwrap_or_default().into();
+                if !triage::interactive_codex(&params["thread"]["source"], None) {
+                    let mut background = lock(&self.triage.background);
+                    // ponytail: forget past 1024 threads, as above.
+                    if background.len() > 1024 {
+                        background.clear();
+                    }
+                    background.insert(thread);
+                }
             }
             "item/completed" if params["item"]["type"] == "agentMessage" => {
                 entry.1 = params["item"]["text"].as_str().unwrap_or_default().into();
@@ -599,9 +575,6 @@ impl Runtime {
                 }
                 if let Err(error) = node.send_answered().await {
                     tracing::warn!(%error, "could not tell the webhook about answers");
-                }
-                if let Err(error) = node.route_sessions().await {
-                    tracing::warn!(%error, "could not hand over answered sessions");
                 }
             }
         });
@@ -720,8 +693,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// `/api/triage`, the Agents' side: `requests`, `respond`, `events`, `raise`, `dismiss` and
-    /// `assign`.
+    /// `/api/triage`, the Agents' side: `requests`, `respond`, `events`, `raise` and `dismiss`.
     pub(crate) async fn triage_command(&self, input: Value) -> Result<Value> {
         let network = self.network_id().await?;
         let action = super::field(&input, "action")?;
@@ -746,31 +718,6 @@ impl Runtime {
             }
             return self
                 .answer_codex_request(request_id, Some(Ok(result)), "agent")
-                .await;
-        }
-        if action == "assign" {
-            let question = super::id(&input, "question_id")?;
-            let conversation = super::id(&input, "conversation_id")?;
-            let asked = self
-                .store
-                .lock()
-                .await
-                .question(&network, &question)?
-                .context("no such question")?;
-            // The device running the session hands it over; a routing turn may run elsewhere.
-            if let Some(node) = asked["about"]["node"].as_str()
-                && node != self.identity.device_id()?
-            {
-                return self
-                    .peer_request(
-                        &network,
-                        node,
-                        json!({"type":"triage_assign","question_id":question,"conversation_id":conversation}),
-                    )
-                    .await;
-            }
-            return self
-                .attribute_session(&network, &question, &conversation)
                 .await;
         }
         if action == "events" {
@@ -823,13 +770,7 @@ impl Runtime {
                     question_id: triage::question_id(&event.node, &event.event_id),
                     severity,
                     text: super::field(&input, "question")?.into(),
-                    choices: labels
-                        .into_iter()
-                        .map(|label| Choice {
-                            label,
-                            conversation_id: None,
-                        })
-                        .collect(),
+                    choices: labels.into_iter().map(|label| Choice { label }).collect(),
                     about: subject(&event, request_id)?,
                 };
                 self.raise(&network, &event, question).await?
@@ -959,132 +900,69 @@ impl Runtime {
         Ok(())
     }
 
-    /// `triage assign`: the session a session question is about goes to this bot, once.
-    pub(super) async fn attribute_session(
-        &self,
-        network: &str,
-        question: &str,
-        conversation: &str,
-    ) -> Result<Value> {
-        let (owner, event, session) = {
-            let mut store = self.store.lock().await;
-            let (owner, event) = store.attribute_session(
-                &self.identity,
-                network,
-                question,
-                conversation,
-                now_ms(),
-            )?;
-            let asked = store
-                .question(network, question)?
-                .context("question missing")?;
-            (
-                owner,
-                event,
-                asked["about"]["session_id"]
+    /// `session_owner`: the user hands a session a bot owns to another bot, or stops following
+    /// it when `conversation_id` is null. The device running the session writes the change.
+    pub(super) async fn set_session_owner(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user hands sessions over");
+        let node = super::field(input, "node")?;
+        let session = super::field(input, "session_id")?;
+        let target = match &input["conversation_id"] {
+            Value::Null => None,
+            value => Some(
+                value
                     .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            )
+                    .context("conversation_id is a bot's conversation or null")?,
+            ),
         };
-        self.forget_ignored(&session);
-        if let Some(event) = &event {
-            tracing::info!(
-                event = "session.attributed",
-                conversation_id = owner,
-                question_id = question,
-                "session handed to a bot"
-            );
-            self.publish_changed(network, &owner, Changed::Event(&event.hash));
+        if node != self.identity.device_id()? {
+            return self
+                .peer_request(
+                    &access.network_id,
+                    node,
+                    json!({"type":"session_owner","session_id":session,"conversation_id":target,"human":true}),
+                )
+                .await;
         }
-        Ok(json!({"question_id":question,"conversation_id":owner,"attributed":event.is_some()}))
+        self.hand_over_session(&access.network_id, session, target)
+            .await
     }
 
-    /// Acts on answered questions about sessions no bot owns yet, except `忽略`. The device
-    /// running the session hands it to a `交给` choice, or to the primary bot once that
-    /// bot's routing turn replied without handing it over, or after `ROUTE_WITHIN`. The
-    /// Node scheduling the primary bot gives every other answer one routing turn there.
-    async fn route_sessions(&self) -> Result<()> {
-        let Ok(network) = self.network_id().await else {
-            return Ok(());
-        };
-        let local = self.identity.device_id()?;
-        let answered: Vec<(String, String, String, i64)> = {
-            let store = self.store.lock().await;
-            let mut statement = store.connection.prepare(
-                "SELECT q.question_id,m.text,q.node,m.created_at_ms FROM questions q
-                 JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id
-                 WHERE q.network_id=?1 AND q.conversation_id=?2 AND m.text<>?3
-                 AND NOT EXISTS(SELECT 1 FROM session_owners o WHERE o.network_id=q.network_id AND o.node=q.node AND o.session_id=q.session_id)
-                 ORDER BY q.rank",
-            )?;
-            statement
-                .query_map(params![network, SESSIONS_SCOPE, IGNORE], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        for (question_id, answer, node, answered_at) in answered {
-            let (question, primary) = {
-                let store = self.store.lock().await;
-                (
-                    store
-                        .question(&network, &question_id)?
-                        .context("question missing")?,
-                    store.primary_bot(&network)?,
-                )
-            };
-            let Some(primary) = primary else {
-                tracing::info!(question = %question_id, "no bot to hand the session to yet");
-                continue;
-            };
-            let chosen = question["choices"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|choice| choice["label"] == answer.as_str())
-                .and_then(|choice| choice["conversation_id"].as_str());
-            if node == local {
-                if let Some(conversation) = chosen {
-                    self.attribute_session(&network, &question_id, conversation)
-                        .await?;
-                    continue;
-                }
-                let replied = self.store.lock().await.connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=? AND role='assistant' AND in_reply_to=?)",
-                    params![network, primary, question_id],
-                    |r| r.get::<_, bool>(0),
-                )?;
-                if replied || now_ms() - answered_at > ROUTE_WITHIN.as_millis() as i64 {
-                    tracing::info!(
-                        event = "session.routing",
-                        question_id,
-                        conversation_id = primary,
-                        replied,
-                        "the primary bot keeps the session"
-                    );
-                    self.attribute_session(&network, &question_id, &primary)
-                        .await?;
-                    continue;
-                }
-            }
-            if chosen.is_none()
-                && self
-                    .store
-                    .lock()
-                    .await
-                    .admit_route(&local, &network, &primary, &question_id)?
-            {
-                tracing::info!(
-                    event = "session.routing",
-                    question_id,
-                    conversation_id = primary,
-                    "routing a session in the primary bot's chat"
-                );
-                self.wake_scheduler()?;
+    /// Hands a session this device runs to `target`, or mutes it when `None`; a repeat writes
+    /// nothing.
+    pub(super) async fn hand_over_session(
+        &self,
+        network: &str,
+        session: &str,
+        target: Option<&str>,
+    ) -> Result<Value> {
+        let (before, event) = self.store.lock().await.hand_over_session(
+            &self.identity,
+            network,
+            session,
+            target,
+            now_ms(),
+        )?;
+        let owner = target.unwrap_or(&before);
+        if let Some(event) = &event {
+            tracing::info!(
+                event = if target.is_some() {
+                    "session.attributed"
+                } else {
+                    "session.muted"
+                },
+                conversation_id = owner,
+                thread_id = session,
+                "the user changed who follows a session"
+            );
+            self.publish_changed(network, owner, Changed::Event(&event.hash));
+            if owner != before {
+                self.publish_changed(network, &before, Changed::Reload);
             }
         }
-        Ok(())
+        Ok(
+            json!({"session_id":session,"conversation_id":owner,"muted":target.is_none(),
+            "changed":event.is_some()}),
+        )
     }
 
     fn decision_url(&self) -> String {
@@ -1154,6 +1032,7 @@ impl Runtime {
         }
         // Scan marks advance only once scanned events can be queued, which needs a network.
         self.network_id().await?;
+        // The coordination Agent's threads stay known: one forgotten would go to the primary bot.
         {
             let store = self.store.lock().await;
             let cutoff = now_ms() - SEEN_TTL_MS;
@@ -1163,10 +1042,6 @@ impl Runtime {
             store
                 .connection
                 .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
-            store.connection.execute(
-                "DELETE FROM coordination_threads WHERE created_ms<?",
-                [cutoff],
-            )?;
         }
         if !self.triage.config().scan_codex_sessions {
             return Ok(());
@@ -1357,7 +1232,7 @@ impl Runtime {
         Ok(json!({"questions":self.store.lock().await.unanswered_questions(&access.network_id)?}))
     }
 
-    /// The user's answer, signed by their device, to a question in any chat or about a session.
+    /// The user's answer, signed by their device, to a question in any chat.
     pub(super) async fn answer_question(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "only the user answers questions");
         let answered = self
@@ -1375,7 +1250,7 @@ impl Runtime {
     }
 
     /// Posts the one answer to a question; the conversation's owner turns it into an `answer`
-    /// turn, and the device running a session question's session acts on it.
+    /// turn.
     async fn post_answer(
         &self,
         network: &str,
@@ -2011,66 +1886,143 @@ mod tests {
         }
     }
 
-    /// A session no bot started is asked about once; `忽略` keeps it quiet, `交给` and
-    /// `处理` hand it over exactly once, and its later questions go to that bot's chat.
+    /// How many times a session was attributed in `scope`.
+    async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
+        let network = node.network_id().await?;
+        let context = node.store.lock().await.context(&network, scope, None)?;
+        Ok(context
+            .events
+            .iter()
+            .filter(|event| matches!(event.event.body, EventBody::SessionAttributed { .. }))
+            .count())
+    }
+
+    async fn owner_of(node: &Runtime, session: &str) -> Result<Option<String>> {
+        let network = node.network_id().await?;
+        let local = node.identity.device_id()?;
+        node.store
+            .lock()
+            .await
+            .session_owner(&network, &local, session)
+    }
+
+    fn the_user(network: &str) -> Access {
+        Access {
+            network_id: network.into(),
+            human: true,
+            conversation_id: None,
+            manager: None,
+        }
+    }
+
+    /// A session no bot started goes to the primary bot once, however often it reports and
+    /// whichever bot is primary later; nobody is asked whose it is. The user hands it to
+    /// another bot, whose chat its next question goes to, or stops following it.
     #[tokio::test]
-    async fn a_foreign_session_is_asked_about_once_and_handed_over_once() -> Result<()> {
+    async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "d", "后端", &[]).await?;
             let network = node.network_id().await?;
             let local = node.identity.device_id()?;
-            let queued = |node: Arc<Runtime>| async move {
-                Ok::<_, anyhow::Error>(node.triage_command(json!({"action":"events"})).await?["events"].as_array().unwrap().len())
-            };
-            for (session, step) in [("s1", "t1"), ("s1", "t2"), ("s2", "t1"), ("s3", "t1")] {
-                assert_eq!(node.ingest_agent_event(turn(session, step, "/w")).await?["status"], "foreign");
+            for step in ["t1", "t2"] {
+                let queued = node.ingest_agent_event(turn("s1", step, "/w")).await?;
+                assert_eq!(queued["status"], "accepted");
             }
-            assert_eq!(queued(node.clone()).await?, 0);
-            let asked = unanswered(&node).await?;
-            assert_eq!(asked.len(), 3, "one question per session");
-            let s1 = triage::session_question_id(&local, "s1");
-            let first = asked.iter().find(|q| q["question_id"] == s1.as_str()).unwrap();
-            assert_eq!(first["conversation_id"], Value::Null);
-            assert_eq!(first["text"], "谁来接这个 Codex 会话？");
-            assert_eq!(first["about"]["summary"], "tests fail");
+            let again = node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            assert_eq!(again["status"], "duplicate");
+            assert!(unanswered(&node).await?.is_empty(), "nobody is asked whose it is");
+            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("c"));
+            assert_eq!((attributions(&node, "c").await?, attributions(&node, "d").await?), (1, 0));
+            let lines = node.store.lock().await.attributed_sessions(&network, "c")?;
             assert_eq!(
-                first["choices"],
-                json!([{"label":"忽略"},{"label":"处理"},{"label":"交给 前端","conversation_id":"c"}])
+                (lines[0]["session_id"].clone(), lines[0]["summary"].clone(), lines[0]["muted"].clone()),
+                (json!("s1"), json!("tests fail"), json!(false))
             );
 
-            let s2 = triage::session_question_id(&local, "s2");
-            assert_eq!(answer(&node, &s2, "忽略").await?, "answered");
-            assert_eq!(answer(&node, &s1, "交给 前端").await?, "answered");
-            assert_eq!(answer(&node, &triage::session_question_id(&local, "s3"), "处理").await?, "answered");
-            node.route_sessions().await?;
-            node.route_sessions().await?;
-            let owner = |session: &'static str| {
-                let node = node.clone();
-                let network = network.clone();
-                let local = local.clone();
-                async move { node.store.lock().await.session_owner(&network, &local, session) }
-            };
-            assert_eq!(owner("s1").await?.as_deref(), Some("c"));
-            assert_eq!(owner("s3").await?, None, "处理 waits for the primary bot's routing turn");
-            assert_eq!(owner("s2").await?, None);
-            let again = node.triage_command(json!({"action":"assign","question_id":s1,"conversation_id":"other"})).await?;
-            assert_eq!((again["conversation_id"].clone(), again["attributed"].clone()), (json!("c"), json!(false)));
-            let handed = node.store.lock().await.attributed_sessions(&network, "c")?;
-            assert_eq!(handed.iter().map(|s| s["session_id"].clone()).collect::<Vec<_>>(), vec![json!("s1")]);
+            let set = admin.attest(
+                &network,
+                crate::model::BOTS_SCOPE,
+                EventBody::PrimaryBotSet {
+                    conversation_id: "d".into(),
+                    attestation: None,
+                },
+            )?;
+            node.store.lock().await.append_event(
+                &node.identity,
+                &network,
+                crate::model::BOTS_SCOPE,
+                set,
+                vec![],
+                now_ms(),
+            )?;
+            node.ingest_agent_event(turn("s1", "t3", "/w")).await?;
+            node.ingest_agent_event(turn("s2", "t1", "/w")).await?;
+            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("c"), "an owner stands");
+            assert_eq!(owner_of(&node, "s2").await?.as_deref(), Some("d"), "the next goes to the new primary");
+            assert_eq!(attributions(&node, "c").await?, 1);
 
-            assert_eq!(node.ingest_agent_event(turn("s2", "t2", "/w")).await?["status"], "foreign");
-            let accepted = node.ingest_agent_event(turn("s1", "t3", "/w")).await?;
-            assert_eq!(accepted["status"], "accepted");
-            assert_eq!(queued(node.clone()).await?, 1);
-            assert!(unanswered(&node).await?.is_empty(), "no new question about an ignored session");
+            let hand = json!({"node":local,"session_id":"s1","conversation_id":"d"});
+            let not_user = Access { human: false, ..the_user(&network) };
+            assert!(node.set_session_owner(&not_user, &hand).await.is_err());
+            let moved = node.set_session_owner(&the_user(&network), &hand).await?;
+            assert_eq!((moved["conversation_id"].clone(), moved["changed"].clone()), (json!("d"), json!(true)));
+            let retried = node.set_session_owner(&the_user(&network), &hand).await?;
+            assert_eq!(retried["changed"], false, "a retried hand-over writes nothing");
+            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("d"));
+            assert!(node.store.lock().await.attributed_sessions(&network, "c")?.is_empty());
+
+            let accepted = node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
             let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
-            let raised = node.triage_command(raise).await?;
-            assert_eq!(raised["conversation_id"], "c");
-            let chat = node.store.lock().await.conversation_questions(&network, "c")?;
-            assert_eq!(chat.len(), 1);
-            assert_eq!((chat[0]["bot"]["name"].clone(), chat[0]["about"]["session_id"].clone()), (json!("前端"), json!("s1")));
+            assert_eq!(node.triage_command(raise).await?["conversation_id"], "d");
+
+            let mute = json!({"node":local,"session_id":"s1","conversation_id":null});
+            let muted = node.set_session_owner(&the_user(&network), &mute).await?;
+            assert_eq!((muted["muted"].clone(), muted["changed"].clone()), (json!(true), json!(true)));
+            assert_eq!(node.set_session_owner(&the_user(&network), &mute).await?["changed"], false);
+            let quiet = node.ingest_agent_event(turn("s1", "t5", "/w")).await?;
+            assert_eq!(quiet["status"], "muted");
+            assert!(
+                node.pending_events().await?.iter().all(|event| event.event_id != quiet["event_id"]),
+                "a muted session's events drop"
+            );
+            assert_eq!(attributions(&node, "c").await?, 1, "a muted session is not claimed again");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// Without a bot nothing gets an owner and a request falls back at once; a thread nobody
+    /// drives (`codex exec`, a sub-agent) is never given to a bot.
+    #[tokio::test]
+    async fn unattended_sessions_get_no_owner() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            let (mut server, handed) = app_server(&node).await?;
+            node.on_codex_request(&handed).await;
+            assert_eq!(
+                answered_once(&mut server).await["result"],
+                json!({"decision":"decline"})
+            );
+            let status = node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            assert_eq!(status["status"], "foreign");
+            assert_eq!(owner_of(&node, "s1").await?, None);
+
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            node.triage_app_server(&json!({"method":"thread/started","params":{"thread":
+                {"id":"sub","cwd":"/w","source":{"subAgent":"review"}}}}));
+            let status = node.ingest_agent_event(turn("sub", "t1", "/w")).await?;
+            assert_eq!(status["status"], "foreign");
+            assert_eq!(owner_of(&node, "sub").await?, None);
+            let status = node.ingest_agent_event(turn("s1", "t2", "/w")).await?;
+            assert_eq!(status["status"], "accepted");
+            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("c"));
+            assert_eq!(attributions(&node, "c").await?, 1);
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -2290,6 +2242,16 @@ mod tests {
                 }
             });
             node.coordination_turn(|_| Ok("triage".into())).await?;
+            // A week later the scan's cleanup still knows the thread.
+            *node.triage.config.lock().unwrap() = TriageConfig {
+                scan_codex_sessions: false,
+                ..Default::default()
+            };
+            node.store.lock().await.connection.execute(
+                "UPDATE coordination_threads SET created_ms=?",
+                [now_ms() - 8 * 24 * 3600 * 1000],
+            )?;
+            node.scan_sources().await?;
 
             let ended = node
                 .ingest_agent_event(turn("coord-thread", "coord-turn", "/tmp"))
@@ -2302,248 +2264,10 @@ mod tests {
             assert_eq!(node.queue_event(held).await?["status"], "own");
             assert!(unanswered(&node).await?.is_empty(), "no question about it");
             assert!(node.pending_events().await?.is_empty(), "nothing queued");
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        cleanup(node, dir).await?;
-        result
-    }
-
-    /// Ends the routing turn queued in `conversation` for `question` without a hand-over.
-    async fn end_routing_turn(node: &Runtime, conversation: &str, question: &str) -> Result<()> {
-        let network = node.network_id().await?;
-        let trigger = crate::scheduling::route_trigger(question);
-        let mut store = node.store.lock().await;
-        let claimed = store
-            .claim_next(&node.identity, &network, conversation, "boot", "cfg")?
-            .context("no routing turn queued")?;
-        assert_eq!(claimed.job.trigger, trigger);
-        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
-        store.mark_started(conversation, &trigger, &attempt)?;
-        store.finish_job(
-            &node.identity,
-            &network,
-            conversation,
-            &trigger,
-            &attempt,
-            crate::scheduling::JobOutcome::Failed("no answer".into()),
-            "",
-            now_ms(),
-        )?;
-        Ok(())
-    }
-
-    /// `处理` gives the primary bot one routing turn in its chat. A turn that ends without
-    /// a hand-over leaves the session with the primary; a hand-over shows in both chats. Picking
-    /// another primary sends the next session there.
-    #[tokio::test]
-    async fn an_unowned_session_goes_to_the_primary_bot() -> Result<()> {
-        let (node, admin, dir) = node().await?;
-        let result = async {
-            with_agent(&node);
-            bot(&node, &admin, "c", "前端", &[]).await?;
-            bot(&node, &admin, "d", "后端", &[]).await?;
-            let network = node.network_id().await?;
-            let local = node.identity.device_id()?;
-            let owner = |session: &'static str| {
-                let node = node.clone();
-                let network = network.clone();
-                let local = local.clone();
-                async move {
-                    node.store
-                        .lock()
-                        .await
-                        .session_owner(&network, &local, session)
-                }
-            };
-            let handle = |session: &'static str| {
-                let node = node.clone();
-                let question = triage::session_question_id(&local, session);
-                async move {
-                    node.ingest_agent_event(turn(session, "t1", "/w")).await?;
-                    assert_eq!(answer(&node, &question, "处理").await?, "answered");
-                    node.route_sessions().await?;
-                    node.route_sessions().await?;
-                    Ok::<_, anyhow::Error>(question)
-                }
-            };
-            let routing = |conversation: &'static str| {
-                let node = node.clone();
-                async move {
-                    let jobs = node.store.lock().await.scheduler_jobs(conversation)?;
-                    Ok::<_, anyhow::Error>(
-                        jobs.into_iter().map(|job| job.trigger).collect::<Vec<_>>(),
-                    )
-                }
-            };
-
-            let s1 = handle("s1").await?;
             assert_eq!(
-                routing("c").await?,
-                vec![crate::scheduling::route_trigger(&s1)],
-                "one routing turn in the first bot's chat"
-            );
-            assert_eq!(owner("s1").await?, None);
-            end_routing_turn(&node, "c", &s1).await?;
-            node.route_sessions().await?;
-            assert_eq!(
-                owner("s1").await?.as_deref(),
-                Some("c"),
-                "the primary keeps a session its turn did not hand over"
-            );
-
-            let s2 = handle("s2").await?;
-            node.triage_command(json!({"action":"assign","question_id":s2,"conversation_id":"d"}))
-                .await?;
-            end_routing_turn(&node, "c", &s2).await?;
-            node.route_sessions().await?;
-            assert_eq!(
-                owner("s2").await?.as_deref(),
-                Some("d"),
-                "the routing turn handed it over"
-            );
-            let lines = |conversation: &'static str| {
-                let node = node.clone();
-                let network = network.clone();
-                async move {
-                    let rows = node
-                        .store
-                        .lock()
-                        .await
-                        .attributed_sessions(&network, conversation)?;
-                    Ok::<_, anyhow::Error>(
-                        rows.iter()
-                            .map(|row| (row["session_id"].clone(), row["conversation_id"].clone()))
-                            .collect::<Vec<_>>(),
-                    )
-                }
-            };
-            assert_eq!(
-                lines("c").await?,
-                vec![(json!("s1"), json!("c")), (json!("s2"), json!("d"))],
-                "the primary's chat shows both outcomes"
-            );
-            assert_eq!(lines("d").await?, vec![(json!("s2"), json!("d"))]);
-
-            let set = admin.attest(
-                &network,
-                crate::model::BOTS_SCOPE,
-                EventBody::PrimaryBotSet {
-                    conversation_id: "d".into(),
-                    attestation: None,
-                },
-            )?;
-            node.store.lock().await.append_event(
-                &node.identity,
-                &network,
-                crate::model::BOTS_SCOPE,
-                set,
-                vec![],
-                now_ms(),
-            )?;
-            let s3 = handle("s3").await?;
-            assert_eq!(
-                routing("d").await?,
-                vec![crate::scheduling::route_trigger(&s3)],
-                "the next session goes to the new primary"
-            );
-            let text = "发票导出\n很慢";
-            let posted = admin.attest(
-                &network,
-                "c",
-                EventBody::MessagePosted {
-                    message_id: "m1".into(),
-                    role: crate::model::Role::User,
-                    text: text.into(),
-                    attachments: vec![],
-                    report_results: Some(true),
-                    in_reply_to: None,
-                    status: None,
-                    answers: None,
-                    attestation: None,
-                },
-            )?;
-            let signed = posted.attestation().cloned().context("signed")?;
-            node.store.lock().await.accept_message(
-                &node.identity,
-                &network,
-                "c",
-                "m1",
-                text,
-                vec![],
-                true,
-                signed,
-                now_ms(),
-            )?;
-            let context =
-                crate::scheduler::route_context(&*node.store.lock().await, &network, "d", &s3)?;
-            assert_eq!(
-                (
-                    context["question"]["question_id"].clone(),
-                    context["question"]["answer"]["text"].clone()
-                ),
-                (json!(s3), json!("处理"))
-            );
-            let others = context["bots"].as_array().context("bots")?;
-            assert_eq!(others.len(), 1, "the routing turn sees every other bot");
-            assert_eq!(
-                (
-                    others[0]["conversation_id"].clone(),
-                    others[0]["name"].clone(),
-                    others[0]["project"].clone()
-                ),
-                (json!("c"), json!("前端"), Value::Null)
-            );
-            assert_eq!(
-                others[0]["recent"]
-                    .as_array()
-                    .and_then(|recent| recent.last()),
-                Some(&json!({"role":"user","text":"发票导出 很慢"})),
-                "with what its chat said last"
-            );
-            end_routing_turn(&node, "d", &s3).await?;
-            node.route_sessions().await?;
-            assert_eq!(owner("s3").await?.as_deref(), Some("d"));
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        cleanup(node, dir).await?;
-        result
-    }
-
-    /// An ignored session's events drop without waiting for the store; once the session is
-    /// handed over they reach the Agent again.
-    #[tokio::test]
-    async fn an_ignored_session_drops_its_events_without_the_store() -> Result<()> {
-        let (node, admin, dir) = node().await?;
-        let result = async {
-            with_agent(&node);
-            bot(&node, &admin, "c", "前端", &[]).await?;
-            let question = triage::session_question_id(&node.identity.device_id()?, "s1");
-            node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
-            assert_eq!(answer(&node, &question, "忽略").await?, "answered");
-            assert_eq!(
-                node.ingest_agent_event(turn("s1", "t2", "/w")).await?["status"],
-                "foreign"
-            );
-            let busy = node.store.lock().await;
-            let dropped = tokio::time::timeout(
-                Duration::from_secs(2),
-                node.ingest_agent_event(turn("s1", "t3", "/w")),
-            )
-            .await;
-            drop(busy);
-            assert_eq!(
-                dropped.context("an ignored session's event waited for the store")??["status"],
-                "foreign"
-            );
-            node.triage_command(
-                json!({"action":"assign","question_id":question,"conversation_id":"c"}),
-            )
-            .await?;
-            assert_eq!(
-                node.ingest_agent_event(turn("s1", "t4", "/w")).await?["status"],
-                "accepted"
+                owner_of(&node, "coord-thread").await?,
+                None,
+                "no bot is given it"
             );
             Ok::<_, anyhow::Error>(())
         }
@@ -2668,9 +2392,10 @@ mod tests {
 
     #[tokio::test]
     async fn decision_tokens_answer_questions_once_and_are_revocable() -> Result<()> {
-        let (node, _, dir) = node().await?;
+        let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
+            bot(&node, &admin, "c", "前端", &["s1"]).await?;
             let created = node.create_decision_token("grok").await?;
             let token = created["token"].as_str().unwrap().to_owned();
             let stored = std::fs::read_to_string(dir.join(DECISION_TOKENS))?;
@@ -2680,9 +2405,13 @@ mod tests {
             );
             assert!(!node.triage_settings().await?.to_string().contains(&token));
             assert!(node.decision_token_valid(&token) && !node.decision_token_valid("vfd_wrong"));
-            node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            let event = node.ingest_agent_event(turn("s1", "t1", "/w")).await?;
+            let raised = node
+                .triage_command(json!({"action":"raise","event_id":event["event_id"],
+                    "severity":"attention","question":"要修吗？","choices":["修","不修"]}))
+                .await?;
             let device = node.identity.device_id()?;
-            let question = triage::session_question_id(&device, "s1");
+            let question = raised["question_id"].as_str().unwrap().to_owned();
             let decision = json!({"device_id":device,"question_id":question,"choice":0});
             let refused = node
                 .decision_http("vfd_wrong", decision.clone())
@@ -2693,7 +2422,7 @@ mod tests {
             assert_eq!(
                 answered,
                 json!({"question_id":question,"answer_id":format!("a-{question}"),
-                "status":"answered","text":"忽略"})
+                "status":"answered","text":"修"})
             );
             assert_eq!(
                 node.decision_http(&token, decision).await?,
@@ -2703,12 +2432,12 @@ mod tests {
             let other = node
                 .decision_http(
                     &token,
-                    json!({"device_id":device,"question_id":question,"text":"处理"}),
+                    json!({"device_id":device,"question_id":question,"text":"不修"}),
                 )
                 .await?;
             assert_eq!(
                 (other["status"].clone(), other["text"].clone()),
-                (json!("already_answered"), json!("忽略"))
+                (json!("already_answered"), json!("修"))
             );
             assert!(unanswered(&node).await?.is_empty());
             node.revoke_decision_token(created["token_id"].as_str().unwrap())

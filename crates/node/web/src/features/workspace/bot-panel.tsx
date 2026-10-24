@@ -2,8 +2,9 @@
 
 import { useRef, useState, type ReactNode } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Cpu, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Server, Star, Trash2, type LucideIcon } from "lucide-react"
+import { AlarmClock, BookOpen, CalendarClock, CirclePause, Cpu, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Server, Star, Trash2, type LucideIcon } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { BotAvatar } from "@/components/app/kit"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
@@ -49,8 +50,8 @@ export function BotPanelButton() {
   const models = Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   return <>
-    <Button ref={trigger} type="button" variant="ghost" size="icon" className="shrink-0 rounded-full bg-muted text-muted-foreground hover:bg-accent" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
-      <Bot aria-hidden="true" />
+    <Button ref={trigger} type="button" variant="ghost" size="icon" className="-ms-1 shrink-0 rounded-lg hover:bg-transparent hover:brightness-95 dark:hover:brightness-110" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
+      <BotAvatar id={bot.bot_id} name={bot.name} />
     </Button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>

@@ -10,7 +10,7 @@ const message = (message_id: string, lamport: number) => ({ message_id, role: "u
 const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
   work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", ...extra,
 })
-const question = (question_id: string, conversation_id: string | null, answer: unknown = null) => ({
+const question = (question_id: string, conversation_id: string, answer: unknown = null) => ({
   question_id, conversation_id, bot: null, severity: "info", text: "?", choices: [],
   about: { node: "n", agent: "codex", session_id: "s", cwd: "/", summary: "" }, author: "n", created_at_ms: 1, answer,
 })
@@ -61,9 +61,9 @@ test("pushed records update the network-wide lists for their conversation only",
     notifications: [{ notification_id: "n2", kind: "question", text: "?", conversation_id: "chat" }],
     last_message: { text: "hi", role: "assistant", created_at_ms: 5 },
   })
-  const questions = mergeQuestions(parseQuestions({ questions: [question("old", "chat"), question("other", "other"), question("session", null)] }), pushed)
-  assert.deepEqual(questions.map((item) => item.question_id), ["other", "session", "open"], "answered ones leave the list")
-  assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "sessions", questions: [] }).map((item) => item.question_id), ["other", "open"])
+  const questions = mergeQuestions(parseQuestions({ questions: [question("old", "chat"), question("other", "other")] }), pushed)
+  assert.deepEqual(questions.map((item) => item.question_id), ["other", "open"], "answered ones leave the list")
+  assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "other", questions: [] }).map((item) => item.question_id), ["open"])
   const notifications = mergeNotifications([{ notification_id: "n1", kind: "question", text: "", conversation_id: "chat" }, { notification_id: "x", kind: "question", text: "", conversation_id: "other" }], pushed)
   assert.deepEqual(notifications.map((item) => item.notification_id), ["x", "n2"])
   const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, event_hash: "", last_message: null }], pushed)
@@ -80,9 +80,23 @@ test("a work waits for confirmation only once its device cannot report it", () =
   assert.equal(confirmReason({ ...running, kind: "task" }, node(true, false)), null, "a task does not need the App Server")
   assert.equal(confirmReason({ ...running, state: "unverified", outcome: "unverified" }, node(true, true)), "unverified")
   let open = mergeOpenWorks([], records({ works: [work("w1")] }))
-  assert.deepEqual(workChecks(open, node(false)).map((item) => [item.check_id, item.conversation_id, item.reason]), [["work:w1", "chat", "offline"]])
+  assert.deepEqual(workChecks(open, node(false)).map((item) => item.kind === "work" && [item.check_id, item.conversation_id, item.reason]), [["work:w1", "chat", "offline"]])
   open = mergeOpenWorks(open, records({ works: [work("w1", { state: "finished", outcome: "interrupted" })] }))
   assert.equal(open.length, 0, "a settled work leaves the list")
+})
+
+test("works one offline device holds wait on one card; an unverified one keeps its own", () => {
+  const nodes: NodeInfo[] = [
+    { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, relay: false, roots: [] } },
+    { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, relay: false, roots: [], codex_connected: false } },
+  ]
+  const open = mergeOpenWorks([], records({ works: [
+    work("w1"), work("w2", { state: "unverified", outcome: "unverified" }), work("w3", { target_node: "mac" }), work("w4"), work("w5", { target_node: "mac" }),
+  ] }))
+  const checks = workChecks(open, nodes)
+  assert.deepEqual(checks.map((item) => [item.check_id, item.kind === "device" ? item.works.map((one) => one.work_id) : item.kind]), [
+    ["device:worker:offline", ["w1", "w4"]], ["work:w2", "work"], ["device:mac:disconnected", ["w3", "w5"]],
+  ])
 })
 
 test("a change the Node cannot map reloads only its conversation", () => {

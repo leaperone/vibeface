@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { cn } from 'cn'
-import { Details, DetailRow, EmptyState, InlineError, SafetyCode, Skeleton } from '@/components/app/kit'
+import { Details, DetailRow, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, Wordmark } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -65,20 +65,6 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
   </div>
 }
 
-
-function Steps({ step }: { step: number }) {
-  return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1.5" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn('size-2 rounded-full', item <= step ? 'bg-foreground' : 'bg-muted-foreground/30')} />)}</span>
-    <span className="sr-only">第 {step} 步，共 4 步</span>
-  </div>
-}
-
-function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-xl border bg-card p-5">
-    <h2 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h2>
-    {children}
-  </section>
-}
 
 const REJOIN = `vibeface service stop
 mv ~/.vibeface ~/.vibeface-removed-$(date +%Y%m%d-%H%M%S)
@@ -287,7 +273,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         {thisComputer
           ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
           : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Field>}
-        {purpose === 'link' ? <Button type="submit" className="w-fit">{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
+        {purpose === 'link' ? <Button type="submit" className="w-fit" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
     <p className="text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>
@@ -295,9 +281,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </Panel>
 
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
-    <div className="mx-auto grid w-full max-w-md gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:py-16">
+    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:min-h-full sm:content-center sm:py-16">
       <header className="grid gap-3">
-        <span className="text-heading font-semibold tracking-tight">Vibeface</span>
+        <Wordmark />
         {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
         {step ? <Steps step={step} /> : null}
       </header>
@@ -370,7 +356,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
         </Field>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
-          <Button type="submit">{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
+          <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>
         </div>
       </fieldset>
     </form>
@@ -400,7 +386,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
-      <Button type="button" disabled={!saved || busy} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
+      <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
     </div>
   </Panel>
 }

@@ -1,14 +1,8 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import type { Question } from "./types.ts"
 
-/** Questions about sessions no bot started live here, and their answers are signed for it. */
-export const SESSIONS_SCOPE = "sessions"
-
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
-
-/** Answers are signed for the question's chat, or for sessions. */
-export const answerScope = (question: Pick<Question, "conversation_id">) => question.conversation_id ?? SESSIONS_SCOPE
 
 /** The message the Node writes for an answer, exactly as this browser signs it. */
 export function answerBody(questionId: string, text: string) {

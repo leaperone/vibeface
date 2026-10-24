@@ -67,20 +67,24 @@ pub(crate) const TABLES: [&str; 16] = [
     "session_owners",
 ];
 
-/// The first record of a session by rank decides which bot owns it.
-#[allow(clippy::too_many_arguments)]
+/// Who owns a session, in any order the records arrive: the latest attribution or mute by
+/// rank, or else the first work bound to it.
 fn own_session(
     connection: &Connection,
     network: &str,
-    node: &str,
-    session: &str,
+    (node, session): (&str, &str),
     scope: &str,
     rank: &str,
     attribution: Option<String>,
     created_at_ms: i64,
 ) -> Result<()> {
+    let wins = if attribution.is_some() {
+        "attribution IS NULL OR excluded.rank>rank"
+    } else {
+        "attribution IS NULL AND excluded.rank<rank"
+    };
     connection.execute(
-        "INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,node,session_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,attribution=excluded.attribution,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+        &format!("INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,muted,created_at_ms) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(network_id,node,session_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,attribution=excluded.attribution,muted=0,created_at_ms=excluded.created_at_ms WHERE {wins}"),
         params![network, node, session, scope, rank, attribution, created_at_ms],
     )?;
     Ok(())
@@ -200,8 +204,7 @@ pub(crate) fn apply(
                 own_session(
                     connection,
                     network,
-                    &event.author,
-                    thread_id,
+                    (&event.author, thread_id),
                     scope,
                     rank,
                     None,
@@ -272,9 +275,7 @@ pub(crate) fn apply(
                 "INSERT INTO questions(network_id,question_id,conversation_id,event_hash,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
                 params![network, question_id, scope, hash, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
             )?;
-            if scope != SESSIONS_SCOPE {
-                notify(connection, network, hash, scope, "question", question, rank)?;
-            }
+            notify(connection, network, hash, scope, "question", question, rank)?;
         }
         EventBody::SessionAttributed {
             node,
@@ -282,18 +283,23 @@ pub(crate) fn apply(
             session_id,
             cwd,
             summary,
-            question_id,
         } => {
-            let attribution = serde_json::json!({"agent":agent,"cwd":cwd,"summary":summary,"question_id":question_id});
+            let attribution = serde_json::json!({"agent":agent,"cwd":cwd,"summary":summary});
             own_session(
                 connection,
                 network,
-                node,
-                session_id,
+                (node, session_id),
                 scope,
                 rank,
                 Some(attribution.to_string()),
                 event.created_at_ms,
+            )?;
+        }
+        // Follows the attribution it mutes in its author's log, so that row is already here.
+        EventBody::SessionMuted { node, session_id } => {
+            connection.execute(
+                "UPDATE session_owners SET muted=1,rank=?1,created_at_ms=?2 WHERE network_id=?3 AND node=?4 AND session_id=?5 AND conversation_id=?6 AND attribution IS NOT NULL AND ?1>rank",
+                params![rank, event.created_at_ms, network, node, session_id, scope],
             )?;
         }
         EventBody::BotChanged {

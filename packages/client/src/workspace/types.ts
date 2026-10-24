@@ -94,10 +94,12 @@ export type ConversationRecords = {
 }
 /**
  * What only the person can settle; nothing is resent.
- * `work`: a work waiting for the person's confirmation, answered completed or interrupted. `process`: a coordination process the person confirms stopped.
+ * `work`: a work waiting for the person's confirmation, answered completed or interrupted. `device`: several works one offline
+ * device or one disconnected Codex cannot report, settled one by one on a single card. `process`: a coordination process the person confirms stopped.
  */
 export type PendingCheck =
   | { kind: "work"; check_id: string; detail: string; work_id: string; target_node: string; conversation_id: string; title: string; reason: ConfirmReason }
+  | { kind: "device"; check_id: string; detail: string; target_node: string; reason: "offline" | "disconnected"; works: Extract<PendingCheck, { kind: "work" }>[] }
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
 export type FieldEdit = { before: string; after: string }
@@ -166,16 +168,12 @@ export type PendingBot = CreateBotRequest & {
 export type Severity = "info" | "attention" | "urgent"
 /** The device, project and session a question is about. `agent` is "codex" or "claude". */
 export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
-/** `conversation_id` only on a session question: choosing it hands the session to that bot. */
-export type QuestionChoice = { label: string; conversation_id?: string }
+export type QuestionChoice = { label: string }
 export type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
-/**
- * Something only the person can settle, asked in a bot's chat. `conversation_id` null: a session no bot
- * started, shown in 待处理 only. Text answers are always allowed; a choice answers with its label.
- */
+/** Something only the person can settle, asked in a bot's chat. Text answers are always allowed; a choice answers with its label. */
 export type Question = {
   question_id: string
-  conversation_id: string | null
+  conversation_id: string
   bot: { bot_id: string; name: string } | null
   severity: Severity
   text: string
@@ -189,8 +187,8 @@ export type Question = {
 export type AnswerResult = { status: "answered" | "already_answered"; text: string }
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
-/** A session handed to this bot, shown where it happened. */
-export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; question_id: string; conversation_id: string; created_at_ms: number }
+/** A session no bot started that this bot looks after; `muted`: the person stopped following it here. */
+export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"
 export type TriageSettings = {

@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Globe, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Info, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { Details, DetailRow, EmptyState, InlineError, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
+import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -77,7 +77,7 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
     <JoinRequests />
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
-      : <ul className="divide-y overflow-hidden rounded-xl border bg-card">{rows.map((row) => {
+      : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {
         const Icon = deviceIcon(row)
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
@@ -97,10 +97,11 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
   </div>
 }
 
-function Section({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-xl border bg-card p-4">
-    <h3 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h3>
-    {children}
+/** Captioned like a settings group, so a device reads the same as 设置. */
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return <section className="grid gap-2">
+    <h3 className="px-1 text-meta font-medium text-muted-foreground">{title}</h3>
+    <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>
   </section>
 }
 
@@ -125,7 +126,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
   return <div className="mx-auto grid w-full max-w-3xl gap-6">
     <header className="flex items-center gap-4">
-      <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-muted"><Icon aria-hidden="true" className="size-6" /></span>
+      <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
         <h2 className="truncate text-title font-semibold" title={row.name}>{row.name}</h2>
         <div className="flex flex-wrap items-center gap-2">
@@ -142,7 +143,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。请用管理设备移除它，再重新加入。"}</span>
     </p> : null}
 
-    {row.kind === "node" && !copied ? <Section icon={terms.ai.icon} title={terms.ai.label}>
+    {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
         <p>{row.bot ? "能运行 Bot" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
@@ -150,7 +151,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       </div>}
     </Section> : null}
 
-    {row.entry ? <Section icon={Globe} title="访问地址">
+    {row.entry ? <Section title="访问地址">
       <p className="break-all font-mono text-meta">{address}</p>
       {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
         <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
@@ -165,20 +166,22 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
-    <Details>
-      <DetailRow label="设备编号" value={row.id} mono />
-      {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
-    </Details>
-
-    {canManage && row.member && !row.entry && !row.browser ? removing ? <section className="grid gap-3 rounded-xl border border-danger-border p-4">
-      <p>移除后这台设备无法再连接，已有的对话记录会保留。</p>
-      <div className="flex flex-wrap justify-end gap-2">
-        <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
-        <Button type="button" variant="destructive" disabled={action.busy !== null} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
-          <RemoveIcon aria-hidden="true" />{action.busy === "remove" ? "移除中" : "移除设备"}
-        </Button>
-      </div>
-      {action.errorKey === "remove" ? <InlineError error={action.error} /> : null}
-    </section> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger" onClick={() => setRemoving(true)}><RemoveIcon aria-hidden="true" />移除设备</Button> : null}
+    <SettingsGroup>
+      <SettingsDisclosure icon={Info} label="详细信息">
+        <div className="grid gap-3 text-meta text-muted-foreground">
+          <DetailRow label="设备编号" value={row.id} mono />
+          {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
+        </div>
+      </SettingsDisclosure>
+      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label="移除设备" description={removing ? "移除后这台设备无法再连接，已有的对话记录会保留" : undefined} onClick={removing ? undefined : () => setRemoving(true)}>
+        {removing ? <>
+          <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
+          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast("已移除", { tone: "success" }); void navigate({ to: "/devices" }) })}>
+            <BusyIcon busy={action.busy === "remove"} />移除
+          </Button>
+        </> : null}
+      </SettingsRow> : null}
+      {action.errorKey === "remove" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
+    </SettingsGroup>
   </div>
 }

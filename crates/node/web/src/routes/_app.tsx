@@ -4,7 +4,6 @@ import { accessOf } from '@vibeface/client/identity/access.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useOnboarding } from '@/features/identity/onboarding-flag'
 import { WorkspaceProvider } from '@vibeface/client/workspace/context.tsx'
-import { SESSIONS_SCOPE } from '@vibeface/client/workspace/questions.ts'
 import { ShellSkeleton, WorkspaceShell } from '@/features/workspace/workspace-shell'
 import { webPlatform } from '@/lib/platform'
 
@@ -26,7 +25,7 @@ function AppLayout() {
   if (access.kind === 'resuming') return <ShellSkeleton home={home} retry={access.retryInSeconds} onRetry={retryNow} onLeave={disconnect} />
   if (!ready) return <ShellSkeleton home={home} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
-  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id) => { void (id === SESSIONS_SCOPE ? navigate({ to: '/inbox' }) : navigate({ to: '/', search: { conversation: id } })) }}>
+  return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id) => { void navigate({ to: '/', search: { conversation: id } }) }}>
     {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

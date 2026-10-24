@@ -87,11 +87,6 @@ pub fn question_id(node: &str, event_id: &str) -> String {
     format!("q-{}", hex32(&[node, event_id]))
 }
 
-/// The one question about a session no bot owns, so its answer holds for the session.
-pub fn session_question_id(node: &str, session: &str) -> String {
-    format!("s-{}", hex32(&[node, session]))
-}
-
 impl AgentEvent {
     /// Status is left out, so a hook, the App Server and a scan of the same turn collide.
     pub fn id_for(node: &str, agent: Agent, session: &str, turn: &str, kind: Kind) -> String {
@@ -201,16 +196,39 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
     })
 }
 
-/// Turn ends in the complete lines of a Codex rollout after `offset`. Returns the events and
-/// the offset after the last complete line.
-pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
-    let meta = text
-        .lines()
-        .next()
-        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+/// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
+/// is one the user drives. `codex exec`, MCP and sub-agent sessions run without anyone
+/// watching them.
+pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
+    let background = match source {
+        Value::String(source) => matches!(source.to_ascii_lowercase().as_str(), "exec" | "mcp"),
+        Value::Object(source) => source
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("subagent")),
+        _ => false,
+    };
+    !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
+}
+
+/// Whether a Claude Code hook runs in a session the user drives; `claude -p` and the SDKs set
+/// an `sdk-*` entry point.
+pub fn interactive_claude(entrypoint: Option<&str>) -> bool {
+    !entrypoint.is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
+}
+
+/// The `session_meta` payload on a Codex rollout's first line, if it has one.
+pub fn rollout_meta(first_line: &str) -> Value {
+    serde_json::from_str::<Value>(first_line)
+        .ok()
         .filter(|line| line["type"] == "session_meta")
         .map(|line| line["payload"].clone())
-        .unwrap_or(Value::Null);
+        .unwrap_or(Value::Null)
+}
+
+/// Turn ends in the complete lines of a Codex rollout after `offset`, none for a session the
+/// user does not drive. Returns the events and the offset after the last complete line.
+pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
+    let meta = rollout_meta(text.lines().next().unwrap_or_default());
     let end = text
         .rfind('\n')
         .map_or(0, |at| at + 1)
@@ -219,6 +237,9 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
     let Some(tail) = text.get(offset.min(end)..end) else {
         return (events, end);
     };
+    if !interactive_codex(&meta["source"], meta["originator"].as_str()) {
+        return (events, end);
+    }
     for line in tail.lines() {
         let Ok(line) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -626,6 +647,36 @@ mod tests {
             ("tx:10", Kind::Notification)
         );
         assert!(AgentEvent::default().seal(&node, "h", 1).is_err());
+    }
+
+    #[test]
+    fn sessions_nobody_drives_are_not_scanned() {
+        let rollout = |meta: Value| {
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":meta}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"u1"}})
+            )
+        };
+        for meta in [
+            json!({"id":"t1","source":"cli","originator":"codex_cli_rs"}),
+            json!({"id":"t1","source":"vscode"}),
+            json!({"id":"t1"}),
+        ] {
+            assert_eq!(scan_rollout(&rollout(meta.clone()), 0).0.len(), 1, "{meta}");
+        }
+        for meta in [
+            json!({"id":"t1","source":"exec","originator":"codex_exec"}),
+            json!({"id":"t1","source":"cli","originator":"codex_exec"}),
+            json!({"id":"t1","source":"mcp"}),
+            json!({"id":"t1","source":{"subagent":"review"}}),
+            json!({"id":"t1","source":{"subAgent":{"thread_spawn":{"depth":1}}}}),
+        ] {
+            let text = rollout(meta.clone());
+            assert_eq!(scan_rollout(&text, 0), (vec![], text.len()), "{meta}");
+        }
+        assert!(interactive_claude(None) && interactive_claude(Some("cli")));
+        assert!(!interactive_claude(Some("sdk-cli")) && !interactive_claude(Some("sdk-ts")));
     }
 
     #[test]

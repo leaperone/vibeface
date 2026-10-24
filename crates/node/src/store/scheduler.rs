@@ -554,35 +554,6 @@ fn admit_ended_from(
 }
 
 impl Store {
-    /// Queues the turn in which `conversation`'s bot routes the session `question` is about,
-    /// once. Only the Node that schedules the conversation admits it; returns whether it is new.
-    pub fn admit_route(
-        &mut self,
-        local: &str,
-        network: &str,
-        conversation: &str,
-        question: &str,
-    ) -> Result<bool> {
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let trigger = route_trigger(question);
-        let owner = conversation_from(&tx, network, conversation)?.and_then(|c| c.owner);
-        if owner.as_deref() != Some(local) || load_job(&tx, conversation, &trigger)?.is_some() {
-            return Ok(false);
-        }
-        admit_from(
-            &tx,
-            network,
-            conversation,
-            &trigger,
-            TriggerKind::Route,
-            question,
-        )?;
-        tx.commit()?;
-        Ok(true)
-    }
-
     /// The user messages of a conversation this Node schedules that no device answered, in
     /// conversation order: no completed reply, not answered inside a reply they were steered
     /// into, and no turn here. A former owner left them; only the user starts them again.
@@ -719,7 +690,7 @@ pub(crate) fn chain_depth(
     let (mut conversation, mut trigger) = (conversation.to_owned(), trigger.to_owned());
     for _ in 0..64 {
         match trigger.split_once(':') {
-            Some(("message" | "route", _)) => return Ok(0),
+            Some(("message", _)) => return Ok(0),
             Some(("schedule", _)) => {
                 let (schedule_id, _) =
                     parse_schedule_trigger(&trigger).context("invalid schedule trigger")?;
