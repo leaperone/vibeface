@@ -132,7 +132,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           <div className="flex items-center pe-2 empty:hidden">
             {/* A page inside another page goes back from its header at any width; the sidebar covers the rest on wide screens. */}
             {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
-            {isMobile ? null : <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", !nested && "-ms-2.5")} />}
+            {isMobile ? null : <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", nested ? "max-lg:hidden" : "-ms-2.5")} />}
           </div>
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
