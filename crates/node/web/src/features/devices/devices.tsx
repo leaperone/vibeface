@@ -9,6 +9,7 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
+import { botReadiness } from "@vibeface/client/workspace/model.ts"
 import type { Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings, docs } from "./ai-settings"
 import { JoinRequests } from "./join"
@@ -16,7 +17,7 @@ import { JoinRequests } from "./join"
 export type DeviceRow = {
   id: string; name: string; kind: "node" | "client"; member?: Member; node?: NodeInfo
   /** The device this browser is connected through. */ entry: boolean
-  browser: boolean; online?: boolean; bot: boolean; admin: boolean
+  browser: boolean; online?: boolean; bot: ReturnType<typeof botReadiness>; admin: boolean
 }
 
 export function useDeviceRows(): DeviceRow[] {
@@ -33,7 +34,7 @@ export function useDeviceRows(): DeviceRow[] {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
       entry, browser: id === identity?.deviceId,
       // Before the device list arrives, the computer this page talks through is as online as the connection.
-      online: kind === "node" ? node?.online ?? (entry && connectionOnline) : undefined, bot: Boolean(node?.capabilities?.manager), admin: member?.manage ?? false,
+      online: kind === "node" ? node?.online ?? (entry && connectionOnline) : undefined, bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -61,8 +62,8 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
-function Hint({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
-  return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className="size-4 text-muted-foreground" /><span className="sr-only">{label}</span></span>
+function Hint({ icon: Icon, label, warning = false }: { icon: LucideIcon; label: string; warning?: boolean }) {
+  return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className={cn("size-4", warning ? "text-warning" : "text-muted-foreground")} /><span className="sr-only">{label}</span></span>
 }
 
 export function DevicesPage() {
@@ -81,7 +82,7 @@ export function DevicesPage() {
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="flex min-h-14 items-center gap-3 px-4 py-2 hover:bg-muted/50">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           <span className="flex min-w-0 flex-1 items-center gap-2"><span className="truncate font-medium">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
-          {row.bot ? <Hint icon={Bot} label="能运行 Bot" /> : null}
+          {row.bot ? <Hint icon={Bot} label={row.bot === "ready" ? "能运行 Bot" : "Bot 需设置"} warning={row.bot === "needs_setup"} /> : null}
           {row.admin ? <Hint icon={Crown} label="管理员" /> : null}
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -144,7 +145,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
-        <p>{row.bot ? "能运行 Bot" : "还没配置 Bot"}</p>
+        <p>{row.bot === "ready" ? "能运行 Bot" : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
@@ -154,7 +155,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <p className="break-all font-mono text-meta">{address}</p>
       {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
         <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
-        <a className="font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
+        <a className="hit-area relative font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
       {canManage || localSession ? <label className="flex min-h-11 items-center justify-between gap-3 border-t pt-3">
         <span>本机免确认打开</span>

@@ -8,6 +8,19 @@
 @custom-variant dark (&:where(.dark, .dark *));
 @custom-variant light (&:where(:not(.dark)));
 
+/* A small control keeps its look but takes a 44px touch; the element must be positioned. */
+@utility hit-area {
+  &::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: max(100%, 2.75rem);
+    height: max(100%, 2.75rem);
+    translate: -50% -50%;
+  }
+}
+
 * {
   box-sizing: border-box;
 }

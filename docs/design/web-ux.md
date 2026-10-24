@@ -68,7 +68,7 @@
 | 根恢复 | 用恢复文件找回 | `ArchiveRestore` | |
 | 机器人 | Bot | `Bot` | 用户创建并命名的对话对象，如“项目 Bot” |
 | 管理 Agent、协调 Agent | Bot | `Bot` | 同一个概念，用户不区分“管理”和“协调” |
-| Provider（Codex SDK、Cursor SDK） | AI | `Sparkles` | 设备详情里的一组设置，每个服务一行，显示为“Codex”“Cursor” |
+| Provider（Codex SDK、Cursor SDK） | Bot 与任务 | `Sparkles` | 设备详情里的一组设置，每个服务一行，显示为“Codex”“Cursor” |
 | 原生会话、原生工作、Agent 任务、工作 | 任务 | `ListChecks` | 消息流里的卡片。命令行级别的细节在任务详情里 |
 | 审批请求 | 需要你同意 | `Hand` | |
 | 待核对（pending check） | 待确认 | `CircleQuestionMark` | |
@@ -97,7 +97,7 @@
 | `/b/:botId` | 与 Bot 对话 | 一 | 发送 |
 | `/b/:botId/work/:workId` | 任务详情，桌面为右侧抽屉，手机为全屏 | 二 | 停止任务 |
 | `/devices` | 我的设备 | 一 | 添加设备 |
-| `/devices/:deviceId` | 设备详情：AI（服务、Bot、执行任务、检查清单、可用文件夹）、访问地址、移除 | 二 | 视状态而定 |
+| `/devices/:deviceId` | 设备详情：Bot 与任务（服务、Bot、执行任务、检查清单、可用文件夹）、访问地址、移除 | 二 | 视状态而定 |
 | `/devices/add` | 添加设备：二维码、链接、安全码核对 | 二 | 允许加入 |
 | `/settings` | 这个浏览器：提醒、访问地址、恢复文件、外观 | 一 | 无 |
 
@@ -328,7 +328,7 @@
 **设备详情（`/devices/:id`）。** 分组，渐进披露。
 
 1. 头部：名字（可改）、类型 icon、在线状态、管理员标签。
-2. **AI**（只对 Node）：一个分组，每个服务一行。
+2. **Bot 与任务**（只对 Node）：一个分组，每个服务一行。
    - 每行是服务图标、名字、状态和用途图标。`Bot` 表示运行 Bot，在各行之间单选，再点一次关闭 Bot；Codex 行另有 `ListChecks` 开关执行任务。没有说明文字。
    - 程序检查：缺什么就在 Bot 那一行给对应的“怎么安装”。
    - 每行的“设置”折叠里放程序、App Server 和环境变量；Bot 所在服务的“设置”里还有模型、Bot 工作文件夹和组件路径。

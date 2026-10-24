@@ -14,7 +14,7 @@ import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { pendingChecks } from '@vibeface/client/workspace/model.ts'
+import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
@@ -45,7 +45,8 @@ export function ConversationScreen() {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
+  const agentReady = workspace.nodes.some((node) => botReadiness(node) === 'ready')
+  const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
@@ -129,7 +130,7 @@ export function ConversationScreen() {
 
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
-  const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const ownerAway = Boolean(owner && here && botReadiness(here) === 'ready' && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
@@ -168,10 +169,13 @@ export function ConversationScreen() {
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
+  const hint = notice || (bot && !agentReady ? (unready ? '运行 Bot 的设备需设置' : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
-  const setupTo = managerOffline || !ready ? '/devices' : '/devices/$deviceId'
+  const setupDevice = unready?.device_id ?? ready?.entry.device_id
+  // A device that only needs setup is fixable now, so it comes before one that is offline.
+  const away = managerOffline && !unready
+  const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -207,7 +211,7 @@ export function ConversationScreen() {
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotAvatar id={bot.bot_id} name={bot.name} size="lg" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
-          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }}><Bot aria-hidden="true" />{managerOffline ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
@@ -233,7 +237,7 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput>
     </section>
   )
