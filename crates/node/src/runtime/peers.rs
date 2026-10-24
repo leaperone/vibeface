@@ -390,9 +390,12 @@ impl Runtime {
         input: &Value,
     ) -> Result<Value> {
         let kind = field(input, "type")?;
-        let _work = (!matches!(kind, "capabilities" | "progress_read" | "addresses"))
-            .then(|| self.maintenance.enter())
-            .transpose()?;
+        let _work = (!matches!(
+            kind,
+            "capabilities" | "progress_read" | "addresses" | "scheduler_jobs"
+        ))
+        .then(|| self.maintenance.enter())
+        .transpose()?;
         match kind {
             "capabilities" => Ok(self.capabilities().await),
             "addresses" => {
@@ -402,13 +405,9 @@ impl Runtime {
                 Ok(json!({"records":self.store.lock().await.address_book()?}))
             }
             "deliver" => self.accept_delivery(network, origin, input).await,
-            "manager_status" => {
-                self.manager_status(
-                    network,
-                    field(input, "conversation_id")?,
-                    field(input, "trigger")?,
-                )
-                .await
+            "scheduler_jobs" => {
+                self.owner_jobs(network, field(input, "conversation_id")?)
+                    .await
             }
             "progress_read" => self.read_progress(network, origin, input).await,
             "dispatch_work" => self.accept_remote_dispatch(network, origin, input).await,
@@ -460,16 +459,20 @@ impl Runtime {
                     input["human"] == true,
                     "management control requires the user"
                 );
+                let scope = field(input, "conversation_id")?;
                 let access = Access {
                     network_id: network.into(),
                     human: true,
-                    conversation_id: Some(field(input, "conversation_id")?.into()),
+                    conversation_id: Some(scope.into()),
                     manager: None,
                 };
-                match kind {
-                    "cancel_manager" => self.cancel_manager(&access, input).await,
-                    _ => self.resolve_check(&access, input).await,
+                if kind == "resolve" {
+                    return self.resolve_check(&access, input).await;
                 }
+                self.require_scope(&access, scope).await?;
+                self.cancel_local_manager(network, scope, field(input, "trigger")?)
+                    .await?
+                    .context("this reply is not scheduled on this device")
             }
             _ => bail!("unknown peer request"),
         }

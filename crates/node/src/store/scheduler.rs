@@ -1021,6 +1021,47 @@ fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
     }
 }
 
+/// The job's bot reply, unless one is already written; returns whether it wrote it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a reply is one signed event of the job"
+)]
+fn post_reply_from(
+    connection: &Connection,
+    blob_dir: &Path,
+    identity: &LocalIdentity,
+    network: &str,
+    job: &SchedulerJob,
+    status: ReplyStatus,
+    text: String,
+    at: i64,
+) -> Result<bool> {
+    if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_some() {
+        return Ok(false);
+    }
+    log::append_from(
+        connection,
+        blob_dir,
+        identity,
+        network,
+        &job.conversation_id,
+        EventBody::MessagePosted {
+            message_id: job.message_id.clone(),
+            role: Role::Assistant,
+            text,
+            attachments: vec![],
+            report_results: None,
+            in_reply_to: Some(job.reply_to.clone()),
+            status: Some(status),
+            answers: None,
+            attestation: None,
+        },
+        vec![],
+        at,
+    )?;
+    Ok(true)
+}
+
 /// Ends the job and writes its bot reply in one transaction. Partial text of a stopped or
 /// interrupted turn is kept with its status.
 #[expect(
@@ -1058,27 +1099,9 @@ fn end_job_from(
         super::work::apply_signal_from(
             connection, blob_dir, identity, network, work_id, signal, at,
         )?;
-    } else if message_from(connection, network, &job.conversation_id, &job.message_id)?.is_none() {
-        log::append_from(
-            connection,
-            blob_dir,
-            identity,
-            network,
-            &job.conversation_id,
-            EventBody::MessagePosted {
-                message_id: job.message_id.clone(),
-                role: Role::Assistant,
-                text,
-                attachments: vec![],
-                report_results: None,
-                in_reply_to: Some(job.reply_to.clone()),
-                status: Some(status),
-                answers: None,
-                attestation: None,
-            },
-            vec![],
-            at,
-        )?;
+    } else if post_reply_from(
+        connection, blob_dir, identity, network, &job, status, text, at,
+    )? {
         let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
         // A Node the conversation moved away from mid-turn leaves condensing to the new owner.
@@ -1589,10 +1612,13 @@ impl Store {
         }
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
+            let outcome = JobOutcome::Cancelled(evidence.clone());
+            let (status, text) = reply_status(&outcome);
             let change = TaskJobChange::Ended {
-                outcome: &JobOutcome::Cancelled(evidence.clone()),
+                outcome: &outcome,
                 text: "",
             };
+            let at = crate::runtime::now_ms();
             if let Some((work_id, signal)) = task_work_signal(&job.trigger, change) {
                 super::work::apply_signal_from(
                     &tx,
@@ -1601,7 +1627,18 @@ impl Store {
                     network,
                     work_id,
                     signal,
-                    crate::runtime::now_ms(),
+                    at,
+                )?;
+            } else {
+                post_reply_from(
+                    &tx,
+                    &self.blob_dir,
+                    identity,
+                    network,
+                    &job,
+                    status,
+                    text,
+                    at,
                 )?;
             }
             job.state = JobState::Cancelled {

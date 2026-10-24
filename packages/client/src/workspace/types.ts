@@ -49,6 +49,8 @@ export type ManagerJob = {
   pending_check?: boolean
   /** How the reply a steered message joined ended. */
   outcome?: SteerOutcome
+  /** The owner device that reported it; absent for this device's own jobs. */
+  source_node?: string
 }
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
@@ -58,6 +60,8 @@ export type SchedulerSnapshot = {
   provider?: string
   model?: string
   capabilities?: { streaming: boolean; cancel: boolean; steer: boolean }
+  /** Set when another device schedules this conversation; unreachable leaves its replies' state unknown. */
+  remote?: { owner: string; reachable: boolean }
 }
 /** A coordination process still alive after its turn ended; the Node closes it once the process exits. */
 export type CoordinationCheck = {

@@ -20,7 +20,7 @@ fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
 }
 
 impl Runtime {
-    fn scheduler_manager_metadata(&self) -> Value {
+    pub(super) fn scheduler_manager_metadata(&self) -> Value {
         let Some(manager) = &self.manager() else {
             return Value::Null;
         };
@@ -388,21 +388,92 @@ impl Runtime {
         Ok(json!({"receipts":receipts}))
     }
 
-    pub(super) async fn manager_status(
+    /// This Node's latest jobs of a conversation, read by a device that shows it; `replied`
+    /// says whether the job's reply is already written here.
+    pub(super) async fn owner_jobs(&self, network: &str, scope: &str) -> Result<Value> {
+        let access = Access {
+            network_id: network.into(),
+            human: false,
+            conversation_id: Some(scope.into()),
+            manager: None,
+        };
+        self.require_scope(&access, scope).await?;
+        let store = self.store.lock().await;
+        let checks = store.pending_checks()?;
+        let all = store.scheduler_jobs(scope)?;
+        let mut jobs = Vec::new();
+        for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
+            let mut value = job_value(job, &checks)?;
+            if let Some(fields) = value.as_object_mut() {
+                fields.remove("basis");
+            }
+            value["replied"] = json!(store.message(network, scope, &job.message_id)?.is_some());
+            jobs.push(value);
+        }
+        Ok(json!({"jobs":jobs,"manager":self.scheduler_manager_metadata()}))
+    }
+
+    /// When another device schedules the conversation, its jobs join `jobs` for display only,
+    /// marked with `source_node`; nothing is stored. Returns that owner, whether it answered
+    /// in time, and its bot's provider.
+    pub(super) async fn merge_owner_jobs(
         &self,
         network: &str,
         scope: &str,
-        trigger: &str,
-    ) -> Result<Value> {
-        let _work = self.maintenance.enter()?;
-        let mut store = self.store.lock().await;
-        store.recover_scheduler_jobs(&self.identity, network, crate::scheduler::boot_id())?;
-        let checks = store.pending_checks()?;
-        Ok(match store.scheduler_job(scope, trigger)? {
-            Some(job) => json!({"state":job.state.name(),"receipt":job.receipt(network),
-                "job":job_value(&job,&checks)?,"manager":self.scheduler_manager_metadata()}),
-            None => json!({"state":"not_found","trigger":trigger}),
-        })
+        jobs: &mut Vec<Value>,
+    ) -> Result<Option<(Value, Value)>> {
+        let local = self.identity.device_id()?;
+        let Some(owner) = self
+            .store
+            .lock()
+            .await
+            .conversation(network, scope)?
+            .and_then(|conversation| conversation.owner)
+            .filter(|owner| owner != &local)
+        else {
+            return Ok(None);
+        };
+        let request = json!({"type":"scheduler_jobs","conversation_id":scope});
+        let reply = match tokio::time::timeout(
+            OWNER_READ_WAIT,
+            self.peer_request(network, &owner, request),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            outcome => {
+                if let Ok(Err(error)) = outcome {
+                    tracing::debug!(%error, "the conversation's owner did not report its jobs");
+                }
+                return Ok(Some((
+                    json!({"owner":owner,"reachable":false}),
+                    Value::Null,
+                )));
+            }
+        };
+        let store = self.store.lock().await;
+        let remote = reply["jobs"].as_array().cloned().unwrap_or_default();
+        for mut job in remote.into_iter().take(MAX_OWNER_JOBS) {
+            let Some(trigger) = job["trigger"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            // Written there, not synced here yet: the reply is on its way, not lost.
+            if job["replied"] == true
+                && let Some(reply) = job["reply_message_id"].as_str()
+                && store.message(network, scope, reply)?.is_none()
+            {
+                job["state"] = json!("publishing");
+            }
+            job["source_node"] = json!(owner);
+            jobs.retain(|known| {
+                known["trigger"] != trigger.as_str() || known["state"] != "pending_delivery"
+            });
+            jobs.push(job);
+        }
+        Ok(Some((
+            json!({"owner":owner,"reachable":true}),
+            reply["manager"].clone(),
+        )))
     }
 
     /// The conversation's local jobs, waiting outbox entries and their pending checks.
@@ -452,6 +523,10 @@ fn steer_params(candidate: &SteerCandidate) -> Value {
         "input":[{"type":"text","text":text,"text_elements":[]}]})
 }
 
+/// The most recent jobs a conversation's owner reports to another device.
+const MAX_OWNER_JOBS: usize = 64;
+/// How long showing a conversation waits for its owner's jobs.
+const OWNER_READ_WAIT: Duration = Duration::from_secs(3);
 /// How long one steer or read waits for the App Server inside the scheduling tick; a steer that
 /// times out is unknown and read back later.
 const STEER_WAIT: Duration = Duration::from_secs(5);

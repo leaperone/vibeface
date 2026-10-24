@@ -563,6 +563,34 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_reply_stopped_before_it_started_is_recorded_once() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    say(&mut store, &net, "m1", true)?;
+    let trigger = message_trigger("m1");
+    let job = store.scheduler_job("c", &trigger)?.context("job")?;
+    for _ in 0..2 {
+        store.request_manager_cancel(&net.a, &net.network, "c", &trigger)?;
+    }
+    assert!(matches!(
+        store.scheduler_job("c", &trigger)?.context("job")?.state,
+        JobState::Cancelled { attempt: None, .. }
+    ));
+    let replies: Vec<_> = store
+        .messages(&net.network, "c")?
+        .into_iter()
+        .filter(|message| message.in_reply_to.as_deref() == Some("m1"))
+        .collect();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        (replies[0].message_id.as_str(), replies[0].status),
+        (job.message_id.as_str(), Some(ReplyStatus::Stopped))
+    );
+    Ok(())
+}
+
 fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<()> {
     let signed = net.a.fixture_admin().attest(
         &net.network,

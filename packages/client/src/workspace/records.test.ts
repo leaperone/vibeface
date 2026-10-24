@@ -44,6 +44,17 @@ test("a pushed message lands in rank order and the push replaces deliveries, che
   assert.equal(again.messages.length, 3, "a repeated push does not duplicate the message")
 })
 
+test("the owner's jobs stay through a push of this device's records and replace its undelivered copy", () => {
+  const away = parseConversation({
+    conversation: { conversation_id: "chat", title: "", owner: "owner", owner_epoch: 1 },
+    messages: [], works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
+    scheduler: { jobs: [{ trigger: "message:m1", state: "running", source_node: "owner" }], unanswered: [], remote: { owner: "owner", reachable: true } },
+  }, "chat")
+  assert.deepEqual(away.scheduler?.remote, { owner: "owner", reachable: true })
+  const next = mergeConversation(away, records({ jobs: [{ trigger: "message:m1", state: "pending_delivery" }, { trigger: "message:m2", state: "pending_delivery" }] }))
+  assert.deepEqual(next.scheduler?.jobs.map((item) => [item.trigger, item.state]), [["message:m2", "pending_delivery"], ["message:m1", "running"]])
+})
+
 test("pushed records update the network-wide lists for their conversation only", () => {
   const pushed = records({
     conversation_id: "chat", questions: [question("open", "chat"), question("done", "chat", { message_id: "a", text: "好", author: "b", created_at_ms: 2 })],
