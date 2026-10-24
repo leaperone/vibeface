@@ -199,7 +199,9 @@ impl Store {
             0 => {
                 let tables:i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get(0))?;
                 ensure!(tables == 0, "unversioned database is not supported");
-                connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
+                connection.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;{INITIAL_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
+                ))?;
             }
             SCHEMA_VERSION => {}
             _ => bail!(

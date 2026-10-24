@@ -7,7 +7,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 1;
+pub const DATA_EPOCH: u32 = 2;
+/// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
+/// Any schema change fails a test until both constants change together.
+pub const DATA_EPOCH_SCHEMA_SHA256: &str =
+    "42439878eead97bcf16927648a90ff7f064d6fe6fe91b7c417ae8bbb93cf51d3";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 /// The name a removed Node had, which its fresh data directory offers when it joins again.
@@ -290,6 +294,31 @@ pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_changes_bump_the_data_epoch() {
+        use sha2::{Digest, Sha256};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migrations in {}", dir.display());
+        let mut hasher = Sha256::new();
+        for path in files {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let body = std::fs::read(&path).unwrap();
+            hasher.update(format!("{name}\0{}\0", body.len()));
+            hasher.update(body);
+        }
+        let actual = hex::encode(hasher.finalize());
+        assert_eq!(
+            actual, DATA_EPOCH_SCHEMA_SHA256,
+            "schema changed: bump DATA_EPOCH and update the recorded fingerprint DATA_EPOCH_SCHEMA_SHA256 in crates/node/src/config.rs"
+        );
+    }
 
     #[test]
     fn browser_aliases_do_not_change_network_exposure() {
