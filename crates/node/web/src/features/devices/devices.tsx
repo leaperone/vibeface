@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Globe, Info, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Info, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -97,10 +97,11 @@ export function DevicesPage({ actions }: { actions?: ReactNode }) {
   </div>
 }
 
-function Section({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <section className="grid gap-4 rounded-xl border bg-card shadow-xs p-4">
-    <h3 className="flex items-center gap-2 text-heading font-semibold"><Icon aria-hidden="true" className="size-5 text-muted-foreground" />{title}</h3>
-    {children}
+/** Captioned like a settings group, so a device reads the same as 设置. */
+function Section({ title, children }: { title: string; children: ReactNode }) {
+  return <section className="grid gap-2">
+    <h3 className="px-1 text-meta font-medium text-muted-foreground">{title}</h3>
+    <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>
   </section>
 }
 
@@ -142,7 +143,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。请用管理设备移除它，再重新加入。"}</span>
     </p> : null}
 
-    {row.kind === "node" && !copied ? <Section icon={terms.ai.icon} title={terms.ai.label}>
+    {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
         <p>{row.bot ? "能运行 Bot" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : "只有管理员能修改"}</p>
@@ -150,7 +151,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       </div>}
     </Section> : null}
 
-    {row.entry ? <Section icon={Globe} title="访问地址">
+    {row.entry ? <Section title="访问地址">
       <p className="break-all font-mono text-meta">{address}</p>
       {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
         <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>

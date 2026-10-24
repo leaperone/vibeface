@@ -217,7 +217,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
 
   return <li className="overflow-hidden rounded-xl border">
     <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
-      <div className="flex min-w-0 flex-1 basis-44 items-center gap-3">
+      <div className="flex min-w-0 flex-1 basis-36 items-center gap-3">
         <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
         <span className="min-w-0 truncate font-medium">{name}</span>
         <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>

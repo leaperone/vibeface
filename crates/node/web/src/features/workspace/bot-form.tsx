@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react"
 import { useNavigate } from "@tanstack/react-router"
+import { Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BusyIcon, InlineError } from "@/components/app/kit"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
@@ -112,11 +113,11 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
             {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">{botDevice ? "还没有可用的文件夹，可在「设备」里添加" : "设备能运行 Bot 后就能选"}</FieldDescription>}
           </Field>
           <InlineError error={error} />
-          <div className="flex flex-wrap gap-3">
-            <Button type="submit" className="min-h-11" disabled={busy || !workspace.writable} aria-busy={busy}>
-              <BusyIcon busy={busy} />{pending ? "再试一次" : "创建"}
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button>
+            <Button type="submit" disabled={busy || !workspace.writable} aria-busy={busy || undefined}>
+              <BusyIcon busy={busy} icon={Plus} />{pending ? "再试一次" : "创建"}
             </Button>
-            <Button type="button" className="min-h-11" variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
           </div>
           {!workspace.writable ? <p role="status" className="text-meta text-muted-foreground">{workspace.writeNotice || "连上后就能创建。"}</p> : null}
         </form>

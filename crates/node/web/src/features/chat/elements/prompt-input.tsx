@@ -116,7 +116,7 @@ export function PromptInput({
           </InputGroupAddon>
         </InputGroup>
       </div>
-      <div className="grid gap-1 pt-2 text-meta text-muted-foreground">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-meta text-muted-foreground empty:hidden">
         {hint ? <p id="manager-hint">{hint}</p> : null}
         {children}
       </div>
