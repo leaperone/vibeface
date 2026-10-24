@@ -5,15 +5,20 @@ import { Details, DetailRow, EmptyState, InlineError, Panel, SafetyCode, Skeleto
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
-import { addressName, hostOf } from '@/features/workspace/labels'
-import { messageOf, parseEntry, type ConnectionEntry } from '@/lib/node'
-import { passphrase, recoveryCode, recoveryFileStem } from '@/lib/secure'
+import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
+import { messageOf, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import { passphrase, recoveryCode, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
-import { primaryLane } from './connection-lane'
-import { BROWSER_REMOVED, NOT_JOINED, useDevice } from './context'
+import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
+import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
+import { webPlatform } from '@/lib/platform'
+
+const NOT_JOINED = notJoined(webPlatform.self)
+const BROWSER_REMOVED = removedText(webPlatform.self)
+const { connectDevice } = webPlatform.transport
 import { RecoveryControls, RecoveryReview } from './recovery-controls'
-import { connectDevice, joinTicket } from '../../../transport.js'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
@@ -376,8 +381,8 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
       <span className="min-w-0 flex-1 py-2 font-mono [overflow-wrap:anywhere]">{file}</span>
-      <Button type="button" variant="ghost" disabled={busy} onClick={() => void run(async () => device.downloadBackup())}>重新下载</Button>
-    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(async () => { device.downloadBackup(); setDownloaded(true) })}><Download aria-hidden="true" />下载恢复文件</Button>}
+      <Button type="button" variant="ghost" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup() })}>重新下载</Button>
+    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}><Download aria-hidden="true" />下载恢复文件</Button>}
     <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>

@@ -4,11 +4,11 @@ import { Bell, ChevronRight, Download, LogOut, Monitor, Moon, Palette, ScrollTex
 import { Segmented, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
-import { useDevice } from '@/features/identity/context'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
 import { CurrentRecoveryFile, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
-import { useWorkspace } from '@/features/workspace/context'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
 export const Route = createFileRoute('/_app/settings')({ component: SettingsPage })
@@ -29,7 +29,7 @@ function SettingsPage() {
     <SettingsGroup title="提醒">
       <SettingsRow icon={Bell} label="浏览器提醒">
         {workspace.notificationButton.disabled ? workspace.notificationButton.label
-          : <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(() => workspace.enableBrowserNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>}
+          : <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(() => workspace.enableNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>}
       </SettingsRow>
       {operator ? <TriageSettings /> : null}
     </SettingsGroup>

@@ -173,8 +173,7 @@ pub fn attestation_payload(network_id: &str, scope_id: &str, body_json: &str) ->
     .map_err(Into::into)
 }
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(js_name = ticketEncode)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = ticketEncode))]
 pub fn ticket_encode(
     entry_id: &str,
     secret_hex: &str,
@@ -192,8 +191,7 @@ pub fn ticket_encode(
 }
 
 /// `{entry_id, invite_hash, invite_id}`; the secret stays out of JSON the page logs.
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(js_name = ticketDecode)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = ticketDecode))]
 pub fn ticket_decode(text: &str) -> Result<String> {
     let ticket = Ticket::decode(text)?;
     let hash = ticket.invite_hash();
@@ -206,8 +204,7 @@ pub fn ticket_decode(text: &str) -> Result<String> {
     .to_string())
 }
 
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen(js_name = inviteSigningPayload)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = inviteSigningPayload))]
 pub fn invite_signing_payload(record_json: &str) -> Result<Vec<u8>> {
     let record: InviteRecord =
         serde_json::from_str(record_json).map_err(|_| "invalid invite record")?;

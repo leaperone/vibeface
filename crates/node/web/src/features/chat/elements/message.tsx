@@ -1,12 +1,12 @@
 import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, Merge, RotateCcw } from 'lucide-react'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
-import { messageKey, replyStatusLabel } from '../protocol.ts'
-import type { TranscriptMessage } from '../types.ts'
+import { messageKey, replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
+import type { TranscriptMessage } from '@vibeface/client/chat/types.ts'
 import { Artifact } from './artifact'
-import { useWorkspace } from '@/features/workspace/context'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { ActionButton } from '@/features/workspace/present'
-import type { SteerOutcome } from '@/features/workspace/types'
+import type { SteerOutcome } from '@vibeface/client/workspace/types.ts'
 
 export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupted' | 'sending' | 'queued' | 'merging' | 'merged'; merged?: SteerOutcome }
 

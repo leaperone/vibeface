@@ -1,10 +1,10 @@
 import { useId, type ReactNode } from 'react'
 import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
-import { providerNames } from '@/lib/node'
+import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
-import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@/features/workspace/bot-settings'
-import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@/features/workspace/types'
+import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
 function cardTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind

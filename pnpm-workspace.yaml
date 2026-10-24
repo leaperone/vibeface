@@ -1,0 +1,8 @@
+packages:
+  - crates/node/web
+  - packages/*
+  - apps/*
+minimumReleaseAge: 0
+onlyBuiltDependencies:
+  - esbuild
+  - lightningcss

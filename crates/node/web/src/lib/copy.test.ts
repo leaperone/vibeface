@@ -60,7 +60,10 @@ test("copy check flags jargon outside Details only", () => {
 const pending = new Set<string>([])
 
 test("user-facing copy avoids jargon outside Details", () => {
-  const root = fileURLToPath(new URL("..", import.meta.url))
-  const found = sources(root).filter((file) => !pending.has(file.slice(root.length))).flatMap((file) => violations(readFileSync(file, "utf8"), file.slice(root.length)))
+  // The shared client package carries the same copy, so it is checked here too.
+  const found = [new URL("..", import.meta.url), new URL("../../../../../packages/client/src/", import.meta.url)].flatMap((url) => {
+    const root = fileURLToPath(url)
+    return sources(root).filter((file) => !pending.has(file.slice(root.length))).flatMap((file) => violations(readFileSync(file, "utf8"), file.slice(root.length)))
+  })
   assert.deepEqual(found, [])
 })

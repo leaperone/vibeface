@@ -91,7 +91,7 @@
 
 | 路径 | 方法 | 用途 |
 | --- | --- | --- |
-| `/`、`/assets/*`、`/transport.js` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
+| `/`、`/assets/*` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
 | `/api/info` | GET | `device_id`、`version`、`manager_available` 和 `public_entry` |

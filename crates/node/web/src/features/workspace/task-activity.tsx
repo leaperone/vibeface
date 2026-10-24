@@ -5,12 +5,12 @@ import { Link } from "@tanstack/react-router"
 import { Bot, ChevronRight, CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
 import { ActionCard, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
-import { useDevice } from "../identity/context"
-import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
-import type { WorkCheck } from "./model"
-import type { PendingCheck } from "./types"
+import type { WorkCheck } from "@vibeface/client/workspace/model.ts"
+import type { PendingCheck } from "@vibeface/client/workspace/types.ts"
 
 /** Plain-language reason; the original text stays in the details. */
 export function checkReason(check: Pick<PendingCheck, "detail">): string {

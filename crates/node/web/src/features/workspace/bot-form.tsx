@@ -10,12 +10,12 @@ import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
-import { useDevice } from "@/features/identity/context"
-import { messageOf } from "@/lib/node"
-import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
-import { projectName } from "./questions"
-import type { BotProject } from "./types"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { messageOf } from "@vibeface/client/lib/node.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { projectName } from "@vibeface/client/workspace/questions.ts"
+import type { BotProject } from "@vibeface/client/workspace/types.ts"
 
 type BotFormProps = {
   open: boolean

@@ -2,10 +2,10 @@ import { Download, Eye, EyeOff, File } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import { useWorkspace } from '@/features/workspace/context'
-import { formatSize } from '@/features/workspace/model'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/features/workspace/present'
-import type { Attachment } from '../types'
+import type { Attachment } from '@vibeface/client/chat/types.ts'
 
 /** A file the user attached: read it here as text, or download it under its own name. */
 export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {

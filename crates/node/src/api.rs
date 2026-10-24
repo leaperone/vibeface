@@ -222,7 +222,6 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     let app = App::new(node, sites);
     let mut routes = Router::new()
-        .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/api/info", get(info))
@@ -829,12 +828,6 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
         .into_response()
 }
 
-async fn transport_javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/transport.js"),
-    )
-}
 async fn crypto_javascript() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],

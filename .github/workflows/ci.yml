@@ -76,7 +76,6 @@ jobs:
           bash install.sh --self-test
       - name: Check JavaScript syntax
         run: |
-          node --check crates/node/web/transport.js
           node --check scripts/crypto-client.mjs
           node --check npm/bin/vibeface.mjs
           node --check scripts/package-npm.mjs
@@ -136,7 +135,7 @@ jobs:
         with:
           node-version: '24'
           cache: pnpm
-          cache-dependency-path: crates/node/web/pnpm-lock.yaml
+          cache-dependency-path: pnpm-lock.yaml
       - name: Build and typecheck the static web client
         run: bash scripts/build-web.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

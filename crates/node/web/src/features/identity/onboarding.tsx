@@ -5,7 +5,7 @@ import { BusyIcon, InlineError, Panel, Steps, Wordmark } from "@/components/app/
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AiSettings } from "@/features/devices/ai-settings"
-import { useWorkspace } from "@/features/workspace/context"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
 
 /** Steps 3 and 4 after creating a network here. Skipping step 3 still offers step 4; 待处理 and the composer point back to the device page. */
