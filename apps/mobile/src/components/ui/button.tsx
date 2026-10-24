@@ -98,9 +98,12 @@ const buttonTextVariants = cva(
 
 type ButtonProps = React.ComponentProps<typeof Pressable> &
   React.RefAttributes<typeof Pressable> &
-  VariantProps<typeof buttonVariants>;
+  VariantProps<typeof buttonVariants> & {
+    /** Change fill on the same frame as the content, for buttons whose icon colour swaps with the fill. */
+    instant?: boolean;
+  };
 
-function Button({ className, variant, size, onPressIn, onPressOut, ...props }: ButtonProps) {
+function Button({ className, variant, size, instant, onPressIn, onPressOut, ...props }: ButtonProps) {
   const scale = useSharedValue(1);
   const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const muted = props.disabled && (variant ?? 'default') === 'default';
@@ -110,7 +113,7 @@ function Button({ className, variant, size, onPressIn, onPressOut, ...props }: B
         className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
         role="button"
         {...props}
-        style={[pressed, fade]}
+        style={instant ? pressed : [pressed, fade]}
         onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
         onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
       />

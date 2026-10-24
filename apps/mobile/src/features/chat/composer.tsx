@@ -45,7 +45,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} />
         </Button>
-        <Button size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
+        <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
           // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
           onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
           {onStop || sending ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} />}
