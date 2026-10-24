@@ -78,9 +78,15 @@ export function SaveRecoveryFile({ file, saved, onSaved, download, busy = false 
   </>
 }
 
-let recovered = false
+// Kept in the tab's session so a reload before confirming still lands on saving the new file.
+const recoveredKey = 'vibeface.recovered'
+let recovered = typeof sessionStorage !== 'undefined' && sessionStorage.getItem(recoveredKey) === '1'
 const recoveredListeners = new Set<() => void>()
-function markRecovered(value: boolean) { recovered = value; for (const listener of recoveredListeners) listener() }
+function markRecovered(value: boolean) {
+  recovered = value
+  if (value) sessionStorage.setItem(recoveredKey, '1'); else sessionStorage.removeItem(recoveredKey)
+  for (const listener of recoveredListeners) listener()
+}
 /** Whether a recovery just finished here and its new file still waits to be confirmed as saved. */
 export function useJustRecovered() {
   return useSyncExternalStore((listener) => { recoveredListeners.add(listener); return () => { recoveredListeners.delete(listener) } }, () => recovered, () => recovered)
