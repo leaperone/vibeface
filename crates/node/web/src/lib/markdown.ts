@@ -10,7 +10,7 @@ md.renderer.rules.link_open = (tokens, index, options, _env, self) => {
 md.renderer.rules.fence = (tokens, index) => {
   const token = tokens[index]
   const lang = md.utils.escapeHtml(token.info.trim().split(/\s+/)[0] ?? "")
-  return `<div class="md-code"><div class="md-code-head"><span>${lang}</span><button type="button" data-copy aria-label="复制">复制</button></div><pre><code>${md.utils.escapeHtml(token.content)}</code></pre></div>`
+  return `<div class="md-code"><div class="md-code-head"><span>${lang}</span><button type="button" class="hit-area relative" data-copy aria-label="复制">复制</button></div><pre><code>${md.utils.escapeHtml(token.content)}</code></pre></div>`
 }
 md.renderer.rules.table_open = () => '<div class="md-table"><table>'
 md.renderer.rules.table_close = () => "</table></div>"

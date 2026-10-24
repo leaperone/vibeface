@@ -43,9 +43,9 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
   return <aside aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background md:static md:z-auto md:w-[420px] md:shrink-0 md:border-l">
-    <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
-      <ListChecks aria-hidden="true" className="size-5 text-muted-foreground" />
-      <h2 className="min-w-0 flex-1 truncate text-heading font-semibold">{work?.title || "任务"}</h2>
+    <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
+      <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+      <h2 className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
       {state ? <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
       <Button asChild variant="ghost" size="icon"><Link to="/b/$botId" params={{ botId }} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
@@ -54,7 +54,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
-      {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">结果</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
+      {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{work.failure_reason && !work.result_text ? "原因" : "结果"}</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
       {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。</p> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}

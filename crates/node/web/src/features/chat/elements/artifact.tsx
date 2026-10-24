@@ -5,6 +5,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/features/workspace/present'
+import { FileName } from './prompt-input'
 import type { Attachment } from '@vibeface/client/chat/types.ts'
 
 /** A file the user attached: read it here as text, or download it under its own name. */
@@ -37,7 +38,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
       <div className="flex items-center gap-1">
         <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5 text-sm">
           <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 truncate" title={name}>{name}</span>
+          <span className="min-w-0" title={name}><FileName name={name} /></span>
           <span className="shrink-0 text-meta text-muted-foreground">{formatSize(size)}</span>
         </span>
         {!opened ? <ActionButton variant="ghost" label="打开" disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}><Eye aria-hidden="true" /></ActionButton>
