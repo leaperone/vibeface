@@ -453,7 +453,6 @@ impl Runtime {
         let mut record = record;
         if let Some(thread) = args["thread_id"].as_str() {
             vibeface_protocol::validate_id(thread).map_err(anyhow::Error::msg)?;
-            self.forget_ignored(thread);
             if matches!(record.state, WorkState::Accepted) {
                 ensure!(
                     now_ms() < record.send_by_ms,

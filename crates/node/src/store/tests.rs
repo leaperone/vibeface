@@ -3480,7 +3480,6 @@ fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
         text: "要继续吗？".into(),
         choices: vec![Choice {
             label: "继续".into(),
-            conversation_id: None,
         }],
         about: Subject {
             node: net.a.device_id()?,
@@ -3638,8 +3637,8 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     Ok(())
 }
 
-/// Answered and unanswered questions in two conversations and the sessions scope: the pending
-/// list holds exactly the unanswered ones, and a chat shows its own with their answers.
+/// Answered and unanswered questions in two conversations: the pending list holds exactly the
+/// unanswered ones, and a chat shows its own with their answers.
 #[test]
 fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     let net = net()?;
@@ -3649,29 +3648,14 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
         .a
         .owner_fixture(&net.network, "d", &net.a.device_id()?)?;
     store.create_conversation(&net.a, &net.network, "d", "t", owner, 1)?;
-    for (scope, id) in [
-        ("c", "q-1"),
-        ("c", "q-2"),
-        ("d", "q-3"),
-        (SESSIONS_SCOPE, "s-1"),
-        (SESSIONS_SCOPE, "s-2"),
-    ] {
+    for (scope, id) in [("c", "q-1"), ("c", "q-2"), ("d", "q-3")] {
         store.ask(&net.a, &net.network, scope, question(&net, id, id)?, 2)?;
     }
     let signed = Some(answer_signature(&net, "c", "q-2", "继续")?);
     store.accept_answer(&net.a, &net.network, "q-2", "继续", signed, 3)?;
-    let ignored = store.accept_answer(&net.a, &net.network, "s-2", "忽略", None, 4)?;
-    assert!(
-        ignored.receipt.is_none(),
-        "a session question starts no turn"
-    );
-    assert_eq!(unanswered(&store, &net)?, vec!["q-1", "q-3", "s-1"]);
+    assert_eq!(unanswered(&store, &net)?, vec!["q-1", "q-3"]);
     let pending = store.unanswered_questions(&net.network)?;
-    let session = pending
-        .iter()
-        .find(|q| q["question_id"] == "s-1")
-        .context("s-1")?;
-    assert!(session["conversation_id"].is_null() && session["answer"].is_null());
+    assert!(pending.iter().all(|q| q["conversation_id"] != Value::Null));
     let chat = store.conversation_questions(&net.network, "c")?;
     assert_eq!(
         chat.iter()
@@ -3681,6 +3665,117 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
             (serde_json::json!("q-1"), Value::Null),
             (serde_json::json!("q-2"), serde_json::json!("继续"))
         ]
+    );
+    Ok(())
+}
+
+/// The device running a session writes its owner: the first attribution once, then the
+/// user's hand-overs and mute, each once. Another device syncing the log sees the same.
+#[test]
+fn a_session_owner_is_written_once_and_follows_the_users_latest_choice() -> Result<()> {
+    let net = net()?;
+    let (mut local, _) = bot_with_message(&net)?;
+    second_bot(&mut local, &net, "Other")?;
+    let node = net.a.device_id()?;
+    let about = Subject {
+        node: node.clone(),
+        agent: "codex".into(),
+        session_id: "s1".into(),
+        cwd: "/w".into(),
+        summary: "tests fail".into(),
+        request_id: None,
+    };
+    let owner = |store: &Store| store.session_owner(&net.network, &node, "s1");
+    assert!(
+        local
+            .claim_session(&net.a, &net.network, "c", &about, 3)?
+            .is_some()
+    );
+    assert!(
+        local
+            .claim_session(&net.a, &net.network, "d", &about, 4)?
+            .is_none(),
+        "an owned session is claimed once"
+    );
+    assert!(
+        local
+            .claim_session(&net.b, &net.network, "c", &about, 4)
+            .is_err()
+    );
+    assert_eq!(owner(&local)?.as_deref(), Some("c"));
+    assert!(
+        local
+            .hand_over_session(&net.a, &net.network, "s1", Some("nope"), 5)
+            .is_err()
+    );
+    assert!(
+        local
+            .hand_over_session(&net.a, &net.network, "s2", None, 5)
+            .is_err()
+    );
+
+    let (before, moved) = local.hand_over_session(&net.a, &net.network, "s1", Some("d"), 5)?;
+    assert_eq!((before.as_str(), moved.is_some()), ("c", true));
+    let again = local.hand_over_session(&net.a, &net.network, "s1", Some("d"), 6)?;
+    assert!(again.1.is_none(), "a repeated hand-over writes nothing");
+    assert_eq!(owner(&local)?.as_deref(), Some("d"));
+    assert!(local.attributed_sessions(&net.network, "c")?.is_empty());
+
+    assert!(
+        local
+            .hand_over_session(&net.a, &net.network, "s1", None, 7)?
+            .1
+            .is_some()
+    );
+    assert!(
+        local
+            .hand_over_session(&net.a, &net.network, "s1", None, 8)?
+            .1
+            .is_none()
+    );
+    assert!(local.session_muted(&net.network, &node, "s1")?);
+    assert!(
+        local
+            .claim_session(&net.a, &net.network, "c", &about, 9)?
+            .is_none(),
+        "a muted session is not claimed again"
+    );
+    let rows = local.attributed_sessions(&net.network, "d")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (
+            rows[0]["muted"].clone(),
+            rows[0]["summary"].clone(),
+            rows[0]["agent"].clone()
+        ),
+        (json!(true), json!("tests fail"), json!("codex"))
+    );
+
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &local)?;
+    assert_eq!(owner(&other)?.as_deref(), Some("d"));
+    assert!(other.session_muted(&net.network, &node, "s1")?);
+    other.connection.execute(
+        "UPDATE events SET effective=0 WHERE network_id=?",
+        [&net.network],
+    )?;
+    reduce::clear(&other.connection, &net.network)?;
+    log::recompute(
+        &other.connection,
+        &membership_from(&other.connection, &net.network)?,
+    )?;
+    assert_eq!(
+        owner(&other)?.as_deref(),
+        Some("d"),
+        "a rebuild reads the same"
+    );
+    assert!(other.session_muted(&net.network, &node, "s1")?);
+
+    local.hand_over_session(&net.a, &net.network, "s1", Some("c"), 10)?;
+    assert_eq!(owner(&local)?.as_deref(), Some("c"));
+    assert!(
+        !local.session_muted(&net.network, &node, "s1")?,
+        "handing a muted session to a bot follows it again"
     );
     Ok(())
 }
@@ -3855,7 +3950,7 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         state: JobState::Queued,
     };
     let materialize = |bot: Value| {
-        crate::scheduler::materialize(&context, &job, &works, bot, None, None, &[], None, None)
+        crate::scheduler::materialize(&context, &job, &works, bot, None, &[], None, None)
             .map(|(prompt, _)| prompt)
     };
     let newest = json!(
@@ -4383,17 +4478,8 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
         };
         let works = store.works(&net.network, "c")?;
         let bot = crate::scheduler::bot_value(store, &net.network, "c", 100)?;
-        let rendered = crate::scheduler::materialize(
-            &context,
-            &job,
-            &works,
-            bot,
-            None,
-            None,
-            &[],
-            resumed,
-            thread,
-        )?;
+        let rendered =
+            crate::scheduler::materialize(&context, &job, &works, bot, None, &[], resumed, thread)?;
         Ok::<_, anyhow::Error>((rendered, context.basis))
     };
     let rule = "Operate only inside this personal network";

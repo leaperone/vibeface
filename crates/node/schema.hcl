@@ -719,6 +719,11 @@ table "session_owners" {
     null = true
     type = text
   }
+  column "muted" {
+    null    = false
+    type    = integer
+    default = 0
+  }
   column "created_at_ms" {
     null = false
     type = integer

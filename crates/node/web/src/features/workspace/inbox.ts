@@ -13,7 +13,8 @@ export type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: s
 
 /**
  * Everything waiting on the person: write state, then every unanswered question newest first, then the rest.
- * Every work waiting for confirmation shows as its own card; leftover processes come from the open conversation only.
+ * Each work waiting for confirmation shows once, the works one unreachable device holds on one card; leftover processes
+ * come from the open conversation only, each on its own card.
  */
 export function useInbox(): InboxItem[] {
   const workspace = useWorkspace()
@@ -31,9 +32,8 @@ export function useInbox(): InboxItem[] {
     key: `question:${question.question_id}`, icon: MessageCircleQuestionMark, title: question.text, meta: question.bot?.name,
     to: question.bot ? `/b/${question.bot.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
   })
-  for (const check of workChecks(workspace.openWorks, workspace.nodes)) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", meta: check.title || undefined, to: "/inbox", kind: "confirm", check })
-  const checks = data?.checks.length ?? 0
-  if (checks) items.push({ key: "confirm", icon: CircleQuestionMark, title: checks > 1 ? `${checks} 件待确认` : "待确认", meta: bot?.name, to: chat, kind: "confirm" })
+  const checks = [...workChecks(workspace.openWorks, workspace.nodes), ...(data?.checks ?? []).map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail }))]
+  for (const check of checks) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", to: "/inbox", kind: "confirm", check })
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   for (const join of joins) items.push({ key: `join:${join.join_id}`, icon: MonitorSmartphone, title: `${join.name || "新设备"} 想加入`, to: "/devices", kind: "join", join })
   for (const note of workspace.notifications) {

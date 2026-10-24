@@ -55,7 +55,7 @@ impl Effect {
     pub fn offered(self, kind: TriggerKind) -> bool {
         match self {
             Effect::Read | Effect::Work => true,
-            Effect::Wake => !matches!(kind, TriggerKind::AgentTask | TriggerKind::Route),
+            Effect::Wake => kind != TriggerKind::AgentTask,
             Effect::Settings => kind == TriggerKind::Human,
         }
     }

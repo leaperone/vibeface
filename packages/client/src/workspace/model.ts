@@ -141,7 +141,7 @@ export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReaso
   if (!node.online) return "offline"
   return item.kind === "codex" && node.capabilities?.codex_connected === false ? "disconnected" : null
 }
-/** One card per thing the person must settle: each work waiting for confirmation, then each coordination process still alive. */
+/** One card per thing the person must settle: works waiting for confirmation, then each coordination process still alive. */
 export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"> | null | undefined, nodes: NodeInfo[], conversationId: string): PendingCheck[] {
   if (!data) return []
   return [
@@ -150,10 +150,20 @@ export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"
   ]
 }
 export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
-export function workChecks(works: OpenWork[], nodes: NodeInfo[]): WorkCheck[] {
-  return works.flatMap((item): WorkCheck[] => {
+/** Each work waiting for confirmation; works one offline device or one disconnected Codex holds share one card, where the first of them stood. */
+export function workChecks(works: OpenWork[], nodes: NodeInfo[]): PendingCheck[] {
+  const checks = works.flatMap((item): WorkCheck[] => {
     const reason = confirmReason(item, nodes)
     return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
+  })
+  const held = (check: WorkCheck) => check.reason !== "unverified" ? `device:${check.target_node}:${check.reason}` : null
+  const grouped = new Map<string, WorkCheck[]>()
+  for (const check of checks) { const key = held(check); if (key) grouped.set(key, [...grouped.get(key) ?? [], check]) }
+  return checks.flatMap((check): PendingCheck[] => {
+    const key = held(check), same = key ? grouped.get(key)! : [check]
+    if (same.length < 2) return [check]
+    if (same[0] !== check) return []
+    return [{ kind: "device", check_id: key!, detail: "", target_node: check.target_node, reason: check.reason as "offline" | "disconnected", works: same }]
   })
 }
 export function parseOpenWorks(value: unknown): OpenWork[] {
@@ -353,13 +363,10 @@ function question(value: unknown): Question {
   const data = record(value)
   const bot = data.bot == null ? null : record(data.bot), answer = data.answer == null ? null : record(data.answer)
   return {
-    question_id: text(data.question_id), conversation_id: data.conversation_id == null ? null : text(data.conversation_id),
+    question_id: text(data.question_id), conversation_id: text(data.conversation_id),
     bot: bot && { bot_id: text(bot.bot_id), name: text(bot.name) },
     severity: severity(data.severity), text: text(data.text),
-    choices: list(data.choices ?? []).map((item) => {
-      const choice = record(item)
-      return { label: text(choice.label), ...(choice.conversation_id == null ? {} : { conversation_id: text(choice.conversation_id) }) }
-    }),
+    choices: list(data.choices ?? []).map((item) => ({ label: text(record(item).label) })),
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },
   }
@@ -370,7 +377,7 @@ function sentBotMessage(value: unknown): SentBotMessage {
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), question_id: text(data.question_id), conversation_id: text(data.conversation_id), created_at_ms: number(data.created_at_ms) }
+  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), muted: data.muted === true, created_at_ms: number(data.created_at_ms) }
 }
 /** Every unanswered question across the network. */
 export function parseQuestions(value: unknown): Question[] {

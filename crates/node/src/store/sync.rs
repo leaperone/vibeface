@@ -312,23 +312,7 @@ impl Store {
                     message_id,
                 )?
             }
-            // A routing turn follows its conversation to a new owner.
-            Some(("route", question)) => {
-                if super::questions::question_from(&tx, network, question)?.is_none() {
-                    return Ok(None);
-                }
-                admit_from(
-                    &tx,
-                    network,
-                    conversation,
-                    trigger,
-                    TriggerKind::Route,
-                    question,
-                )?
-            }
-            _ => anyhow::bail!(
-                "only user and bot messages, work results and routing turns are delivered"
-            ),
+            _ => anyhow::bail!("only user and bot messages and work results are delivered"),
         };
         tx.commit()?;
         Ok(Some(receipt))

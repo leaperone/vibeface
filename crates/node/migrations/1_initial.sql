@@ -65,7 +65,7 @@ CREATE INDEX `questions_session` ON `questions` (`network_id`, `node`, `session_
 -- Create index "questions_conversation" to table: "questions"
 CREATE INDEX `questions_conversation` ON `questions` (`network_id`, `conversation_id`, `rank`);
 -- Create "session_owners" table
-CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `attribution` text NULL, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `node`, `session_id`));
+CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `attribution` text NULL, `muted` integer NOT NULL DEFAULT 0, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `node`, `session_id`));
 -- Create "budget_days" table
 CREATE TABLE `budget_days` (`network_id` text NOT NULL, `day` text NOT NULL, `used` integer NOT NULL, PRIMARY KEY (`network_id`, `day`));
 -- Create "triage_seen" table

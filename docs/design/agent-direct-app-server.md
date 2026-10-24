@@ -183,11 +183,10 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 判断留在协调 Agent 里，Node 不写规则。Node 只做不花 token 的确定性工作：收事件、去重、排队、按 Agent 的决定路由和投递。
 
-- 新事件进入本机待处理队列。每 20 秒唤醒一次本机协调 Agent（有挂起的服务端请求时立即唤醒），把待处理事件（最多 20 条）交给它，新会话，带完整 Shell。这一轮结束后，它没处理的事件直接丢弃，没回答也没提问的请求按兜底回复。不属于任何 Bot 的会话的事件不进队列，只得到一个“处理还是忽略”的提问。`test=true` 的事件只确认收到，不入队。
+- 新事件进入本机待处理队列。每 20 秒唤醒一次本机协调 Agent（有挂起的服务端请求时立即唤醒），把待处理事件（最多 20 条）交给它，新会话，带完整 Shell。这一轮结束后，它没处理的事件直接丢弃，没回答也没提问的请求按兜底回复。不属于任何 Bot 的交互会话先由运行它的设备归给主 Bot 再入队；不再关注的和 `codex exec`、子代理等后台会话的事件不入队。`test=true` 的事件只确认收到，不入队。
 - Agent 用 Shell 命令回答：
   - `vibeface triage events [--since <毫秒>]`：列出待处理事件（JSON）。
   - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --question <问题> [--choice <标签>]... [--request-id <ID>]`：需要本人看，在拥有该会话的 Bot 聊天里提问。`--choice` 可重复，最多 8 个，文字回答总是可用；`--request-id` 让提问挂住该请求。
-  - `vibeface triage assign --question <QID> --bot <会话>`：路由轮把外来会话交给一个 Bot，重复调用返回同一归属。
   - `vibeface codex requests`、`vibeface codex respond <request_id> '<result-json>'`：查看和回答挂起的服务端请求（1.2），也走 `/api/triage`。
   - `vibeface triage dismiss --event-id <ID>`：静默处理。
 - 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`。

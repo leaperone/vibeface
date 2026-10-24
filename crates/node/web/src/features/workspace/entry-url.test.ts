@@ -198,8 +198,8 @@ test("workspace preserves bot and message requests while routing native decision
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false
   const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
-  const sessionRow = { ...questionRow, question_id: "s1", conversation_id: null, bot: null }
-  let questionRows: Record<string, unknown>[] = [questionRow, sessionRow]
+  const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
+  let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
   const answers: Record<string, unknown>[] = []
   let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
@@ -286,7 +286,7 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().messagePending, null)
     await render().interruptWork("work")
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
-    const [question, session] = render().questions
+    const [question, other] = render().questions
     assert.equal(question.text, "要不要继续")
     await assert.rejects(render().answer(question, "  "), /不能为空/)
     await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
@@ -302,8 +302,8 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(render().pendingAnswers, [])
     assert.equal(render().answered.q1, "继续", "the answer shows before the next read")
     answerOutcome = "already_answered"
-    assert.equal((await render().answer(session, "处理")).text, "停下", "the answer that stood first is the one shown")
-    assert.equal(signed.at(-1), 'attestation|network|sessions|{"type":"message_posted","message_id":"a-s1","role":"user","text":"处理","report_results":true,"answers":"s1"}', "a session question is answered for sessions")
+    assert.equal((await render().answer(other, "继续")).text, "停下", "the answer that stood first is the one shown")
+    assert.equal(signed.at(-1), 'attestation|network|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
     // After a new connection the outbox asks the questions list before sending an unknown answer again.
     const later = { ...questionRow, question_id: "q2" }, elsewhere = { ...questionRow, question_id: "q3" }
     questionRows = [later, elsewhere]
@@ -507,7 +507,7 @@ const settleComponent = () => new Promise(setImmediate)
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
-    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }, { bot_id: 'main-bot', conversation_id: 'main', name: '主 Bot 甲' }], primary: 'main',
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }],
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
@@ -548,13 +548,12 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
-    const session = { ...question, question_id: 'q2', conversation_id: null, bot: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目 Bot', conversation_id: 'chat' }] }
-    assert.ok(app.render('QuestionCard', { question: session }).some(({ props }) => props['aria-label'] === '其他回答'), 'a session question takes a typed answer too')
-    for (const label of ['处理', '交给 项目 Bot', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
+    workspace.answered = {}
+    labelled(app.render('QuestionCard', { question: { ...question, question_id: 'q2' }, inbox: true }), '继续')?.props.onClick?.()
     await settleComponent()
-    assert.deepEqual(toasts.map(({ text }) => text), ['已交给主 Bot 分派', '已交给 项目 Bot', '已忽略这个会话'], '待处理 says where each session went')
+    assert.deepEqual(toasts.map(({ text }) => text), ['已回答'], '待处理 says it was answered')
     toasts[0].action?.onClick()
-    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'main-bot' } }], 'and leads to the chat that took it')
+    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'bot' } }], 'and leads to the chat it went to')
   } finally { app.close() }
 })
 

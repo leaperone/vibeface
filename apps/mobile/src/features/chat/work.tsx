@@ -124,12 +124,23 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     actions={<ActionButton disabled={!shared.writable} action={() => shared.confirmStopped(check)}>确认已停止</ActionButton>}>
     <Text>{confirmText({ reason: 'unverified', detail: check.detail }, '')}相关程序还没退出，退出后会自动处理。</Text>
   </ActionCard>
+  const device = nodeName(check.target_node, lookup)
+  if (check.kind === 'device') return <ActionCard icon={confirmIcons[check.reason]} title={`${check.works.length} 个任务`}>
+    <Text>{check.reason === 'offline' ? `${device} 离线了，报不回这些任务的结果。` : `${device} 上的 Codex 断开了，报不回这些任务的结果。`}它们实际做完了吗？</Text>
+    {check.works.map((work) => <View key={work.work_id} className="gap-2">
+      <Text numberOfLines={2} className="font-medium">{work.title || '任务结果'}</Text>
+      <View className="flex-row gap-2">
+        <ActionButton variant="outline" disabled={!shared.writable} action={() => shared.resolveCheck(work, 'interrupted', '')}>没做完</ActionButton>
+        <ActionButton disabled={!shared.writable} action={() => shared.resolveCheck(work, 'completed', '')}>做完了</ActionButton>
+      </View>
+    </View>)}
+  </ActionCard>
   const answer = (choice: 'completed' | 'interrupted') => () => shared.resolveCheck(check, choice, note)
   return <ActionCard icon={confirmIcons[check.reason]} title={check.title || '任务结果'} actions={<>
     <ActionButton variant="outline" disabled={!shared.writable} action={answer('interrupted')}>没做完</ActionButton>
     <ActionButton disabled={!shared.writable} action={answer('completed')}>做完了</ActionButton>
   </>}>
-    <Text>{confirmText(check, nodeName(check.target_node, lookup))}它实际做完了吗？</Text>
+    <Text>{confirmText(check, device)}它实际做完了吗？</Text>
     <TextInput {...caret} accessibilityLabel="补充说明" placeholder="补充说明（可选）" placeholderTextColorClassName="accent-muted-foreground" maxLength={2000}
       className="min-h-11 rounded-lg border border-border bg-background px-3 font-sans text-body text-foreground" value={note} onChangeText={setNote} />
   </ActionCard>

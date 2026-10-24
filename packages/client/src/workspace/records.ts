@@ -3,8 +3,6 @@ import type { BotRecord, ConversationPayload, ConversationRecords, NotificationR
 
 const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
 const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
-/** Questions outside any bot's chat live in the Node's sessions scope. */
-const scopeOf = (question: Question) => question.conversation_id ?? "sessions"
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {
   const next = items.map((item) => changed.find((candidate) => key(candidate) === key(item)) ?? item)
@@ -27,7 +25,7 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
 
 /** The network's unanswered questions, with this conversation's replaced by what it holds now. */
 export function mergeQuestions(questions: Question[], records: ConversationRecords): Question[] {
-  return [...questions.filter((item) => scopeOf(item) !== records.conversation_id), ...records.questions.filter((item) => !item.answer)]
+  return [...questions.filter((item) => item.conversation_id !== records.conversation_id), ...records.questions.filter((item) => !item.answer)]
 }
 
 export function mergeNotifications(notifications: NotificationRecord[], records: ConversationRecords): NotificationRecord[] {

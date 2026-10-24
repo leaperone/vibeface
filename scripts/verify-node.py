@@ -1165,8 +1165,9 @@ def fixture_triage(run, initial, prompt, bot):
             else:
                 action.update(action="ignore")
         elif "triage-raise" in event["cwd"] or "needs-human" in event.get("last_message", ""):
+            choices = ["--choice", "继续", "--choice", "停下"] if "dead-letter" in event.get("last_message", "") else []
             asked = json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "attention",
-                                           "--question", "会话停下等你回复：下一步做什么？").stdout)
+                                           "--question", "会话停下等你回复：下一步做什么？", *choices).stdout)
             action.update(action="raise", asked=asked)
         else:
             fixture_cli(initial, "triage", "dismiss", "--event-id", event["event_id"])
@@ -1214,7 +1215,7 @@ def fixture_manager(run, initial, bot):
     fixture_record(run, "manager-invocations.jsonl", record)
     schemas = set(initial["custom_tools"]) - set(context["trigger"].get("unavailable_tools", []))
     expected_tools = READ_TOOLS | WORK_TOOLS
-    if kind not in ("agent_task", "route"):
+    if kind != "agent_task":
         expected_tools |= WAKE_TOOLS
     if kind == "human":
         expected_tools |= SETTINGS_TOOLS
@@ -1269,17 +1270,6 @@ def fixture_manager(run, initial, bot):
                 "dispatch_work from the Shell has its expected outcome: " + completed.stderr[-300:])
         return json.loads(completed.stdout) if accepted else None
 
-    if kind == "route":
-        # The primary bot hands the session to the bot whose chat mentions it, or leaves it alone.
-        question, others = context["trigger"]["question"], context["trigger"]["bots"]
-        summary = question["about"]["summary"]
-        chosen = next((row["conversation_id"] for row in others if any(summary in line["text"] for line in row["recent"])),
-                      None if summary == "fixture-no-route" else context["conversation_id"])
-        assigned = [json.loads(fixture_cli(initial, "triage", "assign", "--question", question["question_id"], "--bot",
-                                           chosen).stdout) for _ in range(2)] if chosen else []
-        fixture_record(run, "routing-actions.jsonl", {"question_id": question["question_id"], "primary": context["conversation_id"],
-                       "bot": chosen, "assigned": assigned, "others": [row["conversation_id"] for row in others],
-                       "pid": os.getpid()})
     if kind == "answer":
         # The user's answer goes where the question came from, once however often it is sent.
         question, answer = context["trigger"]["question"], body["text"]
@@ -2024,8 +2014,9 @@ def triage_checks(run, workspace, a, network, passed):
         node_cli(a, "hook", "codex", stdin=json.dumps(dead_hook))
         wait_for("a 4xx goes to the dead letters", lambda: a.client.call("triage_settings")["outbox"]["dead"] >= 1, timeout=90)
         foreign = next(row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == "dead-session")
-        require(foreign["conversation_id"] is None and not any(row["session_id"] == "dead-session" for row in
-                fixture_records(run, "triage-actions.jsonl")), "a session no bot started is asked about, not triaged")
+        primary = a.client.rpc("bots")["primary"]
+        require(foreign["conversation_id"] == primary and [row["action"] for row in fixture_records(run, "triage-actions.jsonl")
+                if row["session_id"] == "dead-session"] == ["raise"], "a session no bot started goes to the primary bot and is triaged there")
 
         first = a.client.rpc("answer", question_id=question_id, text="继续，先跑测试", scope_id=owner)
         retry = a.client.rpc("answer", question_id=question_id, text="继续，先跑测试", scope_id=owner)
@@ -2052,7 +2043,7 @@ def triage_checks(run, workspace, a, network, passed):
         again = a.client.request("/api/decision", decision, origin=False, headers=bearer)
         a.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer wrong"}, status=401)
         require(posted == again == {"question_id": foreign["question_id"], "answer_id": "a-" + foreign["question_id"],
-                                    "status": "answered", "text": "忽略"}, "a decision token answers one question over HTTP once")
+                                    "status": "answered", "text": "继续"}, "a decision token answers one question over HTTP once")
         a.client.call("revoke_decision_token", {"token_id": tokens["token_id"]})
         a.client.request("/api/decision", decision, origin=False, headers=bearer, status=401)
         log = (a.directory / "process.log").read_text(errors="replace")
@@ -2064,90 +2055,76 @@ def triage_checks(run, workspace, a, network, passed):
 
 
 def foreign_session_checks(run, workspace, a, network, passed):
-    """A session no bot started is asked about once; 忽略 keeps it quiet, 交给 hands it over once, and 处理
-    gives the primary bot one routing turn in its chat that hands it to the bot whose chat fits, or keeps it."""
-    labels = ("ignore", "hand", "route", "keep", "next")
+    """A session no bot started goes to the primary bot once, with no question; the user hands it to another bot or
+    stops following it from the bot's chat, and a session nobody drives is left alone."""
+    labels = ("keep", "hand", "mute", "next", "exec")
     sessions = {label: "foreign-" + label + "-" + uuid.uuid4().hex[:8] for label in labels}
-    marker = "发票导出-" + uuid.uuid4().hex[:8]
-    summaries = {"route": marker, "keep": "fixture-no-route", "next": "fixture-no-route"}
     directory = workspace / "foreign"
     directory.mkdir()
+    rollout = directory / "exec-rollout.jsonl"
+    rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": sessions["exec"], "source": "exec",
+                                   "originator": "codex_exec"}}) + "\n")
 
-    def hook(session, turn, message="tests fail"):
+    def hook(session, turn, message="tests fail", **extra):
         node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": session, "turn_id": turn,
-                                                       "cwd": str(directory), "last_bot_message": message}))
+                                                       "cwd": str(directory), "last_bot_message": message, **extra}))
 
-    def asked(session):
-        return [row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == session]
+    def listed(conversation):
+        return {row["session_id"]: row for row in a.client.rpc("conversation", conversation_id=conversation)["sessions"]}
 
-    def handoffs(conversation):
-        return {row["session_id"]: row["conversation_id"] for row in a.client.rpc("conversation", conversation_id=conversation)["sessions"]}
+    def triaged(session):
+        return [row for row in fixture_records(run, "triage-actions.jsonl") if row["session_id"] == session]
 
-    def owned(conversation):
-        return [session for session, owner in handoffs(conversation).items() if owner == conversation]
+    def owner_events(kind):
+        return [event["body"] for scope in ("bot-history-alpha", "bot-history-beta") for event in scope_events(a, network, scope)
+                if event["body"]["type"] == kind and event["body"]["session_id"] in sessions.values()]
 
-    def routed(label):
-        return [row for row in fixture_records(run, "routing-actions.jsonl") if row["question_id"] == questions[label]["question_id"]]
+    def hand(label, conversation):
+        return [a.client.rpc("session_owner", node=a.device_id, session_id=sessions[label], conversation_id=conversation)
+                for _ in range(2)]
 
-    for label in ("ignore", "hand", "route", "keep"):
-        hook(sessions[label], "t1", summaries.get(label, "tests fail"))
-        hook(sessions[label], "t2", summaries.get(label, "tests fail"))
-    questions = {label: wait_for("one question about each session", lambda: (lambda rows: rows[0] if len(rows) == 1 else None)(
-        asked(sessions[label]))) for label in ("ignore", "hand", "route", "keep")}
-    expected = [{"label": "忽略"}, {"label": "处理"}, {"label": "交给 Alpha", "conversation_id": "bot-history-alpha"},
-                {"label": "交给 Beta", "conversation_id": "bot-history-beta"}]
-    require(all(row["conversation_id"] is None and row["text"] == "谁来接这个 Codex 会话？"
-                and row["choices"] == expected and row["about"]["summary"] == summaries.get(label, "tests fail")
-                for label, row in questions.items()),
-            "the question offers 忽略, 处理 and each bot, and shows only on the pending list")
-    require_quiet("events of an unowned session never reach the Agent", lambda: not any(
-        row["session_id"] in sessions.values() for row in fixture_records(run, "triage-actions.jsonl")))
     require(a.client.rpc("bots")["primary"] == "bot-history-alpha", "the first bot created is the primary one")
-    a.client.rpc("message", conversation_id="bot-history-beta", message_id="foreign-context-" + uuid.uuid4().hex[:8],
-                 text="看看" + marker + "为什么慢")
+    for label in ("keep", "hand", "mute"):
+        hook(sessions[label], "t1")
+        hook(sessions[label], "t2")
+    hook(sessions["exec"], "t1", "needs-human", transcript_path=str(rollout))
+    wait_for("each session goes to the primary bot", lambda: all(sessions[label] in listed("bot-history-alpha")
+             for label in ("keep", "hand", "mute")), timeout=60)
+    wait_for("the attributed sessions reach the Agent", lambda: all(len(triaged(sessions[label])) == 2 for label in ("keep", "hand", "mute")), timeout=90)
+    require(not any(row["about"]["session_id"] in sessions.values() for row in a.client.rpc("questions")["questions"]),
+            "nobody is asked who takes a session")
+    require(sorted(body["session_id"] for body in owner_events("session_attributed")) == sorted(sessions[label] for label in ("keep", "hand", "mute"))
+            and all(not row["muted"] for row in listed("bot-history-alpha").values()), "a repeated hook attributes a session once")
 
-    for label, text in (("ignore", "忽略"), ("hand", "交给 Beta"), ("route", "处理"), ("keep", "处理")):
-        a.client.rpc("answer", question_id=questions[label]["question_id"], text=text, scope_id="sessions")
-    wait_for("交给 hands the session to that bot", lambda: sessions["hand"] in owned("bot-history-beta"), timeout=60)
-    route = wait_for("处理 runs one routing turn in the primary bot's chat", lambda: routed("route") or None, timeout=90)
-    require(len(route) == 1 and route[0]["primary"] == "bot-history-alpha" and route[0]["bot"] == "bot-history-beta"
-            and route[0]["others"] == ["bot-history-beta"]
-            and [row["attributed"] for row in route[0]["assigned"]] == [True, False]
-            and {row["conversation_id"] for row in route[0]["assigned"]} == {"bot-history-beta"},
-            "the routing turn sees the other bot's chat and hands the session there once")
-    wait_for("the hand-over shows in both chats", lambda: handoffs("bot-history-alpha").get(sessions["route"]) == "bot-history-beta"
-             and sessions["route"] in owned("bot-history-beta"), timeout=60)
-    keep = wait_for("a routing turn that hands nothing over leaves the session with the primary", lambda: routed("keep")
-                    and sessions["keep"] in owned("bot-history-alpha") and routed("keep"), timeout=90)
-    require(len(keep) == 1 and keep[0]["bot"] is None and keep[0]["assigned"] == [], "the fallback is the primary bot")
+    handed = hand("hand", "bot-history-beta")
+    require([row["changed"] for row in handed] == [True, False] and handed[0]["conversation_id"] == "bot-history-beta",
+            "转给 hands the session over once; the retry writes nothing")
+    muted = hand("mute", None)
+    require([row["changed"] for row in muted] == [True, False] and muted[0]["muted"], "不再关注 is written once")
+    wait_for("the hand-over moves the session between chats", lambda: sessions["hand"] in listed("bot-history-beta")
+             and sessions["hand"] not in listed("bot-history-alpha"), timeout=60)
+    require(listed("bot-history-alpha")[sessions["mute"]]["muted"], "the muted session stays in its bot's chat, marked")
 
     a.client.rpc("set_primary_bot", conversation_id="bot-history-beta")
-    require(a.client.rpc("bots")["primary"] == "bot-history-beta", "the user picks another primary bot")
-    hook(sessions["next"], "t1", summaries["next"])
-    questions["next"] = wait_for("a question about the next session", lambda: (lambda rows: rows[0] if len(rows) == 1 else None)(
-        asked(sessions["next"])))
-    a.client.rpc("answer", question_id=questions["next"]["question_id"], text="处理", scope_id="sessions")
-    following = wait_for("the next session goes to the new primary", lambda: routed("next")
-                         and sessions["next"] in owned("bot-history-beta") and routed("next"), timeout=90)
-    require(len(following) == 1 and following[0]["primary"] == "bot-history-beta", "the routing turn ran in the new primary's chat")
+    hook(sessions["next"], "t1")
+    wait_for("the next session goes to the new primary", lambda: sessions["next"] in listed("bot-history-beta"), timeout=60)
 
-    require_quiet("an ignored session stays unowned and each hand-over is written once", lambda: sessions["ignore"] not in
-                  owned("bot-history-alpha") + owned("bot-history-beta") and all(len(routed(label)) == 1 for label in ("route", "keep", "next")))
-    attributed = [event for scope in ("bot-history-alpha", "bot-history-beta") for event in scope_events(a, network, scope)
-                  if event["body"]["type"] == "session_attributed"]
-    require(sorted(event["body"]["session_id"] for event in attributed) == sorted(sessions[label] for label in ("hand", "route", "keep", "next")),
-            "each handed-over session has exactly one attribution")
-
-    hook(sessions["ignore"], "t3", "needs-human")
-    hook(sessions["hand"], "t3", "needs-human")
-    later = wait_for("a later question about the handed-over session lands in its bot's chat", lambda: next(
+    before = {label: len(triaged(sessions[label])) for label in labels}
+    for label in ("mute", "hand"):
+        hook(sessions[label], "t3", "needs-human")
+    later = wait_for("a later question about the handed-over session lands in its new bot's chat", lambda: next(
         (row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == sessions["hand"]
          and row["conversation_id"] == "bot-history-beta"), None), timeout=90)
-    require(len(asked(sessions["ignore"])) == 0 and not any(row["session_id"] == sessions["ignore"]
-            for row in fixture_records(run, "triage-actions.jsonl")), "an ignored session stays quiet")
-    passed("a session no bot started is asked about once and handed over once, by the primary bot when the user says 处理",
-           ignored=sessions["ignore"], handed=sessions["hand"], routed=sessions["route"], kept=sessions["keep"],
-           next=sessions["next"], later=later["question_id"])
+    require_quiet("a muted session and one nobody drives stay quiet and unowned", lambda: len(triaged(sessions["mute"])) == before["mute"]
+                  and not triaged(sessions["exec"]) and sessions["exec"] not in listed("bot-history-alpha")
+                  and sessions["exec"] not in listed("bot-history-beta"))
+    attributed = owner_events("session_attributed")
+    require(sorted(body["session_id"] for body in attributed) == sorted(sessions[label] for label in ("keep", "hand", "hand", "mute", "next"))
+            and [body["session_id"] for body in owner_events("session_muted")] == [sessions["mute"]],
+            "each attribution, hand-over and mute is written exactly once")
+    passed("a session no bot started goes to the primary bot once; 转给 and 不再关注 are written once; a codex exec session is skipped",
+           kept=sessions["keep"], handed=sessions["hand"], muted=sessions["mute"], next=sessions["next"],
+           skipped=sessions["exec"], later=later["question_id"])
 
 
 def no_agent_checks(run, a, passed):

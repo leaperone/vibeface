@@ -27,8 +27,10 @@ export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device:
 
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
-/** "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run. */
-/** `inbox`: also names the bot and links to its chat. */
+/**
+ * "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run.
+ * `inbox`: also names the bot and links to its chat.
+ */
 export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inbox?: boolean }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
@@ -45,18 +47,40 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     <p>{checkReason(check)}相关程序还没退出，退出后会自动处理。</p>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
-  const answer = (choice: "completed" | "interrupted") => async () => { await workspace.resolveCheck(check, choice, note); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
+  const settle = (work: WorkCheck, choice: "completed" | "interrupted", text = "") => async () => { await workspace.resolveCheck(work, choice, text); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = nodeName(check.target_node, lookup)
+  const botOf = (work: WorkCheck) => inbox ? workspace.bots.find((item) => item.conversation_id === work.conversation_id) : undefined
+  if (check.kind === "device") return <ActionCard
+    icon={confirmIcons[check.reason]}
+    title={`待确认 · ${check.works.length} 个任务`}
+    meta={device}
+  >
+    <p>{check.reason === "offline" ? `${device} 离线了，报不回这些任务的结果。` : `${device} 上的 Codex 断开了，报不回这些任务的结果。`}它们实际做完了吗？</p>
+    <ul className="grid gap-2">
+      {check.works.map((work) => {
+        const bot = botOf(work)
+        return <li key={work.work_id} className="flex min-w-0 flex-wrap items-center gap-2">
+          <span className="min-w-0 flex-1 truncate font-medium" title={work.title}>{work.title || "任务结果"}</span>
+          {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:underline max-md:min-h-11">
+            <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
+          <span className="flex shrink-0 gap-2">
+            <ActionButton disabled={disabled} action={settle(work, "interrupted")}>没做完</ActionButton>
+            <ActionButton variant="default" disabled={disabled} action={settle(work, "completed")}>做完了</ActionButton>
+          </span>
+        </li>
+      })}
+    </ul>
+  </ActionCard>
   const reason = confirmText(check, device)
-  const bot = inbox ? workspace.bots.find((item) => item.conversation_id === check.conversation_id) : undefined
+  const bot = botOf(check)
   return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.title || "任务结果"}`}
     meta={bot ? <span className="flex min-w-0 items-center gap-3">{device}<Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
       <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" /></Link></span> : device}
     actions={<>
-      <ActionButton disabled={disabled} action={answer("interrupted")}>没做完</ActionButton>
-      <ActionButton variant="default" disabled={disabled} action={answer("completed")}>做完了</ActionButton>
+      <ActionButton disabled={disabled} action={settle(check, "interrupted", note)}>没做完</ActionButton>
+      <ActionButton variant="default" disabled={disabled} action={settle(check, "completed", note)}>做完了</ActionButton>
     </>}
   >
     <p>{reason}那个任务实际做完了吗？</p>
