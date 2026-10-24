@@ -8,6 +8,7 @@ import {
 } from '@/components/ui/message-scroller'
 
 import { useRef, type ReactNode } from 'react'
+import { cn } from 'cn'
 import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */
@@ -32,6 +33,22 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
   const newestKey = newest >= 0 ? entries[newest].key : null
   if (opened.current === undefined && entries.length > 0) opened.current = newestKey
   const anchor = opened.current !== undefined && newestKey !== opened.current ? newest : -1
+  // Messages already here when the chat opened stay still; one that arrives later eases in once, as it mounts.
+  // A finished reply takes over from its streamed text under a new key, so it does not ease in a second time.
+  const seen = useRef<Set<string> | null>(null)
+  const entered = useRef(new Set<string>())
+  const streamed = useRef<string[]>([])
+  seen.current ??= new Set(entries.map((entry) => entry.key))
+  const keys = new Set(entries.map((entry) => entry.key))
+  let handedOff = streamed.current.filter((key) => !keys.has(key)).length
+  for (const entry of entries) {
+    if (seen.current.has(entry.key)) continue
+    seen.current.add(entry.key)
+    if (!('message' in entry)) continue
+    if (entry.message.role !== 'user' && entry.message.state !== 'streaming' && handedOff > 0) handedOff -= 1
+    else entered.current.add(entry.key)
+  }
+  streamed.current = entries.filter((entry) => 'message' in entry && entry.message.state === 'streaming').map((entry) => entry.key)
 
   if (entries.length === 0) {
     return <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{empty}</div>
@@ -47,7 +64,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)
               return (
-                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={index === 0 ? undefined : 'mt-6'}>
+                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && 'mt-6', entered.current.has(entry.key) && 'message-enter')}>
                   {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} last={last} retry={entry.retry} /> : entry.node}
                 </MessageScrollerItem>
               )

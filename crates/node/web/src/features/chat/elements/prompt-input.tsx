@@ -1,4 +1,4 @@
-import { useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { cn } from 'cn'
@@ -39,6 +39,7 @@ export function PromptInput({
 }) {
   const formRef = useRef<HTMLFormElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
+  const textRef = useRef<HTMLTextAreaElement>(null)
   // One line until the text is focused, so the transcript keeps the screen; it grows while writing.
   const [open, setOpen] = useState(false)
   // Buttons keep the focus on the text, so a tap acts instead of collapsing the box under the finger.
@@ -46,6 +47,22 @@ export function PromptInput({
   // A written message is always sendable; while writing, Stop moves beside Send instead of leaving.
   const drafting = Boolean(value.trim() || files.length)
   const stop = drafting ? undefined : onStop
+  // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
+  // between two content heights, so the change is replayed from the height last shown. It lets go once there, so a
+  // resized window still fits the text.
+  const shownHeight = useRef<number | null>(null)
+  useLayoutEffect(() => {
+    const box = textRef.current
+    if (!box) return
+    const from = box.style.height ? box.getBoundingClientRect().height : shownHeight.current
+    box.style.height = ''
+    const to = box.getBoundingClientRect().height
+    shownHeight.current = to
+    if (from === null || from === to || matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    box.style.height = `${from}px`
+    box.getBoundingClientRect()
+    box.style.height = `${to}px`
+  }, [value, open])
   return (
     <form
       ref={formRef}
@@ -61,6 +78,7 @@ export function PromptInput({
         <div data-toast-above="" className="absolute start-0 bottom-full flex pb-2 empty:hidden">{above}</div>
         <InputGroup className="rounded-2xl bg-card shadow-sm dark:bg-card has-[[data-slot=input-group-control]:focus-visible]:ring-2">
           <InputGroupTextarea
+            ref={textRef}
             id="message-text"
             name="text"
             required
@@ -72,8 +90,9 @@ export function PromptInput({
             aria-describedby={hint ? 'manager-hint' : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
-            className={cn('px-4', open ? 'min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
+            className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-150', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
             onFocus={() => setOpen(true)}
+            onTransitionEnd={(event) => { if (event.propertyName === 'height') event.currentTarget.style.height = '' }}
             onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
             onKeyDown={(event: KeyboardEvent<HTMLTextAreaElement>) => {
               if (isSubmitKey(event.nativeEvent)) {
