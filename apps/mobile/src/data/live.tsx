@@ -73,13 +73,16 @@ function Live({ children }: { children: ReactNode }) {
   const conversations: Record<string, Conversation> = {}
   if (data && conversationId) {
     const jobs = data.scheduler?.jobs ?? []
+    // A streamed reply gives way once its job ends or its final reply is in the history, even before the job names it.
     const live = shared.liveProgress.find((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text
-      && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
+      && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || data.messages.some((message) => message.message_id === job.reply_message_id
+        || message.role === 'assistant' && message.in_reply_to !== undefined && message.in_reply_to === job.message_id))))
+    const liveTrigger = live?.kind === 'manager' ? jobs.find((job) => job.trigger === live.trigger)?.message_id : undefined
     const messages: ChatMessage[] = threadReplies(data.messages)
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
-    if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming' })
+    if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const agentReady = nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {

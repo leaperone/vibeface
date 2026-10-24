@@ -33,6 +33,13 @@ const Fade = withUniwind(Animated.View)
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
   const rows: Entry[] = []
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
+  // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
+  const turns = new Set<string>()
+  const keyOf = (message: ChatMessage) => {
+    if (message.role !== 'assistant' || !message.in_reply_to || turns.has(message.in_reply_to)) return message.message_id
+    turns.add(message.in_reply_to)
+    return `turn:${message.in_reply_to}`
+  }
   chat.messages.forEach((message, index) => {
     while (questions.length && questions[0].created_at_ms < message.created_at_ms) {
       const question = questions.shift()!
@@ -42,7 +49,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): 
     // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.last && previous.message.role === message.role
-    rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
+    rows.push({ key: keyOf(message), message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
     rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   })
   for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
