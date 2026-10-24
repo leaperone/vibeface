@@ -39,6 +39,7 @@ const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
+const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
 
 function WorkspaceLayout({ children }: { children: ReactNode }) {
@@ -71,6 +72,18 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     const timer = setInterval(refresh, 30_000)
     return () => clearInterval(timer)
   }, [device.ready])
+  // Each request toasts once, also across reloads of this tab; on a page that lists it, seeing it there counts.
+  const joinIds = joins.map((join) => join.join_id).join()
+  useEffect(() => {
+    if (!joinIds) return
+    let seen: string[] = []
+    try { seen = JSON.parse(sessionStorage.getItem(JOINS_SEEN) ?? "[]") } catch {}
+    const fresh = joins.filter((join) => !seen.includes(join.join_id))
+    if (!fresh.length) return
+    try { sessionStorage.setItem(JOINS_SEEN, JSON.stringify([...seen, ...fresh.map((join) => join.join_id)].slice(-50))) } catch {}
+    if (pathname === "/devices" || pathname === "/inbox") return
+    for (const join of fresh) toast(`${join.name || "新设备"} 想加入`, { icon: MonitorSmartphone, action: { label: "查看", onClick: () => { void navigate({ to: "/devices" }) } } })
+  }, [joinIds, pathname])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
 

@@ -696,6 +696,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   async function openLocalAccess(thenRejoin = false) {
     if (localSetup?.kind !== 'initialized') throw new Error('请先打开这台电脑的本机页面。')
+    // A member browser reconnects as itself; the launcher would start a separate local session on another origin.
+    const computer = localSetup.entry
+    if (!thenRejoin && savedEntries().some(item => entryKey(item) === entryKey(computer))) { await connect(computer); return }
     const version = generation.current, controller = new AbortController(); connecting.current = controller
     const setup = await discoverLocalSetup(controller.signal)
     if (version !== generation.current) throw changed()
@@ -834,7 +837,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       // A launch link opens the localhost page; a browser already joined there keeps that identity instead.
       const launch = invitation || resumeTargets().length ? null : localLaunch
       // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
-      if (!invitation && (launch || load('local-origin') === true)) {
+      // After 断开 only a click (a launch link) opens it again, not the remembered local session.
+      const stay = load('stay-disconnected') === true
+      if (!invitation && (launch || !stay && load('local-origin') === true)) {
         const local = await localEntry(me, launch)
         if (!mounted || version !== generation.current) return
         // Kept while the Node is down, so the next load on this origin still asks it.
@@ -861,6 +866,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         if (launch && local?.kind === 'initialized' && local.local_launch) { launchLocal(local); return }
         if (local?.kind === 'uninitialized') { setPhase('disconnected'); return }
         if (local?.kind === 'initialized' && local.removed) { setPhase('removed'); setRemovedFrom(local.entry); return }
+        if (stay) return
         if (local?.kind === 'initialized') {
           const opening = connect(local.entry); version = generation.current
           void opening.catch(cause => { if (mounted && version === generation.current) setError(messageOf(cause)) })
