@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { ArchiveRestore, Camera, CircleCheck, Download, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LockKeyhole, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { cn } from 'cn'
-import { Details, DetailRow, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, Wordmark } from '@/components/app/kit'
+import { Details, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, Wordmark } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -17,7 +17,8 @@ import { webPlatform } from '@/lib/platform'
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
 const { connectDevice } = webPlatform.transport
-import { RecoveryControls, RecoveryReview } from './recovery-controls'
+import { RecoveryControls, RecoveryReview, SaveRecoveryFile } from './recovery-controls'
+import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
 type Lane = 'local' | 'invite' | 'saved' | 'recovery'
@@ -177,6 +178,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   // A removed computer that started over keeps its old name, and joining again is its next step.
   const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
   const hostName = useComputerName(device.localSetup?.kind === 'uninitialized' && !formerName ? device.localSetup.entry : undefined)
+  const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
+  const localName = useComputerName(device.localSetup?.kind === 'initialized' && !savedName ? device.localSetup.entry : undefined)
+  const computerName = savedName || localName || '这台电脑'
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName), removed: device.error === BROWSER_REMOVED })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
@@ -223,7 +227,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-2">
-      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : '这台电脑'}</Button> : null}
+      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />用加入链接</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
@@ -246,9 +250,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.joining) body = <BrowserJoin />
   else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} initial={draftNames} onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
-  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title="这台电脑">
+  else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这台电脑'}>
     {device.localSetup.kind === 'initialized'
-      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开这台电脑</Button>
+      ? <Button type="button" className="w-fit" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}>打开</Button>
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
@@ -292,15 +296,16 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
       {other}
       {device.identity && !focused ? <Details key={step ?? active}>
-        <DetailRow label="这个浏览器的设备编号" value={device.identity.deviceId} mono />
-        {usable ? <form className="grid gap-3 border-t pt-3" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
-          <fieldset disabled={linking} className="grid gap-3">
-            <legend className="sr-only">手填访问地址</legend>
-            <Field label="访问地址"><Input type="url" name="address" required defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
-            <Button type="submit" variant="outline" className="w-fit">连接</Button>
-          </fieldset>
-        </form> : null}
+        <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
+        {usable ? <Details label="手动填写地址">
+          <form className="grid gap-3" noValidate onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
+            <fieldset disabled={linking} className="grid gap-3">
+              <Field label="访问地址"><Input type="url" name="address" defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
+              <Field label="设备编号"><Input className="font-mono" name="device_id" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+              <Button type="submit" variant="outline" className="w-fit">连接</Button>
+            </fieldset>
+          </form>
+        </Details> : null}
       </Details> : null}
     </div>
   </main>
@@ -342,7 +347,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
       const input = form.elements.namedItem('password') as HTMLInputElement
       if ([...input.value].length < 8) { setShort(true); input.focus(); return }
       void run(async () => {
-        try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password'), value(form, 'password')), names.computer) }
+        try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer) }
         finally { form.reset() }
       })
     }}>
@@ -377,13 +382,7 @@ function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
     return () => { live = false }
   }, [networkId])
   return <Panel icon={FileKey} title="保存恢复文件">
-    <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />文件用恢复密码加密，没有密码打不开</p>
-    {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
-      <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
-      <span className="min-w-0 flex-1 py-2 font-mono [overflow-wrap:anywhere]">{file}</span>
-      <Button type="button" variant="ghost" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup() })}>重新下载</Button>
-    </p> : <Button type="button" className="w-fit" disabled={busy} onClick={() => void run(async () => { await device.downloadBackup(); setDownloaded(true) })}><Download aria-hidden="true" />下载恢复文件</Button>}
-    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => setSaved(event.target.checked)} />已把文件和密码分开保存</label>
+    <SaveRecoveryFile file={file} saved={saved} onSaved={setSaved} busy={busy} download={{ done: downloaded, run: () => void run(async () => { await device.downloadBackup(); setDownloaded(true) }) }} />
     <div className="flex justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={device.cancelSensitive}>上一步</Button>
       <Button type="button" disabled={!saved || busy} aria-busy={busy || undefined} onClick={() => void run(async () => { startOnboarding(); await device.confirmBootstrap(true) })}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}完成创建</Button>
@@ -400,9 +399,6 @@ function BrowserJoin() {
     <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
-    <Details>
-      <DetailRow label="这个浏览器" value={device.identity?.deviceId ?? ''} mono />
-      <DetailRow label="加入请求" value={joining.join_id} mono />
-    </Details>
+    <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
   </Panel>
 }
