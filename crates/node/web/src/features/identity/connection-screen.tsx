@@ -8,7 +8,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { messageOf, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryCode, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
-import { defaultBrowserName, defaultComputerName } from '@/lib/device-name'
+import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
@@ -216,7 +216,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     const form = event.currentTarget
     setNotice('')
     void run(async () => {
-      if (!thisComputer) return device.join(invitation, value(form, 'name'))
+      if (!thisComputer) { rememberBrowserName(value(form, 'name')); return device.join(invitation, value(form, 'name')) }
       // The entry spent the invite on the cancelled request, so it cannot be used again.
       if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
     })
@@ -282,7 +282,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         </p>}
         {thisComputer
           ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
-          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Field>}
+          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
         {purpose === 'link' ? <Button type="submit" className="w-fit" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
       </fieldset>
     </form>}
