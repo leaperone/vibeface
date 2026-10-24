@@ -8,7 +8,7 @@ const decoder = new TextDecoder('utf-8', { fatal: true })
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
 export type RecoveryFile = { size: number; text(): Promise<string> }
-/** What a recovery file carries besides its key: the whole checkpoint chain and the vetoes it rests on, so an empty Node can check it. */
+/** What a recovery file carries besides its key: the whole checkpoint chain and the management events it rests on (the heads each recovery names, and the vetoes), so an empty Node can check it. */
 type RecoveryMaterial = { networkId: string; genesis: unknown; checkpoints: unknown[]; events: unknown[] }
 
 /** The membership and recovery checks built on `crates/secure`, for whichever build of it the platform loaded. */
