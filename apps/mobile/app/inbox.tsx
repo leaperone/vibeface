@@ -1,5 +1,6 @@
 import { Link } from 'expo-router'
 import { Bot, ChevronRight, Inbox as InboxIcon } from 'lucide-react-native'
+import { useRef } from 'react'
 import { Pressable } from 'react-native'
 import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
@@ -17,13 +18,16 @@ const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMo
 /** Questions nobody answered, grouped by bot; each group names its bot once and leads to its chat. */
 export default function Inbox() {
   const workspace = useWorkspace()
-  // Groups order by each bot's latest question, answered or not, so answering never reshuffles them; only a new question does.
+  // Groups order by the newest question each bot has shown here. Answered questions leave the list, so the time is kept
+  // and only rises: answering never reshuffles the groups, and only a new question lifts its bot to the top.
+  const latest = useRef(new Map<string, number>()).current
   const groups = new Map<string, typeof workspace.questions>()
-  for (const question of [...workspace.questions].sort((a, b) => b.created_at_ms - a.created_at_ms)) {
+  for (const question of workspace.questions.filter((item) => item.answer === null).sort((a, b) => b.created_at_ms - a.created_at_ms)) {
     const key = question.bot?.bot_id ?? ''
-    groups.set(key, [...groups.get(key) ?? [], ...question.answer === null ? [question] : []])
+    latest.set(key, Math.max(latest.get(key) ?? 0, question.created_at_ms))
+    groups.set(key, [...groups.get(key) ?? [], question])
   }
-  const open = [...groups.values()].filter((questions) => questions.length)
+  const open = [...groups].sort(([a], [b]) => latest.get(b)! - latest.get(a)!).map(([, questions]) => questions)
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} asChild>
