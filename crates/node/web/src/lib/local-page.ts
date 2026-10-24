@@ -3,16 +3,24 @@ import type { LocalSetup } from '@vibeface/client/lib/node.ts'
 import type { LocalPage } from '@vibeface/client/lib/platform.ts'
 import { localBrowserEntry } from './local-access'
 
+const invitationIn = () => location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.href : ''
+
 /** Only a page on localhost may set up, launch or join the computer serving it. */
 export const localPage: LocalPage = {
   get origin() { return location.origin },
   takeLaunch() {
     const fragment = new URLSearchParams(location.hash.slice(1))
-    const invitation = location.pathname === '/join' && location.hash.startsWith('#vibeface1') ? location.href : ''
+    const invitation = invitationIn()
     const localToken = fragment.get('local')
     const localLaunch = localToken ? { token: localToken, deviceId: fragment.get('node') ?? '', rejoin: fragment.get('rejoin') === '1' } : null
     if (location.hash) { const clean = new URL(location.href); clean.hash = ''; history.replaceState(null, '', clean) }
     return { invitation, localLaunch }
+  },
+  watchInvitation(listener) {
+    // Leaves other hashes alone: `open` reloads to read a local launch.
+    const changed = () => { if (invitationIn()) listener(localPage.takeLaunch().invitation) }
+    addEventListener('hashchange', changed)
+    return () => removeEventListener('hashchange', changed)
   },
   async discoverLocalSetup(signal): Promise<LocalSetup | null> {
     const url = new URL(location.href)

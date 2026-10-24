@@ -65,6 +65,8 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const pageOrigin = local ? localEntry.address : entry.address
   const hash = invitation ? `#${invitation}` : fragment, pathname = invitation ? '/join' : '/'
   const location = { hash, pathname, href: `${pageOrigin}${pathname}${hash}`, origin: pageOrigin, assign(url: string) { navigations.push(url) } }
+  const hashListeners = new Set<() => void>()
+  const openHash = (path: string, next: string) => { Object.assign(location, { pathname: path, hash: next, href: `${pageOrigin}${path}${next}` }); hashListeners.forEach(listener => listener()) }
   let cursor = 0, nextTimer = 0
   const react = {
     createContext: () => ({}), useContext: () => null, useCallback: (fn: unknown) => fn,
@@ -133,7 +135,8 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
     localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) },
-    location, history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
+    location, addEventListener: (type: string, listener: () => void) => { if (type === 'hashchange') hashListeners.add(listener) }, removeEventListener: (_type: string, listener: () => void) => hashListeners.delete(listener),
+    history: { replaceState(_state: unknown, _title: string, url: URL) { location.hash = url.hash } }, URL, URLSearchParams, AbortController, TextEncoder, TextDecoder, Uint8Array, Error, crypto: globalThis.crypto,
     async fetch(path: string, options: RequestInit) {
       if (path === '/api/local/info') calls.push('local-info')
       if (path === '/api/local/info') return localSession
@@ -182,7 +185,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -439,6 +442,22 @@ for (const [status, reason, message] of [['rejected', 'commitment_mismatch', /�
     await assert.rejects(app.render().checkJoin(), message)
     assert.equal(app.render().joining, null)
     assert.equal(app.stored.get('vibeface.pending-join'), 'null')
+  } finally { app.close() }
+})
+
+test('a join link opened in the same tab after a rejection replaces the spent one and its error', async () => {
+  const app = deviceHarness({ joining: 'pending' })
+  try {
+    app.render(); await settle()
+    app.joinStatus.value = joinRequest('rejected', { reason: 'rejected' })
+    await assert.rejects(app.render().checkJoin(), /拒绝/)
+    assert.match(app.render().error, /拒绝/)
+    app.openHash('/join', '#local=token')
+    assert.equal(app.location.hash, '#local=token')
+    app.openHash('/join', '#vibeface1fresh')
+    assert.equal(app.render().initialInvitation, `${entry.address}/join#vibeface1fresh`)
+    assert.equal(app.render().error, '')
+    assert.equal(app.location.hash, '')
   } finally { app.close() }
 })
 
