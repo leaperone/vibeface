@@ -243,7 +243,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       case 'backup': {
         const key = root(input.key || 'root');
         const network = input.network_id || key.deviceId();
-        const payload = encoder.encode(JSON.stringify({ version: 1, network_id: network, root_secret_key: key.secretHex(), genesis: input.genesis, checkpoints: input.checkpoints || [] }));
+        const payload = encoder.encode(JSON.stringify({ version: 1, network_id: network, root_secret_key: key.secretHex(), genesis: input.genesis, checkpoints: input.checkpoints || [], events: input.events || [] }));
         try { result = { version: 1, network_id: network, envelope: JSON.parse(decoder.decode(recoverySeal(payload, input.password))) }; }
         finally { payload.fill(0); }
         break;
@@ -254,7 +254,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         try {
           const payload = JSON.parse(decoder.decode(plaintext));
           roots.get('recovered')?.free(); roots.set('recovered', Identity.fromSecretHex(payload.root_secret_key));
-          result = { network_id: payload.network_id, genesis: payload.genesis, checkpoints: payload.checkpoints };
+          result = { network_id: payload.network_id, genesis: payload.genesis, checkpoints: payload.checkpoints, events: payload.events };
         } finally { plaintext.fill(0); }
         break;
       }
@@ -1454,31 +1454,29 @@ def verify_web_assets(node, module):
 
 
 def recover_fresh_node(node, backup, password):
-    """A fresh Node joins the recovered network through its local capability and a root checkpoint."""
+    """A fresh Node takes the recovery through its local capability, and it waits like any other."""
     node.start()
     node.client.connect(node.device_id)
     material = node.client.command("recover_material", backup=backup, password=password)
     info = node.client.call("info")
     members = [{"device_id": node.client.own_id(), "kind": "client", "name": "Fresh recovery manager", "manage": True},
                {"device_id": node.device_id, "kind": "node", "name": info["name"], "manage": False}]
-    state = {"genesis": material["genesis"], "checkpoints": material["checkpoints"], "events": []}
+    state = {"genesis": material["genesis"], "checkpoints": material["checkpoints"], "events": material["events"]}
     checkpoint = node.client.command("recovery_checkpoint", state=state, network_id=material["network_id"],
                                      members=members, heads={})
-    chain = [*material["checkpoints"], checkpoint]
-    node.client.call("recover", {"genesis": material["genesis"], "checkpoints": chain}, status=400)
-    result = node.client.call("recover", {"genesis": material["genesis"], "checkpoints": chain,
-                                          "capability": node.access["capability"]})
+    submit = {"genesis": material["genesis"], "checkpoints": [*material["checkpoints"], checkpoint],
+              "events": material["events"]}
+    node.client.call("recover", submit, status=400)
+    result = node.client.call("recover", {**submit, "capability": node.access["capability"]})
     node.client.network_id = backup["network_id"]
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"],
-            "fresh node restores independent management at the next recovery epoch")
-    node.client.authenticate()
-    require(node.client.rpc("conversations")["conversations"] == [],
-            "root-only recovery does not invent unavailable business history")
+    require(result["principal"] is None and result["recovery"]["status"] == "waiting",
+            "a recovery on a fresh Node waits like any other")
+    node.client.call("rpc", {"method": "conversations"}, status=400)
     return checkpoint
 
 
 def verify_recovery(node, other, network):
-    """A browser that lost every manager regains control with the root key; existing managers stay."""
+    """A browser holding only the recovery file must wait; a manager stops it and the old file keeps working."""
     wrong = other.command("recover_material", backup=node.backup, password="wrong-acceptance-passphrase", check=False)
     require(wrong["ok"] is False, "encrypted recovery package rejects a wrong password")
     material = other.command("recover_material", backup=node.backup, password=node.backup_password)
@@ -1491,8 +1489,11 @@ def verify_recovery(node, other, network):
                                              body={"type": "probe"})["signature"]
     response = other.call("recovery_state", stale, status=400)
     require("state" not in response, "a proof not signed by the root reveals no membership")
-    read = other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network),
-                                         "checkpoints": material["checkpoints"]})
+    def read_with(checkpoints, events, status=200):
+        proof = other.command("recovery_read_proof", network_id=network)
+        return other.call("recovery_state", {**proof, "checkpoints": checkpoints, "events": events}, status=status)
+
+    read = read_with(material["checkpoints"], material["events"])
     view = node.client.call("directory")["view"]
     revoked = {item["device_id"] for item in view["revoked"]}
     keep = [member for member in view["members"] if member["device_id"] not in revoked]
@@ -1500,27 +1501,42 @@ def verify_recovery(node, other, network):
     keep.append({"device_id": me, "kind": "client", "name": "Recovered management client", "manage": True})
     checkpoint = other.command("recovery_checkpoint", state=read["state"], network_id=network, members=keep,
                                heads=read["heads"])
-    chain = [*read["state"]["checkpoints"], checkpoint]
+    chain, events = [*read["state"]["checkpoints"], checkpoint], read["state"]["events"]
     renewed = other.command("backup", key="next", network_id=network, genesis=material["genesis"], checkpoints=chain,
-                            password=node.backup_password)
-    result = other.call("recover", {"genesis": material["genesis"], "checkpoints": chain})
+                            events=events, password=node.backup_password)
+    submit = {"genesis": material["genesis"], "checkpoints": chain, "events": events}
+    result = other.call("recover", submit)
     other.network_id = network
-    require(result["principal"]["can_manage"] and result["view"]["epoch"] == checkpoint["epoch"] > view["epoch"],
-            "root recovery establishes a manager in a higher epoch")
-    retry = other.call("recover", {"genesis": material["genesis"], "checkpoints": chain})
-    require(retry["view"]["epoch"] == checkpoint["epoch"], "retrying the same recovery changes nothing")
-    refused = other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network), "checkpoints": []},
-                         status=400)
-    require("state" not in refused and "replaced by a newer recovery" in json.dumps(refused),
-            "the recovery file used for recovery stops working")
+    waiting = result["recovery"]
+    require(result["principal"] is None and waiting["status"] == "waiting"
+            and waiting["effective_at_ms"] == checkpoint["issued_at_ms"] + 48 * 3600 * 1000,
+            "a root recovery waits two days before it takes effect")
+    require(other.call("recover", submit)["recovery"] == waiting, "retrying the same recovery changes nothing")
+    other.call("directory", status=400)
+    directory = node.client.call("directory")
+    pending = directory["view"]["pending"]
+    require(pending["effective_at_ms"] == waiting["effective_at_ms"] and directory["view"]["epoch"] == view["epoch"],
+            "managers see the waiting recovery and keep the directory in effect")
+    refused = read_with([], [], status=400)
+    require("state" not in refused and "another recovery is waiting" in json.dumps(refused),
+            "the old recovery file signs nothing while a recovery waits")
+    veto = node.client.command("governance", state=directory["state"], network_id=network,
+                               action={"type": "veto", "checkpoint": pending["checkpoint"], "at_ms": directory["now_ms"]})
+    other.call("veto", {"event": veto}, status=400)
+    stopped = node.client.call("veto", {"event": veto})
+    require(stopped["view"]["pending"] is None and stopped["view"]["stopped"] == [pending["checkpoint"]],
+            "an existing manager stops the recovery")
+    require(node.client.call("veto", {"event": veto})["view"] == stopped["view"], "retrying the veto changes nothing")
+    require(other.call("authenticate")["recovery"] == {"status": "stopped"}, "the recovering browser learns it was stopped")
+    read_with([], [])
     other.command("recover_material", backup=renewed, password=node.backup_password)
-    other.call("recovery_state", {**other.command("recovery_read_proof", network_id=network), "checkpoints": chain})
-    node.backup = renewed
-    private_json(node.directory / "recovery-package.json", renewed)
+    refused = read_with(chain, events, status=400)
+    require("stopped this recovery" in json.dumps(refused), "the new recovery file is void after the veto")
     node.client.connect()
     node.client.authenticate(network)
-    require(node.client.principal["can_manage"] and node.client.own_id() in managers,
-            "existing managers keep management after root recovery by default")
+    require(node.client.principal["can_manage"] and node.client.own_id() in managers
+            and node.client.call("directory")["view"]["epoch"] == view["epoch"],
+            "existing managers keep management and the directory after the veto")
     return checkpoint
 
 
@@ -3882,7 +3898,7 @@ def auto_route_acceptance(options):
 
         recovered = fresh(target.url)
         checkpoint = verify_recovery(target, recovered, network)
-        passed("root-recovery-keeps-managers", epoch=checkpoint["epoch"])
+        passed("root-recovery-waits-and-is-vetoed", epoch=checkpoint["epoch"])
         blank = Node(run, "FRESH", binary, workspace, helper)
         nodes.append(blank)
         fresh_checkpoint = recover_fresh_node(blank, target.backup, target.backup_password)

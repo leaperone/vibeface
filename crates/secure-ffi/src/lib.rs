@@ -155,7 +155,7 @@ impl Membership {
 
 #[uniffi::export]
 pub fn verify_membership(state_json: String, expected_network: String) -> Result<Arc<Membership>> {
-    let membership = secure::membership::verify_membership(&state_json, &expected_network)?;
+    let membership = secure::membership::verify_membership(&state_json, &expected_network, None)?;
     Ok(Arc::new(Membership(membership)))
 }
 

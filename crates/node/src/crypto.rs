@@ -182,7 +182,7 @@ impl LocalIdentity {
         for epoch in 2..=revision {
             let next = self.fixture_root_at(epoch).device_id()?;
             let signer = self.fixture_root_at(epoch - 1);
-            state.recover(RootCheckpoint::rotation(&state, &signer, &next)?)?;
+            state.recover(RootCheckpoint::rotation(&state, &signer, &next, 0)?)?;
         }
         let epoch = revision + 1;
         let next = self.fixture_root_at(epoch).device_id()?;
@@ -193,6 +193,7 @@ impl LocalIdentity {
             &next,
             members,
             vec![],
+            0,
         )?)?;
         Ok(state)
     }

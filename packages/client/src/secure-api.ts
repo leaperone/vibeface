@@ -53,5 +53,6 @@ export interface SecureApi {
   ticketDecode(text: string): string
   ticketEncode(entryId: string, secretHex: string, relayUrl: string | null | undefined, directAddrs: string[]): string
   verify(deviceId: string, domain: string, payload: Uint8Array, signature: string): void
-  verifyMembership(stateJson: string, expectedNetwork: string): SecureMembership
+  /** `now`: the Node's clock in ms, so both sides see the same directory in effect; this device's clock when absent. */
+  verifyMembership(stateJson: string, expectedNetwork: string, now?: number | null): SecureMembership
 }

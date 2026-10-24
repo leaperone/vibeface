@@ -17,7 +17,7 @@ import { webPlatform } from '@/lib/platform'
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
 const { connectDevice } = webPlatform.transport
-import { RecoveryControls, RecoveryReview, SaveRecoveryFile } from './recovery-controls'
+import { RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
 import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
@@ -230,7 +230,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const quiet = notice || (!error ? membership : '')
   const alert = error || deviceError && device.phase !== 'reconnecting' ? <InlineError error={error || deviceError} />
     : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
-  const focused = Boolean(device.review || device.joining || device.nodeJoining)
+  const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
@@ -252,6 +252,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.phase === 'restarting') body = <Panel icon={LoaderCircle} busy title="正在重新开始">
     <p className="text-muted-foreground">旧数据已改名保留。这台电脑重启好后，用加入链接把它加回来。</p>
   </Panel>
+  else if (device.recovery) body = <RecoveryWaiting />
   else if (device.nodeJoining) body = <NodeJoin />
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />

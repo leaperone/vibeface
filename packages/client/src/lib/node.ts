@@ -20,7 +20,9 @@ export type ReadyConnection = {
 }
 export type Member = { device_id: string; kind: 'node' | 'client'; name: string; manage: boolean }
 type Revocation = { device_id: string; cutoff_seq: number; cutoff_hash: string | null }
-export type MembershipView = { network_id: string; epoch: number; recovery_key: string; heads: string[]; members: Member[]; revoked: Revocation[]; attesters: string[] }
+/** A recovery that replaces the directory once `effective_at_ms` passes, unless a manager of this one stops it. */
+export type PendingRecovery = { checkpoint: string; effective_at_ms: number; members: Member[] }
+export type MembershipView = { network_id: string; epoch: number; recovery_key: string; heads: string[]; members: Member[]; revoked: Revocation[]; attesters: string[]; pending: PendingRecovery | null; stopped: string[] }
 type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn' | 'expired'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
@@ -104,8 +106,12 @@ export function parseView(value: unknown): MembershipView {
     network_id: validTarget(v.network_id), epoch: integer(v.epoch), recovery_key: validTarget(v.recovery_key), heads: strings(v.heads), members: array(v.members).map(parseMember),
     revoked: array(v.revoked).map(item => { const r = record(item); return { device_id: validTarget(r.device_id), cutoff_seq: cutoff(r.cutoff_seq), cutoff_hash: r.cutoff_hash === null ? null : text(r.cutoff_hash) } }),
     attesters: strings(v.attesters),
+    pending: v.pending === null ? null : (({ checkpoint, effective_at_ms, members }) => ({ checkpoint: text(checkpoint), effective_at_ms: integer(effective_at_ms), members: array(members).map(parseMember) }))(record(v.pending)),
+    stopped: strings(v.stopped),
   }
 }
+/** The Node's clock in an answer that carries one. */
+export const nodeNow = (answer: Record<string, unknown>) => typeof answer.now_ms === 'number' ? answer.now_ms : undefined
 export function parsePrincipal(value: unknown): ClientPrincipal {
   const v = record(value)
   const principal = { network_id: validTarget(v.network_id), device_id: validTarget(v.device_id), epoch: integer(v.epoch) }

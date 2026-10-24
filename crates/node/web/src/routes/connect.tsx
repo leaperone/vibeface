@@ -3,7 +3,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { AuthPage } from '@/components/app/kit'
 import { returnPath } from '@vibeface/client/identity/access.ts'
 import { ConnectionScreen } from '@/features/identity/connection-screen'
-import { RecoveredStep, useJustRecovered } from '@/features/identity/recovery-controls'
+import { RecoveredStep } from '@/features/identity/recovery-controls'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 
 export const Route = createFileRoute('/connect')({
@@ -13,8 +13,7 @@ export const Route = createFileRoute('/connect')({
 
 /** Where a browser without a membership joins, recovers or connects; it returns to the page it came from, after a recovery once its new file is saved. */
 function Page() {
-  const { ready } = useDevice()
-  const recovered = useJustRecovered()
+  const { ready, recovered } = useDevice()
   const { redirect } = Route.useSearch()
   const navigate = useNavigate()
   useEffect(() => { if (ready && !recovered) void navigate({ href: returnPath(redirect), replace: true }) }, [ready, recovered])
