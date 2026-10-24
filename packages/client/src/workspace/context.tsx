@@ -32,7 +32,8 @@ export type InterruptedReply = { trigger: string; conversation_id: string; after
 
 /** A file the person attached: a browser `File` or a picked document on a phone. */
 export type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
-type NotificationButton = { label: string; disabled: boolean }
+/** `label` is a full sentence for a lone button; `state` lets a settings row word it shorter. */
+type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 
@@ -82,7 +83,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
-  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false })
+  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false, state: "off" })
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
@@ -214,10 +215,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const permission = await notifier.permission()
     if (!current()) return
     const enabled = readStorage(networkKey("notify", networkId), false)
-    setNotificationButton(permission === "unsupported" ? { label: `不支持${notifier.name}`, disabled: true }
-      : permission === "granted" ? { label: enabled ? `${notifier.name}已开启` : "启用此网络提醒", disabled: enabled }
-      : permission === "denied" ? { label: `请在设置里允许${notifier.name}`, disabled: true }
-      : { label: `开启${notifier.name}`, disabled: false })
+    setNotificationButton(permission === "unsupported" ? { label: `不支持${notifier.name}`, disabled: true, state: "unsupported" }
+      : permission === "granted" ? { label: enabled ? `${notifier.name}已开启` : "启用此网络提醒", disabled: enabled, state: enabled ? "on" : "off" }
+      : permission === "denied" ? { label: `请在设置里允许${notifier.name}`, disabled: true, state: "denied" }
+      : { label: `开启${notifier.name}`, disabled: false, state: "off" })
   }
   const notify = async (items: NotificationRecord[]) => {
     if (!items.length || !readStorage(networkKey("notify", networkId), false) || await notifier.permission() !== "granted") return

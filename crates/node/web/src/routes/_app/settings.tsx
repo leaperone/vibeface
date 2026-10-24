@@ -1,7 +1,8 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useState } from 'react'
-import { Bell, ChevronRight, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
-import { Segmented, SettingsGroup, SettingsRow } from '@/components/app/kit'
+import { Bell, BellOff, ChevronRight, CircleCheck, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { cn } from 'cn'
+import { Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -27,14 +28,13 @@ function SettingsPage() {
   const operator = principal?.can_manage || principal?.source === 'local_session'
   return <div className="mx-auto grid w-full max-w-2xl gap-8">
     <SettingsGroup title="提醒">
-      <SettingsRow icon={Bell} label="浏览器提醒">
-        {workspace.notificationButton.disabled ? workspace.notificationButton.label
-          : <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(() => workspace.enableNotifications(), "开启提醒") }}>{workspace.notificationButton.label}</Button>}
+      <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
+        <NotificationValue />
       </SettingsRow>
       {operator ? <TriageSettings /> : null}
     </SettingsGroup>
     <SettingsGroup title="外观">
-      <SettingsRow icon={Palette} label="主题">
+      <SettingsRow icon={Palette} label="主题" description={<SegmentedValue value={theme} options={themes} />}>
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
@@ -63,6 +63,18 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup>
   </div>
+}
+
+const notificationText = { on: '已开启', unsupported: '不支持', denied: '已拒绝' } as const
+
+function NotificationValue() {
+  const workspace = useWorkspace()
+  const { label, disabled, state } = workspace.notificationButton
+  if (state === 'off' && !disabled) return <Button type="button" size="sm" variant="outline" title={label} onClick={() => { void workspace.run(() => workspace.enableNotifications(), '开启提醒') }}>开启</Button>
+  return <span title={label} className={cn('inline-flex items-center gap-1', state === 'on' && 'text-success')}>
+    {state === 'on' ? <CircleCheck aria-hidden="true" className="size-4" /> : state === 'denied' ? <BellOff aria-hidden="true" className="size-4" /> : null}
+    {state === 'off' ? label : notificationText[state]}
+  </span>
 }
 
 function saveDiagnostics(bundle: unknown) {

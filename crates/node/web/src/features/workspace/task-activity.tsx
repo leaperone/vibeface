@@ -2,8 +2,8 @@
 
 import { useId, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleQuestionMark, Unplug, WifiOff } from "lucide-react"
-import { ActionCard, Details, toast } from "@/components/app/kit"
+import { Bot, ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
+import { ActionCard, BotAvatar, Details, toast } from "@/components/app/kit"
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -39,12 +39,12 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const disabled = !workspace.writable || check.kind === "process" && !workspace.selectedBot
   const lookup = { nodes: workspace.nodes, directory }
   if (check.kind === "process") return <ActionCard
-    icon={CircleQuestionMark}
-    title="待确认 · 上次回复的程序还在运行"
+    icon={Cpu}
+    title="上次回复的程序还在运行"
     meta={nodeName(workspace.data?.local_node, lookup)}
-    actions={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}>确认已停止</ActionButton>}
+    actions={<ActionButton variant="default" disabled={disabled} action={() => workspace.confirmStopped(check)}><CircleStop aria-hidden="true" />确认已停止</ActionButton>}
   >
-    <p>{checkReason(check)}相关程序还没退出，退出后会自动处理。</p>
+    <p className="text-muted-foreground">{checkReason(check)}程序退出后会自动处理。</p>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
   const settle = (work: WorkCheck, choice: "completed" | "interrupted", text = "") => async () => { await workspace.resolveCheck(work, choice, text); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
@@ -55,16 +55,18 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     title={`待确认 · ${check.works.length} 个任务`}
     meta={device}
   >
-    <p>{check.reason === "offline" ? `${device} 离线了，报不回这些任务的结果。` : `${device} 上的 Codex 断开了，报不回这些任务的结果。`}它们实际做完了吗？</p>
-    <ul className="grid gap-2">
+    <p className="text-muted-foreground">{check.reason === "offline" ? `${device} 离线了` : `${device} 上的 Codex 断开了`}，这些任务做完了吗？</p>
+    <ul className="divide-y overflow-hidden rounded-lg border bg-card">
       {check.works.map((work) => {
         const bot = botOf(work)
-        return <li key={work.work_id} className="flex min-w-0 flex-wrap items-center gap-2">
-          <span className="min-w-0 flex-1 truncate font-medium" title={work.title}>{work.title || "任务结果"}</span>
-          {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:underline max-md:min-h-11">
-            <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
-          <span className="flex shrink-0 gap-2">
-            <ActionButton disabled={disabled} action={settle(work, "interrupted")}>没做完</ActionButton>
+        return <li key={work.work_id} className="flex min-h-13 min-w-0 items-center gap-3 py-2 ps-3 pe-2">
+          <span className="grid min-w-0 flex-1">
+            <span className="line-clamp-2 font-medium [overflow-wrap:anywhere]" title={work.title}>{work.title || "任务结果"}</span>
+            {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
+              <BotAvatar id={bot.bot_id} name={bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
+          </span>
+          <span className="flex shrink-0 gap-1.5">
+            <ActionButton variant="ghost" disabled={disabled} action={settle(work, "interrupted")}>没做完</ActionButton>
             <ActionButton variant="default" disabled={disabled} action={settle(work, "completed")}>做完了</ActionButton>
           </span>
         </li>

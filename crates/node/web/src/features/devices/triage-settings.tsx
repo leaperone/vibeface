@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { BusyIcon, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton } from "@/components/app/kit"
+import { BusyIcon, InlineError, Segmented, SegmentedValue, SettingsDisclosure, SettingsRow, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
@@ -10,6 +10,7 @@ import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
 import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
 const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发到聊天机器人", Layers]]
+const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions">
 
 /** Where this device sends sessions that need the person, plus the chat bot (Grok Bot) channel both ways. Saves on each change. */
@@ -61,8 +62,8 @@ export function TriageSettings() {
   const { pending, delivered, dead } = settings.outbox
 
   return <>
-    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时">
-      <Segmented label="会话等你时" value={config.default_outlet} disabled={Boolean(busy)} options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} onChange={(value) => void save("default", { default_outlet: value })} />
+    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时" description={<SegmentedValue value={config.default_outlet} options={outletOptions} />}>
+      <Segmented label="会话等你时" value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
 
     <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>
