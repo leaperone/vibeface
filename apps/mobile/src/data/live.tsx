@@ -76,9 +76,14 @@ function Live({ children }: { children: ReactNode }) {
     // A streamed reply gives way once its job ends, or as soon as the history's newest message is the reply it was
     // streaming, which can land a frame or two before the job names it.
     const newest = data.messages.at(-1)
+    // Either side may be ahead by the last few characters, so one being the start of the other is the same reply.
+    // A message still on its way means the newest in the history is the last turn's reply, not this one's.
+    const sending = shared.messagePending && !data.messages.some((message) => message.message_id === shared.messagePending?.message_id)
+    const landed = (text: string) => !sending && newest?.role === 'assistant' && newest.text.trim() !== '' && text.trim() !== ''
+      && (newest.text.trim().startsWith(text.trim()) || text.trim().startsWith(newest.text.trim()))
     const streamed = shared.liveProgress.filter((progress): progress is Extract<typeof progress, { kind: 'manager' }> => progress.kind === 'manager' && progress.conversation_id === conversationId && Boolean(progress.text))
-    const handedOver = newest?.role === 'assistant' && streamed.some((progress) => newest.text.startsWith(progress.text.trim()))
-    const live = streamed.find((progress) => !(newest?.role === 'assistant' && newest.text.startsWith(progress.text.trim()))
+    const handedOver = streamed.some((progress) => landed(progress.text))
+    const live = streamed.find((progress) => !landed(progress.text)
       && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))))
     // The message it answers, so the streamed row and the final reply share a row; a reply answers the latest user message.
     const liveTrigger = live && (jobs.find((job) => job.trigger === live.trigger)?.message_id ?? data.messages.findLast((message) => message.role === 'user')?.message_id)
