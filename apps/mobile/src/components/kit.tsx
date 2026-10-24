@@ -1,7 +1,9 @@
-import type { LucideIcon } from 'lucide-react-native'
-import type { ReactNode } from 'react'
+import * as Clipboard from 'expo-clipboard'
+import { Check, Copy, type LucideIcon } from 'lucide-react-native'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { useUniwind } from 'uniwind'
+import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { cn } from '@/lib/utils'
@@ -42,6 +44,23 @@ export function EmptyState({ icon, title, action }: { icon: LucideIcon; title: s
 export function SafetyCode({ code }: { code: string }) {
   const groups = code.match(code.length === 6 ? /.{3}/g : /.{1,4}/g) ?? []
   return <Text accessibilityLabel={`安全码 ${code.split('').join(' ')}`} className="font-mono text-2xl tracking-widest" style={{ fontVariant: ['tabular-nums'] }}>{groups.join(' ')}</Text>
+}
+
+/** A long id on one line with its middle elided, and a copy button that shows 已复制 for a moment. */
+export function CopyableId({ value, label }: { value: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
+  return <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+    <Text numberOfLines={1} ellipsizeMode="middle" className="min-w-0 flex-1 font-mono text-meta">{value}</Text>
+    {copied ? <Text accessibilityLiveRegion="polite" className="text-meta text-muted-foreground">已复制</Text> : null}
+    <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`复制${label}`} onPress={() => {
+      void Clipboard.setStringAsync(value)
+      setCopied(true)
+      clearTimeout(timer.current)
+      timer.current = setTimeout(() => setCopied(false), 1500)
+    }}><Icon as={copied ? Check : Copy} className={cn('size-4', copied && 'text-success')} /></Button>
+  </View>
 }
 
 export function Badge({ count }: { count: number }) {

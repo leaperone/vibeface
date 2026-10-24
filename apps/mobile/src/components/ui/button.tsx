@@ -77,9 +77,10 @@ const buttonTextVariants = cva(
         ),
         secondary: 'text-secondary-foreground',
         ghost: 'group-active:text-accent-foreground',
+        // Underlined at rest so a link reads apart from body text; Android draws the line in the text colour, so the press dims the text instead.
         link: cn(
-          'text-primary group-active:underline',
-          Platform.select({ web: 'underline-offset-4 hover:underline group-hover:underline' })
+          'text-primary underline decoration-muted-foreground group-active:text-primary/70',
+          Platform.select({ web: 'underline-offset-4 hover:text-primary/70 group-hover:text-primary/70' })
         ),
       },
       size: {

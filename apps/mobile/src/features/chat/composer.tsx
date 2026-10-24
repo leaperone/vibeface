@@ -1,7 +1,9 @@
 import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
+import { useEffect } from 'react'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
+import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
@@ -24,6 +26,11 @@ type Props = {
 
 export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop }: Props) {
   const canSend = !blocked && !sending && value.trim().length > 0
+  // The arrow pops the moment it turns live; the fill already changed on that frame, so only the scale is sprung.
+  const armed = canSend && !onStop
+  const pop = useSharedValue(1)
+  const popped = useAnimatedStyle(() => ({ transform: [{ scale: pop.value }] }))
+  useEffect(() => { if (armed) { pop.value = 0.85; pop.value = withSpring(1, { dampingRatio: 0.7, duration: 250, reduceMotion: ReduceMotion.System }) } }, [armed])
   const pick = async () => {
     const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
     if (picked.canceled) return
@@ -45,11 +52,13 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} />
         </Button>
-        <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
-          // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
-          onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-          {onStop || sending ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} />}
-        </Button>
+        <Animated.View style={popped}>
+          <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
+            // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
+            onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
+            {onStop || sending ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} />}
+          </Button>
+        </Animated.View>
       </View>
     </View>
     {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
