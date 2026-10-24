@@ -6,8 +6,8 @@
 use crate::{
     crypto::LocalIdentity,
     identity::{
-        AuthorizationView, Genesis, GovernanceAction, GovernanceEvent, IdentityKind, NetworkState,
-        RootCheckpoint,
+        AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, Member,
+        NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
         local::{Join, JoinRequest, JoinStatus},
     },
     net::{self, Net, NetworkConfig},
@@ -617,9 +617,10 @@ async fn dispatch(
         }
         "directory" => {
             let state = node.membership_state().await?;
-            let view = state.project()?;
+            let now = crate::runtime::now_ms();
+            let view = state.project_at(now as u64)?;
             let since = node.recovery_since_ms(&view.recovery_key).await?;
-            Ok(json!({"view":view,"state":state,"recovery_since_ms":since}))
+            Ok(json!({"view":view,"state":state,"recovery_since_ms":since,"now_ms":now}))
         }
         "write_state" => {
             let principal = principal(node, session).await?;
@@ -862,10 +863,11 @@ async fn dispatch(
             }
         }
         "revoke" => {
-            manager_view(node, session).await?;
+            let view = manager_view(node, session).await?;
             let event: GovernanceEvent = from_field(&params, "event")?;
             ensure!(
                 event.issuer == session.device_id
+                    && event.epoch == view.epoch
                     && matches!(event.action, GovernanceAction::Revoke(_)),
                 "invalid revoke signer or action"
             );
@@ -874,12 +876,40 @@ async fn dispatch(
             node.install_membership(state.clone()).await?;
             authentication(node, session).await
         }
+        "veto" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Veto { checkpoint, at_ms } = &event.action else {
+                bail!("invalid veto signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id && event.epoch == view.epoch,
+                "invalid veto signer or action"
+            );
+            let mut state = node.membership_state().await?;
+            // A retry after the veto landed finds nothing waiting, and changes nothing.
+            if !state.events.contains(&event) {
+                let now = crate::runtime::now_ms() as u64;
+                ensure!(
+                    at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
+                    "this device's clock is too far from this Node's clock"
+                );
+                let checkpoint = checkpoint.clone();
+                state.append(event)?;
+                ensure!(
+                    state.project_at(now)?.stopped.contains(&checkpoint),
+                    NO_RECOVERY_WAITING
+                );
+                node.install_membership(state).await?;
+            }
+            authentication(node, session).await
+        }
         "recovery_state" => {
             // The recovery root may not be a member any more, so it proves itself
             // with a two-minute signature bound to this channel's device. The checkpoints its
             // file carries count too, so a Node that missed the last recovery still knows the key.
             let current = node.membership_state().await?;
-            let state = current.merge(&carried(params.get("checkpoints"), &current)?)?;
+            let state = current.merge(&carried(&params, &current)?)?;
             let expires = params["expires_at_ms"]
                 .as_i64()
                 .context("expires_at_ms must be an integer")?;
@@ -893,19 +923,21 @@ async fn dispatch(
                 session.device_id, state.genesis.network_id
             );
             let signature = text(&params, "signature")?;
-            let signed_by = |key: &str| {
-                vibeface_secure::verify(key, RECOVERY_READ_DOMAIN, payload.as_bytes(), signature)
+            let key = state
+                .recovery_keys()
+                .find(|key| {
+                    vibeface_secure::verify(
+                        key,
+                        RECOVERY_READ_DOMAIN,
+                        payload.as_bytes(),
+                        signature,
+                    )
                     .is_ok()
-            };
-            if !signed_by(state.recovery_key()) {
-                ensure!(
-                    !state.superseded_keys().any(signed_by),
-                    vibeface_secure::membership::SUPERSEDED
-                );
-                bail!("recovery key does not own this personal network");
-            }
+                })
+                .context("recovery key does not own this personal network")?;
+            state.check_root(key, now as u64)?;
             let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
-            Ok(json!({"state":state,"heads":heads}))
+            Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
             recover(node, session, &params).await?;
@@ -924,18 +956,22 @@ async fn dispatch(
     }
 }
 
-/// The checkpoint chain a recovery file carries, on top of `state`'s genesis.
-fn carried(checkpoints: Option<&Value>, state: &NetworkState) -> Result<NetworkState> {
-    let checkpoints: Vec<RootCheckpoint> = checkpoints
-        .map(|value| serde_json::from_value(value.clone()))
-        .transpose()
-        .context("invalid recovery checkpoints")?
-        .unwrap_or_default();
+/// The history a recovery file carries, on top of `state`'s genesis. Its events hold the vetoes
+/// that let a recovery key sign again.
+fn carried(params: &Value, state: &NetworkState) -> Result<NetworkState> {
     Ok(NetworkState {
         genesis: state.genesis.clone(),
-        checkpoints,
-        events: vec![],
+        checkpoints: optional(params, "checkpoints")?,
+        events: optional(params, "events")?,
     })
+}
+
+fn optional<T: serde::de::DeserializeOwned + Default>(params: &Value, key: &str) -> Result<T> {
+    Ok(params
+        .get(key)
+        .map(|_| from_field(params, key))
+        .transpose()?
+        .unwrap_or_default())
 }
 
 /// Creates the network on an empty Node, or installs the recovery file's next checkpoint.
@@ -943,21 +979,17 @@ fn carried(checkpoints: Option<&Value>, state: &NetworkState) -> Result<NetworkS
 /// The recovery key's signatures authorize this; a fresh Node also needs its one-time
 /// capability. A retry of an installed recovery changes nothing.
 async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()> {
-    let genesis: Genesis = from_field(params, "genesis")?;
-    let mut checkpoints: Vec<RootCheckpoint> = params
-        .get("checkpoints")
-        .map(|_| from_field(params, "checkpoints"))
-        .transpose()?
-        .unwrap_or_default();
-    let next = checkpoints.pop();
-    let mut incoming = NetworkState::new(genesis)?;
-    incoming.checkpoints = checkpoints;
+    let mut incoming = carried(params, &NetworkState::new(from_field(params, "genesis")?)?)?;
+    let next = incoming.checkpoints.pop();
     incoming.project()?;
+    let now = crate::runtime::now_ms() as u64;
+    let node_id = node.identity.device_id()?;
     if !node.has_membership().await? {
         if let Some(next) = next {
-            incoming.recover(next)?;
+            fresh(&next, now)?;
+            incoming.recover_at(next, now)?;
         }
-        incoming.project()?.node(&node.identity.device_id()?)?;
+        stays(&incoming.project_at(now)?, &node_id)?;
         node.store.lock().await.bootstrap_network(
             incoming.clone(),
             text(params, "capability")?,
@@ -971,17 +1003,41 @@ async fn recover(node: &Runtime, session: &Session, params: &Value) -> Result<()
         incoming.genesis == current.genesis,
         "personal network already initialized"
     );
+    // A recovery this Node never saw is checked against its clock too, or one signed with an
+    // old time would skip the wait.
+    for checkpoint in incoming.checkpoints.iter().chain(&next) {
+        if !current.checkpoints.contains(checkpoint) {
+            fresh(checkpoint, now)?;
+        }
+    }
     let mut state = current.merge(&incoming)?;
     let Some(next) = next else {
         return Ok(());
     };
-    if state.recover(next)? || state != current {
-        state
-            .project()?
-            .node(&node.identity.device_id()?)
-            .context("this recovery removes this Node; send it to a Node that stays")?;
+    if state.recover_at(next, now)? || state != current {
+        stays(&state.project_at(now)?, &node_id)?;
         node.install_membership(state.clone()).await?;
     }
+    Ok(())
+}
+
+fn fresh(checkpoint: &RootCheckpoint, now: u64) -> Result<()> {
+    ensure!(
+        checkpoint.directory.is_none() || checkpoint.issued_at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
+        "this device's clock is too far from this Node's clock"
+    );
+    Ok(())
+}
+
+/// This Node must be in the directory a recovery leads to, waiting or not.
+fn stays(view: &AuthorizationView, node_id: &str) -> Result<()> {
+    let members = view.pending.as_ref().map_or(&view.members, |p| &p.members);
+    ensure!(
+        members
+            .iter()
+            .any(|m| m.device_id == node_id && m.kind == IdentityKind::Node),
+        "this recovery removes this Node; send it to a Node that stays"
+    );
     Ok(())
 }
 
@@ -1123,16 +1179,19 @@ async fn manager_view(node: &Runtime, session: &Session) -> Result<Authorization
     Ok(view)
 }
 
-/// Members get the directory; anyone else learns only whether this device was revoked.
+/// Members get the directory; anyone else learns only whether this device was revoked, or
+/// where the recovery that names it as a manager stands.
 async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     if !node.has_membership().await? {
         return Ok(json!({"principal":null,"initialized":false,"revoked":false}));
     }
     let state = node.membership_state().await?;
-    let view = state.project()?;
+    // The browser checks the view against the state at this same time.
+    let now = crate::runtime::now_ms();
+    let view = state.project_at(now as u64)?;
     match principal(node, session).await {
         Ok(principal) => Ok(
-            json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled()}),
+            json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled(),"now_ms":now}),
         ),
         // This Node's own browsers get the signed history that removed it, to check themselves.
         Err(_)
@@ -1140,13 +1199,31 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
                 && (session.cookie.is_some() || view.client(&session.device_id).is_ok()) =>
         {
             Ok(
-                json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state}),
+                json!({"principal":null,"initialized":true,"network_id":view.network_id,"node_revoked":true,"state":state,"now_ms":now}),
             )
         }
         Err(_) => Ok(
-            json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some()}),
+            json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?}),
         ),
     }
+}
+
+fn recovery_status(state: &NetworkState, view: &AuthorizationView, device: &str) -> Result<Value> {
+    let manages = |members: &[Member]| members.iter().any(|m| m.device_id == device && m.manage);
+    if let Some(pending) = view.pending.as_ref().filter(|p| manages(&p.members)) {
+        return Ok(json!({"status":"waiting","effective_at_ms":pending.effective_at_ms}));
+    }
+    for checkpoint in &state.checkpoints {
+        if checkpoint
+            .directory
+            .as_ref()
+            .is_some_and(|d| manages(&d.members))
+            && view.stopped.contains(&checkpoint.hash()?)
+        {
+            return Ok(json!({"status":"stopped"}));
+        }
+    }
+    Ok(Value::Null)
 }
 
 async fn connection_entry(node: &Runtime) -> Result<Value> {
@@ -1647,7 +1724,7 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::{Member, Revocation};
+    use crate::identity::{Genesis, Member, Revocation};
 
     #[tokio::test]
     async fn log_intake_needs_a_member_and_bounded_records_and_reading_needs_management()
@@ -2645,7 +2722,7 @@ mod tests {
             let checkpoint = RootCheckpoint::recovery(&state, &root, &LocalIdentity::generate().device_id()?, vec![
                 Member::node(&node.identity, "local device")?,
                 Member::client(&replacement_manager, "replacement manager", true)?,
-            ], vec![])?;
+            ], vec![], 0)?;
             state.recover(checkpoint)?;
             node.install_membership(state).await?;
             let after_recovery = std::fs::read(dir.join("config.json"))?;
@@ -2808,14 +2885,16 @@ mod tests {
 
             let replacement = LocalIdentity::generate();
             let before = node.membership_state().await?;
-            let epoch = before.epoch() + 1;
             let next = LocalIdentity::generate();
-            let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![
+            let members = vec![
                 Member::client(&admin, "admin", true)?,
                 Member::client(&replacement, "new laptop", true)?,
                 Member::node(&node.identity, "node")?,
-            ], vec![])?;
-            let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![])?;
+            ];
+            let now = crate::runtime::now_ms() as u64;
+            let checkpoint = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], now)?;
+            let backdated = RootCheckpoint::recovery(&before, &root, &next.device_id()?, members.clone(), vec![], 0)?;
+            let dropped = RootCheckpoint::recovery(&before, &root, &next.device_id()?, vec![Member::client(&replacement, "new laptop", true)?], vec![], now)?;
             let mut recovering = connect(replacement.clone()).await?;
             let expires = crate::runtime::now_ms() + 60_000;
             let read_with = |signer: &LocalIdentity, checkpoints: &[&RootCheckpoint]| -> Result<Value> {
@@ -2826,32 +2905,52 @@ mod tests {
             assert!(recovering.call("recovery_state", read(&admin)?).await.is_err(), "only the root may read");
             assert_eq!(recovering.call("recovery_state", read(&root)?).await?["state"]["genesis"]["network_id"], network);
             let submit = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints});
+            let refused = |error: anyhow::Error, reason: &str| assert!(format!("{error:#}").contains(reason), "{error:#}");
             assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err());
-            let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].as_i64().context("genesis key has a date")?;
-            let started = crate::runtime::now_ms();
-            let recovered = recovering.call("recover", submit(vec![&checkpoint])).await?;
-            assert_eq!(recovered["principal"]["can_manage"], true);
-            let since = recovered["recovery_since_ms"].as_i64().context("new key has a date")?;
-            assert!(first_since <= started && since >= started, "a new recovery key restarts the date");
-            let retried = recovering.call("recover", submit(vec![&checkpoint])).await?;
-            assert_eq!(retried["principal"], recovered["principal"], "a retry changes nothing");
-            assert_eq!(retried["recovery_since_ms"], since, "a retry keeps the date");
-            assert_eq!(manager.call("authenticate", json!({})).await?["principal"]["epoch"], epoch);
+            refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), "too far from this Node's clock");
+            let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
+            let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
+            assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
+            assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
+            assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
+            assert!(recovering.call("directory", json!({})).await.is_err(), "a waiting device reads nothing");
+            let seen = manager.call("authenticate", json!({})).await?;
+            assert_eq!((&seen["view"]["pending"]["checkpoint"], &seen["recovery_since_ms"]), (&json!(checkpoint.hash()?), &first_since));
+            refused(recovering.call("recovery_state", read(&root)?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_WAITING);
+            let veto = GovernanceEvent::unsigned(&node.membership_state().await?.project()?, &admin.device_id()?, GovernanceAction::Veto { checkpoint: checkpoint.hash()?, at_ms: now })?.sign(&admin)?;
+            assert!(recovering.call("veto", json!({"event":veto})).await.is_err(), "only a manager in effect stops it");
+            let stopped = manager.call("veto", json!({"event":veto})).await?;
+            assert_eq!(stopped["view"]["stopped"], json!([checkpoint.hash()?]));
+            assert_eq!(manager.call("veto", json!({"event":veto})).await?["view"], stopped["view"], "a retry changes nothing");
+            assert_eq!(recovering.call("authenticate", json!({})).await?["recovery"]["status"], "stopped");
+            refused(recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await.unwrap_err(), vibeface_secure::membership::RECOVERY_STOPPED);
+            recovering.call("recovery_state", read(&root)?).await?;
 
-            let refused = recovering.call("recovery_state", read(&root)?).await.unwrap_err();
-            assert!(format!("{refused:#}").contains(vibeface_secure::membership::SUPERSEDED), "{refused:#}");
+            let (next, stopped) = (LocalIdentity::generate(), node.membership_state().await?);
+            let effective = RootCheckpoint::recovery(&stopped, &root, &next.device_id()?, members, vec![], 0)?;
+            let started = crate::runtime::now_ms();
+            let mut state = stopped.clone();
+            state.recover(effective.clone())?;
+            node.install_membership(state).await?;
+            let recovered = recovering.call("authenticate", json!({})).await?;
+            assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
+            assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
+            let chain = [&checkpoint, &effective];
+            refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
             let after = node.membership_state().await?;
+            // The new file carries the veto, without which the root could not have signed again.
+            let carrying = |checkpoints: Vec<&RootCheckpoint>| json!({"genesis":genesis,"checkpoints":checkpoints,"events":after.events});
             let stale = RootCheckpoint::rotation(&after, &root, &LocalIdentity::generate().device_id()?)?;
-            let refused = recovering.call("recover", submit(vec![&checkpoint, &stale])).await.unwrap_err();
-            assert!(format!("{refused:#}").contains(vibeface_secure::membership::SUPERSEDED), "{refused:#}");
+            refused(recovering.call("recover", carrying(vec![&checkpoint, &effective, &stale])).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
             assert!(recovering.call("recover", submit(vec![&dropped])).await.is_err(), "a rival of the installed recovery conflicts");
-            let read_next = recovering.call("recovery_state", read_with(&next, &[&checkpoint])?).await?;
-            assert_eq!(read_next["state"]["checkpoints"][0], serde_json::to_value(&checkpoint)?);
+            let read_next = recovering.call("recovery_state", read_with(&next, &chain)?).await?;
+            assert_eq!(read_next["state"]["checkpoints"][1], serde_json::to_value(&effective)?);
             let rotated = RootCheckpoint::rotation(&after, &next, &LocalIdentity::generate().device_id()?)?;
             let started = crate::runtime::now_ms();
-            recovering.call("recover", submit(vec![&checkpoint, &rotated])).await?;
+            refused(recovering.call("recover", submit(vec![&checkpoint, &effective, &rotated])).await.unwrap_err(), "signs again only after");
+            recovering.call("recover", carrying(vec![&checkpoint, &effective, &rotated])).await?;
             assert!(recovering.call("directory", json!({})).await?["recovery_since_ms"].as_i64() >= Some(started), "a rotation restarts the date");
-            assert_eq!(node.membership_state().await?.recovery_key(), rotated.recovery_key);
+            assert_eq!(node.membership_state().await?.project()?.recovery_key, rotated.recovery_key);
             assert!(recovering.call("recovery_state", read(&next)?).await.is_err(), "a rotation supersedes the file too");
 
             assert!(Client::connect(&origin, &admin, &LocalIdentity::generate().device_id()?).await.is_err());

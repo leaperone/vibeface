@@ -193,6 +193,7 @@ impl LocalIdentity {
             &next,
             members,
             vec![],
+            0,
         )?)?;
         Ok(state)
     }
