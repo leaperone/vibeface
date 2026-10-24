@@ -62,8 +62,11 @@ pub struct Store {
 
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
 ///
-/// A recovery takes effect, or is stopped, with time alone, so this also rebuilds when the
-/// same history now has another recovery key in effect; that voids every invite and join request.
+/// A recovery takes effect with time alone, so this also rebuilds when the same history now has
+/// another recovery key in effect; that voids every invite and join request. A key in effect here
+/// stays in effect: history that would stop it (a veto or rotation that arrives after the
+/// recovery's time) is refused, so the epoch in effect only moves forward and what moving forward
+/// does runs once.
 pub(crate) fn install_trust_bundle_in(
     connection: &Connection,
     network_id: &str,
@@ -81,12 +84,21 @@ pub(crate) fn install_trust_bundle_in(
             |r| r.get(0),
         )
         .optional()?;
+    let now = crate::runtime::now_ms() as u64;
     let merged = match &previous {
-        Some(previous) => serde_json::from_str::<NetworkState>(previous)?.merge(state)?,
+        Some(previous) => {
+            let previous = serde_json::from_str::<NetworkState>(previous)?;
+            let merged = previous.merge(state)?;
+            merged.keeps(&previous.project_at(now)?.recovery_key, now)?;
+            merged
+        }
         None => state.clone(),
     };
+    if let Some(key) = recovery_since_key(connection)? {
+        merged.keeps(&key, now)?;
+    }
     let encoded = serde_json::to_string(&merged)?;
-    let view = merged.project()?;
+    let view = merged.project_at(now)?;
     let changed = previous.as_ref() != Some(&encoded);
     let flipped = recovery_since_ms(connection, &view.recovery_key)?.is_none();
     if !changed && !flipped {
@@ -105,11 +117,8 @@ pub(crate) fn install_trust_bundle_in(
     log::recompute(connection, &view)
 }
 
-/// When this Node first saw `recovery_key`; signed records carry no time of their own.
-pub(crate) fn recovery_since_ms(
-    connection: &Connection,
-    recovery_key: &str,
-) -> Result<Option<i64>> {
+/// The recovery key this Node last saw in effect, and since when.
+fn recovery_since(connection: &Connection) -> Result<Option<(String, i64)>> {
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM identity_meta WHERE key='recovery_since'",
@@ -120,8 +129,21 @@ pub(crate) fn recovery_since_ms(
     Ok(value
         .as_deref()
         .and_then(|value| value.split_once(':'))
-        .filter(|(key, _)| *key == recovery_key)
-        .and_then(|(_, ms)| ms.parse().ok()))
+        .and_then(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?))))
+}
+
+fn recovery_since_key(connection: &Connection) -> Result<Option<String>> {
+    Ok(recovery_since(connection)?.map(|(key, _)| key))
+}
+
+/// When this Node first saw `recovery_key`; signed records carry no time of their own.
+pub(crate) fn recovery_since_ms(
+    connection: &Connection,
+    recovery_key: &str,
+) -> Result<Option<i64>> {
+    Ok(recovery_since(connection)?
+        .filter(|(key, _)| key == recovery_key)
+        .map(|(_, ms)| ms))
 }
 
 /// Total order shared by prompts and UI: a Kahn sort of the DAG with ties broken by

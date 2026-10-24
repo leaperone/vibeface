@@ -402,9 +402,10 @@ impl Runtime {
         }
         self.start_network().await
     }
-    /// A recovery takes effect, or a late veto undoes it, with time alone and no new record, so
-    /// this installs the history again whenever another directory is in effect: at start, after
-    /// each membership change, and when a waiting recovery is due.
+    /// A recovery takes effect with time alone and no new record, so this installs the history
+    /// again whenever another directory is in effect: at start, after each membership change, and
+    /// when a waiting recovery is due. It wakes at least every 15 minutes and checks the wall
+    /// clock again, since a monotonic sleep stops while the computer sleeps.
     fn start_recovery_timer(self: &Arc<Self>) {
         let node = Arc::downgrade(self);
         let mut membership = self.membership.subscribe();
@@ -421,7 +422,7 @@ impl Runtime {
                 let wait = async {
                     match due {
                         Some(due) => {
-                            let left = due.saturating_sub(now_ms() as u64);
+                            let left = due.saturating_sub(now_ms() as u64).min(15 * 60_000);
                             tokio::time::sleep(Duration::from_millis(left)).await
                         }
                         None => std::future::pending().await,
