@@ -55,7 +55,7 @@ export function Badge({ count }: { count: number }) {
 const hues = [8, 32, 52, 100, 160, 200, 235, 280]
 
 /** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
-export function Monogram({ name, seed }: { name: string; seed: string }) {
+export function Monogram({ name, seed, hero }: { name: string; seed: string; hero?: boolean }) {
   const { theme } = useUniwind()
   // FNV-1a: a plain `* 31` hash leaves `% 8` set by the last characters, so similar ids shared a tint.
   let hash = 2166136261
@@ -63,7 +63,7 @@ export function Monogram({ name, seed }: { name: string; seed: string }) {
   hash = (hash ^ (hash >>> 16)) >>> 0
   const hue = hues[hash % hues.length]
   const dark = theme === 'dark'
-  return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className="size-11 items-center justify-center rounded-full" style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
-    <Text maxFontSizeMultiplier={1} className="text-heading font-semibold" style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
+  return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className={cn('items-center justify-center rounded-full', hero ? 'size-20' : 'size-11')} style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
+    <Text maxFontSizeMultiplier={1} className={cn('font-semibold', hero ? 'text-3xl' : 'text-heading')} style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>
   </View>
 }

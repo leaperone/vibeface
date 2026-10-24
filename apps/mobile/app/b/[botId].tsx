@@ -22,14 +22,14 @@ import { useChatExtras, type Row } from '@/features/chat/work'
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 
 /** One row of the chat: a message, or a question or status line between them. */
-type Entry = { key: string; message: ChatMessage; last: boolean } | (Row & { attached?: boolean })
+type Entry = { key: string; message: ChatMessage; last: boolean; grouped: boolean } | (Row & { attached?: boolean })
+
+const Fade = withUniwind(Animated.View)
 
 /**
  * Questions sit right before the first message written after them, tasks and changes right after the message that caused
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
-const Fade = withUniwind(Animated.View)
-
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
   const rows: Entry[] = []
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
@@ -40,7 +40,9 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): 
     }
     const next = chat.messages[index + 1]
     // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
-    rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000 })
+    const previous = rows.at(-1)
+    const grouped = previous !== undefined && 'message' in previous && !previous.last && previous.message.role === message.role
+    rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
     rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   })
   for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
@@ -115,12 +117,12 @@ export default function ChatScreen() {
       // The inverted list's footer is its top: the oldest message starts below the transparent bar.
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
-      ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
+      ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
       renderItem={({ item }) => 'message' in item ? <Message message={item.message} last={item.last} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <Monogram name={bot.name} seed={bot.bot_id} />
+        <Monogram name={bot.name} seed={bot.bot_id} hero />
         <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
