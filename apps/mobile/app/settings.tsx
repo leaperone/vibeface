@@ -33,7 +33,7 @@ export default function Settings() {
       </View>
     </Section>
     <Section icon={Globe} title="连接">
-      <View className="-mx-2 -mt-3 -mb-4"><ConnectionPill connection={workspace.connection} /></View>
+      <View className="-mx-2 -my-3"><ConnectionPill connection={workspace.connection} /></View>
     </Section>
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
@@ -46,14 +46,10 @@ export default function Settings() {
     </Section>
     {device.ready ? <Notifications /> : null}
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
-      <Link href="/ai" asChild>
-        <Button variant="outline" className="min-h-11 self-start"><Icon as={SlidersHorizontal} /><Text>AI 设置</Text><Icon as={ChevronRight} className="text-muted-foreground" /></Button>
-      </Link>
+      <LinkRow href="/ai" icon={SlidersHorizontal} label="AI 设置" />
     </Section> : null}
     <Section icon={FileKey} title="恢复文件">
-      <Link href="/recovery" asChild>
-        <Button variant="outline" className="min-h-11 self-start"><Icon as={KeyRound} /><Text>换恢复密码</Text><Icon as={ChevronRight} className="text-muted-foreground" /></Button>
-      </Link>
+      <LinkRow href="/recovery" icon={KeyRound} label="换恢复密码" />
     </Section>
     <View className="border-t border-border pt-6">
       {leaving ? <View className="gap-3">
@@ -80,6 +76,16 @@ function Notifications() {
     </Button>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
   </Section>
+}
+
+function LinkRow({ href, icon, label }: { href: '/ai' | '/recovery'; icon: LucideIcon; label: string }) {
+  return <Link href={href} asChild>
+    <Pressable className="min-h-12 flex-row items-center gap-3 overflow-hidden rounded-xl border border-border px-4 py-2 active:bg-muted">
+      <Icon as={icon} className="text-muted-foreground" />
+      <Text className="min-w-0 flex-1 font-medium">{label}</Text>
+      <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+    </Pressable>
+  </Link>
 }
 
 function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {

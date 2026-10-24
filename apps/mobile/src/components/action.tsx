@@ -24,13 +24,13 @@ export function ErrorText({ error }: { error: string }) {
 }
 
 /** A button that runs its action, spins while it runs and shows why it failed under it. */
-export function ActionButton({ icon, children, action, disabled, className, ...props }: Omit<ButtonProps, 'children' | 'onPress'> & {
-  icon?: LucideIcon; children: ReactNode; action: () => Promise<unknown>
+export function ActionButton({ icon, iconClassName, children, action, disabled, className, ...props }: Omit<ButtonProps, 'children' | 'onPress'> & {
+  icon?: LucideIcon; iconClassName?: string; children: ReactNode; action: () => Promise<unknown>
 }) {
   const { busy, error, run } = useAction()
   return <View className="gap-1">
     <Button {...props} className={className ?? 'h-11'} disabled={disabled || busy !== null} onPress={() => void run('run', action)}>
-      {busy ? <Icon as={LoaderCircle} /> : icon ? <Icon as={icon} /> : null}
+      {busy ? <Icon as={LoaderCircle} /> : icon ? <Icon as={icon} className={iconClassName} /> : null}
       <Text>{children}</Text>
     </Button>
     <ErrorText error={error} />

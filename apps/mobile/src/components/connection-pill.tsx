@@ -18,6 +18,6 @@ export function ConnectionPill({ connection }: { connection: Connection }) {
   return <View accessible accessibilityLabel={`经 ${connection.entry} · ${look.label}`} className="min-h-11 flex-row items-center gap-2 px-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />
     <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">经 {connection.entry}</Text>
-    <Text className={cn('text-meta', toneText[look.tone])}>{look.label}</Text>
+    <Text className="text-meta text-muted-foreground">{look.label}</Text>
   </View>
 }
