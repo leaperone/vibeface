@@ -69,8 +69,8 @@ const primaryHint = '没有 bot 负责的 Codex 会话，由主 bot 分派'
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <View className="gap-3">
     <View className="flex-row items-center gap-2">
-      <Icon as={icon} className="size-4 text-muted-foreground" />
-      <Text role="heading" className="text-meta font-medium text-muted-foreground">{title}</Text>
+      <Icon as={icon} />
+      <Text role="heading" className="text-heading font-semibold">{title}</Text>
       {count ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text> : null}
     </View>
     {children}

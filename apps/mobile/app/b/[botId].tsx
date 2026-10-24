@@ -123,7 +123,7 @@ export default function ChatScreen() {
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
         <Monogram name={bot.name} seed={bot.bot_id} hero />
-        <Text role="heading" className="text-heading font-semibold">{bot.name}</Text>
+        <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
         </View>
