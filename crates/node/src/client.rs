@@ -438,7 +438,7 @@ async fn serve_session(
     .await
     .context("client handshake timed out")??;
     if let Some(cookie) = &cookie {
-        let view = node.membership_view().await?;
+        let view = node.membership_state().await?.project()?;
         if view.client(&device_id).is_err() {
             let local =
                 node.local_access
@@ -595,9 +595,8 @@ async fn dispatch(
             let (network_id, name) = match node.has_membership().await? {
                 true => {
                     let state = node.membership_state().await?;
-                    let name = node
-                        .membership_view()
-                        .await?
+                    let name = state
+                        .project()?
                         .members
                         .into_iter()
                         .find(|m| m.device_id == device_id)
@@ -622,7 +621,9 @@ async fn dispatch(
             Ok(authenticated)
         }
         "directory" => {
-            let (state, now, view) = node.membership_now().await?;
+            let state = node.membership_state().await?;
+            let now = crate::runtime::now_ms();
+            let view = state.project_at(now as u64)?;
             let since = node.recovery_since_ms(&view.recovery_key).await?;
             Ok(json!({"view":view,"state":state,"recovery_since_ms":since,"now_ms":now}))
         }
@@ -903,8 +904,8 @@ async fn dispatch(
                     .as_ref()
                     .filter(|pending| pending.checkpoint == *checkpoint)
                     .context(NO_RECOVERY_WAITING)?;
-                // A Node whose clock runs a little ahead may have put it in effect already, and
-                // a recovery in effect is final; this leaves the veto time to reach every Node.
+                // A Node whose clock runs a little ahead may have put it in effect already; the
+                // veto would roll it back, but this leaves it time to arrive before that happens.
                 ensure!(
                     now + RECOVERY_SKEW_MS < pending.effective_at_ms,
                     RECOVERY_DUE
@@ -950,12 +951,8 @@ async fn dispatch(
                     .is_ok()
                 })
                 .context("recovery key does not own this personal network")?;
-            let (heads, now) = {
-                let store = node.store.lock().await;
-                let now = crate::store::membership_clock(&store.connection, &state)?.0;
-                (store.heads(&state.genesis.network_id)?, now)
-            };
-            state.check_root(key, now, false)?;
+            state.check_root(key, now as u64, false)?;
+            let heads = node.store.lock().await.heads(&state.genesis.network_id)?;
             Ok(json!({"state":state,"heads":heads,"now_ms":now}))
         }
         "recover" => {
@@ -1150,7 +1147,7 @@ fn notify_join(node: &Runtime, request: &JoinRequest) {
 
 /// Reads membership; a member wins over a local cookie.
 async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
-    let view = node.membership_view().await?;
+    let view = node.membership_state().await?.project()?;
     let node_id = node.identity.device_id()?;
     ensure!(
         view.revocation(&node_id).is_none(),
@@ -1188,7 +1185,7 @@ async fn principal(node: &Runtime, session: &Session) -> Result<Principal> {
 
 /// Starting over is for the owner at this computer, once the signed removal is installed here.
 async fn removed_and_local(node: &Runtime, session: &Session) -> Result<()> {
-    let view = node.membership_view().await?;
+    let view = node.membership_state().await?.project()?;
     let node_id = node.identity.device_id()?;
     ensure!(
         view.revocation(&node_id).is_some(),
@@ -1212,8 +1209,9 @@ async fn is_local_only(node: &Runtime, session: &Session) -> Result<bool> {
     Ok(session.cookie.is_some()
         && (!node.has_membership().await?
             || node
-                .membership_view()
+                .membership_state()
                 .await?
+                .project()?
                 .client(&session.device_id)
                 .is_err()))
 }
@@ -1228,7 +1226,7 @@ async fn node_operator(node: &Runtime, session: &Session) -> Result<()> {
 }
 
 async fn manager_view(node: &Runtime, session: &Session) -> Result<AuthorizationView> {
-    let view = node.membership_view().await?;
+    let view = node.membership_state().await?.project()?;
     view.manager(&session.device_id)?;
     Ok(view)
 }
@@ -1239,9 +1237,10 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
     if !node.has_membership().await? {
         return Ok(json!({"principal":null,"initialized":false,"revoked":false}));
     }
-    // The browser checks the view against the state at this same time: this Node's membership
-    // time, which lags the wall clock while a recovery due here waits for another Node.
-    let (state, now, view) = node.membership_now().await?;
+    let state = node.membership_state().await?;
+    // The browser checks the view against the state at this same time.
+    let now = crate::runtime::now_ms();
+    let view = state.project_at(now as u64)?;
     match principal(node, session).await {
         Ok(principal) => Ok(
             json!({"principal":principal,"network_id":view.network_id,"state":state,"view":view,"recovery_since_ms":node.recovery_since_ms(&view.recovery_key).await?,"local_auto_access":node.local_access.enabled(),"now_ms":now}),
@@ -2993,12 +2992,6 @@ mod tests {
             let recovered = recovering.call("authenticate", json!({})).await?;
             assert_eq!((&recovered["principal"]["can_manage"], &recovered["principal"]["epoch"]), (&json!(true), &json!(3)));
             assert!(recovered["recovery_since_ms"].as_i64() >= Some(started), "a new recovery key restarts the date");
-            // In effect it is final: a veto dated back into its wait cannot undo it.
-            let mut undone = node.membership_state().await?;
-            undone.append(GovernanceEvent::unsigned(&undone.project_at(1)?, &admin.device_id()?, GovernanceAction::Veto { checkpoint: effective.hash()?, at_ms: effective.effective_at_ms() - 1 })?.sign(&admin)?)?;
-            assert_eq!(undone.project()?.epoch, 1, "the dated-back veto would stop it");
-            refused(node.install_membership(undone).await.unwrap_err(), vibeface_secure::membership::RECOVERY_FINAL);
-            assert_eq!(node.membership_state().await?.project()?.epoch, 3);
             let chain = [&checkpoint, &effective];
             refused(recovering.call("recovery_state", read_with(&root, &chain)?).await.unwrap_err(), vibeface_secure::membership::SUPERSEDED);
             let after = node.membership_state().await?;

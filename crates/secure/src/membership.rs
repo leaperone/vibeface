@@ -6,8 +6,8 @@
 //! A checkpoint that replaces the directory waits `RECOVERY_DELAY_MS` from its signed time;
 //! until then any manager of the epoch it would end can stop it with a signed veto, and the same
 //! recovery key can retire it with a rotation. Signed times and causality decide the outcome, so
-//! every replica reaches the same one; a local clock only decides when a replica sees it. Once a
-//! replica saw a recovery in effect it is final there: `keeps` refuses any history that stops it.
+//! every replica reaches the same one; a local clock only decides when a replica sees it. Nothing
+//! is final: a veto signed in time that arrives late puts the earlier directory back everywhere.
 
 use crate::{Identity, validate_device_id};
 use anyhow::{Context, Result, bail, ensure};
@@ -26,8 +26,6 @@ pub const RECOVERY_WAITING: &str = "another recovery is waiting to take effect";
 /// A recovery file whose recovery a device stopped, or one built on it.
 pub const RECOVERY_STOPPED: &str = "one of your devices stopped this recovery";
 pub const NO_RECOVERY_WAITING: &str = "no recovery is waiting";
-/// History that would stop a recovery a replica already saw in effect.
-pub const RECOVERY_FINAL: &str = "a recovery that took effect cannot be undone";
 /// A recovery resting on management changes this replica does not hold yet.
 pub const RECOVERY_INCOMPLETE: &str =
     "this recovery rests on device changes this Node has not received; sync it first";
@@ -869,20 +867,6 @@ impl NetworkState {
                         .any(|epoch| epoch.parent == Some(live) && !epoch.stopped),
                 RECOVERY_WAITING
             ),
-        }
-        Ok(())
-    }
-
-    /// Fails when this history stops the epoch `key` opened. A replica checks every key it saw
-    /// in effect before taking a history, so a recovery in effect is final there: a veto or a
-    /// rotation that arrives after its time, however it is dated, cannot undo it.
-    pub fn keeps(&self, key: &str, now_ms: u64) -> Result<()> {
-        let epochs = self.epochs(now_ms)?;
-        if let Some(epoch) = epochs.iter().find(|epoch| epoch.key == key) {
-            ensure!(
-                !matches!(epoch.standing, Standing::Vetoed | Standing::Void),
-                RECOVERY_FINAL
-            );
         }
         Ok(())
     }
@@ -2312,10 +2296,12 @@ mod tests {
             due,
         )?);
         refused(late.project_at(due), "earlier recoveries were vetoed");
-        // Dated back, it is one; a replica that already saw the recovery in effect refuses it.
-        waiting.keeps(&id(&next), due)?;
-        refused(rotated.keeps(&id(&next), due), RECOVERY_FINAL);
-        rotated.keeps(&id(&root), due)?;
+        // Dated back, it is one, and it wins wherever it arrives.
+        assert_eq!(waiting.project_at(due)?.recovery_key, id(&next));
+        assert_eq!(
+            waiting.merge(&rotated)?.project_at(due)?.recovery_key,
+            id(&rotated_key)
+        );
         Ok(())
     }
 
@@ -2461,7 +2447,7 @@ mod tests {
             "the recovery signed after the veto took effect"
         );
         assert!(view.stopped.contains(&checkpoint.hash()?));
-        removed.keeps(&state.project_at(weeks)?.recovery_key, weeks)?;
+        assert_eq!(view, state.project_at(weeks)?);
         // With only the first recovery, removing the device keeps it stopped too.
         let mut alone = vetoed.clone();
         alone.append(GovernanceEvent::revoke(
@@ -2471,7 +2457,6 @@ mod tests {
         )?)?;
         let view = alone.project_at(weeks)?;
         assert_eq!((view.epoch, view.stopped), (1, vec![checkpoint.hash()?]));
-        alone.keeps(&id(&root), weeks)?;
         Ok(())
     }
 
@@ -2504,7 +2489,6 @@ mod tests {
         }
         let merged = n.merge(&p)?;
         assert_eq!(merged, p.merge(&n)?);
-        merged.keeps(&id(&next), due)?;
         assert_eq!(merged.project_at(due)?.recovery_key, id(&next));
         Ok(())
     }
@@ -2541,7 +2525,6 @@ mod tests {
         synced.checkpoints.push(checkpoint);
         let view = synced.project_at(due)?;
         assert_eq!((view.epoch, view.pending), (1, None));
-        synced.keeps(&id(&root), due)?;
         refused(synced.check_root(&id(&root), T, false), RECOVERY_WAITING);
         assert_eq!(
             synced.merge(&ahead)?.project_at(due)?.recovery_key,
@@ -2578,21 +2561,23 @@ mod tests {
                 })?;
             assert_eq!(merged, vetoed);
         }
-        // Without the veto every replica flips at the same signed time. Once one saw the recovery
-        // in effect, a veto signed back in the window and arriving later cannot undo it there.
+        // Without the veto every replica flips at the same signed time. A veto signed in the
+        // window that arrives after it puts the old directory back, the same on every replica.
         let due = T + RECOVERY_DELAY_MS;
         let flipped = recovered.project_at(due)?;
         assert_eq!(flipped.epoch, 2);
         let late = veto(&a, &recovered.project_at(T)?, &checkpoint, due - 1)?;
         let mut backdated = recovered.clone();
         backdated.append(late)?;
-        refused(backdated.keeps(&flipped.recovery_key, due), RECOVERY_FINAL);
-        refused(
-            recovered.merge(&vetoed)?.keeps(&flipped.recovery_key, due),
-            RECOVERY_FINAL,
-        );
-        // One that took the veto before the time keeps it: nothing it saw in effect is stopped.
-        vetoed.keeps(&vetoed.project_at(T)?.recovery_key, due)?;
+        for state in [&backdated, &recovered.merge(&vetoed)?, &vetoed] {
+            let view = state.project_at(due)?;
+            assert_eq!((view.epoch, view.recovery_key), (1, id(&root)));
+            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
+        }
+        // Signed after the time, a veto counts for nothing.
+        let mut stale = recovered.clone();
+        stale.append(veto(&a, &recovered.project_at(T)?, &checkpoint, due)?)?;
+        assert_eq!(stale.project_at(due)?.epoch, 2);
         Ok(())
     }
 }

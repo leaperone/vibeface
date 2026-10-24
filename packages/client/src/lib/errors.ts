@@ -47,7 +47,6 @@ const patterns: [RegExp, string][] = [
   [/no recovery is waiting/i, '没有正在等待的找回，可能已生效或已被拦下。'],
   [/signed too long ago/i, '这次找回太旧了，请重新发起。'],
   [/can no longer be stopped/i, '这次找回马上就要生效，来不及拦下了。'],
-  [/took effect cannot be undone/i, '这次找回已经生效，不能撤回。'],
   [/too far from this Node's clock/i, '这台设备的时间和所连电脑差得太多。请校准时间后再试。'],
   [/write needs the signature|signed by another device|client_id differs/i, '这台设备的身份校验没通过。请重新打开后重试。'],
   [/conversation moved meanwhile/i, '这个对话刚换过负责的设备，已刷新。请确认后再试。'],

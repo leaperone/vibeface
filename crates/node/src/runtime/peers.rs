@@ -181,7 +181,7 @@ impl Runtime {
         }
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
-            let view = self.membership_view().await?;
+            let view = self.membership_state().await?.project()?;
             for signed in self.store.lock().await.address_book()? {
                 if let Ok(record) = signed.open(&network)
                     && view.node(&record.device_id).is_ok()
@@ -232,8 +232,9 @@ impl Runtime {
     }
 
     async fn removed_here(&self, device: &str) -> bool {
-        self.membership_view()
+        self.membership_state()
             .await
+            .and_then(|state| state.project())
             .is_ok_and(|view| view.revocation(device).is_some())
     }
 
@@ -286,17 +287,29 @@ impl Runtime {
             Ok(network) => network,
             Err(_) if alpn == net::SYNC && self.removed_here(&remote).await => {
                 // A removed Node learns why from the signed history; it checks every signature.
-                let state = self.membership_state().await?;
-                let reply =
-                    json!({"type":"revoked","network_id":state.genesis.network_id,"state":state});
+                // One that holds a veto undoing that removal hands it here the same way.
+                let network = self.membership_state().await?.genesis.network_id;
+                let node = Arc::downgrade(&self);
                 net::serve_streams(connection, move |request: Value| {
-                    let reply = reply.clone();
+                    let (node, network) = (node.clone(), network.clone());
                     async move {
                         ensure!(
-                            request["network_id"] == reply["network_id"],
+                            request["network_id"].as_str() == Some(network.as_str()),
                             "wrong personal network"
                         );
-                        Ok(reply)
+                        let node = node.upgrade().context("Node stopped")?;
+                        if request["type"] == "membership" {
+                            let incoming: NetworkState =
+                                serde_json::from_value(request["state"].clone())
+                                    .context("invalid membership")?;
+                            ensure!(
+                                incoming.genesis.network_id == network,
+                                "wrong membership network"
+                            );
+                            node.install_membership(incoming).await?;
+                        }
+                        let state = node.membership_state().await?;
+                        Ok(json!({"type":"revoked","network_id":network,"state":state}))
                     }
                 })
                 .await;
@@ -550,7 +563,6 @@ impl Runtime {
                     "wrong membership network"
                 );
                 self.install_membership(incoming).await?;
-                self.note_membership_exchange(origin).await?;
                 Ok(json!({"state":self.membership_state().await?}))
             }
             "forks" => {
@@ -635,9 +647,10 @@ impl Runtime {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                 _ = self.sync_wakeup.notified() => {},
             }
-            let Ok(view) = self.membership_view().await else {
+            let Ok(state) = self.membership_state().await else {
                 continue;
             };
+            let Ok(view) = state.project() else { continue };
             let local = self.identity.device_id().unwrap_or_default();
             if view.revocation(&local).is_some() {
                 continue;
@@ -715,7 +728,23 @@ impl Runtime {
         let ours = self.hello(network).await?;
         let theirs = net.request(peer, net::SYNC, &ours, PEER_TIMEOUT).await?;
         if theirs["type"] == "revoked" {
-            return self.accept_removal(network, &theirs).await;
+            let removed = self.accept_removal(network, &theirs).await;
+            if removed.is_err() {
+                // Still a member here: a late veto may have put back a directory the peer has
+                // not seen, so it gets this history to roll back too.
+                let state = self.membership_state().await?;
+                net.request(
+                    peer,
+                    net::SYNC,
+                    &json!({"type":"membership","network_id":network,"state":state}),
+                    PEER_TIMEOUT,
+                )
+                .await?;
+                // The peer decided how to serve this connection when it took it; the next
+                // round dials again.
+                net.peer_restarted(peer);
+            }
+            return removed;
         }
         ensure!(
             theirs["network_id"].as_str() == Some(network),
@@ -734,8 +763,6 @@ impl Runtime {
             let incoming: NetworkState = serde_json::from_value(reply["state"].clone())?;
             self.install_membership(incoming).await?;
         }
-        // Both now hold the same membership, or this one holds the union of both.
-        self.note_membership_exchange(peer).await?;
         if let Err(error) = self.exchange_addresses(network, peer).await {
             tracing::debug!(%peer, %error, "address book exchange pending");
         }
@@ -939,7 +966,11 @@ impl Runtime {
     /// The write state, and the conflicts kept aside here, for the web.
     /// Each other member Node with whether the last sync reached it and when one last finished.
     pub(crate) async fn peer_health(&self) -> Vec<crate::maintenance::PeerHealth> {
-        let Ok(view) = self.membership_view().await else {
+        let Ok(view) = self
+            .membership_state()
+            .await
+            .and_then(|state| state.project())
+        else {
             return Vec::new();
         };
         let local = self.identity.device_id().unwrap_or_default();
@@ -1095,9 +1126,10 @@ impl Runtime {
         loop {
             self.have_wakeup.notified().await;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let Ok(view) = self.membership_view().await else {
+            let Ok(state) = self.membership_state().await else {
                 continue;
             };
+            let Ok(view) = state.project() else { continue };
             let Ok(local) = self.identity.device_id() else {
                 continue;
             };
@@ -1136,7 +1168,7 @@ impl Runtime {
 
     /// Other member Nodes this one can ask right now.
     async fn member_peers(&self) -> Result<(String, Vec<String>)> {
-        let view = self.membership_view().await?;
+        let view = self.membership_state().await?.project()?;
         let local = self.identity.device_id()?;
         let peers = view
             .members
@@ -1213,17 +1245,20 @@ impl Runtime {
         self.abandon_revoked_works(&view.network_id).await;
     }
 
-    /// Work on removed devices that never reported is recorded as abandoned by the owner, and
-    /// requests still waiting for those devices are dropped.
+    /// Work on devices a manager removed that never reported is recorded as abandoned by the
+    /// owner, and requests still waiting for those devices are dropped.
+    ///
+    /// Only a signed removal counts. A Node a recovery left out is out only until a late veto
+    /// puts the earlier directory back, and an `Abandoned` record in the shared log cannot be
+    /// taken back; its writes past the bound simply stop counting (`log::recompute`) until then.
     pub(super) async fn abandon_revoked_works(&self, network: &str) {
-        let Ok(view) = self.membership_view().await else {
+        let Ok(state) = self.membership_state().await else {
             return;
         };
-        let removed: Vec<String> = view
-            .revoked
-            .iter()
-            .map(|revoked| revoked.device_id.clone())
-            .collect();
+        let Ok(view) = state.project() else {
+            return;
+        };
+        let removed = signed_removals(&state, &view);
         if removed.is_empty() {
             return;
         }
@@ -1318,7 +1353,7 @@ impl Runtime {
         network: &str,
         records: Vec<SignedAddress>,
     ) -> Result<()> {
-        let view = self.membership_view().await?;
+        let view = self.membership_state().await?.project()?;
         let local = self.identity.device_id()?;
         let mut learned = false;
         for signed in records.into_iter().take(MAX_ADDRESS_RECORDS) {
@@ -1346,7 +1381,7 @@ impl Runtime {
 
     /// Signed records of current member Nodes that serve browsers.
     pub(crate) async fn entrances(&self, network: &str) -> Result<Vec<SignedAddress>> {
-        let view = self.membership_view().await?;
+        let view = self.membership_state().await?.project()?;
         Ok(self
             .store
             .lock()
@@ -1640,6 +1675,32 @@ impl Runtime {
     }
 }
 
+/// Devices out of `view` by a manager's signed revocation in an epoch in effect, not only
+/// because a recovery left them out.
+fn signed_removals(state: &NetworkState, view: &AuthorizationView) -> Vec<String> {
+    let stopped: BTreeSet<u64> = state
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint
+                .hash()
+                .is_ok_and(|hash| view.stopped.contains(&hash))
+        })
+        .map(|checkpoint| checkpoint.epoch)
+        .collect();
+    view.revoked
+        .iter()
+        .filter(|revoked| {
+            state.events.iter().any(|event| {
+                event.epoch <= view.epoch
+                    && !stopped.contains(&event.epoch)
+                    && matches!(&event.action, GovernanceAction::Revoke(revocation) if revocation.device_id == revoked.device_id)
+            })
+        })
+        .map(|revoked| revoked.device_id.clone())
+        .collect()
+}
+
 /// Refuses a new download once 64 objects or 256 MiB are already staged.
 pub(super) fn staging_room(dir: &Path, size: u64) -> Result<()> {
     let mut objects = 0;
@@ -1815,6 +1876,378 @@ mod tests {
         Ok(())
     }
 
+    /// A recovery by `ia`'s current root keeping `members`, signed at `issued`, on `state`.
+    fn recovery_on(
+        ia: &LocalIdentity,
+        state: &NetworkState,
+        members: Vec<crate::identity::Member>,
+        retired: Vec<crate::identity::Revocation>,
+        issued: u64,
+    ) -> Result<(NetworkState, crate::identity::RootCheckpoint, String)> {
+        let next = LocalIdentity::generate().device_id()?;
+        let checkpoint = crate::identity::RootCheckpoint::recovery(
+            state,
+            &ia.fixture_root_at(2),
+            &next,
+            members,
+            retired,
+            issued,
+        )?;
+        let mut waiting = state.clone();
+        waiting.recover(checkpoint.clone())?;
+        Ok((waiting, checkpoint, next))
+    }
+
+    /// `waiting` with the fixture manager's veto of `checkpoint`, signed at `at`.
+    fn vetoed(
+        ia: &LocalIdentity,
+        waiting: &NetworkState,
+        checkpoint: &crate::identity::RootCheckpoint,
+        at: u64,
+    ) -> Result<NetworkState> {
+        use crate::identity::{GovernanceAction, GovernanceEvent};
+        let veto = GovernanceEvent::unsigned(
+            &waiting.project_at(checkpoint.issued_at_ms)?,
+            &ia.fixture_admin().device_id()?,
+            GovernanceAction::Veto {
+                checkpoint: checkpoint.hash()?,
+                at_ms: at,
+            },
+        )?
+        .sign(&ia.fixture_admin())?;
+        let mut state = waiting.clone();
+        state.append(veto)?;
+        Ok(state)
+    }
+
+    /// Long enough ago to be due by the wall clock.
+    fn overdue() -> u64 {
+        now_ms() as u64 - crate::identity::RECOVERY_DELAY_MS - 1_000
+    }
+
+    async fn stop_nodes(nodes: Vec<(Arc<Runtime>, PathBuf)>) {
+        for (node, _) in &nodes {
+            node.stop_network().await;
+        }
+        for (node, dir) in nodes {
+            drop(node);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// A Node that slept through the wait puts the recovery in effect by the wall clock; the
+    /// veto it missed, signed in time, puts the old directory back when it arrives. Sync goes on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_flipped_early_rolls_back_on_a_late_veto_and_keeps_syncing() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+            }
+            let attacker = LocalIdentity::generate();
+            let mut members = state.project()?.members;
+            members.push(crate::identity::Member::client(
+                &attacker, "attacker", true,
+            )?);
+            let issued = overdue();
+            let (waiting, checkpoint, next) = recovery_on(&ia, &state, members, vec![], issued)?;
+            let flipped = a.install_membership(waiting.clone()).await?;
+            assert_eq!(flipped.epoch, 3);
+            assert!(flipped.client(&attacker.device_id()?).is_ok());
+            assert!(a.recovery_since_ms(&next).await?.is_some());
+            b.install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
+                .await?;
+            let owner = ia.owner_fixture(&network, "c", &ib.device_id()?)?;
+            b.store
+                .lock()
+                .await
+                .create_conversation(&ib, &network, "c", "t", owner, 1)?;
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            a.sync_peer(&network, &ib.device_id()?).await?;
+            let view = a.membership_state().await?.project()?;
+            assert_eq!(view.epoch, 2);
+            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
+            assert!(view.client(&attacker.device_id()?).is_err());
+            assert_eq!(a.membership_state().await?, b.membership_state().await?);
+            assert!(
+                a.store.lock().await.conversation(&network, "c")?.is_some(),
+                "the data log synced too"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    /// Two Nodes that both slept through the veto agree with each other first, then with the
+    /// Node that holds the veto; all three end on the old directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_nodes_that_slept_through_a_veto_converge_with_the_one_that_holds_it() -> Result<()>
+    {
+        let ids = [
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        ];
+        let ia = &ids[0];
+        let devices = ids
+            .iter()
+            .map(|id| id.device_id())
+            .collect::<Result<Vec<_>>>()?;
+        let state = ia.sign_network_fixture(1, devices.clone())?;
+        let network = ia.fixture_network_id()?;
+        let mut nodes = vec![];
+        for id in &ids {
+            nodes.push(node(id).await?);
+        }
+        let result = async {
+            let [(a, _), (b, _), (c, _)] = &nodes[..] else {
+                unreachable!("three nodes")
+            };
+            let attacker = LocalIdentity::generate();
+            let mut members = state.project()?.members;
+            members.push(crate::identity::Member::client(
+                &attacker, "attacker", true,
+            )?);
+            let issued = overdue();
+            let (waiting, checkpoint, _) = recovery_on(ia, &state, members, vec![], issued)?;
+            for node in [a, b] {
+                node.install_membership(waiting.clone()).await?;
+                assert_eq!(node.membership_state().await?.project()?.epoch, 3);
+            }
+            c.install_membership(vetoed(ia, &waiting, &checkpoint, issued + 1)?)
+                .await?;
+            for node in [a, b] {
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            a.sync_peer(&network, &devices[1]).await?;
+            for node in [a, b] {
+                assert_eq!(node.membership_state().await?.project()?.epoch, 3);
+            }
+            c.start_network().await?;
+            for (from, to) in [(a, c), (b, a), (c, a), (c, b)] {
+                from.net()?.learn(&to.net()?.addr()).await;
+            }
+            a.sync_peer(&network, &devices[2]).await?;
+            b.sync_peer(&network, &devices[0]).await?;
+            let expected = c.membership_state().await?;
+            for node in [a, b, c] {
+                assert_eq!(node.membership_state().await?, expected);
+                let view = node.membership_state().await?.project()?;
+                assert_eq!((view.epoch, &view.stopped), (2, &vec![checkpoint.hash()?]));
+                assert!(view.client(&attacker.device_id()?).is_err());
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(nodes).await;
+        result
+    }
+
+    /// A Node that put in effect a recovery leaving out a peer refuses that peer; the peer, which
+    /// holds the veto, hands it over anyway, and both end on the old directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_refusing_a_peer_it_saw_removed_takes_its_veto() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+            }
+            let view = state.project()?;
+            let kept: Vec<_> = view
+                .members
+                .iter()
+                .filter(|member| member.device_id != ib.device_id().unwrap_or_default())
+                .cloned()
+                .collect();
+            let retired = view.retire(&kept, &a.store.lock().await.heads(&network)?)?;
+            let issued = overdue();
+            let (waiting, checkpoint, _) = recovery_on(&ia, &state, kept, retired, issued)?;
+            let flipped = a.install_membership(waiting.clone()).await?;
+            assert!(flipped.revocation(&ib.device_id()?).is_some());
+            b.install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
+                .await?;
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            // Refused this round (unless a background round already handed it over).
+            let _ = b.sync_peer(&network, &ia.device_id()?).await;
+            assert_eq!(a.membership_state().await?, b.membership_state().await?);
+            assert_eq!(a.membership_state().await?.project()?.epoch, 2);
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    /// The lost device was itself a Node and never comes back: the recovery that leaves it out
+    /// takes effect when the wall clock reaches its time.
+    #[tokio::test]
+    async fn a_recovery_leaving_out_a_lost_node_takes_effect_on_time() -> Result<()> {
+        let (ia, lost) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, lost.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            let view = state.project()?;
+            let kept: Vec<_> = view
+                .members
+                .iter()
+                .filter(|member| member.device_id != lost.device_id().unwrap_or_default())
+                .cloned()
+                .collect();
+            let retired = view.retire(&kept, &a.store.lock().await.heads(&network)?)?;
+            let issued = now_ms() as u64 + 1_000 - crate::identity::RECOVERY_DELAY_MS;
+            let (waiting, _, next) = recovery_on(&ia, &state, kept, retired, issued)?;
+            assert_eq!(a.install_membership(waiting).await?.epoch, 2, "waiting");
+            a.start_recovery_timer();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while a.recovery_since_ms(&next).await?.is_none() {
+                ensure!(Instant::now() < deadline, "the recovery never took effect");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let view = a.membership_state().await?.project()?;
+            assert_eq!(view.epoch, 3);
+            assert!(view.revocation(&lost.device_id()?).is_some());
+            anyhow::Ok(())
+        }
+        .await;
+        drop(a);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    /// A recovery leaving out a Node abandons none of its work: a late veto can put the Node
+    /// back, and an `Abandoned` record in the shared log could not be taken back. A manager's
+    /// signed removal still abandons it.
+    #[tokio::test]
+    async fn a_recovery_undone_by_a_late_veto_adds_nothing_to_the_shared_log() -> Result<()> {
+        use crate::{
+            identity::{GovernanceEvent, Revocation},
+            model::{EventBody, Role, WorkKind, WorkOutcome},
+            work::WorkSpec,
+        };
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state.clone()).await?;
+            let trigger = crate::scheduling::message_trigger("m1");
+            let work = WorkSpec {
+                work_id: WorkSpec::id("c", &trigger, "remote"),
+                conversation: "c".into(),
+                trigger: trigger.clone(),
+                target: ib.device_id()?,
+                dispatcher: ia.device_id()?,
+                call_ref: "remote".into(),
+                kind: WorkKind::Codex,
+                cwd: "/tmp".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            {
+                let mut store = a.store.lock().await;
+                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                store.create_conversation(&ia, &network, "c", "t", owner, 1)?;
+                let posted = ia.fixture_admin().attest(
+                    &network,
+                    "c",
+                    EventBody::MessagePosted {
+                        message_id: "m1".into(),
+                        role: Role::User,
+                        text: "go".into(),
+                        attachments: vec![],
+                        report_results: Some(true),
+                        in_reply_to: None,
+                        status: None,
+                        answers: None,
+                        attestation: None,
+                    },
+                )?;
+                let signature = posted.attestation().cloned().context("signed message")?;
+                store.accept_message(&ia, &network, "c", "m1", "go", vec![], true, signature, 2)?;
+                store.accept_work(&ib, &network, work.clone(), 3)?;
+            }
+            let shared = async || -> Result<(i64, Option<WorkOutcome>)> {
+                let store = a.store.lock().await;
+                let count = store.connection.query_row(
+                    "SELECT count(*) FROM events WHERE network_id=?",
+                    [&network],
+                    |r| r.get(0),
+                )?;
+                let outcome = store
+                    .works(&network, "c")?
+                    .into_iter()
+                    .find(|w| w.work_id == work.work_id)
+                    .context("work")?
+                    .outcome;
+                Ok((count, outcome))
+            };
+            let before = shared().await?;
+            assert_eq!(before.1, None);
+
+            let view = state.project()?;
+            let kept: Vec<_> = view
+                .members
+                .iter()
+                .filter(|member| member.device_id != work.target)
+                .cloned()
+                .collect();
+            let retired = view.retire(&kept, &a.store.lock().await.heads(&network)?)?;
+            let issued = overdue();
+            let (waiting, checkpoint, _) = recovery_on(&ia, &state, kept, retired, issued)?;
+            let flipped = a.install_membership(waiting.clone()).await?;
+            assert!(flipped.revocation(&work.target).is_some());
+            a.abandon_revoked_works(&network).await;
+            assert_eq!(shared().await?, before, "a recovery abandons nothing");
+
+            let back = a
+                .install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
+                .await?;
+            assert_eq!(back.epoch, 2);
+            assert!(back.node(&work.target).is_ok());
+            assert_eq!(shared().await?, before, "nor does rolling it back");
+
+            let heads = a.store.lock().await.heads(&network)?;
+            let (seq, hash) = &heads[&work.target];
+            let removal = GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &back,
+                Revocation::new(&work.target, Some((*seq, hash.as_str())))?,
+            )?;
+            let mut removed = a.membership_state().await?;
+            removed.append(removal)?;
+            a.install_membership(removed).await?;
+            assert_eq!(shared().await?.1, Some(WorkOutcome::Abandoned));
+            anyhow::Ok(())
+        }
+        .await;
+        drop(a);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
     /// Nothing new arrives when a recovery's wait ends, so the Node installs the history again
     /// itself, once.
     #[tokio::test]
@@ -1850,116 +2283,6 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(*a.membership.borrow(), installs + 1, "installed once");
-            anyhow::Ok(())
-        }
-        .await;
-        drop(a);
-        std::fs::remove_dir_all(dir)?;
-        result
-    }
-
-    /// A recovery `issued` long enough ago to be due by the wall clock, adding `attacker` as a
-    /// manager, on top of `state`.
-    fn due_recovery(
-        ia: &LocalIdentity,
-        state: &NetworkState,
-        attacker: &LocalIdentity,
-    ) -> Result<(NetworkState, crate::identity::RootCheckpoint, String, u64)> {
-        use crate::identity::{Member, RECOVERY_DELAY_MS, RootCheckpoint};
-        let mut members = state.project()?.members;
-        members.push(Member::client(attacker, "attacker", true)?);
-        let next = LocalIdentity::generate().device_id()?;
-        let issued = now_ms() as u64 - RECOVERY_DELAY_MS - 1_000;
-        let checkpoint = RootCheckpoint::recovery(
-            state,
-            &ia.fixture_root_at(2),
-            &next,
-            members,
-            vec![],
-            issued,
-        )?;
-        let mut waiting = state.clone();
-        waiting.recover(checkpoint.clone())?;
-        Ok((waiting, checkpoint, next, issued))
-    }
-
-    /// A Node that slept through a recovery's wait puts it in effect only after another member
-    /// Node could hand it the veto it missed; the veto then keeps it stopped.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_node_that_slept_through_a_recovery_waits_for_a_peer() -> Result<()> {
-        use crate::identity::{GovernanceAction, GovernanceEvent};
-        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
-        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
-        let network = ia.fixture_network_id()?;
-        let (a, dir_a) = node(&ia).await?;
-        let (b, dir_b) = node(&ib).await?;
-        let result = async {
-            for node in [&a, &b] {
-                node.install_membership(state.clone()).await?;
-            }
-            let attacker = LocalIdentity::generate();
-            let (waiting, checkpoint, next, issued) = due_recovery(&ia, &state, &attacker)?;
-            a.install_membership(waiting.clone()).await?;
-            a.settle_recovery().await?;
-            let held = a.membership_view().await?;
-            assert_eq!(held.epoch, 2, "not in effect before an exchange");
-            assert_eq!(
-                held.pending.as_ref().map(|p| &p.checkpoint),
-                Some(&checkpoint.hash()?)
-            );
-            assert!(held.client(&attacker.device_id()?).is_err());
-            assert!(a.recovery_since_ms(&next).await?.is_none());
-            let (_, now, _) = a.membership_now().await?;
-            assert!(now < checkpoint.effective_at_ms());
-
-            let veto = GovernanceEvent::unsigned(
-                &waiting.project_at(issued)?,
-                &ia.fixture_admin().device_id()?,
-                GovernanceAction::Veto {
-                    checkpoint: checkpoint.hash()?,
-                    at_ms: issued + 1,
-                },
-            )?
-            .sign(&ia.fixture_admin())?;
-            let mut vetoed = waiting.clone();
-            vetoed.append(veto)?;
-            b.install_membership(vetoed).await?;
-            for node in [&a, &b] {
-                node.start_network().await?;
-            }
-            a.net()?.learn(&b.net()?.addr()).await;
-            a.sync_peer(&network, &ib.device_id()?).await?;
-            let view = a.membership_view().await?;
-            assert_eq!(view.epoch, 2);
-            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
-            assert!(view.client(&attacker.device_id()?).is_err());
-            assert!(a.recovery_since_ms(&next).await?.is_none());
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        for node in [&a, &b] {
-            node.stop_network().await;
-        }
-        drop((a, b));
-        for dir in [dir_a, dir_b] {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        result
-    }
-
-    /// With no other Node to ask, the wall clock decides.
-    #[tokio::test]
-    async fn a_single_node_puts_a_due_recovery_in_effect_by_the_wall_clock() -> Result<()> {
-        let ia = LocalIdentity::generate();
-        let state = ia.sign_network_fixture(1, vec![ia.device_id()?])?;
-        let (a, dir) = node(&ia).await?;
-        let result = async {
-            a.install_membership(state.clone()).await?;
-            let attacker = LocalIdentity::generate();
-            let (waiting, _, next, _) = due_recovery(&ia, &state, &attacker)?;
-            a.install_membership(waiting).await?;
-            assert_eq!(a.membership_view().await?.epoch, 3);
-            assert!(a.recovery_since_ms(&next).await?.is_some());
             anyhow::Ok(())
         }
         .await;

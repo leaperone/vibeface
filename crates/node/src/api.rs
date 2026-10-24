@@ -605,10 +605,8 @@ async fn local_setup(
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {
         let state = app.node.membership_state().await.map_err(ApiError::bad)?;
-        let removed = app
-            .node
-            .membership_view()
-            .await
+        let removed = state
+            .project()
             .map_err(ApiError::bad)?
             .revocation(&device_id)
             .is_some();
