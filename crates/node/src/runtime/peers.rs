@@ -302,11 +302,17 @@ impl Runtime {
                             let incoming: NetworkState =
                                 serde_json::from_value(request["state"].clone())
                                     .context("invalid membership")?;
-                            ensure!(
-                                incoming.genesis.network_id == network,
-                                "wrong membership network"
-                            );
-                            node.install_membership(incoming).await?;
+                            // Only its governance events count: a removed Node cannot bring in a
+                            // recovery checkpoint, so a backdated one skips no wait or veto. Events
+                            // this history cannot check are left out.
+                            let local = node.membership_state().await?;
+                            let state = NetworkState {
+                                events: incoming.events,
+                                ..local
+                            };
+                            if let Err(error) = node.install_membership(state).await {
+                                tracing::debug!(%error, "ignored a removed Node's history");
+                            }
                         }
                         let state = node.membership_state().await?;
                         Ok(json!({"type":"revoked","network_id":network,"state":state}))
@@ -2089,6 +2095,56 @@ mod tests {
             assert_eq!(a.membership_state().await?, b.membership_state().await?);
             assert_eq!(a.membership_state().await?.project()?.epoch, 2);
             b.sync_peer(&network, &ia.device_id()?).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    /// A stolen, removed Node with the recovery file signs a backdated recovery and pushes it:
+    /// the checkpoint stays out, so nothing skips the wait or the veto.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_removed_node_cannot_push_a_backdated_recovery() -> Result<()> {
+        use crate::identity::{GovernanceEvent, Revocation};
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            let mut removed = state.clone();
+            removed.append(GovernanceEvent::revoke(
+                &ia.fixture_admin(),
+                &state.project()?,
+                Revocation::new(&ib.device_id()?, None)?,
+            )?)?;
+            a.install_membership(removed.clone()).await?;
+            let before = a.membership_state().await?;
+            let attacker = LocalIdentity::generate();
+            let mut members = removed.project()?.members;
+            members.push(crate::identity::Member::client(
+                &attacker, "attacker", true,
+            )?);
+            let (forged, _, _) = recovery_on(&ia, &removed, members, vec![], overdue())?;
+            assert!(forged.project()?.client(&attacker.device_id()?).is_ok());
+            for node in [&a, &b] {
+                node.start_network().await?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            let reply = b
+                .net()?
+                .request(
+                    &ia.device_id()?,
+                    net::SYNC,
+                    &json!({"type":"membership","network_id":network,"state":forged}),
+                    PEER_TIMEOUT,
+                )
+                .await?;
+            assert_eq!(reply["type"], "revoked");
+            assert_eq!(a.membership_state().await?, before);
+            let view = a.membership_state().await?.project()?;
+            assert!(view.client(&attacker.device_id()?).is_err());
             anyhow::Ok(())
         }
         .await;
