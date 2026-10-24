@@ -73,14 +73,26 @@ export function Badge({ count }: { count: number }) {
 // Hand-spaced so no two read alike; even 45° steps put two pinks next to each other.
 const hues = [8, 32, 52, 100, 160, 200, 235, 280]
 
-/** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
-export function Monogram({ name, seed, hero }: { name: string; seed: string; hero?: boolean }) {
-  const { theme } = useUniwind()
+/** A bot's own hue, shared by its monogram and its chat's accents so each conversation reads as that bot's. */
+export function botHue(seed: string) {
   // FNV-1a: a plain `* 31` hash leaves `% 8` set by the last characters, so similar ids shared a tint.
   let hash = 2166136261
   for (const char of seed) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619)
   hash = (hash ^ (hash >>> 16)) >>> 0
-  const hue = hues[hash % hues.length]
+  return hues[hash % hues.length]
+}
+
+/** The bot's hue as a solid fill with legible ink on it, and a soft edge for outlines. */
+export function botTint(hue: number, dark: boolean) {
+  return dark
+    ? { fill: `hsl(${hue}, 40%, 72%)`, ink: `hsl(${hue}, 30%, 12%)`, edge: `hsl(${hue}, 25%, 34%)` }
+    : { fill: `hsl(${hue}, 45%, 34%)`, ink: '#fff', edge: `hsl(${hue}, 35%, 80%)` }
+}
+
+/** A bot's first letter on a soft tint picked from its id, so each bot is recognisable at a glance. */
+export function Monogram({ name, seed, hero }: { name: string; seed: string; hero?: boolean }) {
+  const { theme } = useUniwind()
+  const hue = botHue(seed)
   const dark = theme === 'dark'
   return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden className={cn('items-center justify-center rounded-full', hero ? 'size-20' : 'size-11')} style={{ backgroundColor: `hsl(${hue}, ${dark ? 22 : 40}%, ${dark ? 24 : 90}%)` }}>
     <Text maxFontSizeMultiplier={1} className={cn('font-semibold', hero ? 'text-3xl' : 'text-heading')} style={{ color: `hsl(${hue}, ${dark ? 45 : 35}%, ${dark ? 82 : 32}%)` }}>{Array.from(name.trim())[0]?.toUpperCase() ?? '?'}</Text>

@@ -30,9 +30,11 @@ type Props = {
   onStop?: () => void
   /** A follow-up under the blocked note, kept on the composer's column. */
   children?: ReactNode
+  /** The bot's accent for the live send button; the neutral fill without it. */
+  tint?: { fill: string; ink: string }
 }
 
-export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children }: Props) {
+export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
   const canSend = !blocked && !sending && value.trim().length > 0
   // The live arrow mounts afresh with an entering keyframe, which is applied on its first frame; effects and CSS animations can land a frame late.
   const armed = canSend && !onStop
@@ -58,10 +60,10 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
           <Icon as={Paperclip} />
         </Button>
         <Animated.View key={armed ? 'armed' : 'rest'} entering={armed ? pop : undefined}>
-          <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
+          <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" style={armed && tint ? { backgroundColor: tint.fill } : undefined} accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
             // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
             onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
-            {onStop || sending ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} />}
+            {onStop || sending ? <Icon as={Square} className="size-4 fill-foreground" /> : <Icon as={ArrowUp} className={canSend ? undefined : 'text-muted-foreground'} color={armed ? tint?.ink : undefined} />}
           </Button>
         </Animated.View>
       </View>

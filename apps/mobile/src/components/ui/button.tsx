@@ -105,7 +105,7 @@ type ButtonProps = React.ComponentProps<typeof Pressable> &
     instant?: boolean;
   };
 
-function Button({ className, variant, size, instant, onPressIn, onPressOut, ...props }: ButtonProps) {
+function Button({ className, variant, size, instant, style, onPressIn, onPressOut, ...props }: ButtonProps) {
   const scale = useSharedValue(1);
   const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const muted = props.disabled && (variant ?? 'default') === 'default';
@@ -115,7 +115,7 @@ function Button({ className, variant, size, instant, onPressIn, onPressOut, ...p
         className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
         role="button"
         {...props}
-        style={instant ? pressed : [pressed, fade]}
+        style={[typeof style === 'function' ? undefined : style, pressed, !instant && fade]}
         onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
         onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
       />
