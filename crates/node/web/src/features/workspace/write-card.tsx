@@ -15,7 +15,7 @@ export type WriteCardKind = "read_only" | "forked" | "conflicts"
 const summary = (version: ConflictVersion | null) => {
   if (!version) return "这台设备上没有"
   const text = version.body.text
-  return `${new Date(version.created_at_ms).toLocaleString()} · ${typeof text === "string" && text ? text.slice(0, 120) : String(version.body.type ?? "")}`
+  return `${new Date(version.created_at_ms).toLocaleString('zh-CN')} · ${typeof text === "string" && text ? text.slice(0, 120) : String(version.body.type ?? "")}`
 }
 
 function Steps({ items }: { items: string[] }) {

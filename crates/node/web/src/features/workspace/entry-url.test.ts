@@ -9,7 +9,7 @@ import { parseEntry, parseInfo } from "@vibeface/client/lib/node.ts"
 import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
+import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { placeChanges, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
 import { canSend, composerHint, threadReplies } from "@vibeface/client/chat/protocol.ts"
@@ -461,6 +461,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
   let cursor = 0
   const react = {
+    createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
     useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useState(initial: unknown) {
@@ -631,11 +632,11 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -717,7 +718,7 @@ test("artifact reads retain their offset while old responses cannot append or un
     work.resolve({ size: 5, next_offset: null, text: 'fresh' }); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'pre')?.props.children, 'fresh')
     assert.deepEqual(offsets, [0, 0])
-    assert.ok(render().some(({ type, props }) => type === 'span' && props.children === 'notes.txt' && props.title === 'notes.txt'), 'the card names the file')
+    assert.ok(render().some(({ type, props }) => type === 'span' && props.title === 'notes.txt' && (props.children as { props?: { name?: string } } | undefined)?.props?.name === 'notes.txt'), 'the card names the file')
   } finally { app.close() }
 })
 
@@ -791,15 +792,18 @@ test("conversation blocks sending until an online node can run the manager Agent
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
-  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
     assert.equal(composer()?.disabled, true)
     assert.match(String(composer()?.hint), /运行 Bot/)
     assert.equal(sent, 0)
-    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: false, roots: [] } }])
+    assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
+    assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()
     assert.equal(sent, 1)
@@ -814,7 +818,7 @@ test("an owner's reply on its way keeps its streamed text until the reply lands"
   const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
     generation: 1, isCurrent: () => true, conversationId: 'chat', data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
     chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
-  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
   try {
     assert.equal(streamed(), "partial answer")

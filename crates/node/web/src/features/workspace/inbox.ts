@@ -3,7 +3,7 @@ import { useOpenJoins } from "@/features/devices/join"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { workChecks } from "@vibeface/client/workspace/model.ts"
+import { botReadiness, workChecks } from "@vibeface/client/workspace/model.ts"
 import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import type { PendingCheck, Question } from "@vibeface/client/workspace/types.ts"
 import type { WriteCardKind } from "./write-card"
@@ -41,6 +41,8 @@ export function useInbox(): InboxItem[] {
     const owner = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
     if (owner) items.push({ key: `attention:${note.notification_id}`, icon: MessageSquareWarning, title: note.text.trim() || "Bot 需要你看看", meta: owner.name, to: `/b/${owner.bot_id}`, kind: "attention" })
   }
-  if (workspace.nodes.length && !workspace.nodes.some((node) => !node.revoked && node.capabilities?.manager)) items.push({ key: "setup", icon: Sparkles, title: "还没设置 Bot", to: device.ready ? `/devices/${device.ready.entry.device_id}` : "/devices", kind: "setup" })
+  const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
+  const setupDevice = unready?.device_id ?? device.ready?.entry.device_id
+  if (workspace.nodes.length && !workspace.nodes.some((node) => botReadiness(node) === "ready")) items.push({ key: "setup", icon: Sparkles, title: unready ? "Bot 需设置" : "还没设置 Bot", to: setupDevice ? `/devices/${setupDevice}` : "/devices", kind: "setup" })
   return items
 }

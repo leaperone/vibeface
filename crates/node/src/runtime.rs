@@ -504,6 +504,7 @@ impl Runtime {
         codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
+            "manager_ready":self.manager_ready().await,
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
             "codex":codex})
     }

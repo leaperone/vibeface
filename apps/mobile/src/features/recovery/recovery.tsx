@@ -120,12 +120,11 @@ export function ReplaceRecovery() {
   const [picked, setPicked] = useState<PickedFile | null>(null)
   const [oldPassword, setOldPassword] = useState('')
   const [password, setPassword] = useState('')
-  const [confirmation, setConfirmation] = useState('')
   const submit = () => void run('replace', async () => {
     if (!picked) throw new Error('请选择恢复文件。')
-    const typed = { oldPassword, password, confirmation }
-    setOldPassword(''); setPassword(''); setConfirmation('')
-    await device.replaceRecoveryFile({ file: picked.file, oldPassword: typed.oldPassword, password: passphrase(typed.password, typed.confirmation) })
+    const typed = { oldPassword, password }
+    setOldPassword(''); setPassword('')
+    await device.replaceRecoveryFile({ file: picked.file, oldPassword: typed.oldPassword, password: passphrase(typed.password) })
   }, '已保存新文件，旧恢复文件已失效')
   const locked = busy !== null || Boolean(device.review)
   return <View className="gap-4">
@@ -133,10 +132,9 @@ export function ReplaceRecovery() {
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="旧密码" placeholder="旧密码" value={oldPassword} onChangeText={setOldPassword} editable={!locked} />
     <Input {...passwordProps} accessibilityLabel="新密码" placeholder="新密码（至少 8 个字符）" value={password} onChangeText={setPassword} editable={!locked} />
-    <Input {...passwordProps} accessibilityLabel="再输一次" placeholder="再输一次" value={confirmation} onChangeText={setConfirmation} editable={!locked} />
     {status ? <Text role="status" className="text-meta text-success">{status}</Text> : null}
     {errorText(error)}
-    <Button className="min-h-11" disabled={locked || !picked || !oldPassword || !password || !confirmation} onPress={submit}>
+    <Button className="min-h-11" disabled={locked || !picked || !oldPassword || !password} onPress={submit}>
       <Text>{busy ? '处理中' : '保存新文件'}</Text>
     </Button>
   </View>

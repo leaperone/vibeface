@@ -1031,7 +1031,9 @@ impl Runtime {
             }
         }
         // Scan marks advance only once scanned events can be queued, which needs a network.
-        self.network_id().await?;
+        if !self.has_membership().await? {
+            return Ok(());
+        }
         // The coordination Agent's threads stay known: one forgotten would go to the primary bot.
         {
             let store = self.store.lock().await;
@@ -1448,7 +1450,7 @@ mod tests {
         identity::{Genesis, Member, NetworkState},
     };
 
-    async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
+    async fn bare_node() -> Result<(Arc<Runtime>, PathBuf)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("triage-{}", uuid::Uuid::new_v4()));
@@ -1469,7 +1471,11 @@ mod tests {
             &dir.join("identity.json"),
             &serde_json::to_vec(&LocalIdentity::generate())?,
         )?;
-        let node = Arc::new(Runtime::open(&dir).await?);
+        Ok((Arc::new(Runtime::open(&dir).await?), dir))
+    }
+
+    async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
+        let (node, dir) = bare_node().await?;
         let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
             &LocalIdentity::generate(),
@@ -1633,6 +1639,14 @@ mod tests {
             }
         });
         Ok(received)
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_network_skips_the_session_scan() -> Result<()> {
+        let (node, dir) = bare_node().await?;
+        let result = node.scan_sources().await;
+        std::fs::remove_dir_all(dir)?;
+        result
     }
 
     /// A stop while the Agent is still starting the work is kept, not dropped: the turn is

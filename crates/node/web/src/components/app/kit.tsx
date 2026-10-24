@@ -1,7 +1,8 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
+import { createPortal } from "react-dom"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { messageOf } from "@vibeface/client/lib/node.ts"
@@ -44,7 +45,9 @@ export function BotAvatar({ id, name, size = "md", className }: { id: string; na
   let hash = 2166136261
   for (const char of id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0
   const hue = Math.round((hash * 0.618033988749895 % 1) * 360)
-  const letter = [...name.trim()][0]?.toUpperCase() ?? "B"
+  // "我的" says whose bot it is, not which; a name left with only "Bot" shows the bot icon.
+  const rest = name.trim().replace(/^我的\s*/, "")
+  const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
   return <span aria-hidden="true" style={{ "--avatar-hue": hue } as CSSProperties} className={cn("bot-avatar grid shrink-0 place-items-center font-semibold select-none",
     size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
@@ -57,6 +60,14 @@ export function CountBadge({ count, label, className }: { count: number; label?:
 /** Brand for news; warning for something that needs a look. */
 export function Dot({ tone = "brand", label, className }: { tone?: "brand" | "warning"; label?: string; className?: string }) {
   return <span aria-label={label} className={cn("size-2 shrink-0 rounded-full", tone === "brand" ? "bg-brand" : "bg-warning", className)} />
+}
+
+/** The header's trailing slot, set by the shell. */
+export const PageActionsSlot = createContext<HTMLElement | null>(null)
+/** Puts a page's own actions on the right of the page header, next to the shell's buttons. */
+export function PageActions({ children }: { children: ReactNode }) {
+  const slot = useContext(PageActionsSlot)
+  return slot ? createPortal(children, slot) : null
 }
 
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
@@ -93,13 +104,13 @@ export function SettingsGroup({ title, footer, children, className }: { title?: 
   </section>
 }
 
-const rowTile: Record<"neutral" | "danger", string> = { neutral: "bg-muted text-muted-foreground", danger: "bg-danger-soft text-danger" }
+const rowTile: Record<"neutral" | "success" | "danger", string> = { neutral: "bg-muted text-muted-foreground", success: "bg-success-soft text-success", danger: "bg-danger-soft text-danger" }
 const rowLayout = "flex min-h-14 w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5 text-start"
 
-function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger" }) {
+function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile }) {
   return <>
     <span className={cn("grid size-8 shrink-0 place-items-center rounded-lg", rowTile[tone])}><Icon aria-hidden="true" className="size-4" /></span>
-    <span className="grid min-w-0 flex-1 basis-32">
+    <span className="grid max-w-fit min-w-0 flex-1 basis-28">
       <span className={cn("truncate", tone === "danger" && "text-danger")}>{label}</span>
       {description ? <span className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{description}</span> : null}
     </span>
@@ -108,12 +119,12 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
 
 /** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
 export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className }: {
-  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: "neutral" | "danger"; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
+  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
 }) {
   const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
   if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
-    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", expanded && "rotate-90")} />
+    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
   </button>
   return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
 }
@@ -124,24 +135,34 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
     <summary className={cn(rowLayout, "cursor-pointer list-none flex-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60 [&::-webkit-details-marker]:hidden")}>
       <RowLead icon={icon} label={label} />
       {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
-      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90" />
+      <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90", !value && "ms-auto")} />
     </summary>
     <div className="grid gap-3 px-4 pb-4 sm:ps-15">{children}</div>
   </details>
 }
 
-/** A short set of mutually exclusive options on a muted track. */
-export function Segmented<T extends string>({ label, value, options, onChange, disabled }: {
-  label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean
+/**
+ * A short set of mutually exclusive options on a muted track.
+ * On a phone, options with icons show only the icon; pair it with `SegmentedValue` so the choice still reads in words.
+ * `labels` keeps the words on a phone too, for options an icon alone can't explain.
+ */
+export function Segmented<T extends string>({ label, value, options, onChange, disabled, labels = false }: {
+  label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean; labels?: boolean
 }) {
   return <div role="radiogroup" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
-    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} disabled={disabled}
+    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined} disabled={disabled}
       onClick={() => { if (option !== value) onChange(option) }}
-      className={cn("inline-flex h-8 items-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/40 disabled:opacity-50 max-md:h-10 max-md:px-3",
+        Icon && !labels && "max-sm:w-10 max-sm:px-0",
         value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
-      {Icon ? <Icon aria-hidden="true" className="size-4" /> : null}{text}
+      {Icon ? <><Icon aria-hidden="true" className="size-4" /><span className={labels ? undefined : "max-sm:hidden"}>{text}</span></> : text}
     </button>)}
   </div>
+}
+
+/** The chosen option of a `Segmented` in words, shown only where the control shrinks to icons. */
+export function SegmentedValue<T extends string>({ value, options }: { value: T; options: Array<{ value: T; label: string }> }) {
+  return <span aria-hidden="true" className="sm:hidden">{options.find((option) => option.value === value)?.label}</span>
 }
 
 /** Same shape as the real layout; fades in only after 300ms to avoid flicker. */
@@ -166,16 +187,19 @@ export function StatusPill({ tone = "neutral", icon: Icon, children, className }
   </span>
 }
 
-/** Shared by approvals, join requests and confirmations, in chat and in /inbox. */
-export function ActionCard({ icon: Icon, tone = "warning", title, meta, menu, children, actions, className }: {
-  icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; menu?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
+/**
+ * Shared by approvals, join requests and confirmations, in chat and in /inbox.
+ * `trailing`: a card with a single action keeps it on the title row instead of a footer of its own.
+ */
+export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing, children, actions, className }: {
+  icon: LucideIcon; tone?: Tone; title: ReactNode; meta?: ReactNode; trailing?: ReactNode; children?: ReactNode; actions?: ReactNode; className?: string
 }) {
   return <section className={cn("grid gap-3 rounded-xl border p-4 shadow-xs", toneCard[tone], className)}>
-    <header className="flex min-w-0 flex-wrap items-center gap-2.5">
+    <header className="flex min-w-0 items-center gap-2.5">
       <span className={cn("grid size-7 shrink-0 place-items-center rounded-lg", toneChip[tone])}><Icon aria-hidden="true" className="size-4" /></span>
       <h3 className="min-w-0 flex-1 text-heading font-semibold">{title}</h3>
-      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground max-sm:order-last max-sm:max-w-full max-sm:basis-full max-sm:ps-9.5">{meta}</span> : null}
-      {menu}
+      {meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground">{meta}</span> : null}
+      {trailing ? <div className="-my-1 shrink-0">{trailing}</div> : null}
     </header>
     {children ? <div className="grid min-w-0 gap-2">{children}</div> : null}
     {actions ? <div className="flex flex-wrap justify-end gap-2">{actions}</div> : null}
@@ -193,7 +217,7 @@ export function SafetyCode({ code, label = "安全码" }: { code: string; label?
 /** Collapsed by default. Jargon from docs/design/web-ux.md section 6 may only appear in here. */
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
-    <summary className="inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
+    <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
       <ChevronRight aria-hidden="true" className="size-4 transition-transform" />{label}
     </summary>
     <div className="grid gap-2 break-all pt-2 text-muted-foreground">{children}</div>
@@ -242,8 +266,14 @@ export function toast(text: string, options: { tone?: Tone; action?: ToastItem["
 }
 const toastIcon: Record<Tone, LucideIcon> = { neutral: Info, success: CircleCheck, warning: TriangleAlert, danger: CircleAlert, info: Info }
 
-/** The visible `[data-toast-anchor]` (the composer), if any. A `[data-toast-above]` inside it floats over the page and counts too. */
-const toastAnchor = () => [...document.querySelectorAll<HTMLElement>("[data-toast-anchor]")].find((anchor) => !anchor.closest("[inert]") && anchor.getBoundingClientRect().height > 0)
+/**
+ * The visible `[data-toast-anchor]` (the composer), if any. A `[data-toast-above]` inside it floats over the page and counts too.
+ * While a dialog or sheet is open, only an anchor inside it counts: the composer behind it is covered.
+ */
+const toastAnchor = () => {
+  const dialog = [...document.querySelectorAll<HTMLElement>("[role=dialog][data-state=open]")].at(-1)
+  return [...(dialog ?? document).querySelectorAll<HTMLElement>("[data-toast-anchor]")].find((anchor) => !anchor.closest("[inert]") && anchor.getBoundingClientRect().height > 0)
+}
 function anchorSpace(anchor: HTMLElement | undefined) {
   if (!anchor) return 0
   const tops = [anchor, ...anchor.querySelectorAll<HTMLElement>("[data-toast-above]")].map((element) => element.getBoundingClientRect()).filter((rect) => rect.height > 0).map((rect) => rect.top)
@@ -256,13 +286,23 @@ export function Toaster() {
   const [space, setSpace] = useState(0)
   useEffect(() => {
     if (!items.length || typeof window === "undefined") return
-    const anchor = toastAnchor()
-    const measure = () => setSpace(anchorSpace(anchor))
+    let anchor: HTMLElement | undefined
+    const resize = new ResizeObserver(() => setSpace(anchorSpace(anchor)))
+    // A sheet opening or closing changes which anchor counts, so the anchor is found again each time.
+    function measure() {
+      const next = toastAnchor()
+      if (next !== anchor) {
+        anchor = next
+        resize.disconnect()
+        for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) resize.observe(element)
+      }
+      setSpace(anchorSpace(anchor))
+    }
     measure()
-    const observer = new ResizeObserver(measure)
-    for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) observer.observe(element)
+    const dialogs = new MutationObserver(measure)
+    dialogs.observe(document.body, { childList: true, subtree: true, attributeFilter: ["data-state"] })
     window.addEventListener("resize", measure)
-    return () => { observer.disconnect(); window.removeEventListener("resize", measure) }
+    return () => { resize.disconnect(); dialogs.disconnect(); window.removeEventListener("resize", measure) }
   }, [items])
   return <div aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {

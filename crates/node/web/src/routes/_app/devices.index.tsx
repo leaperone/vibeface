@@ -10,5 +10,5 @@ export const Route = createFileRoute('/_app/devices/')({
 function Devices() {
   const { add } = Route.useSearch()
   const navigate = useNavigate()
-  return <DevicesPage actions={<AddDevice opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: {}, replace: true }) }} />} />
+  return <><DevicesPage /><AddDevice opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: {}, replace: true }) }} /></>
 }

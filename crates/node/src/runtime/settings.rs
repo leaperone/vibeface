@@ -225,6 +225,18 @@ impl Runtime {
             .clone()
     }
 
+    /// Whether the bot's provider works now; the bot switch alone does not make it run.
+    pub(crate) async fn manager_ready(&self) -> bool {
+        let settings = self.settings_snapshot();
+        let Some(manager) = &settings.manager else {
+            return false;
+        };
+        let status = self
+            .provider_status(Provider::of(manager.provider), &self.providers(), &settings)
+            .await;
+        status["state"] == "ready"
+    }
+
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
         let default = self.default_manager(ManagerKind::CodexSdk)?;

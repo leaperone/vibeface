@@ -112,5 +112,3 @@ CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NU
 CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `spec` text NOT NULL, `state` text NOT NULL, `reason` text NULL, PRIMARY KEY (`work_id`));
 -- Create "work_stops" table
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));
-
-PRAGMA user_version = 1;

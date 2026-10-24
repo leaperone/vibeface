@@ -11,10 +11,6 @@ export function useOpenJoins(): JoinRequest[] {
   return device.ready?.principal.can_manage ? device.joins.filter((request) => request.status === "pending" || request.status === "confirming") : []
 }
 
-let cardsOnScreen = 0
-/** While a join card is visible (sheet, device page or 待处理) the shell skips its "X 想加入" toast; the card already says it. */
-export const joinsOnScreen = () => cardsOnScreen > 0
-
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
 /**
  * `issuing`: this page just handed out a link, so it starts the comparison without a click.
@@ -47,7 +43,6 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
   const device = useDevice()
   const action = useAction()
   const [manage, setManage] = useState(false)
-  useEffect(() => { cardsOnScreen++; return () => { cardsOnScreen-- } }, [])
   // Opening the card is the admin's commitment; the new device then reveals and both sides show the code.
   useEffect(() => {
     if (!auto || request.status !== "pending" || started.has(request.join_id)) return
@@ -70,7 +65,7 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
   >
     <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的比对，不一致就拒绝" : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : request.status === "pending" && !auto ? null : <Skeleton className="h-8 w-40" />}
-    {request.kind === "client" ? <label className="flex min-h-11 w-fit items-center gap-2 text-meta"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
+    {request.kind === "client" ? <label className="flex min-h-11 w-fit items-center gap-2 text-meta md:min-h-9"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为管理员</label> : null}
     <InlineError error={action.error} />
     <Details>
       <DetailRow label="设备编号" value={request.device_id} mono />

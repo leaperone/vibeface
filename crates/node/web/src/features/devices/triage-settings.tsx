@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { BusyIcon, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton } from "@/components/app/kit"
+import { BusyIcon, Details, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
@@ -9,7 +9,8 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
 import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
-const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发到聊天机器人", Layers]]
+const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发给机器人", Layers]]
+const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions">
 
 /** Where this device sends sessions that need the person, plus the chat bot (Grok Bot) channel both ways. Saves on each change. */
@@ -62,7 +63,7 @@ export function TriageSettings() {
 
   return <>
     <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时">
-      <Segmented label="会话等你时" value={config.default_outlet} disabled={Boolean(busy)} options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} onChange={(value) => void save("default", { default_outlet: value })} />
+      <Segmented label="会话等你时" labels value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
 
     <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>
@@ -105,8 +106,8 @@ export function TriageSettings() {
         </div>
       </form>
 
-      <div className="grid gap-2">
-        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><KeyRound aria-hidden="true" className="size-4" />让机器人代你回答</p>
+      <Details label="让机器人代你回答">
+        <p className="flex items-center gap-2 text-meta text-foreground"><KeyRound aria-hidden="true" className="size-4" />机器人用这个地址和授权码回话</p>
         <code className="truncate rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta" title={settings.decision_url}>{settings.decision_url}</code>
         {token ? <div role="status" className="flex min-w-0 items-center gap-2 rounded-lg border border-warning-border bg-warning-soft px-3 py-2">
           <code className="min-w-0 flex-1 break-all font-mono text-meta">{token}</code>
@@ -115,7 +116,7 @@ export function TriageSettings() {
         </div> : null}
         {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <span className="min-w-0 flex-1 truncate text-meta">{item.label || "未命名"}</span>
-          <span className="shrink-0 text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</span>
+          <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
           <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => void call("revoke", "revoke_decision_token", { token_id: item.token_id })}><Trash2 aria-hidden="true" /></Button>
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
@@ -125,7 +126,7 @@ export function TriageSettings() {
             if (typeof value === "string") { setToken(value); setLabel("") }
           })}><BusyIcon busy={busy === "token"} icon={Plus} />生成授权码</Button>
         </div>
-      </div>
+      </Details>
     </SettingsDisclosure>
     {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
   </>

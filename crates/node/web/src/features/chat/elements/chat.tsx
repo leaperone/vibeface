@@ -42,7 +42,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
     <MessageScrollerProvider autoScroll scrollEdgeThreshold={96}>
       <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
-          <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-0 px-4 py-6 sm:px-6 lg:px-8">
+          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 py-6 sm:px-6 lg:px-8">
             {entries.map((entry, index) => {
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)
@@ -54,7 +54,8 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
             })}
           </MessageScrollerContent>
         </MessageScrollerViewport>
-        <MessageScrollerButton aria-label="回到最新消息" className="max-md:size-11" />
+        {/* Sits at the composer's end, level with the waiting pill at its start, so the two never crowd each other. */}
+        <MessageScrollerButton aria-label="回到最新消息" title="回到最新" className="size-8 inset-s-auto translate-x-0 rounded-full shadow-sm rtl:translate-x-0 data-[direction=end]:bottom-0 inset-e-[max(1rem,calc(50%-23rem))] max-md:size-10 sm:inset-e-[max(1.5rem,calc(50%-22.5rem))] lg:inset-e-[max(2rem,calc(50%-22rem))]" />
       </MessageScroller>
     </MessageScrollerProvider>
   )

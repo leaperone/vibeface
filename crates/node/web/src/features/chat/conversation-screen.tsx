@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
-import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
@@ -15,7 +14,7 @@ import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { pendingChecks } from '@vibeface/client/workspace/model.ts'
+import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
@@ -46,7 +45,8 @@ export function ConversationScreen() {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
+  const agentReady = workspace.nodes.some((node) => botReadiness(node) === 'ready')
+  const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
@@ -130,7 +130,7 @@ export function ConversationScreen() {
 
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
-  const ownerAway = Boolean(owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const ownerAway = Boolean(owner && here && botReadiness(here) === 'ready' && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
@@ -163,16 +163,20 @@ export function ConversationScreen() {
   const notice = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
-    : messagePending ? '上一条消息还没确认送达' : ''
+    : messagePending && messageBusy ? '上一条消息还没确认送达' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const hint = notice || (bot && !agentReady ? (managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
+  // An empty chat already offers the setup button in its middle.
+  const hint = notice || (bot && !agentReady ? (unready ? (entries.length ? '运行 Bot 的设备需设置' : '') : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
-  const setupTo = managerOffline || !ready ? '/devices' : '/devices/$deviceId'
+  const setupDevice = unready?.device_id ?? ready?.entry.device_id
+  // A device that only needs setup is fixable now, so it comes before one that is offline.
+  const away = managerOffline && !unready
+  const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -208,14 +212,14 @@ export function ConversationScreen() {
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotAvatar id={bot.bot_id} name={bot.name} size="lg" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
-          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }}><Bot aria-hidden="true" />{managerOffline ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : null}
       />
       <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-9"
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-10 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
           <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
@@ -234,7 +238,7 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length ? <Link to={setupTo} params={{ deviceId: ready?.entry.device_id ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput>
     </section>
   )
@@ -261,27 +265,28 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
-  if (!open) return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  // Breaks by the chat column, which a task panel beside it narrows, not by the window.
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col sm:flex-row sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
-  </Link>
-  return <Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
+  </Link></div>
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col sm:flex-row sm:items-baseline sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>
         : taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
-  </Link>
+  </Link></div>
 }
 
-/** Device and state never yield to a long title: below `sm` they take their own line. */
+/** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
 function TaskMeta({ device, here, state, className = '' }: { device: string; here: boolean; state: string; className?: string }) {
   const Icon = here ? Laptop : Server
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
-    <span aria-hidden="true" className="hidden sm:inline">·</span>
+    <span aria-hidden="true" className="hidden @sm:inline">·</span>
     <Icon aria-hidden="true" className="size-3.5 shrink-0" />
     <span className="truncate">{device}</span>
     <span aria-hidden="true">·</span>
@@ -307,20 +312,28 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
     finally { setBusy(false) }
   }
   const Icon = session.muted ? BellOff : ArrowDownToLine
-  return <div className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
-    <Icon aria-hidden="true" className="size-4 shrink-0" />
-    <span className="shrink-0 text-foreground">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-    <span aria-hidden="true">·</span>
-    <span className="min-w-0 max-w-[40%] shrink truncate" title={session.cwd}><span className="sr-only">项目 </span>{projectName(session.cwd)}</span>
-    {session.summary ? <><span aria-hidden="true">·</span><span className="min-w-0 flex-1 truncate" title={session.summary}>{session.summary}</span></> : null}
-    <span className="ml-auto flex shrink-0 items-center gap-2">
-      {others.length ? <NativeSelect size="sm" aria-label="把会话转给其他 Bot" value="" disabled={disabled} onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
-        <NativeSelectOption value="">转给…</NativeSelectOption>
-        {others.map((bot) => <NativeSelectOption key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</NativeSelectOption>)}
-      </NativeSelect> : null}
-      <Button type="button" size="sm" variant="ghost" disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>{session.muted ? '重新关注' : '不再关注'}</Button>
-    </span>
-    <InlineError error={failure} />
+  const follow = session.muted ? '重新关注' : '不再关注'
+  return <div className="grid gap-1">
+    <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
+      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
+      <span className="grid min-w-0 flex-1">
+        <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
+        <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
+          <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
+        </span>
+      </span>
+      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/40 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
+        <ArrowRightLeft aria-hidden="true" className="size-4" />
+        <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
+          <option value="" disabled>转给…</option>
+          {others.map((bot) => <option key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</option>)}
+        </select>
+      </label> : null}
+      <Button type="button" variant="ghost" size="icon" className="size-9 text-muted-foreground max-md:size-10" aria-label={follow} title={follow} disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>
+        {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : session.muted ? <Bell aria-hidden="true" /> : <BellOff aria-hidden="true" />}
+      </Button>
+    </div>
+    <InlineError error={failure} className="ps-3" />
   </div>
 }
 

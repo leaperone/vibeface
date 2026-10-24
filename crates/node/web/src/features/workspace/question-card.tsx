@@ -2,8 +2,8 @@
 
 import { useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
-import { ActionCard, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
+import { ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ActionCard, BotAvatar, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -48,6 +48,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
   const taskBot = task ? workspace.bots.find((bot) => bot.conversation_id === task.conversation_id)?.bot_id : undefined
   const disabled = !workspace.writable || action.busy !== null
   const shown = question.choices
+  const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   const send = (key: string, value: string) => action.run(key, async () => {
     const result = await workspace.answer(question, value)
     if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
@@ -63,14 +64,14 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
     tone={tone}
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{question.text}</span></>}
   >
-    <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-meta text-muted-foreground">
-      {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
+    <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
+      {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
       </Link> : null}
-      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
-      <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备">{nodeName(question.about.node, { nodes: workspace.nodes, directory })}</Meta>
-      {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} className="inline-flex min-w-0 items-center gap-1 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
-        <Bot aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">去对话 </span><span className="truncate">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0" />
+      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
+      <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>
+      {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
+        <BotAvatar id={question.bot.bot_id} name={question.bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       </Link> : null}
     </p>
     {pending ? <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2 text-meta text-muted-foreground">
@@ -112,8 +113,9 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
 const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-card px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
 const badge = "grid size-7 shrink-0 place-items-center rounded-md text-meta font-semibold tabular-nums"
 
-function Meta({ icon: Icon, label, title, children }: { icon: LucideIcon; label: string; title?: string; children: ReactNode }) {
+/** `compact`: on a phone only the icon shows, so the line keeps to one row. */
+function Meta({ icon: Icon, label, title, compact = false, children }: { icon: LucideIcon; label: string; title?: string; compact?: boolean; children: ReactNode }) {
   return <span className="inline-flex min-w-0 items-center gap-1" title={title}>
-    <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{label} </span><span className="truncate">{children}</span>
+    <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{label} </span><span className={compact ? "truncate max-sm:sr-only" : "truncate"}>{children}</span>
   </span>
 }
