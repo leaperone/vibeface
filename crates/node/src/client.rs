@@ -1203,7 +1203,7 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
             )
         }
         Err(_) => Ok(
-            json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?}),
+            json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
         ),
     }
 }

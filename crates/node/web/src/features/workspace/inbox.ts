@@ -9,7 +9,7 @@ import type { PendingCheck, Question } from "@vibeface/client/workspace/types.ts
 import type { WriteCardKind } from "./write-card"
 
 /** `done`: a question this browser just answered, shown collapsed until the network's list drops it. */
-type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write" | "recovered"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
+type InboxItem = { key: string; icon: LucideIcon; title: string; meta?: string; to: string; kind: "question" | "confirm" | "join" | "setup" | "attention" | "write" | "recovery"; question?: Question; check?: PendingCheck; done?: boolean; join?: JoinRequest; write?: WriteCardKind }
 
 /**
  * Everything waiting on the person: write state, then every unanswered question newest first, then the rest.
@@ -25,7 +25,7 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
-  if (device.recoveredElsewhere) items.push({ key: "recovered", icon: ShieldAlert, title: "有设备刚用了恢复文件", to: "/inbox", kind: "recovered" })
+  if (device.pendingRecovery) items.push({ key: "recovery", icon: ShieldAlert, title: "有人正在用恢复文件找回", to: "/inbox", kind: "recovery" })
   if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })

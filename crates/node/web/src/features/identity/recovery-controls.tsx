@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, CircleCheck, Download, FileKey, KeyRound, LockKeyhole, ShieldAlert, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CircleCheck, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from 'cn'
-import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow } from '@/components/app/kit'
+import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
@@ -63,15 +63,29 @@ export function CurrentRecoveryFile() {
   </SettingsRow>
 }
 
-/** Another browser or device used a recovery file; this one asks whether that was the person. */
-export function RecoveredCard() {
-  const { recoverySince, acknowledgeRecovery } = useDevice()
+/** Hours until `at`, at least one while it has not passed. */
+export const hoursUntil = (at: number) => Math.max(1, Math.ceil((at - Date.now()) / 3_600_000))
+
+/** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
+export function RecoveryPendingCard() {
+  const device = useDevice()
   const navigate = useNavigate()
-  return <ActionCard icon={ShieldAlert} title="有设备刚用了恢复文件" actions={<>
-    <Button type="button" variant="ghost" onClick={() => { acknowledgeRecovery(); void navigate({ to: '/devices' }) }}>不是我</Button>
-    <Button type="button" onClick={acknowledgeRecovery}>是我</Button>
+  const { busy, error, run } = useGenerationRun()
+  const pending = device.pendingRecovery
+  if (!pending) return null
+  const known = new Set(device.directory?.members.map((member) => member.device_id))
+  return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms)} 小时后生效`} actions={<>
+    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我</Button>
+    <Button type="button" variant="destructive" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
+      await device.vetoRecovery()
+      toast('已拦下。恢复文件可能泄露了，换个恢复密码更稳妥', { tone: 'success', action: { label: '去换', onClick: () => void navigate({ to: '/settings' }) } })
+    })}><BusyIcon busy={busy} icon={Hand} />拦下</Button>
   </>}>
-    {recoverySince ? <time className="text-muted-foreground tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleString('zh-CN', { dateStyle: 'long', timeStyle: 'short' })}</time> : null}
+    {pending.members.filter((member) => !known.has(member.device_id)).map((member) => {
+      const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
+      return <p key={member.device_id} className="flex min-w-0 items-center gap-2"><Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{member.name}</span></p>
+    })}
+    <InlineError error={error || null} />
   </ActionCard>
 }
 
@@ -94,29 +108,29 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   </>
 }
 
-// Kept in the tab's session so a reload before confirming still lands on saving the new file.
-const recoveredKey = 'vibeface.recovered'
-let recovered = typeof sessionStorage !== 'undefined' && sessionStorage.getItem(recoveredKey) === '1'
-const recoveredListeners = new Set<() => void>()
-function markRecovered(value: boolean) {
-  recovered = value
-  if (value) sessionStorage.setItem(recoveredKey, '1'); else sessionStorage.removeItem(recoveredKey)
-  for (const listener of recoveredListeners) listener()
-}
-/** Whether a recovery just finished here and its new file still waits to be confirmed as saved. */
-export function useJustRecovered() {
-  return useSyncExternalStore((listener) => { recoveredListeners.add(listener); return () => { recoveredListeners.delete(listener) } }, () => recovered, () => recovered)
+/** This browser's recovery while it waits on the Node, or once one of the devices it would replace stopped it. */
+export function RecoveryWaiting() {
+  const { recovery, dismissRecovery } = useDevice()
+  if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
+    <p className="text-muted-foreground">新文件用不了，原来的恢复文件还能用</p>
+    <Button type="button" className="w-fit justify-self-end" onClick={dismissRecovery}>知道了</Button>
+  </Panel>
+  const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
+  return <Panel icon={Hourglass} title="等待生效">
+    {at === null ? null : <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{at > Date.now() ? `剩余 ${hoursUntil(at)} 小时` : '马上生效'}</p>}
+    <p className="text-muted-foreground">你的其他设备可以拦下</p>
+  </Panel>
 }
 
-/** After a recovery, before anything else: the new file was already downloaded, unasked, so it gets confirmed here. */
+/** After a recovery took effect, before anything else: its new file was downloaded unasked, so it gets confirmed here. */
 export function RecoveredStep() {
-  const { directory } = useDevice()
+  const { directory, finishRecovered } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   const [saved, setSaved] = useState(false)
   return <Panel icon={FileKey} title="保存新的恢复文件">
-    <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已恢复，旧文件已失效</p>
+    <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已找回，旧文件已作废</p>
     <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={setSaved} />
-    <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={() => markRecovered(false)}>完成</Button>
+    <Button type="button" className="w-fit justify-self-end" disabled={!saved} onClick={finishRecovered}>完成</Button>
   </Panel>
 }
 
@@ -137,26 +151,25 @@ export function RecoveryReview() {
           <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
           <span className="grid min-w-0 flex-1 py-1.5">
             <span className={cn('truncate', gone && 'text-muted-foreground line-through')}>{member.name}</span>
-            {gone ? <span className="text-meta text-danger">将被移出，不能再连接</span> : null}
+            {gone ? <span className="text-meta text-danger">生效后移出</span> : null}
           </span>
           {required ? <span className="text-meta text-muted-foreground">当前连接</span>
             : <label className="-me-3 flex min-h-11 cursor-pointer items-center gap-2 px-3 text-meta">丢了<input type="checkbox" role="switch" className="switch" data-tone="danger" checked={gone} onChange={(event) => setLost(event.target.checked ? [...lost, member.device_id] : lost.filter((id) => id !== member.device_id))} /></label>}
         </div>
       })}
     </fieldset>
-    <p className="text-meta text-muted-foreground">恢复后会下载新的恢复文件，旧文件失效</p>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />2 天后生效，期间你的其他设备可以拦下</p>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Download aria-hidden="true" className="size-4 shrink-0" />会下载新的恢复文件，生效后旧文件作废</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(async () => {
-        // Set before the call: connecting again ends this review, and the connect page then asks for the new file first.
-        markRecovered(true)
-        try {
-          await device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)))
-        } catch (cause) { markRecovered(false); throw cause }
+        await device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id)))
+        // A connected manager stays on this page; anyone else moves on to the waiting screen.
+        if (device.ready) toast('已提交，2 天后生效', { tone: 'success' })
       })}><BusyIcon busy={busy} />恢复</Button>
     </div>
-    {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</p> : null}
+    {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回。</p> : null}
   </Panel>
 }
 

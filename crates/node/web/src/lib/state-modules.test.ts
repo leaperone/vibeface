@@ -75,7 +75,7 @@ test('one tab leads and the next takes over when it closes', { skip: !globalThis
 })
 
 const node = (id: string) => ({ device_id: id.repeat(64), kind: 'node' as const, name: id, manage: false })
-const view = { network_id: 'n'.repeat(64), epoch: 1, recovery_key: 'n'.repeat(64), heads: [], members: [node('a'), node('b'), node('c'), { ...node('d'), kind: 'client' as const }], revoked: [{ device_id: 'c'.repeat(64), cutoff_seq: 0, cutoff_hash: null }], attesters: [] }
+const view = { network_id: 'n'.repeat(64), epoch: 1, recovery_key: 'n'.repeat(64), heads: [], members: [node('a'), node('b'), node('c'), { ...node('d'), kind: 'client' as const }], revoked: [{ device_id: 'c'.repeat(64), cutoff_seq: 0, cutoff_hash: null }], attesters: [], pending: null, stopped: [] }
 const address = (id: string, gateway: string | null, network = view.network_id, seq = 1) => ({ payload: JSON.stringify({ version: 1, network_id: network, device_id: id.repeat(64), seq, endpoint: { id: id.repeat(64), addrs: [] }, gateway_url: gateway }), signature: `signed-by-${id}` })
 const signedBySelf = (deviceId: string, _payload: string, signature: string) => signature === `signed-by-${deviceId[0]}`
 
