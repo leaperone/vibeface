@@ -3,18 +3,18 @@ import * as Haptics from 'expo-haptics'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
-import Animated, { useReducedMotion } from 'react-native-reanimated'
+import Animated, { Keyframe, ReduceMotion } from 'react-native-reanimated'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import type { Attachment } from '@/data/types'
 
-const pop = {
-  animationName: { from: { transform: [{ scale: 0.85 }] }, '60%': { transform: [{ scale: 1.03 }] }, to: { transform: [{ scale: 1 }] } },
-  animationDuration: 250,
-  animationTimingFunction: 'ease-out',
-} as const
+const pop = new Keyframe({
+  0: { transform: [{ scale: 0.85 }] },
+  60: { transform: [{ scale: 1.03 }] },
+  100: { transform: [{ scale: 1 }] },
+}).duration(250).reduceMotion(ReduceMotion.System)
 
 type Props = {
   value: string
@@ -34,9 +34,8 @@ type Props = {
 
 export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children }: Props) {
   const canSend = !blocked && !sending && value.trim().length > 0
-  // A CSS animation starts in the same commit as the new fill, so the first live frame is already small; an effect-driven spring lands a frame late.
-  const still = useReducedMotion()
-  const popped = canSend && !onStop && !still ? pop : undefined
+  // The live arrow mounts afresh with an entering keyframe, which is applied on its first frame; effects and CSS animations can land a frame late.
+  const armed = canSend && !onStop
   const pick = async () => {
     const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
     if (picked.canceled) return
@@ -58,7 +57,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
           <Icon as={Paperclip} />
         </Button>
-        <Animated.View style={popped}>
+        <Animated.View key={armed ? 'armed' : 'rest'} entering={armed ? pop : undefined}>
           <Button instant size="icon" variant={onStop || sending ? 'outline' : canSend ? 'default' : 'secondary'} className="size-11 rounded-full shadow-none" accessibilityLabel={onStop || sending ? '停止' : '发送'} disabled={!onStop && !sending && !canSend}
             // While the send goes out the stop look holds at full strength and ignores taps, so the button changes once.
             onPress={onStop ?? (sending ? undefined : () => { void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); onSend() })}>
