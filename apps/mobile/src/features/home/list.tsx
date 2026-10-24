@@ -27,13 +27,15 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const shared = useLive()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
+  // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
+  const replace = sidebar === true && pathname !== '/'
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('grow gap-2 px-1', sidebar ? 'px-2' : 'w-full max-w-2xl self-center pb-8')}
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : undefined}>
     {sidebar ? <View className="flex-row items-center justify-between ps-3 pt-2">
       <Text role="heading" className="text-3xl font-bold">消息</Text>
-      <Link href="/settings" asChild><Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="设置"><Icon as={Settings} /></Button></Link>
+      <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
     </View> : null}
-    <Row href="/inbox" active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : '没有要你决定的事'} />
+    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : '没有要你决定的事'} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">bot</Text>
       <Link href="/new-bot" asChild>
@@ -42,7 +44,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
     </View>
     {bots.length ? bots.map((bot) => {
       const last = bot.last_message
-      return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name}
+      return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name}
         mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
         unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
         preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
@@ -53,8 +55,8 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   </ScrollView>
 }
 
-function Row({ href, active, avatar, name, mark, preview, unread, time }: { href: Href; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }) {
-  return <Link href={href} asChild>
+function Row({ href, replace, active, avatar, name, mark, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }) {
+  return <Link href={href} replace={replace} asChild>
     <Pressable accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">

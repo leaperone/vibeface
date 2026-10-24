@@ -83,7 +83,7 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-type Change = { assistant?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 
 function AiSettings() {
   const { ready } = useDevice()
@@ -133,7 +133,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:assistant`} disabled={busy !== ''} onPress={() => void change('assistant', { assistant: !assistant })} />
+      <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
       {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
       {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>

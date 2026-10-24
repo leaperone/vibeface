@@ -1,14 +1,19 @@
 import * as DocumentPicker from 'expo-document-picker'
 import * as Haptics from 'expo-haptics'
 import { ArrowUp, Paperclip, Square, X } from 'lucide-react-native'
-import { useEffect } from 'react'
 import { Pressable, ScrollView, TextInput, View } from 'react-native'
-import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated'
+import Animated, { useReducedMotion } from 'react-native-reanimated'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import type { Attachment } from '@/data/types'
+
+const pop = {
+  animationName: { from: { transform: [{ scale: 0.85 }] }, '60%': { transform: [{ scale: 1.03 }] }, to: { transform: [{ scale: 1 }] } },
+  animationDuration: 250,
+  animationTimingFunction: 'ease-out',
+} as const
 
 type Props = {
   value: string
@@ -26,11 +31,9 @@ type Props = {
 
 export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop }: Props) {
   const canSend = !blocked && !sending && value.trim().length > 0
-  // The arrow pops the moment it turns live; the fill already changed on that frame, so only the scale is sprung.
-  const armed = canSend && !onStop
-  const pop = useSharedValue(1)
-  const popped = useAnimatedStyle(() => ({ transform: [{ scale: pop.value }] }))
-  useEffect(() => { if (armed) { pop.value = 0.85; pop.value = withSpring(1, { dampingRatio: 0.7, duration: 250, reduceMotion: ReduceMotion.System }) } }, [armed])
+  // A CSS animation starts in the same commit as the new fill, so the first live frame is already small; an effect-driven spring lands a frame late.
+  const still = useReducedMotion()
+  const popped = canSend && !onStop && !still ? pop : undefined
   const pick = async () => {
     const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })
     if (picked.canceled) return
