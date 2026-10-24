@@ -26,6 +26,8 @@ import './chat.css'
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 const replyStates: Record<string, string> = { failed: '回复失败', rejected: '没有处理' }
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
+// The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
+const streamingStates = [...busyStates, 'publishing']
 
 export function ConversationScreen() {
   const workspace = useWorkspace()
@@ -41,7 +43,7 @@ export function ConversationScreen() {
   const unanswered = data?.scheduler?.unanswered ?? []
   const activeJobs = jobs.filter((job) => busyStates.includes(job.state))
   const checks = pendingChecks(data, workspace.nodes, conversationId)
-  const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!busyStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
+  const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
   const agentReady = workspace.nodes.some((node) => node.online && !node.revoked && node.capabilities?.manager)
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
