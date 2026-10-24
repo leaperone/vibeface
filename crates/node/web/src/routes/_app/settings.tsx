@@ -14,7 +14,7 @@ import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
 export const Route = createFileRoute('/_app/settings')({ component: SettingsPage })
 
-const ranges: Array<[number, string]> = [[3_600_000, '最近 1 小时'], [86_400_000, '最近 1 天'], [7 * 86_400_000, '最近 7 天']]
+const ranges: Array<[number, string]> = [[3_600_000, '近 1 小时'], [86_400_000, '近 1 天'], [7 * 86_400_000, '近 7 天']]
 
 const themes: Array<{ value: Theme; label: string; icon: LucideIcon }> = [{ value: 'system', label: '跟随系统', icon: Monitor }, { value: 'light', label: '浅色', icon: Sun }, { value: 'dark', label: '深色', icon: Moon }]
 
@@ -49,10 +49,12 @@ function SettingsPage() {
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
       <SettingsRow icon={Download} label="诊断包">
-        <NativeSelect size="sm" aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))}>
-          {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
-        </NativeSelect>
-        <Button type="button" size="sm" variant="outline" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}>导出</Button>
+        <span className="flex">
+          <NativeSelect size="sm" className="focus-within:z-10 [&_select]:rounded-e-none!" aria-label="诊断包的时间范围" value={String(range)} onChange={(event) => setRange(Number(event.target.value))}>
+            {ranges.map(([value, label]) => <NativeSelectOption key={value} value={String(value)}>{label}</NativeSelectOption>)}
+          </NativeSelect>
+          <Button type="button" size="sm" variant="outline" className="relative -ms-px rounded-s-none focus-visible:z-10" onClick={() => { void workspace.run(async () => saveDiagnostics(await workspace.diagnostics(Date.now() - range)), "导出诊断包") }}>导出</Button>
+        </span>
       </SettingsRow>
     </SettingsGroup> : null}
     <SettingsGroup>

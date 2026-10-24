@@ -68,7 +68,7 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
       {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
       </Link> : null}
-      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd}>{projectName(question.about.cwd)}</Meta> : null}
+      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>
       {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
         <BotAvatar id={question.bot.bot_id} name={question.bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />

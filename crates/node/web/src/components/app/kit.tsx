@@ -108,7 +108,7 @@ const rowLayout = "flex min-h-14 w-full min-w-0 flex-wrap items-center gap-x-3 g
 function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile }) {
   return <>
     <span className={cn("grid size-8 shrink-0 place-items-center rounded-lg", rowTile[tone])}><Icon aria-hidden="true" className="size-4" /></span>
-    <span className="grid min-w-0 flex-1 basis-28">
+    <span className="grid max-w-fit min-w-0 flex-1 basis-28">
       <span className={cn("truncate", tone === "danger" && "text-danger")}>{label}</span>
       {description ? <span className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{description}</span> : null}
     </span>
@@ -122,7 +122,7 @@ export function SettingsRow({ icon, label, description, tone, children, onClick,
   const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
   if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
-    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", expanded && "rotate-90")} />
+    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
   </button>
   return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
 }
@@ -133,7 +133,7 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
     <summary className={cn(rowLayout, "cursor-pointer list-none flex-nowrap transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60 [&::-webkit-details-marker]:hidden")}>
       <RowLead icon={icon} label={label} />
       {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
-      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90" />
+      <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90", !value && "ms-auto")} />
     </summary>
     <div className="grid gap-3 px-4 pb-4 sm:ps-15">{children}</div>
   </details>
