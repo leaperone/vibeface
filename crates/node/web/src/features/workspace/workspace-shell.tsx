@@ -263,21 +263,21 @@ export function ConnectionCapsule() {
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
 /** `home`: the conversation list loads on a phone, the last conversation on a wide screen. */
 export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: { retry?: number | null; onRetry?: () => void; onLeave?: () => void; home?: boolean } = {}) {
-  const status = retry === null
-    ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
-    : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
-  return <div className="flex h-dvh" aria-busy={retry === null}>
+  const offline = retry !== null
+  // Offline, the page says it once in the middle; the corner status is only for a connection still in progress.
+  const status = offline ? null : <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
+  return <div className="flex h-dvh" aria-busy={!offline}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <Wordmark />
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
-      <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
+      {status ? <div className="mt-auto flex items-center gap-2 px-2 text-meta text-info" role="status">{status}</div> : null}
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
-      {retry !== null ? <EmptyState icon={WifiOff} title="连不上设备" className="my-auto" action={<div className="flex flex-wrap justify-center gap-2">
+      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} />{status ? <span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden">{status}</span> : null}</div>
+      {offline ? <div className="my-auto"><EmptyState icon={WifiOff} title="连不上设备" description={`${retry} 秒后自动重试`} action={<div className="flex flex-wrap justify-center gap-2">
         {onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
         {onLeave ? <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button> : null}
-      </div>} /> : <>
+      </div>} /></div> : <>
         {onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
         {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
         <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>

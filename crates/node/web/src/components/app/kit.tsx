@@ -102,10 +102,10 @@ export function AuthPage({ header, children }: { header?: ReactNode; children: R
 }
 
 /** One step of first-time setup: a raised card under an icon title. */
-export function Panel({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+export function Panel({ icon: Icon, title, busy = false, children }: { icon: LucideIcon; title: string; busy?: boolean; children: ReactNode }) {
   // A phone has no room for a frame inside the page's own margins, so there the card is only its content.
   return <section className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:rounded-2xl sm:border sm:bg-card sm:p-6 sm:shadow-sm">
-    <h2 className="flex items-center gap-3 text-title font-semibold"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-[1.125rem]" /></span>{title}</h2>
+    <h2 className="flex items-center gap-3 text-title font-semibold"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className={cn("size-[1.125rem]", busy && "animate-spin")} /></span>{title}</h2>
     {children}
   </section>
 }
