@@ -23,7 +23,7 @@ export const terms = {
   recoveryPassword: { label: "恢复密码", icon: Lock },
   restore: { label: "用恢复文件找回", icon: ArchiveRestore },
   bot: { label: "Bot", icon: Bot },
-  ai: { label: "AI", icon: Sparkles },
+  ai: { label: "Bot 与任务", icon: Sparkles },
   task: { label: "任务", icon: ListChecks },
   approval: { label: "需要你同意", icon: Hand },
   confirm: { label: "待确认", icon: CircleQuestionMark },

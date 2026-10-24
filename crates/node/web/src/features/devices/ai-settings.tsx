@@ -156,7 +156,9 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   // During setup the first provider that works runs the bot, so "可用" never leaves the chat without one.
   const autoBot = useRef(false)
   useEffect(() => {
-    if (!onboarding || !response || botOn || autoBot.current) return
+    if (!onboarding || !response || autoBot.current) return
+    // Once a bot runs here, turning it off is the person's choice and stays.
+    if (botOn) { autoBot.current = true; return }
     const usable = response.providers.find((item) => item.state === "ready")
     if (!usable) return
     autoBot.current = true
@@ -177,7 +179,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
-    <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />
+    {onboarding ? botReady ? null : <BotHint provider={response.providers.find((item) => item.roles.includes("agent"))?.provider} /> : <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -217,14 +219,14 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
 
   return <li className="overflow-hidden rounded-xl border">
     <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
-      <div className="flex min-w-0 flex-1 basis-36 items-center gap-3">
+      <div className="flex items-center gap-3">
         <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 truncate font-medium">{name}</span>
+        <span className="font-medium whitespace-nowrap">{name}</span>
         <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
       </div>
       <div className="ms-auto flex shrink-0 gap-2">
         <RoleToggle icon={terms.bot.icon} label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
-          onClick={() => { if (!(onboarding && bot)) void change("bot", { bot: !bot }) }} />
+          onClick={() => void change("bot", { bot: !bot })} />
         {item.supports.includes("execution") && !onboarding ? <RoleToggle icon={terms.task.icon} label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => void change("execution", { execution: !execution })} /> : null}
       </div>
@@ -232,16 +234,16 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     {issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
-      {issue.code === "bin_missing" ? <a className="font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">怎么装</a> : null}
-      {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="font-medium text-foreground underline underline-offset-4" disabled={working}
-        onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
-        : <button type="button" className="font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
+      {onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
+        : issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
+          onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
+        : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
       <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
       <span className="min-w-0 truncate">{check.label}</span>
-      <a className="shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
+      <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
     </li>)}</ul> : null}
-    <details id={`provider-${item.provider}`} className="details border-t">
+    {onboarding ? null : <details id={`provider-${item.provider}`} className="details border-t">
       <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
@@ -298,9 +300,16 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         </div>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>
-    </details>
+    </details>}
     {error ? <InlineError error={error} className="px-3 pb-3" /> : null}
   </li>
+}
+
+/** Why setup cannot move on yet: no provider runs the bot, or the one that does is not ready. */
+function BotHint({ provider }: { provider?: ProviderId }) {
+  return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />{provider ? `${providerNames[provider]} 需设置` : `打开「运行 ${terms.bot.label}」`}
+  </p>
 }
 
 const botFields = ["model", "workspace", "cursor_sdk_bin"] as const

@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
 import { createPortal } from "react-dom"
-import { ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { messageOf } from "@vibeface/client/lib/node.ts"
@@ -45,7 +45,9 @@ export function BotAvatar({ id, name, size = "md", className }: { id: string; na
   let hash = 2166136261
   for (const char of id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0
   const hue = Math.round((hash * 0.618033988749895 % 1) * 360)
-  const letter = [...name.trim()][0]?.toUpperCase() ?? "B"
+  // "我的" says whose bot it is, not which; a name left with only "Bot" shows the bot icon.
+  const rest = name.trim().replace(/^我的\s*/, "")
+  const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
   return <span aria-hidden="true" style={{ "--avatar-hue": hue } as CSSProperties} className={cn("bot-avatar grid shrink-0 place-items-center font-semibold select-none",
     size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
@@ -214,7 +216,7 @@ export function SafetyCode({ code, label = "安全码" }: { code: string; label?
 /** Collapsed by default. Jargon from docs/design/web-ux.md section 6 may only appear in here. */
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
-    <summary className="inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
+    <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
       <ChevronRight aria-hidden="true" className="size-4 transition-transform" />{label}
     </summary>
     <div className="grid gap-2 break-all pt-2 text-muted-foreground">{children}</div>

@@ -48,9 +48,14 @@ export function parseNodes(value: unknown): NodeInfo[] {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_ready: capabilities.manager_ready === true, relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
     }
   })
+}
+/** `ready` only when the bot's switch is on and its provider works; a switch alone leaves it `needs_setup`. */
+export function botReadiness(node: NodeInfo | undefined): "ready" | "needs_setup" | null {
+  if (!node || node.revoked || !node.online || !node.capabilities?.manager) return null
+  return node.capabilities.manager_ready ? "ready" : "needs_setup"
 }
 export function parseNotifications(value: unknown): NotificationRecord[] {
   return list(record(value).notifications).map((item) => {

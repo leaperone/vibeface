@@ -1924,6 +1924,7 @@ mod tests {
             json!([project.canonicalize()?])
         );
         assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager_ready"], false);
         let persisted = Config::load(&dir)?;
         assert_eq!(persisted.network.relays, latest.network.relays);
         assert_eq!(persisted.daily_decision_limit, 11);

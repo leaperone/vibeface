@@ -7,7 +7,7 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; relay: boolean; roots: string[]; codex_connected?: boolean }
+  capabilities?: { manager: string | null; manager_ready: boolean; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
