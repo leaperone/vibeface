@@ -11,3 +11,7 @@ function browser() {
 /** `deviceId` tells apart two browsers of the same kind joining one network. */
 export const defaultBrowserName = (deviceId = '') => `${platform()} 上的 ${browser()}${deviceId ? ` ${deviceId.slice(0, 4).toUpperCase()}` : ''}`
 export const defaultComputerName = () => `我的 ${platform()}`
+const LAST_BROWSER_NAME = 'vibeface.browser-name'
+/** A refused or removed browser asks again with the name the person last gave it. */
+export function lastBrowserName() { try { return localStorage.getItem(LAST_BROWSER_NAME) } catch { return null } }
+export function rememberBrowserName(name: string) { try { localStorage.setItem(LAST_BROWSER_NAME, name) } catch {} }

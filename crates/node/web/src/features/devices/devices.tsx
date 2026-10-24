@@ -91,7 +91,7 @@ export function DevicesPage() {
     {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>
       <ul className="grid gap-1">{device.directory.revoked.map((item) => <li key={item.device_id} title={item.device_id} className="flex min-h-8 items-center gap-2">
         <terms.remove.icon aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 truncate">{nodes.find((node) => node.device_id === item.device_id)?.name || `设备 ${item.device_id.slice(0, 4).toUpperCase()}`}</span>
+        <span className="min-w-0 truncate">{nodes.find((node) => node.device_id === item.device_id)?.name || device.knownName(item.device_id) || `设备 ${item.device_id.slice(0, 4).toUpperCase()}`}</span>
       </li>)}</ul>
     </Details> : null}
   </div>
