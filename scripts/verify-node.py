@@ -1165,7 +1165,7 @@ def fixture_triage(run, initial, prompt, bot):
             else:
                 action.update(action="ignore")
         elif "triage-raise" in event["cwd"] or "needs-human" in event.get("last_message", ""):
-            choices = ["--choice", "继续", "--choice", "停下"] if "dead-letter" in event.get("last_message", "") else []
+            choices = ["--choice", "继续", "--choice", "停下"] if "choose-next" in event.get("last_message", "") else []
             asked = json.loads(fixture_cli(initial, "triage", "raise", "--event-id", event["event_id"], "--severity", "attention",
                                            "--question", "会话停下等你回复：下一步做什么？", *choices).stdout)
             action.update(action="raise", asked=asked)
@@ -2033,17 +2033,35 @@ def triage_checks(run, workspace, a, network, passed):
         require(told[-1]["body"] == {"schema_version": 1, "type": "answered", "event_id": told[-1]["event_id"],
                                      "question_id": question_id, "text": "继续，先跑测试"}, "the webhook learns the answer given in the web")
 
+        # The decision token answers a question about a live session, so the bot's answer turn sends real work.
+        decide_dir = workspace / "triage-raise-decision"
+        decide_dir.mkdir()
+        node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-decision",
+                                                       "cwd": str(decide_dir), "last_bot_message": "choose-next needs-human"}))
+        pending = wait_for("the Agent asks about the live session again", lambda: next(
+            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == str(decide_dir)), None), timeout=90)
         tokens = a.client.call("create_decision_token", {"label": "grok"})
         listed = a.client.call("triage_settings")
         require(tokens["token"] not in json.dumps(listed) and tokens["token"] not in (a.directory / "decision-tokens.json").read_text(),
                 "a decision token is shown once and stored hashed")
-        decision = {"device_id": a.device_id, "question_id": foreign["question_id"], "choice": 0}
+        decision = {"device_id": a.device_id, "question_id": pending["question_id"], "choice": 0}
         bearer = {"Authorization": "Bearer " + tokens["token"]}
         posted = a.client.request("/api/decision", decision, origin=False, headers=bearer)
         again = a.client.request("/api/decision", decision, origin=False, headers=bearer)
         a.client.request("/api/decision", decision, origin=False, headers={"Authorization": "Bearer wrong"}, status=401)
-        require(posted == again == {"question_id": foreign["question_id"], "answer_id": "a-" + foreign["question_id"],
+        require(posted == again == {"question_id": pending["question_id"], "answer_id": "a-" + pending["question_id"],
                                     "status": "answered", "text": "继续"}, "a decision token answers one question over HTTP once")
+        decided = wait_for("the bot passes the decision on", lambda: [row for row in fixture_records(run, "answer-actions.jsonl")
+                           if row["question_id"] == pending["question_id"]] or None, timeout=90)
+        decided_work = decided[0]["replies"][0]["work_id"]
+        decided_sends = [row for row in fixture_records(run, "codex-rpc.jsonl") if row["message"].get("method") in ("turn/start", "turn/steer")
+                         and row["message"]["params"].get("clientUserMessageId") == decided_work]
+        handle = decided[0]["replies"][0]["state"]
+        require(len(decided) == 1 and decided[0]["answer"] == "继续" and decided[0]["replies"][1]["work_id"] == decided_work
+                and len(decided_sends) == 1 and handle["state"] == "running" and handle["handle"]["thread_id"] == thread_id
+                and not any((row["message"].get("params") or {}).get("threadId") == "dead-session"
+                            for row in fixture_records(run, "codex-rpc.jsonl")),
+                f"a decision token's answer reaches the live session once as the bot's work, and nothing targets a dead one: {handle}")
         a.client.call("revoke_decision_token", {"token_id": tokens["token_id"]})
         a.client.request("/api/decision", decision, origin=False, headers=bearer, status=401)
         log = (a.directory / "process.log").read_text(errors="replace")
