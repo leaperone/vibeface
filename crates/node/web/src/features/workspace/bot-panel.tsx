@@ -52,12 +52,12 @@ export function BotPanelButton() {
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   return <>
     <Button ref={trigger} type="button" variant="ghost" size="icon" className="-ms-1 shrink-0 rounded-lg hover:bg-transparent hover:brightness-95 dark:hover:brightness-110" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
-      <BotAvatar id={bot.bot_id} name={bot.name} />
+      <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} />
     </Button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
       <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
-          <BotAvatar id={bot.bot_id} name={bot.name} size="lg" />
+          <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
           <span className="grid min-w-0 gap-0.5">
             <SheetTitle className="text-title font-semibold break-words">{bot.name}</SheetTitle>
             <SheetDescription className="text-meta">在聊天里说一声就能改</SheetDescription>
