@@ -12,16 +12,18 @@ import subprocess
 import tempfile
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
     "protocol": ("bridge", "node"),
     "bridge": ("node",),
     "secure": ("node", "secure-ffi"),
     "node": (),
     "secure-ffi": (),
+    "delivery": ("node",),
 }
-CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi"), PACKAGES))
+CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
 PATH_RULES = (
+    ("delivery", ("crates/delivery/*",)),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
@@ -268,11 +270,14 @@ def self_test():
         "bridge": ["vibeface-bridge", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface"],
         "secure": ["vibeface-secure", "vibeface", "vibeface-secure-ffi"],
+        "delivery": ["vibeface", "vibeface-delivery"],
     }
     for crate, packages in expected.items():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
+    assert make_plan(["crates/delivery/abi/Statement.sol"])["rust_packages"] == expected["delivery"]
+    assert make_plan(["crates/delivery/Cargo.toml"])["scopes"] == ["delivery"]
     for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
