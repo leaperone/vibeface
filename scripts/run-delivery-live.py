@@ -522,6 +522,43 @@ def command(label, arguments, log, **kwargs):
         raise RuntimeError(f"{label} failed with exit {result.returncode}; private task log withheld")
 
 
+def failed_acceptance_diagnostic(run, log):
+    reports, files = [], [log, run / "deployment.log"]
+    kinds = ("AssertionError", "RuntimeError", "TimeoutError", "OSError", "PermissionError", "FileNotFoundError", "CalledProcessError")
+    for mode in ("charity", "paid"):
+        directories = list((run / "process").glob("delivery-" + mode + "-*"))
+        if len(directories) > 1:
+            raise ValueError("Failure diagnostics require one current run per mode")
+        for directory in directories:
+            file = directory / "summary.json"
+            if file.exists():
+                value = json.loads(regular(file, 8 * 1024 ** 2))
+                failure = value.get("failure", {})
+                message = failure.get("message")
+                reports.append({"mode": mode, "status": value.get("status") if value.get("status") in ("passed", "failed", "running") else "other",
+                    "completedCases": len(value.get("cases", {})), "failureType": failure.get("type") if failure.get("type") in kinds else "other",
+                    "failureMessageSha256": hashlib.sha256(message.encode()).hexdigest() if isinstance(message, str) else None,
+                    "summarySha256": digest(file)})
+            files.extend(directory / name / "process.log" for name in ("S", "R", "P", "X"))
+            files.append(directory / "register-before-crash.log")
+    samples = []
+    for file in files:
+        if file.is_file() and not file.is_symlink():
+            with file.open("rb") as stream:
+                stream.seek(max(0, file.stat().st_size - 65536))
+                samples.append(stream.read(65536))
+    data = b"\n".join(samples)
+    patterns = {"thread-or-process-limit": rb"Resource temporarily unavailable|can't start new thread|pthread_create|ThreadPoolBuildError|os error 11",
+                "memory-allocation": rb"out of memory|memory allocation of [0-9]+ bytes failed|AllocError",
+                "missing-file": rb"No such file or directory|ENOENT", "permission-denied": rb"Permission denied|EACCES",
+                "prover-stopped": rb"first real receiving-key proof stopped|authorized prover remains observable",
+                "node-exited": rb"Node exited [0-9-]+", "rust-panic": rb"panicked at"}
+    lines = [int(value) for value in re.findall(rb'File "/work/scripts/verify-node\.py", line ([0-9]{1,5}),', data)]
+    return {"reports": reports, "verifyNodeLines": list(dict.fromkeys(lines))[-8:],
+            "sampledLogMarkers": [name for name, pattern in patterns.items() if re.search(pattern, data, re.I)],
+            "privateTaskLogSha256": digest(log)}
+
+
 def glibc_failure(directory, log=None):
     files = [*directory.rglob("process.log"), *([log] if log is not None else [])]
     return any(re.search(rb"(?:version [`']GLIBC_[0-9.]+['`] not found|symbol lookup error:.*GLIBC_[0-9.]+)", file.read_bytes())
@@ -1203,6 +1240,10 @@ def inside(package, expected):
                 "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log, env=environment)
         except RuntimeError:
             summary["failureStage"] = "paid-process-acceptance"
+            try:
+                summary["failureDiagnostic"] = failed_acceptance_diagnostic(run, log)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                summary["failureDiagnostic"] = {"available": False}
             try:
                 preserved = preserve_strict_evidence(run, compiled, profile, prover)
                 if preserved is not None:
@@ -1938,6 +1979,23 @@ def self_test():
         self_test_exports(Path(directory), paid)
         self_test_partial_evidence(Path(directory))
         self_test_videos(Path(directory))
+        diagnostic = Path(directory) / "failure-diagnostic"
+        node = diagnostic / "process/delivery-paid-fixture/S"
+        node.mkdir(parents=True)
+        failure_log = diagnostic / "private-task.log"
+        failure_log.write_text('File "/work/scripts/verify-node.py", line 6105, in genuine_prover_started\nprivate-wallet-marker\n')
+        (node / "process.log").write_text("private-witness-marker: Resource temporarily unavailable (os error 11)\n")
+        failed = {"status": "failed", "failure": {"type": "RuntimeError", "message": "private-error-marker"},
+                  "cases": {"private-case-name": {"witness": "private-case-marker"}}}
+        write_private(node.parent / "summary.json", failed)
+        actual = failed_acceptance_diagnostic(diagnostic, failure_log)
+        assert actual["verifyNodeLines"] == [6105] and actual["sampledLogMarkers"] == ["thread-or-process-limit"]
+        assert actual["reports"][0]["completedCases"] == 1 and actual["reports"][0]["failureType"] == "RuntimeError"
+        assert actual["reports"][0]["failureMessageSha256"] == hashlib.sha256(b"private-error-marker").hexdigest()
+        assert "private-" not in json.dumps(actual) and set(actual) == {"reports", "verifyNodeLines", "sampledLogMarkers", "privateTaskLogSha256"}
+        failed["failure"]["type"] = "private-unknown-type"
+        (node.parent / "summary.json").write_text(json.dumps(failed))
+        assert failed_acceptance_diagnostic(diagnostic, failure_log)["reports"][0]["failureType"] == "other"
         file = Path(directory) / "private.json"
         write_private(file, {"configured": True})
         assert file.stat().st_mode & 0o777 == 0o600 and json.loads(regular(file)) == {"configured": True}
