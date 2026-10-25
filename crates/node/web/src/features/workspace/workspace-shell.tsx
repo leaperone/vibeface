@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldCheck, Star, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -211,10 +211,10 @@ export function ConnectionCapsule() {
   const address = device.ready?.entry.address ?? ""
   const entryId = device.ready?.entry.device_id
   const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
-  const name = entryName ? `经 ${entryName}` : addressName(address)
+  const name = entryName || addressName(address)
   // Devices of another network this browser opened before; the current network fails over by itself.
   const others = device.entries.filter((item) => !item.local && !device.directory?.members.some((member) => member.device_id === item.device_id))
-  const state: { label: string; icon: LucideIcon; tone: string } = link.kind === "connecting"
+  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
@@ -224,10 +224,10 @@ export function ConnectionCapsule() {
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
-        : { label: "在线", icon: Wifi, tone: "text-success" }
+        : { label: "在线", icon: terms.encrypted.icon, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
         <span className="min-w-0 flex-1 truncate">{name}</span>
         <span className={cn("shrink-0", state.tone)}>{state.label}</span>
