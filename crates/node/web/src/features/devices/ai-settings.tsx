@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -216,7 +216,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     openProvider(item.provider)
   }
   const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
-    .then((ok) => { if (ok) toast(next === null ? `已删除 ${name}` : `已保存 ${name}`, { tone: "success" }); return ok })
+    .then((ok) => { if (ok) toast(next === null ? `已删除「${name}」` : `已保存「${name}」`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()
 
   return <li className="overflow-hidden rounded-xl border">

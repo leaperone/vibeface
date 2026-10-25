@@ -67,7 +67,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (submitting.current) return
-    if (!pending && !name.trim()) { setError("请填写名称。"); return }
+    if (!pending && !name.trim()) { setError("还没填名称"); return }
     const selected = selectedProject ? projects.find((item) => item.key === selectedProject) : undefined
     if (!pending && selectedProject && !selected) {
       setError("这个文件夹现在用不了，换一个或不选。")

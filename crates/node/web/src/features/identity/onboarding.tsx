@@ -36,7 +36,7 @@ export function Onboarding() {
         <Button type="button" disabled={!botOn} onClick={() => setOnboardingStep(4)}>下一步</Button>
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-      <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("请填写名称。")) }}>
+      <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
         <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">

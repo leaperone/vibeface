@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleAlert, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
-import { cn } from 'cn'
+import { Archive, ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { AuthPage, Details, EmptyState, InlineError, Panel, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -57,11 +57,11 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
       stream = media; video.current.srcObject = media
       await video.current.play()
       void tick()
-    }).catch(() => { if (live) setError('没能打开相机。请允许使用相机，或把链接粘贴到这里。') })
+    }).catch(() => { if (live) setError('没能打开相机，可把链接粘贴到这里') })
     return () => { live = false; clearTimeout(timer); stream?.getTracks().forEach(track => track.stop()) }
   }, [])
   return <div className="grid gap-3">
-    {error ? <p role="alert" className="text-meta text-danger">{error}</p> : <video ref={video} className="aspect-square w-full rounded-lg bg-black object-cover" playsInline muted aria-label="对准二维码" />}
+    {error ? <InlineError error={error} /> : <video ref={video} className="aspect-square w-full rounded-lg bg-black object-cover" playsInline muted aria-label="对准二维码" />}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={onCancel}>不扫了，粘贴链接</Button>
   </div>
 }
@@ -285,7 +285,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
             <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? '或粘贴加入链接' : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
-            {purpose === 'invalid' ? <p role="alert" className="flex items-center gap-2 text-meta text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />这不是有效的加入链接</p> : null}
+            {purpose === 'invalid' ? <InlineError error="这不是有效的加入链接" /> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
             <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
             <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>

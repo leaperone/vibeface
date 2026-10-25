@@ -1,6 +1,6 @@
 import { useMemo } from "react"
 import { renderMarkdown } from "@/lib/markdown"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { toast } from "./kit"
 
 /** Bot replies. Raw HTML is never rendered. */

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -144,7 +144,7 @@ export function ConversationScreen() {
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
-    messagePending && !messageBusy ? <ActionCard key="undelivered" icon={MessageSquareWarning} title="消息可能没送达" actions={<>
+    messagePending && !messageBusy ? <ActionCard key="undelivered" icon={terms.undelivered.icon} title="消息可能没送达" actions={<>
       <ActionButton variant="ghost" disabled={!workspace.writable} action={() => workspace.releaseMessagePending()}>不发了</ActionButton>
       <ActionButton action={() => workspace.refresh()}>再查一次</ActionButton>
       <ActionButton variant="default" disabled={!workspace.writable || workspace.incomplete} action={async () => {
@@ -307,7 +307,7 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
     try {
       await workspace.setSessionOwner(session, target)
       const bot = target && workspace.bots.find((item) => item.conversation_id === target)
-      toast(bot ? `已转给 ${bot.name}` : target ? '已重新关注' : '已不再关注', { tone: 'success' })
+      toast(bot ? `已转给「${bot.name}」` : target ? '已重新关注' : '已不再关注', { tone: 'success' })
     } catch (caught) { setFailure(caught) }
     finally { setBusy(false) }
   }

@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
 import { Smartphone, X } from "lucide-react"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useDeviceRows } from "./devices"

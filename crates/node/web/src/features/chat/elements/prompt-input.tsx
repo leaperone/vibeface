@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { ArrowUpIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { isSubmitKey } from '@vibeface/client/chat/protocol.ts'
 
 import {
