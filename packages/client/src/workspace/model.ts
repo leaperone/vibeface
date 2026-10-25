@@ -288,6 +288,9 @@ export function formatSize(bytes: number) {
   return unit === 0 ? `${bytes} 字节` : `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
 }
 
+/** The largest attachment the entry accepts; an empty file is refused too. */
+export const attachmentLimit = 64 * 1024 * 1024
+
 /** The name a message signs, as the Node checks it: no path separators or control characters, at most 255 UTF-8 bytes. */
 export function attachmentName(raw: string) {
   const encoder = new TextEncoder()

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
+import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -36,7 +36,7 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-const modes: [AppServerMode, string, LucideIcon][] = [["system", "用已在运行的", Monitor], ["spawn", "由 Vibeface 启动", Play]]
+const modes: { value: AppServerMode; label: string; icon: LucideIcon }[] = [{ value: "system", label: "用已在运行的", icon: Monitor }, { value: "spawn", label: "由 Vibeface 启动", icon: Play }]
 const spawnServer = { mode: "spawn", socket: null } as const
 
 /** One line for an App Server state, from the device or a fresh test. */
@@ -68,18 +68,13 @@ function AppServerSettings({ server, working, blocked, busy, save, test }: {
   const link = server.link
   const shown = tested ?? link
   const inUse = shown.state === "connected" || shown.state === "handshake_failed" ? [shown.socket] : shown.state === "not_found" ? shown.candidates : []
-  const setMode = (mode: AppServerMode) => { if (mode !== server.mode) void save("app_server", { app_server: { mode, socket: server.socket } }) }
+  const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-2">
     <p className="text-meta font-medium text-muted-foreground">连接方式</p>
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <div role="radiogroup" aria-label="连接方式" className="flex w-fit gap-1 rounded-lg bg-muted p-1">
-        {modes.map(([mode, text, Icon]) => <Button key={mode} type="button" role="radio" aria-checked={server.mode === mode} disabled={working}
-          variant={server.mode === mode ? "outline" : "ghost"} className={cn(server.mode === mode && "shadow-xs")} onClick={() => setMode(mode)}>
-          <Icon aria-hidden="true" />{text}
-        </Button>)}
-      </div>
+      <Segmented label="连接方式" labels fill value={server.mode} options={modes} disabled={working} onChange={setMode} />
       <Button type="button" variant="ghost" disabled={working || testing || blocked || link.state === "off"} onClick={() => void runTest()}>
         <BusyIcon busy={testing} icon={PlugZap} />测试连接
       </Button>
