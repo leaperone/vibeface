@@ -266,9 +266,9 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
-  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted">
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} quiet={task.state === 'completed'} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
   return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
@@ -283,14 +283,13 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
 }
 
 /** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
-function TaskMeta({ device, here, state, className = '' }: { device: string; here: boolean; state: string; className?: string }) {
-  const Icon = here ? Laptop : Server
+/** Only another device is named on screen. `quiet`: the icon already says the state, so its word is only read out. */
+function TaskMeta({ device, here, state, quiet = false, className = '' }: { device: string; here: boolean; state: string; quiet?: boolean; className?: string }) {
+  if (here && quiet) return <span className="sr-only">{device} · {taskLabel(state)}</span>
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
-    <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-    <span className="truncate">{device}</span>
-    <span aria-hidden="true">·</span>
-    <span className="shrink-0">{taskLabel(state)}</span>
+    {here ? <span className="sr-only">{device}</span> : <><Server aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : <span aria-hidden="true">·</span>}</>}
+    <span className={quiet ? 'sr-only' : 'shrink-0'}>{taskLabel(state)}</span>
   </span>
 }
 
@@ -337,15 +336,16 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
   </div>
 }
 
+/** Shaped like a message from another bot, its name above the text, so both directions read as one kind of thing. */
 function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
-  return <div className="grid min-w-0 gap-1 rounded-lg border px-3 py-2 text-meta">
-    <p className="flex min-w-0 items-center gap-2 text-muted-foreground">
+  return <div className="flex min-w-0 flex-col items-start gap-1">
+    <p className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
       <Send aria-hidden="true" className="size-4 shrink-0" />
       <span className="shrink-0">发给</span>
-      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">{to.name}</Link>
+      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="hit-area relative flex min-w-0 font-medium text-foreground underline-offset-4 hover:underline"><span className="truncate">{to.name}</span></Link>
         : <span className="min-w-0 truncate font-medium text-foreground">{to.name}</span>}
     </p>
-    <p className="line-clamp-3 whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]" title={sent.text}>{sent.text}</p>
+    <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
   </div>
 }
 

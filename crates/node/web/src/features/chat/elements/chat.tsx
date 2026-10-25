@@ -25,6 +25,9 @@ const sender = (entry: ChatEntry | undefined): string | null => {
 /** A schedule run's reply stands alone, so it always opens a group. The time shows once, at the end of a group. */
 const continues = (entry: ChatEntry, previous: ChatEntry | undefined) => !('schedule' in entry && entry.schedule) && sender(entry) !== null && sender(entry) === sender(previous)
 
+/** Tasks one turn started stack as a group instead of spacing out like separate turns. */
+const stacked = (entry: ChatEntry, previous: ChatEntry) => entry.key.startsWith('task:') && previous.key.startsWith('task:')
+
 export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNode }) {
   // MessageScroller scrolls to the first anchored item it has not aligned yet. Only a user message sent after the
   // chat opened is an anchor, so opening a chat stays at its newest entry and a send still lands at the bottom.
@@ -64,7 +67,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)
               return (
-                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && 'mt-6', entered.current.has(entry.key) && 'message-enter')}>
+                <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && (stacked(entry, entries[index - 1]) ? 'mt-2' : 'mt-6'), entered.current.has(entry.key) && 'message-enter')}>
                   {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} last={last} retry={entry.retry} /> : entry.node}
                 </MessageScrollerItem>
               )

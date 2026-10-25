@@ -34,7 +34,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
     } finally { if (inFlight.current === generation) inFlight.current = null; setReadingGeneration(owner => owner === generation ? null : owner) }
   }
   return <Card className="w-full min-w-0 gap-0 py-0">
-    <CardContent className="space-y-3 p-3">
+    <CardContent className={opened ? 'space-y-3 p-3' : 'py-1 ps-3 pe-1'}>
       <div className="flex items-center gap-1">
         <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5 text-sm">
           <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
