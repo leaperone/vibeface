@@ -392,7 +392,65 @@ def self_test():
     config = (root / "crates/node/src/config.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
+    release_privacy_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def release_privacy_test(root, scratch):
+    import shutil
+    import tarfile
+
+    with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
+        repo = Path(directory)
+        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/node/src/config.rs", "README.md"):
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / name, target)
+        source = repo / "private build.rs"
+        source.write_text('#[cfg(not(privacy_flag))] compile_error!("caller flag lost"); fn main() { println!("{}", file!()); }')
+        binary = repo / "target/privacy-fixture/release/vibeface"
+        binary.parent.mkdir(parents=True)
+        environment = {**os.environ, "CARGO_TARGET_DIR": str(repo / "target"), "RUSTFLAGS": "--cfg privacy_flag"}
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        for encoded in (None, "--cfg\x1fprivacy_flag", ""):
+            if encoded is not None:
+                environment["CARGO_ENCODED_RUSTFLAGS"] = encoded
+                environment["RUSTFLAGS"] = "--cfg ignored_flag"
+            flags = subprocess.check_output(["python3", str(repo / "scripts/release-rustflags.py")], env=environment, text=True).strip().split("\x1f")
+            assert "ignored_flag" not in flags
+            if encoded == "":
+                assert "privacy_flag" not in flags
+                continue
+            subprocess.run(["rustc", "--crate-name", "privacy_fixture", "-Copt-level=3", "-Cdebuginfo=0", *flags, str(source), "-o", str(binary)], check=True)
+            assert str(repo).encode() not in binary.read_bytes(), "release binary contains its source directory"
+            assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
+        for name, content in {"crates/node/web/generated/vibeface_secure.js": "fixture", "crates/node/web/generated/vibeface_secure_bg.wasm": "fixture", "crates/node/web/dist/client/_shell.html": "fixture", "docs/guide.md": "public guide"}.items():
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        if hasattr(os, "setxattr"):
+            os.setxattr(repo / "docs/guide.md", "user.build-host", b"private builder")
+        environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
+        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--skip-build", "--target", "privacy-fixture"], env=environment, check=True, stdout=subprocess.PIPE)
+        archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
+        with tarfile.open(archive_path) as archive:
+            for entry in archive.getmembers():
+                assert entry.uid == entry.gid == 0 and entry.uname == entry.gname == ""
+                assert not set(entry.pax_headers) - {"mtime"}
+                assert not any(part.startswith("._") for part in Path(entry.name).parts)
+            package = archive.getmembers()[0].name
+            assert archive.extractfile(f"{package}/docs/guide.md").read() == b"public guide"
+            assert archive.getmember(f"{package}/vibeface").mode & 0o111
+        (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
+        fake_cargo = repo / "bin/cargo"
+        fake_cargo.parent.mkdir()
+        fake_cargo.write_text('#!/bin/sh\ntouch "$CARGO_MARKER"\n')
+        fake_cargo.chmod(0o755)
+        marker = repo / "cargo-called"
+        environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
+        assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
+        assert not marker.exists(), "a failed privacy setup must stop the build"
+    print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")
 
 
 def expect_failure(check):

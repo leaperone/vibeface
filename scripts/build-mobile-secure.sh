@@ -22,4 +22,5 @@ if [[ "$platform" == android ]] && ! command -v cargo-ndk >/dev/null 2>&1; then
 fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../packages/secure-native"
-pnpm exec ubrn build "$platform" --and-generate --release --config ubrn.config.yaml
+release_rustflags="$(python3 ../../scripts/release-rustflags.py)"
+CARGO_ENCODED_RUSTFLAGS="$release_rustflags" pnpm exec ubrn build "$platform" --and-generate --release --config ubrn.config.yaml

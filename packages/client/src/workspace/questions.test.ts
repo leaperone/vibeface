@@ -3,7 +3,7 @@ import test from "node:test"
 import { parseAnswer, parseConversation, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
 import { answerBody, foldAnswers, openQuestions, placeByTime, projectName, settledAnswer } from "./questions.ts"
 
-const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/Users/me/web/", summary: "改登录" }
+const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
   question_id, conversation_id: "chat", bot: { bot_id: "bot", name: "Bot" }, severity: "attention", text: "要不要继续",
   choices: [{ label: "继续" }, { label: "看看" }], about, author: "gateway", created_at_ms, answer: null, ...extra,
@@ -74,7 +74,7 @@ test("questions and hand-offs sit where they happened in the chat", () => {
   assert.deepEqual(before.get("m1")?.map((item) => item.id), ["first"])
   assert.deepEqual(before.get("m2")?.map((item) => item.id), ["a", "b"])
   assert.deepEqual(rest.map((item) => item.id), ["late"])
-  assert.equal(projectName("/Users/me/web/"), "web")
+  assert.equal(projectName("/path/to/web/"), "web")
   assert.equal(projectName("C:\\code\\api"), "api")
 })
 

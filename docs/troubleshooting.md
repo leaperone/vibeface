@@ -14,11 +14,11 @@ Node 在运行时输出类似：
 Peer ID: 3f2a…
 Status: running
 Listen: 127.0.0.1:4790
-Data: /Users/me/.vibeface
+Data: /path/to/node-data
 Version: 0.0.1
 Writes: writable
-Peer: mac-mini (9c41…) reachable, synced 4s ago
-Peer: server (51be…) unreachable, synced 1830s ago
+Peer: device-a (9c41…) reachable, synced 4s ago
+Peer: device-b (51be…) unreachable, synced 1830s ago
 ```
 
 `Writes` 是这台 Node 能否写入，取值见下文“写入状态”。每台其他成员 Node 一行 `Peer`：`reachable` 表示最近一次同步连上了，`unreachable` 表示最近一次失败，`not tried yet` 表示启动后还没试过；`synced Ns ago` 是最近一次同步完成的时间，`never synced` 表示本次启动后没有成功过。`--json` 输出同样的内容，`write_state` 和 `peers` 是对应字段。
@@ -121,7 +121,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 **对端一直 `unreachable`。** 两台 Node 没有直连路径时要经 relay 转发。确认至少一台 Node 用 `--relay-listen` 运行 relay，其他 Node 的 `config.json` 里 `network.relays` 指向它，反向代理允许 WebSocket 升级。改了 `network` 字段要重启。见 [Node 之间的连接](node.md#node-之间的连接)。
 
-**手机打开公共入口后连不上家里的设备。** 公共入口只经自己的 relay 找到成员 Node。检查家里的 Node 是否用 `--entry` 和 `--relay-token-file` 初始化，令牌文件是否与入口数据目录里的 `entry-token` 相同，nginx 是否把 `/relay`、`/ping` 和 `/generate_204` 转给入口的 relay 端口。见 [配置公共入口](node.md#配置公共入口)。
+**手机打开公共入口后连不上个人设备。** 公共入口只经自己的 relay 找到成员 Node。检查个人设备上的 Node 是否用 `--entry` 和 `--relay-token-file` 初始化，令牌文件是否与入口数据目录里的 `entry-token` 相同，nginx 是否把 `/relay`、`/ping` 和 `/generate_204` 转给入口的 relay 端口。见 [配置公共入口](node.md#配置公共入口)。
 
 **任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
 
