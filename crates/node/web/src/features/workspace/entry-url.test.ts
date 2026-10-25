@@ -458,6 +458,12 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
   let cursor = 0
+  function effect(run: () => (() => void) | void, dependencies: unknown[]) {
+    const index = cursor++, previous = effects.get(index)
+    if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
+      previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
+    })
+  }
   const react = {
     createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
@@ -468,12 +474,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
+    useEffect: effect, useLayoutEffect: effect,
   }
   const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
@@ -561,7 +562,7 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
   const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
@@ -587,6 +588,51 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work', 'work'], 'the count is named before the confirming tap stops them all')
+  } finally { app.close() }
+})
+
+test("below lg the task panel is a modal dialog that makes the rest of the page inert, and beside the chat it is not", () => {
+  const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
+  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
+  let wide = false
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => false, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
+  // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
+  type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
+  const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
+    const self: Node = { name, attributes: new Set(attributes), parentElement: null, children, hasAttribute: (key) => self.attributes.has(key), setAttribute: (key) => { self.attributes.add(key) }, removeAttribute: (key) => { self.attributes.delete(key) } }
+    for (const child of children) child.parentElement = self
+    return self
+  }
+  const layer = node('layer'), chat = node('chat'), header = node('header'), sidebar = node('sidebar'), toasts = node('toasts', [], ['aria-live']), hidden = node('hidden', [], ['inert'])
+  const head = node('head')
+  node('html', [head, node('body', [node('shell', [sidebar, node('main', [header, node('row', [chat, layer])])]), toasts, hidden])])
+  const inert = () => [chat, header, sidebar, toasts, hidden, layer, head].filter((item) => item.hasAttribute('inert')).map((item) => item.name)
+  const render = () => {
+    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    return { panel: elements.find(({ type }) => type === 'aside')?.props ?? {}, title: elements.find(({ type }) => type === 'h2')?.props ?? {}, layer: elements.find(({ props }) => props.className === 'contents')?.props.ref as { current: unknown } }
+  }
+  try {
+    const first = render()
+    assert.equal(first.panel.role, 'dialog')
+    assert.equal(first.panel['aria-modal'], true)
+    assert.equal(first.panel['aria-labelledby'], first.title.id, 'the dialog is named by its title')
+    first.layer.current = layer
+    wide = true
+    const beside = render().panel
+    assert.equal(beside.role, undefined, 'beside the chat the panel is not a dialog')
+    assert.equal(beside['aria-modal'], undefined)
+    assert.equal(beside['aria-label'], '任务详情')
+    assert.deepEqual(inert(), ['hidden'], 'and nothing else is made inert')
+    wide = false
+    render()
+    assert.deepEqual(inert(), ['chat', 'header', 'sidebar', 'hidden'], 'narrowing the window covers the page but not the panel, the toasts or <head>')
+    wide = true
+    render()
+    assert.deepEqual(inert(), ['hidden'], 'widening it gives the page back, leaving what was inert before alone')
+    wide = false
+    render()
+    app.close()
+    assert.deepEqual(inert(), ['hidden'], 'closing the panel gives the page back')
   } finally { app.close() }
 })
 
