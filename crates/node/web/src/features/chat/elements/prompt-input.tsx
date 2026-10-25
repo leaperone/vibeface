@@ -1,8 +1,9 @@
 import { useLayoutEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
-import { ArrowUpIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
+import { ArrowUpIcon, CircleAlertIcon, PaperclipIcon, SquareIcon, XIcon } from 'lucide-react'
 import { Spinner } from '@/components/ui/spinner'
 import { cn } from '@/lib/utils'
 import { isSubmitKey } from '@vibeface/client/chat/protocol.ts'
+import { attachmentLimit } from '@vibeface/client/workspace/model.ts'
 
 import {
   InputGroup,
@@ -47,6 +48,10 @@ export function PromptInput({
   // A written message is always sendable; while writing, Stop moves beside Send instead of leaving.
   const drafting = Boolean(value.trim() || files.length)
   const stop = drafting ? undefined : onStop
+  // Caught on pick: the upload would only refuse it after the person pressed Send.
+  const unfits = (file: File) => !file.size || file.size > attachmentLimit
+  const unfit = files.find(unfits)
+  const limit = `${attachmentLimit / 2 ** 20} MiB`
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
   // between two content heights, so the change is replayed from the height last shown. It lets go once there, so a
   // resized window still fits the text.
@@ -70,7 +75,7 @@ export function PromptInput({
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false) }}
       onSubmit={(event) => {
         event.preventDefault()
-        if (disabled || busy || !value.trim()) return
+        if (disabled || busy || !value.trim() || unfit) return
         onSubmit()
       }}
     >
@@ -84,8 +89,10 @@ export function PromptInput({
             required
             maxLength={100000}
             value={value}
-            placeholder="发消息"
-            disabled={disabled || busy}
+            placeholder={files.length ? '给附件写句说明' : '发消息'}
+            disabled={disabled}
+            // Read-only, not disabled, while sending: a disabled box drops focus, which folds it and closes a phone's keyboard.
+            readOnly={busy}
             aria-label="给 Bot 发消息"
             aria-describedby={hint ? 'manager-hint' : undefined}
             title="Enter 发送，Shift+Enter 换行"
@@ -108,9 +115,10 @@ export function PromptInput({
                 <PaperclipIcon aria-hidden="true" />
                 {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[0.625rem] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
               </InputGroupButton>
-              {open && files.map((file, index) => <span key={`${file.name}:${index}`} title={file.name} className="flex max-w-56 min-w-0 items-center gap-1 rounded-full bg-muted ps-3 text-meta">
+              {open && files.map((file, index) => <span key={`${file.name}:${index}`} title={file.name} className={cn('flex max-w-56 min-w-0 items-center gap-1 rounded-full ps-3 text-meta', unfits(file) ? 'border border-danger-border bg-danger-soft text-danger' : 'bg-muted')}>
+                {unfits(file) ? <CircleAlertIcon aria-label={file.size ? `超过 ${limit}` : '空文件'} className="-ms-1 size-3.5 shrink-0" /> : null}
                 <FileName name={file.name} />
-                <button type="button" onMouseDown={keepFocus} className="grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
+                <button type="button" onMouseDown={keepFocus} className="hit-area relative grid size-8 shrink-0 place-items-center rounded-full hover:bg-background" aria-label={`移除 ${file.name}`} disabled={busy} onClick={() => onFiles(files.filter((_, at) => at !== index))}><XIcon aria-hidden="true" className="size-3.5" /></button>
               </span>)}
             </> : null}
             <span className="ms-auto flex shrink-0 gap-1">
@@ -121,7 +129,7 @@ export function PromptInput({
                 type={stop ? 'button' : 'submit'}
                 variant={stop ? 'outline' : 'default'}
                 size="icon-sm"
-                disabled={!stop && (disabled || busy || !value.trim())}
+                disabled={!stop && (disabled || busy || !value.trim() || Boolean(unfit))}
                 aria-busy={busy || undefined}
                 aria-label={stop ? '停止' : '发送'}
                 title={stop ? '停止' : '发送'}
@@ -136,6 +144,7 @@ export function PromptInput({
         </InputGroup>
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-meta text-muted-foreground empty:hidden">
+        {unfit ? <p role="alert" className="flex basis-full items-center gap-1.5 text-danger"><CircleAlertIcon aria-hidden="true" className="size-4 shrink-0" />{unfit.size ? `附件超过 ${limit}` : '附件是空文件'}，移除后再发送</p> : null}
         {hint ? <p id="manager-hint">{hint}</p> : null}
         {children}
       </div>
