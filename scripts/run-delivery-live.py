@@ -71,8 +71,10 @@ def source_commit(expected):
     if not re.fullmatch(r"[0-9a-f]{40}", expected):
         raise ValueError("Expected an explicit full source commit")
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    if actual != expected or subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT):
-        raise ValueError("Live delivery requires the clean exact checkout used by the artifact job")
+    dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT, text=True)
+    if actual != expected or dirty:
+        details = {"expected": expected, "actual": actual, "changes": dirty.splitlines()[:20]}
+        raise ValueError("Live delivery requires the clean exact checkout used by the artifact job: " + json.dumps(details))
 
 
 def checked_package(package, expected):
@@ -1846,6 +1848,17 @@ def self_test_videos(directory):
 def self_test():
     from copy import deepcopy
     from unittest.mock import patch
+    with patch("subprocess.check_output", side_effect=["1" * 40, ""]):
+        source_commit("1" * 40)
+    for actual, dirty in (("2" * 40, ""), ("1" * 40, " M tracked.cpp\n"), ("1" * 40, "?? generated.json\n")):
+        with patch("subprocess.check_output", side_effect=[actual, dirty]):
+            try:
+                source_commit("1" * 40)
+            except ValueError as error:
+                details = json.loads(str(error).split(": ", 1)[1])
+                assert details == {"expected": "1" * 40, "actual": actual, "changes": dirty.splitlines()}
+            else:
+                raise AssertionError("Wrong commits and both tracked and untracked drift must fail with bounded filename diagnostics")
     checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
     _, original = checks["sandbox_commands"](Path("/context"))
     package = ROOT / ".artifacts/vdp/live-input/package"
