@@ -747,6 +747,33 @@ test("a toast's action is a 44px touch target on phones and stays compact on des
   assert.match(String(action?.className), /md:h-7/)
 })
 
+test("a segmented control is one Tab stop whose arrow keys move and select, wrapping at the ends", () => {
+  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  const options = ['light', 'dark', 'system'].map((value) => ({ value, label: value }))
+  let value = 'dark', focused = -1
+  const radios = options.map((_, index) => ({ focus: () => { focused = index } }))
+  const radio = () => radios[options.findIndex((option) => option.value === value)] ?? radios[focused]
+  const render = (props: object = {}) => app.render('Segmented', { label: '外观', value, options, onChange: (next: string) => { value = next }, ...props })
+  const press = (key: string, props?: object) => {
+    let prevented = false
+    ;(render(props).find(({ props }) => props.role === 'radiogroup')?.props.onKeyDown as (event: unknown) => void)({ key, preventDefault: () => { prevented = true }, target: radio(), currentTarget: { querySelectorAll: () => radios } })
+    return prevented
+  }
+  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [-1, 0, -1])
+  assert.ok(press('ArrowRight')); assert.equal(value, 'system'); assert.equal(focused, 2)
+  press('ArrowDown'); assert.equal(value, 'light', 'wraps past the last option'); assert.equal(focused, 0)
+  press('ArrowLeft'); assert.equal(value, 'system', 'wraps past the first option')
+  press('ArrowUp'); assert.equal(value, 'dark')
+  press('Home'); assert.equal(value, 'light')
+  press('End'); assert.equal(value, 'system'); assert.equal(focused, 2)
+  assert.equal(press('Tab'), false, 'Tab leaves the group')
+  assert.equal(press('ArrowLeft', { disabled: true }), false); assert.equal(value, 'system')
+  value = 'unknown'; focused = 1
+  press('ArrowRight'); assert.equal(value, 'system', "arrows move from the focused option even when a change did not take")
+  value = 'unknown'
+  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
+})
+
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
   let generation = 1, work = pendingResult()
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
