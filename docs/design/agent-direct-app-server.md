@@ -151,7 +151,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 | Codex hook | `Stop`、`PermissionRequest` 调用 `vibeface hook codex` |
 | Claude Code hook | `Stop`、`StopFailure`、`Notification` 调用 `vibeface hook claude` |
 | App Server | 本机 App Server 报告的所有线程的 `turn/completed`（完成、失败、中断） |
-| 会话扫描 | 每 5 分钟扫 `$CODEX_HOME/sessions` 下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
+| 会话扫描 | 默认关闭；显式启用后，每 5 分钟扫描 `triage.codex_sessions` 配置目录下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
 
 `vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 头的 JSON 请求，浏览器跨站请求一律拒绝。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
 
@@ -194,11 +194,13 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
-| `triage_settings` | 无 | `{default_outlet, projects, webhook_url, scan_codex_sessions, webhook_secret_set, decision_url, device_id, decision_tokens: [{token_id, label, created_ms}], outbox: {pending, delivered, dead}}` |
-| `configure_triage` | `{default_outlet, projects: [{prefix, outlet}], webhook_url, scan_codex_sessions, webhook_secret?}`；`webhook_secret` 为字符串时设置，`null` 时清除，缺省时保留 | 同 `triage_settings` |
+| `triage_settings` | 无 | `{default_outlet, projects, webhook_url, scan_codex_sessions, codex_sessions, webhook_secret_set, decision_url, device_id, decision_tokens: [{token_id, label, created_ms}], outbox: {pending, delivered, dead}}` |
+| `configure_triage` | `{default_outlet, projects: [{prefix, outlet}], webhook_url, scan_codex_sessions, codex_sessions, webhook_secret?}`；`webhook_secret` 为字符串时设置，`null` 时清除，缺省时保留 | 同 `triage_settings` |
 | `test_webhook` | 无 | `{ok, status, error}`，立即发一条签名的测试事件，不进发件箱 |
 | `create_decision_token` | `{label}` | `{token_id, token, label, created_ms}`，`token` 只在这里出现一次 |
 | `revoke_decision_token` | `{token_id}` | `{revoked}` |
+
+启用会话扫描前必须设置 `codex_sessions` 的绝对路径，配置示例见[部署说明](../deployment.md)。
 
 提问经 `rpc` 读写：`questions` 返回全网未回答的提问；`answer {question_id, text, attestation}` 写该提问唯一的回答消息。形状见 [聊天里的提问与回答](questions-in-chat.md)。
 

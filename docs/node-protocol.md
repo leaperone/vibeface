@@ -96,7 +96,7 @@
 | `/`、`/assets/*` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
-| `/api/info` | GET | `device_id`、`version`、`manager_available` 和 `public_entry` |
+| `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 回调带 Node 级令牌，按 `agentId` 找到所属管理轮 |
@@ -120,7 +120,7 @@
 
 | method | params | 用途 |
 | --- | --- | --- |
-| `info` | `{}` | 公开身份、主机名、角色、版本、初始化状态和 `connection_entry` |
+| `info` | `{}` | 访客仅得到通用名称 `Node`、`device_id`、`version`、`initialized`、`public_entry` 和 `network_id: null`；有效成员或本机会话还可读取真实名称、`network_id` 和 `connection_entry` |
 | `authenticate` | 可选 `network_id` | 验证成员授权或本机会话；不是成员但在找回目录里做管理设备的，回 `recovery: {status: "waiting", effective_at_ms}` 或 `{status: "stopped"}` |
 | `directory` | `{}` | 当前签名目录及投影 |
 | `entrances` | `{}` | 地址簿中的签名地址记录，浏览器自行验签 |

@@ -162,10 +162,9 @@ pub async fn run(options: Update) -> Result<()> {
             ),
         }
     }
-    let policy_path = data.join("update.json");
-    let policy = policy(&data)?;
     match options.action {
         Action::Status(_) => {
+            let policy = policy(&data)?;
             let current = installed(&policy.install_root)
                 .and_then(|path| manifest(&path).map(|m| m.version))
                 .ok();
@@ -200,11 +199,12 @@ pub async fn run(options: Update) -> Result<()> {
             };
             // Keep the old policy if the platform cannot install the requested timer.
             configure_timer(&new, &data).await?;
-            persist(&policy_path, &new)?;
+            persist(&data.join("update.json"), &new)?;
             println!("{}", serde_json::to_string(&new)?);
             Ok(())
         }
         Action::Check(_) => {
+            let policy = policy(&data)?;
             let current = manifest(&installed(&policy.install_root)?)?.version;
             let latest = release::check(policy.channel).await?;
             let newer = latest.as_ref().filter(|r| r.version > current);
@@ -217,6 +217,7 @@ pub async fn run(options: Update) -> Result<()> {
             Ok(())
         }
         Action::Apply { automatic, .. } => {
+            let policy = policy(&data)?;
             recover(&policy, &data).await?;
             if automatic && !policy.automatic {
                 println!("Automatic updates are disabled.");
@@ -873,6 +874,60 @@ mod tests {
         )
         .unwrap();
         directory
+    }
+
+    #[tokio::test]
+    async fn first_update_configuration_creates_an_explicit_policy() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        config::private_dir(&data)?;
+        let identity = crate::crypto::LocalIdentity::generate();
+        persist(&data.join("identity.json"), &identity)?;
+        let package = package(&root, "1.0.0");
+        std::os::unix::fs::symlink(&package, root.join("current"))?;
+        let installer = package.join("scripts/install-node-service.sh");
+        fs::write(
+            &installer,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )?;
+        fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))?;
+
+        assert!(
+            run(Update {
+                action: Action::Status(Data {
+                    data_dir: data.clone()
+                }),
+            })
+            .await
+            .is_err()
+        );
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Nightly,
+                automatic: false,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
+        assert_eq!(
+            saved,
+            serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
+        );
+        assert_eq!(
+            fs::read_to_string(installer.with_extension("sh.args"))?,
+            format!("uninstall-updater\n--data-dir\n{}\n", data.display())
+        );
+        run(Update {
+            action: Action::Status(Data { data_dir: data }),
+        })
+        .await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

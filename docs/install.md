@@ -150,25 +150,25 @@ vibeface service uninstall
 
 本节只适用于 GitHub 受管安装。npm 安装按上面的 npm 命令更新。
 
-首次下载渠道与运行时更新策略分别配置。默认运行时策略是 Stable，自动更新关闭。Nightly 安装初始化后建议明确配置：
+首次下载渠道与运行时更新策略分别配置。更新器没有默认策略，必须明确指定渠道、是否自动更新及安装根目录。Nightly 安装初始化后配置：
 
 ```sh
-vibeface update configure --channel nightly --automatic false
-vibeface update status
-vibeface update check
-vibeface update apply
+vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update status --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update check --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update apply --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 手动应用更新需已安装并运行用户服务，更新器才可取得维护租约并确认重启健康状态。希望在空闲时自动更新：
 
 ```sh
-vibeface update configure --channel nightly --automatic true
+vibeface update configure --channel nightly --automatic true --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 将来改用正式版：
 
 ```sh
-vibeface update configure --channel stable --automatic true
+vibeface update configure --channel stable --automatic true --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
-Stable 不存在时不会切换 Nightly，更新器也不自动降级。自定义安装根需在首次 `update configure` 时加上 `--install-root /absolute/path/to/vibeface`。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。
+Stable 不存在时不会切换 Nightly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。
