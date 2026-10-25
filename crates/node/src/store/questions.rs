@@ -8,7 +8,7 @@ use super::{
     scheduler::{admit_from, queue_delivery_from},
 };
 use crate::{crypto::LocalIdentity, model::*, scheduling::*};
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 
@@ -171,7 +171,7 @@ impl Store {
             .collect()
     }
 
-    /// Whether the user stopped following this session.
+    /// Whether its bot stopped following this session.
     pub fn session_muted(&self, network: &str, node: &str, session: &str) -> Result<bool> {
         Ok(self
             .connection
@@ -273,13 +273,15 @@ impl Store {
         Ok(Some(event))
     }
 
-    /// Hands an attributed session this device runs to `target`, or mutes it in its owner's
-    /// conversation when `None`. A repeat of the standing state writes nothing. Returns the
-    /// owner before, and the event when this call wrote one.
+    /// `from`'s bot hands an attributed session this device runs to `target`, or mutes it in
+    /// its own conversation when `None`. Only the bot that owns the session changes it; asking
+    /// for the state that stands writes nothing, so a retry reads it back. Returns the owner
+    /// before, and the event when this call wrote one.
     pub fn hand_over_session(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
+        from: &str,
         session: &str,
         target: Option<&str>,
         created_at_ms: i64,
@@ -295,13 +297,21 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
-            .context("no bot owns this session on this device")?;
+            .context("no bot follows this session on this device")?;
+        match target {
+            Some(target) if target == owner && !muted => return Ok((owner, None)),
+            None if muted && owner == from => return Ok((owner, None)),
+            _ if owner != from => {
+                let name =
+                    bot_for_conversation_from(&tx, network, &owner)?.map_or(owner, |bot| bot.name);
+                bail!("this session is not yours; {name} follows it")
+            }
+            _ => {}
+        }
         let attribution: Value = serde_json::from_str(
             &attribution.context("this session belongs to the work that started it")?,
         )?;
         let body = match target {
-            Some(target) if target == owner && !muted => return Ok((owner, None)),
-            None if muted => return Ok((owner, None)),
             Some(target) => {
                 ensure!(
                     bot_for_conversation_from(&tx, network, target)?.is_some(),

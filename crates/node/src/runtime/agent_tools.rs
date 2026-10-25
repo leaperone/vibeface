@@ -386,6 +386,27 @@ impl Runtime {
                 let id = field(&args, "work_id")?;
                 self.stop_work(network, &scope, id).await
             }
+            Tool::HandOverSession => {
+                let target = match (args["to"].as_str(), args["stop_following"] == true) {
+                    (Some(bot), false) => Some(
+                        self.store
+                            .lock()
+                            .await
+                            .find_bot(network, bot)?
+                            .conversation_id,
+                    ),
+                    (None, true) => None,
+                    _ => bail!("give either to or stop_following=true"),
+                };
+                self.hand_over_session(
+                    network,
+                    &scope,
+                    field(&args, "node")?,
+                    field(&args, "session_id")?,
+                    target.as_deref(),
+                )
+                .await
+            }
         }
     }
 

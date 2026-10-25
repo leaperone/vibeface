@@ -462,10 +462,11 @@ impl Runtime {
                 self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
-            "session_owner" => {
-                ensure!(input["human"] == true, "only the user hands sessions over");
+            "hand_over_session" => {
                 self.hand_over_session(
                     network,
+                    field(input, "from")?,
+                    &self.identity.device_id()?,
                     field(input, "session_id")?,
                     input["conversation_id"].as_str(),
                 )
