@@ -4,15 +4,16 @@ import { Bot, ChevronDown, CircleX, Code, Copy, Globe, Info, Layers, ListChecks,
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { EmptyState, InlineError, Skeleton, toast } from '@/components/app/kit'
+import { EmptyState, InlineError, Segmented, Skeleton, toast } from '@/components/app/kit'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
 
-const levelChoices: Array<[LogLevel | undefined, string, LucideIcon]> = [
-  [undefined, '全部', Layers], ['info', '信息', Info], ['warn', '警告', TriangleAlert], ['error', '错误', CircleX],
+type LevelChoice = 'all' | Extract<LogLevel, 'info' | 'warn' | 'error'>
+const levelChoices: Array<{ value: LevelChoice; label: string; icon: LucideIcon }> = [
+  { value: 'all', label: '全部', icon: Layers }, { value: 'info', label: '信息', icon: Info }, { value: 'warn', label: '警告', icon: TriangleAlert }, { value: 'error', label: '错误', icon: CircleX },
 ]
 const sourceChoices: Array<[LogSource, string, LucideIcon]> = [
   ['node', '设备', Server], ['web', '网页', Globe], ['agent', 'Bot', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['cursor', 'Cursor', MousePointerClick],
@@ -68,11 +69,7 @@ function LogsPage() {
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
     </div>
-    <div role="radiogroup" aria-label="级别" className="flex w-full gap-1 rounded-lg bg-muted p-1 sm:w-fit">
-      {levelChoices.map(([value, label, Icon]) => <Button key={label} type="button" role="radio" aria-checked={level === value} variant={level === value ? 'outline' : 'ghost'} className="flex-1 sm:flex-none" onClick={() => setLevel(value)}>
-        <Icon aria-hidden="true" />{label}
-      </Button>)}
-    </div>
+    <Segmented label="级别" labels fill value={level ?? 'all'} options={levelChoices} onChange={(value) => setLevel(value === 'all' ? undefined : value)} />
     <div role="group" aria-label="来源" className="flex flex-wrap gap-2">
       {sourceChoices.map(([value, label, Icon]) => {
         const on = sources.includes(value)

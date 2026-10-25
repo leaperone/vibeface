@@ -10,7 +10,7 @@ import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder, attachmentLimit,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
@@ -424,7 +424,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** Sends one file to the entry in 1 MiB chunks; an interrupted upload continues where the entry's disk stopped. */
   const uploadAttachment = async (id: string, file: AttachmentFile): Promise<Attachment> => {
     const bytes = new Uint8Array(await file.arrayBuffer())
-    if (!bytes.length || bytes.length > 64 * 1024 * 1024) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
+    if (!bytes.length || bytes.length > attachmentLimit) throw new Error(`附件「${file.name}」需在 64 MiB 以内且不能为空。`)
     const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((byte) => byte.toString(16).padStart(2, "0")).join("")
     let offset = 0
     for (;;) {
