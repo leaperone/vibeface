@@ -50,7 +50,7 @@ function SettingsPage() {
       <CurrentRecoveryFile />
       <RecoveryControls />
     </SettingsGroup> : null}
-    {operator ? <SettingsGroup title="排障" footer="诊断包不含登录信息和加入链接">
+    {operator ? <SettingsGroup title="问题排查" footer="诊断包不含登录信息和加入链接">
       <Link to="/settings/logs" className="interactive-row block">
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>

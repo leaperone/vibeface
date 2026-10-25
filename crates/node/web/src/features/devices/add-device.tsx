@@ -37,6 +37,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
   const [added, setAdded] = useState<string | null>(null)
   // "已复制" shows on the button itself for a moment.
   const [copied, setCopied] = useState(false)
+  const sheet = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!copied) return
     const timer = setTimeout(() => setCopied(false), 2000)
@@ -86,14 +87,16 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
       <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     </PageActions>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
-      <SheetContent className="!w-full overflow-y-auto sm:!max-w-md">
+      {/* A waiting request leads the sheet; its first control is 设为管理员, which should not take focus on its own. */}
+      <SheetContent ref={sheet} className="!w-full overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+          {/* A device already asking is the next thing to act on, so it comes before a new link. */}
+          <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added}>已添加「{added}」</span></p>
             <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
           </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
-          <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
           {result && !used ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用手机相机扫码打开" /> : <div className="grid gap-2 rounded-lg bg-muted p-3 text-meta">
               <p className="flex items-center gap-1.5 text-muted-foreground"><Smartphone aria-hidden="true" className="size-4 shrink-0" />{local ? "手机打不开本机地址" : "手机打不开这个地址"}</p>

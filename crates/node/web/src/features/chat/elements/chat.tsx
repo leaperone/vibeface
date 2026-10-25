@@ -62,7 +62,8 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
     <MessageScrollerProvider autoScroll scrollEdgeThreshold={96}>
       <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
-          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 py-6 sm:px-6 lg:px-8">
+          {/* Room for a toast over the composer, so the last card can scroll clear of it. */}
+          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 pt-6 pb-[calc(1.5rem+var(--toast-cover,0px))] sm:px-6 lg:px-8">
             {entries.map((entry, index) => {
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)

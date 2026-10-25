@@ -246,7 +246,7 @@ export function Details({ children, label = "详细信息", className, open }: {
 /** Long hex ids show their first 10 characters; a click reveals the rest. */
 function LongId({ value }: { value: string }) {
   const [full, setFull] = useState(false)
-  return <button type="button" className="w-fit text-left font-mono text-foreground break-all" title={full ? undefined : value} aria-expanded={full} onClick={() => setFull(!full)}>{full ? value : `${value.slice(0, 10)}…`}</button>
+  return <button type="button" className="hit-area relative w-fit text-left font-mono text-foreground break-all" title={full ? undefined : value} aria-expanded={full} onClick={() => setFull(!full)}>{full ? value : `${value.slice(0, 10)}…`}</button>
 }
 
 export function DetailRow({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
@@ -298,31 +298,44 @@ function anchorSpace(anchor: HTMLElement | undefined) {
   return Math.max(0, window.innerHeight - Math.min(...tops))
 }
 
-/** Toasts rise from the bottom edge, above the composer when one is on screen, so they never cover the header or the first card. */
+/**
+ * Toasts rise from the bottom edge, above the composer when one is on screen, so they never cover the header or the first card.
+ * Over a composer they publish how far they reach above it as `--toast-cover`, so the list behind can end clear of them.
+ */
 export function Toaster() {
   const items = useSyncExternalStore((listener) => { toastListeners.add(listener); return () => { toastListeners.delete(listener) } }, () => toasts, () => toasts)
   const [space, setSpace] = useState(0)
+  const stack = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!items.length || typeof window === "undefined") return
+    const root = document.documentElement
     let anchor: HTMLElement | undefined
-    const resize = new ResizeObserver(() => setSpace(anchorSpace(anchor)))
+    function update() {
+      const next = anchorSpace(anchor)
+      setSpace(next)
+      // The stack sits 0.5rem above the anchor and whatever floats on top of it; offsetHeight ignores the entry slide.
+      const above = anchor ? next - (window.innerHeight - anchor.getBoundingClientRect().top) : 0
+      root.style.setProperty("--toast-cover", `${anchor && stack.current ? stack.current.offsetHeight + 8 + above : 0}px`)
+    }
+    const resize = new ResizeObserver(update)
+    if (stack.current) resize.observe(stack.current)
     // A sheet opening or closing changes which anchor counts, so the anchor is found again each time.
     function measure() {
       const next = toastAnchor()
       if (next !== anchor) {
         anchor = next
         resize.disconnect()
-        for (const element of anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : []) resize.observe(element)
+        for (const element of [...(stack.current ? [stack.current] : []), ...(anchor ? [anchor, ...anchor.querySelectorAll("[data-toast-above]")] : [])]) resize.observe(element)
       }
-      setSpace(anchorSpace(anchor))
+      update()
     }
     measure()
     const dialogs = new MutationObserver(measure)
     dialogs.observe(document.body, { childList: true, subtree: true, attributeFilter: ["data-state"] })
     window.addEventListener("resize", measure)
-    return () => { resize.disconnect(); dialogs.disconnect(); window.removeEventListener("resize", measure) }
+    return () => { resize.disconnect(); dialogs.disconnect(); window.removeEventListener("resize", measure); root.style.removeProperty("--toast-cover") }
   }, [items])
-  return <div aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
+  return <div ref={stack} aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {
       const Icon = item.icon ?? toastIcon[item.tone]
       return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
