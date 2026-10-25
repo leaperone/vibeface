@@ -635,7 +635,7 @@ pub enum EventBody {
     },
     /// Written by the device running the session, in the conversation of the bot that owns
     /// it from now on: the primary bot when the session first shows up without an owner, or
-    /// the bot the user hands it to. The latest by rank stands.
+    /// the bot its owner hands it to. The latest by rank stands.
     SessionAttributed {
         node: DeviceId,
         agent: String,
@@ -643,7 +643,7 @@ pub enum EventBody {
         cwd: String,
         summary: String,
     },
-    /// Written by the device running the session, in its owner's conversation: the user stopped
+    /// Written by the device running the session, in its owner's conversation: that bot stopped
     /// following it, and its events are dropped until it is handed to a bot again.
     SessionMuted {
         node: DeviceId,

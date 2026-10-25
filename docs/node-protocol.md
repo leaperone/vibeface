@@ -178,7 +178,6 @@
 | `codex_state` | 可选 `node` | App Server 状态摘要 `{connection, threads: [{thread_id, name, status, cwd, plan, reasoning, token_usage}], rate_limits}`；网页不调用 App Server 方法 |
 | `questions` | 无 | 全网未回答的提问：`{questions: [{question_id, severity, text, choices: [{label}], about, conversation_id, bot, author, created_at_ms, answer}]}` |
 | `answer` | `question_id`、`text`、`attestation` | 写该提问唯一的回答消息 `a-<question_id>`，签名作用域是提问所在会话。会话里的回答按 `answer` 触发准入，或转交调度 Node。返回 `{status, question_id, message, receipt}`；已有不同回答时 `status = "already_answered"`，返回已有回答 |
-| `session_owner` | `node`、`session_id`、`conversation_id`（`null` 为不再关注） | 本人把外来会话转给某个 Bot 或不再关注；运行该会话的设备写 `session_attributed`/`session_muted`，不在本机时经 peer RPC 转过去。状态已成立时不写。返回 `{session_id, conversation_id, muted, changed}` |
 | `resolve` | `conversation_id`、`check_id`、工作项另带 `outcome` 与可选备注 | 本人一键结清：管理进程确认已停止；工作项写一条带本人签名的 `WorkFinished`。不重做原触发 |
 | `upload_attachment` | `conversation_id`、`hash`、`size`、`offset`、`data` | 按 1 MiB 分块上传附件，返回已落盘的偏移 |
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
@@ -235,7 +234,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；只有会话当前所属的 Bot 能操作，运行该会话的设备写入，状态已成立时不写、重试只读回，返回 `{node, session_id, conversation_id, muted, changed}`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 
@@ -367,6 +366,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `interrupt_work` | 停止目标上的工作 |
 | `codex_state` | 转发本人读状态，要求 `human: true` |
 | `codex_respond` | 另一台设备的 Bot 应答本设备挂起的 App Server 请求，同一请求只应答一次 |
+| `hand_over_session` | 另一台设备上的 Bot 转交或不再关注本设备运行的会话，带发起 Bot 的会话 `from`；本设备核对归属后写入，状态已成立时不写 |
 | `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 

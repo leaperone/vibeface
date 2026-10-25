@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -84,7 +84,7 @@ export function ConversationScreen() {
   const folded = foldAnswers(data?.messages ?? [], questions)
   const asides = placeByTime(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
-    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <HandoffRow session={session} /> })),
+    ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <SessionRow session={session} /> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
 
@@ -294,46 +294,17 @@ function TaskMeta({ device, here, state, quiet = false, className = '' }: { devi
   </span>
 }
 
-/** A session no bot started that this bot looks after: hand it to another bot, or stop following it. */
-function HandoffRow({ session }: { session: SessionHandoff }) {
-  const workspace = useWorkspace()
-  const [busy, setBusy] = useState(false)
-  const [failure, setFailure] = useState<unknown>(null)
-  const others = workspace.bots.filter((bot) => bot.conversation_id !== workspace.conversationId)
-  const disabled = !workspace.writable || busy
-  const handTo = async (target: string | null) => {
-    setBusy(true)
-    setFailure(null)
-    try {
-      await workspace.setSessionOwner(session, target)
-      const bot = target && workspace.bots.find((item) => item.conversation_id === target)
-      toast(bot ? `已转给「${bot.name}」` : target ? '已重新关注' : '已不再关注', { tone: 'success' })
-    } catch (caught) { setFailure(caught) }
-    finally { setBusy(false) }
-  }
+/** A session no bot started that this bot looks after. Bots hand sessions to each other themselves; the row only shows it. */
+function SessionRow({ session }: { session: SessionHandoff }) {
   const Icon = session.muted ? BellOff : ArrowDownToLine
-  const follow = session.muted ? '重新关注' : '不再关注'
-  return <div className="grid gap-1">
-    <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
-      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
-      <span className="grid min-w-0 flex-1">
-        <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-        <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
-          <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
-        </span>
+  return <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
+    <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
+    <span className="grid min-w-0 flex-1">
+      <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
+      <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
+        <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
       </span>
-      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50 max-md:size-11 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
-        <ArrowRightLeft aria-hidden="true" className="size-4" />
-        <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
-          <option value="" disabled>转给…</option>
-          {others.map((bot) => <option key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</option>)}
-        </select>
-      </label> : null}
-      <Button type="button" variant="ghost" size="icon" className="size-9 text-muted-foreground max-md:size-11" aria-label={follow} title={follow} disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>
-        {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : session.muted ? <Bell aria-hidden="true" /> : <BellOff aria-hidden="true" />}
-      </Button>
-    </div>
-    <InlineError error={failure} className="ps-3" />
+    </span>
   </div>
 }
 
