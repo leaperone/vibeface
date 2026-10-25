@@ -2,7 +2,7 @@ import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
 import { Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
+import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
@@ -30,8 +30,9 @@ export default function Settings() {
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once. */}
-      <Segmented snap options={themes} value={current} onChange={(value) => Uniwind.setTheme(value)} />
+      {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
+          UIKit gets the same style, so native glass like the back button turns with the page instead of re-sampling it later. */}
+      <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
     </Section>
     {/* Beside the sidebar its footer already shows the connection. */}
     {wide ? null : <Section icon={Globe} title="连接">
