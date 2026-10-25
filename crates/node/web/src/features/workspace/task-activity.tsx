@@ -1,6 +1,6 @@
 "use client"
 
-import { useId, useState } from "react"
+import { useId, useState, type ReactNode } from "react"
 import { Link } from "@tanstack/react-router"
 import { ChevronRight, CircleQuestionMark, CircleStop, Cpu, Unplug, WifiOff } from "lucide-react"
 import { ActionCard, BotAvatar, DetailRow, Details, toast } from "@/components/app/kit"
@@ -54,7 +54,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const botOf = (work: WorkCheck) => inbox ? workspace.bots.find((item) => item.conversation_id === work.conversation_id) : undefined
   // In the chat this card stands in for the task, so its title opens the task.
   const chatBot = inbox ? undefined : workspace.selectedBot
-  const taskLink = (work: WorkCheck, title: string, className = "") => chatBot ? <Link to="/b/$botId/work/$workId" params={{ botId: chatBot.bot_id, workId: work.work_id }} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
+  const taskLink = (work: WorkCheck, title: ReactNode, className = "") => chatBot ? <Link to="/b/$botId/work/$workId" params={{ botId: chatBot.bot_id, workId: work.work_id }} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
   if (check.kind === "device") return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.works.length} 个任务`}
@@ -66,8 +66,8 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
         const bot = botOf(work)
         return <li key={work.work_id} className="flex min-h-13 min-w-0 items-center gap-3 py-2 ps-3 pe-2">
           <span className="grid min-w-0 flex-1">
-            <span className="line-clamp-2 font-medium [overflow-wrap:anywhere]" title={work.title}>{taskLink(work, work.title || "任务结果")}</span>
-            {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
+            <span className="font-medium [overflow-wrap:anywhere]" title={work.title}>{taskLink(work, <span className="line-clamp-2">{work.title || "任务结果"}</span>, "max-md:block max-md:py-2.5")}</span>
+            {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
               <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
           </span>
           <span className="flex shrink-0 gap-1.5">

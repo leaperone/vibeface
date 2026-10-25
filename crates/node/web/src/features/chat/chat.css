@@ -26,6 +26,11 @@
 .md-fold svg { transition: rotate 150ms var(--ease-out); }
 .md-fold[aria-expanded="true"] svg { rotate: 180deg; }
 .md-fold[aria-expanded="true"] .md-fold-more, .md-fold[aria-expanded="false"] .md-fold-less { display: none; }
+/* .md-code clips overflow, so a hit-area cannot reach past it; on a phone the controls take the full 44px themselves. */
+@media (width < 48rem) {
+  .md-code-head { padding-block: 0; }
+  .md-code-head button, .md-fold { min-height: 2.75rem; }
+}
 .md-table { overflow-x: auto; }
 .md table { border-collapse: collapse; font-size: 14px; }
 .md th, .md td { border: 1px solid var(--border); padding: .25rem .5rem; text-align: start; }
