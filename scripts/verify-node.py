@@ -534,7 +534,7 @@ class Node:
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
-        self.configure_network(bind=f"127.0.0.1:{self.port}")
+        self.configure_network(bind="127.0.0.1:0")
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
                                 capture_output=True, timeout=15)
         require(result.returncode == 0, f"{name}: local access material is available")
