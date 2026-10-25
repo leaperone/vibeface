@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
 import { ArrowRightLeft, Bot, ChevronRight, Copy, Crown, Info, Laptop, Monitor, MonitorSmartphone, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
-import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, StatusPill, toast, useAction } from "@/components/app/kit"
+import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -45,7 +45,7 @@ export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): Luc
 }
 
 function Tag({ children }: { children: ReactNode }) {
-  return <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
+  return <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
 /** `compact`: the list names only the exception, so an online row shows the dot alone. */
@@ -132,7 +132,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-          {row.admin ? <StatusPill icon={Crown}>管理员</StatusPill> : null}
+          {row.admin ? <Tag><Crown aria-hidden="true" className="size-3.5" />管理员</Tag> : null}
         </div>
         {row.online === false ? <p className="text-meta text-muted-foreground">确认它开着，并且和这台设备网络互通</p> : null}
       </div>
