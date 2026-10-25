@@ -36,6 +36,8 @@ cd vibeface-<version>-<target>
 
 发布构建脚本把本机源码、用户目录和工具缓存路径替换成通用路径；压缩包清除构建账号和扩展属性。`--skip-build` 不处理已有程序中的路径，正式发布须重新构建。
 
+自定义 Rust 编译参数通过 `RUSTFLAGS` 或 `CARGO_ENCODED_RUSTFLAGS` 传入，后者优先。发布脚本保留这些参数并追加路径映射；按 Cargo 的优先级，此时不使用配置文件中的 `rustflags`。
+
 运行任务前须另装并登录相应 Provider。Cursor 管理路径需另装 Cursor SDK Bridge 并配置凭证。初始化、配对、服务安装和公网 TLS 见 [Node 使用说明](node.md)。
 
 ## CI 验证范围
