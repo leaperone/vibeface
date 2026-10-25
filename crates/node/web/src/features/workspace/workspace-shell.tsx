@@ -282,7 +282,9 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
     <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} />{status ? <span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden">{status}</span> : null}</div>
       {offline ? <div className="my-auto"><EmptyState icon={WifiOff} title="连不上设备" action={<div className="grid justify-items-center gap-3">
-        <p className="flex items-center gap-1 text-meta text-muted-foreground"><span role="status">{retrying ? "正在重连" : `${shown.current} 秒后自动重试`}</span>
+        <p className="flex items-center gap-1 text-meta text-muted-foreground"><span aria-hidden={retrying || undefined}>{retrying ? "正在重连" : `${shown.current} 秒后自动重试`}</span>
+          {/* The countdown ticks every second, so only the state change is announced. */}
+          <span role="status" className="sr-only">{retrying ? "正在重连" : "连不上设备"}</span>
           {onRetry ? <Button type="button" variant="ghost" size="icon-sm" className="hit-area relative text-muted-foreground" aria-label="立即重连" title="立即重连" disabled={retrying} aria-busy={retrying || undefined}
             onClick={() => { setRetrying(true); onRetry() }}><RefreshCw aria-hidden="true" className={cn(retrying && "animate-spin")} /></Button> : null}
         </p>

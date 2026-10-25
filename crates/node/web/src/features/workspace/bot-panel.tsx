@@ -24,7 +24,9 @@ export function BotPanelButton() {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const [open, setOpen] = useState(false)
-  const trigger = useRef<HTMLButtonElement>(null)
+  // 取消 removes itself; focus goes back to the control that asked, or it would fall into the sheet's frame.
+  const refocus = useRef<string | null>(null)
+  const returnFocus = (key: string) => (node: HTMLElement | null) => { if (node && refocus.current === key) { refocus.current = null; node.focus() } }
   const [gaps, setGaps] = useState<Gap[]>([])
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
@@ -51,11 +53,11 @@ export function BotPanelButton() {
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   return <>
-    <Button ref={trigger} type="button" variant="ghost" size="icon" className="-ms-1 shrink-0 rounded-lg hover:bg-transparent hover:brightness-95 dark:hover:brightness-110" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
+    <Button type="button" variant="ghost" size="icon" className="-ms-1 shrink-0 rounded-lg hover:bg-transparent hover:brightness-95 dark:hover:brightness-110" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => setOpen(true)}>
       <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} />
     </Button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
-      <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => { event.preventDefault(); trigger.current?.focus() }}>
+      <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md">
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
           <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
           <span className="grid min-w-0 gap-0.5">
@@ -95,13 +97,13 @@ export function BotPanelButton() {
                   {detail ? <span className="basis-full truncate" title={detail}>{detail}</span> : null}
                 </span>}>
                 {confirming === schedule.schedule_id ? <>
-                  <Button type="button" variant="ghost" autoFocus onClick={() => setConfirming(null)}>取消</Button>
+                  <Button type="button" variant="ghost" autoFocus onClick={() => { refocus.current = schedule.schedule_id; setConfirming(null) }}>取消</Button>
                   <ActionButton variant="destructive" disabled={!workspace.writable} action={() => remove(schedule, index)}>删除</ActionButton>
                 </> : <span className="-me-2 flex">
                   <ActionButton variant="ghost" label={schedule.enabled ? "暂停" : "恢复"} disabled={!workspace.writable} action={() => workspace.controlSchedule(schedule.schedule_id, schedule.enabled ? "pause" : "resume")}>
                     {schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}
                   </ActionButton>
-                  <Button type="button" variant="ghost" size="icon" aria-label="删除" title="删除" disabled={!workspace.writable} onClick={() => setConfirming(schedule.schedule_id)}>
+                  <Button ref={returnFocus(schedule.schedule_id)} type="button" variant="ghost" size="icon" aria-label="删除" title="删除" disabled={!workspace.writable} onClick={() => setConfirming(schedule.schedule_id)}>
                     <Trash2 aria-hidden="true" />
                   </Button>
                 </span>}
@@ -115,9 +117,9 @@ export function BotPanelButton() {
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}
           <SettingsGroup>
-            <SettingsRow icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录保留" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
+            <SettingsRow ref={returnFocus("bot")} icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录保留" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
               {deleting ? <>
-                <Button type="button" variant="ghost" autoFocus onClick={() => setDeleting(false)}>取消</Button>
+                <Button type="button" variant="ghost" autoFocus onClick={() => { refocus.current = "bot"; setDeleting(false) }}>取消</Button>
                 <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); toast(`已删除「${bot.name}」`, { tone: "success" }); setOpen(false); void navigate({ to: "/" }) }}>删除</ActionButton>
               </> : null}
             </SettingsRow>
