@@ -431,7 +431,68 @@ def self_test():
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
     release_privacy_test(root, scratch)
+    gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def gatekeeper_test(root, scratch):
+    import sys
+    import textwrap
+
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    step = workflow.split("      - name: Verify Developer ID signature\n", 1)[1]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+    accepted = (0, "Notarized Developer ID")
+    pending = (3, "Unnotarized Developer ID")
+    cases = (
+        ("accepted", [accepted], False, 0),
+        ("pending-accepted", [pending, accepted], False, 0),
+        ("pending-exhausted", [pending] * 4, False, 3),
+        ("other-status", [(2, pending[1])], False, 2),
+        ("other-source", [(3, "fixture rejection")], False, 3),
+        ("wrong-success-source", [(0, pending[1])], False, 1),
+        ("binary-changed", [accepted], True, 1),
+    )
+    with tempfile.TemporaryDirectory(prefix="gatekeeper-", dir=scratch) as directory:
+        fixture = Path(directory)
+        tools = fixture / "bin"
+        tools.mkdir()
+        stub = tools / "stub"
+        stub.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import json, os, sys
+            from pathlib import Path
+            tool = Path(sys.argv[0]).name
+            binary = Path(os.environ["PACKAGE"]) / "vibeface"
+            if tool == "codesign":
+                if sys.argv[1:] == ["--verify", "--strict", str(binary)]:
+                    sys.exit(0)
+                assert sys.argv[1:] == ["-dvvv", str(binary)]
+                print("Identifier=cn.leaperone.vibeface\\nTeamIdentifier=FIXTURETEAM\\nCodeDirectory flags=0x10000(runtime)")
+            elif tool == "spctl":
+                assert sys.argv[1:] == ["-a", "-vvv", "--ignore-cache", "--no-cache", "-t", "open", "--context", "context:primary-signature", str(binary)]
+                state = Path(os.environ["RUNNER_TEMP"]) / "calls"
+                index = int(state.read_text()) if state.exists() else 0
+                state.write_text(str(index + 1))
+                status, source = json.loads(os.environ["FIXTURE_ASSESSMENTS"])[index]
+                if os.environ["FIXTURE_MUTATE"] == "true":
+                    binary.write_text("changed")
+                print("source=" + source)
+                sys.exit(status)
+            else:
+                assert tool == "sleep" and sys.argv[1:] == ["15"]
+            '''))
+        stub.chmod(0o755)
+        for tool in ("codesign", "spctl", "sleep"):
+            (tools / tool).symlink_to(stub)
+        for name, assessments, mutate, expected in cases:
+            case = fixture / name
+            case.mkdir()
+            (case / "vibeface").write_text("original")
+            environment = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", PACKAGE=str(case), RUNNER_TEMP=str(case), VIBEFACE_CODESIGN_TEAM="FIXTURETEAM", FIXTURE_ASSESSMENTS=json.dumps(assessments), FIXTURE_MUTATE=json.dumps(mutate))
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"], input=script, env=environment, text=True, capture_output=True)
+            assert result.returncode == expected, (name, result.returncode, result.stdout, result.stderr)
+            assert int((case / "calls").read_text()) == len(assessments), name
+    print("Gatekeeper workflow control-flow self-tests passed; native assessment remains required")
 
 
 def release_privacy_test(root, scratch):
