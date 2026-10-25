@@ -169,6 +169,15 @@ impl Delivery {
             }
             let current_label=current_key_label(&config)?;
             let current=store.value(&current_label)?.map(|bytes|serde_json::from_slice::<ReceivingMaterial>(&bytes)).transpose()?;
+            if action == KeyAction::Rotate {
+                let confirmed_active = match &current {
+                    Some(material) => material.binding.binding.action == BindingAction::Active
+                        && registry.active
+                        && registry_matches(&material.binding.binding, registry)?,
+                    None => false,
+                };
+                ensure!(confirmed_active, "rotate-key requires a confirmed active receiving key; use register-key to enable receiving");
+            }
             let expected=if action==KeyAction::Revoke {BindingAction::Revoked}else{BindingAction::Active};
             let reusable=current.as_ref().is_some_and(|material|action==KeyAction::Register && material.binding.binding.action==BindingAction::Active
                 && material.binding.binding.serial>registry.serial
@@ -441,6 +450,58 @@ mod tests {
             active: binding.action == BindingAction::Active,
         }
     }
+    fn reservation_counts(node: &Delivery) -> (u64, u64, u64) {
+        node.with_store(|store| {
+            let db = rusqlite::Connection::open_with_flags(
+                store.root().join("service.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            Ok(db.query_row(
+                "SELECT (SELECT count(*) FROM private_values),(SELECT count(*) FROM proof_jobs),(SELECT count(*) FROM transactions)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?)
+        }).unwrap()
+    }
+    #[test]
+    fn rotation_without_a_confirmed_current_key_reserves_nothing() {
+        for (local_material, foreign_active) in [(false, false), (true, false), (true, true)] {
+            let (node, _, dir) = node();
+            let current = local_material.then(|| node.key_binding(Mode::Paid).unwrap());
+            let mut registry = chain::KeyRecord {
+                binding_hash: [0; 32],
+                serial: 0,
+                valid_from: 0,
+                valid_until: 0,
+                active: false,
+            };
+            if foreign_active {
+                registry = record(&current.as_ref().unwrap().binding);
+                registry.binding_hash[0] ^= 1;
+            }
+            let before = reservation_counts(&node);
+            let error = node
+                .reserve_key_operation(
+                    &uuid::Uuid::new_v4().to_string(),
+                    KeyAction::Rotate,
+                    "1000000000000000",
+                    &registry,
+                )
+                .err()
+                .expect("rotation requires a confirmed current key");
+            assert_eq!(
+                error.to_string(),
+                "rotate-key requires a confirmed active receiving key; use register-key to enable receiving"
+            );
+            assert_eq!(reservation_counts(&node), before);
+            assert!(node.pending_key_operation().unwrap().is_none());
+            if let Some(current) = current {
+                assert_eq!(node.key_binding(Mode::Paid).unwrap(), current);
+            }
+            drop(node);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
     #[test]
     fn receiving_key_intents_keep_the_same_binding_across_retries_and_restarts() {
         let (node, identity, dir) = node();
@@ -484,8 +545,11 @@ mod tests {
         );
         drop(node);
         let node = Delivery::open(&dir, identity).unwrap();
+        let mut revoked = current;
+        revoked.active = false;
+        revoked.serial += 2;
         let retry = node
-            .reserve_key_operation(&intent, KeyAction::Rotate, "1000000000000000", &current)
+            .reserve_key_operation(&intent, KeyAction::Rotate, "1000000000000000", &revoked)
             .unwrap();
         assert_eq!(retry.binding, operation.binding);
         assert_eq!(retry.transaction_id(), operation.transaction_id());
@@ -552,6 +616,26 @@ mod tests {
             node.key_binding(Mode::Paid).unwrap().binding.serial,
             revoke.binding.binding.serial
         );
+        let before = reservation_counts(&node);
+        let rejected = node
+            .reserve_key_operation(
+                &uuid::Uuid::new_v4().to_string(),
+                KeyAction::Rotate,
+                "1000000000000000",
+                &record(&revoke.binding.binding),
+            )
+            .err()
+            .expect("revoked receiving keys require a new register intent");
+        assert_eq!(
+            rejected.to_string(),
+            "rotate-key requires a confirmed active receiving key; use register-key to enable receiving"
+        );
+        assert_eq!(reservation_counts(&node), before);
+        assert_eq!(
+            node.pending_key_operation().unwrap().unwrap().intent_id,
+            revoke.intent_id
+        );
+        assert_eq!(node.key_binding(Mode::Paid).unwrap(), revoke.binding);
         for binding in [&old.binding, &rotate.binding.binding] {
             assert_eq!(
                 receiving_public(&node.receiver_secret(binding.key_id).unwrap()).unwrap(),

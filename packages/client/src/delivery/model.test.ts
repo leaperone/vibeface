@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, parseOrder, parseReceived, parseStatus, sha256, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -44,6 +44,17 @@ test('paid accounting remains exact above Number precision and rejects overspend
   assert.throws(() => parseOrder({ ...order(), evidence: 'decryption_proven' }))
   assert.throws(() => parseOrder({ ...order(), phase: 'success' }))
   assert.throws(() => parseOrder({ ...order(), role: 'provider' }))
+})
+
+test('uncertain chain results label retained settlement amounts as the last record rather than current receipts', () => {
+  const paid = paidOrder()
+  const confirmed = parseOrder({ ...paid, phase: 'paid', payment: { ...paid.payment, state: 'withdrawn', earned: paid.payment.total, withdrawn: paid.payment.total } })
+  const uncertain = parseOrder({ ...confirmed, phase: 'reconciling', evidence: 'none', payment: { ...confirmed.payment, state: 'unknown' } })
+  assert.equal(settlementAmountsLabel(confirmed), '已赚取 / 已提款 / 已退款')
+  assert.equal(settlementAmountsLabel(uncertain), '上次记录（赚取 / 提款 / 退款，到账待确认）')
+  assert.equal(uncertain.payment.withdrawn, confirmed.payment.withdrawn)
+  assert.equal(settlementAmountsLabel({ ...confirmed, phase: 'failed' }), settlementAmountsLabel(uncertain))
+  assert.equal(settlementAmountsLabel({ ...confirmed, payment: { ...confirmed.payment, state: 'failed' } }), settlementAmountsLabel(uncertain))
 })
 
 test('a received file is saved only after exact content, length, name and digest agree', async () => {

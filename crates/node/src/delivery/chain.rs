@@ -570,7 +570,7 @@ impl Chain {
         Ok(intent)
     }
 
-    pub async fn broadcast(&self, transaction: &SignedBytes) -> Result<String> {
+    async fn broadcast(&self, transaction: &SignedBytes) -> Result<String> {
         let raw = hex_data(
             &Value::String(transaction.raw_tx.clone()),
             MAX_CALLDATA_BYTES + 1024,
@@ -617,7 +617,7 @@ impl Chain {
             );
             wallet.address()?
         };
-        let mut transaction = if let Some(transaction) = existing {
+        let transaction = if let Some(transaction) = existing {
             let (target, calldata) = encode_call(&self.config, call, wallet)?;
             ensure!(
                 transaction.intent.to == address_hex(target)
@@ -626,7 +626,6 @@ impl Chain {
                     && transaction.intent.gas_cap == gas_cap,
                 "delivery spend intent changed; reconcile the original authorization"
             );
-            checked_transaction(&self.config, &transaction.intent, wallet, transaction.nonce)?;
             transaction
         } else {
             delivery.authorize_spend(id).await?;
@@ -658,8 +657,18 @@ impl Chain {
                 .sign_transaction(&self.config, &transaction.intent, transaction.nonce)?;
             delivery
                 .with_store(|store| store.sign_transaction(id, &signed.raw_tx, &signed.tx_hash))?;
-            transaction = delivery.with_store(|store| store.transaction(id))?;
         }
+        self.reconcile_transaction(delivery, id).await
+    }
+
+    pub(super) async fn reconcile_transaction(
+        &self,
+        delivery: &super::Delivery,
+        id: &str,
+    ) -> Result<TxObservation> {
+        let transaction = delivery.with_store(|store| store.transaction(id))?;
+        let wallet = address(&transaction.intent.wallet)?;
+        checked_transaction(&self.config, &transaction.intent, wallet, transaction.nonce)?;
         let mut result = self.observe(&transaction).await.unwrap_or_else(|_| {
             observation(
                 "unknown",

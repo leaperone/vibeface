@@ -72,12 +72,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 ulimit -s 16384
-mkfifo "$temporary/witness"
-/opt/vdp/bin/stark_verify "$work/input.json" "$temporary/witness" \
+mkfifo "$temporary/witness.wtns"
+/opt/vdp/bin/stark_verify "$work/input.json" "$temporary/witness.wtns" \
   >"$temporary/generator.stdout" 2>"$temporary/generator.stderr" &
 generator_pid=$!
 /opt/vdp/bin/prover /opt/vdp/gnark/stark_verify.cs /opt/vdp/gnark/stark_verify_final.pk.dmp \
-  "$temporary/witness" "$temporary/proof.json" \
+  "$temporary/witness.wtns" "$temporary/proof.json" \
   >"$temporary/prover.stdout" 2>"$temporary/prover.stderr" &
 prover_pid=$!
 

@@ -4,7 +4,7 @@ import { Switch, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { canRead, canRestart, changeMode, deadlineRows, evidenceLabels, paymentLabels, phaseLabels, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { canRead, canRestart, changeMode, deadlineRows, evidenceLabels, paymentLabels, phaseLabels, settlementAmountsLabel, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { Acceptance, DeliveryDraft, DeliveryMode, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { ErrorText } from '@/components/action'
 import { EmptyState } from '@/components/kit'
@@ -99,7 +99,7 @@ function OrderDetails({ order, busy, canManage, walletReady, confirm, accept, re
       <Info label="测试链 ID" value={order.payment.chain_id ?? ''} /><Info label="测试资产合约" value={order.payment.asset ?? ''} /><Info label="付款钱包" value={order.payment.payer ?? ''} /><Info label="固定收款钱包" value={order.payment.provider_wallet ?? ''} />
       <View className="gap-3 border-y border-border py-3">
         <Info label="传输费" value={order.payment.delivery_fee} /><Info label="暂存预留费" value={order.payment.reservation_fee} /><Info label="时效优先费" value={order.payment.priority_fee} /><Info label="服务费合计（最小单位）" value={order.payment.total} /><Info label="链费上限（原生币最小单位）" value={order.payment.gas_cap} />
-        <Info label="已赚取 / 已提款 / 已退款" value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
+        <Info label={settlementAmountsLabel(order)} value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
       </View>
       {deadlineRows(order).map(([label, value]) => <Info key={label} label={label} value={value} />)}
       <Text className="text-meta text-muted-foreground">时效优先费只有在其截止前完成整单才赚取。过了时效截止，仍可在结算硬截止前完成交付。暂存费支付容量预留，不代表持续存储证明。</Text>

@@ -62,6 +62,28 @@ export RISC0_SERVER_PATH=/absolute/path/to/verified/r0vm
 
 The host directly constructs ExternalProver with this trusted local binary. It never selects Bonsai or an automatic remote backend. It rejects RISC0_DEV_MODE, Fake receipts, unsuccessful execution, unresolved assumptions, wrong image and wrong journal. `execute` reports cycles and `proved=false`. `prove` verifies a real succinct receipt, compresses it to Groth16, verifies again and exports a public seal with the verifier selector.
 
+At startup the host sets its process umask to `077`, before starting any child process. The local r0vm and its compression command inherit this mask, so Rust tempfile directories are created with mode `0700` and their files remain private. This does not depend on the calling shell's umask or relax the compression sandbox's permission checks.
+
+### Explicit compression diagnostics
+
+The normal two-argument `prove <new-receipt-path>` command and its eight public output fields are unchanged. For a diagnostic run, an explicit optional flag saves the verified Succinct receipt before Groth16 compression:
+
+```sh
+"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" prove .artifacts/delivery-proof/source.receipt --succinct-receipt .artifacts/delivery-proof/source.succinct.receipt < .artifacts/delivery-proof/source.private.json
+```
+
+Both output paths must be new and distinct. The checkpoint is atomically published with mode `0600`, after verification against this build's image and the exact statement journal. It remains available if compression fails. The Node's default call does not request this checkpoint or allocate additional intermediate storage.
+
+Retry only compression from an existing checkpoint with its expected public statement journal:
+
+```sh
+"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" compress .artifacts/delivery-proof/source.retry.receipt "<expected-public-journal-hex>" < .artifacts/delivery-proof/source.succinct.receipt
+```
+
+`compress` reads a bincode Receipt on stdin, limited to 16 MiB with trailing bytes rejected. It accepts only a genuine Succinct receipt for this compiled image, successful execution without unresolved assumptions, and the specified canonical statement journal. It rejects Fake, Groth16, corrupted or mismatched input before invoking the local compression prover. The new Groth16 receipt is verified and atomically published with mode `0600`; an existing destination, including a symlink, is never overwritten.
+
+Diagnostic success emits exactly seven public fields: `mode="compress"`, `kind="groth16"`, `imageId`, `relation`, `journal`, `journalHash`, and `seal`. It does not rerun guest execution or generate a new Succinct proof. This output omits `profileId` and is not automatically accepted as the eight-field `prove` public fixture. Neither checkpoint creation nor a failed compression counts as a Groth16 proof.
+
 Do not call a source native test or guest execution a genuine proof. Run incorrect witnesses before expensive proof generation. Check a complete 64 KiB window and both windows of a two-window manifest against the actual compiled image.
 
 The profile's maxProverMemoryBytes is a signed limit. It is not OS enforcement. A Linux cgroup must include the local r0vm and the Groth16 prover. A Docker wrapper launched through a host Docker socket becomes a sibling container and needs its own explicit bound. Putting only the host process inside a container does not prove the whole job stayed within the profile. macOS RLIMIT_RSS is not a substitute.

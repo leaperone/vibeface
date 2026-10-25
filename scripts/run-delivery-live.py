@@ -198,6 +198,17 @@ def public_exports(run):
     return value
 
 
+def checked_capacity_case(report):
+    case = report.get("cases", {}).get("two-window-source-hold-open-and-original-file")
+    if report.get("status") != "passed" or not isinstance(case, dict):
+        raise ValueError("Maximum-file evidence requires the successful actual paid case")
+    if any(type(case.get(name)) is not int or case[name] != 130_816 for name in ("bytes", "max_file_bytes")):
+        raise ValueError("Paid file evidence must cover the actual advertised 130816-byte boundary")
+    if case.get("capacity_boundary") is not True or not isinstance(case.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", case["sha256"]):
+        raise ValueError("Paid file capacity evidence or SHA-256 is invalid")
+    return {"bytes": case["bytes"], "maxFileBytes": case["max_file_bytes"], "capacityBoundary": True, "sha256": case["sha256"]}
+
+
 def inside(package, expected):
     if ROOT != Path("/work") or os.uname().machine != "x86_64" or os.environ.get("TOKIO_WORKER_THREADS") != "2":
         raise ValueError("Live acceptance requires the canonical Linux sandbox and two Tokio worker threads")
@@ -249,10 +260,11 @@ def inside(package, expected):
                 "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
                 "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/proofs/delivery/profile.json"], log, env=environment)
         results = list((run / "process").glob("delivery-paid-*/summary.json"))
-        if len(results) != 1 or json.loads(regular(results[0])).get("status") != "passed":
-            raise ValueError("Actual paid process acceptance did not report success")
+        if len(results) != 1:
+            raise ValueError("Expected exactly one actual paid process acceptance result")
+        original_file = checked_capacity_case(json.loads(regular(results[0])))
         public_exports(results[0].parent)
-        summary.update(status="PASS", genuineProofs=7, earned="29", withdrawn="29", readOnlyObserver=True)
+        summary.update(status="PASS", genuineProofs=7, earned="29", withdrawn="29", readOnlyObserver=True, originalFile=original_file)
     finally:
         final, delta, resource_failure = None, None, None
         try:
@@ -276,6 +288,7 @@ def inside(package, expected):
 
 
 def self_test():
+    from copy import deepcopy
     from unittest.mock import patch
     checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
     _, original = checks["sandbox_commands"](Path("/context"))
@@ -298,6 +311,23 @@ def self_test():
             pass
         else:
             raise AssertionError("Decreasing, missing or invalid OOM counters must fail")
+    case_name = "two-window-source-hold-open-and-original-file"
+    report = {"status": "passed", "cases": {case_name: {"bytes": 130_816, "max_file_bytes": 130_816, "capacity_boundary": True,
+              "sha256": "a" * 64, "name": "private-name", "content_base64": "private-content", "witness": "private-witness",
+              "private_path": "/private/node", "raw_transaction": "private-transaction"}}}
+    assert checked_capacity_case(report) == {"bytes": 130_816, "maxFileBytes": 130_816, "capacityBoundary": True, "sha256": "a" * 64}
+    invalid_reports = [{**report, "status": "failed"}, {"status": "passed", "cases": {}}]
+    for field, value in (("bytes", 98_304), ("max_file_bytes", 98_304), ("bytes", 130816.0), ("capacity_boundary", 1), ("capacity_boundary", False), ("sha256", "A" * 64), ("sha256", "a" * 63)):
+        changed = deepcopy(report)
+        changed["cases"][case_name][field] = value
+        invalid_reports.append(changed)
+    for changed in invalid_reports:
+        try:
+            checked_capacity_case(changed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Failed, old-size or invalid capacity evidence must not be exported as success")
     with tempfile.TemporaryDirectory(prefix="live-self-test-", dir=ARTIFACTS) as directory:
         file = Path(directory) / "private.json"
         write_private(file, {"configured": True})
@@ -345,7 +375,7 @@ def self_test():
             else:
                 raise AssertionError("A different crypto artifact must fail")
     assert len(PROOFS) == len(set(PROOFS)) == 7
-    print("Live dispatch, OOM counters, protected configuration and GLIBC classification self-tests passed; no runtime or proof ran")
+    print("Live dispatch, capacity evidence, OOM counters, protected configuration and GLIBC classification self-tests passed; no runtime or proof ran")
 
 
 if __name__ == "__main__":

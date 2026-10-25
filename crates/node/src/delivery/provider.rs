@@ -699,37 +699,11 @@ impl Delivery {
         }
         let chain = self.chain().await?;
         if let Some(transaction) = transaction {
-            let observed = chain.observe(&transaction).await?;
-            self.with_store(|store| {
-                store.observe_transaction(
-                    &transaction.intent.id,
-                    &observed.phase,
-                    observed.block_number,
-                    observed.block_hash.as_deref(),
-                    observed.error.as_deref(),
-                )
-            })?;
+            let observed = chain
+                .reconcile_transaction(self, &transaction.intent.id)
+                .await?;
             self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
                 .await?;
-            if matches!(observed.phase.as_str(), "unknown" | "submitted" | "reorged")
-                && matches!(self.wallet.lock().expect("delivery wallet").status(),wallet::WalletStatus::Unlocked{ref address} if address==&transaction.intent.wallet)
-            {
-                self.authorize_spend(&transaction.intent.id).await?;
-                if let (Some(raw_tx), Some(tx_hash)) = (transaction.raw_tx, transaction.tx_hash) {
-                    let phase = if chain
-                        .broadcast(&chain::SignedBytes { raw_tx, tx_hash })
-                        .await
-                        .is_ok()
-                    {
-                        "submitted"
-                    } else {
-                        "unknown"
-                    };
-                    self.with_store(|store| {
-                        store.observe_transaction(&transaction.intent.id, phase, None, None, None)
-                    })?;
-                }
-            }
         }
         if orders.is_empty() {
             return Ok(());

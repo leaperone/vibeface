@@ -2981,6 +2981,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "hex",
+ "libc",
  "risc0-zkvm",
  "serde_json",
  "vibeface-delivery",

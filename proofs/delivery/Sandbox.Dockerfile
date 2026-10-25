@@ -14,6 +14,7 @@ COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN set -eu; \
     ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm; \
     ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx; \
+    ln -s /opt/vdp/gnark/stark_verify.dat /opt/vdp/bin/stark_verify.dat; \
     curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
         https://github.com/risc0/risc0/releases/download/v3.0.6/cargo-risczero-x86_64-unknown-linux-gnu.tgz \
         --output /tmp/vdp-r0vm.tgz; \

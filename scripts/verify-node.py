@@ -4660,7 +4660,11 @@ def delivery_paid_run(options, configuration, deployment):
                restarted_wallet_locked=True, same_intent=True, proof_reservations=1, registry_transactions=1)
         passed("local-wallets-and-genuine-receiving-key-registration", wallets=3, chain_id=31337,
                two_confirmations=True, protected_passphrase_fd=True)
-        original = os.urandom(96 * 1024)
+        max_file_bytes = 130_816
+        require(delivery_call(source, "status")["max_file_bytes"] == max_file_bytes
+                and delivery_call(receiver, "status")["max_file_bytes"] == max_file_bytes,
+                "paid acceptance covers the exact advertised original-file capacity")
+        original = os.urandom(130_816)
         digest, name, intent = hashlib.sha256(original).hexdigest(), "private-paid-" + uuid.uuid4().hex + ".bin", str(uuid.uuid4())
         request = {"intent_id": intent, "receiver_peer": receiver.device_id, "provider_peer": provider.device_id,
                    "mode": "paid", "acceptance": "strict", "name": name,
@@ -4668,8 +4672,9 @@ def delivery_paid_run(options, configuration, deployment):
                    "max_gas_amount": configuration["source_gas_cap_wei"]}
         prepared = delivery_call(source, "prepare", **request)
         order_id = prepared["order_id"]
-        require(len(prepared["windows"]) == 2 and prepared["payment"]["total"] == "29",
-                "strict two-window quotation has exact delivery, reservation and priority fees")
+        require(prepared["bytes"] == max_file_bytes and len(prepared["windows"]) == 2
+                and prepared["payment"]["total"] == "29",
+                "maximum-capacity strict two-window quotation has the exact original length and fees")
         require(delivery_call(source, "prepare", **request)["order_id"] == order_id,
                 "same paid intent returns the existing order before authorization")
         changed = {**request, "content_base64": base64.b64encode(b"different").decode()}
@@ -4708,12 +4713,14 @@ def delivery_paid_run(options, configuration, deployment):
         final = wait_for("both genuine hold and open proofs settle strict delivery", completely_opened, timeout=32000)
         recovered = delivery_call(receiver, "read", order_id=order_id)
         data = base64.b64decode(recovered["content_base64"], validate=True)
-        require(data == original and recovered["name"] == name and recovered["sha256"] == digest,
-                "strict paid delivery returns the actual original file, private name and SHA-256")
+        require(len(data) == max_file_bytes and recovered["bytes"] == max_file_bytes
+                and data == original and recovered["name"] == name and recovered["sha256"] == digest,
+                "strict paid delivery returns the maximum-size original file, private name and SHA-256")
         require(final["payment"]["earned"] == "29" and final["payment"]["withdrawn"] == "29"
                 and final["payment"]["refunded"] == "0", "provider actually withdraws all exact earned service fees")
         passed("two-window-source-hold-open-and-original-file", order_id=order_id, windows=2,
-               bytes=len(data), sha256=digest, earned="29", withdrawn="29", evidence=final["evidence"])
+               bytes=len(data), max_file_bytes=max_file_bytes, capacity_boundary=True, sha256=digest,
+               earned="29", withdrawn="29", evidence=final["evidence"])
         register_rows = delivery_rows(receiver, "SELECT id,intent FROM transactions WHERE id=?",
                                       (f"key-{register_intent}/register",))
         require(len(register_rows) == 1, "receiving key has a unique registration transaction")

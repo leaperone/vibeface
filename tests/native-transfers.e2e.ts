@@ -97,12 +97,12 @@ test('receives a charity file through a real native pairing and verifies the sav
   assert(/^[0-9]{6}$/.test(code), 'Real pairing has a six digit safety code');
   await expect(screen.getByLabel(`安全码 ${code.split('').join(' ')}`)).toBeVisible();
   await network.call({ op: 'native_approve', peer: text(pairing.peer), code });
-  await expect(screen.getByRole('button', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
-  await screen.getByRole('button', '设置', { exact: true }).click();
-  await screen.scrollUntilVisible(screen.getByText('公益转发与实验付费交付', { exact: true }), { direction: 'down' });
-  await screen.getByText('公益转发与实验付费交付', { exact: true }).click();
-  await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible();
-  await expect(screen.getByText('未创建钱包。公益转发仍可使用。', { exact: true })).toBeVisible();
+  await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
+  await screen.getByRole('link', '设置', { exact: true }).click();
+  await screen.scrollUntilVisible(screen.getByRole('link', '公益转发与实验付费交付', { exact: true }), { direction: 'down' });
+  await screen.getByRole('link', '公益转发与实验付费交付', { exact: true }).click();
+  await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible();
+  await expect(screen.getByText('未创建钱包。公益转发仍可使用。', { exact: true }).first()).toBeVisible();
   const bytes = randomBytes(96 * 1024), name = 'native-charity-original.bin';
   const digest = createHash('sha256').update(bytes).digest('hex');
   const offered = await network.call({ op: 'native_send', name, content_base64: bytes.toString('base64') });
