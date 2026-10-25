@@ -8,7 +8,7 @@ import {
 } from '@/components/ui/message-scroller'
 
 import { useRef, type ReactNode } from 'react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */

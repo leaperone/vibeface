@@ -1,10 +1,10 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Bot, ChevronDown, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { EmptyState, InlineError, toast } from '@/components/app/kit'
+import { EmptyState, InlineError, Skeleton, toast } from '@/components/app/kit'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
@@ -57,7 +57,7 @@ function LogsPage() {
       toast(`已复制这个${what}的 ${all.length} 条记录`, { tone: 'success' })
     } catch (cause) { setError(cause) }
   }
-  if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
+  if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机页面能看" />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-4">
     <div className="flex items-center gap-2">
       <div className="relative min-w-0 flex-1">
@@ -84,7 +84,7 @@ function LogsPage() {
       })}
     </div>
     <InlineError error={error} />
-    {records === null ? null : records.length === 0
+    {records === null ? error ? null : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-12" /><Skeleton className="h-12" /><Skeleton className="h-12" /></div> : records.length === 0
       ? <EmptyState icon={ScrollText} title={level || sources.length || query ? "没有符合条件的记录" : "还没有日志"}
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>

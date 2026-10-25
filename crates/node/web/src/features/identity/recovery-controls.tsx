@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'

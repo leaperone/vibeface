@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router"
-import { Bot, Inbox, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
+import { Bot, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
 import { BotAvatar, CountBadge, EmptyState, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -7,6 +7,7 @@ import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
+import { terms } from "@/lib/glossary"
 import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 
@@ -34,7 +35,7 @@ export function ConversationList() {
   else if (!workspace.writable) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={Inbox} name="待处理" unread={open.length} preview={open[0]?.title ?? "没有要你处理的事"} />
+    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? "没有要你处理的事"} />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
