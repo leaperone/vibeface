@@ -36,7 +36,7 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-const modes: [AppServerMode, string, LucideIcon][] = [["system", "用已在运行的", Monitor], ["spawn", "自己启动", Play]]
+const modes: [AppServerMode, string, LucideIcon][] = [["system", "用已在运行的", Monitor], ["spawn", "由 Vibeface 启动", Play]]
 const spawnServer = { mode: "spawn", socket: null } as const
 
 /** One line for an App Server state, from the device or a fresh test. */
@@ -237,7 +237,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
+          onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改由 Vibeface 启动</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">

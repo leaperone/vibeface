@@ -904,11 +904,11 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "api_key is missing",
             "missing environment variable",
         ],
-        "AI 服务缺少密钥或密钥无效。去「设备 → AI」填好后再发一次。",
+        "AI 服务缺少密钥或密钥无效。去「设备 → Bot 与任务」填好后再发一次。",
     ),
     (
         &["execution is turned off"],
-        "这台设备的 Codex 没开执行任务。去「设备 → AI」打开后再发一次。",
+        "这台设备的 Codex 没开执行任务。去「设备 → Bot 与任务」打开后再发一次。",
     ),
     (
         &[
@@ -917,7 +917,7 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "no cursor sdk bridge",
             "enoent",
         ],
-        "这台设备上找不到 AI 服务的程序。去「设备 → AI」检查后再发一次。",
+        "这台设备上找不到 AI 服务的程序。去「设备 → Bot 与任务」检查后再发一次。",
     ),
     (
         &["usage limit", "rate limit", "quota", "too many requests"],
@@ -930,7 +930,7 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "not logged in",
             "invalid api key",
         ],
-        "AI 服务登录没通过。去「设备 → AI」检查密钥后再发一次。",
+        "AI 服务登录没通过。去「设备 → Bot 与任务」检查密钥后再发一次。",
     ),
 ];
 
@@ -955,7 +955,7 @@ fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
             match plain_failure(detail) {
                 Some(text) => text.into(),
                 None if chinese(detail) => format!("这次没能回复：{detail}"),
-                None => "这次没能回复。再发一次试试；一直不行就去「设备 → AI」看看。".into(),
+                None => "这次没能回复。再发一次试试。".into(),
             },
         ),
         JobOutcome::Cancelled(_) => (ReplyStatus::Stopped, "已停止回复。".into()),
