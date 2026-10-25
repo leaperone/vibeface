@@ -37,7 +37,7 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 )]
 struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
-    #[arg(long)]
+    #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
@@ -132,7 +132,7 @@ enum CodexCommand {
 
 #[derive(Args)]
 struct DataDir {
-    #[arg(long, env = "VIBEFACE_DATA_DIR")]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: PathBuf,
 }
 
@@ -248,7 +248,7 @@ struct Hooks {
     #[command(flatten)]
     local: LocalNode,
     /// Explicit home directory holding the `.codex` and `.claude` hook configuration.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
     #[arg(long)]
@@ -386,6 +386,7 @@ async fn main() -> Result<()> {
                 .data_dir
                 .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
                 .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
+            ensure!(data_dir.is_absolute(), "specify an absolute data directory");
             if !data_dir.join("config.json").exists() {
                 check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
             }
@@ -1653,6 +1654,19 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
+        for value in ["", "relative-node"] {
+            for command in [
+                vec![],
+                vec!["serve"],
+                vec!["service", "status"],
+                vec!["update", "status"],
+            ] {
+                let mut arguments = vec!["vibeface"];
+                arguments.extend(command);
+                arguments.extend(["--data-dir", value]);
+                assert!(Cli::try_parse_from(arguments).is_err());
+            }
+        }
         for arguments in [
             vec!["vibeface", "--data-dir", "/one", "serve"],
             vec![

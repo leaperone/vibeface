@@ -47,7 +47,7 @@ enum Action {
 
 #[derive(Args)]
 struct Data {
-    #[arg(long, env = "VIBEFACE_DATA_DIR")]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: PathBuf,
 }
 

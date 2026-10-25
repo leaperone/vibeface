@@ -32,7 +32,7 @@
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
-| `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不连接 App Server，也不向其他设备提供执行能力 |
+| `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
 | `providers.codex_app_server` | `{mode, socket}`：`system` 要求明确 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境明确设置 `CODEX_HOME` |
 | `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |

@@ -2324,7 +2324,11 @@ mod tests {
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
-        assert!(node.providers().codex_target(false) == crate::providers::CodexTarget::Off);
+        assert!(!node.providers().switches.execution);
+        assert!(matches!(
+            node.providers().codex_target(true),
+            crate::providers::CodexTarget::System(_)
+        ));
         assert!(
             off["providers"][0]["env"]
                 .as_array()

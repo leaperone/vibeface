@@ -7,7 +7,7 @@ use vibeface::{config, update};
 #[derive(Args)]
 pub struct Service {
     /// Data directory bound to this user's single installed node service.
-    #[arg(long, global = true, env = "VIBEFACE_DATA_DIR")]
+    #[arg(long, global = true, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     action: Action,

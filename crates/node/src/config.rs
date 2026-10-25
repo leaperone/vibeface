@@ -23,6 +23,15 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
 
 pub const UNNAMED_NODE: &str = "Node";
 
+pub fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("specify an absolute path".into())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
