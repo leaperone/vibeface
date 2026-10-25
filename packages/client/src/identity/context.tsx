@@ -312,6 +312,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
+    active.info = parseInfo(await request('info'))
+    if (active.info.network_id !== principal.network_id) throw new AuthenticationError('设备授权已改变，请重新连接。')
+    setInfo(active.info)
     const subscribed = record(await request('subscribe', { vector: { ...seen.current } }))
     if (session.current !== active || active.generation !== generation.current) throw changed()
     const lagging = behind(seen.current, subscribed.vector)
@@ -861,7 +864,6 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const fresh = !active.info.initialized
       const capability = fresh && localSetup?.kind === 'uninitialized' && entryKey(localSetup.entry) === entryKey(active.entry) ? localSetup.capability : ''
       if (fresh && !capability) throw new Error('恢复到新电脑需要在那台电脑的本机页面进行。')
-      if (!fresh && active.info.network_id !== opened.networkId) throw new Error('这台电脑属于另一组设备。')
       const { genesis } = opened.material
       let state: unknown = { genesis, checkpoints: opened.material.checkpoints, events: opened.material.events }
       let heads: unknown = {}

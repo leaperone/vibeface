@@ -196,6 +196,7 @@ export type TriageSettings = {
   projects: { prefix: string; outlet: Outlet }[]
   webhook_url: string
   scan_codex_sessions: boolean
+  codex_sessions: string | null
   webhook_secret_set: boolean
   decision_url: string
   device_id: string

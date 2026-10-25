@@ -203,7 +203,7 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
       </Button>
     </View>
     {shown.state === 'handshake_failed' || shown.state === 'launch_failed' ? <Text selectable className="font-mono text-meta text-muted-foreground">{shown.reason}</Text> : null}
-    {server.mode === 'system' ? <SaveRow value={socket} saved={server.socket ?? ''} placeholder="自动查找" mono working={working} onChange={setSocket}
+    {server.mode === 'system' ? <SaveRow value={socket} saved={server.socket ?? ''} placeholder="App Server socket 的绝对路径" mono working={working} onChange={setSocket}
       onSave={() => void save('socket', { app_server: { mode: 'system', socket: socket.trim() || null } })} /> : null}
   </Field>
 }
@@ -278,7 +278,7 @@ function Triage() {
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
   if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-24 rounded-xl bg-muted" />
-  const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions }
+  const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
   const save = (key: string, patch: Partial<typeof config>, extra: Record<string, unknown> = {}) => {
     const next = { ...config, ...patch }
     return call(key, 'configure_triage', { ...next, webhook_url: next.webhook_url.trim() || null, ...extra })

@@ -333,6 +333,7 @@ pub struct TriageConfig {
     pub projects: Vec<ProjectOutlet>,
     pub webhook_url: Option<String>,
     pub scan_codex_sessions: bool,
+    pub codex_sessions: Option<PathBuf>,
 }
 
 impl Default for TriageConfig {
@@ -341,7 +342,8 @@ impl Default for TriageConfig {
             default_outlet: Outlet::Record,
             projects: vec![],
             webhook_url: None,
-            scan_codex_sessions: true,
+            scan_codex_sessions: false,
+            codex_sessions: None,
         }
     }
 }
@@ -357,6 +359,14 @@ impl TriageConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.scan_codex_sessions {
+            ensure!(
+                self.codex_sessions
+                    .as_ref()
+                    .is_some_and(|path| path.is_absolute() && path.is_dir()),
+                "set codex_sessions to an existing absolute directory before enabling session scanning"
+            );
+        }
         ensure!(self.projects.len() <= 256, "at most 256 project outlets");
         for project in &self.projects {
             ensure!(

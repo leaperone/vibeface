@@ -11,7 +11,7 @@ import type { Outlet, TriageSettings as Settings } from "@vibeface/client/worksp
 
 const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发给机器人", Layers]]
 const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
-type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions">
+type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions" | "codex_sessions">
 
 /** Where this device sends sessions that need the person, plus the chat bot (Grok Bot) channel both ways. Saves on each change. */
 export function TriageSettings() {
@@ -48,7 +48,7 @@ export function TriageSettings() {
   useEffect(() => { setSettings(null); void call("load", "triage_settings"); return () => { sequence.current += 1 } }, [ready])
 
   if (!settings) return <div className="px-4 py-3">{error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-8" />}</div>
-  const config: Config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions }
+  const config: Config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
   const save = (key: string, patch: Partial<Config>, extra: Record<string, unknown> = {}) => {
     const next = { ...config, ...patch }
     return call(key, "configure_triage", { ...next, webhook_url: next.webhook_url.trim() || null, ...extra })

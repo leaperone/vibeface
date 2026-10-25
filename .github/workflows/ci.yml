@@ -113,6 +113,8 @@ jobs:
             crates/node/web/generated/vibeface_secure.js
             crates/node/web/generated/vibeface_secure_bg.wasm
             crates/node/web/generated/*.d.ts
+            crates/node/web/generated/.vibeface-build.json
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 
@@ -353,12 +355,12 @@ jobs:
         run: |
           set -o pipefail
           codesign --verify --strict "$PACKAGE/vibeface"
-          details="$(codesign -dv "$PACKAGE/vibeface" 2>&1)"
+          details="$(codesign -dvvv "$PACKAGE/vibeface" 2>&1)"
           printf '%s\n' "$details"
           grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
           grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
           grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
-          spctl -a -vvv -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | tee "$RUNNER_TEMP/gatekeeper-assessment.txt"
+          spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | tee "$RUNNER_TEMP/gatekeeper-assessment.txt"
           grep -qx 'source=Notarized Developer ID' "$RUNNER_TEMP/gatekeeper-assessment.txt"
       - name: Verify packaged Web assets and process
         env:

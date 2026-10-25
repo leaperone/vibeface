@@ -56,9 +56,9 @@ Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的�
 
 ### 2.1a 用哪个 App Server
 
-用户决定（2026-10-21）：默认用这台电脑上已经运行的 App Server，会话与本人的 Codex 共用；Node 自己启动一个只作为本人可选的后备。设置在 `config.json` 的 `providers.codex_app_server`：`{"mode":"system"|"spawn","socket":null|"<路径>"}`，网页在“设备 → Bot 与任务 → Codex → 设置”里切换并测试连接。
+App Server 由部署配置显式选择。执行默认关闭；启用时在 `providers.codex_app_server` 选择 `system` 并提供 socket，或选择 `spawn` 并在 Provider 环境设置 `CODEX_HOME`。配置步骤见[部署配置](../deployment.md#配置-sdk-与-app-server)。
 
-- `system`（默认）：Node 不启动也不结束它。`socket` 为空时按 Codex 自己的约定找控制 socket：先 Node 环境里的 `$CODEX_HOME`，再 `~/.codex`，路径是 `<home>/app-server-control/app-server-control.sock`。`codex app-server proxy` 和 `codex app-server daemon version` 用的就是它；桌面应用的 daemon 把它做成指向 `/tmp/codex-daemon-<uid>/<hash>` 中活着那个 socket 的软链。`/tmp/codex-daemon-<uid>/` 里留着很多旧 socket，Node 不扫描那个目录。每个候选都做一次真实的 `initialize` 握手：不存在、拒绝连接或路径过长的跳过，握手失败的报 `handshake_failed`，都不通时报 `not_found`。连上后断开 5 秒就重新查找，按 1 至 30 秒退避；App Server 被重启或换了 socket 时自动跟过去。
+- `system`：Node 只连接明确配置的 socket，不搜索用户 home 或其他运行中的会话。它不启动或结束外部 App Server，只重连同一个配置入口。
 - `spawn`：沿用原来的托管方式，`codex_bin` 和 `provider-env.json` 里的 Codex 变量只在这个模式传给 App Server。
 - Agent 的 `VIBEFACE_CODEX_SOCKET` 固定是 `/tmp/vibeface-<identity>/app-server.sock`，Node 把它软链到正在用的 socket，切换模式或 App Server 换位置时 Agent 的环境不用变。
 - 线程被另一个进程写着时（Codex 报 `already has an active writer`），写请求按“没有发出”报错，不自动重发；观察改为读取 turn，不再反复 `thread/resume`。
@@ -151,7 +151,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 | Codex hook | `Stop`、`PermissionRequest` 调用 `vibeface hook codex` |
 | Claude Code hook | `Stop`、`StopFailure`、`Notification` 调用 `vibeface hook claude` |
 | App Server | 本机 App Server 报告的所有线程的 `turn/completed`（完成、失败、中断） |
-| 会话扫描 | 每 5 分钟扫 `$CODEX_HOME/sessions` 下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
+| 会话扫描 | 默认关闭；显式启用后，每 5 分钟扫描 `triage.codex_sessions` 配置目录下 24 小时内修改的 `rollout-*.jsonl`，按文件记录已读偏移，读 `task_complete`、`turn_aborted` |
 
 `vibeface hook` 从 stdin 读 hook 输入，补上 git 分支和提交，POST 到本机 Node 的 `/api/hooks`。该路由只在本机监听器上，只接受回环地址、没有 `Origin` 头的 JSON 请求，浏览器跨站请求一律拒绝。Node 不在线时写入数据目录的 `hook-spool/`，Node 每次扫描（启动 5 秒后，之后每 5 分钟）时读入。Node 第一次见到启动前就存在的 rollout 文件时从文件末尾开始读，不把历史当新事件。hook 总是以 0 退出，连接超时 2 秒，总超时 5 秒。
 
@@ -194,11 +194,13 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
-| `triage_settings` | 无 | `{default_outlet, projects, webhook_url, scan_codex_sessions, webhook_secret_set, decision_url, device_id, decision_tokens: [{token_id, label, created_ms}], outbox: {pending, delivered, dead}}` |
-| `configure_triage` | `{default_outlet, projects: [{prefix, outlet}], webhook_url, scan_codex_sessions, webhook_secret?}`；`webhook_secret` 为字符串时设置，`null` 时清除，缺省时保留 | 同 `triage_settings` |
+| `triage_settings` | 无 | `{default_outlet, projects, webhook_url, scan_codex_sessions, codex_sessions, webhook_secret_set, decision_url, device_id, decision_tokens: [{token_id, label, created_ms}], outbox: {pending, delivered, dead}}` |
+| `configure_triage` | `{default_outlet, projects: [{prefix, outlet}], webhook_url, scan_codex_sessions, codex_sessions, webhook_secret?}`；`webhook_secret` 为字符串时设置，`null` 时清除，缺省时保留 | 同 `triage_settings` |
 | `test_webhook` | 无 | `{ok, status, error}`，立即发一条签名的测试事件，不进发件箱 |
 | `create_decision_token` | `{label}` | `{token_id, token, label, created_ms}`，`token` 只在这里出现一次 |
 | `revoke_decision_token` | `{token_id}` | `{revoked}` |
+
+启用会话扫描前必须设置 `codex_sessions` 的绝对路径，配置示例见[部署说明](../deployment.md)。
 
 提问经 `rpc` 读写：`questions` 返回全网未回答的提问；`answer {question_id, text, attestation}` 写该提问唯一的回答消息。形状见 [聊天里的提问与回答](questions-in-chat.md)。
 
@@ -208,15 +210,13 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的转给目标。令牌错误返回 401。
 
-这替代了 Leo 方案里的 `codex-ws-proxy` 和 frpc。原方案把 App Server 的控制 socket 以明文 `ws://` 暴露在公网，持有 Bearer 的一方能调用 App Server 的全部方法。现在公网只有 TLS 之后的一个窄接口，令牌只能回答提问；上行改为 Node 签名推送，Grok Bot 不再需要本机 Shell 读 jsonl 和每 3 小时巡检。
-
 ## 6. 安装 hook
 
 ```sh
-vibeface hooks install --data-dir <数据目录> [--home <目录>] [--dry-run]
-vibeface hooks status --data-dir <数据目录> [--home <目录>]
+vibeface hooks install --data-dir <数据目录> --home <目录> [--dry-run]
+vibeface hooks status --data-dir <数据目录> --home <目录>
 vibeface hooks test --data-dir <数据目录>
-vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
+vibeface hooks uninstall --data-dir <数据目录> --home <目录> [--dry-run]
 ```
 
-`install` 修改 `~/.codex/hooks.json` 和 `~/.claude/settings.json`。先把原文件备份为 `<文件>.bak-vibeface-<时间>`，只追加本工具的条目，不改动其他 hook（如 orca、paseo），重复执行不会重复添加；写回时 JSON 键按字母排序，内容不变。`uninstall` 只删本工具的条目。未给 `--home` 时 Codex 的目录取 `$CODEX_HOME`。`--dry-run` 只打印将要追加的内容。`test` 发送一条 `test=true` 的事件，确认 Node 收到。Codex 还要求 `config.toml` 的 `[features] hooks = true`，未开启时 `install` 只提示，不改该文件；新 hook 第一次运行前 Codex 会请求信任。已经在跑的会话要重启或 resume 后才会触发 hook。
+`install` 要求 `--home`，只修改明确指定目录下的 `.codex/hooks.json` 和 `.claude/settings.json`。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。

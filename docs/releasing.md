@@ -32,9 +32,9 @@ cd vibeface-<version>-<target>
 ./vibeface --help
 ```
 
-包内有 Rust 程序、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序或模型凭证。干净 Git 提交的正常构建会记录版本、target 和源码提交；`--skip-build` 或未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
+包内有 Rust 程序、浏览器密码学 JS/WASM、文档、用户级服务安装脚本和 `BUILD-INFO.json`，不含身份、配置、数据库、Provider 程序或模型凭证。干净 Git 提交的正常构建会记录版本、target 和源码提交；未提交源码构建的 `source_commit` 为 `null`，不能作为提交身份的证明。
 
-发布构建脚本把本机源码、用户目录和工具缓存路径替换成通用路径；压缩包清除构建账号和扩展属性。`--skip-build` 不处理已有程序中的路径，正式发布须重新构建。
+发布构建脚本把本机源码、用户目录和工具缓存路径替换成通用路径；压缩包清除构建账号和扩展属性。打包拒绝过期生成物、额外文件和跳过原生构建。
 
 自定义 Rust 编译参数通过 `RUSTFLAGS` 或 `CARGO_ENCODED_RUSTFLAGS` 传入，后者优先。发布脚本保留这些参数并追加路径映射；按 Cargo 的优先级，此时不使用配置文件中的 `rustflags`。
 
@@ -87,7 +87,7 @@ npm Nightly 的制品与发布流程见下面的 npm 章节。npm 安装由 npm 
 
 Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，不使用 Actions 的临时制品。Stable 只选择 `vX.Y.Z` 正式版，Nightly 只选择 `vX.Y.Z-nightly.YYYYMMDD.N` 预发布；两者都不选择 rc。更新器比较数值版本，不按 Release 创建时间或字符串排序，不自动降级。尚无正式版时，Stable 报告没有匹配版本，不回退到 Nightly。
 
-自动更新默认关闭，默认渠道为 Stable。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。配置、检查及手动应用命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
+更新器没有默认策略；先用 `update configure` 明确指定渠道、是否自动更新及安装根目录，再检查或应用更新。策略保存在数据目录的私有 `update.json`，不进入共享会话或 DAG。命令见 [选择更新渠道](node.md#选择更新渠道)。首次建立受管安装可使用 [公开安装命令](install.md)，已安装的节点使用 `update apply`。
 
 匿名 GitHub API 请求被限流时，更新器明确报错并保留现版，自动更新在下轮再次检查。可在更新服务的运行环境提供 `GITHUB_TOKEN` 提高额度；token 只发往 `api.github.com`，不发给下载 CDN，也不写入配置或更新策略。后台服务不保证继承终端的临时环境变量。
 
@@ -111,9 +111,9 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 先停用旧更新定时服务，备份 `current` 目标、用户服务定义和私有启动脚本。确认维护状态空闲且无结果未知操作后，再停止 Node 用户服务并等待目录锁释放，然后备份完整数据目录。备份包括身份和历史，应保持私密。不要强行结束任务，也不要让新旧程序同时使用同一数据目录。
 
-校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$HOME/.local/share/vibeface/releases/<version>`，再创建指向它的 `$HOME/.local/share/vibeface/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本和 `BUILD-INFO.json`。
+校验并解压新包到受管安装根目录下的独立目录，通过 `current` 符号链接选择程序。例如，先将解压后的包移动到 `$VIBEFACE_INSTALL_ROOT/releases/<version>`，再创建指向它的 `$VIBEFACE_INSTALL_ROOT/current`。保留整个包，不单独复制 Rust binary；更新器需要同包的脚本和 `BUILD-INFO.json`。
 
-原子切换 `current` 后，建立 `~/.local/bin/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 3 的数据目录前台启动，核对设备身份与状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
+原子切换 `current` 后，建立 `$VIBEFACE_BIN_DIR/vibeface` 到 `current/vibeface` 的链接。旧 CLI 链接只有在确认属于该受管安装时才可移除，不覆盖用户自有文件。使用全新或已确认属于 epoch 3 的数据目录前台启动，核对设备身份与状态，随后按 [后台运行说明](node.md#作为后台应用运行) 配置指向这一固定路径的用户服务。Linux 服务名是 `vibeface.service`，先卸载旧服务定义，避免双进程。停止前台进程后再启动用户服务。
 
 已有私有凭证启动脚本时，保留内容和私有权限，仅将末端启动路径改为 `current/vibeface`。不要用 `service install` 覆盖凭证脚本。核对新服务的 PID、版本、设备身份、历史及本机健康状态，再恢复原更新渠道和自动更新策略。
 

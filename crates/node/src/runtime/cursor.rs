@@ -13,6 +13,10 @@ impl Runtime {
     pub(crate) fn agent_env(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
             (
+                "VIBEFACE_DATA_DIR".into(),
+                self.data_dir.display().to_string(),
+            ),
+            (
                 TRIAGE_URL_ENV.into(),
                 format!("http://{}", self.config.local_listen),
             ),

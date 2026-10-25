@@ -64,7 +64,7 @@ impl TriageState {
             started_ms: now_ms(),
         }
     }
-    fn config(&self) -> TriageConfig {
+    pub(super) fn config(&self) -> TriageConfig {
         self.config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -149,6 +149,36 @@ fn subject(event: &AgentEvent, request_id: Option<String>) -> Result<Subject> {
         summary: summary(event),
         request_id,
     })
+}
+
+fn shared_event(event: &AgentEvent, roots: &[PathBuf]) -> AgentEvent {
+    crate::logging::add_private_path(Path::new(&event.cwd));
+    let mut shared = event.clone();
+    shared.cwd = roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| {
+            let relative = Path::new(&event.cwd).strip_prefix(root).ok()?;
+            if relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return None;
+            }
+            Some((
+                root.components().count(),
+                format!("workspace-{}/{}", index + 1, relative.display()),
+            ))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .map_or_else(|| "workspace".into(), |(_, path)| path);
+    shared.host.clear();
+    shared.repo = None;
+    shared.git_branch = None;
+    shared.git_head = None;
+    shared.last_message = crate::logging::scrub(&event.last_message);
+    shared.detail = crate::logging::scrub(&event.detail);
+    shared
 }
 
 fn name(value: impl Serialize) -> Result<String> {
@@ -270,7 +300,8 @@ impl Runtime {
     }
 
     async fn queue_event(&self, event: AgentEvent) -> Result<Value> {
-        let event = event.seal(&self.identity.device_id()?, &config::hostname(), now_ms())?;
+        crate::logging::add_private_path(Path::new(&event.cwd));
+        let event = event.seal(&self.identity.device_id()?, config::UNNAMED_NODE, now_ms())?;
         if event.test {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
@@ -332,7 +363,7 @@ impl Runtime {
             &self.identity,
             network,
             &primary,
-            &subject(event, None)?,
+            &subject(&shared_event(event, &self.settings_snapshot().roots), None)?,
             now_ms(),
         )?;
         if let Some(written) = written {
@@ -660,7 +691,10 @@ impl Runtime {
                     },
                     None => None,
                 };
-                offered.push((event.clone(), json!({"conversation_id":owner,"name":name})));
+                offered.push((
+                    shared_event(event, &self.settings_snapshot().roots),
+                    json!({"conversation_id":owner,"name":name}),
+                ));
             }
         }
         let turn = self
@@ -764,9 +798,17 @@ impl Runtime {
                 let question = EventBody::QuestionAsked {
                     question_id: triage::question_id(&event.node, &event.event_id),
                     severity,
-                    text: super::field(&input, "question")?.into(),
-                    choices: labels.into_iter().map(|label| Choice { label }).collect(),
-                    about: subject(&event, request_id)?,
+                    text: crate::logging::scrub(super::field(&input, "question")?),
+                    choices: labels
+                        .into_iter()
+                        .map(|label| Choice {
+                            label: crate::logging::scrub(&label),
+                        })
+                        .collect(),
+                    about: subject(
+                        &shared_event(&event, &self.settings_snapshot().roots),
+                        request_id,
+                    )?,
                 };
                 self.raise(&network, &event, question).await?
             }
@@ -1029,15 +1071,15 @@ impl Runtime {
                 .connection
                 .execute("DELETE FROM triage_handled WHERE ts_ms<?", [cutoff])?;
         }
-        if !self.triage.config().scan_codex_sessions {
+        let config = self.triage.config();
+        if !config.scan_codex_sessions {
             return Ok(());
         }
-        let root = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-            .context("no home directory")?
-            .join("sessions");
-        for path in rollouts(&root, now_ms() - SCAN_WINDOW_MS) {
+        let root = config
+            .codex_sessions
+            .as_ref()
+            .context("codex_sessions is required")?;
+        for path in rollouts(root, now_ms() - SCAN_WINDOW_MS) {
             let rollout = crate::crypto::digest(path.to_string_lossy().as_bytes());
             let mark: Option<usize> = self
                 .store
@@ -1096,6 +1138,7 @@ impl Runtime {
         Ok(json!({
             "default_outlet":config.default_outlet, "projects":config.projects,
             "webhook_url":config.webhook_url, "scan_codex_sessions":config.scan_codex_sessions,
+            "codex_sessions":config.codex_sessions,
             "webhook_secret_set":self.webhook_secret()?.is_some(),
             "decision_url":self.decision_url(), "device_id":self.identity.device_id()?,
             "decision_tokens":tokens, "outbox":outbox,
@@ -1441,6 +1484,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         configuration.providers.codex_app_server.socket = Some(socket.into());
+        configuration.providers.execution = true;
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1868,6 +1912,23 @@ mod tests {
             last_message: "tests fail".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn shared_events_keep_relative_context_without_local_identity() {
+        let event = AgentEvent {
+            host: "private-host".into(),
+            repo: Some("/private-event-fixture/project".into()),
+            last_message: "failed in /private-event-fixture/project/src".into(),
+            ..turn("session", "turn", "/private-event-fixture/project")
+        };
+        let shared = shared_event(&event, &[PathBuf::from("/private-event-fixture")]);
+        assert_eq!(shared.cwd, "workspace-1/project");
+        assert!(shared.host.is_empty() && shared.repo.is_none());
+        assert!(!shared.last_message.contains("/private-event-fixture"));
+        assert_eq!(event.cwd, "/private-event-fixture/project");
+        assert_eq!(shared.event_id, event.event_id);
+        assert_eq!(shared_event(&event, &[]).cwd, "workspace");
     }
 
     async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
