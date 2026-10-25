@@ -170,6 +170,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 2. 在服务器上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
 
    ```sh
+   export VIBEFACE_ENTRY_DATA_DIR='<入口 Node 数据目录的绝对路径>'
    vibeface init --data-dir "$VIBEFACE_ENTRY_DATA_DIR" \
    	--public-entry \
    	--public-url https://vb.example.com \
@@ -216,7 +217,15 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
    `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
 
-4. 把公共入口服务器上的 `entry-token` 复制到个人电脑，例如 `scp user@vb.example.com:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
+4. 在个人电脑上指定服务器的 SSH 地址、步骤 2 选择的数据目录，以及本机用于接收令牌的临时文件，再复制 `entry-token`：
+
+   ```sh
+   export VIBEFACE_ENTRY_SSH='<SSH 用户>@<入口域名>'
+   export VIBEFACE_ENTRY_DATA_DIR='<步骤 2 的服务器数据目录绝对路径>'
+   export VIBEFACE_RELAY_TOKEN_FILE='<本机临时令牌文件的绝对路径>'
+   scp "${VIBEFACE_ENTRY_SSH}:${VIBEFACE_ENTRY_DATA_DIR}/entry-token" "$VIBEFACE_RELAY_TOKEN_FILE"
+   chmod 600 "$VIBEFACE_RELAY_TOKEN_FILE"
+   ```
 
 5. 在个人电脑上初始化 Node 时指向公共入口，然后启动：
 
@@ -225,10 +234,10 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
    	--root /absolute/path/to/projects \
    	--entry https://vb.example.com \
        --relay-token-file "$VIBEFACE_RELAY_TOKEN_FILE"
-   vibeface
+   vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
    ```
 
-   `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `~/vb-entry-token`。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
+   `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `$VIBEFACE_RELAY_TOKEN_FILE` 指向的临时文件。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
 
 6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
 

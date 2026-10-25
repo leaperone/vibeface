@@ -1627,6 +1627,7 @@ def bot_checks(run, workspace, a, network, passed, outsider):
 def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     """The real `vibeface` CLI on the Node's machine, with the Node's private HOME."""
     environment = node.environment()
+    environment["VIBEFACE_DATA_DIR"] = str(node.directory)
     if socket:
         environment["VIBEFACE_CODEX_SOCKET"] = str(socket)
     environment["VIBEFACE_TRIAGE_URL"] = f"http://127.0.0.1:{node.local_port}"

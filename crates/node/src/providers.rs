@@ -78,22 +78,13 @@ pub struct AppServer {
 
 /// What the providers do besides the bot, which `Config.manager` chooses. A provider is in
 /// use while the bot runs on it or, for Codex, while it executes dispatched work.
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
     /// Dispatched work runs on the Codex App Server.
     pub execution: bool,
     #[serde(default)]
     pub codex_app_server: AppServer,
-}
-
-impl Default for Providers {
-    fn default() -> Self {
-        Self {
-            execution: false,
-            codex_app_server: AppServer::default(),
-        }
-    }
 }
 
 impl Providers {

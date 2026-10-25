@@ -1079,7 +1079,7 @@ impl Runtime {
             .codex_sessions
             .as_ref()
             .context("codex_sessions is required")?;
-        for path in rollouts(&root, now_ms() - SCAN_WINDOW_MS) {
+        for path in rollouts(root, now_ms() - SCAN_WINDOW_MS) {
             let rollout = crate::crypto::digest(path.to_string_lossy().as_bytes());
             let mark: Option<usize> = self
                 .store

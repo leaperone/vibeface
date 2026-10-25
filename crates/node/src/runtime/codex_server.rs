@@ -450,7 +450,7 @@ impl Inner {
                     true
                 }
                 CodexTarget::Spawn(launch) => self.run_spawned(launch).await,
-                CodexTarget::System(socket) => self.use_system(&socket).await,
+                CodexTarget::System(socket) => self.use_system(socket).await,
             };
             if replaced || started.elapsed() > Duration::from_secs(60) {
                 backoff = 1;

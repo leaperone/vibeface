@@ -2327,7 +2327,7 @@ mod tests {
         assert!(!node.providers().switches.execution);
         assert!(matches!(
             node.providers().codex_target(true),
-            crate::providers::CodexTarget::System(_)
+            crate::providers::CodexTarget::Spawn(_)
         ));
         assert!(
             off["providers"][0]["env"]
