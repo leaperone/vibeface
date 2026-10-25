@@ -155,7 +155,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有两种做法：
 
-- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它只提供网页、relay 和密文转发，不保存你的任何数据。个人设备不需要入站端口。推荐用这种方式。
+- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它默认只提供网页、relay 和密文转发，不保存个人网络的事件或附件。个人设备不需要入站端口。推荐用这种方式。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
 ### 公共入口：Linux 服务器加 nginx
@@ -228,7 +228,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
 
-公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存事件或附件。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
+默认公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
 
 已经初始化的 Node 要改用公共入口，停掉它，在 `config.json` 的 `network` 中加入 `"entry": {"url": "https://vb.example.com", "relay": "https://vb.example.com"}`，把令牌放到数据目录的 `entry-token`（权限 600），再启动。
 
@@ -276,6 +276,61 @@ vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 历史按每台设备一条签名日志同步：双方交换版本向量，只拉对方缺的区间，入库前逐条验签并去重，中断后从已入库的位置续拉。对端重启后，它发来的同步请求带新的启动编号，本机随即关闭旧连接并重新同步，不等 QUIC 空闲超时。同步只写入历史和投影，不会重新执行历史中的操作；调度和执行只发生在被指定的 Node 上，见[事件 DAG 协议](node-protocol.md#事件-dag)。
 
 网页按 1 MiB 分块把附件上传到当前入口 Node，入口重启后从已落盘的位置继续，消息只引用附件的 hash 和大小。附件下载的已收部分保存在本机私有暂存文件。断线或重启后，Node 重新核验授权并从已保存的位置继续；只有最终大小和 hash 校验通过的完整附件才能使用。暂存最多占用 256 MiB、64 个对象。连接恢复只继续传输，不重发业务操作。
+
+## 启用可选文件传输
+
+文件交付默认关闭，不影响已有会话同步和附件。节点发现免费，公益转发不需要钱包。付费交付只供本机 `31337` 测试链使用，不要转入真实资产。验收条件、费用和恢复边界见[文件交付实验参考](paid-delivery.md)。
+
+S 是发送 Node，R 是接收 Node，P 是服务 Node。
+
+1. 在 S、R 各自的可信管理客户端打开**设置 → 公益转发与实验付费交付**，在**此设备的传输设置**开启**启用文件传输**和**公益转发**。本机自动访问会话只能查看，须使用已加入个人网络且有管理权限的客户端操作。
+2. 在 P 上启用相同服务。P 可以是不入个人网络的公共入口。公共入口没有管理网页，通过本机所有者命令应用以下 JSON 文件。命令要求对应 Node 正在运行。
+
+   ```json
+   {
+       "enabled": true,
+       "charity_enabled": true,
+       "paid_enabled": false
+   }
+   ```
+
+   ```sh
+   vibeface wallet --data-dir /path/to/node-data configure /path/to/delivery-charity.json
+   ```
+
+3. 确保 S、R 和 P 能按 PeerID 建立连接。沿用已有地址和 relay，或在停掉 Node 后为 `config.json` 的 `network` 增加明确选择的发现目录，再重启。以下设置发布 relay 地址并解析 PeerID，默认不发布直连 IP。
+
+   ```json
+   "discovery": {
+       "publish": true,
+       "resolve": true,
+       "urls": ["https://discovery.example/pkarr"],
+       "publish_direct": false
+   }
+   ```
+
+   发现目录只返回签名地址，不转发文件，也不收取协议服务费。启用发布会公开这台 Node 的 PeerID 和所发布的地址，请使用自己选择和维护的目录。
+
+4. 在 S 的传输页面选择文件，在**接收设备的连接 ID**和**服务设备的连接 ID**分别填写 R、P 的 PeerID，选择**公益转发**，点击**准备订单并查看费用**，核对后点击**确认公益传输**。当前原文件上限为 130816 字节。
+5. 在 R 的传输页面选择该订单，点击**接受此订单**。完成后点击**取回文件**。Web 把已核对文件交给浏览器保存，Mobile 写入并再次核对后提供分享副本。
+
+断线或进程重启后，保留原订单并点击**继续与对账**。不要通过另建订单处理未知结果。公益收据不表示链上解密证明，也不表示真人阅读。
+
+付费实验还需按[proof 构建说明](../proofs/delivery/README.md)配置 Linux prover，并按[合约说明](../contracts/delivery/README.md)固定本机测试部署。仅切换网页开关不能创建这些配置。完整进程验收见[e2e 的付费模式](e2e.md#验证付费交付和实际结算)。
+
+在已启用服务的本机 Node 上管理独立钱包，口令由 TTY 关闭回显输入。以下命令不接受网页远程口令。
+
+```sh
+vibeface wallet --data-dir /path/to/node-data create
+vibeface wallet --data-dir /path/to/node-data unlock
+vibeface wallet --data-dir /path/to/node-data status
+vibeface wallet --data-dir /path/to/node-data lock
+vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.json
+```
+
+自动化可用 `--passphrase-fd` 从所有者私有文件或管道读取口令。不要把口令写进命令参数或环境变量。钱包每次重启都保持锁定，损坏时显示 `unavailable`，只能在本机从独立备份恢复，不能覆盖创建。
+
+钱包备份和个人恢复文件都不包含订单接收私钥。停掉 Node 后备份完整数据目录，尤其是整个 `delivery/`。注册、轮换和撤销接收密钥的命令及原意图重试规则见[接收密钥和恢复材料](paid-delivery.md#接收密钥和恢复材料)。
 
 ## 多个访问地址
 
