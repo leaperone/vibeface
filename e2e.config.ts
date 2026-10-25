@@ -1,6 +1,9 @@
 import type { E2EConfig } from 'e2e';
-import { web } from '@e2e-dev/web';
 import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
+
+process.env.PLAYWRIGHT_BROWSERS_PATH ??= resolve('.artifacts/e2e/browsers');
+const { web } = await import('@e2e-dev/web');
 
 export default {
   targets: [{

@@ -368,6 +368,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           VIBEFACE_E2E_BINARY: ${{ steps.unpack.outputs.package }}/vibeface
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/e2e/browsers
           E2E_TELEMETRY_DISABLED: '1'
         run: |
           pnpm install --frozen-lockfile --filter .

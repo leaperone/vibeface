@@ -14,7 +14,11 @@ pnpm test:e2e
 VIBEFACE_E2E_BINARY=/absolute/path/to/vibeface pnpm test:e2e
 ```
 
-程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。首次运行会下载 Chromium；Linux CI 先运行 `pnpm exec e2e-web install chromium --with-deps`。
+程序的构建步骤见[源码构建](releasing.md#ci-验证范围)。首次运行会把 Chromium 下载到 `.artifacts/e2e/browsers/`。Linux CI 先执行以下命令：
+
+```sh
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web install chromium --with-deps
+```
 
 每次运行创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。数据、日志、报告和下载文件位于 `.artifacts/e2e/`，不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
