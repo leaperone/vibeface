@@ -7,6 +7,26 @@ fail() {
   exit "${2:-1}"
 }
 
+if [[ ${VIBEFACE_DELIVERY_PROOF_LOCK_FD+x} ]]; then
+  python3 - <<'PY_LOCK' || fail 'invalid inherited proof lock descriptor' 64
+import os
+import stat
+import sys
+
+raw = os.environ["VIBEFACE_DELIVERY_PROOF_LOCK_FD"]
+try:
+    if not raw or len(raw) > 10 or not raw.isascii() or not raw.isdecimal():
+        raise ValueError()
+    descriptor = int(raw)
+    if descriptor < 3 or descriptor > 2**31 - 1 or str(descriptor) != raw:
+        raise ValueError()
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode) or not os.get_inheritable(descriptor):
+        raise ValueError()
+except (OSError, ValueError, OverflowError):
+    sys.exit(64)
+PY_LOCK
+fi
+
 if [[ $# == 1 && $1 == --version ]]; then
   echo 'Vibeface confined RISC Zero Groth16 runner v2025-04-03.1'
   exit 0
@@ -27,8 +47,8 @@ mode=$(stat -c '%a' -- "$work")
 [[ -f $work/input.json && ! -L $work/input.json ]] || fail 'missing regular Groth16 input' 64
 [[ ! -e $work/proof.json && ! -L $work/proof.json ]] || fail 'Groth16 output already exists' 64
 
-exec 9</opt/vdp/gnark
-flock --nonblock 9 || fail 'confined Groth16 runner is busy' 75
+exec {gnark_lock_fd}</opt/vdp/gnark
+flock --nonblock "$gnark_lock_fd" || fail 'confined Groth16 runner is busy' 75
 temporary=$(mktemp -d /tmp/vibeface-gnark.XXXXXXXX)
 generator_pid=
 prover_pid=

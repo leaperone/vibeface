@@ -234,13 +234,12 @@ impl Delivery {
                     }
                     Err(error) => {
                         let mut order = self.with_store(|store| store.order(&id))?;
-                        order.resume_requested = false;
+                        order.resume_requested = error.is::<proof::Busy>();
                         order.view.error = Some(error.to_string());
                         if order.view.mode == Mode::Paid
                             && !matches!(order.view.phase, Phase::Prepared | Phase::Proving)
                         {
-                            order.view.phase = Phase::Reconciling;
-                            order.view.payment.state = PaymentState::Unknown;
+                            order.view.chain_unknown();
                         }
                         self.save(&mut order)?;
                     }

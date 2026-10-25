@@ -3,8 +3,8 @@ base_branch = "main"
 [[scope]]
 prefix = ""
 name = "CI policy and Python syntax"
-check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && actionlint .github/workflows/ci.yml"
-build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\")]'"
+check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && actionlint .github/workflows/ci.yml"
+build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\")]'"
 
 [[domain_check]]
 name = "Rust workspace"

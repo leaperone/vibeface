@@ -1829,15 +1829,29 @@ mod tests {
     #[test]
     fn receiving_key_commands_require_an_explicit_stable_intent() {
         let intent = uuid::Uuid::new_v4().to_string();
+        let data_dir = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         for action in ["register-key", "rotate-key", "revoke-key"] {
             assert!(
-                Cli::try_parse_from(["vibeface", "wallet", action, "--gas-cap", "1000000"])
-                    .is_err()
+                Cli::try_parse_from([
+                    "vibeface",
+                    "wallet",
+                    "--data-dir",
+                    &data_dir,
+                    action,
+                    "--gas-cap",
+                    "1000000"
+                ])
+                .is_err()
             );
             assert!(
                 Cli::try_parse_from([
                     "vibeface",
                     "wallet",
+                    "--data-dir",
+                    &data_dir,
                     action,
                     "--intent-id",
                     &intent,
@@ -1874,11 +1888,30 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
         let file = fs::File::open(&path)?;
         assert!(read_wallet_passphrase(Some(file.as_raw_fd())).is_err());
+        let data_dir = dir.to_string_lossy();
         assert!(
-            Cli::try_parse_from(["vibeface", "wallet", "unlock", "--passphrase", "text"]).is_err()
+            Cli::try_parse_from([
+                "vibeface",
+                "wallet",
+                "--data-dir",
+                &data_dir,
+                "unlock",
+                "--passphrase",
+                "text"
+            ])
+            .is_err()
         );
         assert!(
-            Cli::try_parse_from(["vibeface", "wallet", "unlock", "--passphrase-fd", "3"]).is_ok()
+            Cli::try_parse_from([
+                "vibeface",
+                "wallet",
+                "--data-dir",
+                &data_dir,
+                "unlock",
+                "--passphrase-fd",
+                "3"
+            ])
+            .is_ok()
         );
         fs::remove_dir_all(dir)?;
         Ok(())

@@ -68,6 +68,16 @@ CI 不生成新的昂贵证明，也不为新容量或资源上限背书。修�
 
 公益进程验收与 paid proof 任务各自必须通过。公益收据不代表链上交付或结算。Preflight 对 probe 和相关服务改动单独运行 fmt 与最小 locked build，不把这一构建当作进程验收。
 
+## 手动生成真实付费交付证据
+
+现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
+
+该任务读取同一 run 的 Linux x64 Node 包、Web 和 WASM，核对归档摘要、源码提交及生成资源的隐私收据。固定 sandbox 先运行打包 Node 的真实网页进程。只有明确的 GLIBC symbol 或 loader 不兼容才从同一提交和已经验证的 Web/WASM 实际构建 Node，并单独记录这一来源。业务或验收失败直接阻塞任务。
+
+任务随后安装固定 guest 编译器，重编实际 guest 和 host，核对产品 profile，构建真实 QUIC probe，再写入权限为 `0600` 的全新本机部署配置。它不依赖已有证明 fixture，而是调用 `verify-node.py --delivery` 串行产生七份真实证明，检查原文件、实际 29 TestToken 提现及独立只读 observer。测试链限 loopback 31337，不使用真实资产、公共部署或 AI Provider。
+
+整个 Node、EVM 和 prover 流程在既定四挂载、11 GiB 内存、零交换及 64 进程的同一 cgroup 中运行，Node 使用两个 Tokio worker threads。公开资源记录来自实际 kernel cgroup 文件。上传清单仅含七份公开 receipt 与对应 JSON、含 capsule 和交易哈希的 settlement bundle、只读观察结果和安全 summary/resource；Node 数据、钱包、私密见证和原始日志留在临时工作区。任务失败、缺少证明或观察未通过均不能标成成功。
+
 ## 定期、手动和发布检查
 
 每日 UTC 03:23 定时、Actions 中手动运行 `ci`、`v*` tag 强制执行扩展检查，不受路径影响。手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。

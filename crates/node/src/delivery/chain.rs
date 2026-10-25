@@ -673,11 +673,21 @@ impl Chain {
         if matches!(result.phase.as_str(), "unknown" | "reorged")
             && !matches!(transaction.phase.as_str(), "conflicted" | "reverted")
         {
+            let pending_nonce = self.pending_nonce(wallet).await;
+            let nonce_available =
+                matches!(&pending_nonce, Ok(nonce) if *nonce <= transaction.nonce);
             let authorized = delivery.authorize_spend(id).await.is_ok();
             let unlocked = matches!(delivery.wallet.lock().map_err(|_| anyhow::anyhow!("delivery wallet lock failed"))?.status(), super::wallet::WalletStatus::Unlocked { address } if address == transaction.intent.wallet);
-            if !authorized || !unlocked {
+            if !authorized || !unlocked || !nonce_available {
+                result.phase = "unknown".into();
                 result.tx_hash = transaction.tx_hash;
-                result.error = Some("delivery wallet is locked or authorization changed; signed transaction was preserved for reconciliation".into());
+                result.error = Some(if !authorized || !unlocked {
+                    "delivery wallet is locked or authorization changed; signed transaction was preserved for reconciliation"
+                } else if pending_nonce.is_err() {
+                    "delivery nonce observation failed; signed transaction was preserved for reconciliation"
+                } else {
+                    "wallet nonce advanced but the original transaction outcome remains unproven; reconcile its original hash"
+                }.into());
                 delivery.with_store(|store| {
                     store.observe_transaction(
                         id,
@@ -845,22 +855,7 @@ impl Chain {
         let nonce = self
             .pending_nonce(address(&transaction.intent.wallet)?)
             .await?;
-        if nonce > transaction.nonce {
-            return Ok(observation(
-                "conflicted",
-                None,
-                None,
-                Some("wallet nonce is occupied; delivery outcome remains unproven"),
-            ));
-        }
-        Ok(observation(
-            "unknown",
-            None,
-            None,
-            Some(
-                "delivery transaction has no canonical receipt; reconcile the same signed transaction",
-            ),
-        ))
+        Ok(missing_receipt_observation(transaction.nonce, nonce))
     }
 
     async fn call<C: SolCall>(&self, target: Address, call: C) -> Result<C::Return> {
@@ -1320,6 +1315,18 @@ fn receipt_observation(
         (!succeeded).then_some("delivery chain transaction reverted"),
     ))
 }
+fn missing_receipt_observation(original_nonce: u64, pending_nonce: u64) -> TxObservation {
+    observation(
+        "unknown",
+        None,
+        None,
+        Some(if pending_nonce > original_nonce {
+            "wallet nonce advanced but the original transaction outcome remains unproven; reconcile its original hash"
+        } else {
+            "delivery transaction has no canonical receipt; reconcile the same signed transaction"
+        }),
+    )
+}
 
 pub fn address(value: &str) -> Result<Address> {
     ensure!(
@@ -1491,6 +1498,15 @@ pub(super) mod tests {
                 "/../../proofs/delivery/profile.json"
             )))
             .expect("built-in delivery profile"),
+        }
+    }
+    #[test]
+    fn a_missing_receipt_and_advanced_pending_nonce_never_prove_payment_failure() {
+        for pending in [6, 7, 8, 100] {
+            let observation = missing_receipt_observation(7, pending);
+            assert_eq!(observation.phase, "unknown");
+            assert!(observation.block_number.is_none());
+            assert!(observation.block_hash.is_none());
         }
     }
     #[test]

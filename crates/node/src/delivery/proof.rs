@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::File,
+    os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -11,6 +13,69 @@ use zeroize::Zeroizing;
 pub const INFO_TIMEOUT_SECS: u64 = 30;
 pub const PROVE_TIMEOUT_SECS: u64 = 7200;
 pub const VERIFY_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug)]
+pub struct Busy;
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "a previously authorized proof is still running; waiting to reconcile its receipt",
+        )
+    }
+}
+impl std::error::Error for Busy {}
+
+fn process_lock(receipt: &Path) -> Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let directory = receipt
+        .parent()
+        .context("proof receipt has no private directory")?;
+    let metadata = std::fs::symlink_metadata(directory)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o077 == 0,
+        "proof receipt directory must be private"
+    );
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("prover.lock"))?;
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.permissions().mode() & 0o077 == 0,
+        "proof lock must be a private regular file"
+    );
+    let duplicate = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    ensure!(
+        duplicate >= 0,
+        "proof lock descriptor could not be reserved"
+    );
+    let file = unsafe { File::from_raw_fd(duplicate) };
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Busy.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn inherit_lock(command: &mut tokio::process::Command, lock: &File) {
+    let fd = lock.as_raw_fd();
+    command.env("VIBEFACE_DELIVERY_PROOF_LOCK_FD", fd.to_string());
+    // The trusted host and its local descendants retain ownership if this Node is killed.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,11 +241,11 @@ impl Drop for ProcessGroup {
         }
     }
 }
-fn command(config: &ProofConfig) -> Result<tokio::process::Command> {
+fn command(config: &ProofConfig, lock: &File) -> Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new(&config.program);
     command
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("RISC0_SERVER_PATH", &config.r0vm)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -224,6 +289,7 @@ fn command(config: &ProofConfig) -> Result<tokio::process::Command> {
     {
         command.process_group(0);
     }
+    inherit_lock(&mut command, lock);
     Ok(command)
 }
 async fn bounded_run(
@@ -273,6 +339,7 @@ impl ProofRunner {
             .slot
             .try_acquire()
             .context("proof queue is busy; no charge was submitted")?;
+        let lock = process_lock(receipt)?;
         config.validate()?;
         config.validate_executables()?;
         config.check_memory_limit()?;
@@ -286,7 +353,7 @@ impl ProofRunner {
             input.profile == config.profile,
             "proof request mismatches local profile"
         );
-        let mut identify = command(config)?;
+        let mut identify = command(config, &lock)?;
         identify.arg("info");
         let info = bounded_run(
             identify,
@@ -303,14 +370,14 @@ impl ProofRunner {
             "proof host image or schema mismatch"
         );
         if receipt.try_exists()? {
-            let seal = verified_seal(config, input, receipt).await?;
+            let seal = verified_seal(config, input, receipt, &lock).await?;
             ensure!(
                 config.oom_events()? == oom_before,
                 "proof memory limit was exceeded; receipt was not accepted"
             );
             return Ok(seal);
         }
-        let mut prove = command(config)?;
+        let mut prove = command(config, &lock)?;
         prove.arg("prove").arg(receipt);
         let private = Zeroizing::new(serde_json::to_vec(input)?);
         ensure!(
@@ -340,7 +407,7 @@ impl ProofRunner {
             seal.len() == 260 && seal[..4] == [0x73, 0xc4, 0x57, 0xba],
             "unrecognized proof seal"
         );
-        let verified = verified_seal(config, input, receipt).await?;
+        let verified = verified_seal(config, input, receipt, &lock).await?;
         ensure!(verified == seal, "receipt and emitted proof seal differ");
         ensure!(
             config.oom_events()? == oom_before,
@@ -354,6 +421,7 @@ async fn verified_seal(
     config: &ProofConfig,
     input: &ProofInput,
     receipt: &Path,
+    lock: &File,
 ) -> Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(receipt)?;
     ensure!(
@@ -370,7 +438,7 @@ async fn verified_seal(
         bytes.len() <= 16_384,
         "proof receipt exceeds its reserved storage"
     );
-    let mut verify = command(config)?;
+    let mut verify = command(config, lock)?;
     verify
         .arg("verify")
         .arg(hex::encode(input.statement.abi_bytes()));
@@ -404,6 +472,198 @@ async fn verified_seal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn lock_directory() -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("proof-lock-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir).unwrap();
+        dir
+    }
+    #[tokio::test]
+    #[ignore = "subprocess fixture invoked by the proof restart tests"]
+    async fn inherited_lock_fixture() {
+        let dir = PathBuf::from(
+            std::env::var_os("VIBEFACE_DELIVERY_LOCK_TEST_DIR").expect("fixture directory"),
+        );
+        if std::env::var_os("VIBEFACE_DELIVERY_LOCK_TEST_BEFORE").is_some() {
+            crate::config::private_write(&dir.join("ready.json"), b"{}").unwrap();
+            std::future::pending::<()>().await;
+            return;
+        }
+        let lock = process_lock(&dir.join("proof.receipt")).unwrap();
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command.args(["-c","import os,subprocess,sys\nfd=int(os.environ['VIBEFACE_DELIVERY_PROOF_LOCK_FD'])\nos.fstat(fd)\np=subprocess.Popen(['/bin/sleep','120'],pass_fds=(fd,))\nopen(sys.argv[1],'w').write(str(p.pid))\np.wait()"])
+            .arg(dir.join("descendant.pid")).env_clear().stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+        inherit_lock(&mut command, &lock);
+        let host = command.spawn().unwrap();
+        let pid = host.id().unwrap();
+        let _group = ProcessGroup(pid);
+        for _ in 0..200 {
+            if dir.join("descendant.pid").exists() {
+                let child = std::fs::read_to_string(dir.join("descendant.pid")).unwrap();
+                if let Ok(descendant) = child.parse::<u32>() {
+                    crate::config::private_write(
+                        &dir.join("ready.json"),
+                        &serde_json::to_vec(
+                            &serde_json::json!({"host":pid,"descendant":descendant}),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    std::future::pending::<()>().await;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("proof lock fixture did not start its descendant");
+    }
+    async fn fixture(dir: &Path, before: bool) -> tokio::process::Child {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "delivery::proof::tests::inherited_lock_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("VIBEFACE_DELIVERY_LOCK_TEST_DIR", dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if before {
+            command.env("VIBEFACE_DELIVERY_LOCK_TEST_BEFORE", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        for _ in 0..200 {
+            if dir.join("ready.json").exists() {
+                return child;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "proof lock fixture exited before readiness"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("proof lock fixture readiness timed out");
+    }
+    #[tokio::test]
+    async fn a_crash_before_the_lock_does_not_block_a_fresh_proof() {
+        let dir = lock_directory();
+        let mut node = fixture(&dir, true).await;
+        node.start_kill().unwrap();
+        node.wait().await.unwrap();
+        let lock = process_lock(&dir.join("proof.receipt")).unwrap();
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn sigkill_keeps_the_proof_locked_until_the_last_inheriting_descendant_exits() {
+        let dir = lock_directory();
+        let receipt = dir.join("proof.receipt");
+        let mut node = fixture(&dir, false).await;
+        let ready: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("ready.json")).unwrap()).unwrap();
+        let host = ready["host"].as_u64().unwrap() as u32;
+        let group = ProcessGroup(host);
+        assert!(process_lock(&receipt).unwrap_err().is::<Busy>());
+        node.start_kill().unwrap();
+        node.wait().await.unwrap();
+        assert!(process_lock(&receipt).unwrap_err().is::<Busy>());
+        std::fs::write(&receipt, b"public receipt fixture").unwrap();
+        assert!(
+            process_lock(&receipt).unwrap_err().is::<Busy>(),
+            "an existing receipt must not bypass an active proof lock"
+        );
+        unsafe {
+            libc::kill(host as i32, libc::SIGKILL);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            process_lock(&receipt).unwrap_err().is::<Busy>(),
+            "the proof descendant must retain the lock after its host exits"
+        );
+        drop(group);
+        let mut released = false;
+        for _ in 0..100 {
+            if let Ok(lock) = process_lock(&receipt) {
+                drop(lock);
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            released,
+            "proof lock was not released after the process group exited"
+        );
+        assert_eq!(std::fs::read(&receipt).unwrap(), b"public receipt fixture");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn an_error_exit_releases_the_inherited_lock() {
+        let dir = lock_directory();
+        let receipt = dir.join("proof.receipt");
+        let lock = process_lock(&receipt).unwrap();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        inherit_lock(&mut command, &lock);
+        let mut child = command.spawn().unwrap();
+        let _group = ProcessGroup(child.id().unwrap());
+        drop(lock);
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
+        let lock = process_lock(&receipt).unwrap();
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn confined_groth16_shim_requires_an_inherited_regular_lock_descriptor() {
+        fn shim() -> tokio::process::Command {
+            let mut command = tokio::process::Command::new("/bin/bash");
+            command
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../proofs/delivery/confined-gnark.sh"),
+                )
+                .arg("--version")
+                .env_clear()
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .stdin(Stdio::null());
+            command
+        }
+        let dir = lock_directory();
+        let lock = process_lock(&dir.join("proof.receipt")).unwrap();
+        let mut inherited = shim();
+        inherit_lock(&mut inherited, &lock);
+        let output = inherited.output().await.unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            output.stdout,
+            b"Vibeface confined RISC Zero Groth16 runner v2025-04-03.1\n"
+        );
+        let output = shim()
+            .env("VIBEFACE_DELIVERY_PROOF_LOCK_FD", "2147483647")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(64));
+        assert_eq!(output.stderr, b"invalid inherited proof lock descriptor\n");
+        let directory = File::open(&dir).unwrap();
+        let mut invalid = shim();
+        inherit_lock(&mut invalid, &directory);
+        let output = invalid.output().await.unwrap();
+        assert_eq!(output.status.code(), Some(64));
+        assert_eq!(output.stderr, b"invalid inherited proof lock descriptor\n");
+        drop(directory);
+        drop(lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[tokio::test]
     async fn excessive_output_fails_without_waiting_for_more() {
         let mut command = tokio::process::Command::new("/bin/sh");

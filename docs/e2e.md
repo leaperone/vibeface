@@ -98,6 +98,22 @@ python3 scripts/verify-node.py --delivery \
 
 缺少配置、真实证明、部署或结算证据时，命令失败并报告 `UNVERIFIED` 或具体错误。公益模式通过不能代替付费验收。测试链的两次确认也不代表绝对最终性。
 
+## 验证原生接收和本地文件
+
+原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。
+
+```sh
+VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
+VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
+VIBEFACE_E2E_BINARY=/absolute/task/.artifacts/native/vibeface \
+VIBEFACE_E2E_CRYPTO_MODULE=/absolute/task/.artifacts/native/web/vibeface_secure.js \
+AGENT_DEVICE_HOME="$PWD/.artifacts/native/agent-device" \
+AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
+pnpm exec e2e run --config e2e.native.config.ts
+```
+
+原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。邀请码仅通过 e2e SecretProvider 从私有任务文件读取。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
+
 ## 让编码代理使用 e2e
 
 项目已配置 Codex、Claude Code 和 Cursor 的 e2e MCP。安装依赖后重新打开可信项目会话。编写或运行测试前，读取 [e2e skill](../.agents/skills/e2e/SKILL.md)。

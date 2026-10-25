@@ -11,6 +11,11 @@ on:
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      delivery_live:
+        description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -72,7 +77,8 @@ jobs:
           python3 scripts/ci.py --self-test
           python3 scripts/check-delivery.py --self-test
           python3 scripts/install-delivery-toolchain.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py")]'
+          python3 scripts/run-delivery-live.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
@@ -530,6 +536,47 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
+  delivery-live:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    needs: [plan, package, crypto-web, web]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: node-package-x86_64-unknown-linux-gnu-${{ github.sha }}
+          path: .artifacts/vdp/live-package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: crates/node/web/generated
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
+      - name: Generate seven genuine local proofs and observe exact settlement
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --source-commit "$SOURCE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: delivery-live-public-${{ github.sha }}
+          path: |
+            .artifacts/vdp/live-public/key-binding.receipt
+            .artifacts/vdp/live-public/key-binding.json
+            .artifacts/vdp/live-public/relation-*-window-*.receipt
+            .artifacts/vdp/live-public/relation-*-window-*.json
+            .artifacts/vdp/live-public/settlement.json
+            .artifacts/vdp/live-public/settlement-observation.json
+            .artifacts/vdp/live-public/summary.json
+            .artifacts/vdp/live-public/resources.json
+          if-no-files-found: warn
+          retention-days: 14
+
   npm-package:
     needs: [plan, package]
     if: needs.plan.outputs.npm == 'true'
@@ -596,7 +643,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, package, npm-package, npm-smoke]
+    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -605,7 +652,7 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

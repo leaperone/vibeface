@@ -4070,6 +4070,11 @@ def delivery_rows(node, query, parameters=()):
         return connection.execute(query, parameters).fetchall()
 
 
+def delivery_entry_args():
+    address = f"127.0.0.1:{available_port()}"
+    return ["--public-entry", "--relay-listen", address, "--relay-url", "http://" + address]
+
+
 def delivery_free_state(nodes, spy):
     wallets = sum((node.directory / "delivery-wallet.json").exists() for node in nodes)
     transactions = sum((delivery_rows(node, "SELECT count(*) FROM transactions") or [(0,)])[0][0]
@@ -4175,7 +4180,7 @@ def delivery_charity_acceptance(options):
 
     try:
         for name in ("S", "R", "P", "X"):
-            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"] if name == "P" else [])
+            args = delivery_entry_args() if name == "P" else []
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
@@ -4381,6 +4386,9 @@ def delivery_paid_run(options, configuration, deployment):
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     relay, nodes, passwords = PkarrRelay(), [], {}
+    inherited_proof = {}
+    registration_process = None
+    registration_log = None
     report = {"status": "running", "mode": "paid", "binary_sha256": file_sha256(binary),
               "free_checks": free["status"], "deployment": {name: chain[name] for name in fields if name != "profile"},
               "cases": {}, "not_checked": ["public assets", "absolute chain finality", "rendered native mobile UI",
@@ -4408,7 +4416,7 @@ def delivery_paid_run(options, configuration, deployment):
         height = int(rpc("eth_blockNumber", []), 16)
         return receipt if height >= int(receipt["blockNumber"], 16) + chain["confirmations"] - 1 else None
 
-    def cli(node, arguments, *, password=None, timeout=30, success=True):
+    def cli(node, arguments, *, password=None, timeout=30, success=True, error_contains=None):
         descriptor, password_path = None, None
         command = [str(binary), "wallet", "--data-dir", str(node.directory), *arguments]
         try:
@@ -4425,9 +4433,66 @@ def delivery_paid_run(options, configuration, deployment):
                 os.close(descriptor)
                 password_path.unlink(missing_ok=True)
         require((result.returncode == 0) == success, "local wallet command has its expected outcome without exposing its passphrase")
+        if error_contains is not None:
+            require(not success and error_contains.encode() in result.stderr,
+                    "the rejected local wallet operation names the expected authority or proof-lock boundary")
         if success and result.stdout.lstrip().startswith(b"{"):
             return json.loads(result.stdout)
         return None
+
+    def process_fact(pid):
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            return {"pid": pid, "start": fields[19], "group": int(fields[2]),
+                    "exe": Path(f"/proc/{pid}/exe").resolve(strict=True)}
+        except FileNotFoundError:
+            return None
+
+    def controlled_descendants(parent):
+        pending, found = [parent], {}
+        while pending:
+            pid = pending.pop()
+            if pid in found:
+                continue
+            fact = process_fact(pid)
+            if fact is None:
+                continue
+            found[pid] = fact
+            for task in Path(f"/proc/{pid}/task").glob("*"):
+                try:
+                    pending.extend(int(child) for child in (task / "children").read_text().split())
+                except FileNotFoundError:
+                    pass
+        found.pop(parent, None)
+        return found
+
+    def same_process(fact):
+        current = process_fact(fact["pid"])
+        return current is not None and current["start"] == fact["start"]
+
+    def owns_proof_lock(fact, lock):
+        if not same_process(fact):
+            return False
+        for fd in Path(f"/proc/{fact['pid']}/fd").glob("*"):
+            try:
+                if fd.resolve(strict=True) == lock:
+                    return True
+            except FileNotFoundError:
+                pass
+        return False
+
+    def proof_busy(lock):
+        import fcntl
+        descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(descriptor)
 
     def transaction(node, identifier):
         def observed():
@@ -4476,7 +4541,7 @@ def delivery_paid_run(options, configuration, deployment):
         funder = accounts[0]
         require(int(rpc("eth_chainId", []), 16) == 31337, "the running local chain has the pinned identity")
         for name in ("S", "R", "P"):
-            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"] if name == "P" else [])
+            args = delivery_entry_args() if name == "P" else []
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
@@ -4509,14 +4574,90 @@ def delivery_paid_run(options, configuration, deployment):
         token_tx = rpc("eth_sendTransaction", [{"from": funder, "to": chain["asset"], "data": transfer}])
         wait_for("controlled sender TestToken funding", lambda: confirmed(token_tx), timeout=60)
         register_intent = str(uuid.uuid4())
+        registration_log = (run / "register-before-crash.log").open("wb")
+        registration_process = subprocess.Popen([str(binary), "wallet", "--data-dir", str(receiver.directory),
+            "register-key", "--intent-id", register_intent, "--gas-cap", configuration["register_key_gas_cap_wei"]],
+            stdin=subprocess.DEVNULL, stdout=registration_log, stderr=registration_log, start_new_session=True)
+        lock = (receiver.directory / "delivery/private/prover.lock").resolve()
+        actual_r0vm = Path(prover["r0vm"]).resolve(strict=True)
+
+        def genuine_prover_started():
+            if registration_process.poll() is not None:
+                raise RuntimeError("the first real receiving-key proof stopped before its crash checkpoint; inspect the private registration log")
+            facts = controlled_descendants(receiver.process.pid)
+            inherited = {pid: fact for pid, fact in facts.items() if owns_proof_lock(fact, lock)}
+            r0vm = [fact for fact in inherited.values() if fact["exe"] == actual_r0vm]
+            if r0vm and len(inherited) >= 2 and lock.exists() and proof_busy(lock):
+                require(all(fact["group"] not in (os.getpgrp(), receiver.process.pid) for fact in inherited.values()),
+                        "the trusted proof descendants use a separate process group owned by this task")
+                return inherited
+            return None
+
+        inherited_proof = wait_for("actual trusted host and r0vm inherit the exclusive Node proof lock", genuine_prover_started, timeout=120)
+        jobs = delivery_rows(receiver, "SELECT digest,path FROM proof_jobs")
+        require(len(jobs) == 1, "the first receiving-key proof has one reserved stable receipt")
+        proof_digest, receipt_name = jobs[0]
+        receipt = Path(receipt_name)
+        require(receipt.resolve().is_relative_to(receiver.directory.resolve()) and not receipt.exists(),
+                "the genuine crash checkpoint precedes publication of its original receipt")
+        receiver.stop(crash=True)
+        require(any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()) and proof_busy(lock),
+                "the actual authorized proof retains the lock after its Node is killed")
+        try:
+            registration_process.wait(timeout=35)
+        except subprocess.TimeoutExpired:
+            registration_process.terminate()
+            registration_process.wait(timeout=5)
+        registration_log.close()
+        registration_log = None
+        receiver.start()
+        receiver.client.connect()
+        receiver.client.authenticate()
+        require(cli(receiver, ["status"])["state"] == "locked", "SIGKILL restores the actual receiving wallet locked")
+        registration_args = ["register-key", "--intent-id", register_intent,
+                             "--gas-cap", configuration["register_key_gas_cap_wei"]]
+        cli(receiver, registration_args, success=False, error_contains="unlock the independent delivery wallet locally first")
+        require(proof_busy(lock), "the original proof still occupies its inherited lock at the retry checkpoint")
+        cli(receiver, ["unlock"], password=passwords["R"])
+        cli(receiver, registration_args, success=False,
+            error_contains="a previously authorized proof is still running; waiting to reconcile its receipt")
+        cli(receiver, ["lock"])
+        spawned = controlled_descendants(receiver.process.pid)
+        require(not any(fact["exe"] == actual_r0vm or owns_proof_lock(fact, lock) for fact in spawned.values()),
+                "same-intent retries create no second host or r0vm while the inherited proof is active")
+        require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs") == jobs
+                and not delivery_rows(receiver, "SELECT id FROM transactions WHERE id=?", (f"key-{register_intent}/register",)),
+                "the crash and occupied-lock retries preserve one proof reservation and reserve no transaction nonce")
+        print("OBSERVE delivery-paid the original receiving-key proof continues after Node SIGKILL", flush=True)
+
+        def original_receipt_ready():
+            if receipt.exists() and not proof_busy(lock):
+                metadata = receipt.lstat()
+                require(stat.S_ISREG(metadata.st_mode) and 0 < metadata.st_size <= 16384,
+                        "the original trusted prover atomically publishes its bounded receipt")
+                return True
+            require(any(same_process(fact) for fact in inherited_proof.values()),
+                    "the authorized prover remains observable until it publishes its receipt")
+            return False
+
+        wait_for("the original genuine receiving-key proof completes without a duplicate job", original_receipt_ready, timeout=7400)
+        original_receipt_sha = file_sha256(receipt)
+        require(cli(receiver, ["status"])["state"] == "locked", "waiting for the authorized receipt does not unlock the receiving wallet")
+        cli(receiver, ["unlock"], password=passwords["R"])
 
         def registration():
-            value = cli(receiver, ["register-key", "--intent-id", register_intent,
-                                  "--gas-cap", configuration["register_key_gas_cap_wei"]], timeout=7300)
+            value = cli(receiver, registration_args, timeout=7300)
             if value["phase"] in ("reverted", "conflicted", "failed"):
                 raise RuntimeError("receiving-key registration reached a terminal chain failure")
             return value if value["phase"] == "confirmed" and value.get("registry_confirmed") is True else None
         wait_for("actual receiving-key proof registration confirmation", registration, timeout=7400)
+        require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs") == jobs
+                and file_sha256(receipt) == original_receipt_sha
+                and len(delivery_rows(receiver, "SELECT id FROM transactions WHERE id=?", (f"key-{register_intent}/register",))) == 1,
+                "same registry intent reuses the original genuine receipt and has exactly one durable transaction")
+        passed("genuine-prover-survives-node-sigkill-without-a-duplicate-job", proof_digest=proof_digest,
+               original_receipt_sha256=original_receipt_sha, inherited_lock=True,
+               restarted_wallet_locked=True, same_intent=True, proof_reservations=1, registry_transactions=1)
         passed("local-wallets-and-genuine-receiving-key-registration", wallets=3, chain_id=31337,
                two_confirmations=True, protected_passphrase_fd=True)
         original = os.urandom(96 * 1024)
@@ -4627,6 +4768,21 @@ def delivery_paid_run(options, configuration, deployment):
         raise
     finally:
         passwords.clear()
+        if registration_process is not None and registration_process.poll() is None:
+            registration_process.terminate()
+            try:
+                registration_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                registration_process.kill()
+                registration_process.wait(timeout=5)
+        if registration_log is not None:
+            registration_log.close()
+        for group in {fact["group"] for fact in inherited_proof.values() if same_process(fact)}:
+            if any(fact["group"] == group and same_process(fact) for fact in inherited_proof.values()):
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         for node in reversed(nodes):
             node.client.close()
             node.stop()
@@ -4652,6 +4808,7 @@ def e2e_fixture(options):
     nodes = {}
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
+    native_ready = False
 
     def details():
         return {"run": str(run), "nodes": {
@@ -4666,8 +4823,7 @@ def e2e_fixture(options):
     signal.signal(signal.SIGINT, stop)
     try:
         for role in (["source", "receiver", "provider"] if relay else ["source"]):
-            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"]
-                    if role == "provider" else [])
+            args = delivery_entry_args() if role == "provider" else []
             node = Node(run, role, binary, workspace, helper, init_args=args,
                         port=options.fixture_port if role == "source" else None)
             nodes[role] = node
@@ -4697,6 +4853,53 @@ def e2e_fixture(options):
                               "pkarr_reads": relay.reads if relay else 0,
                               "pkarr_writes": relay.writes if relay else 0,
                               "chain_rpc_calls": rpc.calls if rpc else 0}
+                elif op == "native_setup":
+                    require(relay is not None and not native_ready, "native setup initializes only its own fresh delivery fixture")
+                    for role in ("source", "receiver"):
+                        node = nodes[role]
+                        node.bootstrap()
+                        delivery_call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
+                    path = Path(request["invitation_file"])
+                    require(path.is_absolute() and path.resolve().is_relative_to(options.artifacts.resolve())
+                            and not path.exists(), "native invitation stays in a new private task file")
+                    invitation = nodes["receiver"].client.invite()
+                    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+                        output.write(invitation)
+                    native_ready = True
+                    result = details()
+                elif op == "native_join":
+                    require(native_ready, "native pairing requires the controlled initialized receiver")
+                    client = nodes["receiver"].client
+
+                    def revealed():
+                        entries = client.call("join_status")["requests"]
+                        pending = next((item for item in entries if item["name"] == "VDP native receiver"
+                                        and item["kind"] == "client" and item["status"] in ("pending", "confirming")), None)
+                        if pending and pending["status"] == "pending":
+                            client.start_approval(pending["join_id"])
+                            return None
+                        return pending if pending and pending.get("joiner_nonce") else None
+
+                    pending = wait_for("native client reveals its actual pairing nonce", revealed)
+                    result = {"peer": pending["device_id"], "code": client.command("short_code", request=pending)}
+                elif op == "native_approve":
+                    require(native_ready, "native approval belongs to the controlled receiver")
+                    client = nodes["receiver"].client
+                    pending = client.pending_join(request["peer"])
+                    require(pending and pending["name"] == "VDP native receiver" and pending.get("joiner_nonce")
+                            and request["code"] == client.command("short_code", request=pending),
+                            "native and managing device must show the exact same revealed safety code")
+                    client.grant(pending, manage=True)
+                    result = {"approved": True}
+                elif op == "native_send":
+                    require(native_ready, "native delivery is scoped to the initialized fixture")
+                    intent = str(uuid.uuid4())
+                    prepared = delivery_call(nodes["source"], "prepare", intent_id=intent,
+                        receiver_peer=nodes["receiver"].device_id, provider_peer=nodes["provider"].device_id,
+                        mode="charity", acceptance="recoverable", name=request["name"], content_base64=request["content_base64"],
+                        max_service_amount="0", max_gas_amount="0")
+                    delivery_call(nodes["source"], "confirm", intent_id=intent)
+                    result = {"order_id": prepared["order_id"]}
                 else:
                     raise ValueError("unsupported fixture operation")
                 print(json.dumps({"ok": True, "result": result}), flush=True)

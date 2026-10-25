@@ -432,7 +432,7 @@ impl Delivery {
                         )
                         .await?;
                     if observed.phase != "confirmed" {
-                        stored.view.phase = Phase::Reconciling;
+                        stored.view.chain_unknown();
                         self.save(&mut stored)?;
                         return Ok(serde_json::to_value(stored.view)?);
                     }
@@ -451,7 +451,7 @@ impl Delivery {
                         )
                         .await?;
                     if observed.phase != "confirmed" {
-                        stored.view.phase = Phase::Reconciling;
+                        stored.view.chain_unknown();
                         self.save(&mut stored)?;
                         return Ok(serde_json::to_value(stored.view)?);
                     }
@@ -502,7 +502,7 @@ impl Delivery {
                     self.update_paid_view(&mut stored).await?;
                     self.withdraw_earned(&mut stored, index).await?;
                 } else {
-                    stored.view.phase = Phase::Reconciling;
+                    stored.view.chain_unknown();
                 }
                 self.save(&mut stored)?;
                 Ok(serde_json::to_value(stored.view)?)
@@ -739,7 +739,7 @@ impl Delivery {
         match self.update_paid_view(&mut order).await {
             Ok(()) => order.view.error = None,
             Err(error) => {
-                order.view.phase = Phase::Reconciling;
+                order.view.chain_unknown();
                 order.view.error = Some(error.to_string());
                 self.save(&mut order)?;
                 return Ok(());
@@ -809,67 +809,252 @@ impl Delivery {
     }
     pub(super) async fn update_paid_view(&self, stored: &mut StoredOrder) -> Result<()> {
         let state = self.paid_state(&stored.order).await?;
-        stored.view.payment.earned = state.earned;
-        stored.view.payment.withdrawn = state.withdrawn;
-        stored.view.payment.refunded = state.refunded;
-        for (window, fact) in stored.view.windows.iter_mut().zip(state.windows) {
-            window.state = match fact.phase {
-                0 => WindowState::Pending,
-                1 => WindowState::Held,
-                2 => WindowState::KeyPublished,
-                3 => WindowState::Earned,
-                4 => WindowState::Refunded,
-                _ => bail!("unknown chain delivery phase"),
-            };
-            window.decryption_proven = fact.decryption_proven;
-        }
-        let all_earned = stored
-            .view
-            .windows
-            .iter()
-            .all(|w| w.state == WindowState::Earned);
-        let all_open = stored.view.windows.iter().all(|w| w.decryption_proven);
-        let refunded = stored
-            .view
-            .windows
-            .iter()
-            .filter(|w| w.state == WindowState::Refunded)
-            .count();
-        if all_earned {
-            stored.view.phase = Phase::Paid;
-            stored.view.payment.state = PaymentState::Earned;
-            if stored.view.payment.withdrawn == stored.view.payment.earned
-                && stored.view.payment.earned != "0"
-            {
-                stored.view.payment.state = PaymentState::Withdrawn;
-            }
-            stored.view.evidence = if all_open {
-                Evidence::DecryptionProven
+        apply_paid_snapshot(&mut stored.view, &state)
+    }
+}
+
+fn apply_paid_snapshot(view: &mut DeliveryOrder, state: &chain::OrderState) -> Result<()> {
+    ensure!(
+        !state.windows.is_empty() && state.windows.len() == view.windows.len(),
+        "chain delivery window coverage changed"
+    );
+    view.payment.earned = state.earned.clone();
+    view.payment.withdrawn = state.withdrawn.clone();
+    view.payment.refunded = state.refunded.clone();
+    view.phase = Phase::Funded;
+    view.payment.state = PaymentState::Confirmed;
+    view.evidence = Evidence::None;
+    for (window, fact) in view.windows.iter_mut().zip(&state.windows) {
+        window.state = match fact.phase {
+            0 => WindowState::Pending,
+            1 => WindowState::Held,
+            2 => WindowState::KeyPublished,
+            3 => WindowState::Earned,
+            4 => WindowState::Refunded,
+            _ => bail!("unknown chain delivery phase"),
+        };
+        window.decryption_proven = fact.decryption_proven;
+    }
+    let all_earned = state.windows.iter().all(|window| window.phase == 3);
+    let all_refunded = state.windows.iter().all(|window| window.phase == 4);
+    let any_refunded = state.windows.iter().any(|window| window.phase == 4);
+    let all_recoverable = state.windows.iter().all(|window| {
+        matches!(window.phase, 2..=4)
+            && window.capsule.len() == 80
+            && hash(&window.capsule) == window.capsule_hash
+    });
+    let all_held = state
+        .windows
+        .iter()
+        .all(|window| matches!(window.phase, 1..=3));
+    let any_progress = state.windows.iter().any(|window| window.phase != 0);
+    if all_earned {
+        view.phase = Phase::Paid;
+    } else if all_refunded {
+        view.phase = Phase::Refunded;
+        view.payment.state = PaymentState::Refunded;
+    } else if any_refunded {
+        view.phase = Phase::Partial;
+    } else if all_recoverable {
+        view.phase = Phase::KeyPublished;
+    } else if all_held {
+        view.phase = Phase::CipherHeld;
+    } else if any_progress {
+        view.phase = Phase::Partial;
+    }
+    if view.payment.earned != "0" || all_earned {
+        view.payment.state =
+            if view.payment.withdrawn == view.payment.earned && view.payment.earned != "0" {
+                PaymentState::Withdrawn
             } else {
-                Evidence::Recoverable
+                PaymentState::Earned
             };
-        } else if refunded == stored.view.windows.len() {
-            stored.view.phase = Phase::Refunded;
-            stored.view.payment.state = PaymentState::Refunded;
-        } else if refunded > 0 {
-            stored.view.phase = Phase::Partial;
-        } else if stored
-            .view
+    }
+    view.evidence = if all_recoverable
+        && state
             .windows
             .iter()
-            .any(|w| w.state == WindowState::Held)
-        {
-            stored.view.phase = Phase::CipherHeld;
-            stored.view.evidence = Evidence::CiphertextHeld;
-        } else if stored
-            .view
-            .windows
-            .iter()
-            .any(|w| w.state == WindowState::KeyPublished)
-        {
-            stored.view.phase = Phase::KeyPublished;
-            stored.view.evidence = Evidence::Recoverable;
+            .all(|window| window.phase == 3 && window.decryption_proven)
+    {
+        Evidence::DecryptionProven
+    } else if all_recoverable {
+        Evidence::Recoverable
+    } else if all_held {
+        Evidence::CiphertextHeld
+    } else {
+        Evidence::None
+    };
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn view() -> DeliveryOrder {
+        DeliveryOrder {
+            order_id: "ab".repeat(32),
+            intent_id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Receiver,
+            mode: Mode::Paid,
+            acceptance: Acceptance::Strict,
+            source_peer: "11".repeat(32),
+            receiver_peer: "22".repeat(32),
+            provider_peer: "33".repeat(32),
+            name: None,
+            bytes: 8,
+            sha256: None,
+            phase: Phase::Paid,
+            evidence: Evidence::DecryptionProven,
+            payment: Payment {
+                state: PaymentState::Withdrawn,
+                chain_id: Some("31337".into()),
+                asset: Some(format!("0x{}", "44".repeat(20))),
+                payer: Some(format!("0x{}", "55".repeat(20))),
+                provider_wallet: Some(format!("0x{}", "66".repeat(20))),
+                delivery_fee: "20".into(),
+                reservation_fee: "4".into(),
+                priority_fee: "5".into(),
+                total: "29".into(),
+                gas_cap: "1000000000000000".into(),
+                earned: "29".into(),
+                withdrawn: "29".into(),
+                refunded: "0".into(),
+                tx_hash: None,
+            },
+            windows: (0..2)
+                .map(|index| WindowView {
+                    index,
+                    bytes: 4,
+                    committed_bytes: 72,
+                    state: WindowState::Earned,
+                    decryption_proven: true,
+                })
+                .collect(),
+            deadlines: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            error: None,
         }
-        Ok(())
+    }
+    fn fact(phase: u8, open: bool) -> chain::WindowState {
+        let capsule = if matches!(phase, 2 | 3) {
+            vec![0x42; 80]
+        } else {
+            Vec::new()
+        };
+        chain::WindowState {
+            phase,
+            decryption_proven: open,
+            ciphertext_hash: [0xab; 32],
+            capsule_hash: hash(&capsule),
+            capsule,
+        }
+    }
+    fn snapshot(
+        windows: Vec<chain::WindowState>,
+        earned: &str,
+        withdrawn: &str,
+        refunded: &str,
+    ) -> chain::OrderState {
+        chain::OrderState {
+            payer: format!("0x{}", "55".repeat(20)),
+            provider_wallet: format!("0x{}", "66".repeat(20)),
+            earned: earned.into(),
+            withdrawn: withdrawn.into(),
+            refunded: refunded.into(),
+            bonus_earned: false,
+            bonus_refunded: false,
+            windows,
+        }
+    }
+    #[test]
+    fn a_reorg_to_funded_rebuilds_money_and_proof_state_without_old_completion() {
+        let mut view = view();
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(0, false), fact(0, false)], "0", "0", "0"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::Funded);
+        assert_eq!(view.payment.state, PaymentState::Confirmed);
+        assert_eq!(view.evidence, Evidence::None);
+        assert_eq!(view.payment.earned, "0");
+        assert_eq!(view.payment.withdrawn, "0");
+        assert!(
+            view.windows
+                .iter()
+                .all(|window| window.state == WindowState::Pending && !window.decryption_proven)
+        );
+        assert_eq!(view.windows[0].committed_bytes, 72);
+    }
+    #[test]
+    fn mixed_strict_windows_never_claim_the_whole_file_is_recoverable() {
+        let mut view = view();
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(2, false), fact(0, false)], "0", "0", "0"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::Partial);
+        assert_eq!(view.evidence, Evidence::None);
+        assert_eq!(view.windows[0].state, WindowState::KeyPublished);
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(3, true), fact(1, false)], "12", "0", "0"),
+        )
+        .unwrap();
+        assert_eq!(view.evidence, Evidence::CiphertextHeld);
+        assert_eq!(view.payment.state, PaymentState::Earned);
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(3, true), fact(4, false)], "12", "12", "17"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::Partial);
+        assert_eq!(view.evidence, Evidence::None);
+        assert_eq!(view.payment.state, PaymentState::Withdrawn);
+    }
+    #[test]
+    fn whole_file_evidence_uses_every_current_window_and_refunds_clear_old_proofs() {
+        let mut view = view();
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(2, false), fact(2, false)], "0", "0", "0"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::KeyPublished);
+        assert_eq!(view.evidence, Evidence::Recoverable);
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(3, true), fact(3, true)], "29", "29", "0"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::Paid);
+        assert_eq!(view.evidence, Evidence::DecryptionProven);
+        apply_paid_snapshot(
+            &mut view,
+            &snapshot(vec![fact(4, false), fact(4, false)], "0", "0", "29"),
+        )
+        .unwrap();
+        assert_eq!(view.phase, Phase::Refunded);
+        assert_eq!(view.payment.state, PaymentState::Refunded);
+        assert_eq!(view.evidence, Evidence::None);
+    }
+    #[test]
+    fn an_unknown_chain_view_retracts_order_and_window_proof_claims() {
+        let mut view = view();
+        view.chain_unknown();
+        assert_eq!(view.phase, Phase::Reconciling);
+        assert_eq!(view.payment.state, PaymentState::Unknown);
+        assert_eq!(view.evidence, Evidence::None);
+        assert!(
+            view.windows
+                .iter()
+                .all(|window| !window.decryption_proven && window.state == WindowState::Pending)
+        );
+        assert!(!matches!(
+            view.phase,
+            Phase::Paid | Phase::Refunded | Phase::Failed
+        ));
     }
 }

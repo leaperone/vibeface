@@ -62,8 +62,7 @@ impl Delivery {
                             )
                         })?;
                         if observed.phase != "confirmed" {
-                            stored.view.phase = Phase::Reconciling;
-                            stored.view.payment.state = PaymentState::Unknown;
+                            stored.view.chain_unknown();
                             self.save(&mut stored)?;
                             return Ok(stored);
                         }
@@ -205,7 +204,7 @@ impl Delivery {
                         .await?;
                         let remote: DeliveryOrder = serde_json::from_value(value)?;
                         if remote.phase == Phase::Reconciling {
-                            stored.view.phase = Phase::Reconciling;
+                            stored.view.chain_unknown();
                             self.save(&mut stored)?;
                             return Ok(stored);
                         }
@@ -990,10 +989,8 @@ impl Delivery {
                     self.save(&mut order)?;
                     return self.reconcile(node, order).await;
                 }
-                if matches!(
-                    observed.phase.as_str(),
-                    "reverted" | "conflicted" | "failed"
-                ) {
+                if observed.phase == "reverted" {
+                    order.view.chain_unknown();
                     order.view.phase = Phase::Failed;
                     order.view.payment.state = PaymentState::Failed;
                     order.view.error = observed.error;
@@ -1040,8 +1037,7 @@ impl Delivery {
                 )
                 .await?;
             if approve.phase != "confirmed" {
-                order.view.phase = Phase::Reconciling;
-                order.view.payment.state = PaymentState::Unknown;
+                order.view.chain_unknown();
                 self.save(&mut order)?;
                 return Ok(order);
             }
@@ -1061,8 +1057,7 @@ impl Delivery {
                 .with_store(|store| store.transaction(&format!("{}/fund", order.view.order_id)))?;
             order.view.payment.tx_hash = tx.tx_hash;
             if fund.phase != "confirmed" {
-                order.view.phase = Phase::Reconciling;
-                order.view.payment.state = PaymentState::Unknown;
+                order.view.chain_unknown();
                 self.save(&mut order)?;
                 return Ok(order);
             }

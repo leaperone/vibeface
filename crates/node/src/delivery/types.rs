@@ -158,6 +158,17 @@ pub struct DeliveryOrder {
     pub updated_at_ms: i64,
     pub error: Option<String>,
 }
+impl DeliveryOrder {
+    pub fn chain_unknown(&mut self) {
+        self.phase = Phase::Reconciling;
+        self.payment.state = PaymentState::Unknown;
+        self.evidence = Evidence::None;
+        for window in &mut self.windows {
+            window.state = WindowState::Pending;
+            window.decryption_proven = false;
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

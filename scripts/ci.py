@@ -23,7 +23,7 @@ DEPENDENTS = {
 }
 CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/discovery.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py")),
+    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/discovery.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
@@ -199,7 +199,7 @@ def write_plan(plan, output=None):
             )
 
 
-def gate(needs, plan=None):
+def gate(needs, plan=None, delivery_live=False):
     if needs.get("plan", {}).get("result") != "success":
         raise ValueError("CI plan did not succeed")
     if plan is None:
@@ -207,9 +207,11 @@ def gate(needs, plan=None):
     expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
     if any(plan[key] != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
-    required = expected["required_jobs"]
+    if delivery_live and plan["event"] != "workflow_dispatch":
+        raise ValueError("Live delivery proofs require explicit workflow_dispatch")
+    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else [])
     failed = [job for job in required if needs.get(job, {}).get("result") != "success"]
-    failed.extend(job for job in JOBS if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
+    failed.extend(job for job in (*JOBS, "delivery-live") if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
     if failed:
         raise ValueError(f"Required CI checks did not succeed: {', '.join(failed)}")
     print(f"CI gate passed: {', '.join(required)}")
@@ -340,6 +342,14 @@ def self_test():
         incomplete = json.loads(json.dumps(complete))
         incomplete[job]["result"] = "skipped"
         expect_failure(lambda: gate(incomplete))
+    expect_failure(lambda: gate(complete, delivery_live=True))
+    complete["delivery-live"] = {"result": "success"}
+    gate(complete, delivery_live=True)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        broken = json.loads(json.dumps(complete))
+        broken["delivery-live"] = {"result": result}
+        expect_failure(lambda: gate(broken, delivery_live=True))
+    expect_failure(lambda: gate(needs, delivery_live=True))
     delivery_plan = make_plan(["proofs/delivery/fixtures/manifest.json"])
     delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
     delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
@@ -521,6 +531,7 @@ def main():
     plan.add_argument("--github-output")
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)
+    final_gate.add_argument("--delivery-live", action="store_true", help="also require the explicitly dispatched live proof job")
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
@@ -540,7 +551,7 @@ def main():
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
-        gate(needs, json.loads(args.plan.read_text()) if args.plan else None)
+        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live)
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":
