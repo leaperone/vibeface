@@ -30,7 +30,7 @@
 flowchart LR
     U[本人的网页或手机浏览器]
     G[公共入口<br>网页、relay 与密文转发]
-    A[Mac mini Node<br>协调 Agent]
+    A[Node A<br>协调 Agent]
     B[Node B<br>协调 Agent 与本机工具]
     C[Node C<br>协调 Agent 与历史副本]
     U -->|HTTPS 内的 Noise| G
@@ -161,7 +161,7 @@ vibeface join '<加入链接>'
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface --locked
+bash scripts/package-node.sh
 ./target/release/vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects

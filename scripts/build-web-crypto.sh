@@ -14,7 +14,8 @@ if [[ "$("$bindgen" --version)" != "wasm-bindgen $version" ]]; then
   printf 'Expected wasm-bindgen-cli %s.\n' "$version" >&2
   exit 1
 fi
-cargo build --package vibeface-secure --lib --locked --release --target wasm32-unknown-unknown
+release_rustflags="$(python3 "$root/scripts/release-rustflags.py")"
+CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo build --package vibeface-secure --lib --locked --release --target wasm32-unknown-unknown
 metadata="$(cargo metadata --no-deps --format-version 1 --locked)"
 target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' <<< "$metadata")"
 mkdir -p "$out"

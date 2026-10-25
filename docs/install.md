@@ -112,11 +112,11 @@ vibeface init --relay https://relay.example                                     
 
 设置写入 `config.json` 的 `network` 字段，之后修改该字段并重启。程序不内置公共 relay。更多说明见 [Node 之间的连接](node.md#node-之间的连接)。
 
-要让手机从外网打开网页而公网机器不保存你的数据，在公网机器上运行公共入口，家里的 Node 指向它：
+要让手机从外网打开网页而公网机器不保存你的数据，在公网机器上运行公共入口，个人设备上的 Node 指向它：
 
 ```sh
 vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340   # 公网机器
-vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-token             # 家里的 Node
+vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-token             # 个人设备上的 Node
 ```
 
 反向代理和令牌的处理见 [配置公共入口](node.md#配置公共入口)。

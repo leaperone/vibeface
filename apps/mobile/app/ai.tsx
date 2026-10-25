@@ -359,7 +359,7 @@ function PathList({ label, items, busy, trailing, onChange }: { label: string; i
       <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`移除 ${item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
     </View>)}
     <View className="flex-row gap-2">
-      <Input accessibilityLabel="文件夹路径" placeholder="/Users/me/project" autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
+      <Input accessibilityLabel="文件夹路径" placeholder="/path/to/project" autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
         returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />
       <Button variant="outline" className="min-h-11" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
     </View>

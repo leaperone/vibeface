@@ -59,7 +59,10 @@ crypto="$repo/crates/node/web/generated"
   echo 'Web client is missing. Run scripts/build-web.sh before building a package.' >&2
   exit 1
 }
-if "$build"; then cargo "${build_args[@]}"; fi
+if "$build"; then
+  release_rustflags="$(python3 "$repo/scripts/release-rustflags.py")"
+  CARGO_ENCODED_RUSTFLAGS="$release_rustflags" cargo "${build_args[@]}"
+fi
 [[ -x "$binary" ]] || { printf 'Release binary is missing: %s\n' "$binary" >&2; exit 1; }
 version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "$repo/Cargo.toml" | head -n 1)"
 [[ -n "$version" && -n "$target" ]] || { echo 'Could not determine package version or target.' >&2; exit 1; }
@@ -116,7 +119,21 @@ The archive contains the Rust node binary. Install the provider tools separately
 
 Use absolute provider paths in `config.json` when running a background service. No credentials or provider runtimes are included.
 REQUIREMENTS
-tar -czf "$output/$name.tar.gz" -C "$staging" "$name"
+python3 - "$output/$name.tar.gz" "$package" "$name" <<'PY'
+import sys
+import tarfile
+
+
+def public_metadata(info):
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.pax_headers = {}
+    return info
+
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    archive.add(sys.argv[2], arcname=sys.argv[3], filter=public_metadata)
+PY
 cd "$output"
 if command -v sha256sum >/dev/null; then
   sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
