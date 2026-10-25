@@ -81,8 +81,18 @@ body {
 :root.dark .workspace-shell {
   --sidebar: oklch(0.2 0.007 270);
   --sidebar-accent: oklch(0.26 0.009 270);
-  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-border: var(--line-soft);
 }
+
+/* Dark lines, web only: the shared 8% white sat near 1.2:1 and cards lost their edge. A card's outline and a field's border reach 3:1 against the page and the card; a divider inside stays soft so a card reads as one block. */
+:root.dark {
+  --line-soft: oklch(0.86 0.016 270 / 20%);
+  --line-strong: oklch(0.86 0.016 270 / 42%);
+  --border: var(--line-soft);
+  --input: var(--line-strong);
+}
+:root.dark :is([data-slot="card"], .bg-card) { --border: var(--line-strong); }
+:root.dark :is([data-slot="card"], .bg-card) > * { --border: var(--line-soft); }
 .workspace-shell [data-slot="sidebar-container"] { border-color: var(--sidebar-border); }
 
 :root.dark {
