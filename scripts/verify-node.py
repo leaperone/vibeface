@@ -3430,7 +3430,7 @@ def public_entry_acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         p = Node(run, "P", binary, workspace, helper,
-                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}"])
+                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
         nodes.append(p)
         token = p.directory / "entry-token"
         require(token.stat().st_mode & 0o077 == 0 and len(token.read_text().strip()) == 64,
