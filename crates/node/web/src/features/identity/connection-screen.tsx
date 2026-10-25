@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
-import { messageOf, parseEntry, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
@@ -16,7 +16,6 @@ import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
-const { connectDevice } = webPlatform.transport
 import { RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
 import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
@@ -67,21 +66,9 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
 }
 
 
-const REJOIN = `vibeface service stop
-mv ~/.vibeface ~/.vibeface-removed-$(date +%Y%m%d-%H%M%S)
-vibeface init
-vibeface join '加入链接'
-vibeface service start`
-
 function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
-  const [copied, setCopied] = useState(false)
-  const commands = <>
-    <pre className="overflow-x-auto rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta text-foreground">{REJOIN}</pre>
-    <Button type="button" variant="outline" className="w-fit" onClick={() => { void navigator.clipboard?.writeText(REJOIN).then(() => setCopied(true)) }}>
-      {copied ? <CircleCheck aria-hidden="true" /> : null}{copied ? '已复制' : '复制命令'}
-    </Button>
-  </>
+  const commands = <a href="https://github.com/leaperone/vibeface/blob/main/docs/deployment.md" target="_blank" rel="noreferrer" className="underline">按部署说明选择数据目录并重新加入</a>
   // On its own local page the rejoin first opens this computer, then carries on there.
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
@@ -141,21 +128,6 @@ function usePublicEntry() {
   return publicEntry
 }
 
-/** A computer not set up yet answers with its host name, so two computers don't both default to the same name. */
-function useComputerName(entry: ConnectionEntry | undefined) {
-  const [name, setName] = useState<string>()
-  useEffect(() => {
-    if (!entry) return
-    const controller = new AbortController()
-    connectDevice(entry, { signal: controller.signal, timeoutMs: 5000 })
-      .then(channel => channel.request('info').finally(() => channel.close()))
-      .then(info => { const value = (info as { name?: unknown } | null)?.name; if (!controller.signal.aborted && typeof value === 'string' && value) setName(value) })
-      .catch(() => {})
-    return () => controller.abort()
-  }, [entry?.address, entry?.device_id])
-  return name
-}
-
 /** Opened from the Home Screen: iOS keeps such an app's storage apart from Safari's. */
 const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true)
 
@@ -176,13 +148,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const [draftNames, setDraftNames] = useState<Names | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
-  // A removed computer that started over keeps its old name, and joining again is its next step.
-  const formerName = device.localSetup?.kind === 'uninitialized' ? device.localSetup.name : undefined
-  const hostName = useComputerName(device.localSetup?.kind === 'uninitialized' && !formerName ? device.localSetup.entry : undefined)
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
-  const localName = useComputerName(device.localSetup?.kind === 'initialized' && !savedName ? device.localSetup.entry : undefined)
-  const computerName = savedName || localName || '这台电脑'
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined || Boolean(formerName), removed: device.error === BROWSER_REMOVED })
+  const computerName = savedName || '这台电脑'
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed: device.error === BROWSER_REMOVED })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -260,7 +228,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
-  else if (active === 'local' && setup && !names) body = <NamesStep computer={hostName} initial={draftNames} onNext={setNames} />
+  else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这台电脑'}>
     {device.localSetup.kind === 'initialized'
@@ -292,7 +260,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
           {thisComputer
-            ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
+            ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
             : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
         </fieldset>

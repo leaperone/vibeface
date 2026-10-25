@@ -32,8 +32,8 @@
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
-| `providers.execution` | 默认 `true`，本机 Codex App Server 执行派发的工作；`false` 时不连接 App Server，也不向其他设备提供执行能力 |
-| `providers.codex_app_server` | `{mode, socket}`：`system`（默认）连接本机已运行的 App Server，`socket` 为 `null` 时自动查找；`spawn` 时 Node 自行托管 |
+| `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
+| `providers.codex_app_server` | `{mode, socket}`：`system` 要求明确 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境明确设置 `CODEX_HOME` |
 | `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
@@ -47,7 +47,7 @@
 | `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
 | `relay_paths_only` | `--relay-paths-only` | 不绑定直连 socket，只经 relay 连接 |
 | `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 iroh relay 的地址，明文 HTTP，公网经反向代理提供 HTTPS |
-| `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，默认 `http://<relay_listen>`；监听全部网卡时必填 |
+| `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
 | `discovery` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
 
@@ -101,7 +101,7 @@
 | `/`、`/assets/*` | GET | 内置网页客户端；`/assets/` 下为带哈希的不可变资源 |
 | `/sw.js`、`/manifest.webmanifest`、`/icon.svg` | GET | 离线应用外壳和 PWA 清单，`no-cache` |
 | `/generated/vibeface_secure.js`、`/generated/vibeface_secure_bg.wasm` | GET | 同一 Rust 密码学实现的浏览器构建 |
-| `/api/info` | GET | `device_id`、`version`、`manager_available` 和 `public_entry` |
+| `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
 | `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 回调带 Node 级令牌，按 `agentId` 找到所属管理轮 |
@@ -125,7 +125,7 @@
 
 | method | params | 用途 |
 | --- | --- | --- |
-| `info` | `{}` | 公开身份、主机名、角色、版本、初始化状态和 `connection_entry` |
+| `info` | `{}` | 访客仅得到通用名称 `Node`、`device_id`、`version`、`initialized`、`public_entry` 和 `network_id: null`；有效成员或本机会话还可读取真实名称、`network_id` 和 `connection_entry` |
 | `authenticate` | 可选 `network_id` | 验证成员授权或本机会话；不是成员但在找回目录里做管理设备的，回 `recovery: {status: "waiting", effective_at_ms}` 或 `{status: "stopped"}` |
 | `directory` | `{}` | 当前签名目录及投影 |
 | `entrances` | `{}` | 地址簿中的签名地址记录，浏览器自行验签 |

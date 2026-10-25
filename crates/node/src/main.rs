@@ -37,7 +37,7 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 )]
 struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
-    #[arg(long)]
+    #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
@@ -134,7 +134,7 @@ enum CodexCommand {
 
 #[derive(Args)]
 struct DataDir {
-    #[arg(long, default_value_os_t = config::default_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: PathBuf,
 }
 
@@ -212,7 +212,7 @@ struct Init {
     model: Option<String>,
     #[arg(long, default_value = "cursor-sdk-bridge")]
     cursor_sdk_bin: PathBuf,
-    /// The system Codex App Server's socket, when discovery should not choose it.
+    /// Explicit socket of the existing Codex App Server to use.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
@@ -221,9 +221,9 @@ struct Init {
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
     /// Run an iroh relay for the personal network on this address.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", requires = "relay_url")]
     relay_listen: Option<SocketAddr>,
-    /// The relay's URL as other Nodes reach it; defaults to `http://<relay-listen>`.
+    /// The relay's explicitly configured URL as other Nodes reach it.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
     /// Reach other Nodes only through relays, as behind a strict NAT.
@@ -287,8 +287,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Home directory holding `.codex` and `.claude`; defaults to `$HOME` (and `$CODEX_HOME`).
-    #[arg(long, value_name = "DIR")]
+    /// Explicit home directory holding the `.codex` and `.claude` hook configuration.
+    #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
     #[arg(long)]
@@ -411,9 +411,9 @@ struct Join {
     link: String,
     #[command(flatten)]
     data: DataDir,
-    /// Device name shown to the network; defaults to this machine's host name.
+    /// Device name chosen by its owner and shown to the network.
     #[arg(long)]
-    name: Option<String>,
+    name: String,
 }
 
 #[tokio::main]
@@ -422,7 +422,11 @@ async fn main() -> Result<()> {
     let command = match cli.command {
         Some(command) => command,
         None => {
-            let data_dir = cli.data_dir.unwrap_or_else(config::default_dir);
+            let data_dir = cli
+                .data_dir
+                .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
+                .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
+            ensure!(data_dir.is_absolute(), "specify an absolute data directory");
             if !data_dir.join("config.json").exists() {
                 check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
             }
@@ -466,8 +470,7 @@ async fn main() -> Result<()> {
             };
             runtime.shutdown().await;
             if rejoin {
-                let name = runtime.member_name().await;
-                return restart_fresh(&options.data.data_dir, name.as_deref());
+                return restart_fresh(&options.data.data_dir);
             }
             result
         }
@@ -988,6 +991,11 @@ fn init(options: Init) -> Result<()> {
     configuration.codex_bin = options.codex_bin;
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
+    } else {
+        ensure!(
+            configuration.listen.ip().is_loopback(),
+            "set --public-url when listening beyond loopback"
+        );
     }
     configuration.allowed_origins = options.allowed_origins;
     let entry = match options.entry {
@@ -1049,7 +1057,7 @@ fn initialize_announced(
         configuration.public_url.clone()
     };
     initialize(dir, configuration, entry_token)?;
-    println!("Vibeface 已就绪：{}", config::hostname());
+    println!("Vibeface 已就绪");
     println!("打开 {open}");
     if public_entry {
         println!(
@@ -1104,8 +1112,8 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
 /// Restarts this removed Node fresh. Replacing the process image keeps its PID, so a service
 /// manager sees no exit and a Node started by hand keeps running; nothing of the old runtime
 /// survives to write into the data set aside.
-fn restart_fresh(dir: &Path, name: Option<&str>) -> Result<()> {
-    match start_over(dir, name) {
+fn restart_fresh(dir: &Path) -> Result<()> {
+    match start_over(dir) {
         Ok(archive) => tracing::warn!(archive = %archive.display(), "removed Node data set aside"),
         Err(error) => tracing::error!(%error, "removed Node data could not be set aside"),
     }
@@ -1116,10 +1124,7 @@ fn restart_fresh(dir: &Path, name: Option<&str>) -> Result<()> {
     Err(error).context("restart the Node")
 }
 
-/// Renames the data directory to `<name>-removed-<local time>`, never deleting it, and puts a
-/// fresh Node with the same settings and the former `name` in its place. The new directory is
-/// complete before either rename, so a failure leaves the old data where it was.
-fn start_over(dir: &Path, former_name: Option<&str>) -> Result<PathBuf> {
+fn start_over(dir: &Path) -> Result<PathBuf> {
     let configuration = Config::load(dir)?;
     let entry_token = configuration
         .network
@@ -1139,10 +1144,7 @@ fn start_over(dir: &Path, former_name: Option<&str>) -> Result<PathBuf> {
         "{} already exists",
         archive.display()
     );
-    let made = initialize(&fresh, configuration, entry_token).and_then(|_| match former_name {
-        Some(name) => config::private_write(&fresh.join(config::FORMER_NAME_FILE), name.as_bytes()),
-        None => Ok(()),
-    });
+    let made = initialize(&fresh, configuration, entry_token);
     if let Err(error) = made {
         let _ = fs::remove_dir_all(&fresh);
         return Err(error);
@@ -1380,9 +1382,9 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 async fn join(options: Join) -> Result<()> {
-    let name = options.name.unwrap_or_else(config::hostname);
     let state =
-        vibeface::client::join_network(&options.data.data_dir, &options.link, &name).await?;
+        vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
+            .await?;
     println!(
         "已加入个人网络 {}。启动 Node 后即可连接。",
         state.genesis.network_id
@@ -1664,21 +1666,17 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let home = match &options.home {
-        Some(home) => home.clone(),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),
-    };
-    let codex_home = match &options.home {
-        Some(_) => None,
-        None => std::env::var_os("CODEX_HOME").map(PathBuf::from),
-    };
+    let home = options
+        .home
+        .as_ref()
+        .context("--home is required for hook configuration")?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
         Err(_) => options.local.data.data_dir.clone(),
     };
     let stamp = vibeface::runtime::now_ms();
-    for file in triage::hook_files(&home, codex_home.as_deref()) {
+    for file in triage::hook_files(home, None) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -1731,9 +1729,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("{}: changed {}", file.path.display(), changed.join(", "));
     }
     if let HooksAction::Install = options.action {
-        let config = codex_home
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("config.toml");
+        let config = home.join(".codex/config.toml");
         let enabled = fs::read_to_string(&config)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -1875,6 +1871,19 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
+        for value in ["", "relative-node"] {
+            for command in [
+                vec![],
+                vec!["serve"],
+                vec!["service", "status"],
+                vec!["update", "status"],
+            ] {
+                let mut arguments = vec!["vibeface"];
+                arguments.extend(command);
+                arguments.extend(["--data-dir", value]);
+                assert!(Cli::try_parse_from(arguments).is_err());
+            }
+        }
         for arguments in [
             vec!["vibeface", "--data-dir", "/one", "serve"],
             vec![
@@ -1905,6 +1914,8 @@ mod tests {
             "https://relay.test",
             "--relay-listen",
             "127.0.0.1:0",
+            "--relay-url",
+            "https://relay.test",
             "--relay-paths-only",
         ])?;
         let Some(Action::Init(options)) = cli.command else {
@@ -2018,15 +2029,37 @@ mod tests {
                 "join",
                 "https://node.example/join#vibeface1abc",
                 "--name",
-                "Build Node"
+                "Build Node",
+                "--data-dir",
+                "/data/node"
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface", "access", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["vibeface", "access", "--enable"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "join",
+                "https://node.example/join#vibeface1abc",
+                "--data-dir",
+                "/data/node"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["vibeface", "serve"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["vibeface", "access", "--enable", "--data-dir", "/data/node"])
+                .is_ok()
+        );
         assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
-        assert!(Cli::try_parse_from(["vibeface", "status", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["vibeface", "status", "--json", "--data-dir", "/data/node"])
+                .is_ok()
+        );
         for action in [
             "install",
             "start",
@@ -2053,6 +2086,8 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
+                "--data-dir",
+                "/data/node",
                 "--relay",
                 "https://relay.test",
                 "--relay-listen",
@@ -2066,6 +2101,8 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
+                "--data-dir",
+                "/data/node",
                 "--manager",
                 "cursor_sdk",
                 "--workspace",

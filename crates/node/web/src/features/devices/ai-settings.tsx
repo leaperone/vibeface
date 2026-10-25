@@ -84,7 +84,7 @@ function AppServerSettings({ server, working, blocked, busy, save, test }: {
     {server.mode === "system" ? <Details label="手动指定">
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
       <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
-        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="自动查找" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
+        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
         {socket.trim() !== (server.socket ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
       </form>
     </Details> : null}
@@ -147,17 +147,6 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
-  // During setup the first provider that works runs the bot, so "可用" never leaves the chat without one.
-  const autoBot = useRef(false)
-  useEffect(() => {
-    if (!onboarding || !response || autoBot.current) return
-    // Once a bot runs here, turning it off is the person's choice and stays.
-    if (botOn) { autoBot.current = true; return }
-    const usable = response.providers.find((item) => item.state === "ready")
-    if (!usable) return
-    autoBot.current = true
-    void call(`${usable.provider}:bot`, usable.provider, "configure_provider", { provider: usable.provider, bot: true })
-  }, [response])
   useEffect(() => {
     if (!starting) return
     const timer = setTimeout(() => void load(), 2000)

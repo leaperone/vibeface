@@ -29,7 +29,7 @@ export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
   admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
-export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string; name?: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
+export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
 export type ProviderId = 'codex' | 'cursor'
@@ -41,7 +41,7 @@ export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env
 export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 'connected'; socket: string; user_agent: string }
   | { state: 'not_found'; candidates: string[] } | { state: 'handshake_failed'; socket: string; reason: string } | { state: 'launch_failed'; reason: string }
 export type AppServerMode = 'system' | 'spawn'
-/** `socket` is the owner's choice for the system App Server; `null` finds it. */
+/** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
@@ -88,7 +88,7 @@ export function parseInfo(value: unknown): EntryInfo {
   const initialized = boolean(v.initialized)
   return {
     device_id: validTarget(v.device_id), name: text(v.name), version: text(v.version), initialized,
-    network_id: initialized ? validTarget(v.network_id) : null,
+    network_id: v.network_id === null ? null : validTarget(v.network_id),
     ...(v.connection_entry === undefined ? {} : { connection_entry: parseEntry(v.connection_entry) }),
   }
 }
@@ -140,7 +140,6 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
   if (v.kind === 'uninitialized') {
     const invitation = record(v.invitation, '本机初始化')
     setup = { kind: 'uninitialized', entry: parseEntry({ address: invitation.url, device_id: invitation.device_id }), capability: validTarget(invitation.capability) }
-    if (typeof v.name === 'string') setup.name = v.name
   } else if (v.kind === 'initialized') {
     const entry = parseEntry(v.entry)
     setup = { kind: 'initialized', entry, removed: boolean(v.removed) }

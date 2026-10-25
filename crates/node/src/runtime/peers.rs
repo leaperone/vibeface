@@ -1007,7 +1007,7 @@ impl Runtime {
             .collect()
     }
 
-    /// The troubleshooting export: versions, configuration (it holds no secrets), write and peer
+    /// The troubleshooting export: versions, configuration summary, write and peer
     /// state, the structured log over a time range (the last day by default), and the end of the
     /// service's stderr, both redacted.
     pub(crate) async fn diagnostics(
@@ -1038,12 +1038,19 @@ impl Runtime {
             .into_iter()
             .rev()
             .collect();
+        let settings = self.settings_snapshot();
+        let peers: Vec<Value> = self.peer_health().await.into_iter().map(|peer| {
+            json!({"device_id":peer.device_id,"reachable":peer.reachable,"synced_ms":peer.synced_ms})
+        }).collect();
         Ok(json!({
             "generated_at_ms":now_ms(), "version":env!("CARGO_PKG_VERSION"),
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
-            "device_id":self.identity.device_id()?, "config":self.config,
+            "device_id":self.identity.device_id()?, "config":{
+                "public_entry":self.config.public_entry,"project_roots":settings.roots.len(),
+                "manager_enabled":settings.manager.is_some(),"execution_enabled":self.providers().switches.execution,
+                "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
-            "peers":self.peer_health().await,
+            "peers":peers,
             "range":{"since_ms":since_ms,"until_ms":until_ms},
             "logs":{"node.log":records,"service.stderr.log":stderr},
         }))

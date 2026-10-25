@@ -5,6 +5,17 @@ use std::{env, fs, path::Path};
 fn main() {
     let manifest = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
     delivery_abi(&manifest);
+    let verified = std::process::Command::new("python3")
+        .arg(manifest.join("../../scripts/build-inputs.py"))
+        .args(["check", "web", "--cargo"])
+        .output()
+        .expect("Python 3 is required to verify generated Web assets");
+    assert!(
+        verified.status.success(),
+        "{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    print!("{}", String::from_utf8(verified.stdout).unwrap());
     let dist = manifest.join("web/dist/client");
     println!("cargo:rerun-if-changed=web/dist/client");
     let shell = dist.join("_shell.html");

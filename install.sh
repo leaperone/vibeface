@@ -5,7 +5,7 @@ export LC_ALL=C
 
 usage() {
   cat <<'USAGE'
-Usage: install.sh [--channel stable|nightly] [--install-root DIRECTORY] [--bin-dir DIRECTORY]
+Usage: install.sh [--channel stable|nightly] --install-root DIRECTORY --bin-dir DIRECTORY
        install.sh --self-test
 
 Install the latest published Vibeface release for this platform (default: stable).
@@ -151,7 +151,7 @@ verify_package() {
 }
 
 install_release() (
-  local channel=stable install_root="$HOME/.local/share/vibeface" bin_dir="$HOME/.local/bin"
+  local channel=stable install_root='' bin_dir=''
   local target tag version package archive scratch='' lock='' destination='' complete=false
   local made_current=false made_bin=false
   while (($#)); do
@@ -169,6 +169,7 @@ install_release() (
     esac
   done
   [[ $channel == stable || $channel == nightly ]] || fail 'channel must be stable or nightly'
+  [[ -n "$install_root" && -n "$bin_dir" ]] || fail 'Specify --install-root and --bin-dir explicitly.'
   [[ $install_root == /* && $bin_dir == /* && $install_root != *$'\n'* && $bin_dir != *$'\n'* ]] || fail 'installation directories must be absolute paths without newlines'
   [[ ! -e "$install_root/current" && ! -L "$install_root/current" ]] || fail 'current already exists; use vibeface update apply'
   [[ ! -e "$bin_dir/vibeface" && ! -L "$bin_dir/vibeface" ]] || fail 'vibeface already exists in the bin directory; use update apply for a managed installation'

@@ -363,9 +363,12 @@ impl Runtime {
                 "only Codex has an App Server"
             );
             next.switches.codex_app_server = app_server;
-            next.switches.validate()?;
         }
         next.env.apply(change.provider, change.env)?;
+        let codex_agent = manager
+            .as_ref()
+            .is_some_and(|manager| manager.provider == ManagerKind::CodexSdk);
+        next.validate(codex_agent)?;
         let manager_changed = manager != previous_manager;
         if manager_changed
             || next.switches != previous.switches
@@ -388,7 +391,7 @@ impl Runtime {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
-        self.codex.retarget(next.codex_target());
+        self.codex.retarget(next.codex_target(codex_agent));
         if manager_changed || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor) {
             self.refresh_cursor();
         }

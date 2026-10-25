@@ -1,4 +1,4 @@
-import { boolean, entryKey, parseEntry, record, text } from '@vibeface/client/lib/node.ts'
+import { boolean, entryKey, parseEntry, record } from '@vibeface/client/lib/node.ts'
 import type { ConnectionEntry, PublicIdentity } from '@vibeface/client/lib/node.ts'
 
 type LocalLaunch = { token: string; deviceId: string }
@@ -28,6 +28,6 @@ export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch
     body: JSON.stringify({ token: launch.token, node_id: launch.deviceId, device_id: own.deviceId }),
   })))
   const authorized = parseEntry(exchanged.entry)
-  if (entryKey(authorized) !== entryKey(entry) || text(exchanged.network_id) !== info.network_id) throw new Error('兑换后的本机会话与原设备或网络不一致。')
+  if (entryKey(authorized) !== entryKey(entry)) throw new Error('兑换后的本机会话与原设备不一致。')
   return authorized
 }

@@ -113,23 +113,16 @@ _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
 
 
 def available_port():
-    """A free loopback port; VIBEFACE_PORT_BASE pins runs to a known range."""
-    while _port_base[0]:
+    """A free TCP/UDP loopback port; VIBEFACE_PORT_BASE pins a known range."""
+    while True:
         port = _port_base[0]
-        _port_base[0] += 1
-        with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as udp:
+        if port:
+            _port_base[0] += 1
+        with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
             try:
                 stream.bind(("127.0.0.1", port))
-                udp.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    while True:
-        with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as udp:
-            stream.bind(("127.0.0.1", 0))
-            port = stream.getsockname()[1]
-            try:
-                udp.bind(("127.0.0.1", port))
+                port = stream.getsockname()[1]
+                datagram.bind(("127.0.0.1", port))
                 return port
             except OSError:
                 continue
@@ -559,6 +552,12 @@ class Node:
         configuration.update(values)
         if app_server is not None:
             configuration["providers"]["codex_app_server"] = app_server
+            configuration["providers"]["execution"] = True
+            if app_server["mode"] == "spawn":
+                env_path = self.directory / "provider-env.json"
+                providers = json.loads(env_path.read_text()) if env_path.exists() else {"codex": {}, "cursor": {}}
+                providers["codex"]["CODEX_HOME"] = str(self.directory / "home/.codex")
+                private_json(env_path, providers)
         private_json(path, configuration)
 
     def configure_network(self, **values):
@@ -1636,6 +1635,7 @@ def bot_checks(run, workspace, a, network, passed, outsider):
 def node_cli(node, *arguments, socket=None, check=True, timeout=60, stdin=None):
     """The real `vibeface` CLI on the Node's machine, with the Node's private HOME."""
     environment = node.environment()
+    environment["VIBEFACE_DATA_DIR"] = str(node.directory)
     if socket:
         environment["VIBEFACE_CODEX_SOCKET"] = str(socket)
     environment["VIBEFACE_TRIAGE_URL"] = f"http://127.0.0.1:{node.local_port}"
@@ -1998,8 +1998,9 @@ def triage_checks(run, workspace, a, network, passed):
     try:
         raise_dir = workspace / "triage-raise"
         raise_dir.mkdir()
+        shared_raise_dir = "workspace-1/triage-raise"
         settings = a.client.call("configure_triage", {"default_outlet": "both", "webhook_url": receiver.url,
-                                 "scan_codex_sessions": True, "webhook_secret": secret})
+                                 "scan_codex_sessions": True, "codex_sessions": str(a.directory / "home/.codex/sessions"), "webhook_secret": secret})
         require(settings["webhook_secret_set"] and secret not in json.dumps(settings)
                 and secret not in (a.directory / "config.json").read_text(), "the webhook secret is write-only and stays out of config")
         tested = a.client.call("test_webhook")
@@ -2017,16 +2018,16 @@ def triage_checks(run, workspace, a, network, passed):
         tested_hook = json.loads(node_cli(a, "hook", "codex", "--test").stdout)
         require(tested_hook["status"] == "accepted" and replayed.returncode == 0, "the hook CLI reaches the local Node")
         question = wait_for("the Agent asks in the chat that owns the session", lambda: next(
-            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == str(raise_dir)), None), timeout=90)
+            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == shared_raise_dir), None), timeout=90)
         question_id = question["question_id"]
         require(question["conversation_id"] == owner and question["severity"] == "attention"
                 and question["about"]["session_id"] == thread_id and question["about"]["node"] == a.device_id,
                 "the question names the chat, session and device it is about")
-        wait_for("the triage turn records its question", lambda: any(row["cwd"] == str(raise_dir) and row["session_id"] == thread_id
+        wait_for("the triage turn records its question", lambda: any(row["cwd"] == shared_raise_dir and row["session_id"] == thread_id
                  for row in fixture_records(run, "triage-actions.jsonl")))
         actions = fixture_records(run, "triage-actions.jsonl")
-        raised = [row for row in actions if row["cwd"] == str(raise_dir) and row["session_id"] == thread_id]
-        same_turn = [row for row in actions if row["session_id"] == thread_id and row["cwd"] != str(raise_dir)
+        raised = [row for row in actions if row["cwd"] == shared_raise_dir and row["session_id"] == thread_id]
+        same_turn = [row for row in actions if row["session_id"] == thread_id and row["cwd"] != shared_raise_dir
                      and not row.get("request_id")]
         require(len(raised) == 1 and len(same_turn) == 1,
                 "a repeated hook and the App Server's report of the same turn reach the Agent once")
@@ -2035,6 +2036,7 @@ def triage_checks(run, workspace, a, network, passed):
         require(all(row["valid"] for row in signed) and [row["status"] for row in signed] == [500, 200]
                 and signed[-1]["body"]["type"] == "question" and signed[-1]["body"]["answer"]["question_id"] == question_id,
                 "a 5xx is retried with the same event_id until accepted")
+        require(str(workspace) not in json.dumps(signed), "the signed webhook must not expose the local workspace path")
         dead_hook = {"hook_event_name": "Stop", "session_id": "dead-session", "turn_id": "dead-turn", "cwd": str(raise_dir),
                      "last_bot_message": "dead-letter needs-human"}
         node_cli(a, "hook", "codex", stdin=json.dumps(dead_hook))
@@ -2065,7 +2067,7 @@ def triage_checks(run, workspace, a, network, passed):
         node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-decision",
                                                        "cwd": str(decide_dir), "last_bot_message": "choose-next needs-human"}))
         pending = wait_for("the Agent asks about the live session again", lambda: next(
-            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == str(decide_dir)), None), timeout=90)
+            (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == "workspace-1/triage-raise-decision"), None), timeout=90)
         tokens = a.client.call("create_decision_token", {"label": "grok"})
         listed = a.client.call("triage_settings")
         require(tokens["token"] not in json.dumps(listed) and tokens["token"] not in (a.directory / "decision-tokens.json").read_text(),
@@ -3436,7 +3438,7 @@ def public_entry_acceptance(options):
         relay_port = available_port()
         relay_url = f"http://127.0.0.1:{relay_port}"
         p = Node(run, "P", binary, workspace, helper,
-                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}"])
+                 init_args=["--public-entry", "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
         nodes.append(p)
         token = p.directory / "entry-token"
         require(token.stat().st_mode & 0o077 == 0 and len(token.read_text().strip()) == 64,

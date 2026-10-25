@@ -79,11 +79,14 @@ npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载
 
 ### 首次启动
 
+先按[部署配置](docs/deployment.md)选择本机目录和要启用的集成。
+
 ```sh
-vibeface
+export VIBEFACE_DATA_DIR='<数据目录的绝对路径>'
+vibeface --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
-首次运行会在 `~/.vibeface` 初始化数据目录，并监听 `127.0.0.1:4790`。然后：
+首次运行只在指定的空数据目录初始化，并监听 `127.0.0.1:4790`。然后：
 
 1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
 2. 填写浏览器名称和恢复包口令，下载并保存加密恢复包，创建个人网络。
@@ -92,13 +95,14 @@ vibeface
 
 ### 配置
 
-日常配置都在网页里完成。也可以在初始化时用参数写入 `~/.vibeface/config.json`：
+日常配置可在网页里完成。也可以在初始化时用参数写入所选数据目录的 `config.json`：
 
 ```sh
 vibeface init \
-	--data-dir "$HOME/.vibeface" \
+	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
 	--manager codex_sdk \
+	--codex-socket '<App Server socket 的绝对路径>' \
 	--workspace /absolute/path/to/manager-workspace
 ```
 
@@ -122,7 +126,7 @@ vibeface init \
 
 ```sh
 vibeface init
-vibeface join '<加入链接>'
+vibeface join '<加入链接>' --name '<设备显示名称>'
 ```
 
 加入链接由管理设备的 **添加设备** 生成。终端会显示 6 位安全码，在管理设备上核对一致后批准。不要在新设备上另建个人网络。详见 [添加自己的设备](docs/node.md#添加自己的设备)。
@@ -138,7 +142,7 @@ vibeface join '<加入链接>'
 
 | 命令 | 作用 |
 |---|---|
-| `vibeface` | 用默认数据目录初始化（如需要）并启动节点。 |
+| `vibeface` | 在明确配置的数据目录初始化（如需要）并启动节点。 |
 | `vibeface serve` | 按已有配置启动节点。 |
 | `vibeface status` | 通过本机维护 socket 检查节点状态。 |
 | `vibeface access` | 显示本机浏览器入口。 |
@@ -163,9 +167,9 @@ bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 bash scripts/package-node.sh
 ./target/release/vibeface init \
-	--data-dir "$HOME/.vibeface" \
+	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects
-./target/release/vibeface serve --data-dir "$HOME/.vibeface"
+./target/release/vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 `init` 要求数据目录为空或不存在。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和 `node.sqlite3`，运行日志写在 `node.log`。`serve` 和 `join` 用目录锁独占数据目录。

@@ -105,7 +105,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        (
+            self.0,
+            Json(json!({"error": crate::logging::scrub(&self.1)})),
+        )
+            .into_response()
     }
 }
 
@@ -450,7 +454,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"device_id":local_session.map(|session| session.device_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"device_id":local_session.map(|session| session.device_id),"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true}}),
     ))
 }
 
@@ -557,9 +561,6 @@ struct LocalSetupRequest {}
 enum LocalSetup {
     Uninitialized {
         invitation: BootstrapInvitation,
-        /// What this computer was called before it was removed, the default when it joins again.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
     },
     Initialized {
         entry: LocalEntry,
@@ -669,9 +670,6 @@ async fn local_setup(
             device_id,
             capability: capability.capability,
         },
-        name: std::fs::read_to_string(app.node.data_dir.join(crate::config::FORMER_NAME_FILE))
-            .ok()
-            .filter(|name| !name.is_empty() && name.chars().count() <= 128),
     }))
 }
 

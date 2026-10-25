@@ -234,9 +234,13 @@ impl Runtime {
             codex_bin: config.codex_bin.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
+        let codex_agent = config
+            .manager
+            .as_ref()
+            .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk);
+        providers.validate(codex_agent)?;
         let codex = Arc::new(codex_server::CodexServer::open(
-            providers.codex_target(),
-            codex_server::system_candidates(),
+            providers.codex_target(codex_agent),
             &identity,
             dir,
             tx,
@@ -365,14 +369,8 @@ impl Runtime {
     pub async fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
         self.store.lock().await.recovery_since_ms(recovery_key)
     }
-    /// The name this Node had in its network, kept after its removal.
-    pub async fn member_name(&self) -> Option<String> {
-        let device = self.identity.device_id().ok()?;
-        node_display_names(&self.membership_state().await.ok()?).remove(&device)
-    }
     pub fn info(&self) -> Value {
-        let manager_available = self.manager().is_some();
-        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         self.delivery.attach(Arc::downgrade(self))?;
