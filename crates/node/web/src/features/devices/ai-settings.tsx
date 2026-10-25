@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
+import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
 import { cn } from "cn"
 import { BusyIcon, Details, InlineError, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -183,11 +183,14 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   </div>
 }
 
-/** A chip that turns one use of a provider on or off; filled while on, so a phone without hover still reads it. */
+/**
+ * A chip that turns one use of a provider on or off. On, it is tinted with a check, so a phone without hover still reads it;
+ * never solid, so the page's own next step stays the only filled button.
+ */
 function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick }: { icon: LucideIcon; label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
-  return <Button type="button" size="sm" variant={pressed ? "default" : "outline"} aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
-    className={cn("rounded-full", !pressed && "text-muted-foreground")} onClick={onClick}>
-    <BusyIcon busy={busy} icon={Icon} />{label}
+  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
+    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : pressed ? <Check aria-hidden="true" className="text-brand" /> : <Icon aria-hidden="true" />}{label}
   </Button>
 }
 

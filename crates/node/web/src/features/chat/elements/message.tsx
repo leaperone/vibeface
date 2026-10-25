@@ -1,4 +1,6 @@
-import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, Merge, RotateCcw } from 'lucide-react'
+import { Link } from '@tanstack/react-router'
+import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, Merge, MonitorSmartphone, RotateCcw } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
 import { messageKey, replyStatusLabel } from '@vibeface/client/chat/protocol.ts'
@@ -44,7 +46,8 @@ export function FoldedText({ text }: { text: string }) {
  * the schedule whose run produced this reply. `retry` sends the person's message again after this reply failed.
  */
 export function Message({ message, schedule, last = true, retry }: { message: ChatMessage; schedule?: string; last?: boolean; retry?: () => Promise<void> }) {
-  const { connectionOnline } = useWorkspace()
+  const { connectionOnline, data } = useWorkspace()
+  const owner = data?.conversation?.owner
   const user = message.role === 'user'
   const when = message.created_at_ms ? new Date(message.created_at_ms) : null
   const full = when?.toLocaleString('zh-CN')
@@ -82,6 +85,8 @@ export function Message({ message, schedule, last = true, retry }: { message: Ch
     {ended === '失败' ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">
       <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
       {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
+      {/* The failure text points at the device's AI settings; the device running this chat holds them. */}
+      {owner ? <Button asChild variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11"><Link to="/devices/$deviceId" params={{ deviceId: owner }}><MonitorSmartphone aria-hidden="true" />检查设备</Link></Button> : null}
     </span>
       : ended ? <span className="flex items-center gap-1 text-meta text-muted-foreground"><CirclePause aria-hidden="true" className="size-4" />{ended}</span> : null}
     {time}
