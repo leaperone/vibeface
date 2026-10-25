@@ -158,13 +158,13 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 - **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它只提供网页、relay 和密文转发，不保存你的任何数据。家里的设备不需要入站端口。推荐用这种方式。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
-### 公共入口：PVE 加 nginx
+### 公共入口：Linux 服务器加 nginx
 
-下面以 PVE 上的一台 Linux 虚拟机为公共入口，域名 `vb.example.com`，家里的 Mac 是个人网络里的 Node。
+下面以一台 Linux 服务器为公共入口，域名 `vb.example.com`，本地 Mac 是个人网络里的 Node。
 
-1. 域名解析到 PVE 的公网地址，用 certbot 或其他方式为它签发证书。
+1. 域名解析到服务器的公网地址，用 certbot 或其他方式为它签发证书。
 
-2. 在 PVE 上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
+2. 在服务器上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
 
    ```sh
    vibeface init --data-dir "$HOME/.vibeface-entry" \
@@ -212,7 +212,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
    `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
 
-4. 把 PVE 上的 `entry-token` 复制到 Mac，例如 `scp pve:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
+4. 把公共入口服务器上的 `entry-token` 复制到本地 Mac，例如 `scp user@vb.example.com:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
 
 5. 在 Mac 上初始化 Node 时指向公共入口，然后启动：
 
@@ -260,7 +260,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-公网 Node 承担 relay 角色。例如 PVE 用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
+公网 Node 承担 relay 角色。例如在服务器上用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
 ```sh
 vibeface init --data-dir "$HOME/.vibeface" \
