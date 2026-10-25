@@ -56,7 +56,7 @@ Node 不再有执行层：删除 `executor` 命名、Node 发 `turn/start` 的�
 
 ### 2.1a 用哪个 App Server
 
-用户决定（2026-10-21）：默认用这台电脑上已经运行的 App Server，会话与本人的 Codex 共用；Node 自己启动一个只作为本人可选的后备。设置在 `config.json` 的 `providers.codex_app_server`：`{"mode":"system"|"spawn","socket":null|"<路径>"}`，网页在“设备 → AI → Codex → 设置”里切换并测试连接。
+用户决定（2026-10-21）：默认用这台电脑上已经运行的 App Server，会话与本人的 Codex 共用；Node 自己启动一个只作为本人可选的后备。设置在 `config.json` 的 `providers.codex_app_server`：`{"mode":"system"|"spawn","socket":null|"<路径>"}`，网页在“设备 → Bot 与任务 → Codex → 设置”里切换并测试连接。
 
 - `system`（默认）：Node 不启动也不结束它。`socket` 为空时按 Codex 自己的约定找控制 socket：先 Node 环境里的 `$CODEX_HOME`，再 `~/.codex`，路径是 `<home>/app-server-control/app-server-control.sock`。`codex app-server proxy` 和 `codex app-server daemon version` 用的就是它；桌面应用的 daemon 把它做成指向 `/tmp/codex-daemon-<uid>/<hash>` 中活着那个 socket 的软链。`/tmp/codex-daemon-<uid>/` 里留着很多旧 socket，Node 不扫描那个目录。每个候选都做一次真实的 `initialize` 握手：不存在、拒绝连接或路径过长的跳过，握手失败的报 `handshake_failed`，都不通时报 `not_found`。连上后断开 5 秒就重新查找，按 1 至 30 秒退避；App Server 被重启或换了 socket 时自动跟过去。
 - `spawn`：沿用原来的托管方式，`codex_bin` 和 `provider-env.json` 里的 Codex 变量只在这个模式传给 App Server。

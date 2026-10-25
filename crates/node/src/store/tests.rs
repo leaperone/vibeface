@@ -3728,7 +3728,7 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
         assert!(!reply.text.contains("CURSOR_API_KEY"), "{}", reply.text);
-        assert!(reply.text.contains("设备 → AI"), "{}", reply.text);
+        assert!(reply.text.contains("设备 → Bot 与任务"), "{}", reply.text);
         assert!(
             matches!(&job.state, JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } if detail == raw),
             "the raw cause stays on the local job"
