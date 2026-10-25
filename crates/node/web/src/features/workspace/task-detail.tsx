@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
 import { ChevronLeft, Laptop, Link2, ListChecks, RotateCw, Server, Square, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
@@ -20,6 +20,27 @@ function holdFocus(node: HTMLElement | null) {
   const opener = node.ownerDocument.activeElement
   node.focus({ preventScroll: true })
   return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true }) }
+}
+
+// Below lg the panel covers the chat, so it is a modal; beside the chat it is not. Same query as the lg: classes.
+const WIDE = "(min-width: 1024px)"
+const followWidth = (change: () => void) => {
+  const query = window.matchMedia(WIDE)
+  query.addEventListener("change", change)
+  return () => query.removeEventListener("change", change)
+}
+
+/** Everything outside `keep` stops taking focus and leaves the accessibility tree; live regions such as toasts stay heard. */
+function inertAround(keep: Element) {
+  const covered: Element[] = []
+  for (let node = keep; node.parentElement?.parentElement; node = node.parentElement) {
+    for (const sibling of node.parentElement.children) {
+      if (sibling === node || sibling.hasAttribute("inert") || sibling.hasAttribute("aria-live")) continue
+      sibling.setAttribute("inert", "")
+      covered.push(sibling)
+    }
+  }
+  return () => { for (const element of covered) element.removeAttribute("inert") }
 }
 
 /**
@@ -44,6 +65,11 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const navigate = useNavigate()
   const leave = from === "inbox" ? { to: "/inbox" as const } : { to: "/b/$botId" as const, params: { botId } }
   const close = () => void navigate(leave)
+  const modal = !useSyncExternalStore(followWidth, () => window.matchMedia(WIDE).matches, () => true)
+  const titleId = useId()
+  const layer = useRef<HTMLDivElement>(null)
+  // A layout effect, so the chat is live again before holdFocus returns focus to the task link in it.
+  useLayoutEffect(() => modal && layer.current ? inertAround(layer.current) : undefined, [modal])
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !event.defaultPrevented) close() }
     window.addEventListener("keydown", onKey)
@@ -55,14 +81,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
-  return <>
-  <div aria-hidden="true" onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in dark:bg-black/60 fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
-  <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:bg-popover md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:bg-background lg:shadow-none">
+  return <div ref={layer} className="contents">
+  {/* Clicking it must not move focus to the page behind, or React hands focus back there instead of to the task link. */}
+  <div aria-hidden="true" onMouseDown={(event) => event.preventDefault()} onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in dark:bg-black/60 fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
+  <aside ref={holdFocus} tabIndex={-1} {...modal ? { role: "dialog", "aria-modal": true, "aria-labelledby": titleId, "data-state": "open" } : { "aria-label": "任务详情" }} className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:bg-popover md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:bg-background lg:shadow-none">
     <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
       {/* Full screen on a phone, so it leaves like a page, from the start of its header. */}
       <Button asChild variant="ghost" size="icon" className="-ms-2 md:hidden"><Link {...leave} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button>
       <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground max-md:hidden" />
-      <h2 className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
+      <h2 id={titleId} className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
       {state ? <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
       <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
@@ -100,5 +127,5 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </Details>
     </div>}
   </aside>
-  </>
+  </div>
 }
