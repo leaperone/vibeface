@@ -151,7 +151,7 @@ vibeface join '<加入链接>'
 
 ### 公网部署
 
-有公网地址的机器（例如 PVE）有两种用法。用 `init --public-entry` 运行公共入口，家里的 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
+有公网地址的服务器有两种用法。用 `init --public-entry` 运行公共入口，本地 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
 
 ## 🛠️ 从源码构建
 
