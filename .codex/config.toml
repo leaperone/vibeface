@@ -1,0 +1,3 @@
+[mcp_servers.e2e]
+command = "pnpm"
+args = ["exec", "e2e", "mcp"]
