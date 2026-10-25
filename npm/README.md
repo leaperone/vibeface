@@ -1,5 +1,7 @@
 # Vibeface Nightly
 
+Set `VIBEFACE_DATA_DIR` to the chosen absolute data directory before running the Node. Configure external tools explicitly as described in [deployment configuration](https://github.com/leaperone/vibeface/blob/main/docs/deployment.md).
+
 Install Node.js 22 or newer, then install the Nightly CLI:
 
 ```sh

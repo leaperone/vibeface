@@ -4,7 +4,7 @@ base_branch = "main"
 prefix = ""
 name = "CI policy and Python syntax"
 check = "python3 scripts/ci.py --self-test && actionlint .github/workflows/ci.yml"
-build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\")]'"
+build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\")]'"
 
 [[domain_check]]
 name = "Rust workspace"

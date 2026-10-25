@@ -1,5 +1,7 @@
 # 部署与使用 Node
 
+本文的命令使用[部署配置](deployment.md)中显式设置的 `VIBEFACE_DATA_DIR`、`VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`。先设置所需变量，再执行对应步骤。
+
 本文使用 `vibeface` 管理自己的设备。HTTP 与同步协议见 [协议参考](node-protocol.md)，出问题时见 [排障](troubleshooting.md)。
 
 ## 安装制品
@@ -25,32 +27,32 @@ bash scripts/build-web.sh
 ./scripts/package-node.sh
 ```
 
-`--target` 指定 Rust target，仍需本机具备相应工具链。此选项不保证跨平台编译成功。`--skip-build` 使用已有 release 程序，不能用于证明程序与当前源码一致。
+`--target` 指定 Rust target，仍需本机具备相应工具链。此选项不保证跨平台编译成功。打包始终重新构建原生程序，并校验 Web 与 WASM 的来源和完整文件清单。
 
 验收制品时，密码学资源、网页和 Rust 程序必须来自同一提交。使用干净 checkout 重新构建，核对包内 `BUILD-INFO.json` 的 `source_commit` 与验收 SHA 一致。`source_commit` 为 `null` 的包不能证明这一点，网页能打开也不证明真实 SDK 调用及后台回报闭环可用。
 
 ## 初始化首台设备
 
-直接运行 `./vibeface` 即可启动本机节点。首次运行仅在不存在或为空的数据目录中初始化，默认目录是 `$HOME/.vibeface`，不授予执行目录或启用管理 Agent。根 `--data-dir` 可选择数据目录；有子命令时使用子命令自己的 `--data-dir`，两种位置不能混用。显式 `serve` 要求已初始化。
+先按[部署配置](deployment.md)明确设置 `VIBEFACE_DATA_DIR` 或 `--data-dir`，再启动节点。首次运行仅在指定的空数据目录初始化，不授予执行目录或启用 Provider。根 `--data-dir` 用于直接启动；有子命令时使用子命令自己的 `--data-dir`，两种位置不能混用。显式 `serve` 要求已初始化。
 
 `--root` 指向本机 Agent 可选择的现有绝对项目目录，可重复指定。省略时没有项目目录。
 
 ```sh
 ./vibeface init \
-	--data-dir "$HOME/.vibeface" \
+	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects
-./vibeface serve --data-dir "$HOME/.vibeface"
+./vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 `init` 创建本机独立密钥、配置及一次性本机接入材料，不注册网站账号，也不把个人根私钥放进 Node。在本机可信浏览器打开 `http://localhost:4790`，网页自动读取本机设置。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建网络，无需终端接入链接。
 
 客户端独立生成个人根身份和自己的设备身份，签署首个成员目录。Node 验证一次性本机授权后安装该目录，日常连接使用客户端设备密钥。已有网络的节点提供当前入口；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或加密恢复包。本机恢复自动填入目标及所需初始化材料。要加入已有个人网络的 Node 不在网页上建网，用 `vibeface join` 加入，见 [添加自己的设备](#添加自己的设备)。
 
-`./vibeface access --data-dir "$HOME/.vibeface"` 保留为备用入口。不要公开它输出的初始化链接。后续连接自动核验设备编号和成员授权，不输入账号密码。个人根私钥留在可信客户端及加密恢复包，不作为节点间的长期共享密码。
+`./vibeface access --data-dir "$VIBEFACE_DATA_DIR"` 保留为备用入口。不要公开它输出的初始化链接。后续连接自动核验设备编号和成员授权，不输入账号密码。个人根私钥留在可信客户端及加密恢复包，不作为节点间的长期共享密码。
 
 默认只监听本机。`http://127.0.0.1:4790` 和 `http://localhost:4790` 可用于本机初始化。`http://0.0.0.0:4790` 可打开服务，但不能自动取得初始化授权。保存密钥的网页客户端必须处于浏览器认可的安全上下文，推荐固定使用 `http://localhost:4790` 或可信 HTTPS 页面。
 
-`init` 不覆盖现有身份和配置。默认数据目录为 `$HOME/.vibeface`，包含本机身份、配置、私有授权记录和 `node.sqlite3`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
+`init` 不覆盖现有身份和配置。数据目录由 `--data-dir` 或 `VIBEFACE_DATA_DIR` 明确指定，包含本机身份、配置、私有授权记录和 `node.sqlite3`。不同 Node 使用独立数据目录，同一目录同时只允许运行一个进程。
 
 ### 本机自动访问
 
@@ -82,7 +84,7 @@ bash scripts/build-web.sh
 
 ```sh
 ./vibeface init \
-	--data-dir "$HOME/.vibeface" \
+	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
 	--manager cursor_sdk \
 	--workspace /absolute/path/to/manager-workspace \
@@ -98,13 +100,14 @@ Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `
 
 ### 使用 Codex SDK
 
-Codex Bot 的回合在本机 Codex App Server 上运行，只需要已登录的 Codex CLI。
+Codex Bot 的回合在明确配置的 Codex App Server 上运行。先启动并登录该服务，再指定它的 socket；由 Node 启动独立实例时，按[部署配置](deployment.md#配置-sdk-与-app-server)设置目录和运行模式。
 
 ```sh
 ./vibeface init \
-	--data-dir "$HOME/.vibeface" \
+	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
 	--manager codex_sdk \
+	--codex-socket '<App Server socket 的绝对路径>' \
 	--workspace /absolute/path/to/manager-workspace
 ```
 
@@ -123,10 +126,10 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 添加另一台 Node 时，在新机器上先用 `vibeface init` 初始化（不要在它的本机网页上建网），再执行：
 
 ```sh
-./vibeface join --data-dir "$HOME/.vibeface" "https://gateway.example/join#vibeface1…"
+./vibeface join --data-dir "$VIBEFACE_DATA_DIR" --name "<设备显示名称>" "https://gateway.example/join#vibeface1…"
 ```
 
-命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入，再启动新 Node。`--name` 可改设备名，默认取主机名。连接中断时用同一链接和目录重试，结果未知时先核对原请求状态，不重新创建请求。
+命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入，再启动新 Node。`--name` 必须明确指定设备名，不读取系统主机名。连接中断时用同一链接和目录重试，结果未知时先核对原请求状态，不重新创建请求。
 
 任何管理设备都能撤销设备。Node 不代替本人签署授权，Agent 不能添加设备、扩大权限或撤销设备。浏览器设备私钥不可导出，清除站点数据后需要重新加入。
 
@@ -167,11 +170,13 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 2. 在服务器上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
 
    ```sh
-   vibeface init --data-dir "$HOME/.vibeface-entry" \
+   export VIBEFACE_ENTRY_DATA_DIR='<入口 Node 数据目录的绝对路径>'
+   vibeface init --data-dir "$VIBEFACE_ENTRY_DATA_DIR" \
    	--public-entry \
    	--public-url https://vb.example.com \
-   	--relay-listen 127.0.0.1:3340
-   vibeface serve --data-dir "$HOME/.vibeface-entry"
+       --relay-listen 127.0.0.1:3340 \
+       --relay-url https://vb.example.com
+   vibeface serve --data-dir "$VIBEFACE_ENTRY_DATA_DIR"
    ```
 
    `init` 在数据目录生成运营者令牌 `entry-token`（权限 600）并打印它的路径。令牌决定谁能把设备挂到这台 relay 上，不要放进配置、聊天或代码仓库。确认能用后按 [作为后台应用运行](#作为后台应用运行) 安装服务。
@@ -212,19 +217,27 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
    `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
 
-4. 把公共入口服务器上的 `entry-token` 复制到个人电脑，例如 `scp user@vb.example.com:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
+4. 在个人电脑上指定服务器的 SSH 地址、步骤 2 选择的数据目录，以及本机用于接收令牌的临时文件，再复制 `entry-token`：
+
+   ```sh
+   export VIBEFACE_ENTRY_SSH='<SSH 用户>@<入口域名>'
+   export VIBEFACE_ENTRY_DATA_DIR='<步骤 2 的服务器数据目录绝对路径>'
+   export VIBEFACE_RELAY_TOKEN_FILE='<本机临时令牌文件的绝对路径>'
+   scp "${VIBEFACE_ENTRY_SSH}:${VIBEFACE_ENTRY_DATA_DIR}/entry-token" "$VIBEFACE_RELAY_TOKEN_FILE"
+   chmod 600 "$VIBEFACE_RELAY_TOKEN_FILE"
+   ```
 
 5. 在个人电脑上初始化 Node 时指向公共入口，然后启动：
 
    ```sh
-   vibeface init --data-dir "$HOME/.vibeface" \
+   vibeface init --data-dir "$VIBEFACE_DATA_DIR" \
    	--root /absolute/path/to/projects \
    	--entry https://vb.example.com \
-   	--relay-token-file "$HOME/vb-entry-token"
-   vibeface
+       --relay-token-file "$VIBEFACE_RELAY_TOKEN_FILE"
+   vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
    ```
 
-   `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `~/vb-entry-token`。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
+   `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `$VIBEFACE_RELAY_TOKEN_FILE` 指向的临时文件。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
 
 6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
 
@@ -255,7 +268,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 |---|---|---|
 | `--relay <URL>` | `relays` | 个人网络中另一台 Node 的 relay，可重复，最多 16 个 |
 | `--relay-listen <ADDR>` | `relay_listen` | 本 Node 在这个地址运行 relay |
-| `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，默认 `http://<relay-listen>`；监听全部网卡时必填 |
+| `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
 | `--relay-paths-only` | `relay_paths_only` | 只经 relay 连接，用于模拟严格 NAT 或排障 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
@@ -263,10 +276,10 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 公网 Node 承担 relay 角色。例如在服务器上用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
 ```sh
-vibeface init --data-dir "$HOME/.vibeface" \
+vibeface init --data-dir "$VIBEFACE_DATA_DIR" \
 	--relay-listen 127.0.0.1:3340 --relay-url https://relay.example \
 	--public-url https://vibe.example
-vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
+vibeface join '<管理设备给出的加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 个人设备上的 Node 用 `--relay https://relay.example` 初始化，无需入站端口。邀请链接写明发出邀请的 Node 自己的 relay。relay 只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
@@ -314,7 +327,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface codex requests` 查看，`vibeface codex respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface codex respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。没有协调 Agent 时分诊事件直接丢弃。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
-Node 默认连接本机已经运行的 Codex App Server（`providers.codex_app_server.mode` 为 `system`，查找方式见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)），不启动也不结束它。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
+Node 默认不启用 Codex。启用 Codex Bot 或任务执行前，先明确配置 App Server。`providers.codex_app_server.mode` 为 `system` 时只连接配置的 socket，不启动也不结束服务，见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
 App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
 
@@ -349,22 +362,22 @@ A 已派发 B 后掉线时，从 C 打开原业务会话，等待 DAG 补齐，�
 `vibeface` 是节点主进程，也是本机管理 CLI。先用前台 `serve` 确认配置，再按 Ctrl-C 停止前台进程，安装用户级服务：
 
 ```sh
-vibeface service install --data-dir "$HOME/.vibeface"
-vibeface status --data-dir "$HOME/.vibeface"
-vibeface service status --data-dir "$HOME/.vibeface"
+vibeface service install --data-dir "$VIBEFACE_DATA_DIR"
+vibeface status --data-dir "$VIBEFACE_DATA_DIR"
+vibeface service status --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
-服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface`。通过 `~/.local/bin/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。自定义安装根先使用 `update configure --install-root /absolute/path` 保存路径。
+服务管理命令需要完整的受管安装，启动路径始终为安装根目录下的 `current/vibeface`。通过 `$VIBEFACE_BIN_DIR/vibeface` 链接调用也保留该路径，升级后不会固定在旧 release。直接运行 `cargo build` 的程序不安装服务。先使用 `update configure --install-root "$VIBEFACE_INSTALL_ROOT"` 保存部署时选择的安装根。
 
-每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略时使用 `$HOME/.vibeface`。管理其他数据目录时显式传入绝对路径。
+每个系统用户管理一个 Node 服务。各服务命令核对 `--data-dir` 与已安装服务一致，再操作该服务。省略参数时要求已设置 `VIBEFACE_DATA_DIR`。管理其他数据目录时显式传入绝对路径。
 
 `status` 通过私有维护 socket 检查运行中的 Node，并核对设备编号，不要求安装服务。它输出设备编号、监听地址、运行版本、写入状态（`Writes`），以及每台其他成员 Node 最近一次同步是否连上、多久之前完成（`Peer`）。`status --json` 输出同样内容，不输出接入授权材料。已停止或无法连接时返回非零退出码。`service status` 则展示 launchd 或 systemd 的 Node 和更新服务状态。各项含义见 [排障](troubleshooting.md)。
 
 ```sh
-vibeface status --json --data-dir "$HOME/.vibeface"
-vibeface service stop --data-dir "$HOME/.vibeface"
-vibeface service start --data-dir "$HOME/.vibeface"
-vibeface service restart --data-dir "$HOME/.vibeface"
+vibeface status --json --data-dir "$VIBEFACE_DATA_DIR"
+vibeface service stop --data-dir "$VIBEFACE_DATA_DIR"
+vibeface service start --data-dir "$VIBEFACE_DATA_DIR"
+vibeface service restart --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`。Node 无论前台还是后台都把 info 级日志写到数据目录的 `node.log`（JSON lines，用 `vibeface logs` 查看）；后台运行时 macOS 的 `service.stderr.log` 和 Linux 的用户 journal 只剩崩溃输出。退出登录后仍需运行的 Linux 主机，由管理员按主机策略启用该用户的 lingering。
@@ -374,7 +387,7 @@ macOS 使用当前登录用户的 launchd agent，Linux 使用 `systemd --user`�
 卸载同时移除 Node 服务和更新定时服务，不删除身份、配置和历史：
 
 ```sh
-vibeface service uninstall --data-dir "$HOME/.vibeface"
+vibeface service uninstall --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 ## 选择更新渠道
@@ -384,21 +397,21 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 选择 Stable 并开启自动更新：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface" update configure \
-	--data-dir "$HOME/.vibeface" \
-	--install-root "$HOME/.local/share/vibeface" \
+"$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
+	--data-dir "$VIBEFACE_DATA_DIR" \
+	--install-root "$VIBEFACE_INSTALL_ROOT" \
 	--channel stable \
 	--automatic true
 ```
 
-将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。默认渠道为 Stable，未配置时不开启自动更新；已有 Nightly 安装应显式选择 `nightly`。
+将 `stable` 改为 `nightly` 可跟随开发预发布。Stable 不会安装 Nightly；尚无正式版时不会自动更换版本。切换渠道不触发降级。更新渠道和安装目录必须先配置；已有 Nightly 安装应显式选择 `nightly`。
 
 查看策略和最近结果、主动检查或立即尝试升级：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface" update status --data-dir "$HOME/.vibeface"
-"$HOME/.local/share/vibeface/current/vibeface" update check --data-dir "$HOME/.vibeface"
-"$HOME/.local/share/vibeface/current/vibeface" update apply --data-dir "$HOME/.vibeface"
+"$VIBEFACE_INSTALL_ROOT/current/vibeface" update status --data-dir "$VIBEFACE_DATA_DIR"
+"$VIBEFACE_INSTALL_ROOT/current/vibeface" update check --data-dir "$VIBEFACE_DATA_DIR"
+"$VIBEFACE_INSTALL_ROOT/current/vibeface" update apply --data-dir "$VIBEFACE_DATA_DIR"
 ```
 
 `check` 只查询与校验版本信息。`apply` 仅安装声明与当前数据格式兼容的包，需要安全的空闲窗口。待投递消息、排队与活动管理轮、活动任务和待核对记录都会阻止安装，先完成或核对原任务，不需要关闭网页。升级不会调用模型或修改 Provider 密钥。
@@ -408,9 +421,9 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 关闭自动更新时，保留所选渠道与受管路径，重新执行 `configure`：
 
 ```sh
-"$HOME/.local/share/vibeface/current/vibeface" update configure \
-	--data-dir "$HOME/.vibeface" \
-	--install-root "$HOME/.local/share/vibeface" \
+"$VIBEFACE_INSTALL_ROOT/current/vibeface" update configure \
+	--data-dir "$VIBEFACE_DATA_DIR" \
+	--install-root "$VIBEFACE_INSTALL_ROOT" \
 	--channel stable \
 	--automatic false
 ```

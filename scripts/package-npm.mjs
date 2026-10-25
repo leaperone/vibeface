@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const targets = ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu', 'x86_64-unknown-linux-gnu'];
@@ -17,6 +17,31 @@ const run = (program, args, options = {}) => execFileSync(program, args, {
   encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options,
 });
 const hash = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+
+function verifyTarMetadata(compressed) {
+  const bytes = gunzipSync(compressed, { maxOutputLength: 512 * 1024 * 1024 });
+  const text = (header, start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '').trim();
+  for (let offset = 0; offset + 512 <= bytes.length;) {
+    const header = bytes.subarray(offset, offset + 512);
+    if (header.every(byte => byte === 0)) break;
+    for (const start of [108, 116]) assert.equal(parseInt(text(header, start, 8) || '0', 8), 0, 'archive must not contain a builder uid or gid');
+    assert.equal(text(header, 265, 32), '', 'archive must not contain a builder user name');
+    assert.equal(text(header, 297, 32), '', 'archive must not contain a builder group name');
+    const size = parseInt(text(header, 124, 12) || '0', 8);
+    assert(Number.isSafeInteger(size) && size >= 0 && offset + 512 + size <= bytes.length, 'invalid archive size');
+    if (header[156] === 120 || header[156] === 103) {
+      let pax = bytes.subarray(offset + 512, offset + 512 + size).toString('utf8');
+      while (pax) {
+        const length = parseInt(pax, 10), separator = pax.indexOf(' ');
+        assert(Number.isSafeInteger(length) && length > separator + 1 && length <= Buffer.byteLength(pax), 'invalid PAX metadata');
+        const record = Buffer.from(pax).subarray(separator + 1, length).toString('utf8');
+        assert(['mtime', 'atime', 'ctime'].includes(record.split('=')[0]), 'archive contains private PAX metadata');
+        pax = Buffer.from(pax).subarray(length).toString('utf8');
+      }
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+}
 
 function nightly(version) {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-nightly\.(\d{8})\.([1-9]\d*)$/.exec(version);
@@ -66,6 +91,7 @@ function verifyReceipt(archive, version, sourceCommit) {
 }
 
 function verify(archive, version, sourceCommit, scratch) {
+  verifyTarMetadata(fs.readFileSync(archive));
   const directory = unpack(archive, scratch, 'package');
   const metadata = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
   assert.equal(metadata.name, '@leaperone/vibeface');
@@ -75,6 +101,7 @@ function verify(archive, version, sourceCommit, scratch) {
   assert(!metadata.scripts && !metadata.dependencies && !metadata.optionalDependencies, 'npm package must not run lifecycle scripts or download dependencies');
   assert.equal(fs.readFileSync(path.join(directory, 'bin/vibeface.mjs'), 'utf8'),
     fs.readFileSync(path.join(repo, 'npm/bin/vibeface.mjs'), 'utf8'), 'launcher does not match the source');
+  assert.deepEqual(fs.readdirSync(path.join(directory, 'bin')), ['vibeface.mjs'], 'unexpected npm launcher file');
   assert.deepEqual(fs.readdirSync(path.join(directory, 'vendor')).sort(), [...targets].sort());
   const epochs = targets.map(target => nativePackage(path.join(directory, 'vendor', target), version, target, sourceCommit));
   assert.equal(new Set(epochs).size, 1, 'platform packages must use the same data epoch');
@@ -92,7 +119,8 @@ function pack(input, output, version, sourceCommit) {
   try {
     const directory = path.join(scratch, 'npm');
     fs.mkdirSync(path.join(directory, 'vendor'), { recursive: true });
-    fs.cpSync(path.join(repo, 'npm/bin'), path.join(directory, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(directory, 'bin'));
+    fs.copyFileSync(path.join(repo, 'npm/bin/vibeface.mjs'), path.join(directory, 'bin/vibeface.mjs'));
     fs.copyFileSync(path.join(repo, 'npm/README.md'), path.join(directory, 'README.md'));
     const metadata = JSON.parse(fs.readFileSync(path.join(repo, 'npm/package.json'), 'utf8'));
     fs.writeFileSync(path.join(directory, 'package.json'), `${JSON.stringify({ ...metadata, version, private: false }, null, 2)}\n`);
@@ -153,6 +181,9 @@ async function selfTest() {
     const artifact = pack(input, path.join(scratch, 'output'), version, commit);
     assert.equal(path.basename(artifact), `leaperone-vibeface-${version}.tgz`);
     const artifactBytes = fs.readFileSync(artifact);
+    const privateHeader = gunzipSync(artifactBytes);
+    privateHeader.write('0000001\0', 108, 'ascii');
+    assert.throws(() => verifyTarMetadata(gzipSync(privateHeader)), /builder uid/);
     fs.appendFileSync(artifact, 'changed');
     assert.throws(() => verifyReceipt(artifact, version, commit), /SHA256 mismatch/);
     fs.writeFileSync(artifact, artifactBytes);

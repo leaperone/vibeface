@@ -389,6 +389,7 @@ def self_test():
                 ["cargo", "+1.89", "check", "--locked", "-p", "vibeface"],
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
+    subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/node/src/config.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
@@ -402,7 +403,7 @@ def release_privacy_test(root, scratch):
 
     with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
         repo = Path(directory)
-        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/node/src/config.rs", "README.md"):
+        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/node/src/config.rs", "README.md"):
             target = repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(root / name, target)
@@ -424,14 +425,38 @@ def release_privacy_test(root, scratch):
             subprocess.run(["rustc", "--crate-name", "privacy_fixture", "-Copt-level=3", "-Cdebuginfo=0", *flags, str(source), "-o", str(binary)], check=True)
             assert str(repo).encode() not in binary.read_bytes(), "release binary contains its source directory"
             assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
-        for name, content in {"crates/node/web/generated/vibeface_secure.js": "fixture", "crates/node/web/generated/vibeface_secure_bg.wasm": "fixture", "crates/node/web/dist/client/_shell.html": "fixture", "docs/guide.md": "public guide"}.items():
-            target = repo / name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
+        (repo / "docs").mkdir()
+        (repo / "docs/guide.md").write_text("public guide")
+        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\ncrates/node/web/generated/\ncrates/node/web/dist/\n.env\ncargo-called\n")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+
+        def generated():
+            tool = ["python3", str(repo / "scripts/build-inputs.py")]
+            for component, files in (
+                ("crypto", {"vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "fixture"}),
+                ("web", {"_shell.html": "fixture"}),
+            ):
+                subprocess.run([*tool, "prepare", component], check=True)
+                output = repo / ("crates/node/web/generated" if component == "crypto" else "crates/node/web/dist/client")
+                for name, content in files.items():
+                    (output / name).write_text(content)
+                subprocess.run([*tool, "finish", component], check=True)
+
+        generated()
+        (repo / "docs/.env").write_text("PRIVATE_FIXTURE=must-not-be-packaged")
+        (repo / "docs/untracked-note.md").write_text("must-not-be-packaged")
         if hasattr(os, "setxattr"):
             os.setxattr(repo / "docs/guide.md", "user.build-host", b"private builder")
         environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
-        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--skip-build", "--target", "privacy-fixture"], env=environment, check=True, stdout=subprocess.PIPE)
+        fake_cargo = repo / "bin/cargo"
+        fake_cargo.parent.mkdir()
+        fake_cargo.write_text('#!/bin/sh\ntouch "$CARGO_MARKER"\n')
+        fake_cargo.chmod(0o755)
+        marker = repo / "cargo-called"
+        environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
+        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, check=True, stdout=subprocess.PIPE)
+        assert marker.exists(), "packaging must always rebuild the native binary"
         archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
         with tarfile.open(archive_path) as archive:
             for entry in archive.getmembers():
@@ -440,14 +465,11 @@ def release_privacy_test(root, scratch):
                 assert not any(part.startswith("._") for part in Path(entry.name).parts)
             package = archive.getmembers()[0].name
             assert archive.extractfile(f"{package}/docs/guide.md").read() == b"public guide"
+            assert not any(entry.name.endswith(("/.env", "/untracked-note.md")) for entry in archive.getmembers())
             assert archive.getmember(f"{package}/vibeface").mode & 0o111
         (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
-        fake_cargo = repo / "bin/cargo"
-        fake_cargo.parent.mkdir()
-        fake_cargo.write_text('#!/bin/sh\ntouch "$CARGO_MARKER"\n')
-        fake_cargo.chmod(0o755)
-        marker = repo / "cargo-called"
-        environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
+        generated()
+        marker.unlink()
         assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
         assert not marker.exists(), "a failed privacy setup must stop the build"
     print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")

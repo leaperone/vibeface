@@ -88,6 +88,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   // A cookie-bound local session only exists after a launch on this origin, which the browser remembers.
   if (localSession) stored.set('vibeface.local-origin', 'true')
   let key = subject
+  let initialized = !bootstrap && local !== 'fresh'
   const transport = {
     validTarget: (value: string) => value, validEndpoint: (value: string) => value,
     initClient: async () => ({ deviceId: key }), signClient: async () => 'signature',
@@ -96,6 +97,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     async connectDevice(candidate: ConnectionEntry, options: { onClose?(cause: Error): void; signal?: AbortSignal }) {
       calls.push(`open:${candidate.device_id}`)
       let closed = false
+      let authorized = false
       const close = () => { if (closed) return; closed = true; options.onClose?.(new Error('connection lost')) }
       sockets.push({ entry: candidate, close, drop: close })
       options.signal?.addEventListener('abort', close)
@@ -104,11 +106,17 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'log') return { accepted: 1 }
         calls.push(method)
         requests.push({ method, params })
-        if (holds.has(method)) return holds.get(method)?.promise
-        const initialized = !bootstrap && local !== 'fresh' && candidate.device_id !== remote
-        if (method === 'info') return { device_id: candidate.device_id, name: 'node', version: 'test', initialized, network_id: initialized ? network : null }
-        if (method === 'authenticate' && localSession) return { principal: { network_id: network } }
+        if (holds.has(method)) {
+          const result = await holds.get(method)?.promise
+          if (method === 'recover') { initialized = true; authorized = true }
+          if (method === 'authenticate' && result && typeof result === 'object' && 'principal' in result) authorized = result.principal !== null
+          return result
+        }
+        if (method === 'info') return { device_id: candidate.device_id, name: authorized ? 'node' : 'Node', version: 'test', initialized, network_id: initialized && authorized ? network : null }
+        if (method === 'recover') { initialized = true; authorized = true; return {} }
+        if (method === 'authenticate' && localSession) { initialized = true; authorized = true; return { principal: { network_id: network } } }
         if (method === 'authenticate' && removed && key === subject) return { principal: null, initialized: true, network_id: network, revoked: true }
+        if (method === 'authenticate') { initialized = true; authorized = true }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
         if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
@@ -792,7 +800,7 @@ for (const responded of [true, false]) test(`a ${responded ? 'rejected' : 'disco
   } finally { app.close() }
 })
 
-for (const stage of ['authenticate', 'subscribe']) test(`cancelJoin during ${stage} cannot restore the cancelled connection`, async () => {
+for (const stage of ['authenticate', 'info', 'subscribe']) test(`cancelJoin during ${stage} cannot restore the cancelled connection`, async () => {
   const app = deviceHarness({ joining: 'joined' })
   const hold = deferred(); app.holds.set(stage, hold)
   try {
@@ -866,7 +874,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     const rejected = assert.rejects(work, /切换|取消/)
     for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
     assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
-    hold.resolve({ state: { genesis }, view: membership })
+    hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] } })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()
     assert.equal(app.render().phase, 'disconnected')
@@ -883,7 +891,7 @@ test('an approved join restores only verified authentication and subscription, a
     app.render(); await settle(); app.render()
     assert.equal(app.render().ready?.entry.device_id, target)
     assert.equal(app.verifications(), 1)
-    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status', 'join_status', 'authenticate', 'subscribe', 'entrances'])
+    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'join_status', 'join_status', 'authenticate', 'info', 'subscribe', 'entrances'])
     app.sockets[0].drop(); app.render()
     assert.equal(app.timers.size, 1)
     app.render().disconnect()
@@ -904,7 +912,7 @@ test('unexpected closure reconnects the same target with fresh authentication an
     assert.notEqual(app.render().ready?.generation, previous)
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.verifications(), 2)
-    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'subscribe', 'entrances'])
+    assert.deepEqual(app.calls, [`open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances', `open:${target}`, 'info', 'authenticate', 'info', 'subscribe', 'entrances'])
     assert.equal(app.timers.size, 0)
   } finally { app.close() }
 })
