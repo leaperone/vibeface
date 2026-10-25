@@ -37,9 +37,11 @@ export function QuestionCard({ question }: { question: Question }) {
     try {
       await workspace.actions.answer(question, value)
       void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
+      // Stays busy until the answer arrives and folds or removes the card, so it never flashes back to open.
     } catch (caught) {
       setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次回答'))
-    } finally { setBusy(null) }
+      setBusy(null)
+    }
   }
   const typed = () => {
     const value = text.trim()

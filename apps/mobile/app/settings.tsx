@@ -2,21 +2,23 @@ import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
 import { Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
-import { Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
+import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ConnectionPill } from '@/components/connection-pill'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
+import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { JoinRequests } from '@/features/devices/join-requests'
+import { useWide } from '@/lib/layout'
 import { cn } from '@/lib/utils'
 import { useRun } from '@/lib/use-run'
 
-const themes = [['system', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const
+const themes = [{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }] as const
 
 export default function Settings() {
   const workspace = useWorkspace()
@@ -24,18 +26,18 @@ export default function Settings() {
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
-  const { fontScale } = useWindowDimensions()
+  const wide = useWide()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', fontScale >= 1.3 ? 'self-stretch' : 'flex-row self-start')}>
-        {themes.map(([value, label]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: current === value }}
-          variant={current === value ? 'outline' : 'ghost'} className={cn('min-h-11', fontScale >= 1.3 && 'justify-start')} onPress={() => { void Haptics.selectionAsync(); Uniwind.setTheme(value) }}><Text>{label}</Text></Button>)}
-      </View>
+      {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
+          UIKit gets the same style, so native glass like the back button turns with the page instead of re-sampling it later. */}
+      <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
     </Section>
-    <Section icon={Globe} title="连接">
+    {/* Beside the sidebar its footer already shows the connection. */}
+    {wide ? null : <Section icon={Globe} title="连接">
       <View className="-mx-2 -my-3"><ConnectionPill connection={workspace.connection} /></View>
-    </Section>
+    </Section>}
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">
