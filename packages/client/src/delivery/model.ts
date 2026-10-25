@@ -162,7 +162,8 @@ export const paymentLabels: Record<PaymentState, string> = {
   free: '免费', prepared: '未付款', submitted: '交易已提交', included: '已打包，等待确认', confirmed: '链上已确认', earned: '服务商已取得债权', withdrawn: '服务商已提款', refunded: '已退还', unknown: '交易结果未知，需对账', failed: '付款失败',
 }
 export function canRead(order: DeliveryOrder): boolean {
-  return order.role !== 'provider' && (order.role === 'sender' || order.evidence === 'charity_receipt' || order.evidence === 'recoverable' || order.evidence === 'decryption_proven')
+  return order.mode === 'charity' && order.role === 'sender'
+    || order.role === 'receiver' && (order.evidence === 'charity_receipt' || order.evidence === 'recoverable' || order.evidence === 'decryption_proven')
 }
 export function needsRefresh(order: DeliveryOrder): boolean {
   return !['prepared', 'paid', 'refunded', 'failed', 'key_unavailable'].includes(order.phase) || order.payment.state === 'unknown'

@@ -373,7 +373,6 @@ impl Runtime {
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
-        self.delivery.attach(Arc::downgrade(self))?;
         let events = self
             .codex_rx
             .lock()

@@ -4261,7 +4261,6 @@ def delivery_charity_acceptance(options):
         passed("real-service-and-private-network-boundaries", **security)
         call(receiver, "accept", order_id=order_id)
         restart(receiver)
-        call(receiver, "accept", order_id=order_id)
 
         def recovered():
             state = call(receiver, "get", order_id=order_id)
@@ -4509,11 +4508,14 @@ def delivery_paid_run(options, configuration, deployment):
         transfer = "0xa9059cbb" + source.wallet_address[2:].lower().zfill(64) + format(1000000, "064x")
         token_tx = rpc("eth_sendTransaction", [{"from": funder, "to": chain["asset"], "data": transfer}])
         wait_for("controlled sender TestToken funding", lambda: confirmed(token_tx), timeout=60)
+        register_intent = str(uuid.uuid4())
+
         def registration():
-            value = cli(receiver, ["register-key", "--gas-cap", configuration["register_key_gas_cap_wei"]], timeout=7300)
+            value = cli(receiver, ["register-key", "--intent-id", register_intent,
+                                  "--gas-cap", configuration["register_key_gas_cap_wei"]], timeout=7300)
             if value["phase"] in ("reverted", "conflicted", "failed"):
                 raise RuntimeError("receiving-key registration reached a terminal chain failure")
-            return value if value["phase"] == "confirmed" else None
+            return value if value["phase"] == "confirmed" and value.get("registry_confirmed") is True else None
         wait_for("actual receiving-key proof registration confirmation", registration, timeout=7400)
         passed("local-wallets-and-genuine-receiving-key-registration", wallets=3, chain_id=31337,
                two_confirmations=True, protected_passphrase_fd=True)
@@ -4571,7 +4573,8 @@ def delivery_paid_run(options, configuration, deployment):
                 and final["payment"]["refunded"] == "0", "provider actually withdraws all exact earned service fees")
         passed("two-window-source-hold-open-and-original-file", order_id=order_id, windows=2,
                bytes=len(data), sha256=digest, earned="29", withdrawn="29", evidence=final["evidence"])
-        register_rows = delivery_rows(receiver, "SELECT id,intent FROM transactions WHERE id LIKE 'key-%/register'")
+        register_rows = delivery_rows(receiver, "SELECT id,intent FROM transactions WHERE id=?",
+                                      (f"key-{register_intent}/register",))
         require(len(register_rows) == 1, "receiving key has a unique registration transaction")
         register_id, register_intent = register_rows[0]
         calldata = bytes.fromhex(json.loads(register_intent)["calldata"].removeprefix("0x"))

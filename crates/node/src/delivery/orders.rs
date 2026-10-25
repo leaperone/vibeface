@@ -602,51 +602,6 @@ impl Delivery {
         }
         self.update_paid_view(stored).await
     }
-    pub async fn local_register_key(&self, gas_cap: &str) -> Result<Value> {
-        let _operation = self
-            .operations
-            .try_lock()
-            .context("another delivery operation is in progress")?;
-        self.ensure_mode(Mode::Paid)?;
-        let binding = self.key_binding(Mode::Paid)?;
-        let config = self
-            .config()
-            .prover
-            .context("local prover is not configured")?;
-        let statement = Statement::key_binding(&config.profile, &binding)?;
-        let id = format!(
-            "key-{}-{}",
-            hex::encode(binding.binding.receiver_peer),
-            binding.binding.serial
-        );
-        let proof_id = format!("proof-seal:{id}");
-        self.with_store(|store| store.put_value(&format!("local-spend:{id}"), gas_cap.as_bytes()))?;
-        let seal = if let Some(seal) = self.with_store(|store| store.value(&proof_id))? {
-            seal
-        } else {
-            let input = ProofInput {
-                profile: config.profile.clone(),
-                statement: statement.clone(),
-                witness: Witness::KeyBinding { binding },
-            };
-            let path = self
-                .with_store(|store| store.reserve_proof(&hex::encode(input.statement.digest())))?;
-            let seal = self.proofs.prove(&config, &input, &path).await?;
-            self.with_store(|store| store.put_value(&proof_id, &seal))?;
-            seal
-        };
-        let result = self
-            .chain()
-            .await?
-            .execute(
-                self,
-                &format!("{id}/register"),
-                chain::Call::RegisterKey { statement, seal },
-                gas_cap,
-            )
-            .await?;
-        Ok(serde_json::to_value(result)?)
-    }
     pub(super) async fn prepare(
         &self,
         node: &Runtime,

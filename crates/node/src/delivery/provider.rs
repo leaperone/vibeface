@@ -709,6 +709,8 @@ impl Delivery {
                     observed.error.as_deref(),
                 )
             })?;
+            self.finish_key_operation(&chain, &transaction.intent.id, &observed.phase)
+                .await?;
             if matches!(observed.phase.as_str(), "unknown" | "submitted" | "reorged")
                 && matches!(self.wallet.lock().expect("delivery wallet").status(),wallet::WalletStatus::Unlocked{ref address} if address==&transaction.intent.wallet)
             {

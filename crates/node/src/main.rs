@@ -168,6 +168,22 @@ enum WalletAction {
     /// Register this Node's receiving key on the configured local test chain.
     RegisterKey {
         #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Rotate the receiving key while retaining material for already-held orders.
+    RotateKey {
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Revoke new receiving rights without deleting old held-order keys.
+    RevokeKey {
+        #[arg(long)]
+        intent_id: String,
+        #[arg(long)]
         gas_cap: String,
     },
     /// Save the separate encrypted wallet backup without overwriting an existing file.
@@ -566,9 +582,36 @@ async fn wallet(options: WalletOptions) -> Result<()> {
             println!("Delivery settings applied.");
             return Ok(());
         }
-        WalletAction::RegisterKey { gas_cap } => {
-            vibeface_delivery::Amount::from_decimal_str(&gas_cap)?;
-            let result = maintenance::register_delivery_key(&dir, gas_cap).await?;
+        WalletAction::RegisterKey { intent_id, gas_cap } => {
+            let result = maintenance::delivery_key_operation(
+                &dir,
+                vibeface::delivery::KeyAction::Register,
+                intent_id,
+                gas_cap,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
+            return Ok(());
+        }
+        WalletAction::RotateKey { intent_id, gas_cap } => {
+            let result = maintenance::delivery_key_operation(
+                &dir,
+                vibeface::delivery::KeyAction::Rotate,
+                intent_id,
+                gas_cap,
+            )
+            .await?;
+            println!("{}", serde_json::to_string(&result)?);
+            return Ok(());
+        }
+        WalletAction::RevokeKey { intent_id, gas_cap } => {
+            let result = maintenance::delivery_key_operation(
+                &dir,
+                vibeface::delivery::KeyAction::Revoke,
+                intent_id,
+                gas_cap,
+            )
+            .await?;
             println!("{}", serde_json::to_string(&result)?);
             return Ok(());
         }
@@ -1782,6 +1825,29 @@ async fn triage(options: Triage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receiving_key_commands_require_an_explicit_stable_intent() {
+        let intent = uuid::Uuid::new_v4().to_string();
+        for action in ["register-key", "rotate-key", "revoke-key"] {
+            assert!(
+                Cli::try_parse_from(["vibeface", "wallet", action, "--gas-cap", "1000000"])
+                    .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "vibeface",
+                    "wallet",
+                    action,
+                    "--intent-id",
+                    &intent,
+                    "--gas-cap",
+                    "1000000"
+                ])
+                .is_ok()
+            );
+        }
+    }
 
     #[test]
     fn wallet_passphrase_requires_a_protected_descriptor_and_cli_never_accepts_it_as_text()

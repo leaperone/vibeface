@@ -20,6 +20,8 @@ async function createNetwork({ screen, browser }: Page, url: string, name: strin
   await screen.getByRole('button', '完成创建').click();
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   await screen.getByRole('button', '稍后设置').click();
+  await expect(screen.getByRole('heading', '创建第一个 Bot')).toBeVisible();
+  await screen.getByRole('button', '跳过', { exact: true }).click();
   await browser.goto(`${url}/transfers`);
   await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible();
   await expect(screen.getByRole('switch', '启用文件传输')).not.toBeChecked();
@@ -38,8 +40,18 @@ test('forwards an encrypted charity file between separate networks and survives 
   const input = join(network.source.directory, name);
   await writeFile(input, bytes, { mode: 0o600, flag: 'wx' });
   const digest = createHash('sha256').update(bytes).digest('hex');
+  await browser.evaluate(() => {
+    const intercept = (event: MouseEvent) => {
+      if (event.target instanceof HTMLInputElement && event.target.type === 'file' && event.target.parentElement === document.body) {
+        event.preventDefault();
+        document.removeEventListener('click', intercept, true);
+      }
+    };
+    document.addEventListener('click', intercept, true);
+    return null;
+  });
   await screen.getByRole('button', '选择文件').click();
-  await browser.locator('input[type="file"]').setInputFiles(input);
+  await browser.locator('body > input[type="file"]').setInputFiles(input);
   await expect(screen.getByText(`${name} · ${bytes.length} 字节。当前最多`, { exact: false })).toBeVisible();
   await screen.getByRole('button', '准备订单并查看费用').click();
   await expect(screen.getByRole('heading', '确认这笔订单')).toBeVisible();
@@ -50,6 +62,7 @@ test('forwards an encrypted charity file between separate networks and survives 
   await expect(screen.getByRole('button', /^密文订单/)).toBeVisible({ timeout: 30000 });
   await screen.getByRole('button', /^密文订单/).click();
   await screen.getByRole('button', '接受此订单').click();
+  await expect(screen.getByRole('button', '刷新', { exact: true })).toBeEnabled();
   await network.restart('receiver', true);
   await browser.reload();
   await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible();

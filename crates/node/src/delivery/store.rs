@@ -291,21 +291,39 @@ impl ServiceStore {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn put_value(&self, id: &str, value: &[u8]) -> Result<()> {
+        self.put_values(&[(id, value)])
+    }
+    pub fn put_values(&self, values: &[(&str, &[u8])]) -> Result<()> {
         ensure!(
-            id.len() <= 160 && value.len() <= 1024 * 1024,
-            "private delivery value too large"
+            !values.is_empty() && values.len() <= 8,
+            "invalid private delivery batch"
         );
-        let used: u64 = self.db.query_row(
-            "SELECT (SELECT coalesce(sum(length(body)),0) FROM private_values WHERE id<>?1)+(SELECT coalesce(sum(size),0) FROM objects)+(SELECT coalesce(sum(size),0) FROM proof_jobs)",
-            [id],
-            |r| r.get(0),
-        )?;
+        let mut seen = std::collections::BTreeSet::new();
+        let tx = self.db.unchecked_transaction()?;
+        let mut used:u64=tx.query_row("SELECT (SELECT coalesce(sum(length(body)),0) FROM private_values)+(SELECT coalesce(sum(size),0) FROM objects)+(SELECT coalesce(sum(size),0) FROM proof_jobs)",[],|r|r.get(0))?;
+        for (id, value) in values {
+            ensure!(
+                id.len() <= 160 && value.len() <= 1024 * 1024 && seen.insert(*id),
+                "invalid or duplicate private delivery value"
+            );
+            let old: u64 = tx.query_row(
+                "SELECT coalesce((SELECT length(body) FROM private_values WHERE id=?1),0)",
+                [*id],
+                |r| r.get(0),
+            )?;
+            used = used
+                .checked_sub(old)
+                .and_then(|used| used.checked_add(value.len() as u64))
+                .context("private delivery capacity overflow")?;
+        }
         ensure!(
-            used.checked_add(value.len() as u64)
-                .is_some_and(|n| n <= self.capacity),
+            used <= self.capacity,
             "private delivery storage quota exceeded"
         );
-        self.db.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,value])?;
+        for (id, value) in values {
+            tx.execute("INSERT INTO private_values(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body",params![id,value])?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn value(&self, id: &str) -> Result<Option<Vec<u8>>> {

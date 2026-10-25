@@ -176,6 +176,7 @@ impl Runtime {
             tracing::info!(%listen, "relay started");
             *self.relay.lock().await = Some(relay);
         }
+        self.delivery.attach(Arc::downgrade(self))?;
         if self.config.public_entry {
             return Ok(());
         }

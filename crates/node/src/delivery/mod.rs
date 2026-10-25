@@ -1,6 +1,8 @@
 pub mod chain;
 mod charity;
+mod keys;
 mod orders;
+pub use keys::KeyAction;
 pub mod proof;
 mod provider;
 mod service;
@@ -102,7 +104,7 @@ impl DeliveryConfig {
 #[derive(Serialize, Deserialize)]
 struct ReceivingMaterial {
     binding: SignedKeyBinding,
-    secret: Secret32,
+    secret: Option<Secret32>,
 }
 
 pub struct Delivery {
@@ -347,7 +349,11 @@ impl Delivery {
             self.charity_key_status()?
         } else if config.enabled && config.paid_enabled {
             let key = self.key_binding(Mode::Paid)?.binding;
-            json!({"key_id":hex::encode(key.key_id),"serial":key.serial,"public_key":hex::encode(key.receiver_public)})
+            if key.action == BindingAction::Active {
+                json!({"key_id":hex::encode(key.key_id),"serial":key.serial,"public_key":hex::encode(key.receiver_public)})
+            } else {
+                Value::Null
+            }
         } else {
             Value::Null
         };
@@ -364,60 +370,27 @@ impl Delivery {
     }
     fn key_binding(&self, mode: Mode) -> Result<SignedKeyBinding> {
         self.ensure_mode(mode)?;
-        let config = self.config();
-        let (chain_id, escrow) = deployment(&config, mode)?;
-        let label = format!(
-            "receiving-current:{}:{}",
-            hex::encode(chain_id),
-            hex::encode(escrow)
+        ensure!(
+            mode == Mode::Paid,
+            "charity has an independent receiving key"
         );
+        let label = keys::current_key_label(&self.config())?;
         self.with_store(|store| {
-            let prior = store
-                .value(&label)?
-                .map(|bytes| serde_json::from_slice::<ReceivingMaterial>(&bytes))
-                .transpose()?;
-            if let Some(material) = &prior {
-                let profile = config
-                    .chain
-                    .as_ref()
-                    .context("paid profile is not configured")?
-                    .profile
-                    .clone();
-                if material.binding.binding.valid_until
-                    > paid_deadlines(now(), &profile).retain_until
-                {
-                    return Ok(material.binding.clone());
-                }
+            if let Some(bytes) = store.value(&label)? {
+                let bytes = Zeroizing::new(bytes);
+                let material: ReceivingMaterial = serde_json::from_slice(&bytes)?;
+                return Ok(material.binding);
             }
-            let secret = Secret32::new(random_word())?;
-            let binding = KeyBinding {
-                chain_id,
-                escrow,
-                receiver_peer: parse_word(&self.identity.device_id()?)?,
-                receiver_public: receiving_public(&secret)?,
-                key_id: random_word(),
-                serial: prior.map(|m| m.binding.binding.serial + 1).unwrap_or(1),
-                valid_from: now().saturating_sub(60),
-                valid_until: now() + 7 * 86400,
-                action: BindingAction::Active,
-            };
-            let signature = signature(
-                self.identity
-                    .sign_payload("delivery-key", &binding.signing_payload()?)?,
-            )?;
-            let material = ReceivingMaterial {
-                binding: SignedKeyBinding { binding, signature },
-                secret,
-            };
+            let material = self.new_receiving_material(1, BindingAction::Active)?;
+            let key = format!(
+                "receiving-key:{}",
+                hex::encode(material.binding.binding.key_id)
+            );
             let encoded = Zeroizing::new(serde_json::to_vec(&material)?);
-            store.put_value(
-                &format!(
-                    "receiving-key:{}",
-                    hex::encode(material.binding.binding.key_id)
-                ),
-                &encoded,
-            )?;
-            store.put_value(&label, &encoded)?;
+            store.put_values(&[
+                (label.as_str(), encoded.as_slice()),
+                (key.as_str(), encoded.as_slice()),
+            ])?;
             Ok(material.binding)
         })
     }
@@ -429,7 +402,9 @@ impl Delivery {
             .context("receiving key is unavailable; restore the independent delivery backup")?,
         );
         let material: ReceivingMaterial = serde_json::from_slice(&bytes)?;
-        Ok(material.secret)
+        material
+            .secret
+            .context("receiving key material has been revoked")
     }
     fn ensure_mode(&self, mode: Mode) -> Result<()> {
         let config = self.config();

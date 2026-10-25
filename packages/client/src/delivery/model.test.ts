@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRestart, changeMode, checkedFile, fromBase64, parseOrder, parseReceived, parseStatus, sha256, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, parseOrder, parseReceived, parseStatus, sha256, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -55,6 +55,18 @@ test('a received file is saved only after exact content, length, name and digest
   assert.throws(() => parseReceived({ ...received, name: '../file' }, 131072))
   assert.throws(() => parseReceived({ ...received, content_base64: undefined }, 131072))
   assert.throws(() => fromBase64('Zh=='))
+})
+
+test('file retrieval permits charity senders and accepted receivers but never paid senders or providers', () => {
+  const charityReceived: DeliveryOrder = { ...order(), role: 'receiver', phase: 'recoverable', evidence: 'charity_receipt', windows: order().windows.map(window => ({ ...window, state: 'held', committed_bytes: window.bytes + 68 })) }
+  const delivered: DeliveryOrder = { ...paidOrder(), phase: 'paid', evidence: 'recoverable', payment: { ...paidOrder().payment, state: 'earned', earned: paidOrder().payment.total }, windows: paidOrder().windows.map(window => ({ ...window, state: 'earned', committed_bytes: window.bytes + 68 })) }
+  assert.equal(canRead(order()), true)
+  assert.equal(canRead(charityReceived), true)
+  assert.equal(canRead(delivered), false)
+  assert.equal(canRead({ ...delivered, role: 'receiver', phase: 'recoverable' }), true)
+  assert.equal(canRead({ ...delivered, role: 'receiver', phase: 'proving' }), true)
+  assert.equal(canRead({ ...paidOrder(), role: 'receiver', evidence: 'none' }), false)
+  assert.equal(canRead({ ...delivered, role: 'provider', name: null, sha256: null }), false)
 })
 
 const status: DeliveryStatus = { enabled: true, charity_enabled: true, paid_enabled: false, node_peer: source, wallet: { state: 'absent', address: null }, max_file_bytes: 130816, receiver_key: null }

@@ -195,7 +195,9 @@ enum Command {
     LocalAccess(bool),
     DeliveryWallet(crate::delivery::wallet::WalletCommand),
     DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
-    DeliveryRegisterKey {
+    DeliveryKeyOperation {
+        action: crate::delivery::KeyAction,
+        intent_id: String,
         gas_cap: String,
     },
 }
@@ -284,8 +286,13 @@ pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Response)> {
-    let response_timeout = if matches!(&command, Command::DeliveryRegisterKey { .. }) {
-        Duration::from_secs(7200)
+    let response_timeout = if matches!(&command, Command::DeliveryKeyOperation { .. }) {
+        Duration::from_secs(
+            crate::delivery::proof::INFO_TIMEOUT_SECS
+                + crate::delivery::proof::PROVE_TIMEOUT_SECS
+                + crate::delivery::proof::VERIFY_TIMEOUT_SECS
+                + 60,
+        )
     } else {
         REQUEST_TIMEOUT
     };
@@ -384,11 +391,24 @@ pub async fn configure_delivery(
     Ok(())
 }
 
-pub async fn register_delivery_key(data_dir: &Path, gas_cap: String) -> Result<serde_json::Value> {
-    let (_, response) = request(data_dir, Command::DeliveryRegisterKey { gas_cap }).await?;
+pub async fn delivery_key_operation(
+    data_dir: &Path,
+    action: crate::delivery::KeyAction,
+    intent_id: String,
+    gas_cap: String,
+) -> Result<serde_json::Value> {
+    let (_, response) = request(
+        data_dir,
+        Command::DeliveryKeyOperation {
+            action,
+            intent_id,
+            gas_cap,
+        },
+    )
+    .await?;
     response
         .delivery
-        .context("node did not return its delivery key registration")
+        .context("node did not return its receiving key operation")
 }
 
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
@@ -470,9 +490,18 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
             }
             write_packet(&mut stream, &response).await?;
         }
-        Command::DeliveryRegisterKey { gas_cap } => {
+        Command::DeliveryKeyOperation {
+            action,
+            intent_id,
+            gas_cap,
+        } => {
             let result = match runtime.maintenance.enter() {
-                Ok(_guard) => runtime.delivery.local_register_key(&gas_cap).await,
+                Ok(_guard) => {
+                    runtime
+                        .delivery
+                        .local_key_operation(action, &intent_id, &gas_cap)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             match result {
