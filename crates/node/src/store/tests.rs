@@ -3573,6 +3573,66 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
     Ok(())
 }
 
+/// The version of a session as its bot's chat lists it.
+fn session_version(store: &Store, net: &Net, session: &str) -> Result<String> {
+    for scope in ["c", "d"] {
+        if let Some(row) = store
+            .attributed_sessions(&net.network, scope)?
+            .into_iter()
+            .find(|row| row["session_id"] == session)
+        {
+            return Ok(row["version"].as_str().context("version")?.to_owned());
+        }
+    }
+    Ok(String::new())
+}
+
+#[test]
+fn a_hand_over_from_an_old_version_writes_nothing() -> Result<()> {
+    let net = net()?;
+    let (mut local, _) = bot_with_message(&net)?;
+    second_bot(&mut local, &net, "Other")?;
+    let about = Subject {
+        node: net.a.device_id()?,
+        agent: "codex".into(),
+        session_id: "s1".into(),
+        cwd: "/w".into(),
+        summary: "tests fail".into(),
+        request_id: None,
+    };
+    local.claim_session(&net.a, &net.network, "c", &about, 3)?;
+    let seen = session_version(&local, &net, "s1")?;
+    let mut hand = |from: &str, seen: &str, target: Option<&str>, at: i64| {
+        local.hand_over_session(&net.a, &net.network, from, "s1", seen, target, at)
+    };
+    let (_, moved, written) = hand("c", &seen, Some("d"), 4)?;
+    assert!(written.is_some());
+    assert_ne!(moved, seen, "a hand-over gives the session a new version");
+    let (_, standing, written) = hand("c", &seen, Some("d"), 4)?;
+    assert!(
+        written.is_none() && standing == moved,
+        "the same call again reads back what stands"
+    );
+    let (_, back, written) = hand("d", &moved, Some("c"), 5)?;
+    assert!(written.is_some(), "the other bot hands it back");
+    let stale = hand("c", &seen, Some("d"), 6).expect_err("c's retry is from before");
+    assert!(
+        stale
+            .to_string()
+            .contains(&format!("it is at version {back} now")),
+        "a retry after the session moved on writes nothing: {stale}"
+    );
+    assert!(hand("c", &seen, None, 6).is_err(), "nor does a stale mute");
+    assert_eq!(session_version(&local, &net, "s1")?, back);
+    assert_eq!(
+        local
+            .session_owner(&net.network, &net.a.device_id()?, "s1")?
+            .as_deref(),
+        Some("c")
+    );
+    Ok(())
+}
+
 #[test]
 fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()> {
     let net = net()?;
@@ -3606,7 +3666,10 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
     );
     assert_eq!(owner(&local)?.as_deref(), Some("c"));
     let mut hand = |from: &str, session: &str, target: Option<&str>, at: i64| {
-        local.hand_over_session(&net.a, &net.network, from, session, target, at)
+        let seen = session_version(&local, &net, session)?;
+        local
+            .hand_over_session(&net.a, &net.network, from, session, &seen, target, at)
+            .map(|(owner, _, event)| (owner, event))
     };
     assert!(hand("c", "s1", Some("nope"), 5).is_err());
     assert!(hand("c", "s2", None, 5).is_err());
@@ -3628,7 +3691,10 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
     assert!(local.attributed_sessions(&net.network, "c")?.is_empty());
 
     let mut hand = |from: &str, session: &str, target: Option<&str>, at: i64| {
-        local.hand_over_session(&net.a, &net.network, from, session, target, at)
+        let seen = session_version(&local, &net, session)?;
+        local
+            .hand_over_session(&net.a, &net.network, from, session, &seen, target, at)
+            .map(|(owner, _, event)| (owner, event))
     };
     assert!(hand("d", "s1", None, 7)?.1.is_some());
     assert!(hand("d", "s1", None, 8)?.1.is_none());
@@ -3674,7 +3740,8 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
     );
     assert!(other.session_muted(&net.network, &node, "s1")?);
 
-    local.hand_over_session(&net.a, &net.network, "d", "s1", Some("c"), 10)?;
+    let seen = session_version(&local, &net, "s1")?;
+    local.hand_over_session(&net.a, &net.network, "d", "s1", &seen, Some("c"), 10)?;
     assert_eq!(owner(&local)?.as_deref(), Some("c"));
     assert!(
         !local.session_muted(&net.network, &node, "s1")?,
@@ -3960,7 +4027,9 @@ fn the_bot_prompt_lists_the_newest_sessions_it_follows() -> Result<()> {
         )?;
     }
     store.claim_session(&net.a, &net.network, "d", &about("theirs"), 40)?;
-    store.hand_over_session(&net.a, &net.network, "c", "s19", None, 50)?;
+    let seen = session_version(&store, &net, "s19")?;
+    let (_, version, _) =
+        store.hand_over_session(&net.a, &net.network, "c", "s19", &seen, None, 50)?;
     let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
     let shown = listed(&bot, "/sessions", "session_id");
     let omitted = bot["sessions_omitted"].as_u64().context("omitted")? as usize;
@@ -3978,9 +4047,16 @@ fn the_bot_prompt_lists_the_newest_sessions_it_follows() -> Result<()> {
         (
             muted["following"].clone(),
             muted["cwd"].clone(),
-            muted["node"].clone()
+            muted["node"].clone(),
+            muted["version"].clone()
         ),
-        (json!(false), json!("/work/project"), json!(node))
+        (
+            json!(false),
+            json!("/work/project"),
+            json!(node),
+            json!(version)
+        ),
+        "a bot names the version it sees"
     );
     assert_eq!(bot["sessions"][0]["following"], json!(true));
     let theirs = crate::scheduler::bot_value(&store, &net.network, "d", 100)?;

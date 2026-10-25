@@ -403,6 +403,7 @@ impl Runtime {
                     &scope,
                     field(&args, "node")?,
                     field(&args, "session_id")?,
+                    field(&args, "version")?,
                     target.as_deref(),
                 )
                 .await

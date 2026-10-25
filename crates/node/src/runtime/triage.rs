@@ -898,15 +898,16 @@ impl Runtime {
         Ok(())
     }
 
-    /// `from`'s bot hands a session it follows to `target`, or stops following it when `None`.
-    /// The device running the session writes the change, so another device's session goes there
-    /// over peer RPC. Asking for what stands writes nothing.
+    /// `from`'s bot hands a session it follows to `target`, or stops following it when `None`,
+    /// at the version it read. The device running the session writes the change, so another
+    /// device's session goes there over peer RPC. Asking for what stands writes nothing.
     pub(super) async fn hand_over_session(
         &self,
         network: &str,
         from: &str,
         node: &str,
         session: &str,
+        seen: &str,
         target: Option<&str>,
     ) -> Result<Value> {
         if node != self.identity.device_id()? {
@@ -914,15 +915,16 @@ impl Runtime {
                 .peer_request(
                     network,
                     node,
-                    json!({"type":"hand_over_session","session_id":session,"from":from,"conversation_id":target}),
+                    json!({"type":"hand_over_session","session_id":session,"version":seen,"from":from,"conversation_id":target}),
                 )
                 .await;
         }
-        let (before, event) = self.store.lock().await.hand_over_session(
+        let (before, version, event) = self.store.lock().await.hand_over_session(
             &self.identity,
             network,
             from,
             session,
+            seen,
             target,
             now_ms(),
         )?;
@@ -945,7 +947,7 @@ impl Runtime {
         }
         Ok(
             json!({"node":node,"session_id":session,"conversation_id":owner,"muted":target.is_none(),
-            "changed":event.is_some()}),
+            "version":version,"changed":event.is_some()}),
         )
     }
 
@@ -1887,6 +1889,22 @@ mod tests {
             .session_owner(&network, &local, session)
     }
 
+    /// The version of a session as its bot's chat lists it.
+    async fn version_of(node: &Runtime, session: &str) -> Result<String> {
+        let network = node.network_id().await?;
+        let store = node.store.lock().await;
+        for scope in ["c", "d", "e"] {
+            if let Some(row) = store
+                .attributed_sessions(&network, scope)?
+                .into_iter()
+                .find(|row| row["session_id"] == session)
+            {
+                return Ok(row["version"].as_str().context("version")?.to_owned());
+            }
+        }
+        Ok(String::new())
+    }
+
     #[tokio::test]
     async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1950,9 +1968,13 @@ mod tests {
                 ..idle.clone()
             };
             let hand = |access: &Access, session: &str, how: Value| {
-                let mut args = json!({"node":local,"session_id":session});
-                args.as_object_mut().unwrap().extend(how.as_object().unwrap().clone());
-                node.tool(access.clone(), "hand_over_session", args)
+                let (node, local, access, session) = (&node, &local, access.clone(), session.to_owned());
+                async move {
+                    let seen = version_of(node, &session).await?;
+                    let mut args = json!({"node":local,"session_id":session,"version":seen});
+                    args.as_object_mut().unwrap().extend(how.as_object().unwrap().clone());
+                    node.tool(access, "hand_over_session", args).await
+                }
             };
             let turn_result = async {
                 assert!(
@@ -2036,16 +2058,22 @@ mod tests {
             for session in ["s1", "s2", "s3"] {
                 node.ingest_agent_event(turn(session, "t1", "/w")).await?;
             }
-            {
-                let mut store = node.store.lock().await;
-                for (from, session, to) in [
-                    ("c", "s1", Some("d")),
-                    ("c", "s2", Some("d")),
-                    ("d", "s2", None),
-                    ("c", "s3", Some("e")),
-                ] {
-                    store.hand_over_session(&node.identity, &network, from, session, to, now_ms())?;
-                }
+            for (from, session, to) in [
+                ("c", "s1", Some("d")),
+                ("c", "s2", Some("d")),
+                ("d", "s2", None),
+                ("c", "s3", Some("e")),
+            ] {
+                let seen = version_of(&node, session).await?;
+                node.store.lock().await.hand_over_session(
+                    &node.identity,
+                    &network,
+                    from,
+                    session,
+                    &seen,
+                    to,
+                    now_ms(),
+                )?;
             }
             let queued = node.ingest_agent_event(turn("s1", "t2", "/w")).await?;
             assert_eq!(queued["status"], "accepted");

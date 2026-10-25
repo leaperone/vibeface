@@ -468,6 +468,7 @@ impl Runtime {
                     field(input, "from")?,
                     &self.identity.device_id()?,
                     field(input, "session_id")?,
+                    field(input, "version")?,
                     input["conversation_id"].as_str(),
                 )
                 .await
