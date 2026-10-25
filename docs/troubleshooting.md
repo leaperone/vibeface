@@ -18,7 +18,7 @@ Data: /Users/me/.vibeface
 Version: 0.0.1
 Writes: writable
 Peer: mac-mini (9c41…) reachable, synced 4s ago
-Peer: pve (51be…) unreachable, synced 1830s ago
+Peer: server (51be…) unreachable, synced 1830s ago
 ```
 
 `Writes` 是这台 Node 能否写入，取值见下文“写入状态”。每台其他成员 Node 一行 `Peer`：`reachable` 表示最近一次同步连上了，`unreachable` 表示最近一次失败，`not tried yet` 表示启动后还没试过；`synced Ns ago` 是最近一次同步完成的时间，`never synced` 表示本次启动后没有成功过。`--json` 输出同样的内容，`write_state` 和 `peers` 是对应字段。
