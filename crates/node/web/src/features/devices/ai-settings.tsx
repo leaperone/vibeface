@@ -134,6 +134,15 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     }
   }
   const load = () => call("load", null, "node_settings")
+  /** After a write that failed, possibly after the device applied it: read the state again instead of resending; the error stays shown. */
+  async function reconcile() {
+    if (!ready?.isCurrent()) return
+    const connection = ready, owner = sequence.current
+    try {
+      const parsed = parseNodeSettings(await connection.request("node_settings"))
+      if (owner === sequence.current && connection.isCurrent()) setResponse(parsed)
+    } catch { /* the shown error already says what failed */ }
+  }
   useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
@@ -160,7 +169,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   return <div className="grid gap-5">
     <ul className="grid gap-3">
       {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
-        error={error?.at === item.provider ? error.cause : null} test={test}
+        error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
@@ -180,9 +189,9 @@ function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick 
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test }: {
+function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test, reconcile }: {
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
@@ -202,15 +211,22 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const noSocket = server?.mode === "system" && !server.socket
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
   const [pick, setPick] = useState(0)
-  useEffect(() => setAsked(null), [server?.mode])
+  // The Codex folder a managed App Server needs before Codex work starts; null while not asked for.
+  const [home, setHome] = useState<string | null>(null)
+  useEffect(() => { setAsked(null); setHome(null); setPick(0) }, [server?.mode])
   useEffect(() => { if (pick) openProvider(item.provider) }, [pick])
   const refused = /explicit App Server socket/i.test(rawError(error))
   const choosing = refused || (noSocket && asked !== null)
   const turnOn = (role: "bot" | "execution") => noSocket ? setAsked(role) : void change(role, role === "bot" ? { bot: true } : { execution: true })
   const serverSettings = server ? <AppServerSettings server={server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} pick={pick > 0} save={change} test={test} /> : null
-  // A managed App Server also needs its own CODEX_HOME before Codex work starts; without it, only the way of connecting changes.
-  const role = item.env.some((row) => row.name === "CODEX_HOME" && row.set) ? asked : null
-  const startOwn = () => void change(role ?? "app_server", { app_server: { ...spawnServer, socket: server?.socket ?? null }, bot: role === "bot" || undefined, execution: role === "execution" || undefined })
+  const homeSet = item.env.some((row) => row.name === "CODEX_HOME" && row.set)
+  const homePath = home?.trim() ?? ""
+  const homeValid = /^(\/|[A-Za-z]:[\\/])/.test(homePath)
+  // One write: the folder, the managed App Server and the use asked for, so a failure leaves nothing half done.
+  const startOwn = (codexHome?: string) => change(asked ?? "app_server", {
+    app_server: { ...spawnServer, socket: server?.socket ?? null }, env: codexHome ? { CODEX_HOME: codexHome } : undefined,
+    bot: asked === "bot" || undefined, execution: asked === "execution" || undefined,
+  }).then((ok) => { if (!ok) void reconcile() })
   const fix = () => {
     if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
     openProvider(item.provider)
@@ -236,14 +252,23 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     {choosing ? <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2 text-meta">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />还没选怎么连 Codex</span>
       <span className="flex flex-wrap gap-2">
-        {noSocket ? <Button type="button" size="sm" variant="outline" disabled={working} onClick={startOwn}><BusyIcon busy={working} icon={Play} />改由 Vibeface 启动</Button> : null}
+        {noSocket ? <Button type="button" size="sm" variant="outline" disabled={working} aria-expanded={asked && !homeSet ? home !== null : undefined}
+          onClick={() => asked && !homeSet ? setHome(home ?? "") : void startOwn()}><BusyIcon busy={working && home === null} icon={Play} />改由 Vibeface 启动</Button> : null}
         <Button type="button" size="sm" variant="ghost" onClick={() => setPick(pick + 1)}><Monitor aria-hidden="true" />指定路径</Button>
       </span>
+      {home !== null ? <form className="grid basis-full gap-1" onSubmit={(event) => { event.preventDefault(); if (homeValid) void startOwn(homePath) }}>
+        <label htmlFor={`${item.provider}-home`} className="font-medium text-muted-foreground">Codex 目录</label>
+        <div className="flex min-w-0 gap-2">
+          <Input id={`${item.provider}-home`} autoFocus className="min-w-0 font-mono" placeholder="/Users/你的用户名/.codex" spellCheck={false} maxLength={4096}
+            value={home} disabled={working} aria-invalid={homePath !== "" && !homeValid ? true : undefined} onChange={(event) => setHome(event.target.value)} />
+          <Button type="submit" variant="outline" disabled={working || !homeValid}><BusyIcon busy={working} icon={Check} />确认</Button>
+        </div>
+      </form> : null}
     </div> : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={startOwn}>改由 Vibeface 启动</button>
+          onClick={() => void startOwn()}>改由 Vibeface 启动</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
