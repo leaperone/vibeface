@@ -1,7 +1,7 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
 import { Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -26,13 +26,12 @@ export default function Settings() {
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
-  const themeTimer = useRef<ReturnType<typeof setTimeout>>(undefined)
   const wide = useWide()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Palette} title="外观">
-      {/* The whole app repaints on a theme change, so it waits for the thumb to land instead of tearing its slide. */}
-      <Segmented options={themes} value={current} onChange={(value) => { clearTimeout(themeTimer.current); themeTimer.current = setTimeout(() => Uniwind.setTheme(value), 350) }} />
+      {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once. */}
+      <Segmented snap options={themes} value={current} onChange={(value) => Uniwind.setTheme(value)} />
     </Section>
     {/* Beside the sidebar its footer already shows the connection. */}
     {wide ? null : <Section icon={Globe} title="连接">

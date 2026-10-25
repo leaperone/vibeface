@@ -15,8 +15,11 @@ const slide = { dampingRatio: 1, duration: 350, reduceMotion: ReduceMotion.Syste
 
 type Option<T> = { value: T; label: string; icon?: LucideIcon }
 
-/** One choice out of a few, with a thumb that slides to it. Stacks once large text no longer fits a row. */
-export function Segmented<T extends string>({ options, value, onChange, disabled }: { options: readonly Option<T>[]; value: T; onChange: (value: T) => void; disabled?: boolean }) {
+/**
+ * One choice out of a few, with a thumb that slides to it. Stacks once large text no longer fits a row.
+ * `snap` moves the thumb at once, for choices whose effect repaints the whole app and would stall a slide.
+ */
+export function Segmented<T extends string>({ options, value, onChange, disabled, snap }: { options: readonly Option<T>[]; value: T; onChange: (value: T) => void; disabled?: boolean; snap?: boolean }) {
   const stacked = useWindowDimensions().fontScale >= 1.3
   const [frames, setFrames] = useState<Partial<Record<T, LayoutRectangle>>>({})
   // The thumb follows the tap at once; the owner may apply the choice later or put it back.
@@ -28,7 +31,7 @@ export function Segmented<T extends string>({ options, value, onChange, disabled
   const move = (next: LayoutRectangle) => {
     const at = placed.current
     if (at && at.x === next.x && at.y === next.y && at.width === next.width && at.height === next.height) return
-    const to = (shared: SharedValue<number>, value: number) => { shared.value = at ? withSpring(value, slide) : value }
+    const to = (shared: SharedValue<number>, value: number) => { shared.value = at && !snap ? withSpring(value, slide) : value }
     to(x, next.x); to(y, next.y); to(width, next.width); to(height, next.height)
     placed.current = next
   }
