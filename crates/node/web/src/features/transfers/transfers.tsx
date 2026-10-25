@@ -49,6 +49,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}{!delivery.canManage ? ' 只有已加入的管理员能更改设置或确认订单。' : ''}</p>
         {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
         {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
+        {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
         <p className="text-meta text-muted-foreground">钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。</p>
       </section>
       {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) void delivery.prepare(draft, file) }}>

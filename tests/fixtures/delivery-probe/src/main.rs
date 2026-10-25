@@ -6,16 +6,17 @@ use iroh::{
     endpoint::{PortmapperConfig, RecvStream, SendStream, presets},
 };
 use iroh_dns::endpoint_info::EndpointInfo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use vibeface_secure::membership::MembershipSigner;
 use vibeface_secure::{Handshake, Identity};
 use zeroize::Zeroizing;
 
@@ -53,7 +54,67 @@ enum Action {
         prefix: String,
         tampered_capsule: String,
     },
+    PaidResume {
+        ciphertext_grant: Value,
+        chunk: String,
+    },
+    PaidSecurity {
+        scenario: PaidSecurity,
+    },
     PaidOrder,
+}
+#[derive(Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+enum PaidSecurity {
+    Source,
+    Receiver { provider_identity_file: PathBuf },
+    Outsider { receiver_grant: Value },
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GrantBody {
+    provider_peer: String,
+    client_peer: String,
+    order_id: String,
+    window_index: u16,
+    object_hash: String,
+    operation: String,
+    max_bytes: u32,
+    expires_at: u64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignedGrant {
+    body: GrantBody,
+    signature: String,
+}
+fn private_identity(path: &Path) -> Result<(Identity, Zeroizing<String>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.len() <= 1024,
+        "probe identity must be one private bounded regular file"
+    );
+    let bytes = Zeroizing::new(std::fs::read(path)?);
+    #[derive(Deserialize)]
+    struct StoredIdentity {
+        secret_key_hex: String,
+    }
+    let value: StoredIdentity = serde_json::from_slice(&bytes)?;
+    let secret = Zeroizing::new(value.secret_key_hex);
+    Ok((Identity::from_secret_hex(&secret)?, secret))
+}
+fn rejection(value: &Value, expected: &str) -> Result<()> {
+    ensure!(
+        value["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(expected)),
+        "paid service did not reject specifically for its expected authority boundary"
+    );
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -255,23 +316,7 @@ async fn main() -> Result<()> {
         input.order_id.len() == 64 && input.order_id.bytes().all(|b| b.is_ascii_hexdigit()),
         "probe requires the controlled order id"
     );
-    let metadata = std::fs::symlink_metadata(&input.identity_file)?;
-    use std::os::unix::fs::PermissionsExt;
-    ensure!(
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.permissions().mode() & 0o077 == 0,
-        "probe identity must be a private regular file"
-    );
-    let identity_bytes = Zeroizing::new(std::fs::read(&input.identity_file)?);
-    ensure!(identity_bytes.len() <= 1024, "identity file exceeds limit");
-    #[derive(Deserialize)]
-    struct StoredIdentity {
-        secret_key_hex: String,
-    }
-    let stored: StoredIdentity = serde_json::from_slice(&identity_bytes)?;
-    let secret = Zeroizing::new(stored.secret_key_hex);
-    let identity = Identity::from_secret_hex(&secret)?;
+    let (identity, secret) = private_identity(&input.identity_file)?;
     ensure!(
         identity.device_id() == input.actor_peer,
         "probe identity mismatches its expected actor peer"
@@ -288,6 +333,210 @@ async fn main() -> Result<()> {
         .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?
         .bind()
         .await?;
+    if let Action::PaidSecurity { scenario } = &input.action {
+        let target = input.targets.last().context("paid provider missing")?;
+        ensure!(
+            target.public_entry,
+            "paid security requires its actual public provider"
+        );
+        let call = async {
+            let announced = service(&endpoint, &identity, target, json!({"op":"announce"})).await?;
+            ensure!(
+                announced["error"].is_null() && announced["result"]["paid_enabled"] == true,
+                "paid service positive control cannot be replaced by a disabled charity request"
+            );
+            let mut checks = Vec::new();
+            let mut extra = json!({});
+            match scenario {
+                PaidSecurity::Source => {
+                    ensure!(
+                        input.targets.len() == 1,
+                        "source paid checks name only their fixed provider"
+                    );
+                    let order = service(
+                        &endpoint,
+                        &identity,
+                        target,
+                        json!({"op":"order","order_id":input.order_id}),
+                    )
+                    .await?;
+                    ensure!(
+                        order["error"].is_null() && order["result"]["order_id"] == input.order_id,
+                        "the actual Source reads the existing completed provider order"
+                    );
+                    rejection(&service(&endpoint, &identity, target,
+                        json!({"op":"grant","order_id":input.order_id,"index":0,"operation":"get_ciphertext"})).await?,
+                        "service grant client has the wrong role")?;
+                    checks.push("source-read-grant-wrong-role");
+                }
+                PaidSecurity::Receiver {
+                    provider_identity_file,
+                } => {
+                    ensure!(
+                        input.targets.len() == 1,
+                        "receiver paid checks name only their fixed provider"
+                    );
+                    let order = service(
+                        &endpoint,
+                        &identity,
+                        target,
+                        json!({"op":"order","order_id":input.order_id}),
+                    )
+                    .await?;
+                    ensure!(
+                        order["error"].is_null() && order["result"]["order_id"] == input.order_id,
+                        "the actual Receiver reads the same existing provider order"
+                    );
+                    let grant = service(&endpoint, &identity, target,
+                        json!({"op":"grant","order_id":input.order_id,"index":0,"operation":"get_ciphertext"})).await?;
+                    ensure!(
+                        grant["error"].is_null(),
+                        "the actual Receiver gets its live read grant"
+                    );
+                    let signed: SignedGrant = serde_json::from_value(grant["result"].clone())?;
+                    ensure!(
+                        signed.body.client_peer == input.actor_peer
+                            && signed.body.provider_peer == target.peer
+                            && signed.body.order_id == input.order_id
+                            && signed.body.window_index == 0
+                            && signed.body.operation == "get_ciphertext",
+                        "the real read grant binds the designated receiver and exact original object"
+                    );
+                    vibeface_secure::verify(
+                        &target.peer,
+                        "delivery-grant",
+                        &serde_json::to_vec(&signed.body)?,
+                        &signed.signature,
+                    )?;
+                    let read = service(
+                        &endpoint,
+                        &identity,
+                        target,
+                        json!({"op":"get","grant":grant["result"],"offset":0}),
+                    )
+                    .await?;
+                    let encoded = read["result"]["bytes"]
+                        .as_str()
+                        .context("real read returned no ciphertext bytes")?;
+                    ensure!(
+                        read["error"].is_null()
+                            && read["result"]["next_offset"] == 8192
+                            && encoded.len() == 10924,
+                        "the valid receiver grant actually reads the existing complete ciphertext"
+                    );
+                    rejection(&service(&endpoint, &identity, target,
+                        json!({"op":"grant","order_id":input.order_id,"index":0,"operation":"put_ciphertext"})).await?,
+                        "service grant client has the wrong role")?;
+                    let (provider, provider_secret) = private_identity(provider_identity_file)?;
+                    ensure!(
+                        provider.device_id() == target.peer,
+                        "only this task's actual provider signs its finite expiry fixture"
+                    );
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                    let mut expired: SignedGrant = serde_json::from_value(grant["result"].clone())?;
+                    expired.body.expires_at = now
+                        .checked_sub(1)
+                        .context("host Unix clock is unavailable")?;
+                    expired.signature = provider
+                        .sign_payload("delivery-grant", &serde_json::to_vec(&expired.body)?)?;
+                    vibeface_secure::verify(
+                        &target.peer,
+                        "delivery-grant",
+                        &serde_json::to_vec(&expired.body)?,
+                        &expired.signature,
+                    )?;
+                    drop(provider_secret);
+                    rejection(
+                        &service(
+                            &endpoint,
+                            &identity,
+                            target,
+                            json!({"op":"get","grant":expired,"offset":0}),
+                        )
+                        .await?,
+                        "service grant expired",
+                    )?;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let output = input
+                        .identity_file
+                        .with_file_name("paid-security-read-grant.json");
+                    let bytes = serde_json::to_vec(&grant["result"])?;
+                    ensure!(
+                        bytes.len() <= 2048,
+                        "the actual receiver grant fixture remains bounded"
+                    );
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(output)?;
+                    std::io::Write::write_all(&mut file, &bytes)?;
+                    file.sync_all()?;
+                    extra = json!({"receiver_grant_sha256":hex::encode(Sha256::digest(&bytes)),
+                        "ciphertext_base64_sha256":hex::encode(Sha256::digest(encoded.as_bytes())),
+                        "expired_signature_verified":true,"expiry_fixture":"resigned-provider-host-unix-seconds"});
+                    checks.extend([
+                        "receiver-valid-read",
+                        "receiver-write-grant-wrong-role",
+                        "signed-expired-grant",
+                    ]);
+                }
+                PaidSecurity::Outsider { receiver_grant } => {
+                    ensure!(
+                        input.targets.len() == 3
+                            && !input.targets[0].public_entry
+                            && !input.targets[1].public_entry,
+                        "the outsider checks exactly the real independent Source, Receiver and public Provider"
+                    );
+                    rejection(
+                        &service(
+                            &endpoint,
+                            &identity,
+                            target,
+                            json!({"op":"order","order_id":input.order_id}),
+                        )
+                        .await?,
+                        "delivery order belongs to another peer",
+                    )?;
+                    rejection(&service(&endpoint, &identity, target,
+                        json!({"op":"grant","order_id":input.order_id,"index":0,"operation":"get_ciphertext"})).await?,
+                        "service grant client has the wrong role")?;
+                    rejection(
+                        &service(
+                            &endpoint,
+                            &identity,
+                            target,
+                            json!({"op":"get","grant":receiver_grant,"offset":0}),
+                        )
+                        .await?,
+                        "service grant belongs to another peer",
+                    )?;
+                    for node in &input.targets {
+                        for alpn in [
+                            b"vibeface/rpc/1".as_slice(),
+                            b"vibeface/sync/1".as_slice(),
+                            b"vibeface/blob/1".as_slice(),
+                        ] {
+                            private_rejected(&endpoint, node, alpn).await?;
+                        }
+                    }
+                    checks.extend([
+                        "outsider-order",
+                        "outsider-grant-role",
+                        "outsider-other-peer-grant",
+                        "private-rpc-sync-blob-all-three-nodes",
+                    ]);
+                }
+            }
+            Ok::<_, anyhow::Error>(
+                json!({"passed":true,"announcement":announced["result"],"checks":checks,"details":extra}),
+            )
+        };
+        let observed = tokio::time::timeout(Duration::from_secs(90), call).await??;
+        endpoint.close().await;
+        println!("{observed}");
+        return Ok(());
+    }
     if matches!(&input.action, Action::PaidOrder) {
         ensure!(
             input.targets.len() == 1 && input.targets[0].public_entry,
@@ -309,6 +558,58 @@ async fn main() -> Result<()> {
         );
         endpoint.close().await;
         println!("{}", json!({"passed":true,"order":observed["result"]}));
+        return Ok(());
+    }
+    if let Action::PaidResume {
+        ciphertext_grant,
+        chunk,
+    } = &input.action
+    {
+        ensure!(
+            input.targets.len() == 1 && input.targets[0].public_entry,
+            "paid resume uses its actual public provider"
+        );
+        let target = &input.targets[0];
+        ensure!(
+            chunk.len() == 10924
+                && ciphertext_grant["body"]["order_id"] == input.order_id
+                && ciphertext_grant["body"]["client_peer"] == input.actor_peer
+                && ciphertext_grant["body"]["provider_peer"] == target.peer
+                && ciphertext_grant["body"]["window_index"] == 0
+                && ciphertext_grant["body"]["operation"] == "put_ciphertext",
+            "paid resume binds the original signed grant, actor and next real ciphertext chunk"
+        );
+        let call = async {
+            let offset = service(
+                &endpoint,
+                &identity,
+                target,
+                json!({"op":"offset","grant":ciphertext_grant}),
+            )
+            .await?;
+            ensure!(
+                offset["error"].is_null() && offset["result"]["offset"] == 8192,
+                "provider restart changed the actual durable prefix"
+            );
+            let resumed = service(
+                &endpoint,
+                &identity,
+                target,
+                json!({"op":"put","grant":ciphertext_grant,"offset":8192,"bytes":chunk}),
+            )
+            .await?;
+            ensure!(
+                resumed["error"].is_null() && resumed["result"]["offset"] == 16384,
+                "the first valid resumed append did not advance the original durable prefix"
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(30), call).await??;
+        endpoint.close().await;
+        println!(
+            "{}",
+            json!({"passed":true,"resumed_offset":8192,"committed_offset":16384})
+        );
         return Ok(());
     }
     if let Action::PaidUpload {

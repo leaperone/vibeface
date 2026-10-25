@@ -49,6 +49,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <Text className="text-meta text-muted-foreground">{walletNotice(status.wallet)}{!delivery.canManage ? ' 只有已加入的管理员能更改设置或确认订单。' : ''}</Text>
         {status.wallet.state === 'unavailable' ? <Text role="alert" className="text-meta text-warning">{status.wallet.reason}</Text> : null}
         {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
+        {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
         <Text className="text-meta text-muted-foreground">钱包创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。</Text>
       </View>
       {status.enabled && delivery.canManage ? <View className="gap-4 rounded-xl border border-border bg-card p-4">

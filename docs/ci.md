@@ -74,19 +74,29 @@ python3 scripts/check-delivery.py --sandbox
 
 该入口还通过 `mobile.yml` 的 `workflow_call` 构建同一提交的 Android release APK，不构建 iOS。Android 构建记录实际 APK 摘要、release variant、application id，以及 arm64-v8a 和 x86_64 两份安全库的 ELF ABI 与摘要。`delivery-live` 只接收同一 run、同一 SHA 的 Android、Linux x64 Node 包、Web 和 WASM，并重新核对源码、归档和原生库字节及生成资源的隐私收据。
 
+Android 的 UBRN 配置保留项目自行维护的 `android/proguard-rules.pro`，与现有 CMake、Gradle 和 manifest 一样列入 `noOverwrite`。生成器不得以通用 JNA 规则覆盖实际 React Native 模块的 R8 keep 规则。打包后仍要求整个源码 checkout 与本次提交一致，不通过恢复文件或忽略 dirty 状态补造来源。
+
 固定 sandbox 先运行打包 Node 的真实网页进程。只有明确的 GLIBC symbol 或 loader 不兼容才从同一提交和已经验证的 Web/WASM 实际构建 Node，并单独记录这一来源。业务或验收失败直接阻塞任务。任务安装固定 guest 编译器，重编实际 guest 和 host，核对产品 profile，构建真实 QUIC probe，再写入权限为 `0600` 的全新本机部署配置。
 
 `verify-node.py --delivery` 生成十三份唯一真实证明。严格最大文件订单产生七份，原文件必须覆盖实际 130816 字节边界，独立只读 observer 验证实际 29 TestToken 提现。rotate、revoke、register 产生三份新的密钥证明，记录实际 serial、intent、交易及 journal 和 receipt 摘要。普通订单复用最后有效的 register 证明，由真实网页选文件、确认报价和付款，真实 Android 接收、断线、恢复并保存 4096 字节原文件，再产生三份 source、hold、open 证明。普通订单使用自己的四份公开证明 bundle 和只读 observer，独立核对 17 TestToken 提现。复用的 binding 不计为新证明。
 
+同一严格订单还执行 16 项客户端权限检查、7 项有效 Agent token 检查、8 项服务授权检查，以及三台 Node 各自的 RPC、SYNC、BLOB 私人协议拒绝。真实普通成员和本机会话保留同网络读权限，写入和付款需要管理成员。Agent 工具正例在拒绝前后都成功，过期服务授权使用实际 Provider 正确签名。检查时钱包实际解锁，财务、对象、设置、DAG 和工作记录保持不变，正常 Agent 完成只增加原回合的一条回复。公开 summary 只包含固定计数和前后状态摘要，不导出 token、服务授权签名字节或本机启动材料。
+
 外层脚本在宿主启动 Chromium 和专属 root AOSP x86_64 AVD。受认证的 loopback controller 发布私有 `0600` 描述文件后，两个 e2e worker 同时驱动 Web 和指定 Android APK。Node 验收与 e2e 必须同时成功，订单、intent、文件 SHA-256、离线观察及真实保存记录均须一致。仅退出码为零、跳过测试或已有公开 fixture 均不能通过。任一进程失败会终止本任务另一进程，恢复本任务接收端的 ADB reverse，并关闭专属 AVD 和私有 ADB server。
 
+controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数据进入全部分支。`stage` 明确区分 `bootstrap`、`inspections`、`ordinary`、`complete`。两个 UI 提前配对并观察原订单的部分退款、真实 HTTP502 未知交易，以及接收密钥 key1 到 Rotate2。检查时钱包锁定，广播数为零，proof 和金融 intent 行保持不变，故障清除后才确认检查。只有 `stage=ordinary` 才允许普通订单的 prepare、confirm、accept。单次 inspection 有独立上限；整个 UI 测试与宿主 join 使用既有 LIVE 剩余总截止，普通订单自身仍保留原一小时上限。
+
+`ui-inspections.json` 只包含四次真实 Node 和 PNG 交叉验证的检查结果，生成证明数为零。外层按严格订单的 public journal 绑定 source/receiver Peer 和 key ID、serial，再核对实际分支的 12/12/17、未知状态下撤回的窗口证明，以及四张 PNG 的字节摘要。普通订单另保留 `web-settled.png`，与原 17/17/0 及真实 Web 验收共验。真实 provider 已提交前缀、held 和 key-published 的 SIGKILL 恢复结果另按固定 case 投影，明确复用了原订单的缓存材料。
+
 整个 Node、EVM、prover 和其包装进程保持 root、固定 HOME、既定四挂载及同一 cgroup，内存上限为 11 GiB，零交换，上限为 64 个进程。Node 使用两个 Tokio worker threads。容器只增加 host network，共享本机 loopback。宿主 UI 和 AVD 不计入该 proof cgroup 的资源记录。任何 OOM 计数增长、资源观察失败或缺少证明均失败。只有 proof、两个真实 UI 和清理全部成功后，宿主才把 `PROOFS_PASS` 更新为最终 `PASS`。
+
+若 paid process 后续失败，外层只尝试保留本次唯一 summary 对应的 strict 七份公开证明。全部 receipt 必须由当前 host 再次验真，绑定当前 image、profile、journal 与 receipt 摘要，且原独立 observer 确认 strict 29 的实际收付款，才整组发布。缺少任何数据均不发布该组。`partialEvidence.scope=strict-only` 始终伴随整体 FAIL，不代表分支恢复、普通 UI 或当前 canonical 状态通过。UI 先失败时，固定 controller abort 后仅在原总截止内给收尾留证一个有界窗口，随后执行原定清理并保留原异常。
 
 完整验收还要求本次 session 的固定 branch index、全部 24 个有限分支、三个 key 观察及 core-restored。逐项核对 index 的文件 SHA-256、真实 ledger、Node 观察范围、同一生命周期 journal 和恢复后的 strict 29 TestToken 结果。缺少任一分支、恢复仍为 pending、旧文件摘要不同或只剩证明总数，均不能通过。incoming 分支只证明原 Node 签名交易在受控原链的实际资金行为，保留 `NOT_TESTED_ORIGINAL_BROADCAST_RAW_ONLY` 标记。
 
 宿主用 `xvfb-run` 分配专用 DISPLAY、`1440x1000x24` 屏幕及任务内的 `0600` XAUTHORITY，Web 使用 headed 模式。e2e 全程视频仍关闭。测试只在配对后录制三个指定短片，Web 为报价确认和同 intent 重载，Android 为接收后离线与恢复后保存。每段最多 180 秒。宿主独立核对 MP4 容器、视频流、时长、文件 SHA-256 和真实退出方式，合并两端独立收据为 `video-metadata.json`。ffmpeg 必须以 q 正常退出，Android screenrecord 保留实际 SIGINT 对应的退出码或信号。
 
-上传清单仅含公开 receipt 与对应 JSON、两个 settlement bundle 及各自 observer、安全 summary/resource、固定白名单中的分支与恢复记录、指定的五个 UI JSON 和 PNG，以及 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4` 和对应合并元数据。分支记录是受控分支的历史证据，不能当作恢复后的当前 canonical 状态。join 邀请、全程 attempt 视频、trace、controller token、原始文件、Node 数据、钱包、私密见证及原始日志不上传。测试链限 loopback 31337，不使用真实资产、公共部署或 AI Provider，也不据此宣称绝对链终局性或 iOS 付费验收。
+上传清单仅含公开 receipt 与对应 JSON、两个 settlement bundle 及各自 observer、安全 summary/resource、固定白名单中的分支与恢复记录、原有五个 UI JSON 和 PNG、检查清单及指定新增五张 PNG，以及 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4` 和对应合并元数据。分支记录是受控分支的历史证据，不能当作恢复后的当前 canonical 状态。join 邀请、全程 attempt 视频、trace、controller token、原始文件、Node 数据、钱包、私密见证及原始日志不上传。测试链限 loopback 31337，不使用真实资产、公共部署或 AI Provider，也不据此宣称绝对链终局性或 iOS 付费验收。
 
 ## 定期、手动和发布检查
 

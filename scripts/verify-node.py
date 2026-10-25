@@ -167,9 +167,20 @@ const connections = new Map();
 const invites = new Map();
 const root = name => { const value = roots.get(name); if (!value) throw new Error('unknown root key'); return value; };
 async function connect(input) {
-  const url = new URL('/api/client', input.url.replace(/^http/, 'ws'));
+  const local = input.local_cookie !== undefined;
+  const url = new URL(local ? '/api/local/ws' : '/api/client', input.url.replace(/^http/, 'ws'));
+  const headers = {};
+  if (input.origin) headers.Origin = input.origin;
+  if (local) {
+    if (!input.origin || typeof input.local_cookie !== 'string' || input.local_cookie.length > 512 || /[\r\n]/.test(input.local_cookie)) throw new Error('invalid fixed local session cookie');
+    headers.Cookie = input.local_cookie;
+  }
+  if (input.authorization !== undefined) {
+    if (local || typeof input.authorization !== 'string' || !/^Bearer [A-Za-z0-9_-]{32,256}$/.test(input.authorization)) throw new Error('invalid fixed Agent authorization');
+    headers.Authorization = input.authorization;
+  }
   // Node's WebSocket can send the Origin a page on another client origin would send.
-  const socket = new WebSocket(url, input.origin ? { headers: { Origin: input.origin } } : undefined);
+  const socket = new WebSocket(url, Object.keys(headers).length ? { headers } : undefined);
   socket.binaryType = 'arraybuffer';
   const queue = [], waiting = [], pending = new Map(), events = [];
   let channel, closed = false, failure, sequence = 0;
@@ -191,7 +202,7 @@ async function connect(input) {
   let handshake;
   try {
     await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('close', () => reject(failure), { once: true }); });
-    socket.send(JSON.stringify({ type: 'connect', target: input.device_id }));
+    if (!local) socket.send(JSON.stringify({ type: 'connect', target: input.device_id }));
     handshake = new Handshake(true, input.device_id, prologue);
     handshake.setProof(client.deviceId, client.raw(handshake.signingBytes()));
     socket.send(handshake.write(new Uint8Array()));
@@ -347,10 +358,12 @@ class Client:
         require(value.get("ok"), f"client {op} failed: {value.get('error', 'unknown error')}")
         return value.get("result")
 
-    def connect(self, device_id=None, *, connection="main", check=True, origin=None):
+    def connect(self, device_id=None, *, connection="main", check=True, origin=None, local_cookie=None, authorization=None):
         self.device_id = device_id or self.device_id
         return self.command("connect", url=self.url, device_id=self.device_id, connection=connection, check=check,
-                            **({"origin": origin} if origin else {}))
+                            **({"origin": origin} if origin else {}),
+                            **({"local_cookie": local_cookie} if local_cookie is not None else {}),
+                            **({"authorization": authorization} if authorization is not None else {}))
 
     def call(self, method, params=None, *, status=200, connection="main"):
         response = self.command("request", method=method, params=params or {}, connection=connection)
@@ -1282,6 +1295,10 @@ def fixture_manager(run, initial, bot):
                 "dispatch_work from the Shell has its expected outcome: " + completed.stderr[-300:])
         return json.loads(completed.stdout) if accepted else None
 
+    if directive.get("paid_delivery_security") is True:
+        fixture_paid_principals(run, initial, bot, tool)
+        return
+
     if kind == "answer":
         question, answer = context["trigger"]["question"], body["text"]
         about = question["about"]
@@ -1358,6 +1375,60 @@ def fixture_manager(run, initial, bot):
     steered = [item["clientId"] for item in bot.turn["items"][1:] if item["type"] == "userMessage"]
     final = "x" * directive.get("result_size", 0) or (f"{explicit}:complete" if explicit else spoken + "。")
     bot.end("completed", final + "".join(" +" + message for message in steered))
+
+
+def fixture_paid_principals(run, initial, bot, tool):
+    specification = run / "paid-principal-input.json"
+    require(stat.S_ISREG(specification.lstat().st_mode) and specification.stat().st_size <= 4096
+            and specification.stat().st_mode & 0o077 == 0, "the paid principal turn reads one private bounded fixture input")
+    value = json.loads(specification.read_text())
+    require(set(value) == {"source_url", "source_peer", "network", "order_id", "intent_id", "configure", "helper", "outsider_identity", "outsider_peer"},
+            "the live Agent check has one fixed paid principal schema")
+    for name in ("source_peer", "network", "order_id", "outsider_peer"):
+        require(re.fullmatch(r"[a-f0-9]{64}", value[name]), "the live Agent pins each actual peer, network and original order")
+    require(str(uuid.UUID(value["intent_id"])) == value["intent_id"]
+            and set(value["configure"]) == {"enabled", "charity_enabled", "paid_enabled"},
+            "the live Agent uses the original UUID and the existing settings")
+    base = Path(__file__).resolve().parents[1] / ".artifacts"
+    require(run.resolve().is_relative_to(base) and Path(value["helper"]).resolve().is_relative_to(base)
+            and Path(value["outsider_identity"]).resolve().is_relative_to(base), "Agent principal materials belong only to the task fixture")
+    parsed = urllib.parse.urlsplit(value["source_url"])
+    require(parsed.scheme == "http" and parsed.hostname == "127.0.0.1" and parsed.port and parsed.path in ("", "/")
+            and not parsed.query and not parsed.fragment, "Agent principal checks use only the actual loopback Node")
+    private_json(run / "agent-ready.json", {"ready": True})
+    wait_for("the original paid principal baseline releases its live Agent", lambda:
+             (run / "agent-run.json").exists() and not bot.stopped.is_set(), timeout=180)
+    outsider = Client(value["source_url"], Path(value["helper"]), identity_file=Path(value["outsider_identity"]))
+    checks = []
+    try:
+        positive = tool("nodes", {})
+        require(isinstance(positive, dict) and positive.get("nodes"), "the actual live scoped Agent token reads its Node catalog")
+        requests = ({"op": "confirm", "intent_id": value["intent_id"]},
+                    {"op": "configure", **value["configure"]}, {"op": "get", "order_id": value["order_id"]})
+        for request in requests:
+            tool("delivery", request, expected=False, rejection="unknown or unavailable coordination tool")
+            checks.append({"entry": "agent-tool", "op": request["op"], "rejection": "unknown or unavailable coordination tool"})
+        require(outsider.own_id() == value["outsider_peer"], "the Agent bearer probe retains the actual unjoined X identity")
+        outsider.connect(value["source_peer"], origin=value["source_url"],
+                         authorization="Bearer " + initial["tool_env"]["VIBEFACE_TOOL_TOKEN"])
+        require(outsider.call("authenticate", {"network_id": value["network"]})["principal"] is None,
+                "a valid live Agent bearer cannot become a client membership principal")
+        for request in requests:
+            error = outsider.call("delivery", request, status=400).get("error")
+            require(isinstance(error, str) and "this device is not a member of the personal network" in error,
+                    "the live Agent bearer leaves each encrypted client action outside the personal network")
+            checks.append({"entry": "agent-bearer-client", "op": request["op"], "rejection": "this device is not a member of the personal network"})
+        error = outsider.rpc("nodes", status=400).get("error")
+        require(isinstance(error, str) and "this device is not a member of the personal network" in error,
+                "a valid Agent bearer also grants no private client Node directory")
+        checks.append({"entry": "agent-bearer-client", "op": "nodes", "rejection": "this device is not a member of the personal network"})
+        require(tool("nodes", {}).get("nodes"), "the same real Agent token remains valid after every boundary rejection")
+        private_json(run / "agent-checked.json", {"passed": True, "valid_token_before_and_after": True, "checks": checks})
+        wait_for("the original paid principal observation releases its normal Agent completion", lambda:
+                 (run / "agent-finish.json").exists() and not bot.stopped.is_set(), timeout=180)
+        bot.end("completed", "paid-principal-security-complete")
+    finally:
+        outsider.close()
 
 
 def javascript_dependencies(content):
@@ -4326,6 +4397,7 @@ class DeliveryRpcForwarder:
         self.target, self.raw_broadcasts = target, 0
         self.lock = threading.Lock()
         self.approval_barrier = None
+        self.read_failure = None
         recorder = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -4345,7 +4417,13 @@ class DeliveryRpcForwarder:
                             "task Node RPC forwarding preserves one actual JSON-RPC request")
                     with recorder.lock:
                         barrier = recorder.approval_barrier
+                        read_failure = recorder.read_failure
                     candidate = value.get("params", [None])[0] if value.get("params") else None
+                    if (read_failure and time.monotonic() < read_failure["expires"] and value["method"] == "eth_call"
+                            and isinstance(candidate, dict) and candidate.get("to", "").lower() == read_failure["escrow"]):
+                        with recorder.lock:
+                            read_failure["blocked"] += 1
+                        raise AssertionError("the bounded Node transport failure returns no fabricated chain result")
                     if (barrier and value["method"] == "eth_estimateGas" and isinstance(candidate, dict)
                             and candidate.get("from", "").lower() == barrier["wallet"]
                             and candidate.get("to", "").lower() == barrier["asset"]
@@ -4393,8 +4471,21 @@ class DeliveryRpcForwarder:
                 self.approval_barrier["released"].set()
                 self.approval_barrier = None
 
+    def fail_reads(self, escrow, timeout=180):
+        require(re.fullmatch(r"0x[0-9a-fA-F]{40}", escrow) and 0 < timeout <= 180,
+                "one bounded transport failure names only the actual escrow")
+        with self.lock:
+            require(self.read_failure is None, "Node transport failures do not overlap")
+            self.read_failure = {"escrow": escrow.lower(), "expires": time.monotonic() + timeout, "blocked": 0}
+            return self.read_failure
+
+    def restore_reads(self):
+        with self.lock:
+            self.read_failure = None
+
     def close(self):
         self.release_approval()
+        self.restore_reads()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
@@ -4403,6 +4494,17 @@ class DeliveryRpcForwarder:
 class DeliveryUiControl:
     names = {"web": "VDP paid web sender", "android": "VDP paid native receiver"}
     sequence = ("prepared", "confirmed", "accepted", "offline-visible", "settled-offline", "saved")
+    inspections = {"source-partial": ("web", "web-partial-refund.png"),
+                   "source-unknown": ("web", "web-unknown-transaction.png"),
+                   "receiver-key-before": ("android", "android-key-before.png"),
+                   "receiver-key-after": ("android", "android-key-rotated.png")}
+
+    @staticmethod
+    def inspection_verified(checks):
+        booleans = ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored")
+        return (set(checks) == {*booleans, "rawBroadcastDelta"}
+                and type(checks["rawBroadcastDelta"]) is int and checks["rawBroadcastDelta"] == 0
+                and all(checks[name] is True for name in booleans))
 
     def __init__(self, path, repository, source_file, nodes, configuration):
         self.path, self.repository, self.source_file = path, repository, source_file
@@ -4414,6 +4516,9 @@ class DeliveryUiControl:
         self.uid, self.gid = int(owner["UID"]), int(owner["GID"])
         self.token = os.urandom(32).hex()
         self.pairings, self.events = {}, {}
+        self.stage, self.observers, self.inspection, self.inspection_ack = "bootstrap", set(), None, None
+        self.closed = False
+        self.inspection_finished = threading.Event()
         self.lock = threading.RLock()
         self.client_locks = {role: threading.RLock() for role in self.names}
         self.failure = None
@@ -4454,6 +4559,9 @@ class DeliveryUiControl:
         self.host_file(self.path, json.dumps({"schemaVersion": 1, "url": self.url, "token": self.token}).encode())
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         self.path.unlink(missing_ok=True)
         if self.thread.is_alive():
             self.server.shutdown()
@@ -4471,6 +4579,8 @@ class DeliveryUiControl:
         return orders[0] if orders else None
 
     def snapshot(self):
+        if self.stage not in ("ordinary", "complete"):
+            return None, None, None
         source = self.order(self.nodes["web"])
         receiver, provider = None, None
         if source:
@@ -4498,7 +4608,36 @@ class DeliveryUiControl:
                 "source": source["view"] if source else None, "receiver": receiver["view"] if receiver else None,
                 "provider": provider["view"] if provider else None, "settled": complete,
                 "paired": {role: self.pairings.get(role, {}).get("approved", False) for role in self.names},
+                "stage": self.stage, "inspection": self.inspection,
                 "events": list(self.events), "failure": self.failure}
+
+    def set_stage(self, stage):
+        with self.lock:
+            require((self.stage, stage) in (("bootstrap", "inspections"), ("inspections", "ordinary")),
+                    "UI stages advance once from pairing through inspection to ordinary actions")
+            require(self.observers == set(self.names) and self.inspection is None and self.failure is None,
+                    "both real paired observers finish each bounded inspection before ordinary actions")
+            self.stage = stage
+
+    def begin_inspection(self, value):
+        with self.lock:
+            require(self.stage == "inspections" and self.inspection is None and value["kind"] in self.inspections,
+                    "one finite original-order inspection is active outside ordinary mutations")
+            role, screenshot = self.inspections[value["kind"]]
+            require(value["role"] == role and value["screenshot"] == screenshot
+                    and value["nodePeer"] == self.nodes[role].device_id and value["timeoutMs"] == 120000,
+                    "inspection binds its fixed real Node, role, file and bounded deadline")
+            self.inspection_finished.clear()
+            self.inspection_ack = None
+            self.inspection = value
+
+    def end_inspection(self):
+        with self.lock:
+            require(self.inspection_ack is not None and self.inspection_finished.is_set() and self.failure is None,
+                    "the actual UI acknowledges its current rendered inspection")
+            result = self.inspection_ack
+            self.inspection, self.inspection_ack = None, None
+            return result
 
     def pairing(self, role):
         require(role in self.names, "UI pairing names one of its two fixed clients")
@@ -4542,12 +4681,42 @@ class DeliveryUiControl:
 
     def event(self, request):
         name = request.get("name")
+        if name == "observer-ready":
+            require(set(request) == {"name", "role"} and request["role"] in self.names,
+                    "bootstrap readiness names one fixed real observer")
+            with self.lock:
+                require(self.stage == "bootstrap" and self.pairings.get(request["role"], {}).get("approved"),
+                        "the observer is actually paired before any whole checkpoint")
+                self.observers.add(request["role"])
+                return {"recorded": name}
+        if name == "inspection-observed":
+            require(set(request) == {"name", "role", "id", "screenshot", "sha256", "bytes"},
+                    "inspection acknowledgements have one exact finite schema")
+            with self.lock:
+                current = self.inspection
+                require(self.stage == "inspections" and current and all(request[key] == current[key]
+                        for key in ("role", "id", "screenshot")), "stale or cross-role inspection acknowledgements are rejected")
+                require(re.fullmatch(r"[0-9a-f]{64}", request["sha256"]) and type(request["bytes"]) is int
+                        and 8 < request["bytes"] <= 10 * 1024 * 1024, "inspection names a bounded actual PNG")
+                screenshot = self.path.parent / "public" / current["screenshot"]
+                metadata = screenshot.lstat()
+                require(stat.S_ISREG(metadata.st_mode) and metadata.st_size == request["bytes"]
+                        and file_sha256(screenshot) == request["sha256"]
+                        and screenshot.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n",
+                        "inspection acknowledgement matches the actual allowlisted rendered screenshot")
+                require(self.inspection_ack is None or self.inspection_ack == request,
+                        "an idempotent inspection acknowledgement cannot change its screenshot")
+                self.inspection_ack = request
+                self.inspection_finished.set()
+                return {"recorded": name}
         require(name in self.sequence and set(request) == ({"name", "sha256", "bytes"} if name == "saved" else {"name"}),
                 "UI events have a fixed bounded schema")
         with self.lock:
             if name == "saved":
                 require(request["sha256"] == self.digest and type(request["bytes"]) is int and request["bytes"] == self.size,
                         "the actual Android saved file matches the original length and SHA-256")
+            require(self.stage == "ordinary" or self.stage == "complete" and name in self.events,
+                    "ordinary acceptance actions are forbidden during bootstrap and inspection")
             if name in self.events:
                 return {"recorded": name}
             require(name == self.sequence[len(self.events)], "ordinary UI events follow the actual acceptance sequence")
@@ -4570,6 +4739,7 @@ class DeliveryUiControl:
             self.events[name] = {"order_id": identifier, "intent_id": source["view"]["intent_id"],
                                  "monotonic": time.monotonic()}
             if name == "saved":
+                self.stage = "complete"
                 self.finished.set()
             return {"recorded": name}
 
@@ -4615,6 +4785,7 @@ class DeliveryUiControl:
                                 require(set(request) == {"role"} and request["role"] in control.names, "abort names one UI client")
                                 control.failure = request["role"] + "_ui_failed"
                                 control.finished.set()
+                                control.inspection_finished.set()
                                 result = {"aborted": True}
                             else:
                                 result = control.event(request)
@@ -4658,6 +4829,14 @@ def delivery_ui_selfcheck(options):
     nodes = {role: Fixture(role, index) for index, role in enumerate(("web", "android", "provider"), 1)}
     control = DeliveryUiControl(run / "control.json", root, source_file, nodes,
                                 {"max_service_amount": "1000000", "source_gas_cap_wei": "1000000000000000000"})
+    verified = {"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True,
+                "transactionIntentsUnchanged": True, "canonicalRestored": True}
+    require(control.inspection_verified(verified), "zero broadcasts with all four actual invariants passes the inspection aggregate")
+    for name in ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored"):
+        require(not control.inspection_verified({**verified, name: False}), "each failed inspection invariant rejects the aggregate")
+    for invalid in (1, False):
+        require(not control.inspection_verified({**verified, "rawBroadcastDelta": invalid}),
+                "a real broadcast or boolean cannot masquerade as a verified zero integer")
     count = 0
 
     def check(path, *, body=None, token=True, origin=None, expected=400):
@@ -4710,6 +4889,35 @@ def delivery_ui_selfcheck(options):
         control.failure = None
         control.pairings = {role: {"peer": format(index, "064x"), "code": "123456", "approved": True}
                             for index, role in enumerate(("web", "android"), 4)}
+        check("/event", body={"name": "observer-ready", "role": "other"})
+        check("/event", body={"name": "observer-ready", "role": "web", "extra": True})
+        check("/event", body={"name": "observer-ready", "role": "web"}, expected=200)
+        check("/event", body={"name": "observer-ready", "role": "android"}, expected=200)
+        check("/event", body={"name": "prepared"})
+        control.set_stage("inspections")
+        inspection = {"id": str(uuid.uuid4()), "kind": "receiver-key-before", "role": "android",
+                      "nodePeer": nodes["android"].device_id, "orderId": None, "intentId": None,
+                      "keyId": "c" * 64, "keySerial": 1, "expectedPhase": None, "expectedPaymentState": None,
+                      "earned": None, "withdrawn": None, "refunded": None, "evidence": None, "windows": [],
+                      "screenshot": "android-key-before.png", "timeoutMs": 120000}
+        control.begin_inspection(inspection)
+        screenshot = run / "public" / inspection["screenshot"]
+        screenshot.parent.mkdir(mode=0o700)
+        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pure-controller-boundary-fixture")
+        acknowledgement = {"name": "inspection-observed", "role": "android", "id": inspection["id"],
+                           "screenshot": inspection["screenshot"], "sha256": file_sha256(screenshot), "bytes": screenshot.stat().st_size}
+        check("/event", body={**acknowledgement, "id": str(uuid.uuid4())})
+        check("/event", body={**acknowledgement, "role": "web"})
+        check("/event", body={**acknowledgement, "screenshot": "../other.png"})
+        check("/event", body={**acknowledgement, "sha256": "f" * 64})
+        check("/event", body={**acknowledgement, "bytes": True})
+        check("/event", body={"name": "prepared"})
+        check("/event", body=acknowledgement, expected=200)
+        check("/event", body=acknowledgement, expected=200)
+        require(control.end_inspection() == acknowledgement and not control.events,
+                "pure inspection acknowledgement cannot authorize any ordinary order action")
+        check("/event", body=acknowledgement)
+        control.set_stage("ordinary")
         identifier = "a" * 64
         view = {"order_id": identifier, "intent_id": str(uuid.uuid4()), "role": "sender", "mode": "paid",
                 "acceptance": "recoverable", "windows": [{"decryption_proven": False}], "bytes": 4096,
@@ -4828,6 +5036,18 @@ def delivery_ui_selfcheck(options):
                 "abandoned pre-approval request is released as failure and never reaches the synthetic upstream")
         require(synthetic_rpc("eth_estimateGas", [{**other, "from": wallet}])[0] == 200,
                 "a fresh request after checkpoint release uses the actual upstream again")
+        fault = recorder.fail_reads(asset)
+        call_count = len(target_calls)
+        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 502
+                and fault["blocked"] == 1 and len(target_calls) == call_count and recorder.broadcasts() == 1,
+                "the finite Node read fault returns a real transport failure without fabricating a receipt")
+        require(synthetic_rpc("eth_call", [{"to": wallet, "data": "0x00"}, "latest"])[0] == 200
+                and synthetic_rpc("eth_chainId", [])[0] == 200,
+                "the bounded fault leaves other targets and non-call methods untouched")
+        fault["expires"] = time.monotonic() - 1
+        require(synthetic_rpc("eth_call", [{"to": asset, "data": "0x00"}, "latest"])[0] == 200,
+                "an expired transport fault cannot leave a live Node read blocked")
+        recorder.restore_reads()
     finally:
         recorder.close()
         target.shutdown()
@@ -4913,6 +5133,8 @@ def delivery_paid_run(options, configuration, deployment):
     export.mkdir(mode=0o700)
     workspace = run / "workspace"
     workspace.mkdir(mode=0o700)
+    principals = run / "paid-principals"
+    principals.mkdir(mode=0o700)
     helper = run / "client.mjs"
     helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
     relay, nodes, passwords = PkarrRelay(), [], {}
@@ -4924,6 +5146,7 @@ def delivery_paid_run(options, configuration, deployment):
     key_processes = []
     branch_process, branch_log = None, None
     data_checkpoints, known_locked, lifecycle_actions, proof_catalog = {}, set(), [], {}
+    ui_control, inspection_records, process_recoveries = None, [], []
     last_quiesced = None
     report = {"status": "running", "mode": "paid", "binary_sha256": file_sha256(binary),
               "free_checks": free["status"], "deployment": {name: chain[name] for name in fields if name != "profile"},
@@ -5160,6 +5383,299 @@ def delivery_paid_run(options, configuration, deployment):
                 "payment": {name: view["payment"][name] for name in ("earned", "withdrawn", "refunded")},
                 "windows": [{name: window[name] for name in ("state", "decryption_proven")} for window in view["windows"]]}
 
+    def durable_intents():
+        return {node.name: {"transactions": delivery_rows(node, "SELECT id,hash,nonce FROM transactions ORDER BY id"),
+                            "proofs": delivery_rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest")}
+                for node in nodes}
+
+    def principal_state():
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+        result = {"nodes": {}, "events": {}, "work_counts": {}, "job_keys": {}, "chain": {},
+                  "broadcasts": chain_recorder.broadcasts()}
+        queries = {"orders": "SELECT id,network,intent,role FROM orders ORDER BY id",
+                   "charity_orders": "SELECT id,network,intent FROM charity_orders ORDER BY id",
+                   "transactions": "SELECT id,chain,wallet,nonce,intent,raw,hash FROM transactions ORDER BY id",
+                   "gas_budgets": "SELECT * FROM gas_budgets ORDER BY chain,wallet,budget_group",
+                   "proof_jobs": "SELECT * FROM proof_jobs ORDER BY digest",
+                   "private_values": "SELECT id,hex(body) FROM private_values ORDER BY id",
+                   "objects": "SELECT * FROM objects ORDER BY order_id,idx,kind"}
+        for node in nodes:
+            tables = {}
+            for name, query in queries.items():
+                rows = delivery_rows(node, query)
+                tables[name] = {"count": len(rows), "sha256": digest(rows)}
+            views = []
+            for body, in delivery_rows(node, "SELECT body FROM orders ORDER BY id"):
+                order = json.loads(body)
+                order["view"].pop("updated_at_ms", None)
+                views.append(order)
+            files = {}
+            for name in ("config.json", "delivery-settings.json", "delivery-wallet.json"):
+                path = node.directory / name
+                metadata = path.lstat()
+                require(stat.S_ISREG(metadata.st_mode), "principal snapshots read only actual regular task configuration and keystores")
+                files[name] = {"sha256": file_sha256(path), "mode": stat.S_IMODE(metadata.st_mode), "mtime_ns": metadata.st_mtime_ns}
+            objects = {}
+            for path in sorted((node.directory / "delivery/objects").rglob("*")):
+                metadata = path.lstat()
+                if stat.S_ISDIR(metadata.st_mode):
+                    continue
+                require(stat.S_ISREG(metadata.st_mode), "principal snapshots do not traverse nonregular task delivery objects")
+                objects[str(path.relative_to(node.directory))] = {"sha256": file_sha256(path), "bytes": metadata.st_size}
+            proof_material = {}
+            for proof_digest, proof_path, size in delivery_rows(node, "SELECT digest,path,size FROM proof_jobs ORDER BY digest"):
+                path = Path(proof_path)
+                require(path.resolve().is_relative_to(node.directory.resolve()) and stat.S_ISREG(path.lstat().st_mode),
+                        "principal snapshots read only actual immutable proof files of this task Node")
+                proof_material[proof_digest] = {"sha256": file_sha256(path), "bytes": path.stat().st_size, "reserved_bytes": size}
+            result["nodes"][node.name] = {"tables": tables, "views": digest(views), "files": files, "objects": objects,
+                                           "proof_material": proof_material, "wallet": cli(node, ["status"])}
+            with sqlite3.connect((node.directory / "node.sqlite3").as_uri() + "?mode=ro", uri=True) as database:
+                result["events"][node.name] = database.execute("SELECT network_id,author,seq,hash FROM events ORDER BY network_id,author,seq,hash").fetchall()
+                result["work_counts"][node.name] = {name: database.execute("SELECT count(*) FROM " + name).fetchone()[0]
+                    for name in ("works", "work_runs", "work_dispatches", "work_stops", "schedules", "questions")}
+                result["job_keys"][node.name] = database.execute("SELECT conversation_id,trigger FROM scheduler_jobs ORDER BY conversation_id,trigger").fetchall()
+            wallet = node.wallet_address
+            result["chain"][node.name] = {"latest_nonce": rpc("eth_getTransactionCount", [wallet, "latest"]),
+                "pending_nonce": rpc("eth_getTransactionCount", [wallet, "pending"]),
+                "native_balance": rpc("eth_getBalance", [wallet, "latest"]),
+                "token_balance": rpc("eth_call", [{"to": chain["asset"], "data": "0x70a08231" + wallet[2:].lower().zfill(64)}, "latest"])}
+        result["chain"]["escrow_token_balance"] = rpc("eth_call", [{"to": chain["asset"],
+            "data": "0x70a08231" + chain["escrow"][2:].lower().zfill(64)}, "latest"])
+        return result
+
+    def principal_digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def principal_client_boundaries(request, prepared):
+        identifier, original_intent = prepared["order_id"], prepared["intent_id"]
+        clients, checks = [], []
+        nonmember = "this device is not a member of the personal network"
+        restricted = "delivery writes and spending require a managing member of your personal network"
+        settings = {name: delivery_call(source, "status")[name] for name in ("enabled", "charity_enabled", "paid_enabled")}
+        actor_directory = principals / "X"
+        actor_directory.mkdir(mode=0o700)
+        outsider = Client(source.url, helper, identity_file=actor_directory / "identity.json")
+        member = Client(source.url, helper, identity_file=principals / "member.json")
+        local = Client(f"http://127.0.0.1:{source.local_port}", helper, identity_file=principals / "local.json")
+        foreign = Client(source.url, helper, identity_file=receiver.client.identity_file)
+        clients.extend((outsider, member, local, foreign))
+        try:
+            outsider.connect(source.device_id)
+            require(outsider.call("info")["device_id"] == source.device_id
+                    and outsider.call("authenticate", {"network_id": source.client.network_id})["principal"] is None,
+                    "X reaches the actual encrypted Node without a personal membership principal")
+            member.join(source.client, "Restricted paid client", manage=False)
+            require(member.principal["source"] == "membership" and member.principal["can_manage"] is False,
+                    "the actual signed ordinary member has no paid management authority")
+            accessed = subprocess.run([str(binary), "access", "--json", "--enable", "--data-dir", str(source.directory)],
+                                      capture_output=True, timeout=20)
+            require(accessed.returncode == 0, "the owner issues a real local-session entry without exposing launch material")
+            entry = json.loads(accessed.stdout)
+            fragment = urllib.parse.parse_qs(urllib.parse.urlsplit(entry["url"]).fragment)
+            require(entry["device_id"] == source.device_id and entry.get("local") is True
+                    and set(fragment) == {"local", "node"} and fragment["node"] == [source.device_id],
+                    "the actual owner launch entry pins only this task Source")
+            local_peer = local.own_id()
+            exchange = urllib.request.Request(local.url + "/api/local/exchange", json.dumps({"token": fragment["local"][0],
+                "node_id": source.device_id, "device_id": local_peer}).encode(), {"Origin": local.url, "Content-Type": "application/json"})
+            with urllib.request.urlopen(exchange, timeout=15) as response:
+                cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                require(response.status == 200 and json.load(response)["network_id"] == source.client.network_id,
+                        "the real one-time local exchange returns this Source network")
+            local.connect(source.device_id, origin=local.url, local_cookie=cookie)
+            local.authenticate(source.client.network_id)
+            require(local.principal["source"] == "local_session" and local.principal["can_manage"] is False
+                    and local_peer not in {row["device_id"] for row in source.client.call("directory")["view"]["members"]},
+                    "the separate actual local session is not silently a managing member")
+            require(receiver.client.principal["source"] == "membership" and receiver.client.principal["can_manage"],
+                    "the foreign personal-network actor is an actual manager of R")
+            foreign.connect(source.device_id)
+            require(foreign.call("authenticate", {"network_id": source.client.network_id})["principal"] is None,
+                    "actual R management grants no principal at the independent Source")
+            require(delivery_call(source, "get", order_id=identifier)["order_id"] == identifier
+                    and delivery_call(source, "prepare", **request)["order_id"] == identifier,
+                    "the managing Source successfully reads and retries the complete original prepare request")
+            private_json(principals / "paid-principal-input.json", {"source_url": source.url, "source_peer": source.device_id,
+                "network": source.client.network_id, "order_id": identifier, "intent_id": original_intent, "configure": settings,
+                "helper": str(helper), "outsider_identity": str(outsider.identity_file), "outsider_peer": outsider.own_id()})
+            conversation = "paid-principal-security"
+            source.client.rpc("create_bot", bot_id="paid-principal-bot", conversation_id=conversation,
+                name="Paid principal fixture", instructions="", project={"target_node": source.device_id, "cwd": str(workspace)})
+            receipt = source.client.rpc("message", conversation_id=conversation, message_id="paid-security-" + uuid.uuid4().hex,
+                text=json.dumps({"label": "paid-principal-security", "paid_delivery_security": True}), report_results=False)
+            trigger = receipt["trigger"]
+            wait_for("the actual controlled Agent turn is live before its principal baseline", lambda:
+                (principals / "agent-ready.json").exists()
+                and (scheduler_record(source, source.client.network_id, trigger) or {}).get("state") == "running", timeout=90)
+            require(all(cli(node, ["status"])["state"] == "unlocked" for node in nodes),
+                    "the principal matrix uses the natural pre-confirm idle point with all wallets actually unlocked")
+            before = principal_state()
+            payloads = ({"op": "prepare", **request}, {"op": "confirm", "intent_id": original_intent}, {"op": "configure", **settings})
+            for role, client, expected in (("outsider", outsider, nonmember), ("member", member, restricted), ("local_session", local, restricted)):
+                for payload in payloads:
+                    error = client.call("delivery", payload, status=400).get("error")
+                    require(isinstance(error, str) and expected in error, "each real principal rejects the valid original paid write for its exact authority boundary")
+                    checks.append({"actor": role, "op": payload["op"], "rejection": expected})
+            for role, client in (("outsider", outsider), ("foreign_manager", foreign)):
+                reads = [{"op": "get", "order_id": identifier}]
+                if role == "foreign_manager":
+                    reads.append({"op": "confirm", "intent_id": original_intent})
+                for payload in reads:
+                    error = client.call("delivery", payload, status=400).get("error")
+                    require(isinstance(error, str) and nonmember in error, "an unjoined actual identity cannot read or authorize the original private order")
+                    checks.append({"actor": role, "op": payload["op"], "rejection": nonmember})
+                error = client.rpc("nodes", status=400).get("error")
+                require(isinstance(error, str) and nonmember in error, "unjoined identities receive no private Node directory")
+                checks.append({"actor": role, "op": "nodes", "rejection": nonmember})
+            for role, client in (("member", member), ("local_session", local)):
+                require(client.call("delivery", {"op": "status"})["node_peer"] == source.device_id
+                        and client.call("delivery", {"op": "get", "order_id": identifier})["intent_id"] == original_intent
+                        and client.rpc("nodes").get("nodes"), "same-network ordinary members and actual local sessions retain their allowed read access")
+                checks.append({"actor": role, "op": "status-get-nodes", "allowed": True})
+            private_json(principals / "agent-run.json", {"run": True})
+            agent_result = wait_for("the same valid live Agent finishes its finite authority checks", lambda:
+                json.loads((principals / "agent-checked.json").read_text()) if (principals / "agent-checked.json").exists() else None, timeout=90)
+            require(agent_result["passed"] and agent_result["valid_token_before_and_after"], "Agent authority includes actual valid token positive controls")
+            after = principal_state()
+            private_json(principals / "client-before.json", before)
+            private_json(principals / "client-after.json", after)
+            require(before == after, "all client and live Agent attacks leave finances, wallet files, objects, settings, DAG and work counts unchanged")
+            private_json(principals / "agent-finish.json", {"finish": True})
+            wait_for("the original controlled Agent reaches its normal terminal scheduler state", lambda:
+                (scheduler_record(source, source.client.network_id, trigger) or {}).get("state") == "completed", timeout=60)
+            completed = principal_state()
+            for name in ("nodes", "work_counts", "job_keys", "chain", "broadcasts"):
+                require(completed[name] == after[name], "normal Agent completion adds no delivery money, work, configuration or object effects")
+            prior_events = {tuple(row) for row in after["events"]["S"]}
+            added = [row for row in completed["events"]["S"] if tuple(row) not in prior_events]
+            job = scheduler_record(source, source.client.network_id, trigger)
+            with sqlite3.connect((source.directory / "node.sqlite3").as_uri() + "?mode=ro", uri=True) as database:
+                events = [json.loads(json.loads(row[0])["canonical_body"]) for item in added
+                          for row in database.execute("SELECT envelope FROM events WHERE network_id=? AND hash=?",
+                                                      (source.client.network_id, item[3])).fetchall()]
+            require(len(added) == len(events) == 1 and events[0]["author"] == source.device_id
+                    and events[0]["scope_id"] == conversation
+                    and events[0]["body"]["type"] == "message_posted" and events[0]["body"]["role"] == "assistant"
+                    and events[0]["body"]["message_id"] == job["message_id"]
+                    and events[0]["body"]["text"] == "paid-principal-security-complete"
+                    and all(completed["events"][name] == after["events"][name] for name in ("R", "P")),
+                    "only the original Agent's exact normal assistant completion event is added outside the attack window")
+            passed("paid-client-principal-boundaries", status="passed", order_id=identifier, intent_id=original_intent,
+                checks=checks, agent=agent_result, before_sha256=principal_digest(before), after_sha256=principal_digest(after),
+                wallets_unlocked=True, raw_broadcast_delta=0, new_orders=0, new_proofs=0, dag_unchanged_during_checks=True,
+                manager_positive_controls=True,
+                agent_completion={"state": "completed", "new_events": 1, "event_hash": added[0][3], "new_work": 0, "financial_state_unchanged": True})
+            return actor_directory, outsider.own_id()
+        finally:
+            private_json(principals / "agent-finish.json", {"finish": True})
+            for client in clients:
+                client.close()
+
+    def principal_service_boundaries(identifier, actor_directory, actor_peer):
+        for node in nodes:
+            cli(node, ["unlock"], password=passwords[node.name])
+            known_locked.discard(node.name)
+        require(all(cli(node, ["status"])["state"] == "unlocked" for node in nodes),
+                "completed-order service boundaries run with every wallet genuinely unlocked")
+        before = principal_state()
+        grant_path = receiver.directory / "paid-security-read-grant.json"
+        class Outsider:
+            directory, device_id = actor_directory, actor_peer
+        try:
+            for node in (source, receiver):
+                node.client.close()
+                node.stop()
+            received = delivery_probe(options, run, receiver, [provider], identifier,
+                action={"kind": "paid_security", "scenario": {"role": "receiver", "provider_identity_file": str(provider.directory / "identity.json")}})
+            require(stat.S_ISREG(grant_path.lstat().st_mode) and grant_path.stat().st_mode & 0o077 == 0
+                    and grant_path.stat().st_size <= 2048
+                    and file_sha256(grant_path) == received["details"]["receiver_grant_sha256"],
+                    "the private grant fixture is the actual provider response already verified by the real receiver")
+            encoded = base64.b64encode((provider.directory / "delivery/objects" / identifier / "0-ciphertext.bin").read_bytes()[:8192])
+            require(hashlib.sha256(encoded).hexdigest() == received["details"]["ciphertext_base64_sha256"]
+                    and received["details"]["expired_signature_verified"] is True,
+                    "the legal receiver read matches the actual complete ciphertext and the expired fixture has a valid provider signature")
+            sent = delivery_probe(options, run, source, [provider], identifier, action={"kind": "paid_security", "scenario": {"role": "source"}})
+            start_task_nodes(unlock=True, names=("S", "R"))
+            outside = delivery_probe(options, run, Outsider(), nodes, identifier,
+                action={"kind": "paid_security", "scenario": {"role": "outsider", "receiver_grant": json.loads(grant_path.read_text())}})
+            for observation in (received, sent, outside):
+                announcement = observation["announcement"]
+                require(announcement["paid_enabled"] is True and announcement["provider_wallet"].lower() == provider.wallet_address.lower()
+                        and announcement["asset"].lower() == chain["asset"].lower() and announcement["profile"] == profile,
+                        "every service boundary has a real enabled paid announcement bound to the same provider, asset and proof profile")
+            after = principal_state()
+            private_json(principals / "service-before.json", before)
+            private_json(principals / "service-after.json", after)
+            require(before == after, "wrong service roles, correctly signed expiry and private ALPN attempts change no financial or private state")
+            passed("paid-service-grant-and-private-alpn-boundaries", status="passed", order_id=identifier,
+                checks={"receiver": received["checks"], "source": sent["checks"], "outsider": outside["checks"]},
+                positive_paid_announcement=True, positive_source_and_receiver_order=True, positive_receiver_ciphertext_read=True,
+                expired_signature_verified=True, expiry_fixture="resigned-provider-host-unix-seconds",
+                private_alpn_targets=3, private_alpns=["rpc", "sync", "blob"], before_sha256=principal_digest(before),
+                after_sha256=principal_digest(after), wallets_unlocked=True, raw_broadcast_delta=0, new_orders=0, new_proofs=0,
+                financial_objects_settings_dag_work_unchanged=True)
+        finally:
+            grant_path.unlink(missing_ok=True)
+
+    def inspection_view(node, view):
+        key = delivery_call(node, "status")["receiver_key"] if node is receiver else None
+        return {"phase": view["phase"] if view else None, "paymentState": view["payment"]["state"] if view else None,
+                **{name: view["payment"][name] if view else None for name in ("earned", "withdrawn", "refunded")},
+                "evidence": view["evidence"] if view else None,
+                "windows": [{"state": window["state"], "decryptionProven": window["decryption_proven"]}
+                            for window in view["windows"]] if view else [],
+                "receiverKey": {"keyId": key["key_id"], "serial": key["serial"]} if key else None}
+
+    def inspect_rendered(kind, *, view=None):
+        require(ui_control is not None and kind in DeliveryUiControl.inspections, "rendered inspection uses the existing paired UI control")
+        role, screenshot = DeliveryUiControl.inspections[kind]
+        node = source if role == "web" else receiver
+        before, broadcasts = durable_intents(), chain_recorder.broadcasts()
+        require(all(cli(item, ["status"])["state"] == "locked" for item in nodes),
+                "every inspection leaves all independent wallets actually locked")
+        observed = inspection_view(node, view)
+        if kind in ("source-partial", "receiver-key-after"):
+            require(observed["phase"] == "partial" and observed["paymentState"] == "withdrawn"
+                    and [observed[name] for name in ("earned", "withdrawn", "refunded")] == ["12", "12", "17"]
+                    and observed["evidence"] == "none"
+                    and observed["windows"] == [{"state": "earned", "decryptionProven": True},
+                                               {"state": "refunded", "decryptionProven": False}],
+                    "partial screenshots require the actual earned first window and refunded second window")
+        if kind == "source-unknown":
+            require(observed["phase"] == "reconciling" and observed["paymentState"] == "unknown"
+                    and observed["evidence"] == "none"
+                    and [observed[name] for name in ("earned", "withdrawn", "refunded")] == ["12", "12", "17"]
+                    and observed["windows"] == [{"state": "pending", "decryptionProven": False}] * 2,
+                    "unknown screenshots require real retracted completion and proof claims with historical amounts")
+        if role == "android":
+            require(observed["receiverKey"] and observed["receiverKey"]["serial"] == (1 if kind == "receiver-key-before" else 2),
+                    "key screenshots show the actual first registration or sole second-serial rotation")
+        value = {"id": str(uuid.uuid4()), "kind": kind, "role": role, "nodePeer": node.device_id,
+                 "orderId": view["order_id"] if view else None, "intentId": view["intent_id"] if view else None,
+                 "keyId": observed["receiverKey"]["keyId"] if observed["receiverKey"] else None,
+                 "keySerial": observed["receiverKey"]["serial"] if observed["receiverKey"] else None,
+                 "expectedPhase": observed["phase"], "expectedPaymentState": observed["paymentState"],
+                 **{name: observed[name] for name in ("earned", "withdrawn", "refunded", "evidence", "windows")},
+                 "screenshot": screenshot, "timeoutMs": 120000}
+        ui_control.begin_inspection(value)
+        require(ui_control.inspection_finished.wait(120), "the fixed real UI renders and saves its bounded inspection")
+        acknowledgement = ui_control.end_inspection()
+        require(before == durable_intents() and chain_recorder.broadcasts() == broadcasts
+                and all(cli(item, ["status"])["state"] == "locked" for item in nodes),
+                "real UI inspection creates no transaction intent, proof reservation or signed broadcast")
+        actual = delivery_call(node, "get", order_id=view["order_id"]) if view else None
+        require(inspection_view(node, actual) == observed, "the screenshot interval retains the same actual Node projection")
+        record = {name: value[name] for name in ("id", "kind", "role", "nodePeer", "orderId", "intentId", "screenshot")}
+        record.update(sha256=acknowledgement["sha256"], bytes=acknowledgement["bytes"], observed=observed,
+                      checks={"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True,
+                              "transactionIntentsUnchanged": True, "canonicalRestored": kind != "source-unknown"})
+        inspection_records.append(record)
+        return record
+
     def view_matches(view, expected):
         phases = ("pending", "held", "key_published", "earned", "refunded")
         return (all(view["payment"][name] == expected[name] for name in ("earned", "withdrawn", "refunded"))
@@ -5246,6 +5762,69 @@ def delivery_paid_run(options, configuration, deployment):
             require(recovered_bytes == original and len(recovered_bytes) == max_file_bytes
                     and recovered_file["sha256"] == recovered_sha == digest,
                     "the actual warm receiver returns every original byte across branch observation")
+        crash_point = ("held" if event["case"] == "held-timeout" and checkpoint_id.endswith("-held") else
+                       "key-published" if event["case"] == "strict-late-open" and checkpoint_id.endswith("-key-published") else None)
+        if crash_point:
+            def provider_projection():
+                rows = delivery_rows(provider, "SELECT body FROM orders WHERE id=?", (order_id,))
+                value = json.loads(rows[0][0])["view"] if len(rows) == 1 else None
+                return value if value and view_matches(value, expected) else None
+
+            provider_before = wait_for("the live provider projects the actual pre-crash canonical stage", provider_projection, timeout=60)
+            immutable = durable_intents()
+            killed = []
+            for node in (receiver, provider):
+                require(node.process is not None and node.process.poll() is None and cli(node, ["status"])["state"] == "locked",
+                        "only the two live task Nodes are killed at the observed held or key-published stage")
+                pid = node.process.pid
+                outcome = node.stop(crash=True)
+                require(outcome == -signal.SIGKILL, "the real held-stage task process exits from SIGKILL")
+                killed.append({"role": node.name, "pid": pid, "signal": "SIGKILL", "exit_code": outcome, "wallet_locked": True})
+            start_task_nodes(names=("R", "P"))
+            delivery_call(receiver, "reconcile", order_id=order_id)
+            after_crash = wait_for("the actual killed receiver converges again to its canonical chain stage", lambda:
+                                   (view if view_matches(view, expected) else None)
+                                   if (view := delivery_call(receiver, "get", order_id=order_id)) else None, timeout=60)
+            provider_after = wait_for("the killed provider projects the same actual canonical stage after restart", provider_projection, timeout=60)
+            require(all(cli(node, ["status"])["state"] == "locked" for node in (receiver, provider))
+                    and immutable == durable_intents(), "real SIGKILL recovery preserves locked wallets, proof rows and signed transaction intents")
+            recovered_file = delivery_call(receiver, "read", order_id=order_id)
+            recovered_bytes = base64.b64decode(recovered_file["content_base64"], validate=True)
+            require(recovered_bytes == original and len(recovered_bytes) == max_file_bytes
+                    and hashlib.sha256(recovered_bytes).hexdigest() == recovered_file["sha256"] == digest
+                    and observed["R"]["payment"]["earned"] == after_crash["payment"]["earned"] == expected["earned"]
+                    and provider_before["payment"]["earned"] == provider_after["payment"]["earned"] == expected["earned"],
+                    "cached old-key original bytes and earned balance survive the actual receiver and provider kills")
+            observed["R"] = compact_view(after_crash)
+            process_recoveries.append({"point": crash_point, "order_id": order_id, "nodes": killed,
+                "earned_before": expected["earned"], "earned_after": after_crash["payment"]["earned"],
+                "proof_rows_unchanged": True, "transaction_rows_unchanged": True, "original_sha256": digest,
+                "original_bytes": max_file_bytes, "raw_broadcast_delta": 0, "warm_cached_material": True})
+            report["process_recoveries"] = process_recoveries
+        if event["case"] == "partial-refund" and checkpoint_id.endswith("-result"):
+            inspect_rendered("source-partial", view=delivery_call(source, "get", order_id=order_id))
+            fault = chain_recorder.fail_reads(chain["escrow"])
+            unknown_record = None
+            try:
+                delivery_call(source, "reconcile", order_id=order_id)
+
+                def source_unknown():
+                    view = delivery_call(source, "get", order_id=order_id)
+                    return view if view["phase"] == "reconciling" and view["payment"]["state"] == "unknown" else None
+
+                actual_unknown = wait_for("a real bounded Node RPC transport failure retracts the original Source claim", source_unknown, timeout=45)
+                require(fault["blocked"] > 0, "the real Node actually encounters the bounded escrow transport failure")
+                unknown_record = inspect_rendered("source-unknown", view=actual_unknown)
+            finally:
+                chain_recorder.restore_reads()
+                for node in (source, receiver):
+                    delivery_call(node, "reconcile", order_id=order_id)
+                    wait_for("removing the transport fault restores the actual canonical order", lambda:
+                             view_matches(delivery_call(node, "get", order_id=order_id), expected), timeout=60)
+            require(unknown_record is not None, "unknown UI inspection completed before canonical recovery")
+            unknown_record["checks"]["canonicalRestored"] = True
+        if checkpoint_id.endswith("-mixed-held-result"):
+            inspect_rendered("receiver-key-after", view=delivery_call(receiver, "get", order_id=order_id))
         if not only_receiver and not rebuild:
             for node in (source, receiver):
                 node.client.close()
@@ -5396,20 +5975,15 @@ def delivery_paid_run(options, configuration, deployment):
         require(active_calldata[4:1508] == current_binding_journal, "ordinary UI binding proof matches its exact registration transaction")
         destination = run / "ordinary-settlement"
         destination.mkdir(mode=0o700)
-        original_path = options.delivery_ui_control.resolve().parent / "ordinary-paid-ui.bin"
-        require(run.resolve().is_relative_to(repository / ".artifacts"), "ordinary UI uses the shared task worktree artifacts")
-        require(original_path.parent.is_relative_to(repository / ".artifacts"), "ordinary source fixture remains in task artifacts")
-        original_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with os.fdopen(os.open(original_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as output:
-            output.write(os.urandom(4096))
+        require(ui_control is not None and ui_control.stage == "inspections", "the ordinary UI reuses the actual members captured before C0")
+        original_path = ui_control.source_file
         ordinary_bytes, ordinary_digest = original_path.read_bytes(), file_sha256(original_path)
         before_jobs = {node.name: delivery_rows(node, "SELECT digest,path FROM proof_jobs ORDER BY digest") for node in nodes}
         for node in nodes:
             cli(node, ["unlock"], password=passwords[node.name])
-        control = DeliveryUiControl(options.delivery_ui_control.resolve(), repository, original_path,
-                                   {"web": source, "android": receiver, "provider": provider}, configuration)
+        control = ui_control
         try:
-            control.start()
+            control.set_stage("ordinary")
             print("OBSERVE delivery-paid ordinary Web and Android UI controller ready", flush=True)
             require(control.finished.wait(options.delivery_ui_timeout_ms / 1000), "ordinary UI completes within its explicit acceptance bound")
             require(control.failure is None and list(control.events) == list(control.sequence),
@@ -5480,6 +6054,9 @@ def delivery_paid_run(options, configuration, deployment):
             node = Node(run, name, binary, workspace, helper, init_args=args)
             nodes.append(node)
             isolate_delivery_node(node)
+            if name == "S" and chain_recorder:
+                node.configure(timeout_secs=600, manager=fixture_manager_settings(principals, workspace),
+                    codex_bin=str(fixture_wrapper(principals, "fixture-codex", "--fixture-codex")), app_server=SPAWN_APP_SERVER)
             node.configure_network(discovery={"publish": True, "resolve": True, "urls": [relay.url], "publish_direct": True})
             node.start()
             if name != "P":
@@ -5631,6 +6208,25 @@ def delivery_paid_run(options, configuration, deployment):
             require(branch_public_index == f".artifacts/vdp/contracts/branch-observations/{branch_session}/index.json",
                     "finite helper identifies this exact session's repository-relative public index")
             wallets = {node.name: node.wallet_address for node in nodes}
+            original_path = options.delivery_ui_control.resolve().parent / "ordinary-paid-ui.bin"
+            require(original_path.parent.is_relative_to(repository / ".artifacts"), "early UI retains its single bounded synthetic source in task artifacts")
+            original_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with os.fdopen(os.open(original_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as output:
+                output.write(os.urandom(4096))
+            for node in nodes:
+                cli(node, ["lock"])
+                known_locked.add(node.name)
+            ui_control = DeliveryUiControl(options.delivery_ui_control.resolve(), repository, original_path,
+                                            {"web": source, "android": receiver, "provider": provider}, configuration)
+            ui_control.start()
+
+            def observers_ready():
+                require(ui_control.failure is None, "both actual UI observers remain healthy during pre-C0 pairing")
+                return ui_control.observers == set(ui_control.names)
+
+            wait_for("both real UI members pair before the original whole Node checkpoints", observers_ready, timeout=120)
+            ui_control.set_stage("inspections")
+            inspect_rendered("receiver-key-before")
             quiesced = stopped_nodes("C0Data", save=True)
             exercise_command("capture-pre-prepare", "captured", quiesced=quiesced, wallets=wallets,
                              receiverPeer="0x" + receiver.device_id)
@@ -5656,6 +6252,7 @@ def delivery_paid_run(options, configuration, deployment):
         changed = {**request, "content_base64": base64.b64encode(b"different").decode()}
         source.client.call("delivery", {"op": "prepare", **changed}, status=400)
         if chain_recorder:
+            outsider_directory, outsider_peer = principal_client_boundaries(request, prepared)
             cli(provider, ["lock"])
             require(cli(provider, ["status"])["state"] == "locked", "intentional paid provider outage starts with its actual wallet locked")
             known_locked.add("P")
@@ -5706,6 +6303,39 @@ def delivery_paid_run(options, configuration, deployment):
                     "real rejected paid chunks never mark an incomplete object complete or create early payment")
             passed("paid-real-service-duplicate-reorder-offset-and-capsule-integrity", **integrity,
                    incomplete_objects=4, early_provider_transactions=0, original_order=True)
+            prefix_rows, prefix_broadcasts = durable_intents(), chain_recorder.broadcasts()
+            provider_exit = provider.stop(crash=True)
+            require(provider_exit == -signal.SIGKILL, "the real task provider is killed before its uncommitted tail fixture")
+            partial = provider.directory / "delivery/objects" / order_id / "0-ciphertext.part"
+            require(provider.process is None and stat.S_ISREG(partial.lstat().st_mode)
+                    and partial.read_bytes() == ciphertext[:8192], "only the actual incomplete durable provider prefix receives an uncommitted tail")
+            tail = b"uncommitted-delivery-tail" * 7
+            with os.fdopen(os.open(partial, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW), "wb") as output:
+                output.write(tail)
+                output.flush()
+                os.fsync(output.fileno())
+            require(delivery_rows(provider, "SELECT idx,kind,committed,complete FROM objects WHERE order_id=? ORDER BY idx,kind", (order_id,)) == durable
+                    and partial.read_bytes() == ciphertext[:8192] + tail,
+                    "the stopped provider fixture changes no committed database offset or complete object")
+            start_task_nodes(names=("P",))
+            require(cli(provider, ["status"])["state"] == "locked" and partial.stat().st_size == 8192 + len(tail)
+                    and delivery_rows(provider, "SELECT committed,complete FROM objects WHERE order_id=? AND idx=0 AND kind='ciphertext'", (order_id,)) == [(8192, 0)],
+                    "provider restart preserves its actual durable offset and does not claim startup truncation")
+            resumed = delivery_probe(options, run, source, [provider], order_id,
+                action={"kind": "paid_resume", "ciphertext_grant": grants["put_ciphertext"],
+                        "chunk": base64.b64encode(ciphertext[8192:16384]).decode()})
+            require(resumed["resumed_offset"] == 8192 and resumed["committed_offset"] == 16384
+                    and partial.read_bytes() == ciphertext[:16384] and partial.stat().st_size == 16384
+                    and delivery_rows(provider, "SELECT committed,complete FROM objects WHERE order_id=? AND idx=0 AND kind='ciphertext'", (order_id,)) == [(16384, 0)]
+                    and prefix_rows == durable_intents() and chain_recorder.broadcasts() == prefix_broadcasts
+                    and cli(provider, ["status"])["state"] == "locked",
+                    "the first original-grant valid append discards only the uncommitted tail without another proof or transaction")
+            passed("paid-provider-sigkill-resumes-committed-prefix-and-discards-uncommitted-tail", status="passed",
+                   order_id=order_id, signal="SIGKILL", exit_code=provider_exit, wallet_locked=True,
+                   committed_before=8192, committed_after=16384, uncommitted_tail_bytes=len(tail),
+                   truncate_on_first_valid_append=True, original_ciphertext_prefix_matches=True,
+                   transaction_rows_unchanged=True, proof_rows_unchanged=True, raw_broadcast_delta=0,
+                   new_proofs=0, original_order=True)
             cli(provider, ["unlock"], password=passwords["P"])
             known_locked.discard("P")
             start_task_nodes(unlock=True, names=("S", "R"))
@@ -5800,6 +6430,7 @@ def delivery_paid_run(options, configuration, deployment):
                       counts == {node.name: len(delivery_rows(node, "SELECT id FROM transactions")) for node in nodes})
         passed("paid-process-restart-retains-file-wallet-lock-and-transaction-identity", transaction_counts=counts)
         if chain_recorder:
+            principal_service_boundaries(order_id, outsider_directory, outsider_peer)
             quiesced = stopped_nodes("MainSuccessData", save=True)
             exercise_command("verify-core", "core-verified", quiesced=quiesced, fileSha256=digest)
             incoming_cases = ("incoming-false", "incoming-frozen", "incoming-fee", "incoming-sender-tax",
@@ -5813,6 +6444,11 @@ def delivery_paid_run(options, configuration, deployment):
                 require(result["case"] == case and result["status"] == "EVM_PASS" and result["newProofs"] == 0,
                         "each finite branch actually uses the original genuine proof set without generating a replacement")
                 branch_results.append(result)
+            require([value["point"] for value in process_recoveries] == ["held", "key-published"]
+                    and all(value["raw_broadcast_delta"] == 0 for value in process_recoveries),
+                    "both actual held and key-published SIGKILL recoveries are required")
+            passed("real-paid-held-and-key-published-sigkill-recovery", status="passed", points=process_recoveries,
+                   new_proofs=0, original_order=True)
             exercise_command("restore-core", "core-restored", quiesced=last_quiesced)
             mixed = exercise_command("lifecycle-held", "lifecycle-held-complete", quiesced=last_quiesced)
             require(len(lifecycle_actions) == 1 and lifecycle_actions[0]["public"]["action"] == "rotate"
@@ -5860,6 +6496,16 @@ def delivery_paid_run(options, configuration, deployment):
                    serials=[value["serial"] for value in public_actions], old_sha256=digest, mixed_held=True)
             passed("genuine-branches-and-canonical-restoration", status="passed", public_index=branch_public_index,
                    session_id=branch_session, helper_new_proofs=0, core_restored=True)
+            require([record["kind"] for record in inspection_records] ==
+                    ["receiver-key-before", "source-partial", "source-unknown", "receiver-key-after"]
+                    and all(DeliveryUiControl.inspection_verified(record["checks"]) for record in inspection_records)
+                    and inspection_records[0]["observed"]["receiverKey"]["keyId"] != inspection_records[3]["observed"]["receiverKey"]["keyId"],
+                    "four actual rendered inspections preserve their original order and the genuine changed key")
+            inspection_manifest = run / "ui-inspections.json"
+            private_json(inspection_manifest, {"schemaVersion": 1, "kind": "vdp-rendered-inspections", "status": "PASS",
+                         "strictOrderId": order_id, "strictIntentId": intent, "generatedProofs": 0, "inspections": inspection_records})
+            passed("rendered-original-order-inspections", status="passed", manifest=str(inspection_manifest), count=4,
+                   new_proofs=0, raw_broadcast_delta=0, strict_order_id=order_id)
             exercise_command("resume-main", "main-miner-resumed")
             start_task_nodes()
             ordinary_bundle = ordinary_ui_acceptance(lifecycle_actions[-1]["journal"], lifecycle_actions[-1]["transaction_id"])
@@ -5880,6 +6526,8 @@ def delivery_paid_run(options, configuration, deployment):
         raise
     finally:
         passwords.clear()
+        if ui_control is not None:
+            ui_control.close()
         if registration_process is not None and registration_process.poll() is None:
             registration_process.terminate()
             try:
@@ -5922,6 +6570,7 @@ def delivery_paid_run(options, configuration, deployment):
         for node in reversed(nodes):
             node.client.close()
             node.stop()
+        stop_fixture_processes(principals)
         relay.close()
         if chain_recorder:
             chain_recorder.close()

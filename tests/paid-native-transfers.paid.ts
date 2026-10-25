@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { test } from '@e2e-dev/mobile';
 import { expect, secrets } from 'e2e';
-import { deadline, event, facts, pairing, preserveScreenshot, request, runUi, saveEvidence } from './paid-delivery-control';
+import { acknowledgeInspection, deadline, event, facts, nextInspection, ordinaryDeadline, ordinaryReady, pairing, preserveScreenshot, request, runUi, saveEvidence } from './paid-delivery-control';
 import { androidRecording, type Video, videoEvidence } from './paid-recordings';
 
 const execute = promisify(execFile);
@@ -46,8 +46,34 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await screen.scrollUntilVisible(screen.getByRole('link', '公益转发与实验付费交付', { exact: true }), { direction: 'down' });
       await screen.getByRole('link', '公益转发与实验付费交付', { exact: true }).click();
       await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible();
+      await event('observer-ready', { role: 'android' });
+      for (const kind of ['receiver-key-before', 'receiver-key-after'] as const) {
+        const inspection = await nextInspection(kind);
+        assert(inspection.role === 'android' && inspection.nodePeer === environment.nodes.android.peer && inspection.keyId
+          && inspection.keySerial === (kind === 'receiver-key-before' ? 1 : 2));
+        if (kind === 'receiver-key-after') {
+          await device.closeApp();
+          await device.openApp(appId);
+          await device.openLink('vibeface://transfers', { app: appId });
+        }
+        const refresh = screen.getByRole('button', '刷新订单', { exact: true });
+        await screen.scrollUntilVisible(refresh, { direction: 'up', timeout: 30000 });
+        await refresh.click();
+        const key = screen.getByText(inspection.keyId, { exact: true }).first();
+        await screen.scrollUntilVisible(key, { direction: 'down', timeout: 30000 });
+        await expect(screen.getByText('当前接收密钥 ID', { exact: true }).first()).toBeVisible();
+        await expect(key).toBeVisible();
+        await expect(screen.getByText('当前接收密钥序号', { exact: true }).first()).toBeVisible();
+        await expect(screen.getByText(inspection.keySerial.toString(), { exact: true }).first()).toBeVisible();
+        await acknowledgeInspection(inspection, await app.screenshot(kind));
+      }
+      await ordinaryReady();
+      await device.closeApp();
+      await device.openApp(appId);
+      await device.openLink('vibeface://transfers', { app: appId });
+      await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible({ timeout: 45000 });
       await expect.poll(async () => (await facts()).receiver !== null, {
-        timeout: deadline(), interval: 1000, message: 'The original ordinary order reaches the real receiver after its genuine source proof',
+        timeout: ordinaryDeadline(), interval: 1000, message: 'The original ordinary order reaches the real receiver after its genuine source proof',
       }).toBe(true);
       const offered = (await facts()).receiver;
       assert(offered && offered.acceptance === 'recoverable' && offered.mode === 'paid');
@@ -81,7 +107,7 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
         videos.push(await acceptanceRecording.stop());
       } finally { await acceptanceRecording.cancel(); }
       await expect.poll(async () => (await facts()).events.includes('settled-offline'), {
-        timeout: deadline(), interval: 1000, message: 'Actual Node settlement completes while this app stays backgrounded and disconnected',
+        timeout: ordinaryDeadline(), interval: 1000, message: 'Actual Node settlement completes while this app stays backgrounded and disconnected',
       }).toBe(true);
       assert(!(await reversePresent()));
       await background();

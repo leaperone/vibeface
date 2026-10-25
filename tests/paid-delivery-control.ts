@@ -1,11 +1,21 @@
 import assert from 'node:assert/strict';
 import { copyFile, lstat, readFile, mkdir, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { expect } from 'e2e';
 
 export const root = resolve(import.meta.dirname, '..');
 export const artifacts = resolve(root, '.artifacts/vdp/live-ui');
 export const roles = ['web', 'android', 'provider'] as const;
 export type UiRole = 'web' | 'android';
+export const inspectionKinds = ['source-partial', 'source-unknown', 'receiver-key-before', 'receiver-key-after'] as const;
+export type InspectionKind = typeof inspectionKinds[number];
+export type Inspection = {
+  id: string; kind: InspectionKind; role: UiRole; nodePeer: string; orderId: string | null; intentId: string | null;
+  keyId: string | null; keySerial: number | null; expectedPhase: string | null; expectedPaymentState: string | null;
+  earned: string | null; withdrawn: string | null; refunded: string | null; evidence: string | null;
+  windows: { state: string; decryptionProven: boolean }[]; screenshot: string; timeoutMs: number;
+};
 export type Pairing = { peer: string; code: string; approved: boolean };
 export type PaidOrder = {
   order_id: string; intent_id: string; name: string | null; bytes: number; sha256: string | null;
@@ -18,6 +28,7 @@ export type PaidFacts = {
   sourceFile: string; name: string; bytes: number; sha256: string; serviceCap: string; gasCap: string;
   source: PaidOrder | null; receiver: PaidOrder | null; provider: PaidOrder | null;
   settled: boolean; paired: Record<UiRole, boolean>; events: string[]; failure: string | null;
+  stage: 'bootstrap' | 'inspections' | 'ordinary' | 'complete'; inspection: Inspection | null;
 };
 
 export function record(value: unknown): Record<string, unknown> {
@@ -50,9 +61,35 @@ export function insideArtifacts(value: string): string {
   return path;
 }
 export function deadline(): number {
-  const value = Number(process.env.VIBEFACE_DELIVERY_UI_TIMEOUT_MS);
+  const value = Number(process.env.VIBEFACE_DELIVERY_UI_TOTAL_TIMEOUT_MS);
   assert(Number.isSafeInteger(value) && value >= 30000 && value <= 86400000, 'UI acceptance requires an explicit bounded runtime deadline');
   return value;
+}
+export function ordinaryDeadline(): number {
+  const value = Number(process.env.VIBEFACE_DELIVERY_UI_TIMEOUT_MS);
+  assert(Number.isSafeInteger(value) && value >= 30000 && value <= 3600000, 'Ordinary UI retains its existing independent deadline');
+  return value;
+}
+function member<const T extends string>(value: unknown, values: readonly T[]): T {
+  const result = values.find(item => item === value);
+  assert(result !== undefined);
+  return result;
+}
+function inspection(value: unknown): Inspection | null {
+  if (value === null) return null;
+  const row = record(value), kind = member(row.kind, inspectionKinds), role = member(row.role, ['web', 'android']);
+  const files = { 'source-partial': 'web-partial-refund.png', 'source-unknown': 'web-unknown-transaction.png',
+    'receiver-key-before': 'android-key-before.png', 'receiver-key-after': 'android-key-rotated.png' };
+  assert(row.screenshot === files[kind] && row.timeoutMs === 120000 && role === (kind.startsWith('source-') ? 'web' : 'android'));
+  assert(Array.isArray(row.windows) && row.windows.length <= 2);
+  const orderId = row.orderId === null ? null : hex(row.orderId), intentId = nullable(row.intentId);
+  assert((kind === 'receiver-key-before') === (orderId === null && intentId === null));
+  return { id: string(row.id), kind, role, nodePeer: hex(row.nodePeer), orderId, intentId,
+    keyId: row.keyId === null ? null : hex(row.keyId), keySerial: row.keySerial === null ? null : integer(row.keySerial),
+    expectedPhase: nullable(row.expectedPhase), expectedPaymentState: nullable(row.expectedPaymentState),
+    earned: nullable(row.earned), withdrawn: nullable(row.withdrawn), refunded: nullable(row.refunded), evidence: nullable(row.evidence),
+    windows: row.windows.map(value => { const window = record(value); return { state: string(window.state), decryptionProven: boolean(window.decryptionProven) }; }),
+    screenshot: string(row.screenshot), timeoutMs: integer(row.timeoutMs) };
 }
 export async function request(path: string, body?: Record<string, unknown>): Promise<unknown> {
   const filename = process.env.VIBEFACE_DELIVERY_UI_CONTROL;
@@ -89,7 +126,29 @@ export async function facts(): Promise<PaidFacts> {
   return { nodes: { web: node('web'), android: node('android'), provider: node('provider') },
     sourceFile: string(value.sourceFile), name: string(value.name), bytes: integer(value.bytes), sha256: hex(value.sha256),
     serviceCap: string(value.serviceCap), gasCap: string(value.gasCap), source: order(value.source), receiver: order(value.receiver), provider: order(value.provider),
-    settled: boolean(value.settled), paired: { web: boolean(paired.web), android: boolean(paired.android) }, events: value.events, failure };
+    settled: boolean(value.settled), paired: { web: boolean(paired.web), android: boolean(paired.android) }, events: value.events, failure,
+    stage: member(value.stage, ['bootstrap', 'inspections', 'ordinary', 'complete']), inspection: inspection(value.inspection) };
+}
+export async function nextInspection(kind: InspectionKind): Promise<Inspection> {
+  await expect.poll(async () => {
+    const current = await facts();
+    assert(current.stage === 'bootstrap' || current.stage === 'inspections', 'The required original-order inspection precedes ordinary payment');
+    return current.inspection?.kind === kind;
+  }, { timeout: deadline(), interval: 1000, message: `The original real Node reaches its fixed ${kind} inspection` }).toBe(true);
+  const value = (await facts()).inspection;
+  assert(value && value.kind === kind);
+  return value;
+}
+export async function ordinaryReady(): Promise<void> {
+  await expect.poll(async () => (await facts()).stage === 'ordinary', {
+    timeout: deadline(), interval: 1000, message: 'All original-order inspections and key lifecycle finish before actual ordinary UI actions',
+  }).toBe(true);
+}
+export async function acknowledgeInspection(value: Inspection, screenshot: string): Promise<void> {
+  await preserveScreenshot(value.screenshot, screenshot);
+  const image = await readFile(resolve(artifacts, 'public', value.screenshot));
+  await event('inspection-observed', { role: value.role, id: value.id, screenshot: value.screenshot,
+    sha256: createHash('sha256').update(image).digest('hex'), bytes: image.length });
 }
 export async function pairing(role: UiRole): Promise<Pairing | null> {
   const value = await request('/pairing', { role });
@@ -110,7 +169,8 @@ export async function saveEvidence(name: string, value: Record<string, unknown>)
   await writeFile(resolve(artifacts, 'public', name), `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
 }
 export async function preserveScreenshot(name: string, source: string): Promise<string> {
-  assert(['web.png', 'android-offline.png', 'android.png'].includes(name));
+  assert(['web.png', 'android-offline.png', 'android.png', 'web-settled.png', 'web-partial-refund.png',
+    'web-unknown-transaction.png', 'android-key-before.png', 'android-key-rotated.png'].includes(name));
   const location = insideArtifacts(source), suffix = relative(resolve(artifacts, 'e2e'), location);
   assert(suffix && !suffix.startsWith('..') && !suffix.startsWith('/'), 'Export only this run explicit post-join e2e screenshot');
   const metadata = await lstat(location);

@@ -32,6 +32,10 @@ PROOFS = ["key-binding", *[f"relation-{relation}-window-{index}" for index in ra
 ANDROID_ABIS = {"arm64-v8a": 183, "x86_64": 62}
 UI_EVENTS = ("prepared", "confirmed", "accepted", "offline-visible", "settled-offline", "saved")
 UI_FILES = ("web.json", "android.json", "web.png", "android-offline.png", "android.png")
+INSPECTIONS = (("receiver-key-before", "android", "android-key-before.png"),
+               ("source-partial", "web", "web-partial-refund.png"),
+               ("source-unknown", "web", "web-unknown-transaction.png"),
+               ("receiver-key-after", "android", "android-key-rotated.png"))
 VIDEO_SPECS = {"web": (("web-confirm.mp4", "web-confirm", "ffmpeg-x11grab"),),
                "android": (("android-accept-offline.mp4", "android-accept-offline", "adb-screenrecord"),
                            ("android-resume-save.mp4", "android-resume-save", "adb-screenrecord"))}
@@ -344,6 +348,26 @@ def join_owned(container, ui, android, deadline):
     raise TimeoutError("Proof and UI processes did not both finish within the acceptance bound")
 
 
+def remaining_ui_timeout_ms(deadline):
+    remaining = int((deadline - time.monotonic()) * 1000)
+    if not 0 < remaining <= LIVE_TIMEOUT_SECONDS * 1000:
+        raise TimeoutError("Paid UI total timeout must remain within the original live deadline")
+    return remaining
+
+
+def finish_failed_ui_evidence(container, ui, descriptor, deadline):
+    if container is None or ui is None or container.poll() is not None or ui.poll() in (None, 0):
+        return
+    until = min(deadline, time.monotonic() + 60)
+    if descriptor is not None:
+        try:
+            controller(descriptor, "/abort", {"role": "web"})
+        except (OSError, ValueError, http.client.HTTPException):
+            pass
+    while container.poll() is None and time.monotonic() < until:
+        time.sleep(0.25)
+
+
 def cleanup_owned(android, proof_process, ui_process, name, descriptor, success):
     failed = False
     if not success and descriptor is not None:
@@ -388,6 +412,7 @@ def dispatch(package_input, android_input, expected):
         raise ValueError("Live acceptance requires fresh task UI, Android and driver state")
     PUBLIC.mkdir(parents=True, mode=0o755, exist_ok=False)
     PUBLIC.chmod(0o755)
+    (PUBLIC / "ui").mkdir(mode=0o755)
     checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
     package = unpack_package(package_input)
     checked_package(package, expected)
@@ -417,24 +442,30 @@ def dispatch(package_input, android_input, expected):
             proof_process = subprocess.Popen(live_container(container, package, expected, name), cwd=ROOT,
                                              stdout=proof_log, stderr=proof_log, start_new_session=True)
             control = UI / "control.json"
-            descriptor = wait_owned("ordinary UI controller", deadline,
+            descriptor = wait_owned("early paid UI pairing controller", deadline,
                 lambda: control_descriptor(control) if control.exists() else None, (proof_process, android.process))
             facts = controller(descriptor, "/facts")
+            if facts.get("stage") not in ("bootstrap", "inspections"):
+                raise ValueError("The first paid UI controller must expose pairing and inspections before ordinary mutations")
             receiver = urllib.parse.urlsplit(facts["nodes"]["android"]["url"])
             if receiver.scheme != "http" or receiver.hostname != "127.0.0.1" or not receiver.port or receiver.path not in ("", "/") or receiver.query or receiver.fragment or receiver.username or receiver.password:
                 raise ValueError("Only the actual receiver's loopback port may receive an ADB reverse")
             android.save_reverse(receiver.port)
             environment = {**environment, "VIBEFACE_DELIVERY_UI_CONTROL": str(control), "VIBEFACE_E2E_ANDROID_APK": str(apk),
-                "VIBEFACE_E2E_ANDROID_SERIAL": android.serial, "VIBEFACE_DELIVERY_UI_TIMEOUT_MS": str(UI_TIMEOUT_MS)}
+                "VIBEFACE_E2E_ANDROID_SERIAL": android.serial, "VIBEFACE_DELIVERY_UI_TIMEOUT_MS": str(UI_TIMEOUT_MS),
+                "VIBEFACE_DELIVERY_UI_TOTAL_TIMEOUT_MS": str(remaining_ui_timeout_ms(deadline))}
             authority = UI / "xauthority"
             os.close(os.open(authority, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
             ui_process = subprocess.Popen(["xvfb-run", "--auto-servernum", "--server-num", "91", "--auth-file", str(authority),
                 "--error-file", str(UI / "private-display.log"), "--server-args=-screen 0 1440x1000x24 -nolisten tcp",
                 "pnpm", "exec", "e2e", "run", "--config", "e2e.paid.config.ts", "--workers", "2", "--headed",
                 "--no-cache", "--retries", "0", "--video=off"], cwd=ROOT, env=environment, stdout=ui_log, stderr=ui_log, start_new_session=True)
-            join_owned(proof_process, ui_process, android.process, min(deadline, time.monotonic() + UI_TIMEOUT_MS / 1000 + 180))
+            join_owned(proof_process, ui_process, android.process, deadline)
             finalize_ui(android_provenance)
             success = True
+    except BaseException:
+        finish_failed_ui_evidence(proof_process, ui_process, descriptor, deadline)
+        raise
     finally:
         try:
             cleanup_failure = cleanup_owned(android, proof_process, ui_process, name, descriptor, success)
@@ -535,7 +566,7 @@ def public_proof(directory, name, relation):
             "journalHash": value["journalHash"], "receiptSha256": digest(directory / (name + ".receipt"))}
 
 
-def settlement_export(run, directory, windows, amount):
+def settlement_export(run, directory, windows, amount, *, destination=None):
     source = run / directory
     bundle = source / "settlement.json"
     value = json.loads(regular(bundle))
@@ -571,7 +602,7 @@ def settlement_export(run, directory, windows, amount):
     observed_proofs = observed.get("proofs", [])
     if len(observed_proofs) != len(proofs) or {(entry.get("journalHash"), entry.get("receiptSha256")) for entry in observed_proofs} != {("0x" + entry["journalHash"], "0x" + entry["receiptSha256"]) for entry in proofs}:
         raise ValueError("The independent observer did not inspect these exact public receipts")
-    destination = PUBLIC if directory == "settlement" else PUBLIC / directory
+    destination = destination if destination is not None else (PUBLIC if directory == "settlement" else PUBLIC / directory)
     for entry in expected:
         for extension in (".json", ".receipt"):
             name = Path(entry["public"]).stem + extension
@@ -579,6 +610,48 @@ def settlement_export(run, directory, windows, amount):
     publish_file(bundle, destination / "settlement.json", 65536)
     publish_file(observation, destination / "settlement-observation.json", 65536)
     return value, proofs
+
+
+def preserve_strict_evidence(run, compiled, profile, prover):
+    results = list((run / "process").glob("delivery-paid-*/summary.json"))
+    if len(results) != 1:
+        return None
+    regular(results[0])
+    source = results[0].parent / "settlement"
+    encoded = hashlib.sha256(b"vibeface-delivery-profile-v1").digest() + bytes(profile["guest_image_id"]) + bytes(profile["statement_schema_hash"])
+    for field in ("crypto_suite", "max_windows", "max_window_bytes", "max_total_bytes", "max_guest_cycles", "max_prover_memory_bytes"):
+        encoded += profile[field].to_bytes(32, "big")
+    profile_id = hashlib.sha256(encoded).hexdigest()
+    for name in PROOFS:
+        relation = 1 if name == "key-binding" else int(name.split("-")[1])
+        fact = public_proof(source, name, relation)
+        metadata = json.loads(regular(source / (name + ".json"), 16384))
+        if fact["imageId"] != compiled["imageId"] or fact["profileId"] != profile_id:
+            raise ValueError("Partial strict evidence belongs to another current image or profile")
+        verified = subprocess.run([str(prover), "verify", metadata["journal"]], input=regular(source / (name + ".receipt"), 16384),
+            capture_output=True, timeout=120, env={"PATH": "/usr/bin:/bin", "RISC0_SERVER_PATH": "/opt/vdp/bin/r0vm"})
+        if verified.returncode != 0 or len(verified.stdout) > 16384:
+            raise ValueError("Partial strict receipt did not pass the actual current host verifier")
+        value = json.loads(verified.stdout)
+        if value.get("verified") is not True or any(value.get(field) != expected for field, expected in (("kind", "groth16"), ("imageId", compiled["imageId"]), ("journalHash", fact["journalHash"]), ("seal", metadata["seal"]))):
+            raise ValueError("Partial strict host verification did not bind the actual public receipt and seal")
+    names = [*(name + extension for name in PROOFS for extension in (".json", ".receipt")), "settlement.json", "settlement-observation.json"]
+    if any((PUBLIC / name).exists() or (PUBLIC / name).is_symlink() for name in names):
+        raise ValueError("Partial evidence must not replace any existing public result")
+    moved = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="strict-public-", dir=run) as staging:
+            settlement_export(results[0].parent, "settlement", 2, "29", destination=Path(staging))
+            for name in names:
+                os.replace(Path(staging) / name, PUBLIC / name)
+                moved.append(PUBLIC / name)
+    except BaseException:
+        for file in moved:
+            file.unlink(missing_ok=True)
+        raise
+    return {"scope": "strict-only", "genuineProofs": 7, "imageId": compiled["imageId"], "profileId": profile_id,
+            "hostVerified": True, "observerScope": "recorded strict observation before later failure",
+            "canonicalRestorationVerified": False}
 
 
 def checked_ordinary_case(report):
@@ -812,6 +885,117 @@ def branch_exports(report, lifecycle, key_directory, original):
             "indexSha256": digest(ROOT / index_path), "coreRestoredSha256": digest(directory / "core-restored.json"), "absoluteFinality": False}
 
 
+def inspection_exports(run, report, strict_bundle, lifecycle):
+    case = report.get("cases", {}).get("rendered-original-order-inspections", {})
+    if case.get("status") != "passed" or any(type(case.get(field)) is not int or case[field] != expected for field, expected in (("count", 4), ("new_proofs", 0), ("raw_broadcast_delta", 0))) or case.get("strict_order_id") != strict_bundle["orderId"][2:] or case.get("manifest") != str(run / "ui-inspections.json"):
+        raise ValueError("Original-order inspections require the exact current Node-verified manifest and zero financial side effects")
+    manifest = json.loads(regular(run / "ui-inspections.json", 65536))
+    fields = {"schemaVersion", "kind", "status", "strictOrderId", "strictIntentId", "generatedProofs", "inspections"}
+    if set(manifest) != fields or manifest["schemaVersion"] != 1 or manifest["kind"] != "vdp-rendered-inspections" or manifest["status"] != "PASS" or manifest["strictOrderId"] != strict_bundle["orderId"][2:] or str(uuid.UUID(manifest["strictIntentId"])) != manifest["strictIntentId"] or type(manifest["generatedProofs"]) is not int or manifest["generatedProofs"] != 0 or len(manifest["inspections"]) != 4:
+        raise ValueError("Every required rendered inspection must bind the same actual original strict order")
+    source = bytes.fromhex(json.loads(regular(run / "settlement/relation-2-window-0.json", 16384))["journal"])
+    before = bytes.fromhex(json.loads(regular(run / "settlement/key-binding.json", 16384))["journal"])
+    after = bytes.fromhex(json.loads(regular(run / "key-lifecycle/rotate.json", 16384))["journal"])
+    keys = [{"keyId": value[18 * 32:19 * 32].hex(), "serial": int.from_bytes(value[19 * 32:20 * 32], "big")} for value in (before, after)]
+    if keys[0]["serial"] != 1 or keys[1]["serial"] != 2 or keys[0]["keyId"] == keys[1]["keyId"] or keys[1]["serial"] != lifecycle["operations"][0]["serial"]:
+        raise ValueError("Inspection key identities must match the actual original and rotated receiving certificates")
+    partial = {"phase": "partial", "paymentState": "withdrawn", "earned": "12", "withdrawn": "12", "refunded": "17", "evidence": "none",
+               "windows": [{"state": "earned", "decryptionProven": True}, {"state": "refunded", "decryptionProven": False}], "receiverKey": None}
+    unknown = {**partial, "phase": "reconciling", "paymentState": "unknown", "windows": [{"state": "pending", "decryptionProven": False}] * 2}
+    expected = ({"phase": None, "paymentState": None, "earned": None, "withdrawn": None, "refunded": None, "evidence": None, "windows": [], "receiverKey": keys[0]},
+                partial, unknown, {**partial, "receiverKey": keys[1]})
+    index = json.loads(regular(PUBLIC / "branches/index.json", 256 * 1024))
+    for name in ("partial-refund", "mixed-held-rotate"):
+        branch = next((entry for entry in index["cases"] if entry["case"] == name), None)
+        if branch is None or branch["status"] != "EVM_PASS" or any(branch["actual"].get(field) != amount for field, amount in (("earned", "12"), ("withdrawn", "12"), ("refunded", "17"))) or branch["actual"]["phases"] != [3, 4]:
+            raise ValueError("Rendered partial and rotated-order states must match their actual original-chain branch ledgers")
+    identifiers, screenshots = set(), []
+    for position, (value, specification) in enumerate(zip(manifest["inspections"], INSPECTIONS)):
+        kind, role, name = specification
+        if set(value) != {"id", "kind", "role", "nodePeer", "orderId", "intentId", "screenshot", "sha256", "bytes", "observed", "checks"} or not isinstance(value["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value["id"]) or value["id"] in identifiers or value["kind"] != kind or value["role"] != role or value["screenshot"] != name or value["nodePeer"] != source[(10 if role == "web" else 11) * 32:(11 if role == "web" else 12) * 32].hex():
+            raise ValueError("Each inspection must name its exact bounded stage, actual Node peer and dedicated screenshot")
+        identifiers.add(value["id"])
+        if value["orderId"] != (None if position == 0 else manifest["strictOrderId"]) or value["intentId"] != (None if position == 0 else manifest["strictIntentId"]) or value["observed"] != expected[position]:
+            raise ValueError("Inspection UI state must match the real partial, unknown or receiving-key state of the original order")
+        if any(type(window["decryptionProven"]) is not bool for window in value["observed"]["windows"]) or (value["observed"]["receiverKey"] is not None and type(value["observed"]["receiverKey"]["serial"]) is not int):
+            raise ValueError("Inspection decryption flags and receiving-key serial must retain their exact protocol types")
+        checks = value["checks"]
+        if set(checks) != {"walletLocked", "rawBroadcastDelta", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored"} or type(checks["rawBroadcastDelta"]) is not int or checks["rawBroadcastDelta"] != 0 or any(checks[field] is not True for field in ("walletLocked", "proofJobsUnchanged", "transactionIntentsUnchanged", "canonicalRestored")):
+            raise ValueError("Inspection cannot unlock a wallet, broadcast, regenerate a proof, replace intent or leave the transport fault active")
+        file = UI / "public" / name
+        data = regular(file, 10 * 1024 ** 2)
+        if type(value["bytes"]) is not int or value["bytes"] != len(data) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) or value["sha256"] != digest(file) or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("Inspection receipt must bind the actual bounded rendered PNG bytes")
+        screenshots.append(file)
+    for file in screenshots:
+        publish_file(file, PUBLIC / "ui" / file.name, 10 * 1024 ** 2)
+    publish_file(run / "ui-inspections.json", PUBLIC / "ui/ui-inspections.json", 65536)
+    return {"status": "PASS", "count": 4, "newProofs": 0, "strictOrderId": manifest["strictOrderId"],
+            "manifestSha256": digest(PUBLIC / "ui/ui-inspections.json")}
+
+
+def recovery_evidence(report, strict_bundle, original):
+    prefix = report.get("cases", {}).get("paid-provider-sigkill-resumes-committed-prefix-and-discards-uncommitted-tail", {})
+    fields = {"status", "order_id", "signal", "exit_code", "wallet_locked", "committed_before", "committed_after", "uncommitted_tail_bytes", "truncate_on_first_valid_append", "original_ciphertext_prefix_matches", "transaction_rows_unchanged", "proof_rows_unchanged", "raw_broadcast_delta", "new_proofs", "original_order"}
+    if set(prefix) != fields or prefix["status"] != "passed" or prefix["order_id"] != strict_bundle["orderId"][2:] or prefix["signal"] != "SIGKILL" or any(type(prefix[field]) is not int or prefix[field] != expected for field, expected in (("exit_code", -9), ("committed_before", 8192), ("committed_after", 16384), ("uncommitted_tail_bytes", len(b"uncommitted-delivery-tail" * 7)), ("raw_broadcast_delta", 0), ("new_proofs", 0))) or any(prefix[field] is not True for field in ("wallet_locked", "truncate_on_first_valid_append", "original_ciphertext_prefix_matches", "transaction_rows_unchanged", "proof_rows_unchanged", "original_order")):
+        raise ValueError("Actual provider crash recovery must preserve committed encrypted bytes and discard the uncommitted tail without finance or new proofs")
+    held = report.get("cases", {}).get("real-paid-held-and-key-published-sigkill-recovery", {})
+    if set(held) != {"status", "new_proofs", "original_order", "points"} or held["status"] != "passed" or type(held["new_proofs"]) is not int or held["new_proofs"] != 0 or held["original_order"] is not True or len(held["points"]) != 2:
+        raise ValueError("Both existing paid recovery points require actual process SIGKILL evidence")
+    for value, point in zip(held["points"], ("held", "key-published")):
+        if set(value) != {"point", "order_id", "nodes", "earned_before", "earned_after", "proof_rows_unchanged", "transaction_rows_unchanged", "original_sha256", "original_bytes", "raw_broadcast_delta", "warm_cached_material"} or value["point"] != point or value["order_id"] != strict_bundle["orderId"][2:] or value["earned_before"] != "0" or value["earned_after"] != "0" or value["original_sha256"] != original["sha256"] or type(value["original_bytes"]) is not int or value["original_bytes"] != 130816 or type(value["raw_broadcast_delta"]) is not int or value["raw_broadcast_delta"] != 0 or any(value[field] is not True for field in ("proof_rows_unchanged", "transaction_rows_unchanged", "warm_cached_material")) or len(value["nodes"]) != 2:
+            raise ValueError("Paid crash recovery must retain the exact original file, warm material and unchanged financial and proof rows")
+        for node, role in zip(value["nodes"], ("R", "P")):
+            if set(node) != {"role", "pid", "signal", "exit_code", "wallet_locked"} or node["role"] != role or type(node["pid"]) is not int or node["pid"] <= 0 or node["signal"] != "SIGKILL" or type(node["exit_code"]) is not int or node["exit_code"] != -9 or node["wallet_locked"] is not True:
+                raise ValueError("Each paid recovery point must actually kill and restart its exact receiver and provider locked")
+        if len({node["pid"] for node in value["nodes"]}) != 2:
+            raise ValueError("Receiver and provider recovery evidence must name two distinct actual processes")
+    return {"providerPrefix": prefix, "heldAndPublished": held, "scope": "warm cached material on the original order; no cold reproving"}
+
+
+def principal_evidence(report, strict_bundle):
+    client = report.get("cases", {}).get("paid-client-principal-boundaries", {})
+    service = report.get("cases", {}).get("paid-service-grant-and-private-alpn-boundaries", {})
+    for value, flags in ((client, ("wallets_unlocked", "dag_unchanged_during_checks", "manager_positive_controls")),
+                         (service, ("wallets_unlocked", "positive_paid_announcement", "positive_source_and_receiver_order",
+                                    "positive_receiver_ciphertext_read", "expired_signature_verified", "financial_objects_settings_dag_work_unchanged"))):
+        if value.get("status") != "passed" or value.get("order_id") != strict_bundle["orderId"][2:] or any(value.get(field) is not True for field in flags):
+            raise ValueError("Paid authority boundaries require their actual original order and all positive controls")
+        if any(type(value.get(field)) is not int or value[field] != 0 for field in ("raw_broadcast_delta", "new_orders", "new_proofs")):
+            raise ValueError("Authority checks cannot broadcast, create an order or generate another proof")
+        if not isinstance(value.get("before_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", value["before_sha256"]) or value["before_sha256"] != value.get("after_sha256"):
+            raise ValueError("Authority checks must preserve the actual financial and private state")
+    if str(uuid.UUID(client["intent_id"])) != client["intent_id"]:
+        raise ValueError("Client authority evidence requires its actual original intent")
+    nonmember = "this device is not a member of the personal network"
+    restricted = "delivery writes and spending require a managing member of your personal network"
+    expected = [{"actor": actor, "op": op, "rejection": nonmember if actor == "outsider" else restricted}
+                for actor in ("outsider", "member", "local_session") for op in ("prepare", "confirm", "configure")]
+    expected += [{"actor": actor, "op": op, "rejection": nonmember}
+                 for actor, operations in (("outsider", ("get", "nodes")), ("foreign_manager", ("get", "confirm", "nodes"))) for op in operations]
+    expected += [{"actor": actor, "op": "status-get-nodes", "allowed": True} for actor in ("member", "local_session")]
+    if client.get("checks") != expected or any(row.get("allowed") is not True for row in client["checks"][-2:]):
+        raise ValueError("Every actual client role must exercise its fixed writes, private reads and allowed same-network reads")
+    agent = client.get("agent", {})
+    expected_agent = [{"entry": entry, "op": op, "rejection": rejection}
+                      for entry, operations, rejection in (("agent-tool", ("confirm", "configure", "get"), "unknown or unavailable coordination tool"),
+                                                            ("agent-bearer-client", ("confirm", "configure", "get", "nodes"), nonmember)) for op in operations]
+    if agent.get("passed") is not True or agent.get("valid_token_before_and_after") is not True or agent.get("checks") != expected_agent:
+        raise ValueError("Agent authority needs a valid live token before and after every fixed tool and client rejection")
+    completion = client.get("agent_completion", {})
+    if completion.get("state") != "completed" or type(completion.get("new_events")) is not int or completion["new_events"] != 1 or type(completion.get("new_work")) is not int or completion["new_work"] != 0 or completion.get("financial_state_unchanged") is not True or not isinstance(completion.get("event_hash"), str) or not re.fullmatch(r"[0-9a-f]{64}", completion["event_hash"]):
+        raise ValueError("Only the original Agent's normal completion may follow the side-effect-free authority checks")
+    expected_service = {"receiver": ["receiver-valid-read", "receiver-write-grant-wrong-role", "signed-expired-grant"],
+                        "source": ["source-read-grant-wrong-role"],
+                        "outsider": ["outsider-order", "outsider-grant-role", "outsider-other-peer-grant", "private-rpc-sync-blob-all-three-nodes"]}
+    if service.get("checks") != expected_service or service.get("expiry_fixture") != "resigned-provider-host-unix-seconds" or type(service.get("private_alpn_targets")) is not int or service["private_alpn_targets"] != 3 or service.get("private_alpns") != ["rpc", "sync", "blob"]:
+        raise ValueError("Service authority needs real paid roles, correctly signed expiry and every private protocol at all three Nodes")
+    return {"status": "PASS", "orderId": strict_bundle["orderId"], "clientChecks": 16, "agentChecks": 7,
+            "serviceChecks": 8, "privateAlpnChecks": 9, "rawBroadcastDelta": 0, "newOrders": 0, "newProofs": 0,
+            "clientStateSha256": client["before_sha256"], "serviceStateSha256": service["before_sha256"],
+            "agentCompletionEventHash": completion["event_hash"]}
+
+
 def public_exports(run, report, compiled):
     original = checked_capacity_case(report)
     ordinary = checked_ordinary_case(report)
@@ -824,10 +1008,14 @@ def public_exports(run, report, compiled):
     if len(unique) != 13 or len({proof["journalHash"] for proof in unique}) != 13 or len({proof["receiptSha256"] for proof in unique}) != 13 or any(proof["imageId"] != compiled["imageId"] for proof in unique) or len({proof["profileId"] for proof in unique}) != 1:
         raise ValueError("Live acceptance requires thirteen distinct real receipts bound to the actual guest and one profile")
     branches = branch_exports(report, lifecycle, run / "key-lifecycle", original)
+    inspections = inspection_exports(run, report, strict_bundle, lifecycle)
+    recovery = recovery_evidence(report, strict_bundle, original)
+    principals = principal_evidence(report, strict_bundle)
     return {"genuineProofs": 13, "earned": "29", "withdrawn": "29", "paymentScope": "strict maximum-file order",
             "readOnlyObserver": True, "originalFile": original, "ordinary": ordinary,
             "keyLifecycle": {"generatedProofs": 3, "finalActiveSerial": lifecycle["finalActiveSerial"],
-                             "finalBindingJournalHash": lifecycle["finalBindingJournalHash"]}, "branches": branches}
+                             "finalBindingJournalHash": lifecycle["finalBindingJournalHash"]}, "branches": branches,
+            "inspections": inspections, "recovery": recovery, "principals": principals}
 
 
 def checked_ui_evidence(summary, web, android, report):
@@ -896,8 +1084,20 @@ def finalize_ui(android_provenance):
     summary = json.loads(regular(PUBLIC / "summary.json", 65536))
     resources_report = json.loads(regular(PUBLIC / "resources.json", 16384))
     branches = summary.get("branches", {})
-    if summary.get("status") != "PROOFS_PASS" or summary.get("genuineProofs") != 13 or branches.get("status") != "PASS" or branches.get("caseCount") != len(BRANCH_CASES) or branches.get("coreRestored") is not True or summary.get("sourceCommit") != android_provenance["sourceCommit"] or resources_report.get("resourceStatus") != "PASS" or any(resources_report.get("oomEventsDelta", {}).get(field) != 0 for field in ("oom", "oom_kill", "oom_group_kill")):
+    inspections = summary.get("inspections", {})
+    if summary.get("status") != "PROOFS_PASS" or summary.get("genuineProofs") != 13 or branches.get("status") != "PASS" or branches.get("caseCount") != len(BRANCH_CASES) or branches.get("coreRestored") is not True or inspections.get("status") != "PASS" or inspections.get("count") != 4 or inspections.get("newProofs") != 0 or summary.get("sourceCommit") != android_provenance["sourceCommit"] or resources_report.get("resourceStatus") != "PASS" or any(resources_report.get("oomEventsDelta", {}).get(field) != 0 for field in ("oom", "oom_kill", "oom_group_kill")):
         raise ValueError("UI cannot upgrade missing or failed actual proof acceptance")
+    manifest_file = PUBLIC / "ui/ui-inspections.json"
+    manifest = json.loads(regular(manifest_file, 65536))
+    if digest(manifest_file) != inspections["manifestSha256"] or manifest["strictOrderId"] != inspections["strictOrderId"] or len(manifest["inspections"]) != len(INSPECTIONS):
+        raise ValueError("Host UI join requires the exact Node-verified original-order inspection manifest")
+    for value, (_, _, name) in zip(manifest["inspections"], INSPECTIONS):
+        if value["screenshot"] != name:
+            raise ValueError("Inspect only the four exact original-order PNG files")
+        for file in (UI / "public" / name, PUBLIC / "ui" / name):
+            data = regular(file, 10 * 1024 ** 2)
+            if len(data) != value["bytes"] or digest(file) != value["sha256"] or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("Host UI join found changed inspection screenshot bytes")
     web = json.loads(regular(UI / "public/web.json", 16384))
     android = json.loads(regular(UI / "public/android.json", 16384))
     report = json.loads(regular(UI / "e2e/report.json", 8 * 1024 ** 2))
@@ -908,7 +1108,12 @@ def finalize_ui(android_provenance):
         if name.endswith(".png") and not regular(source, 10 * 1024 ** 2).startswith(b"\x89PNG\r\n\x1a\n"):
             raise ValueError("Only the three explicit post-join PNG screenshots may be published")
         publish_file(source, PUBLIC / "ui" / name, 10 * 1024 ** 2 if name.endswith(".png") else 16384)
-    summary.update(status="PASS", ui=joined, videos=videos, android={"sourceCommit": android_provenance["sourceCommit"],
+    settled = UI / "public/web-settled.png"
+    settled_bytes = regular(settled, 10 * 1024 ** 2)
+    if not settled_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("The ordinary Web order requires its actual post-settlement PNG")
+    publish_file(settled, PUBLIC / "ui/web-settled.png", 10 * 1024 ** 2)
+    summary.update(status="PASS", ui=joined, videos=videos, settledScreenshot={"file": "web-settled.png", "bytes": len(settled_bytes), "sha256": digest(settled)}, android={"sourceCommit": android_provenance["sourceCommit"],
                    "variant": android_provenance["variant"], "applicationId": android_provenance["applicationId"], "apks": android_provenance["apks"]})
     replace_public(PUBLIC / "summary.json", summary)
 
@@ -944,7 +1149,8 @@ def inside(package, expected):
     owner = [os.environ.get("VIBEFACE_DELIVERY_UI_" + field, "") for field in ("UID", "GID")]
     if any(not re.fullmatch(r"[0-9]{1,10}", value) or int(value) >= 2 ** 32 for value in owner):
         raise ValueError("The host must supply bounded numeric UI owner IDs")
-    if PUBLIC.is_symlink() or not PUBLIC.is_dir() or PUBLIC.stat().st_uid != int(owner[0]) or PUBLIC.stat().st_gid != int(owner[1]) or list(PUBLIC.iterdir()):
+    public_ui = PUBLIC / "ui"
+    if PUBLIC.is_symlink() or not PUBLIC.is_dir() or PUBLIC.stat().st_uid != int(owner[0]) or PUBLIC.stat().st_gid != int(owner[1]) or set(PUBLIC.iterdir()) != {public_ui} or public_ui.is_symlink() or not public_ui.is_dir() or public_ui.stat().st_uid != int(owner[0]) or public_ui.stat().st_gid != int(owner[1]) or list(public_ui.iterdir()):
         raise ValueError("The host must create one fresh public directory owned by its task user")
     log = run / "private-task.log"
     cgroup, initial = resources()
@@ -985,10 +1191,20 @@ def inside(package, expected):
             "max_service_amount": "1000000", "source_gas_cap_wei": "1000000000000000000",
             "provider_gas_cap_wei": "1000000000000000000", "register_key_gas_cap_wei": "1000000000000000000",
             "settlement_observer": "/work/contracts/delivery/observe-settlement.mjs"})
-        command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary),
+        try:
+            command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary),
                 "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
                 "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/proofs/delivery/profile.json",
                 "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log, env=environment)
+        except RuntimeError:
+            summary["failureStage"] = "paid-process-acceptance"
+            try:
+                preserved = preserve_strict_evidence(run, compiled, profile, prover)
+                if preserved is not None:
+                    summary["partialEvidence"] = preserved
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                print("UNVERIFIED delivery-live strict-only partial evidence unavailable", flush=True)
+            raise
         results = list((run / "process").glob("delivery-paid-*/summary.json"))
         if len(results) != 1:
             raise ValueError("Expected exactly one actual paid process acceptance result")
@@ -1085,6 +1301,28 @@ def self_test_ui(directory):
         ready = Mock(poll=Mock(return_value=0))
         running = Mock(poll=Mock(return_value=None))
         failed = Mock(poll=Mock(return_value=1))
+        with patch("time.monotonic", return_value=100):
+            assert remaining_ui_timeout_ms(100.75) == 750
+            rejected(lambda: remaining_ui_timeout_ms(100))
+            rejected(lambda: remaining_ui_timeout_ms(100 + LIVE_TIMEOUT_SECONDS + 1))
+        with patch(f"{__name__}.controller", side_effect=OSError("closed private controller")) as abort, patch("time.monotonic", side_effect=[100, 100.5, 101]), patch("time.sleep") as pause:
+            finish_failed_ui_evidence(running, failed, value, 101)
+            abort.assert_called_once_with(value, "/abort", {"role": "web"})
+            assert pause.call_count == 1
+        with patch(f"{__name__}.controller") as abort, patch("time.monotonic", side_effect=[100, 160]), patch("time.sleep") as pause:
+            original = RuntimeError("original paid UI failure")
+            try:
+                try:
+                    raise original
+                except RuntimeError:
+                    finish_failed_ui_evidence(running, failed, value, 500)
+                    raise
+            except RuntimeError as raised:
+                assert raised is original
+            pause.assert_not_called()
+        with patch(f"{__name__}.controller") as abort:
+            finish_failed_ui_evidence(running, ready, value, time.monotonic() + 10)
+            abort.assert_not_called()
         join_owned(ready, ready, running, time.monotonic() + 10)
         for processes in ((failed, running, running), (running, failed, running), (ready, ready, ready)):
             rejected(lambda: join_owned(*processes, time.monotonic() + 10))
@@ -1160,6 +1398,50 @@ def self_test_exports(directory, report):
         (run / name).mkdir(parents=True)
     original = {"bytes": 130816, "max_file_bytes": 130816, "capacity_boundary": True, "sha256": "a" * 64}
     report["cases"]["two-window-source-hold-open-and-original-file"] = original
+    nonmember = "this device is not a member of the personal network"
+    restricted = "delivery writes and spending require a managing member of your personal network"
+    client_checks = [{"actor": actor, "op": op, "rejection": error}
+                     for actor, error in (("outsider", nonmember), ("member", restricted), ("local_session", restricted))
+                     for op in ("prepare", "confirm", "configure")]
+    client_checks += [{"actor": "outsider", "op": op, "rejection": nonmember} for op in ("get", "nodes")]
+    client_checks += [{"actor": "foreign_manager", "op": op, "rejection": nonmember} for op in ("get", "confirm", "nodes")]
+    client_checks += [{"actor": actor, "op": "status-get-nodes", "allowed": True} for actor in ("member", "local_session")]
+    agent_checks = [{"entry": "agent-tool", "op": op, "rejection": "unknown or unavailable coordination tool"} for op in ("confirm", "configure", "get")]
+    agent_checks += [{"entry": "agent-bearer-client", "op": op, "rejection": nonmember} for op in ("confirm", "configure", "get", "nodes")]
+    client_case = {"status": "passed", "order_id": "a" * 64, "intent_id": str(uuid.uuid4()), "checks": client_checks,
+                   "agent": {"passed": True, "valid_token_before_and_after": True, "checks": agent_checks},
+                   "before_sha256": "c" * 64, "after_sha256": "c" * 64, "wallets_unlocked": True,
+                   "raw_broadcast_delta": 0, "new_orders": 0, "new_proofs": 0, "dag_unchanged_during_checks": True,
+                   "manager_positive_controls": True,
+                   "agent_completion": {"state": "completed", "new_events": 1, "event_hash": "e" * 64, "new_work": 0, "financial_state_unchanged": True}}
+    service_case = {"status": "passed", "order_id": "a" * 64,
+                    "checks": {"receiver": ["receiver-valid-read", "receiver-write-grant-wrong-role", "signed-expired-grant"],
+                               "source": ["source-read-grant-wrong-role"],
+                               "outsider": ["outsider-order", "outsider-grant-role", "outsider-other-peer-grant", "private-rpc-sync-blob-all-three-nodes"]},
+                    "positive_paid_announcement": True, "positive_source_and_receiver_order": True,
+                    "positive_receiver_ciphertext_read": True, "expired_signature_verified": True,
+                    "expiry_fixture": "resigned-provider-host-unix-seconds", "private_alpn_targets": 3, "private_alpns": ["rpc", "sync", "blob"],
+                    "before_sha256": "d" * 64, "after_sha256": "d" * 64, "wallets_unlocked": True,
+                    "raw_broadcast_delta": 0, "new_orders": 0, "new_proofs": 0, "financial_objects_settings_dag_work_unchanged": True}
+    client_name, service_name = "paid-client-principal-boundaries", "paid-service-grant-and-private-alpn-boundaries"
+    report["cases"].update({client_name: client_case, service_name: service_case})
+    bundle = {"orderId": "0x" + "a" * 64}
+    assert principal_evidence(report, bundle)["privateAlpnChecks"] == 9
+    for case_name, field, invalid in ((client_name, "raw_broadcast_delta", False), (client_name, "checks", client_checks[:-1]),
+                                      (client_name, "agent", {**client_case["agent"], "valid_token_before_and_after": False}),
+                                      (service_name, "after_sha256", "f" * 64), (service_name, "expired_signature_verified", 1),
+                                      (service_name, "private_alpns", ["rpc", "sync"]), (service_name, "status", "skipped")):
+        changed = deepcopy(report)
+        changed["cases"][case_name][field] = invalid
+        try:
+            principal_evidence(changed, bundle)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Missing, untrusted or state-changing authority checks cannot become public PASS evidence")
+    private_marker = "private-principal-fixture-must-not-export"
+    report["cases"][client_name]["private_diagnostic"] = private_marker
+    assert private_marker not in json.dumps(principal_evidence(report, bundle))
     ordinary_case = report["cases"]["ordinary-paid-real-web-android-offline-recovery-and-save"]
     adapter = directory / "contracts/delivery/RiscZeroAdapter.sol"
     adapter.parent.mkdir(parents=True)
@@ -1174,6 +1456,7 @@ def self_test_exports(directory, report):
         for index, value in ((1, relation), (19, serial), (45, identifier), (46, action)):
             journal[32 * index:32 * (index + 1)] = value.to_bytes(32, "big")
         journal[128:160], journal[160:192], journal[704:736] = bytes.fromhex("c" * 64), bytes.fromhex("b" * 64), bytes.fromhex("e" * 64)
+        journal[10 * 32:11 * 32], journal[11 * 32:12 * 32], journal[18 * 32:19 * 32] = bytes.fromhex("1" * 64), bytes.fromhex("2" * 64), bytes([serial + 2]) * 32
         value = {"mode": "prove", "kind": "groth16", "relation": relation, "imageId": "b" * 64, "profileId": "c" * 64,
                  "journal": journal.hex(), "journalHash": hashlib.sha256(journal).hexdigest(), "seal": "73c457ba" + "00" * 256}
         write_private(parent / (name + ".json"), value)
@@ -1246,6 +1529,8 @@ def self_test_exports(directory, report):
             record = {"schemaVersion": 1, "sessionId": session, "case": name, "status": "EVM_PASS", "newProofs": 0, "originalGenuineProofSet": 7,
                       "state": deepcopy(core_state), "imageId": "0x" + "b" * 64, "profileId": "0x" + "c" * 64,
                       "confirmationPolicy": policy, "transactions": [], "nodeObservations": [], "nodeAutonomy": "SELF_TEST_EXPORT_FORMAT_ONLY"}
+            if name == "partial-refund":
+                record["state"] = deepcopy(mixed["state"])
             if incoming:
                 successful = name in ("incoming-reentrancy", "incoming-nonreturn")
                 record.update(snapshotKind="C0Prime", actualFundReceiptStatus=int(successful), nodeAutonomy="NOT_TESTED_ORIGINAL_BROADCAST_RAW_ONLY")
@@ -1287,8 +1572,65 @@ def self_test_exports(directory, report):
     write_private(branch_directory / "index.json", index)
     report["cases"]["genuine-branches-and-canonical-restoration"] = {"status": "passed", "session_id": session, "helper_new_proofs": 0, "core_restored": True,
         "public_index": str(Path(".artifacts/vdp/contracts/branch-observations") / session / "index.json")}
-    with patch(f"{__name__}.PUBLIC", public), patch(f"{__name__}.ROOT", directory):
+    ui = directory / "inspection-ui"
+    (ui / "public").mkdir(parents=True)
+    strict_intent = str(uuid.uuid4())
+    partial_observed = {"phase": "partial", "paymentState": "withdrawn", "earned": "12", "withdrawn": "12", "refunded": "17", "evidence": "none",
+                        "windows": [{"state": "earned", "decryptionProven": True}, {"state": "refunded", "decryptionProven": False}], "receiverKey": None}
+    states = ({"phase": None, "paymentState": None, "earned": None, "withdrawn": None, "refunded": None, "evidence": None, "windows": [], "receiverKey": {"keyId": "03" * 32, "serial": 1}},
+              partial_observed, {**partial_observed, "phase": "reconciling", "paymentState": "unknown", "windows": [{"state": "pending", "decryptionProven": False}] * 2},
+              {**partial_observed, "receiverKey": {"keyId": "04" * 32, "serial": 2}})
+    inspections = []
+    for position, (kind, role, name) in enumerate(INSPECTIONS):
+        file = ui / "public" / name
+        file.write_bytes(b"\x89PNG\r\n\x1a\nself-test byte fixture; not a rendered UI")
+        inspections.append({"id": "self-test-" + kind, "kind": kind, "role": role, "nodePeer": ("1" if role == "web" else "2") * 64,
+            "orderId": None if position == 0 else "a" * 64, "intentId": None if position == 0 else strict_intent,
+            "screenshot": name, "sha256": digest(file), "bytes": file.stat().st_size, "observed": states[position],
+            "checks": {"walletLocked": True, "rawBroadcastDelta": 0, "proofJobsUnchanged": True, "transactionIntentsUnchanged": True, "canonicalRestored": True}})
+    manifest = {"schemaVersion": 1, "kind": "vdp-rendered-inspections", "status": "PASS", "strictOrderId": "a" * 64, "strictIntentId": strict_intent, "generatedProofs": 0, "inspections": inspections}
+    write_private(run / "ui-inspections.json", manifest)
+    report["cases"]["rendered-original-order-inspections"] = {"status": "passed", "manifest": str(run / "ui-inspections.json"), "count": 4, "new_proofs": 0, "raw_broadcast_delta": 0, "strict_order_id": "a" * 64}
+    report["cases"]["paid-provider-sigkill-resumes-committed-prefix-and-discards-uncommitted-tail"] = {"status": "passed", "order_id": "a" * 64, "signal": "SIGKILL", "exit_code": -9, "wallet_locked": True,
+        "committed_before": 8192, "committed_after": 16384, "uncommitted_tail_bytes": 175, "truncate_on_first_valid_append": True, "original_ciphertext_prefix_matches": True,
+        "transaction_rows_unchanged": True, "proof_rows_unchanged": True, "raw_broadcast_delta": 0, "new_proofs": 0, "original_order": True}
+    report["cases"]["real-paid-held-and-key-published-sigkill-recovery"] = {"status": "passed", "new_proofs": 0, "original_order": True,
+        "points": [{"point": point, "order_id": "a" * 64, "nodes": [{"role": role, "pid": pid, "signal": "SIGKILL", "exit_code": -9, "wallet_locked": True} for role, pid in (("R", 100), ("P", 101))],
+                    "earned_before": "0", "earned_after": "0", "proof_rows_unchanged": True, "transaction_rows_unchanged": True, "original_sha256": "a" * 64, "original_bytes": 130816,
+                    "raw_broadcast_delta": 0, "warm_cached_material": True} for point in ("held", "key-published")]}
+    with patch(f"{__name__}.PUBLIC", public), patch(f"{__name__}.ROOT", directory), patch(f"{__name__}.UI", ui):
         assert public_exports(run, report, {"imageId": "b" * 64})["genuineProofs"] == 13
+        assert json.loads((public / "ui/ui-inspections.json").read_bytes())["generatedProofs"] == 0
+        for position, field, value in ((2, "observed", partial_observed), (3, "nodePeer", "f" * 64), (0, "screenshot", "../private-node.png")):
+            changed = deepcopy(manifest)
+            changed["inspections"][position][field] = value
+            (run / "ui-inspections.json").write_text(json.dumps(changed))
+            try:
+                public_exports(run, report, {"imageId": "b" * 64})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Inspection must show the actual unknown state, correct Node and exact public PNG")
+        (run / "ui-inspections.json").write_text(json.dumps(manifest))
+        for field, value in (("rawBroadcastDelta", False), ("walletLocked", 1), ("canonicalRestored", False)):
+            changed = deepcopy(manifest)
+            changed["inspections"][2]["checks"][field] = value
+            (run / "ui-inspections.json").write_text(json.dumps(changed))
+            try:
+                public_exports(run, report, {"imageId": "b" * 64})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Inspection requires exact boolean safeguards, integer zero broadcasts and restored transport")
+        (run / "ui-inspections.json").write_text(json.dumps(manifest))
+        changed = deepcopy(report)
+        changed["cases"]["real-paid-held-and-key-published-sigkill-recovery"]["points"][0]["nodes"][1]["role"] = "R"
+        try:
+            public_exports(run, changed, {"imageId": "b" * 64})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Recovery must include both actual receiver and provider, not duplicate roles")
         mixed_source = run / "key-lifecycle/mixed-held.json"
         original_mixed = mixed_source.read_bytes()
         unprefixed = json.loads(original_mixed)
@@ -1369,6 +1711,85 @@ def self_test_exports(directory, report):
             pass
         else:
             raise AssertionError("A reused receipt cannot count as a newly generated ordinary proof")
+
+
+def self_test_partial_evidence(directory):
+    from unittest.mock import Mock, patch
+    run = directory / "failed-paid-run"
+    source = run / "process/delivery-paid-fixture/settlement"
+    source.mkdir(parents=True)
+    for name in [*(name + extension for name in PROOFS for extension in (".json", ".receipt")), "settlement.json", "settlement-observation.json"]:
+        shutil.copyfile(directory / "proof-export-fixtures/settlement" / name, source / name)
+    write_private(source.parent / "summary.json", {"status": "failed", "privateFixture": "must never be exported"})
+    profile = {"guest_image_id": [187] * 32, "statement_schema_hash": [221] * 32, "crypto_suite": 1, "max_windows": 2,
+               "max_window_bytes": 65536, "max_total_bytes": 131072, "max_guest_cycles": 64000000, "max_prover_memory_bytes": 16 * 1024 ** 3}
+    encoded = hashlib.sha256(b"vibeface-delivery-profile-v1").digest() + bytes(profile["guest_image_id"]) + bytes(profile["statement_schema_hash"])
+    for field in ("crypto_suite", "max_windows", "max_window_bytes", "max_total_bytes", "max_guest_cycles", "max_prover_memory_bytes"):
+        encoded += profile[field].to_bytes(32, "big")
+    profile_id = hashlib.sha256(encoded).hexdigest()
+    observed = json.loads((source / "settlement-observation.json").read_bytes())
+    verified = {}
+    for position, name in enumerate(PROOFS):
+        file = source / (name + ".json")
+        value = json.loads(file.read_bytes())
+        journal = bytearray.fromhex(value["journal"])
+        journal[128:160] = bytes.fromhex(profile_id)
+        value.update(profileId=profile_id, journal=journal.hex(), journalHash=hashlib.sha256(journal).hexdigest())
+        file.write_text(json.dumps(value))
+        observed["proofs"][position]["journalHash"] = "0x" + value["journalHash"]
+        verified[value["journal"]] = {"verified": True, "kind": "groth16", "imageId": "b" * 64, "journalHash": value["journalHash"], "seal": value["seal"]}
+    (source / "settlement-observation.json").write_text(json.dumps(observed))
+    public = directory / "strict-only-public"
+    public.mkdir()
+
+    def actual_host_command(arguments, **options):
+        assert arguments[:2] == ["/fixture-current-host", "verify"] and isinstance(options["input"], bytes)
+        return Mock(returncode=0, stdout=json.dumps(verified[arguments[2]]).encode())
+
+    with patch(f"{__name__}.ROOT", directory), patch(f"{__name__}.PUBLIC", public), patch("subprocess.run", side_effect=actual_host_command) as host:
+        partial = preserve_strict_evidence(run, {"imageId": "b" * 64}, profile, Path("/fixture-current-host"))
+        assert partial["scope"] == "strict-only" and partial["genuineProofs"] == 7 and partial["canonicalRestorationVerified"] is False
+        assert host.call_count == 7 and len(list(public.iterdir())) == 16 and not (public / "summary.json").exists()
+        for file in public.iterdir():
+            file.unlink()
+        for wrong in ({**profile, "max_windows": 3}, profile):
+            host.side_effect = actual_host_command if wrong is not profile else None
+            host.return_value = Mock(returncode=1, stdout=b"")
+            try:
+                preserve_strict_evidence(run, {"imageId": "b" * 64}, wrong, Path("/fixture-current-host"))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("A foreign profile or failed actual host verify must not export partial receipts")
+            assert not list(public.iterdir())
+        host.side_effect = actual_host_command
+        observation = source / "settlement-observation.json"
+        contents = observation.read_bytes()
+        observation.unlink()
+        try:
+            preserve_strict_evidence(run, {"imageId": "b" * 64}, profile, Path("/fixture-current-host"))
+        except (OSError, ValueError):
+            pass
+        else:
+            raise AssertionError("Strict-only evidence requires its actual successful independent observer")
+        assert not list(public.iterdir())
+        observation.write_bytes(contents)
+        real_replace, calls = os.replace, []
+
+        def failed_move(source_file, destination):
+            calls.append(destination)
+            if len(calls) == 2:
+                raise OSError("synthetic partial publication failure")
+            return real_replace(source_file, destination)
+
+        with patch("os.replace", side_effect=failed_move):
+            try:
+                preserve_strict_evidence(run, {"imageId": "b" * 64}, profile, Path("/fixture-current-host"))
+            except OSError:
+                pass
+            else:
+                raise AssertionError("Failed partial publication must retain its original error")
+        assert not list(public.iterdir())
 
 
 def self_test_videos(directory):
@@ -1470,6 +1891,7 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix="live-self-test-", dir=ARTIFACTS) as directory:
         paid = self_test_ui(Path(directory))
         self_test_exports(Path(directory), paid)
+        self_test_partial_evidence(Path(directory))
         self_test_videos(Path(directory))
         file = Path(directory) / "private.json"
         write_private(file, {"configured": True})

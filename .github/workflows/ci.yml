@@ -652,6 +652,12 @@ jobs:
             .artifacts/vdp/live-public/ui/web.png
             .artifacts/vdp/live-public/ui/android-offline.png
             .artifacts/vdp/live-public/ui/android.png
+            .artifacts/vdp/live-public/ui/ui-inspections.json
+            .artifacts/vdp/live-public/ui/web-partial-refund.png
+            .artifacts/vdp/live-public/ui/web-unknown-transaction.png
+            .artifacts/vdp/live-public/ui/android-key-before.png
+            .artifacts/vdp/live-public/ui/android-key-rotated.png
+            .artifacts/vdp/live-public/ui/web-settled.png
             .artifacts/vdp/live-public/ui/video-metadata.json
             .artifacts/vdp/live-public/ui/web-confirm.mp4
             .artifacts/vdp/live-public/ui/android-accept-offline.mp4
