@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, CirclePause, Cpu, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, Check, CirclePause, Cpu, Inbox, Laptop, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BotAvatar, SettingsGroup, SettingsRow } from "@/components/app/kit"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
@@ -86,7 +86,7 @@ export function BotPanelButton() {
               const detail = scheduleDetail(schedule)
               const name = detail ? schedule.name : schedule.prompt
               if (deleted) return <SettingsRow key={schedule.schedule_id} icon={Trash2} className="text-muted-foreground" label={<span role="status"><span className="line-through">{schedule.name}</span> 已删除</span>} />
-              return <SettingsRow key={schedule.schedule_id} icon={once ? AlarmClock : Repeat}
+              return <SettingsRow key={schedule.schedule_id} icon={once ? AlarmClock : Repeat} className={schedule.enabled ? undefined : "text-muted-foreground"}
                 label={<span title={name}>{name}</span>}
                 description={<span className="flex flex-wrap items-center gap-x-1.5 tabular-nums">
                   {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-3.5" />已暂停</span>
@@ -109,13 +109,13 @@ export function BotPanelButton() {
             })}
           </SettingsGroup> : null}
           {view.memory.length ? <SettingsGroup title={`笔记 · ${view.memory.length}`}>
-            {view.memory.map((note) => <p key={note.memory_id} className="flex gap-3 px-4 py-3">
-              <NotebookPen aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-              <span className="line-clamp-3 min-w-0 [overflow-wrap:anywhere]" title={note.text}>{note.text}</span>
-            </p>)}
+            {view.memory.map((note) => <p key={note.memory_id} className="line-clamp-3 px-4 py-3 [overflow-wrap:anywhere]" title={note.text}>{note.text}</p>)}
           </SettingsGroup> : null}
           {view.skills.length ? <SettingsGroup title={`${bot.skills === null ? "skill · 全部" : "skill"} · ${view.skills.length}`}>
-            {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={skill.name} description={skill.description || undefined} />)}
+            {view.skills.map((skill) => <p key={skill.skill_id} className="grid min-w-0 gap-0.5 px-4 py-3">
+              <span className="truncate">{skill.name}</span>
+              {skill.description ? <span className="text-meta text-muted-foreground [overflow-wrap:anywhere]">{skill.description}</span> : null}
+            </p>)}
           </SettingsGroup> : null}
           <SettingsGroup>
             <SettingsRow icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录保留" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
