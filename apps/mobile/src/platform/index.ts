@@ -1,5 +1,6 @@
 import { AppState } from 'react-native'
-import { File, Paths } from 'expo-file-system'
+import { Directory, File, Paths } from 'expo-file-system'
+import * as DocumentPicker from 'expo-document-picker'
 import * as Notifications from 'expo-notifications'
 import * as SecureStore from 'expo-secure-store'
 import * as Sharing from 'expo-sharing'
@@ -8,6 +9,7 @@ import { secure, type NativeIdentity } from '@vibeface/secure-native'
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
+import { sha256 } from '@vibeface/client/delivery/model.ts'
 
 const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
@@ -87,6 +89,26 @@ export const mobilePlatform: Platform = {
     if (file.exists) file.delete()
     file.write(bytes)
     await Sharing.shareAsync(file.uri, { mimeType: 'application/json', dialogTitle: '保存恢复文件' })
+  },
+  files: {
+    async pick() {
+      const picked = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true, multiple: false })
+      const asset = picked.assets?.[0]
+      if (picked.canceled || !asset) return null
+      const file = new File(asset.uri)
+      return { name: asset.name, size: file.size, arrayBuffer: () => file.arrayBuffer() }
+    },
+    async save(bytes, name) {
+      const directory = new Directory(Paths.document, 'transfers')
+      directory.create({ idempotent: true, intermediates: true })
+      const file = new File(directory, `${crypto.randomUUID()}-${name}`)
+      file.create()
+      file.write(bytes)
+      const saved = await file.bytes()
+      if (saved.length !== bytes.length || await sha256(saved) !== await sha256(bytes)) throw new Error('保存后的文件摘要不一致，请重新取回。')
+      if (await Sharing.isAvailableAsync()) await Sharing.shareAsync(file.uri, { mimeType: 'application/octet-stream', dialogTitle: '导出文件副本' })
+      return 'saved'
+    },
   },
   self: '这台手机',
 }

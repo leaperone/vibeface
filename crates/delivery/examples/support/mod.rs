@@ -50,6 +50,19 @@ pub fn fixture(lengths: &[usize], image: Word) -> Fixture {
         max_guest_cycles: 64_000_000,
         max_prover_memory_bytes: 16 * 1024 * 1024 * 1024,
     };
+    fixture_with_profile(lengths, profile)
+}
+
+pub fn fixture_with_profile(lengths: &[usize], profile: ProofProfile) -> Fixture {
+    profile.validate().unwrap();
+    assert!(lengths.len() <= profile.max_windows as usize);
+    assert!(
+        lengths
+            .iter()
+            .all(|length| *length <= profile.max_window_bytes as usize)
+    );
+    assert!(lengths.iter().sum::<usize>() as u64 <= profile.max_total_bytes);
+    let image = profile.guest_image_id;
     let mut chain_id = [0; 32];
     chain_id[30..].copy_from_slice(&31337u16.to_be_bytes());
     let binding = KeyBinding {

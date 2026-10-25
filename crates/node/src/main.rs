@@ -51,6 +51,8 @@ enum Action {
     Serve(Serve),
     /// Check this local node through its private maintenance socket.
     Status(Access),
+    /// Manage the experimental delivery wallet through its owner-only local socket.
+    Wallet(WalletOptions),
     /// Manage this user's installed node service and update timer.
     Service(service::Service),
     /// Display this node's local browser entry, or turn opening it without confirmation on or off.
@@ -134,6 +136,44 @@ enum CodexCommand {
 struct DataDir {
     #[arg(long, default_value_os_t = config::default_dir())]
     data_dir: PathBuf,
+}
+
+#[derive(Args)]
+struct WalletOptions {
+    #[command(flatten)]
+    data: DataDir,
+    #[command(subcommand)]
+    command: WalletAction,
+}
+
+#[derive(Subcommand)]
+enum WalletAction {
+    Status,
+    /// Create an independent encrypted wallet; it starts locked.
+    Create {
+        /// Read the passphrase from an owner-only file or pipe descriptor instead of the terminal.
+        #[arg(long)]
+        passphrase_fd: Option<i32>,
+    },
+    /// Unlock this process's wallet without sending its passphrase to a network endpoint.
+    Unlock {
+        #[arg(long)]
+        passphrase_fd: Option<i32>,
+    },
+    Lock,
+    /// Apply local experimental delivery settings from a JSON file.
+    Configure {
+        file: PathBuf,
+    },
+    /// Register this Node's receiving key on the configured local test chain.
+    RegisterKey {
+        #[arg(long)]
+        gas_cap: String,
+    },
+    /// Save the separate encrypted wallet backup without overwriting an existing file.
+    Backup {
+        output: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -433,6 +473,7 @@ async fn main() -> Result<()> {
         }
         Action::Access(options) => access(options).await,
         Action::Status(options) => status(options).await,
+        Action::Wallet(options) => wallet(options).await,
         Action::Service(options) => service::run(options).await,
         Action::Update(options) => update::run(options).await,
         Action::Join(options) => join(options).await,
@@ -500,6 +541,147 @@ async fn main() -> Result<()> {
         Action::Log(options) => log_record(options).await,
         Action::Logs(options) => logs(options).await,
     }
+}
+
+async fn wallet(options: WalletOptions) -> Result<()> {
+    use vibeface::delivery::wallet::{WalletCommand, backup};
+    let dir = options.data.data_dir;
+    let command = match options.command {
+        WalletAction::Status => WalletCommand::Status,
+        WalletAction::Create { passphrase_fd } => WalletCommand::Create {
+            passphrase: read_wallet_passphrase(passphrase_fd)?,
+        },
+        WalletAction::Unlock { passphrase_fd } => WalletCommand::Unlock {
+            passphrase: read_wallet_passphrase(passphrase_fd)?,
+        },
+        WalletAction::Lock => WalletCommand::Lock,
+        WalletAction::Configure { file } => {
+            let bytes = read_bounded_local(&file, 16 * 1024)?;
+            let config =
+                serde_json::from_slice(&bytes).context("invalid delivery configuration")?;
+            maintenance::configure_delivery(&dir, config).await?;
+            println!("Delivery settings applied.");
+            return Ok(());
+        }
+        WalletAction::RegisterKey { gas_cap } => {
+            vibeface_delivery::Amount::from_decimal_str(&gas_cap)?;
+            let result = maintenance::register_delivery_key(&dir, gas_cap).await?;
+            println!("{}", serde_json::to_string(&result)?);
+            return Ok(());
+        }
+        WalletAction::Backup { output } => {
+            backup(&dir, &output)?;
+            println!("Encrypted delivery wallet backup saved.");
+            return Ok(());
+        }
+    };
+    let result = maintenance::delivery_wallet(&dir, command).await?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+fn read_bounded_local(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.len() <= limit,
+        "local delivery input is not a bounded regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "local delivery input exceeds its limit"
+    );
+    Ok(bytes)
+}
+
+fn read_wallet_passphrase(fd: Option<i32>) -> Result<vibeface::delivery::wallet::SecretString> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{FileTypeExt, MetadataExt},
+    };
+    use zeroize::Zeroizing;
+    let mut bytes = Zeroizing::new(Vec::new());
+    if let Some(fd) = fd {
+        ensure!(fd >= 0, "wallet passphrase descriptor is invalid");
+        // Duplicate the borrowed descriptor so the caller retains ownership of its original.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        ensure!(
+            duplicate >= 0,
+            "wallet passphrase descriptor cannot be read"
+        );
+        let file = unsafe { fs::File::from_raw_fd(duplicate) };
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0
+                && (metadata.is_file() || metadata.file_type().is_fifo()),
+            "wallet passphrase descriptor must be an owner-only regular file or pipe"
+        );
+        file.take(1026).read_to_end(&mut bytes)?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    } else {
+        let mut terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("wallet passphrase requires a terminal or --passphrase-fd")?;
+        let mut previous = std::mem::MaybeUninit::<libc::termios>::uninit();
+        ensure!(
+            unsafe { libc::tcgetattr(terminal.as_raw_fd(), previous.as_mut_ptr()) } == 0,
+            "wallet terminal settings are unavailable"
+        );
+        let previous = unsafe { previous.assume_init() };
+        let mut hidden = previous;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        ensure!(
+            unsafe { libc::tcsetattr(terminal.as_raw_fd(), libc::TCSAFLUSH, &hidden) } == 0,
+            "wallet terminal cannot disable echo"
+        );
+        struct RestoreEcho {
+            fd: i32,
+            previous: libc::termios,
+        }
+        impl Drop for RestoreEcho {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.previous);
+                }
+            }
+        }
+        let restore = RestoreEcho {
+            fd: terminal.as_raw_fd(),
+            previous,
+        };
+        terminal.write_all(b"Delivery wallet passphrase: ")?;
+        terminal.flush()?;
+        loop {
+            let mut byte = [0];
+            ensure!(
+                terminal.read(&mut byte)? == 1,
+                "wallet terminal closed before a passphrase was entered"
+            );
+            if matches!(byte[0], b'\n' | b'\r') {
+                break;
+            }
+            ensure!(bytes.len() < 1024, "wallet passphrase exceeds its limit");
+            bytes.push(byte[0]);
+        }
+        drop(restore);
+        terminal.write_all(b"\n")?;
+    }
+    ensure!(
+        (12..=1024).contains(&bytes.len())
+            && !bytes.iter().any(|byte| matches!(byte, b'\n' | b'\r' | 0)),
+        "wallet passphrase must contain 12 to 1024 bytes on one line"
+    );
+    let text = String::from_utf8(bytes.to_vec()).context("wallet passphrase must be UTF-8")?;
+    Ok(vibeface::delivery::wallet::SecretString::new(text))
 }
 
 async fn log_record(options: LogRecord) -> Result<()> {
@@ -1604,6 +1786,41 @@ async fn triage(options: Triage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_passphrase_requires_a_protected_descriptor_and_cli_never_accepts_it_as_text()
+    -> Result<()> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{OpenOptionsExt, PermissionsExt},
+        };
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts/wallet-cli-tests")
+            .join(uuid::Uuid::new_v4().to_string());
+        config::private_dir(&dir)?;
+        let path = dir.join("synthetic-passphrase");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(b"synthetic test passphrase\n")?;
+        drop(file);
+        let file = fs::File::open(&path)?;
+        read_wallet_passphrase(Some(file.as_raw_fd()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        let file = fs::File::open(&path)?;
+        assert!(read_wallet_passphrase(Some(file.as_raw_fd())).is_err());
+        assert!(
+            Cli::try_parse_from(["vibeface", "wallet", "unlock", "--passphrase", "text"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["vibeface", "wallet", "unlock", "--passphrase-fd", "3"]).is_ok()
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn codex_call_refuses_turn_writes_before_reaching_the_app_server() {

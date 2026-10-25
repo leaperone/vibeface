@@ -4,6 +4,7 @@ use std::{env, fs, path::Path};
 
 fn main() {
     let manifest = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).to_path_buf();
+    delivery_abi(&manifest);
     let dist = manifest.join("web/dist/client");
     println!("cargo:rerun-if-changed=web/dist/client");
     let shell = dist.join("_shell.html");
@@ -38,6 +39,24 @@ fn main() {
     fs::write(
         Path::new(&env::var("OUT_DIR").unwrap()).join("web_assets.rs"),
         source,
+    )
+    .unwrap();
+}
+
+fn delivery_abi(manifest: &Path) {
+    let schema = manifest.join("../delivery/abi/Statement.sol");
+    let interface = manifest.join("src/delivery/abi.sol");
+    println!("cargo:rerun-if-changed={}", schema.display());
+    println!("cargo:rerun-if-changed={}", interface.display());
+    let source = format!(
+        "{}\n{}",
+        fs::read_to_string(schema).unwrap(),
+        fs::read_to_string(interface).unwrap()
+    )
+    .replace("struct ", "#[sol(all_derives)]\nstruct ");
+    fs::write(
+        Path::new(&env::var("OUT_DIR").unwrap()).join("delivery_abi.rs"),
+        format!("alloy_sol_types::sol! {{ {source} }}"),
     )
     .unwrap();
 }

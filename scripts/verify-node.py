@@ -22,6 +22,7 @@ import copy
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import signal
 import select
 import socket
 import struct
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -115,15 +117,22 @@ def available_port():
     while _port_base[0]:
         port = _port_base[0]
         _port_base[0] += 1
-        with socket.socket() as stream:
+        with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as udp:
             try:
                 stream.bind(("127.0.0.1", port))
+                udp.bind(("127.0.0.1", port))
                 return port
             except OSError:
                 continue
-    with socket.socket() as stream:
-        stream.bind(("127.0.0.1", 0))
-        return stream.getsockname()[1]
+    while True:
+        with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as udp:
+            stream.bind(("127.0.0.1", 0))
+            port = stream.getsockname()[1]
+            try:
+                udp.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
 
 
 CLIENT_SOURCE = r"""
@@ -512,11 +521,13 @@ class Client:
 
 
 class Node:
-    def __init__(self, run, name, binary, workspace, helper, *, init_args=None):
+    def __init__(self, run, name, binary, workspace, helper, *, init_args=None, port=None):
         self.name = name
         self.binary = binary
         self.directory = run / name
-        self.port = available_port()
+        self.port = port if port is not None else available_port()
+        require(0 < self.port < 65536, "Node listener uses a valid port")
+        self.quic_port = available_port() if port is not None else self.port
         self.local_port = available_port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.client = Client(self.url, helper, identity_file=self.directory / "client-identity.json")
@@ -534,7 +545,7 @@ class Node:
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
-        self.configure_network(bind=f"127.0.0.1:{self.port}")
+        self.configure_network(bind=f"127.0.0.1:{self.quic_port}")
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
                                 capture_output=True, timeout=15)
         require(result.returncode == 0, f"{name}: local access material is available")
@@ -567,7 +578,11 @@ class Node:
             [str(self.binary), "serve", "--data-dir", str(self.directory)],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env or self.environment())
-        info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
+        def listener():
+            if self.process.poll() is not None:
+                raise RuntimeError(f"{self.name}: Node exited {self.process.returncode}; inspect {self.directory / 'process.log'}")
+            return self.client.request("/api/info")
+        info = wait_for(f"{self.name} HTTP listener", listener)
         require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
@@ -3942,6 +3957,756 @@ def auto_route_acceptance(options):
         print("REPORT " + str(run / "report.json"), flush=True)
 
 
+class PkarrRelay:
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.packets = {}
+        self.reads = 0
+        self.writes = 0
+        self.lock = threading.Lock()
+        relay = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def key(self):
+                match = re.fullmatch(r"/pkarr/([a-z0-9]{52})", self.path)
+                return match[1] if match else None
+
+            def do_PUT(self):
+                key = self.key()
+                length = int(self.headers.get("Content-Length", "0"))
+                if key is None or not 72 <= length <= 1072:
+                    self.send_error(400)
+                    return
+                packet = self.rfile.read(length)
+                with relay.lock:
+                    relay.packets[key] = packet
+                    relay.writes += 1
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                with relay.lock:
+                    relay.reads += 1
+                    packet = relay.packets.get(self.key())
+                if packet is None:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(packet)))
+                self.end_headers()
+                self.wfile.write(packet)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/pkarr"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+class DeliveryRpcSpy:
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.calls = 0
+        spy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                spy.calls += 1
+                self.rfile.read(min(int(self.headers.get("Content-Length", "0")), 4096))
+                body = b'{"error":"unexpected chain RPC in a free delivery"}'
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def free_delivery_settings(spy, profile, *, enabled):
+    return {"enabled": enabled, "charity_enabled": True, "paid_enabled": False,
+            "chain": {"rpc_url": spy.url, "chain_id": 31337, "escrow": "0x" + "11" * 20,
+                      "asset": "0x" + "22" * 20, "confirmations": 2,
+                      "profile": json.loads(profile.read_text())}, "prover": None}
+
+
+def isolate_delivery_node(node):
+    config = json.loads((node.directory / "config.json").read_text())
+    config["manager"] = None
+    config["providers"]["execution"] = False
+    config["triage"]["scan_codex_sessions"] = False
+    private_json(node.directory / "config.json", config)
+
+
+def delivery_rows(node, query, parameters=()):
+    database = node.directory / "delivery/service.sqlite3"
+    if not database.exists():
+        return []
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        return connection.execute(query, parameters).fetchall()
+
+
+def delivery_free_state(nodes, spy):
+    wallets = sum((node.directory / "delivery-wallet.json").exists() for node in nodes)
+    transactions = sum((delivery_rows(node, "SELECT count(*) FROM transactions") or [(0,)])[0][0]
+                       for node in nodes)
+    require(wallets == 0 and transactions == 0 and spy.calls == 0,
+            "free discovery and charity create no wallet, transactions or chain RPC calls")
+    return {"wallet_files": wallets, "transaction_rows": transactions, "chain_rpc_calls": spy.calls}
+
+
+def delivery_call(node, op, **params):
+    def attempt():
+        response = node.client.command("request", method="delivery", params={"op": op, **params})
+        error = response.get("error")
+        if error == "another delivery operation is in progress" and op in ("confirm", "accept", "reconcile"):
+            lookup = ({"op": "find_intent", "intent_id": params["intent_id"]} if op == "confirm"
+                      else {"op": "get", "order_id": params["order_id"]})
+            node.client.call("delivery", lookup)
+            return None
+        require(not error, f"encrypted delivery {op} rejected: {error}")
+        return {"result": response.get("result")}
+    return wait_for("delivery authority after an explicit pre-mutation busy rejection", attempt)["result"]
+
+
+def delivery_probe(options, run, actor, targets, order_id, *, action=None):
+    probe = options.delivery_probe.resolve(strict=True)
+    source = options.delivery_source_root.resolve(strict=True)
+    value = {"actor_peer": actor.device_id, "identity_file": str(actor.directory / "identity.json"),
+             "targets": [{"peer": node.device_id, "address": f"127.0.0.1:{node.quic_port}",
+                          "public_entry": node is targets[-1] and node.name == "P"} for node in targets],
+             "order_id": order_id}
+    if action is not None:
+        value["action"] = action
+    path = run / ("probe-" + uuid.uuid4().hex[:10] + ".json")
+    private_json(path, value)
+    try:
+        result = subprocess.run([str(probe), str(path)], capture_output=True, timeout=150)
+    finally:
+        path.unlink(missing_ok=True)
+    with (run / "probe-output.log").open("ab") as output:
+        output.write(result.stderr[:16384])
+        output.write(result.stdout[:16384])
+    require(result.returncode == 0, "real loopback QUIC/Noise probe succeeds; inspect the private probe log")
+    public = json.loads(result.stdout)
+    require(public.get("passed") is True, "probe returned a positive bounded result")
+    if action is None:
+        require(public["discovery"]["productSourceSha256"] == file_sha256(source / "crates/node/src/net/discovery.rs"),
+                "probe resolves with the current product discovery implementation")
+    return public
+
+
+def delivery_charity_acceptance(options):
+    repository = Path(__file__).resolve().parents[1]
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    profile = options.delivery_profile.resolve(strict=True)
+    artifacts = options.artifacts.resolve()
+    require(artifacts.is_relative_to(repository / ".artifacts"), "delivery fixtures stay in the task worktree")
+    require(options.delivery_probe is not None, "delivery acceptance requires the real loopback QUIC/Noise probe")
+    artifacts.mkdir(parents=True, exist_ok=True)
+    run = artifacts / ("delivery-charity-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    relay, spy = PkarrRelay(), DeliveryRpcSpy()
+    nodes = []
+    report = {"status": "running", "mode": "charity", "source_binary": str(binary),
+              "binary_sha256": file_sha256(binary), "profile_sha256": file_sha256(profile),
+              "cases": {}, "not_checked": ["paid proof and settlement", "rendered browser UI",
+                                             "native mobile UI", "public internet or long-term retention"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS delivery-charity " + name, flush=True)
+
+    call = delivery_call
+
+    def reconnect(node):
+        node.client.connect()
+        node.client.authenticate()
+
+    def restart(node):
+        node.stop(crash=True)
+        node.start()
+        if node.client.network_id:
+            reconnect(node)
+
+    def no_private_payload(provider, original_name, original):
+        name_bytes = original_name.encode()
+        marker = original[:64]
+        for path in provider.directory.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                data = path.read_bytes()
+                require(name_bytes not in data and marker not in data,
+                        "public provider stores neither original file metadata nor plaintext in data or logs")
+        database = provider.directory / "node.sqlite3"
+        if database.exists():
+            with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "events" in tables:
+                    require(connection.execute("SELECT count(*) FROM events").fetchone()[0] == 0,
+                            "public provider has no private event DAG")
+
+    try:
+        for name in ("S", "R", "P", "X"):
+            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"] if name == "P" else [])
+            node = Node(run, name, binary, workspace, helper, init_args=args)
+            nodes.append(node)
+            isolate_delivery_node(node)
+            node.configure_network(discovery={"publish": True, "resolve": True,
+                                             "urls": [relay.url], "publish_direct": True})
+            private_json(node.directory / "delivery-settings.json", free_delivery_settings(spy, profile, enabled=False))
+            node.start()
+        source, receiver, provider, outsider = nodes
+        source.bootstrap()
+        receiver.bootstrap()
+        require(source.client.network_id != receiver.client.network_id, "source and receiver use different personal networks")
+        for node in (source, receiver):
+            state = call(node, "status")
+            require(state["enabled"] is False and state["wallet"]["state"] == "absent",
+                    "object delivery starts disabled with no independent wallet")
+        wait_for("free peer publication", lambda: relay.writes >= 3)
+        passed("default-disabled-and-free-discovery", **delivery_free_state(nodes, spy), published=relay.writes)
+        for node in (source, receiver):
+            state = call(node, "configure", enabled=True, charity_enabled=True, paid_enabled=False)
+            require(state["enabled"] and not state["paid_enabled"], "manager explicitly enables charity")
+        provider.stop()
+        private_json(provider.directory / "delivery-settings.json", free_delivery_settings(spy, profile, enabled=True))
+        provider.start()
+        original_name = "private-" + uuid.uuid4().hex + ".bin"
+        original = os.urandom(96 * 1024)
+        digest = hashlib.sha256(original).hexdigest()
+        intent = str(uuid.uuid4())
+        request = {"intent_id": intent, "receiver_peer": receiver.device_id,
+                   "provider_peer": provider.device_id, "mode": "charity", "acceptance": "recoverable",
+                   "name": original_name, "content_base64": base64.b64encode(original).decode(),
+                   "max_service_amount": "0", "max_gas_amount": "0"}
+        prepared = call(source, "prepare", **request)
+        order_id = prepared["order_id"]
+        require(prepared["phase"] == "prepared" and len(prepared["windows"]) == 2
+                and prepared["payment"]["state"] == "free" and prepared["payment"]["total"] == "0",
+                "charity produces two encrypted windows and zero financial terms")
+        repeated = call(source, "prepare", **request)
+        found = call(source, "find_intent", intent_id=intent)
+        require(repeated["order_id"] == order_id and found["order"]["order_id"] == order_id,
+                "same durable intent returns the exact prepared order")
+        changed = {**request, "content_base64": base64.b64encode(b"different").decode()}
+        refusal = source.client.call("delivery", {"op": "prepare", **changed}, status=400)
+        require("intent changed" in refusal["error"], "changed content cannot reuse a prepared intent")
+        passed("encrypted-two-window-prepare-and-idempotent-intent", order_id=order_id, windows=2,
+               same_intent_same_order=True, changed_content_rejected=True)
+
+        source.stop(crash=True)
+        body = delivery_rows(source, "SELECT body FROM charity_orders WHERE id=?", (order_id,))
+        require(len(body) == 1, "prepared source state survives its process crash")
+        signed = json.loads(body[0][0])["order"]
+        ciphertext = source.directory / "delivery/objects" / order_id / "0-ciphertext.bin"
+        prefix = base64.b64encode(ciphertext.read_bytes()[:8192]).decode()
+        action = {"kind": "prefix", "order": signed, "prefix": prefix, "expected_offset": 0}
+        before = delivery_probe(options, run, source, [provider], order_id, action=action)
+        checkpoint = delivery_rows(provider, "SELECT committed,size,complete FROM objects WHERE order_id=? AND idx=0 AND kind='ciphertext'", (order_id,))
+        require(len(checkpoint) == 1 and checkpoint[0][0] == 8192 and checkpoint[0][1] > 8192
+                and checkpoint[0][2] == 0, "provider has an actual incomplete durable prefix")
+        restart(provider)
+        after = delivery_probe(options, run, source, [provider], order_id,
+                               action={**action, "expected_offset": 8192})
+        require(before["durablePrefix"] == 8192 and after["afterRestart"] and after["staleOffsetRejected"],
+                "public provider resumes the committed prefix and rejects stale offsets after SIGKILL")
+        source.start()
+        reconnect(source)
+        require(call(source, "find_intent", intent_id=intent)["order"]["order_id"] == order_id,
+                "source restores its existing prepared intent")
+        call(source, "confirm", intent_id=intent)
+        duplicate = source.client.command("request", method="delivery",
+            params={"op": "confirm", "intent_id": intent}, _wait_timeout=5)
+        require(not duplicate.get("error") and duplicate["result"]["order_id"] == order_id,
+                "immediate duplicate confirmation returns the same durable order even while the executor is busy")
+        incoming = wait_for("receiver gets an encrypted offer", lambda:
+            next((item for item in call(receiver, "list")["orders"] if item["order_id"] == order_id), None), timeout=60)
+        require(incoming["name"] is None and incoming["sha256"] is None, "receiver learns no original metadata before decryption")
+        receiver.client.call("delivery", {"op": "read", "order_id": order_id}, status=400)
+        passed("provider-prefix-crash-and-source-intent-recovery", committed_prefix=8192,
+               stale_offset_rejected=True, immediate_duplicate_confirmation=True)
+
+        outsider.stop()
+        security = delivery_probe(options, run, outsider, [source, receiver, provider], order_id)
+        require(security["discovery"]["fresh"] and len(security["targets"]) == 3,
+                "real signed discovery and service positive controls accompany all boundary rejections")
+        passed("real-service-and-private-network-boundaries", **security)
+        call(receiver, "accept", order_id=order_id)
+        restart(receiver)
+        call(receiver, "accept", order_id=order_id)
+
+        def recovered():
+            state = call(receiver, "get", order_id=order_id)
+            return state if state["evidence"] == "charity_receipt" else None
+
+        received = wait_for("receiver decrypts and signs the actual recovered file", recovered, timeout=90)
+        recovered_file = call(receiver, "read", order_id=order_id)
+        data = base64.b64decode(recovered_file["content_base64"], validate=True)
+        require(data == original and recovered_file["sha256"] == digest and recovered_file["name"] == original_name
+                and hashlib.sha256(data).hexdigest() == digest and recovered_file["bytes"] == len(original),
+                "receiver recovers the original file bytes, name, length and SHA-256")
+        require(all(not window["decryption_proven"] for window in received["windows"]),
+                "charity signature receipt is not labeled as an on-chain decryption proof")
+        wait_for("source reconciles the receiver receipt", lambda:
+                 call(source, "get", order_id=order_id)["evidence"] == "charity_receipt", timeout=60)
+        no_private_payload(provider, original_name, original)
+        require(relay.reads > 0 and relay.writes > 0, "delivery resolves PeerIDs through the free signed directory")
+        for node in (source, receiver):
+            orders = call(node, "list")["orders"]
+            require(sum(order["order_id"] == order_id for order in orders) == 1, "retry and restart retain exactly one order")
+        passed("receiver-restart-original-file-and-charity-receipt", bytes=len(original), sha256=digest,
+               evidence=received["evidence"], provider_plaintext_absent=True, provider_private_events_absent=True)
+        passed("free-path-has-no-financial-side-effects", **delivery_free_state(nodes, spy),
+               pkarr_reads=relay.reads, pkarr_writes=relay.writes)
+        report["status"] = "passed"
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
+        relay.close()
+        spy.close()
+        private_json(run / "summary.json", report)
+        print("Delivery report: " + str(run / "summary.json"), flush=True)
+    return report
+
+
+def delivery_paid_acceptance(options):
+    require(options.delivery_config is not None,
+            "UNVERIFIED paid delivery requires --delivery-config; charity success is not full delivery acceptance")
+    configuration_path = options.delivery_config.resolve(strict=True)
+    metadata = options.delivery_config.lstat()
+    require(stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+            and metadata.st_mode & 0o077 == 0 and metadata.st_size <= 16384,
+            "paid acceptance configuration must be an owner-only bounded regular file")
+    configuration = json.loads(configuration_path.read_text())
+    expected = {"schema_version", "deployment_file", "prover", "max_service_amount", "source_gas_cap_wei",
+                "provider_gas_cap_wei", "register_key_gas_cap_wei", "settlement_observer"}
+    require(set(configuration) == expected and configuration["schema_version"] == 1,
+            "paid acceptance requires the exact schema_version 1 configuration")
+    require(sys.platform.startswith("linux"), "UNVERIFIED paid Node proving requires the real Linux cgroup environment")
+    repository = Path(__file__).resolve().parents[1]
+    deployment_path = Path(configuration["deployment_file"])
+    require(deployment_path.is_absolute() and not deployment_path.exists()
+            and deployment_path.resolve().is_relative_to(repository / ".artifacts"),
+            "paid acceptance requires a fresh deployment output inside this task's ignored artifacts")
+    deployment_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log = deployment_path.with_suffix(".log").open("xb")
+    process = subprocess.Popen(["node", str(repository / "contracts/delivery/deploy-local.mjs"),
+                               "--listen", "127.0.0.1:0", "--output", str(deployment_path)],
+                              stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    try:
+        def deployed():
+            if process.poll() is not None:
+                raise RuntimeError("local paid deployment process exited; inspect its task-local log")
+            try:
+                value = json.loads(deployment_path.read_text())
+                return value if value.get("rpc_url") else None
+            except (FileNotFoundError, json.JSONDecodeError):
+                return None
+        deployment = wait_for("fresh local delivery contracts and automatic confirmation blocks", deployed, timeout=120)
+        return delivery_paid_run(options, configuration, deployment)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+        log.close()
+
+
+def delivery_paid_run(options, configuration, deployment):
+    fields = ("rpc_url", "chain_id", "escrow", "asset", "profile", "confirmations")
+    chain = {name: deployment[name] for name in fields}
+    profile = json.loads(options.delivery_profile.resolve(strict=True).read_text())
+    require(chain["chain_id"] == 31337 and chain["confirmations"] == 2 and chain["profile"] == profile,
+            "paid acceptance uses the exact local deployment, product profile and two confirmations")
+    url = urllib.parse.urlsplit(chain["rpc_url"])
+    require(url.scheme == "http" and url.hostname and ipaddress.ip_address(url.hostname).is_loopback()
+            and url.port and not url.username and not url.password and url.path in ("", "/")
+            and not url.query and not url.fragment, "paid acceptance RPC is a literal loopback HTTP origin")
+    for name in ("escrow", "asset"):
+        require(re.fullmatch(r"0x[0-9a-fA-F]{40}", chain[name]), "deployment contains a bounded contract address")
+    prover = configuration["prover"]
+    require(set(prover) == {"program", "r0vm", "cgroup", "profile"} and prover["profile"] == profile,
+            "paid acceptance prover uses the fixed product profile")
+    for name in ("program", "r0vm", "cgroup"):
+        require(Path(prover[name]).is_absolute(), "paid acceptance prover paths are explicit absolute paths")
+    for name in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei"):
+        require(isinstance(configuration[name], str) and re.fullmatch(r"[1-9][0-9]{0,70}", configuration[name]),
+                "paid acceptance financial caps are explicit positive decimal strings")
+    free = delivery_charity_acceptance(options)
+    require(free["status"] == "passed", "full paid acceptance also requires the free-network safety checks")
+    repository = Path(__file__).resolve().parents[1]
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    artifacts = options.artifacts.resolve()
+    run = artifacts / ("delivery-paid-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    export = run / "settlement"
+    export.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    relay, nodes, passwords = PkarrRelay(), [], {}
+    report = {"status": "running", "mode": "paid", "binary_sha256": file_sha256(binary),
+              "free_checks": free["status"], "deployment": {name: chain[name] for name in fields if name != "profile"},
+              "cases": {}, "not_checked": ["public assets", "absolute chain finality", "rendered native mobile UI",
+                                             "public internet or long-term retention"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS delivery-paid " + name, flush=True)
+
+    def rpc(method, params):
+        request = urllib.request.Request(chain["rpc_url"], json.dumps({"jsonrpc": "2.0", "id": 1,
+            "method": method, "params": params}).encode(), {"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read(1024 * 1024 + 1)
+        require(len(body) <= 1024 * 1024, "local chain RPC response is bounded")
+        value = json.loads(body)
+        require(value.get("id") == 1 and "error" not in value, "local chain RPC returns a matching successful response")
+        return value["result"]
+
+    def confirmed(hash_value):
+        receipt = rpc("eth_getTransactionReceipt", [hash_value])
+        if receipt is None:
+            return None
+        require(receipt["status"] == "0x1", "controlled local funding transaction succeeds")
+        height = int(rpc("eth_blockNumber", []), 16)
+        return receipt if height >= int(receipt["blockNumber"], 16) + chain["confirmations"] - 1 else None
+
+    def cli(node, arguments, *, password=None, timeout=30, success=True):
+        descriptor, password_path = None, None
+        command = [str(binary), "wallet", "--data-dir", str(node.directory), *arguments]
+        try:
+            if password is not None:
+                password_path = run / ("passphrase-" + uuid.uuid4().hex)
+                descriptor = os.open(password_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(descriptor, password.encode() + b"\n")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                command += ["--passphrase-fd", str(descriptor)]
+            result = subprocess.run(command, capture_output=True, timeout=timeout,
+                                    pass_fds=(() if descriptor is None else (descriptor,)))
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+                password_path.unlink(missing_ok=True)
+        require((result.returncode == 0) == success, "local wallet command has its expected outcome without exposing its passphrase")
+        if success and result.stdout.lstrip().startswith(b"{"):
+            return json.loads(result.stdout)
+        return None
+
+    def transaction(node, identifier):
+        def observed():
+            rows = delivery_rows(node, "SELECT hash,phase FROM transactions WHERE id=?", (identifier,))
+            require(len(rows) == 1 and re.fullmatch(r"0x[0-9a-f]{64}", rows[0][0]),
+                    "settlement bundle references a unique actual Node transaction")
+            if rows[0][1] in ("reverted", "conflicted", "failed"):
+                raise RuntimeError("actual Node settlement transaction reached a terminal failure")
+            return rows[0][0] if rows[0][1] == "confirmed" else None
+        return wait_for("Node durably observes its settlement transaction confirmed", observed)
+
+    def public_proof(journal, node, relation, index=None):
+        require(len(journal) == 1504 and int.from_bytes(journal[32:64], "big") == relation,
+                "exported journal is the canonical 47-word relation")
+        digest = hashlib.sha256(journal).hexdigest()
+        rows = delivery_rows(node, "SELECT path FROM proof_jobs WHERE digest=?", (digest,))
+        require(len(rows) == 1, "public proof has one durable Node receipt")
+        receipt = Path(rows[0][0])
+        require(receipt.resolve().is_relative_to(node.directory.resolve()) and stat.S_ISREG(receipt.lstat().st_mode)
+                and receipt.stat().st_size <= 16384, "receipt is a bounded regular file in its controlled Node")
+        verified = subprocess.run([prover["program"], "verify", journal.hex()], input=receipt.read_bytes(),
+                                  capture_output=True, timeout=120,
+                                  env={"PATH": "/usr/bin:/bin", "RISC0_SERVER_PATH": prover["r0vm"]})
+        require(verified.returncode == 0, "actual host verifies the binary Groth16 receipt against the public journal")
+        value = json.loads(verified.stdout)
+        image = bytes(profile["guest_image_id"]).hex()
+        require(value["verified"] is True and value["kind"] == "groth16" and value["imageId"] == image
+                and value["journalHash"] == digest, "verified receipt binds the product image and exact journal")
+        profile_bytes = hashlib.sha256(b"vibeface-delivery-profile-v1").digest() + bytes(profile["guest_image_id"]) + bytes(profile["statement_schema_hash"])
+        for field in ("crypto_suite", "max_windows", "max_window_bytes", "max_total_bytes", "max_guest_cycles", "max_prover_memory_bytes"):
+            profile_bytes += profile[field].to_bytes(32, "big")
+        basename = "key-binding" if index is None else f"relation-{relation}-window-{index}"
+        shutil.copyfile(receipt, export / (basename + ".receipt"))
+        private_json(export / (basename + ".json"), {"mode": "prove", "kind": "groth16", "relation": relation,
+                     "imageId": image, "profileId": hashlib.sha256(profile_bytes).hexdigest(),
+                     "journal": journal.hex(), "journalHash": digest, "seal": value["seal"]})
+        entry = {"relation": relation, "public": basename + ".json", "receipt": basename + ".receipt"}
+        if index is not None:
+            entry["windowIndex"] = index
+        return entry
+
+    try:
+        accounts = rpc("eth_accounts", [])
+        require(accounts and deployment.get("funder", accounts[0]).lower() == accounts[0].lower(),
+                "only the controlled fixture's unlocked local funder is used")
+        funder = accounts[0]
+        require(int(rpc("eth_chainId", []), 16) == 31337, "the running local chain has the pinned identity")
+        for name in ("S", "R", "P"):
+            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"] if name == "P" else [])
+            node = Node(run, name, binary, workspace, helper, init_args=args)
+            nodes.append(node)
+            isolate_delivery_node(node)
+            node.configure_network(discovery={"publish": True, "resolve": True, "urls": [relay.url], "publish_direct": True})
+            node.start()
+            if name != "P":
+                node.bootstrap()
+            settings = {"enabled": True, "charity_enabled": False, "paid_enabled": True, "chain": chain,
+                        "prover": prover, "provider_gas_cap": configuration["provider_gas_cap_wei"],
+                        "delivery_fee_per_window": "10", "reservation_fee_per_window": "2", "priority_fee": "5"}
+            settings_path = node.directory / "acceptance-delivery-settings.json"
+            private_json(settings_path, settings)
+            cli(node, ["configure", str(settings_path)])
+            password = base64.urlsafe_b64encode(os.urandom(32)).decode()
+            passwords[name] = password
+            created = cli(node, ["create"], password=password)
+            require(created["state"] == "locked", "a newly created wallet starts locked")
+            cli(node, ["unlock"], password="invalid-acceptance-passphrase", success=False)
+            require(cli(node, ["status"])["state"] == "locked", "wrong local passphrase cannot unlock the wallet")
+            unlocked = cli(node, ["unlock"], password=password)
+            require(unlocked["state"] == "unlocked" and unlocked["address"] == created["address"],
+                    "protected FD unlocks only this Node's independent wallet")
+            node.wallet_address = unlocked["address"]
+            funding = rpc("eth_sendTransaction", [{"from": funder, "to": node.wallet_address,
+                                                   "value": hex(10 ** 19)}])
+            wait_for("controlled Node native gas funding", lambda: confirmed(funding), timeout=60)
+        source, receiver, provider = nodes
+        require(source.client.network_id != receiver.client.network_id, "paid transfer does not merge personal networks")
+        transfer = "0xa9059cbb" + source.wallet_address[2:].lower().zfill(64) + format(1000000, "064x")
+        token_tx = rpc("eth_sendTransaction", [{"from": funder, "to": chain["asset"], "data": transfer}])
+        wait_for("controlled sender TestToken funding", lambda: confirmed(token_tx), timeout=60)
+        def registration():
+            value = cli(receiver, ["register-key", "--gas-cap", configuration["register_key_gas_cap_wei"]], timeout=7300)
+            if value["phase"] in ("reverted", "conflicted", "failed"):
+                raise RuntimeError("receiving-key registration reached a terminal chain failure")
+            return value if value["phase"] == "confirmed" else None
+        wait_for("actual receiving-key proof registration confirmation", registration, timeout=7400)
+        passed("local-wallets-and-genuine-receiving-key-registration", wallets=3, chain_id=31337,
+               two_confirmations=True, protected_passphrase_fd=True)
+        original = os.urandom(96 * 1024)
+        digest, name, intent = hashlib.sha256(original).hexdigest(), "private-paid-" + uuid.uuid4().hex + ".bin", str(uuid.uuid4())
+        request = {"intent_id": intent, "receiver_peer": receiver.device_id, "provider_peer": provider.device_id,
+                   "mode": "paid", "acceptance": "strict", "name": name,
+                   "content_base64": base64.b64encode(original).decode(), "max_service_amount": configuration["max_service_amount"],
+                   "max_gas_amount": configuration["source_gas_cap_wei"]}
+        prepared = delivery_call(source, "prepare", **request)
+        order_id = prepared["order_id"]
+        require(len(prepared["windows"]) == 2 and prepared["payment"]["total"] == "29",
+                "strict two-window quotation has exact delivery, reservation and priority fees")
+        require(delivery_call(source, "prepare", **request)["order_id"] == order_id,
+                "same paid intent returns the existing order before authorization")
+        changed = {**request, "content_base64": base64.b64encode(b"different").decode()}
+        source.client.call("delivery", {"op": "prepare", **changed}, status=400)
+        delivery_call(source, "confirm", intent_id=intent)
+        duplicate = source.client.command("request", method="delivery",
+            params={"op": "confirm", "intent_id": intent}, _wait_timeout=5)
+        require(not duplicate.get("error") and duplicate["result"]["order_id"] == order_id,
+                "immediate duplicate authorization keeps the exact original paid intent")
+        latest = {}
+
+        def state(node):
+            value = delivery_call(node, "get", order_id=order_id)
+            if value["error"]:
+                raise RuntimeError("paid executor reported a failure while proving or settling: " + value["error"])
+            key = (value["phase"], value["evidence"], tuple(w["state"] for w in value["windows"]))
+            if latest.get(node.name) != key:
+                latest[node.name] = key
+                print(f"OBSERVE delivery-paid {node.name} phase={key[0]} evidence={key[1]}", flush=True)
+            return value
+
+        def offered():
+            state(source)
+            return next((order for order in delivery_call(receiver, "list")["orders"] if order["order_id"] == order_id), None)
+
+        wait_for("two genuine source proofs, escrow funding and receiver offer", offered, timeout=16000)
+        delivery_call(receiver, "accept", order_id=order_id)
+
+        def completely_opened():
+            value = state(receiver)
+            complete = (value["evidence"] == "decryption_proven"
+                        and all(w["decryption_proven"] for w in value["windows"])
+                        and value["payment"]["earned"] == "29" and value["payment"]["withdrawn"] == "29")
+            return value if complete else None
+
+        final = wait_for("both genuine hold and open proofs settle strict delivery", completely_opened, timeout=32000)
+        recovered = delivery_call(receiver, "read", order_id=order_id)
+        data = base64.b64decode(recovered["content_base64"], validate=True)
+        require(data == original and recovered["name"] == name and recovered["sha256"] == digest,
+                "strict paid delivery returns the actual original file, private name and SHA-256")
+        require(final["payment"]["earned"] == "29" and final["payment"]["withdrawn"] == "29"
+                and final["payment"]["refunded"] == "0", "provider actually withdraws all exact earned service fees")
+        passed("two-window-source-hold-open-and-original-file", order_id=order_id, windows=2,
+               bytes=len(data), sha256=digest, earned="29", withdrawn="29", evidence=final["evidence"])
+        register_rows = delivery_rows(receiver, "SELECT id,intent FROM transactions WHERE id LIKE 'key-%/register'")
+        require(len(register_rows) == 1, "receiving key has a unique registration transaction")
+        register_id, register_intent = register_rows[0]
+        calldata = bytes.fromhex(json.loads(register_intent)["calldata"].removeprefix("0x"))
+        proofs = [public_proof(calldata[4:1508], receiver, 1)]
+        for index in range(2):
+            source_input = delivery_rows(source, "SELECT body FROM private_values WHERE id=?", (f"source-input:{order_id}:{index}",))
+            require(len(source_input) == 1, "source proof input retains its exact public statement")
+            journal = bytes(json.loads(source_input[0][0])["statement"])
+            proofs.append(public_proof(journal, source, 2, index))
+            for relation in (3, 4):
+                public = journal[:32] + relation.to_bytes(32, "big") + journal[64:]
+                proofs.append(public_proof(public, receiver, relation, index))
+        transactions = {"registerKey": transaction(receiver, register_id), "approve": transaction(source, f"{order_id}/approve"),
+                        "fund": transaction(source, f"{order_id}/fund")}
+        for action in ("hold", "publish", "open", "withdraw"):
+            transactions[action] = [transaction(provider, f"{order_id}/{action}-{index}") for index in range(2)]
+        capsules = [{"windowIndex": index, "capsule": (provider.directory / "delivery/objects" / order_id / f"{index}-capsule.bin").read_bytes().hex()}
+                    for index in range(2)]
+        bundle = {"schemaVersion": 1, "escrow": chain["escrow"], "asset": chain["asset"], "orderId": "0x" + order_id,
+                  "proofs": proofs, "capsules": capsules, "transactions": transactions}
+        bundle_path = export / "settlement.json"
+        private_json(bundle_path, bundle)
+        observer = Path(configuration["settlement_observer"]).resolve(strict=True)
+        observed = subprocess.run(["node", str(observer), "--settlement", str(bundle_path), "--rpc-url", chain["rpc_url"]],
+                                  capture_output=True, timeout=180)
+        with (run / "settlement-observer.log").open("wb") as output:
+            output.write(observed.stdout[:65536])
+            output.write(observed.stderr[:65536])
+        require(observed.returncode == 0, "independent read-only observer verifies seven proofs, actual transactions, balances and gas on the original chain")
+        passed("seven-real-receipts-and-independent-settlement-observer", bundle=str(bundle_path), proofs=7,
+               fund=transactions["fund"], withdrawals=transactions["withdraw"], read_only_observer=True)
+        counts = {node.name: len(delivery_rows(node, "SELECT id FROM transactions")) for node in nodes}
+        for node in (source, receiver):
+            node.stop(crash=True)
+            node.start()
+            node.client.connect()
+            node.client.authenticate()
+            require(cli(node, ["status"])["state"] == "locked", "a restarted Node restores its independent wallet locked")
+        recovered_again = delivery_call(receiver, "read", order_id=order_id)
+        require(base64.b64decode(recovered_again["content_base64"], validate=True) == original,
+                "paid file remains recoverable after a real receiver process restart")
+        require_quiet("restarting completed paid Nodes creates no second nonce or transaction intent", lambda:
+                      counts == {node.name: len(delivery_rows(node, "SELECT id FROM transactions")) for node in nodes})
+        passed("paid-process-restart-retains-file-wallet-lock-and-transaction-identity", transaction_counts=counts)
+        report["status"] = "passed"
+        report["bundle"] = str(bundle_path)
+    except BaseException as error:
+        report["status"] = "failed"
+        report["failure"] = {"type": type(error).__name__, "message": str(error)}
+        raise
+    finally:
+        passwords.clear()
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
+        relay.close()
+        private_json(run / "summary.json", report)
+        print("Paid delivery report: " + str(run / "summary.json"), flush=True)
+    return report
+
+
+def e2e_fixture(options):
+    program = shutil.which(str(options.binary)) if len(options.binary.parts) == 1 else str(options.binary)
+    require(program is not None, "the isolated e2e Node binary exists on PATH or at its explicit path")
+    binary = Path(program).resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("fixture-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    module = options.crypto_module.resolve()
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes = {}
+    relay = PkarrRelay() if options.fixture_kind == "delivery" else None
+    rpc = DeliveryRpcSpy() if relay else None
+
+    def details():
+        return {"run": str(run), "nodes": {
+            role: {"url": node.url, "peer": node.device_id, "directory": str(node.directory)}
+            for role, node in nodes.items()
+        }}
+
+    def stop(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        for role in (["source", "receiver", "provider"] if relay else ["source"]):
+            args = (["--public-entry", "--relay-listen", f"127.0.0.1:{available_port()}"]
+                    if role == "provider" else [])
+            node = Node(run, role, binary, workspace, helper, init_args=args,
+                        port=options.fixture_port if role == "source" else None)
+            nodes[role] = node
+            isolate_delivery_node(node)
+            if relay:
+                node.configure_network(discovery={"publish": True, "resolve": True,
+                                                 "urls": [relay.url], "publish_direct": True})
+            if rpc:
+                private_json(node.directory / "delivery-settings.json",
+                             free_delivery_settings(rpc, options.fixture_profile, enabled=role == "provider"))
+            node.start()
+        print(json.dumps({"ready": details()}), flush=True)
+        for line in sys.stdin:
+            request = json.loads(line)
+            try:
+                op = request.get("op")
+                if op == "restart":
+                    role = request.get("role")
+                    require(role in nodes, "fixture restart names its own Node")
+                    node = nodes[role]
+                    node.stop(crash=bool(request.get("crash")))
+                    node.start()
+                    result = details()
+                elif op == "inspect":
+                    result = {"wallet_files": sum((node.directory / "delivery-wallet.json").exists()
+                                                  for node in nodes.values()),
+                              "pkarr_reads": relay.reads if relay else 0,
+                              "pkarr_writes": relay.writes if relay else 0,
+                              "chain_rpc_calls": rpc.calls if rpc else 0}
+                else:
+                    raise ValueError("unsupported fixture operation")
+                print(json.dumps({"ok": True, "result": result}), flush=True)
+            except Exception as error:
+                print(json.dumps({"ok": False, "error": type(error).__name__}), flush=True)
+    finally:
+        for node in reversed(list(nodes.values())):
+            node.client.close()
+            node.stop()
+        if relay:
+            relay.close()
+        if rpc:
+            rpc.close()
+
+
 if __name__ == "__main__":
     os.umask(0o077)
     if "--fixture-codex" in sys.argv:
@@ -3959,9 +4724,26 @@ if __name__ == "__main__":
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
         modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
+        modes.add_argument("--e2e-fixture", action="store_true", help=argparse.SUPPRESS)
+        modes.add_argument("--delivery-charity", action="store_true", help="check free discovery, charity transfer, loopback service boundaries and durable restart")
+        modes.add_argument("--delivery", action="store_true", help="check the full paid delivery flow; requires a private local deployment configuration")
+        parser.add_argument("--delivery-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json")
+        parser.add_argument("--delivery-source-root", type=Path, default=Path(__file__).resolve().parents[1])
+        parser.add_argument("--delivery-probe", type=Path)
+        parser.add_argument("--delivery-config", type=Path)
+        parser.add_argument("--fixture-kind", choices=("single", "delivery"), default="single", help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-port", type=int, help=argparse.SUPPRESS)
+        parser.add_argument("--fixture-profile", type=Path, default=Path(__file__).resolve().parents[1] / "proofs/delivery/profile.json", help=argparse.SUPPRESS)
         arguments = parser.parse_args()
         try:
-            if arguments.phase5:
+            if arguments.e2e_fixture:
+                require(arguments.fixture_port is not None, "e2e fixture requires its allocated port")
+                e2e_fixture(arguments)
+            elif arguments.delivery:
+                delivery_paid_acceptance(arguments)
+            elif arguments.delivery_charity:
+                delivery_charity_acceptance(arguments)
+            elif arguments.phase5:
                 phase5_acceptance(arguments)
             elif arguments.public_entry:
                 public_entry_acceptance(arguments)

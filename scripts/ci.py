@@ -23,7 +23,7 @@ DEPENDENTS = {
 }
 CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
 PATH_RULES = (
-    ("delivery", ("crates/delivery/*",)),
+    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/discovery.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
@@ -39,7 +39,7 @@ PLATFORMS = (
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "package", "npm-package", "npm-smoke")
+JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke")
 
 
 def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
@@ -71,6 +71,7 @@ def scope_plan(scopes, event, ref_type, channel):
     packages = [package for crate, package in CRATES.items() if crate in affected]
     web = full or "web" in scopes or "node" in affected
     slow = "node" in affected and extended
+    delivery = full or "delivery" in affected
     platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
     plan = {
         "full": full,
@@ -83,6 +84,7 @@ def scope_plan(scopes, event, ref_type, channel):
         "scopes": sorted(scopes),
         "web": web,
         "node": "node" in affected,
+        "delivery": delivery,
         "rust_packages": packages,
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
@@ -96,6 +98,8 @@ def scope_plan(scopes, event, ref_type, channel):
         required.update(("rust-check", "rust-fast"))
     if slow:
         required.add("rust-slow")
+    if delivery:
+        required.add("delivery")
     if plan["npm"]:
         required.update(("npm-package", "npm-smoke"))
     plan["required_jobs"] = [job for job in JOBS if job in required]
@@ -167,6 +171,7 @@ def write_plan(plan, output=None):
             "web": str(plan["web"]).lower(),
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
+            "delivery": str(plan["delivery"]).lower(),
             "package": str("package" in plan["required_jobs"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
@@ -276,8 +281,13 @@ def self_test():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
-    assert make_plan(["crates/delivery/abi/Statement.sol"])["rust_packages"] == expected["delivery"]
-    assert make_plan(["crates/delivery/Cargo.toml"])["scopes"] == ["delivery"]
+    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "crates/node/src/net/discovery.rs", "crates/node/src/delivery/wallet.rs", "crates/node/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
+        selected = make_plan([path])
+        assert selected["scopes"] == ["delivery"] and selected["delivery"]
+        assert selected["rust_packages"] == expected["delivery"] and selected["web"]
+        assert "delivery" in selected["required_jobs"]
+        assert "package" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
+    assert not docs["delivery"] and not web["delivery"]
     for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
@@ -322,6 +332,7 @@ def self_test():
     expect_failure(lambda: gate(needs, dict(ready, package_matrix={"include": list(PLATFORMS[:1])})))
     expect_failure(lambda: gate(needs, dict(ready, npm=False)))
     expect_failure(lambda: gate(needs, dict(ready, check_msrv=False)))
+    expect_failure(lambda: gate(needs, dict(ready, delivery=False)))
     complete = {job: {"result": "success"} for job in JOBS}
     complete["plan"] = {"result": "success", "outputs": {"plan": json.dumps(ready)}}
     gate(complete)
@@ -329,6 +340,17 @@ def self_test():
         incomplete = json.loads(json.dumps(complete))
         incomplete[job]["result"] = "skipped"
         expect_failure(lambda: gate(incomplete))
+    delivery_plan = make_plan(["proofs/delivery/fixtures/manifest.json"])
+    delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
+    delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
+    gate(delivery_needs)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        broken = json.loads(json.dumps(delivery_needs))
+        broken["delivery"] = {"result": result}
+        expect_failure(lambda: gate(broken))
+    broken = json.loads(json.dumps(delivery_needs))
+    del broken["delivery"]
+    expect_failure(lambda: gate(broken))
     assert validate_slow_tests(["other::test", *SLOW_TESTS]) == {"other::test"}
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS[:-1]]))
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS, SLOW_TESTS[0] + "_extra"]))

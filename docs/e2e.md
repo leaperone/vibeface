@@ -20,11 +20,11 @@ VIBEFACE_E2E_BINARY=/absolute/path/to/vibeface pnpm test:e2e
 PLAYWRIGHT_BROWSERS_PATH="$PWD/.artifacts/e2e/browsers" pnpm exec e2e-web install chromium --with-deps
 ```
 
-每次运行创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。数据、日志、报告和下载文件位于 `.artifacts/e2e/`，不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
+每项测试创建独立 Node 数据目录，使用随机本机端口，关闭模型执行和 Codex 会话扫描。测试结束后停止自己的进程，不连接已有 Node。测试控制口只监听 loopback，认证材料保存在 owner-only 文件。数据、日志、报告和下载文件位于 `.artifacts/e2e/`，不会提交。恢复密码每次随机生成，通过 e2e secrets 传入。
 
-示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。这两项测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
+示例检查建网页面。核心测试依次建网、下载恢复文件、跳过 AI 设置、创建 Bot，再刷新确认它仍存在。传输测试启动发送 Node、接收 Node 和公共入口 Node，经真实界面创建两个独立个人网络，启用公益传输，确认零费用订单，接受订单并重启接收 Node。浏览器下载的原文件必须通过 SHA-256 核对，免费过程不创建钱包或调用链上 RPC。这些测试不需要模型或登录。CI 使用本次提交打包出的 Linux 程序运行。
 
-Node 按整次命令隔离。重复验收请重新运行命令，不使用 `--repeat-each`，也不要开启重试；新增会修改后端状态的流程时，应先改为按测试隔离 Node。
+测试使用 `tests/fixtures.ts` 导出的 `test` 或 `deliveryTest`，每项测试均重建 Node。保持 `workers: 1` 和 `retries: 0`，避免重复执行有外部副作用的验收。
 
 只运行核心测试或显示浏览器：
 
@@ -34,6 +34,67 @@ pnpm test:e2e --headed
 ```
 
 排查失败时，读取终端指向的 `trace.md`。不要上传 Node 数据目录或恢复文件。
+
+## 验证公益传输进程和网络边界
+
+先构建仅用于受控 loopback 验收的 QUIC/Noise probe。构建产物必须留在任务 worktree 的 `.artifacts/`。
+
+```sh
+VIBEFACE_PROBE_SOURCE_ROOT="$PWD" \
+CARGO_TARGET_DIR="$PWD/.artifacts/delivery-probe/target" \
+cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
+
+python3 scripts/verify-node.py --delivery-charity \
+  --binary /absolute/path/to/vibeface \
+  --artifacts .artifacts/delivery \
+  --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe
+```
+
+该模式运行四个全新 Node，验证免费签名目录、默认关闭、两窗公益传输、同 intent 幂等、明确接收同意和原文件恢复。probe 使用真实产品发现代码和受控身份，正例必须成功到达指定 PeerID 的服务，外部 Node 必须在真实私网权限检查处遭到拒绝。验收先上传 8192 字节真实密文，再强制停止公共入口 Node，重启后检查持久前缀和旧 offset 拒绝，最后由产品继续完成订单。摘要保存在输出路径的 `summary.json`。
+
+构建与执行目录不同时，分别传入 `--crypto-module`、`--delivery-profile` 和 `--delivery-source-root` 的绝对路径。运行时会核对 probe 内嵌发现代码的 SHA-256，拒绝使用其他源码的旧 probe。
+
+## 验证付费交付和实际结算
+
+完整付费模式必须在 Linux cgroup v2 环境中运行，使用固定产品 profile、真实 prover 和本机 31337 测试链。先安装合约依赖。
+
+```sh
+node contracts/delivery/install.mjs
+```
+
+在同一任务目录创建权限为 `0600` 的配置文件，使用以下字段。`deployment_file` 指向当前 worktree 的 `.artifacts/` 下尚不存在的新文件。runner 自行启动并清理该次独立部署，拒绝复用旧输出或旧链。`prover` 必须含绝对路径 `program`、`r0vm`、`cgroup` 和与 `proofs/delivery/profile.json` 完全相同的 `profile`。金额均为十进制字符串，gas 上限以 wei 表示。
+
+```json
+{
+  "schema_version": 1,
+  "deployment_file": "/absolute/task/.artifacts/delivery/deployment.json",
+  "prover": {
+    "program": "/absolute/path/to/vibeface-delivery-prover",
+    "r0vm": "/absolute/path/to/r0vm",
+    "cgroup": "/sys/fs/cgroup/task-proof",
+    "profile": {}
+  },
+  "max_service_amount": "1000000",
+  "source_gas_cap_wei": "1000000000000000000",
+  "provider_gas_cap_wei": "1000000000000000000",
+  "register_key_gas_cap_wei": "1000000000000000000",
+  "settlement_observer": "/absolute/repo/contracts/delivery/observe-settlement.mjs"
+}
+```
+
+用实际产品 profile 替换示例中的空对象，再执行以下命令。
+
+```sh
+python3 scripts/verify-node.py --delivery \
+  --binary /absolute/path/to/vibeface \
+  --artifacts .artifacts/delivery \
+  --delivery-probe .artifacts/delivery-probe/target/debug/vibeface-delivery-probe \
+  --delivery-config .artifacts/delivery/acceptance.json
+```
+
+该模式先验证公益路径，再创建独立测试钱包，通过受保护 FD 解锁。它只使用本机部署的公开测试资助账户，生成一份 key-binding 证明及两个窗口各自的 source、hold、open 证明，核对完整原文件和实际提现。独立观察器只读原链，复核七份证明、真实交易、余额和 gas。导出的 `settlement/` 只含公开证明、capsule 与交易哈希，不含 witness、私钥、密码或 raw transaction。
+
+缺少配置、真实证明、部署或结算证据时，命令失败并报告 `UNVERIFIED` 或具体错误。公益模式通过不能代替付费验收。测试链的两次确认也不代表绝对最终性。
 
 ## 让编码代理使用 e2e
 

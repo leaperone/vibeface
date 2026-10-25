@@ -18,6 +18,7 @@ mod abi {
 use abi::DeliveryStatement;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofProfile {
     pub guest_image_id: Word,
     pub statement_schema_hash: Word,
@@ -385,14 +386,14 @@ pub(crate) fn source_payload(order: &UnsignedOrder) -> Vec<u8> {
 
 pub(crate) fn crypto_context(
     tag_name: &str,
-    terms: &Terms,
+    terms_hash: Word,
     index: u16,
     offset: u64,
     length: u32,
 ) -> Vec<u8> {
     (
         B256::from(tag(tag_name)),
-        B256::from(terms_hash(terms)),
+        B256::from(terms_hash),
         index,
         offset,
         length,

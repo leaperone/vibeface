@@ -27,6 +27,7 @@ jobs:
       web: ${{ steps.select.outputs.web }}
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
+      delivery: ${{ steps.select.outputs.delivery }}
       package: ${{ steps.select.outputs.package }}
       package_matrix: ${{ steps.select.outputs.package_matrix }}
       package_mode: ${{ steps.select.outputs.package_mode }}
@@ -69,7 +70,9 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py")]'
+          python3 scripts/check-delivery.py --self-test
+          python3 scripts/install-delivery-toolchain.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
@@ -228,6 +231,58 @@ jobs:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
         run: python3 scripts/ci.py test --tier slow --plan-env CI_PLAN
 
+  delivery:
+    needs: plan
+    if: needs.plan.outputs.delivery == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      RISC0_HOME: /risc0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: delivery
+          workspaces: |
+            . -> .artifacts/vdp/domain-target
+            proofs/delivery -> ../../.artifacts/vdp/proof-target
+      - name: Require current public delivery fixtures
+        run: python3 scripts/check-delivery.py --check-fixtures
+      - name: Install checksum-pinned guest compiler in artifacts
+        run: python3 scripts/install-delivery-toolchain.py
+      - name: Bind canonical Linux build paths
+        run: |
+          mkdir -p .artifacts/vdp "${CARGO_HOME:-$HOME/.cargo}"
+          sudo mkdir -p /work /cargo /risc0 /artifacts
+          sudo mount --bind "$PWD" /work
+          sudo mount --bind "${CARGO_HOME:-$HOME/.cargo}" /cargo
+          sudo mount --bind "$PWD/.artifacts/vdp/risc0" /risc0
+          sudo mount --bind "$PWD/.artifacts/vdp" /artifacts
+      - name: Rebuild guest and verify real delivery receipts on host and EVM
+        working-directory: /work
+        env:
+          CARGO_HOME: /cargo
+        run: python3 scripts/check-delivery.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: delivery-${{ github.sha }}
+          path: |
+            .artifacts/vdp/host-info.json
+            .artifacts/vdp/proof-results.json
+            .artifacts/vdp/public-vectors.json
+            .artifacts/vdp/contracts/*-results.json
+          if-no-files-found: warn
+          retention-days: 7
+
   package:
     needs: [plan, crypto-web, web]
     if: needs.plan.outputs.package == 'true'
@@ -251,6 +306,8 @@ jobs:
           name: web-${{ github.sha }}
           path: crates/node/web/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: package-${{ matrix.target }}
@@ -364,6 +421,23 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
+      - name: Verify packaged free discovery and charity delivery over real Node processes
+        if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+          VIBEFACE_PROBE_SOURCE_ROOT: ${{ github.workspace }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/delivery-probe/target
+        run: |
+          cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
+          cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          name: delivery-charity-${{ github.sha }}
+          path: .artifacts/ci-delivery/delivery-charity-*/report.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Verify packaged Web onboarding in Chromium
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
@@ -520,7 +594,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, package, npm-package, npm-smoke]
+    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

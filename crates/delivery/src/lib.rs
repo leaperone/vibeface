@@ -14,7 +14,10 @@ use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-pub use crypto::{encrypt_window, receiving_public, recover_window, verify_peer, verify_relation};
+pub use crypto::{
+    encrypt_charity_window, encrypt_window, receiving_public, recover_charity_window,
+    recover_window, validate_receiving_public, verify_peer, verify_relation,
+};
 pub use statement::{ProofProfile, Statement, hash, schema_hash, signing_message};
 
 pub type Word = [u8; 32];
@@ -107,6 +110,7 @@ pub enum BindingAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerSignature {
     pub r: Word,
     pub s: Word,
@@ -127,6 +131,7 @@ impl PeerSignature {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyBinding {
     pub chain_id: Word,
     pub escrow: Address,
@@ -169,6 +174,7 @@ impl KeyBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedKeyBinding {
     pub binding: KeyBinding,
     pub signature: PeerSignature,
@@ -185,6 +191,7 @@ impl SignedKeyBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Terms {
     pub profile_id: Word,
     pub guest_image_id: Word,
@@ -254,6 +261,7 @@ impl Terms {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowSpec {
     pub index: u16,
     pub offset: u64,
@@ -272,6 +280,7 @@ impl WindowSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnsignedOrder {
     pub terms: Terms,
     pub windows: Vec<WindowSpec>,
@@ -338,6 +347,7 @@ impl UnsignedOrder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Order {
     pub unsigned: UnsignedOrder,
     pub binding_signature: PeerSignature,
@@ -407,6 +417,7 @@ impl SecretBytes {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WindowRandomness {
     pub salt: Secret32,
     pub data_key: Secret32,
@@ -415,6 +426,7 @@ pub struct WindowRandomness {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncryptedWindow {
     pub spec: WindowSpec,
     pub ciphertext: Vec<u8>,
@@ -422,6 +434,7 @@ pub struct EncryptedWindow {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Witness {
     KeyBinding {
         binding: SignedKeyBinding,
@@ -451,6 +464,7 @@ pub enum Witness {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofInput {
     pub profile: ProofProfile,
     pub statement: Statement,
@@ -517,6 +531,109 @@ mod tests {
             run(&f.input(relation, 0)).unwrap();
         }
         assert_eq!(f.encrypted[0].ciphertext.len(), 68);
+    }
+
+    #[test]
+    fn charity_roundtrip_has_zero_fees_and_distinct_crypto_domain() {
+        let f = fixture(&[35], [0x91; 32]);
+        let terms = &f.order.unsigned.terms;
+        let context = terms.digest().unwrap();
+        let receiver = terms.binding.receiver_public;
+        let plain = crate::fixture::plaintext(35, 0);
+        let free = encrypt_charity_window(
+            context,
+            receiver,
+            0,
+            0,
+            &plain,
+            &crate::fixture::randomness(0),
+        )
+        .unwrap();
+        assert_eq!(free.spec.delivery_fee, Amount::ZERO);
+        assert_eq!(free.spec.reservation_fee, Amount::ZERO);
+        assert_ne!(free.ciphertext, f.encrypted[0].ciphertext);
+        assert_ne!(free.capsule, f.encrypted[0].capsule);
+        let secret = Secret32::new([7; 32]).unwrap();
+        let restored = recover_charity_window(
+            context,
+            receiver,
+            &free.spec,
+            &secret,
+            &free.ciphertext,
+            &free.capsule,
+        )
+        .unwrap();
+        assert_eq!(*restored.plaintext, plain);
+        let mut wrong = context;
+        wrong[0] ^= 1;
+        assert!(
+            recover_charity_window(
+                wrong,
+                receiver,
+                &free.spec,
+                &secret,
+                &free.ciphertext,
+                &free.capsule
+            )
+            .is_err()
+        );
+        let mut charged = free.spec.clone();
+        charged.delivery_fee = Amount::from_u64(1);
+        assert!(
+            recover_charity_window(
+                context,
+                receiver,
+                &charged,
+                &secret,
+                &free.ciphertext,
+                &free.capsule
+            )
+            .is_err()
+        );
+        assert!(
+            encrypt_charity_window(
+                [0; 32],
+                receiver,
+                0,
+                0,
+                &plain,
+                &crate::fixture::randomness(0)
+            )
+            .is_err()
+        );
+        assert!(
+            encrypt_charity_window(
+                context,
+                receiver,
+                16,
+                0,
+                &plain,
+                &crate::fixture::randomness(0)
+            )
+            .is_err()
+        );
+        assert!(
+            encrypt_charity_window(
+                context,
+                receiver,
+                0,
+                u64::MAX,
+                &plain,
+                &crate::fixture::randomness(0)
+            )
+            .is_err()
+        );
+        assert!(
+            recover_charity_window(
+                context,
+                receiver,
+                &free.spec,
+                &Secret32::new([8; 32]).unwrap(),
+                &free.ciphertext,
+                &free.capsule
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -843,5 +960,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn witness_decoder_rejects_secrets_outside_its_phase() {
+        let f = fixture(&[35], [0x91; 32]);
+        let mut input = serde_json::to_value(f.input(Relation::Open, 0)).unwrap();
+        input["witness"]["Open"]["data_key"] = serde_json::json!([1, 2, 3]);
+        assert!(serde_json::from_value::<ProofInput>(input).is_err());
+        let mut input = serde_json::to_value(f.input(Relation::Source, 0)).unwrap();
+        input["witness"]["Source"]["receiving_secret"] = serde_json::json!([1, 2, 3]);
+        assert!(serde_json::from_value::<ProofInput>(input).is_err());
     }
 }

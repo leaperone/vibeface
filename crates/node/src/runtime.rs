@@ -120,6 +120,7 @@ pub struct Update {
 }
 pub struct Runtime {
     pub config: Config,
+    pub delivery: crate::delivery::Delivery,
     pub(crate) data_dir: PathBuf,
     settings: std::sync::Mutex<NodeSettings>,
     providers: std::sync::Mutex<crate::providers::Local>,
@@ -245,7 +246,9 @@ impl Runtime {
             config.local_auto_access,
         )?);
         let triage = triage::TriageState::new(config.triage.clone());
+        let delivery = crate::delivery::Delivery::open(dir, identity.clone())?;
         let node = Self {
+            delivery,
             data_dir: dir.to_owned(),
             settings: std::sync::Mutex::new(NodeSettings {
                 roots: config.roots.clone(),
@@ -372,6 +375,7 @@ impl Runtime {
         json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        self.delivery.attach(Arc::downgrade(self))?;
         let events = self
             .codex_rx
             .lock()
@@ -464,6 +468,7 @@ impl Runtime {
     }
     /// Stops the managed App Server and Cursor bridge; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
+        self.delivery.shutdown().await;
         self.stop_network().await;
         self.codex.stop().await;
         if let Some(bridge) = self.cursor.get() {

@@ -19,6 +19,8 @@ use std::{
     time::Duration,
 };
 
+pub mod discovery;
+
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
@@ -26,7 +28,8 @@ pub const CLIENT: &[u8] = b"vibeface/client/1";
 pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";
-pub const ALPNS: [&[u8]; 6] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION];
+pub const SERVICE: &[u8] = b"vibeface/service/1";
+pub const ALPNS: [&[u8]; 7] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
@@ -35,6 +38,8 @@ const RELAY_TOKEN_DOMAIN: &[u8] = b"vibeface:relay:v1";
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    #[serde(default)]
+    pub discovery: discovery::DiscoveryConfig,
     /// UDP address of the iroh endpoint; defaults to all interfaces on the `listen` port.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
@@ -92,6 +97,7 @@ pub fn same_token(a: &str, b: &str) -> bool {
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
+        self.discovery.validate()?;
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
         for url in self.relays.iter().chain(&self.relay_url) {
             relay_url(url)?;
@@ -272,6 +278,21 @@ impl Net {
             .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
+        for url in &config.discovery.urls {
+            let url = reqwest::Url::parse(url)?;
+            if config.discovery.publish {
+                let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone());
+                let publisher = if config.discovery.publish_direct {
+                    publisher.addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
+                } else {
+                    publisher
+                };
+                builder = builder.address_lookup(publisher);
+            }
+            if config.discovery.resolve {
+                builder = builder.address_lookup(discovery::FreshResolver::new(url)?);
+            }
+        }
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
@@ -296,7 +317,7 @@ impl Net {
         let endpoint = builder
             .bind()
             .await
-            .map_err(|error| anyhow!("QUIC endpoint failed to start: {error}"))?;
+            .context("QUIC endpoint failed to start")?;
         Ok(Self {
             endpoint,
             lookup,

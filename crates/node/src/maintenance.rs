@@ -11,6 +11,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::Notify,
 };
+use zeroize::Zeroizing;
 
 const PROTOCOL: u32 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -192,6 +193,11 @@ enum Command {
     Commit,
     /// Turn local browser access without confirmation on or off.
     LocalAccess(bool),
+    DeliveryWallet(crate::delivery::wallet::WalletCommand),
+    DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
+    DeliveryRegisterKey {
+        gas_cap: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -215,14 +221,24 @@ struct Response {
     status: Status,
     health: Option<Health>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wallet: Option<crate::delivery::wallet::WalletStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<serde_json::Value>,
 }
 
 async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
-    tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let mut packet = Vec::new();
-        let mut chunk = [0u8; 256];
+    read_packet_timeout(stream, REQUEST_TIMEOUT).await
+}
+async fn read_packet_timeout<T: for<'de> Deserialize<'de>>(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<T> {
+    tokio::time::timeout(timeout, async {
+        let mut packet = Zeroizing::new(Vec::new());
+        let mut chunk = Zeroizing::new([0u8; 256]);
         loop {
-            let count = stream.read(&mut chunk).await?;
+            let count = stream.read(&mut chunk[..]).await?;
             ensure!(count != 0, "maintenance socket closed before response");
             packet.extend_from_slice(&chunk[..count]);
             ensure!(packet.len() <= 4096, "maintenance packet is too large");
@@ -240,7 +256,7 @@ async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> R
     .context("maintenance socket timed out")?
 }
 async fn write_packet<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
+    let mut bytes = Zeroizing::new(serde_json::to_vec(value)?);
     bytes.push(b'\n');
     tokio::time::timeout(REQUEST_TIMEOUT, stream.write_all(&bytes))
         .await
@@ -268,6 +284,11 @@ pub fn socket_path(data_dir: &Path) -> Result<PathBuf> {
 }
 
 async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Response)> {
+    let response_timeout = if matches!(&command, Command::DeliveryRegisterKey { .. }) {
+        Duration::from_secs(7200)
+    } else {
+        REQUEST_TIMEOUT
+    };
     let mut stream =
         tokio::time::timeout(REQUEST_TIMEOUT, UnixStream::connect(socket_path(data_dir)?))
             .await
@@ -280,7 +301,7 @@ async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Respo
         },
     )
     .await?;
-    let response: Response = read_packet(&mut stream).await?;
+    let response: Response = read_packet_timeout(&mut stream, response_timeout).await?;
     ensure!(
         response.protocol == PROTOCOL,
         "unsupported maintenance protocol"
@@ -341,6 +362,35 @@ pub async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+pub async fn delivery_wallet(
+    data_dir: &Path,
+    command: crate::delivery::wallet::WalletCommand,
+) -> Result<crate::delivery::wallet::WalletStatus> {
+    let (_, response) = request(data_dir, Command::DeliveryWallet(command)).await?;
+    response
+        .wallet
+        .context("node did not return its delivery wallet status")
+}
+
+pub async fn configure_delivery(
+    data_dir: &Path,
+    config: crate::delivery::DeliveryConfig,
+) -> Result<()> {
+    let (_, response) = request(data_dir, Command::DeliveryConfig(Box::new(config))).await?;
+    ensure!(
+        response.status == Status::Healthy,
+        "node did not apply delivery settings"
+    );
+    Ok(())
+}
+
+pub async fn register_delivery_key(data_dir: &Path, gas_cap: String) -> Result<serde_json::Value> {
+    let (_, response) = request(data_dir, Command::DeliveryRegisterKey { gas_cap }).await?;
+    response
+        .delivery
+        .context("node did not return its delivery key registration")
+}
+
 pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     let socket = socket_path(&data_dir)?;
@@ -369,6 +419,11 @@ pub async fn serve(runtime: Arc<Runtime>, data_dir: PathBuf) -> Result<()> {
     }
 }
 async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStream) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        stream.peer_cred()?.uid() == std::fs::metadata(&runtime.data_dir)?.uid(),
+        "maintenance socket requires its local owner"
+    );
     let request: Request = read_packet(&mut stream).await?;
     ensure!(
         request.protocol == PROTOCOL,
@@ -385,9 +440,50 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
         status: Status::Healthy,
         health: Some(health),
         error: None,
+        wallet: None,
+        delivery: None,
     };
     match request.command {
         Command::Probe => write_packet(&mut stream, &response).await?,
+        Command::DeliveryWallet(command) => {
+            let result = match runtime.maintenance.enter() {
+                Ok(_guard) => runtime.delivery.local_wallet(command).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(status) => response.wallet = Some(status),
+                Err(error) => {
+                    response.status = Status::Error;
+                    response.error = Some(error.to_string());
+                }
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::DeliveryConfig(config) => {
+            let result = match runtime.maintenance.enter() {
+                Ok(_guard) => runtime.delivery.configure_local(*config),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                response.status = Status::Error;
+                response.error = Some(error.to_string());
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::DeliveryRegisterKey { gas_cap } => {
+            let result = match runtime.maintenance.enter() {
+                Ok(_guard) => runtime.delivery.local_register_key(&gas_cap).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(value) => response.delivery = Some(value),
+                Err(error) => {
+                    response.status = Status::Error;
+                    response.error = Some(error.to_string());
+                }
+            }
+            write_packet(&mut stream, &response).await?;
+        }
         Command::LocalAccess(enabled) => {
             let result = {
                 let _save = runtime.config_save.lock().await;

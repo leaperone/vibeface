@@ -82,6 +82,16 @@ Use C length `plaintext_bytes + 68`, E length 80. All hashes use SHA256. AEAD an
 
 The chain remains responsible for current time, current registry serial, source-before-hold, held-before-publish, escrow balances, fixed provider and finality. A valid Open relation alone does not establish a paid order or prior source verification.
 
+## Charity object crypto
+
+`encrypt_charity_window(context: Word, receiver_public: Word, index: u16, offset: u64, plaintext: &[u8], randomness: &WindowRandomness)` returns Result<EncryptedWindow>. `recover_charity_window(context: Word, receiver_public: Word, spec: &WindowSpec, secret: &Secret32, ciphertext: &[u8], capsule: &[u8])` returns Result<RecoveredWindow>.
+
+The context must be the nonzero digest of independently signed CharityTerms, including the receiving public key, sender, receiver and provider PeerIDs, nonce, exact size, window count and retention rules. The Node validates these signatures and the full manifest before calling this primitive. Do not construct fake paid Terms, registry state, wallet addresses or profile IDs.
+
+Use `verify_peer()` for the separate Charity key certificate and `validate_receiving_public()` to reject noncanonical or small-order X25519 keys at its boundary. Paid KeyBinding deliberately requires a real chain and escrow and does not stand in for this certificate.
+
+Charity uses the same C and E byte layouts and zeroized random material as paid delivery. Its fee fields are always zero. Limits remain 64 KiB per window, 16 windows and 1 MiB total as protocol bounds, not measured service capacity. AEAD, HPKE info, HPKE AAD and plaintext-commitment labels are respectively `vibeface-delivery-charity-data-v1`, `vibeface-delivery-charity-hpke-info-v1`, `vibeface-delivery-charity-hpke-aad-v1`, and `vibeface-delivery-charity-plain-v1`. The canonical context tuple remains label hash, context digest, uint16 index, uint64 offset and uint32 plaintext length. This API has no chain calls or proof acceptance and must display signature receipt strength only.
+
 ## Commands
 
 Native checks from the task worktree.
@@ -93,8 +103,10 @@ cargo run --manifest-path crates/delivery/Cargo.toml --target-dir .artifacts/vdp
 
 The public vector generator reports profile ABI, all journals, transcript payloads, signatures, leaves, C and E. Its synthetic fixture keys are confined to example and unit-test support. These vectors check serialization and native crypto, not guest proofs.
 
+Without an explicit profile file the example uses the protocol's 16-window and 1-MiB bounds for tests only. Genuine first-release fixtures must supply the frozen two-window profile with max_total_bytes=131072. Pass its public JSON path after image_hex for `public`, or after private_output for `input`. The example validates its schema, image and caps before generating data. These profile fields are runtime data and do not change the guest.
+
 The independent workspace is `proofs/delivery`. Set `RISC0_HOME` to a preinstalled compatible RISC Zero toolchain and `CARGO_TARGET_DIR` to an ignored task artifact directory when building. The host uses `risc0-zkvm=3.0.6` client-only with disable-dev-mode. Official SHA2, Curve25519 and crypto-bigint patches live only in this proof workspace and guest workspace.
 
-`vibeface-delivery-prover info` returns this build's image and schema hashes. Generate private input with the fixture example's `input <length> <count> <image_hex> <relation> <index> <new_private_path>` command. It creates a mode-0600 file and refuses overwrite. Run `execute` or `prove <new_public_receipt_path>` with that file on stdin. Set `RISC0_SERVER_PATH` to an absolute trusted local r0vm path. Execute reports cycles and explicitly says proved=false. Prove only exports a genuinely verified Groth16 seal. `verify <expected_public_journal_hex>` reads a serialized public receipt from stdin.
+`vibeface-delivery-prover info` returns this build's image and schema hashes. Generate private input with the fixture example's `input <length> <count> <image_hex> <relation> <index> <new_private_path>` command. It creates a mode-0600 file and refuses overwrite. Run `execute` or `prove <new_public_receipt_path>` with that file on stdin. Set `RISC0_SERVER_PATH` to an absolute trusted local r0vm path. Execute reports cycles and explicitly says proved=false. Prove only exports a genuinely verified Groth16 seal. Its final receipt appears only after a private temporary file has been fsynced and atomically published without replacing another result, followed by directory fsync. An existing final file stops another prove attempt. `verify <expected_public_journal_hex>` reads a serialized public receipt from stdin and returns verified, kind=groth16, the 260-byte selector-plus-seal, imageId and journalHash. Node restarts recover a stable receipt through verify rather than generating another proof.
 
 Host memory enforcement is the Node supervisor's responsibility. A maxProverMemoryBytes field is a signed limit, not evidence that the OS enforced it. No claim of resource acceptance follows from native unit tests or a successful build.

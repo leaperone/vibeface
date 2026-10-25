@@ -14,6 +14,7 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 | Bridge | Bridge 和 Node 的核心检查 |
 | Protocol | Protocol、Bridge 和 Node 的核心检查 |
 | Secure、密码学验收脚本 | Secure、Node 和浏览器密码学互通 |
+| Delivery 领域库、proof、合约和服务入口 | Delivery 与 Node 核心检查、新 guest 的公开证明验证和本地 EVM 验收 |
 | Cargo manifest、锁文件、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试。
@@ -22,9 +23,50 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 
 Web 路径优先于 Node 路径。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
+`delivery` 路径先于通用 Node 和 Cargo 路径匹配。它包括 `crates/delivery/`、`proofs/delivery/`、`contracts/delivery/`、`tests/fixtures/delivery-probe/`、`crates/node/src/delivery/`、发现实现、服务入口与本地钱包边界，以及两个 delivery 验收脚本。Delivery 领域库向上触发 Node 检查，因此 Rust 任务所需的 Web 和密码学资源仍会构建。完整工作区检查也要求 `delivery` 任务成功。
+
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
 Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证建网页面以及建网、下载恢复文件、跳过 AI 设置、创建 Bot 和刷新后保留的流程。它不调用真实模型。CI 上传浏览器测试报告，排除下载的恢复文件和 Node 数据。
+
+## 可验证交付的核心检查
+
+`delivery` 任务使用 Rust 1.98.1 构建独立的 `proofs/delivery` host。guest 编译器固定为 RISC Zero Rust `r0.1.97.0`，由 `scripts/install-delivery-toolchain.py` 校验官方归档 SHA-256 后安装到 `.artifacts/vdp/risc0/`。它不改全局 Rust 配置，Node 默认构建不依赖重型 proof host。
+
+规范 guest 只在 Linux x86_64 构建。CI 把源码、Cargo 缓存、编译器和产物分别挂到 `/work`、`/cargo`、`/risc0` 和 `/artifacts`，再调用唯一入口 `proofs/delivery/build.sh`。固定路径和 guest 的 remap 参数避免把不同机器的绝对路径写入不同的 image。Mac 原生构建不能作为该规范 image 的证明验收。
+
+`scripts/check-delivery.py` 先要求 `proofs/delivery/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
+
+所有 receipt 还必须绑定产品的 `proofs/delivery/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
+
+合约检查使用锁定的 solc、Ganache 和 ethers。官方 verifier 源码逐项校验摘要，`compile.mjs --check-trust` 对比重新编译的 runtime 与已提交的 `trust.json`，不改 tracked 文件。检查还包括账务正反例、官方 published fixture、两连续窗口的 Rust 与 Solidity 编码比较，以及当前 delivery image 的真实 seal 在生产 adapter 上的验真和篡改拒绝。
+
+这些结果分别保留在 `.artifacts/vdp/` 和 `.artifacts/vdp/contracts/`。CI 只上传公开 journal、结果和合成公开向量，不上传私密见证、密钥、Node 数据或工具链。官方 published fixture 和账务测试有各自的标签，它们不能替代当前 delivery image 的证明。
+
+在上述固定路径的 Linux sandbox 中执行同一核心检查：
+
+```sh
+python3 scripts/check-delivery.py --check-fixtures
+python3 scripts/install-delivery-toolchain.py
+CARGO_HOME=/cargo RISC0_HOME=/risc0 python3 scripts/check-delivery.py
+```
+
+Mac 或未配置上述挂载的 Linux 主机使用同一 sandbox 入口：
+
+```sh
+python3 scripts/check-delivery.py --check-fixtures
+python3 scripts/check-delivery.py --sandbox
+```
+
+`--sandbox` 先检查 fixture，再用固定的 `proofs/delivery/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。容器只挂四个目录，复用 `.artifacts/vdp/cargo`、`.artifacts/vdp/risc0` 和 `.artifacts/vdp/canonical`，不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
+
+`--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。完整命令缺少 fixture、编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
+
+CI 不生成新的昂贵证明，也不为新容量或资源上限背书。修改密码关系或 guest 后，先在本地生成并验收新 image 的真实证明，再更新公开 fixture。完整 64 KiB 窗口、连续窗口、实际 prover 和包装进程的资源硬限制、真实 Node 传输与资金流程、断线恢复及原生手机操作仍需按任务单独验收。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+
+当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复及私人协议拒绝使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
+
+公益进程验收与 paid proof 任务各自必须通过。公益收据不代表链上交付或结算。Preflight 对 probe 和相关服务改动单独运行 fmt 与最小 locked build，不把这一构建当作进程验收。
 
 ## 定期、手动和发布检查
 

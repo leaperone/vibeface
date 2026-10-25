@@ -21,7 +21,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     } else {
         [0x91; 32]
     };
-    let fixture = support::fixture(&vec![length; count], image);
+    let profile_path = args.get(if args[0] == "input" { 7 } else { 4 });
+    let fixture = if let Some(path) = profile_path {
+        let profile: ProofProfile = serde_json::from_slice(&std::fs::read(path)?)?;
+        profile.validate()?;
+        if profile.guest_image_id != image {
+            return Err("profile image mismatch".into());
+        }
+        if count > profile.max_windows as usize
+            || length > profile.max_window_bytes as usize
+            || (count * length) as u64 > profile.max_total_bytes
+        {
+            return Err("fixture exceeds supplied profile".into());
+        }
+        support::fixture_with_profile(&vec![length; count], profile)
+    } else {
+        support::fixture(&vec![length; count], image)
+    };
     if args[0] == "input" {
         let relation = Relation::try_from(args.get(4).ok_or("missing relation")?.parse::<u8>()?)?;
         let index: u16 = args.get(5).ok_or("missing index")?.parse()?;

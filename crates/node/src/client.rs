@@ -667,6 +667,26 @@ async fn dispatch(
             node_operator(node, session).await?;
             node.node_settings().await
         }
+        "delivery" => {
+            let principal = principal(node, session).await?;
+            let read_only = matches!(
+                params["op"].as_str(),
+                Some("status" | "list" | "get" | "find_intent" | "read")
+            );
+            ensure!(
+                read_only || (principal.source == "membership" && principal.can_manage),
+                "delivery writes and spending require a managing member of your personal network"
+            );
+            if !read_only && params["op"] != "configure" {
+                ensure!(
+                    node.write_status(&principal.network_id).await?["state"] == "writable",
+                    "delivery writes wait until this Node is writable"
+                );
+            }
+            node.delivery
+                .client_request(node, &principal.network_id, &principal.device_id, params)
+                .await
+        }
         "configure_node" => {
             node_operator(node, session).await?;
             let settings = serde_json::from_value(params).context("invalid Node settings")?;
@@ -1777,6 +1797,140 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    #[tokio::test]
+    async fn delivery_requires_a_current_managing_member_and_does_not_create_a_wallet_for_free_use()
+    -> Result<()> {
+        use crate::config::{self, Config};
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("delivery-principal-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, admin, member, local) = (
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        );
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&admin, "admin", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&member, "member", false)?,
+        )?)?;
+        let network = state.genesis.network_id.clone();
+        node.install_membership(state.clone()).await?;
+        let session = |identity: &LocalIdentity| -> Result<Session> {
+            Ok(Session {
+                device_id: identity.device_id()?,
+                cookie: None,
+                subscribed: false,
+                observation: None,
+            })
+        };
+        let mut browser = session(&member)?;
+        assert_eq!(
+            dispatch(&node, &mut browser, "delivery", json!({"op":"status"})).await?["enabled"],
+            false
+        );
+        assert!(!dir.join("delivery").exists());
+        assert!(!dir.join("delivery-wallet.json").exists());
+        let change =
+            json!({"op":"configure","enabled":true,"charity_enabled":true,"paid_enabled":false});
+        assert!(
+            dispatch(&node, &mut browser, "delivery", change.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch(
+                &node,
+                &mut browser,
+                "delivery",
+                json!({"op":"confirm","intent_id":uuid::Uuid::new_v4().to_string()})
+            )
+            .await
+            .is_err()
+        );
+        node.local_access
+            .publish_listener("http://127.0.0.1:0".into(), node.identity.device_id()?)?;
+        let token = node
+            .local_access
+            .issue_from_local_setup(&node.identity.device_id()?, &network)?;
+        let cookie = node.local_access.exchange(
+            &token,
+            &node.identity.device_id()?,
+            &network,
+            &local.device_id()?,
+        )?;
+        let mut local_session = session(&local)?;
+        local_session.cookie = Some(cookie);
+        assert_eq!(
+            dispatch(&node, &mut local_session, "authenticate", json!({})).await?["principal"]["source"],
+            "local_session"
+        );
+        assert!(
+            dispatch(&node, &mut local_session, "delivery", change.clone())
+                .await
+                .is_err()
+        );
+        let mut manager = session(&admin)?;
+        assert_eq!(
+            dispatch(&node, &mut manager, "delivery", change).await?["enabled"],
+            true
+        );
+        assert!(!dir.join("delivery-wallet.json").exists());
+        assert!(
+            dispatch(
+                &node,
+                &mut manager,
+                "delivery",
+                json!({"op":"unlock","passphrase":"not-a-remote-wallet-api"})
+            )
+            .await
+            .is_err()
+        );
+        let replacement = LocalIdentity::generate();
+        state.append(GovernanceEvent::grant(
+            &admin,
+            &state.project()?,
+            Member::client(&replacement, "replacement", true)?,
+        )?)?;
+        state.append(GovernanceEvent::revoke(
+            &replacement,
+            &state.project()?,
+            Revocation::new(&admin.device_id()?, None)?,
+        )?)?;
+        node.install_membership(state).await?;
+        assert!(
+            dispatch(
+                &node,
+                &mut manager,
+                "delivery",
+                json!({"op":"reconcile","order_id":"ab".repeat(32)})
+            )
+            .await
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn log_intake_needs_a_member_and_bounded_records_and_reading_needs_management()

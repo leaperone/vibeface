@@ -1,0 +1,55 @@
+[
+  {
+    "path": "vendor/risc0/contracts/src/groth16/RiscZeroGroth16Verifier.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/groth16/RiscZeroGroth16Verifier.sol",
+    "http": 200,
+    "sha256": "f24784fb625b8a82232c79f21db28f759593e29a287a4f9865cc6e78d36eb283"
+  },
+  {
+    "path": "vendor/openzeppelin/contracts/utils/math/SafeCast.sol",
+    "url": "https://raw.githubusercontent.com/OpenZeppelin/openzeppelin-contracts/v5.0.2/contracts/utils/math/SafeCast.sol",
+    "http": 200,
+    "sha256": "089488198de38548e4e8ee7940d307f18396e5b295de5bca7ff7567fd4142cc3"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/groth16/ControlID.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/groth16/ControlID.sol",
+    "http": 200,
+    "sha256": "753535e844a84a28b275fe21bd4c30022266b27bcdaa9b189220dece220accfa"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/groth16/Groth16Verifier.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/groth16/Groth16Verifier.sol",
+    "http": 200,
+    "sha256": "14bdf78c8b6168b12a5235395d42b8daabb48ee29d49913bb06d20071f156fd6"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/IRiscZeroVerifier.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/IRiscZeroVerifier.sol",
+    "http": 200,
+    "sha256": "cfd7c80872313134d028c0250ddc86036448fb4df290ce4dba113ea80646e180"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/StructHash.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/StructHash.sol",
+    "http": 200,
+    "sha256": "9fd507fc30726dcecf35a7a1d16b2ffe34561721fa37895bb75b9c3cf07f0131"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/Util.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/Util.sol",
+    "http": 200,
+    "sha256": "4711aa3c42754c996278f62091ffd1422132512e0900a9cdea3fe54235fa5896"
+  },
+  {
+    "path": "vendor/risc0/contracts/src/IRiscZeroSelectable.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/src/IRiscZeroSelectable.sol",
+    "http": 200,
+    "sha256": "54a8a39dd427e8ec21db31815d80a3df6df992d3244a2370ba21517dde7dd11b"
+  },
+  {
+    "path": "vendor/risc0/contracts/test/TestReceiptV3_0.sol",
+    "url": "https://raw.githubusercontent.com/risc0/risc0-ethereum/v3.0.1/contracts/test/TestReceiptV3_0.sol",
+    "sha256": "552f7885ba6aefec3fd2f8d8e56017cf97481455da6bb76ed0798e1a67cacabb"
+  }
+]

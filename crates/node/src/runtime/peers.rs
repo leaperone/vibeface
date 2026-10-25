@@ -269,6 +269,9 @@ impl Runtime {
         connection: Connection,
     ) -> Result<()> {
         let remote = net::device_id(&connection.remote_id());
+        if alpn == net::SERVICE {
+            return self.delivery.serve(self.clone(), connection).await;
+        }
         if self.config.public_entry {
             connection.close(1u32.into(), b"a public entry accepts no connections");
             bail!("a public entry accepts no connections");

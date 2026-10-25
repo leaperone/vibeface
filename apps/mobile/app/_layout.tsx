@@ -62,6 +62,7 @@ function Screens() {
             <Stack.Screen name="ai" options={{ title: 'AI' }} />
             <Stack.Screen name="inbox" options={{ title: '待处理', ...root }} />
             <Stack.Screen name="settings" options={{ title: '设置', ...root }} />
+            <Stack.Screen name="transfers" options={{ title: '文件传输' }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
             <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal' }} />
             <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />
