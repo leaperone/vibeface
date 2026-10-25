@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Pressable, useWindowDimensions, View } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
@@ -12,6 +12,7 @@ import { EmptyState, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
+import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
 import { cn } from '@/lib/utils'
 
@@ -82,7 +83,7 @@ function issueText(provider: ProviderId, issue: ProviderIssue): string {
   }
 }
 
-type Change = { assistant?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Change = { bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
 
 function AiSettings() {
   const { ready } = useDevice()
@@ -132,7 +133,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:assistant`} disabled={busy !== ''} onPress={() => void change('assistant', { assistant: !assistant })} />
+      <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
       {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
       {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
@@ -163,7 +164,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
 
 function Toggle({ icon, label, pressed, busy, disabled, onPress }: { icon: LucideIcon; label: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   // While a save runs the toggles keep their look and ignore taps; the spinner says which one is changing.
-  return <Button variant={pressed ? 'default' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
+  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
     <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
   </Button>
 }
@@ -275,7 +276,6 @@ function Triage() {
   const [label, setLabel] = useState('')
   const [token, setToken] = useState('')
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
-  const { fontScale } = useWindowDimensions()
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
   if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-24 rounded-xl bg-muted" />
   const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions }
@@ -286,12 +286,8 @@ function Triage() {
   const other = (outlet: Outlet): Outlet => outlet === 'both' ? 'record' : 'both'
   const { pending, delivered, dead } = settings.outbox
   return <View className="gap-6">
-    <View accessibilityRole="radiogroup" className={cn('gap-1 rounded-lg bg-muted p-1', fontScale >= 1.3 ? 'self-stretch' : 'flex-row self-start')}>
-      {outlets.map(([value, text, icon]) => <Button key={value} accessibilityRole="radio" accessibilityState={{ checked: config.default_outlet === value }} disabled={busy !== ''}
-        variant={config.default_outlet === value ? 'outline' : 'ghost'} className={cn('min-h-11', fontScale >= 1.3 && 'justify-start')} onPress={() => { if (value !== config.default_outlet) void save('default', { default_outlet: value }) }}>
-        <Icon as={icon} /><Text>{text}</Text>
-      </Button>)}
-    </View>
+    <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
+      onChange={(value) => void save('default', { default_outlet: value })} />
     <Field label="按文件夹另设">
       <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
         trailing={(prefix) => {

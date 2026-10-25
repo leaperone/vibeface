@@ -20,7 +20,8 @@ function IconImpl({ as: IconComponent, fill, size, ...props }: IconProps) {
   const scaled = typeof size === 'number' ? size * (1 + (Math.min(fontScale, 2) - 1) / 2) : size;
   const icon = <IconComponent {...props} size={scaled} {...(fill === undefined ? {} : { fill })} />;
   // The loader means work in progress, so it turns wherever it appears; with Reduce Motion it holds still.
-  return IconComponent === LoaderCircle && !reduced ? <Animated.View style={spin}>{icon}</Animated.View> : icon;
+  // Sized to the glyph, or a column stretches the wrapper and the loader orbits the row's centre.
+  return IconComponent === LoaderCircle && !reduced ? <Animated.View style={[spin, { width: scaled, height: scaled }]}>{icon}</Animated.View> : icon;
 }
 
 const StyledIcon = withUniwind(IconImpl, {

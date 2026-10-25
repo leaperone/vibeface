@@ -7,7 +7,7 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { EmptyState, Monogram } from '@/components/kit'
+import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -33,16 +33,27 @@ const Fade = withUniwind(Animated.View)
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
   const rows: Entry[] = []
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
-  chat.messages.forEach((message, index) => {
+  // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
+  const turns = new Set<string>()
+  const keyOf = (message: ChatMessage) => {
+    if (message.role !== 'assistant' || !message.in_reply_to || turns.has(message.in_reply_to)) return message.message_id
+    turns.add(message.in_reply_to)
+    return `turn:${message.in_reply_to}`
+  }
+  // A streamed reply whose final text is already in the history is the same reply: draw it once, whichever side is behind.
+  const same = (a: string, b: string) => a.trim() !== '' && b.trim() !== '' && (a.trim().startsWith(b.trim()) || b.trim().startsWith(a.trim()))
+  const messages = chat.messages.filter((message) => message.state !== 'streaming' || !message.in_reply_to || !chat.messages.some((other) => other.role === 'assistant'
+    && other.state !== 'streaming' && other.in_reply_to === message.in_reply_to && same(other.text, message.text)))
+  messages.forEach((message, index) => {
     while (questions.length && questions[0].created_at_ms < message.created_at_ms) {
       const question = questions.shift()!
       rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
     }
-    const next = chat.messages[index + 1]
+    const next = messages[index + 1]
     // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
     const previous = rows.at(-1)
     const grouped = previous !== undefined && 'message' in previous && !previous.last && previous.message.role === message.role
-    rows.push({ key: message.message_id, message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
+    rows.push({ key: keyOf(message), message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
     rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
   })
   for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
@@ -68,6 +79,7 @@ export default function ChatScreen() {
   const id = bot?.conversation_id
   const chat = id ? workspace.conversations[id] : undefined
   const [drafts, setDrafts] = useState<Record<string, { text: string; files: Attachment[] }>>({})
+  const [launching, setLaunching] = useState(false)
   const draft = (id && drafts[id]) || { text: '', files: [] }
   const setDraft = (next: Partial<typeof draft>) => { if (id) setDrafts((current) => ({ ...current, [id]: { ...draft, ...next } })) }
   useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
@@ -77,6 +89,16 @@ export default function ChatScreen() {
   const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
+  // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is
+  // cleared if untouched, so a second tap never posts it twice. Until then a resend reuses the pending message.
+  const unsettled = useRef<{ text: string; seen: number } | null>(null)
+  const sent = (text: string) => chat?.messages.filter((message) => message.role === 'user' && message.state !== 'sending' && message.text === text).length ?? 0
+  const landed = unsettled.current !== null && sent(unsettled.current.text) > unsettled.current.seen
+  useEffect(() => {
+    if (!landed || !unsettled.current) return
+    if (draft.text.trim() === unsettled.current.text) setDraft({ text: '', files: [] })
+    unsettled.current = null
+  }, [landed])
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
@@ -85,10 +107,15 @@ export default function ChatScreen() {
   const send = () => {
     const { text, files } = draft
     setDraft({ text: '', files: [] })
-    list.current?.scrollToOffset({ offset: 0, animated: true })
-    workspace.actions.send(id, text.trim(), files).catch(() => setDraft({ text, files }))
+    // Held from the tap itself: the shared sending flag lands a frame or two after the draft clears.
+    setLaunching(true)
+    // iOS makes room for the keyboard with an inset, so the newest message rests at a negative offset, not at 0.
+    list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
+    workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras) : []
+  // The bot's hue carries from its monogram into the send button and starter chips, so each chat reads as that bot's.
+  const tint = botTint(botHue(bot.bot_id), theme === 'dark')
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
     <Stack.Screen options={{
@@ -125,7 +152,7 @@ export default function ChatScreen() {
         <Monogram name={bot.name} seed={bot.bot_id} hero />
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
+          {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
         </View>
       </View>
     </Animated.View>}
@@ -133,10 +160,11 @@ export default function ChatScreen() {
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={chat?.sending ?? false} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} />
-        {noAgent ? <Link href="/ai" asChild>
-          <Button variant="link" className="-mt-2 min-h-11 self-start px-6"><Text>去配置</Text></Button>
-        </Link> : null}
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
+          {noAgent ? <Link href="/ai" asChild>
+            <Button variant="link" className="min-h-11 self-start px-2"><Text>去配置</Text></Button>
+          </Link> : null}
+        </Composer>
       </View>
     </KeyboardStickyView>
   </View>

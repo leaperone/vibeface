@@ -7,7 +7,7 @@ import { humanError, rawError } from '@vibeface/client/lib/errors.ts'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
-import { EmptyState, toneText, type Tone } from '@/components/kit'
+import { CopyableId, EmptyState, toneText, type Tone } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
@@ -69,7 +69,10 @@ export default function TaskDetail() {
       {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
       {work.cwd ? <Detail label="文件夹" mono>{work.cwd}</Detail> : null}
-      <Detail label="任务编号" mono>{work.work_id}</Detail>
+      <View className="gap-0.5">
+        <Text className="text-meta text-muted-foreground">任务编号</Text>
+        <CopyableId value={work.work_id} label="任务编号" />
+      </View>
     </Section>
   </ScrollView>
 }
