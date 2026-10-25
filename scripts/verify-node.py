@@ -111,19 +111,19 @@ _port_base = [int(os.environ.get("VIBEFACE_PORT_BASE", "0"))]
 
 
 def available_port():
-    """A free loopback port; VIBEFACE_PORT_BASE pins runs to a known range."""
-    while _port_base[0]:
+    """A free TCP/UDP loopback port; VIBEFACE_PORT_BASE pins a known range."""
+    while True:
         port = _port_base[0]
-        _port_base[0] += 1
-        with socket.socket() as stream:
+        if port:
+            _port_base[0] += 1
+        with socket.socket() as stream, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
             try:
                 stream.bind(("127.0.0.1", port))
+                port = stream.getsockname()[1]
+                datagram.bind(("127.0.0.1", port))
                 return port
             except OSError:
                 continue
-    with socket.socket() as stream:
-        stream.bind(("127.0.0.1", 0))
-        return stream.getsockname()[1]
 
 
 CLIENT_SOURCE = r"""
@@ -534,7 +534,7 @@ class Node:
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
-        self.configure_network(bind="127.0.0.1:0")
+        self.configure_network(bind=f"127.0.0.1:{self.port}")
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
                                 capture_output=True, timeout=15)
         require(result.returncode == 0, f"{name}: local access material is available")
