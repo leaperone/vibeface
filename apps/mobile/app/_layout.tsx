@@ -2,7 +2,9 @@ import '@/platform/polyfills'
 import '../global.css'
 
 import { Stack } from 'expo-router'
+import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
+import { useEffect } from 'react'
 import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
@@ -25,6 +27,8 @@ export default function RootLayout() {
 function Screens() {
   const workspace = useWorkspace()
   const [background, foreground] = useCSSVariable(['--background', '--foreground']) as [string, string]
+  // Mid-rotation, UIKit can show the window behind a view that has not resized yet; paint it the page colour, not white.
+  useEffect(() => { void SystemUI.setBackgroundColorAsync(background) }, [background])
   const ready = workspace.session.phase === 'ready'
   const wide = useWide()
   // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
@@ -32,7 +36,7 @@ function Screens() {
   // The Stack keeps its place in the tree whether or not the sidebar shows, so a rotation never resets the route.
   return <>
     <StatusBar style="auto" />
-    <View className="flex-1 flex-row">
+    <View className="flex-1 flex-row bg-background">
       {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
       {ready ? <View className="w-80 border-e border-border bg-background" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
       <View className="flex-1">
