@@ -98,6 +98,42 @@ python3 scripts/verify-node.py --delivery \
 
 缺少配置、真实证明、部署或结算证据时，命令失败并报告 `UNVERIFIED` 或具体错误。公益模式通过不能代替付费验收。测试链的两次确认也不代表绝对最终性。
 
+## 验证完整付费分支与双端恢复
+
+`scripts/run-delivery-live.py` 监督同一临时链、sandbox 和宿主 UI。向 `verify-node.py --delivery` 追加 `--delivery-ui-control` 的专用路径后，runner 在原严格订单之后运行有限分支、真实密钥生命周期和普通单窗口订单。核心严格订单仍是 130816 字节、两窗和七份证明。
+
+扩展验收在实际付款前捕获 C0，并在两个 source 证明完成、原 Source 的 approve `eth_estimateGas` 返回前捕获 C0Prime。该请求保持阻断，停稳节点并备份完整私有目录后，以失败结束旧请求。后续操作复用原意图和已完成的证明。C1 对应真实 fund 已确认、接收方尚未接受的状态。链快照和完整 Node 数据快照必须配对恢复，不修改单表或删除签名交易。
+
+有限分支验证入金代币行为、退款、部分交付、截止、重组和固定收款地址。keeper 操作与真实 Source 自主退款分别记录。Source 自主退款恢复匹配的完整 C1 数据，只解锁 Source，完成后保存分支目录和实际交易，再停稳恢复。Node 专用 loopback RPC 转发器只计广播次数，不保存请求体或 raw。锁定观察期间广播必须为零。
+
+真实 Rotate、Revoke、Register 各新增一份 key-binding 证明。Rotate 在一个旧窗口已 Held、另一个尚未 Held 的分支执行。原签名交易恢复后保留同一 Rotate 和旧密钥，最后的新 Active key 接收普通订单。普通订单是 4096 字节的 `ordinary-paid-ui.bin`，新增 source、hold、open 各一份。全任务共十三份不同证明，普通公开 bundle 有四项，其中 key-binding 与最终 Register 共用。
+
+宿主通过 `e2e.paid.config.ts` 运行两个平台过滤的测试，使用 `workers: 2` 和 `retries: 0`。测试扩展名是 `.paid.ts`，默认 e2e 测试不会发现这些需要控制器的用例。两个测试都通过真实邀请、安全码和管理权限入网。Web 选择实际文件、查看费用并确认原订单。Android release app 接受订单，实际后台、移除本任务的接收端口 reverse，并终止原 app 连接。只有前台实际出现离线状态才记录断线。后台 Node 完成结算后，恢复同一 reverse，手机回到原订单并保存文件。root AVD 仅读取该 app 的 transfers 文件核对大小与 SHA。
+
+宿主必须提供以下环境变量。APK、serial 和 controller 都由本轮 CI 明确指定。
+
+```sh
+VIBEFACE_DELIVERY_UI_CONTROL=/absolute/task/.artifacts/vdp/live-ui/control.json
+VIBEFACE_DELIVERY_UI_TIMEOUT_MS=3600000
+VIBEFACE_E2E_ANDROID_APK=/absolute/task/.artifacts/native/app-release.apk
+VIBEFACE_E2E_ANDROID_SERIAL=emulator-5554
+```
+
+容器保持原 root 证明环境，通过 `VIBEFACE_DELIVERY_UI_UID` 和 `VIBEFACE_DELIVERY_UI_GID` 把专用控制目录、原文件和 `0600` 控制描述交给宿主用户。邀请码只经过认证 API，不落公开文件。Node 目录、钱包、密钥和 witness 不改变所有者或权限。
+
+严格和普通 observer 的当次公开 JSON 分别保存在各自 bundle 目录的 `settlement-observation.json`，不读取一个可被覆盖的 latest 报告。有限分支只接受 helper ready 事件给出的本次 `publicIndex`。密钥生命周期公开文件位于 `key-lifecycle/`，完整私有数据快照与分支 raw 永不上传。
+
+普通双端操作保留三个配对后的视频片段，内置整段录像保持关闭。CI 以 `--headed --video off` 在任务独立 Xvfb 的 1440×1000 显示中运行。Web 在费用报价可见后启动 ffmpeg，确认付款并刷新原意图后用 `q` 结束。Android 通过现有 adb screenrecord 分别录制接受至实际离线、恢复连接至实际保存，只向本次录像的匹配 PID 发 SIGINT。两端都检查录像实际开始、一直存活至片段结束，并用 ffprobe 核对真实 MP4 视频流与时长。提前自行结束，即使退出码为零，也失败。
+
+公开目录只增加 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4`，以及各自独立写入的 `web-video.json` 和 `android-video.json`。收据包含原订单与意图、实际退出码和 signal、视频 SHA 与大小。宿主独立复核后合并视频清单。邀请码、钱包密码、恢复文件、完整 attempt 视频和 trace 均不上传。
+
+只检查控制器和阻断规则时运行以下纯自检。它不启动 Node、UI、链或证明，不能替代实际验收。
+
+```sh
+python3 scripts/verify-node.py --delivery-ui-selfcheck \
+  --binary /usr/bin/true --artifacts .artifacts/paid-ui-selfcheck
+```
+
 ## 验证原生接收和本地文件
 
 原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。

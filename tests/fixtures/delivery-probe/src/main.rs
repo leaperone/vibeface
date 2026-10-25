@@ -46,6 +46,14 @@ enum Action {
         prefix: String,
         expected_offset: u32,
     },
+    PaidUpload {
+        offer: Value,
+        ciphertext_grant: Value,
+        capsule_grant: Value,
+        prefix: String,
+        tampered_capsule: String,
+    },
+    PaidOrder,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,6 +288,175 @@ async fn main() -> Result<()> {
         .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?
         .bind()
         .await?;
+    if matches!(&input.action, Action::PaidOrder) {
+        ensure!(
+            input.targets.len() == 1 && input.targets[0].public_entry,
+            "paid order observation requires its controlled public provider"
+        );
+        let observed = tokio::time::timeout(
+            Duration::from_secs(30),
+            service(
+                &endpoint,
+                &identity,
+                &input.targets[0],
+                json!({"op":"order","order_id":input.order_id}),
+            ),
+        )
+        .await??;
+        ensure!(
+            observed["error"].is_null() && observed["result"]["order_id"] == input.order_id,
+            "authorized source cannot read its actual provider order view"
+        );
+        endpoint.close().await;
+        println!("{}", json!({"passed":true,"order":observed["result"]}));
+        return Ok(());
+    }
+    if let Action::PaidUpload {
+        offer,
+        ciphertext_grant,
+        capsule_grant,
+        prefix,
+        tampered_capsule,
+    } = &input.action
+    {
+        ensure!(
+            input.targets.len() == 1 && input.targets[0].public_entry,
+            "paid upload probe requires its controlled public provider"
+        );
+        let target = &input.targets[0];
+        ensure!(
+            offer["op"] == "offer"
+                && offer["mode"] == "paid"
+                && prefix.len() == 10924
+                && tampered_capsule.len() == 108,
+            "paid probe uses its real offer, one bounded prefix and one capsule"
+        );
+        for (grant, operation) in [
+            (ciphertext_grant, "put_ciphertext"),
+            (capsule_grant, "put_capsule"),
+        ] {
+            ensure!(
+                grant["body"]["order_id"] == input.order_id
+                    && grant["body"]["client_peer"] == input.actor_peer
+                    && grant["body"]["provider_peer"] == target.peer
+                    && grant["body"]["window_index"] == 0
+                    && grant["body"]["operation"] == operation,
+                "paid upload grant binds its exact actor, provider, order, window and operation"
+            );
+        }
+        let call = async {
+            let offered = service(&endpoint, &identity, target, offer.clone()).await?;
+            ensure!(
+                offered["error"].is_null() && offered["result"]["order_id"] == input.order_id,
+                "real funded paid offer was rejected"
+            );
+            let offset = |grant: &Value| json!({"op":"offset","grant":grant});
+            let before = service(&endpoint, &identity, target, offset(ciphertext_grant)).await?;
+            ensure!(
+                before["result"]["offset"] == 0,
+                "paid ciphertext must begin at the actual empty durable prefix"
+            );
+            for start in [1, 8192] {
+                let value = service(
+                    &endpoint,
+                    &identity,
+                    target,
+                    json!({"op":"put","grant":ciphertext_grant,"offset":start,"bytes":prefix}),
+                )
+                .await?;
+                ensure!(
+                    value["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("durable prefix")),
+                    "paid wrong or reordered offset bypassed the actual durable prefix"
+                );
+            }
+            let uploaded = service(
+                &endpoint,
+                &identity,
+                target,
+                json!({"op":"put","grant":ciphertext_grant,"offset":0,"bytes":prefix}),
+            )
+            .await?;
+            ensure!(
+                uploaded["result"]["offset"] == 8192,
+                "real paid ciphertext prefix was not durably acknowledged"
+            );
+            for start in [0, 16384] {
+                let value = service(
+                    &endpoint,
+                    &identity,
+                    target,
+                    json!({"op":"put","grant":ciphertext_grant,"offset":start,"bytes":prefix}),
+                )
+                .await?;
+                ensure!(
+                    value["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("durable prefix")),
+                    "paid duplicate or reordered chunk changed its durable prefix"
+                );
+            }
+            let after = service(&endpoint, &identity, target, offset(ciphertext_grant)).await?;
+            ensure!(
+                after["result"]["offset"] == 8192,
+                "rejected paid chunks changed the durable ciphertext prefix"
+            );
+            let before_capsule =
+                service(&endpoint, &identity, target, offset(capsule_grant)).await?;
+            ensure!(
+                before_capsule["result"]["offset"] == 0,
+                "paid capsule must begin empty before its hash check"
+            );
+            let tampered = service(
+                &endpoint,
+                &identity,
+                target,
+                json!({"op":"put","grant":capsule_grant,"offset":0,"bytes":tampered_capsule}),
+            )
+            .await?;
+            ensure!(
+                tampered["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("complete delivery object hash mismatch")),
+                "tampered paid capsule did not reach the actual complete-object hash check"
+            );
+            let after_capsule =
+                service(&endpoint, &identity, target, offset(capsule_grant)).await?;
+            ensure!(
+                after_capsule["result"]["offset"] == 0,
+                "a rejected paid capsule retained an invalid durable completion"
+            );
+            let observed = service(
+                &endpoint,
+                &identity,
+                target,
+                json!({"op":"order","order_id":input.order_id}),
+            )
+            .await?;
+            let order = &observed["result"];
+            ensure!(
+                observed["error"].is_null()
+                    && order["payment"]["earned"] == "0"
+                    && order["payment"]["withdrawn"] == "0"
+                    && order["evidence"] == "none"
+                    && order["windows"].as_array().is_some_and(|windows| windows
+                        .iter()
+                        .all(|window| window["decryption_proven"] == false)),
+                "rejected paid content acquired early evidence or payment"
+            );
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(90), call).await??;
+        endpoint.close().await;
+        println!(
+            "{}",
+            json!({"passed":true,"paid":true,"durablePrefix":8192,
+            "wrongOffsetRejected":true,"reorderedRejected":true,"duplicateRejected":true,
+            "capsuleHashMismatchRejected":true,"capsuleOffsetAfterRejection":0,"earlyEarned":"0","earlyWithdrawn":"0"})
+        );
+        return Ok(());
+    }
     if let Action::Prefix {
         order,
         prefix,

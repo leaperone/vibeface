@@ -14,6 +14,12 @@ const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
 class Unverified extends Error {}
 
+export function observationCase(name = 'strict') {
+  assert(['strict', 'ordinary'].includes(name), 'unknown observation case');
+  return name === 'strict' ? { name, windows: 2, proofs: 7, acceptance: 1n, total: 29n }
+    : { name, windows: 1, proofs: 4, acceptance: 0n, total: 17n };
+}
+
 function keys(value, required, optional = []) {
   assert(value && typeof value === 'object' && !Array.isArray(value), 'expected an object');
   for (const key of required) assert(Object.hasOwn(value, key), `missing ${key}`);
@@ -30,26 +36,27 @@ function filename(value) {
   assert(typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(value), 'proof filenames must be relative basenames');
 }
 
-export function validateBundle(bundle) {
+export function validateBundle(bundle, caseName = 'strict') {
+  const selected = observationCase(caseName), indexes = Array.from({ length: selected.windows }, (_, index) => index);
   keys(bundle, ['schemaVersion', 'escrow', 'asset', 'orderId', 'proofs', 'capsules', 'transactions']);
   assert.equal(bundle.schemaVersion, 1);
   assert(ADDRESS.test(bundle.escrow) && ADDRESS.test(bundle.asset), '0x-prefixed contract addresses required');
   assert(HASH.test(bundle.orderId), '0x-prefixed order ID required');
-  assert(Array.isArray(bundle.proofs) && bundle.proofs.length === 7, 'exactly seven proofs required');
+  assert(Array.isArray(bundle.proofs) && bundle.proofs.length === selected.proofs, `exactly ${selected.proofs} proofs required for ${caseName}`);
   const seen = new Set(), files = new Set();
   for (const proof of bundle.proofs) {
     keys(proof, proof.relation === 1 ? ['relation', 'public', 'receipt'] : ['relation', 'windowIndex', 'public', 'receipt']);
     assert([1, 2, 3, 4].includes(proof.relation), 'unknown proof relation');
-    if (proof.relation !== 1) assert([0, 1].includes(proof.windowIndex), 'window index must be 0 or 1');
+    if (proof.relation !== 1) assert(indexes.includes(proof.windowIndex), 'window index outside the selected case');
     const id = `${proof.relation}:${proof.windowIndex ?? 'key'}`;
     assert(!seen.has(id), `duplicate proof ${id}`); seen.add(id);
     for (const name of [proof.public, proof.receipt]) { filename(name); assert(!files.has(name), 'duplicate proof filename'); files.add(name); }
   }
-  for (const id of ['1:key', '2:0', '3:0', '4:0', '2:1', '3:1', '4:1']) assert(seen.has(id), `missing proof ${id}`);
-  assert(Array.isArray(bundle.capsules) && bundle.capsules.length === 2, 'two public capsules required');
+  for (const id of ['1:key', ...indexes.flatMap(index => [2, 3, 4].map(relation => `${relation}:${index}`))]) assert(seen.has(id), `missing proof ${id}`);
+  assert(Array.isArray(bundle.capsules) && bundle.capsules.length === selected.windows, 'one public capsule per selected window required');
   const capsuleIndexes = new Set();
   for (const item of bundle.capsules) {
-    keys(item, ['windowIndex', 'capsule']); assert([0, 1].includes(item.windowIndex));
+    keys(item, ['windowIndex', 'capsule']); assert(indexes.includes(item.windowIndex));
     assert(!capsuleIndexes.has(item.windowIndex), 'duplicate capsule'); capsuleIndexes.add(item.windowIndex);
     bareHex(item.capsule, 80, 'capsule');
   }
@@ -57,11 +64,11 @@ export function validateBundle(bundle) {
   const hashes = [bundle.transactions.registerKey, bundle.transactions.fund];
   if (bundle.transactions.approve !== undefined) hashes.push(bundle.transactions.approve);
   for (const name of ['hold', 'publish', 'open']) {
-    assert(Array.isArray(bundle.transactions[name]) && bundle.transactions[name].length === 2, `${name} requires one transaction per window`);
+    assert(Array.isArray(bundle.transactions[name]) && bundle.transactions[name].length === selected.windows, `${name} requires one transaction per window`);
     hashes.push(...bundle.transactions[name]);
   }
-  assert(Array.isArray(bundle.transactions.withdraw) && bundle.transactions.withdraw.length >= 1 && bundle.transactions.withdraw.length <= 2,
-    'withdraw requires one or two actual transaction hashes');
+  assert(Array.isArray(bundle.transactions.withdraw) && bundle.transactions.withdraw.length >= 1 && bundle.transactions.withdraw.length <= selected.windows,
+    'withdraw requires the actual transaction hashes within the selected window count');
   hashes.push(...bundle.transactions.withdraw);
   const unique = new Set();
   for (const hash of hashes) { assert(typeof hash === 'string' && HASH.test(hash), 'invalid transaction hash'); assert(!unique.has(hash.toLowerCase()), 'transaction hash reused'); unique.add(hash.toLowerCase()); }
@@ -98,17 +105,18 @@ export function checkRuntime(entry, code) {
 }
 
 export function parseArguments(args) {
-  assert.equal(args.length, 4, 'Usage: node observe-settlement.mjs --settlement <public-bundle.json> --rpc-url <original-local-rpc>');
+  assert([4, 6].includes(args.length), 'Usage: node observe-settlement.mjs --settlement <public-bundle.json> --rpc-url <original-local-rpc> [--case ordinary]');
   const values = {};
   for (let i = 0; i < args.length; i += 2) {
-    assert(['--settlement', '--rpc-url'].includes(args[i]) && values[args[i]] === undefined, 'unknown or duplicate argument');
+    assert(['--settlement', '--rpc-url', '--case'].includes(args[i]) && values[args[i]] === undefined, 'unknown or duplicate argument');
     values[args[i]] = args[i + 1];
   }
   assert(values['--settlement'] && values['--rpc-url'], 'both arguments are required');
   const url = new URL(values['--rpc-url']);
   assert(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) && !url.username && !url.password,
     'only the original loopback HTTP RPC is supported');
-  return { bundleFile: path.resolve(values['--settlement']), rpcUrl: url.href };
+  const caseName = observationCase(values['--case']).name;
+  return { bundleFile: path.resolve(values['--settlement']), rpcUrl: url.href, caseName };
 }
 
 function readRegular(file) {
@@ -121,12 +129,13 @@ function sameAddress(a, b) { assert.equal(getAddress(a), getAddress(b), 'address
 function sameHex(a, b, message) { assert.equal(a.toLowerCase(), b.toLowerCase(), message); }
 function before(a, b) { return a.receipt.blockNumber < b.receipt.blockNumber || (a.receipt.blockNumber === b.receipt.blockNumber && a.receipt.index < b.receipt.index); }
 
-export async function observe({ bundleFile, rpcUrl }) {
-  const report = { schemaVersion: 1, status: 'UNVERIFIED', scope: 'read-only observation of genuine local delivery settlement', checks: [], transactions: [], proofs: [] };
+export async function observe({ bundleFile, rpcUrl, caseName = 'strict' }) {
+  const report = { schemaVersion: 1, status: 'UNVERIFIED', case: caseName, scope: 'read-only observation of genuine local delivery settlement', checks: [], transactions: [], proofs: [] };
   let provider;
   const passed = name => report.checks.push({ name, passed: true });
   try {
-    const bundle = validateBundle(JSON.parse(readRegular(bundleFile)));
+    const selected = observationCase(caseName);
+    const bundle = validateBundle(JSON.parse(readRegular(bundleFile)), caseName);
     report.orderId = bundle.orderId; report.escrow = bundle.escrow; report.asset = bundle.asset;
     compile({ checkTrust: true });
     const escrowArtifact = artifact('DeliveryEscrow');
@@ -170,7 +179,8 @@ export async function observe({ bundleFile, rpcUrl }) {
       assert.equal(statement.relation, BigInt(entry.relation)); assert.equal(statement.profileId, profileId); assert.equal(statement.guestImageId, profile.guestImageId);
       if (entry.relation !== 1) {
         sameHex(statement.orderId, bundle.orderId); assert.equal(statement.windowIndex, BigInt(entry.windowIndex));
-        assert.equal(statement.windowCount, 2n); assert(statement.windowCount <= BigInt(profile.maxWindows));
+        assert.equal(statement.windowCount, BigInt(selected.windows)); assert(statement.windowCount <= BigInt(profile.maxWindows));
+        assert.equal(statement.acceptance, selected.acceptance, 'acceptance mode differs from selected case');
         assert.equal(statement.cryptoSuite, BigInt(profile.cryptoSuite));
         assert(statement.windowPlaintextBytes <= BigInt(profile.maxWindowBytes) && statement.totalPlaintextBytes <= BigInt(profile.maxTotalBytes));
       }
@@ -180,7 +190,7 @@ export async function observe({ bundleFile, rpcUrl }) {
       report.proofs.push({ relation: entry.relation, windowIndex: entry.windowIndex ?? null, journalHash: digest,
         receiptSha256: sha256(binary), binaryReceiptBinding: 'not checked here; the host must separately verify the indexed binary receipt; this observer verifies the public EVM seal' });
     }
-    passed('seven complete public proofs match the fixed product image and profile');
+    passed(`${selected.proofs} complete public proofs match the fixed product image and profile`);
     provider = new JsonRpcProvider(rpcUrl, undefined, { cacheTimeout: -1 });
     assert.equal((await provider.getNetwork()).chainId, 31337n, 'wrong chain');
     const tip = await provider.getBlockNumber(), anchorNumber = tip - (CONFIRMATIONS - 1);
@@ -215,18 +225,23 @@ export async function observe({ bundleFile, rpcUrl }) {
     assert.equal(await verifier.SELECTOR(at), await adapter.SELECTOR(at));
     report.adapter = adapterAddress; report.verifier = verifierAddress;
     const order = await escrow.getOrder(bundle.orderId, at);
-    sameAddress(order.terms.asset, bundle.asset); assert.equal(order.terms.windowCount, 2n); assert.equal(order.windows.length, 2);
+    sameAddress(order.terms.asset, bundle.asset); assert.equal(order.terms.windowCount, BigInt(selected.windows)); assert.equal(order.windows.length, selected.windows);
+    assert.equal(order.terms.acceptance, selected.acceptance); assert.equal(order.terms.escrowAmount, selected.total);
+    assert.equal(order.terms.wholeOrderBonus, 5n);
+    if (caseName === 'ordinary') assert.equal(order.terms.totalPlaintextBytes, 4096n + 6n + BigInt(Buffer.byteLength('ordinary-paid-ui.bin')), 'ordinary UI sample must contain the expected 4096-byte file envelope');
     sameHex(order.terms.orderId, bundle.orderId);
     const key = proofs.get('1:key');
     assert.equal(key.statement.bindingAction, 1n);
+    if (caseName === 'ordinary') assert.equal(key.statement.receiverKeySerial, 4n, 'ordinary supplement must use the final active Register4 binding');
     assert.equal(statementBytes(await escrow.previewBinding(object(key.statement), at)), key.journal, 'key statement reconstruction mismatch');
     assert.equal(key.statement.keyBindingHash, order.terms.keyBindingHash);
     const registry = await escrow.keys(key.statement.receiverPeer, at);
     assert(registry.serial >= key.statement.receiverKeySerial, 'registry serial regressed');
     if (registry.serial === key.statement.receiverKeySerial) { assert.equal(registry.active, true); assert.equal(registry.bindingHash, key.statement.keyBindingHash); }
     const windows = [];
-    for (let index = 0; index < 2; index++) {
+    for (let index = 0; index < selected.windows; index++) {
       windows.push(await escrow.getWindow(bundle.orderId, index, at));
+      assert.equal(windows[index].spec.deliveryFee, 10n); assert.equal(windows[index].spec.reservationFee, 2n);
       for (const relation of [2, 3, 4]) {
         const proof = proofs.get(`${relation}:${index}`);
         assert.equal(statementBytes(await escrow.publicValues(bundle.orderId, index, relation, at)), proof.journal,
@@ -241,7 +256,7 @@ export async function observe({ bundleFile, rpcUrl }) {
     for (const proof of proofs.values()) {
       assert.equal(await adapter.verify(proof.seal, proof.digest, at), true, `genuine seal rejected for relation ${proof.relation} window ${proof.windowIndex ?? 'key'}`);
     }
-    passed('all seven genuine seals verify and journals match contract-constructed public values');
+    passed(`all ${selected.proofs} genuine seals verify and journals match contract-constructed public values`);
     const blockCache = new Map();
     const block = async number => {
       if (!blockCache.has(number)) {
@@ -299,8 +314,8 @@ export async function observe({ bundleFile, rpcUrl }) {
     if (approval) assert(before(approval, funded), 'fund preceded listed approval');
     sameAddress(funded.tx.from, order.terms.payer);
     const sourceStatements = await escrow.preview(funded.parsed.args[0], funded.parsed.args[1], at);
-    assert.equal(funded.parsed.args[2].length, 2);
-    for (let index = 0; index < 2; index++) {
+    assert.equal(funded.parsed.args[2].length, selected.windows);
+    for (let index = 0; index < selected.windows; index++) {
       assert.equal(statementBytes(sourceStatements[index]), proofs.get(`2:${index}`).journal);
       sameHex(funded.parsed.args[2][index], proofs.get(`2:${index}`).seal);
     }
@@ -310,7 +325,7 @@ export async function observe({ bundleFile, rpcUrl }) {
     assert(funded.timestamp <= order.terms.quoteExpiresAt && funded.timestamp >= order.terms.keyValidFrom);
     const capsules = new Map(bundle.capsules.map(item => [item.windowIndex, bareHex(item.capsule, 80, 'capsule')]));
     const completions = [];
-    for (let index = 0; index < 2; index++) {
+    for (let index = 0; index < selected.windows; index++) {
       const held = await transaction(bundle.transactions.hold[index], escrow, 'hold', `hold-${index}`);
       const published = await transaction(bundle.transactions.publish[index], escrow, 'publish', `publish-${index}`);
       const opened = await transaction(bundle.transactions.open[index], escrow, 'open', `open-${index}`);
@@ -339,12 +354,12 @@ export async function observe({ bundleFile, rpcUrl }) {
     const fees = windows.reduce((sum, window) => sum + window.spec.deliveryFee + window.spec.reservationFee, 0n);
     const timely = completions.every(completion => completion.timestamp <= order.terms.priorityDeadline);
     const expectedEarned = fees + (timely ? order.terms.wholeOrderBonus : 0n);
-    assert.equal(order.earnedWindows, 2n); assert.equal(order.refundedWindows, 0n); assert.equal(order.refunded, 0n);
+    assert.equal(order.earnedWindows, BigInt(selected.windows)); assert.equal(order.refundedWindows, 0n); assert.equal(order.refunded, 0n);
     assert.equal(order.earned, expectedEarned); assert.equal(order.withdrawn, expectedEarned); assert.equal(withdrawn, expectedEarned);
     assert.equal(order.bonusEarned, timely);
     if (!timely && order.terms.wholeOrderBonus > 0n) throw new Unverified('all window fees were earned, but the missed priority bonus is outside this complete-flow bundle');
     assert.equal(order.terms.escrowAmount - order.withdrawn - order.refunded, 0n, 'order has unsettled funds');
-    passed('actual calldata, successful receipts, events, retained capsules and both terminal windows match the complete order');
+    passed('actual calldata, successful receipts, events, retained capsules and all selected terminal windows match the complete order');
     const accounts = [...new Set([order.terms.payer, order.terms.providerWallet, bundle.escrow].map(getAddress))];
     const balance = async (address, number) => {
       try { return await token.balanceOf(address, { blockTag: number }); }
@@ -402,6 +417,16 @@ export async function observe({ bundleFile, rpcUrl }) {
       includesListedApproval: Boolean(approval), executionGasUsed: records.reduce((sum, record) => sum + record.receipt.gasUsed, 0n).toString(),
       executionGasFeeWei: [...gasBySender.values()].reduce((sum, value) => sum + value, 0n).toString(),
       bySender: Object.fromEntries([...gasBySender].map(([address, fee]) => [address, fee.toString()])) };
+    const shared = records.filter(record => ['registerKey', 'approve', 'fund'].includes(record.label) || record.label.startsWith('withdraw-'));
+    const sharedGas = shared.reduce((sum, record) => sum + record.receipt.gasUsed, 0n);
+    report.gas.perWindowAttribution = Array.from({ length: selected.windows }, (_, index) => {
+      const actions = records.filter(record => ['hold', 'publish', 'open'].some(method => record.label === `${method}-${index}`));
+      const total = sharedGas + actions.reduce((sum, record) => sum + record.receipt.gasUsed, 0n);
+      return { windowIndex: index, policy: 'all shared transactions and all withdrawals plus this window hold/publish/open',
+        sharedTransactionHashes: shared.map(record => record.receipt.hash), windowTransactionHashes: actions.map(record => record.receipt.hash),
+        conservativeGasUsed: total.toString(), maximumGasUsed: '3000000', passed: total <= 3000000n };
+    });
+    for (const window of report.gas.perWindowAttribution) assert(window.passed, `window ${window.windowIndex} exceeds the confirmed-receipt 3000000 gas limit`);
     const finalAnchor = await provider.getBlock(anchorNumber);
     if (!finalAnchor || finalAnchor.hash !== anchor.hash) throw new Unverified('confirmation anchor changed during observation; possible reorg');
     passed('the fixed two-confirmation experimental anchor remained canonical during observation; absolute finality is not asserted');
@@ -418,7 +443,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   try { report = await observe(parseArguments(process.argv.slice(2))); }
   catch (error) { report = { schemaVersion: 1, status: 'FAIL', error: error.message }; }
   fs.mkdirSync(artifacts, { recursive: true });
-  fs.writeFileSync(path.join(artifacts, 'settlement-observation.json'), `${JSON.stringify(report, null, 2)}\n`);
+  fs.writeFileSync(path.join(artifacts, report.case === 'ordinary' ? 'ordinary-settlement-observation.json' : 'settlement-observation.json'), `${JSON.stringify(report, null, 2)}\n`);
   console.log(JSON.stringify(report, null, 2));
   process.exitCode = report.status === 'PASS' ? 0 : report.status === 'UNVERIFIED' ? 2 : 1;
 }

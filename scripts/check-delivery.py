@@ -188,7 +188,7 @@ def check():
             raise ValueError("A receipt accepted a journal with another guest image")
         verified.append({"relation": relation, "journalHash": proof["journalHash"], "verified": True, "wrongJournalRejected": True})
         print(f"PASS current guest relation {relation} public receipt and wrong-journal rejection", flush=True)
-    for script, arguments in (("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("run.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)]), ("verify-delivery.mjs", [str(FIXTURES)])):
+    for script, arguments in (("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("exercise-settlement.mjs", ["--self-test"]), ("run.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)]), ("verify-delivery.mjs", [str(FIXTURES)])):
         run(["node", f"contracts/delivery/{script}", *arguments])
     (ARTIFACTS / "proof-results.json").write_text(json.dumps({"imageId": compiled["imageId"], "schemaHash": compiled["schemaHash"], "receipts": verified}, indent=2) + "\n")
     print("Delivery receipts, cross-language bytes and production EVM adapter checks passed")

@@ -536,9 +536,15 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
+  delivery-android:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    uses: ./.github/workflows/mobile.yml
+    with:
+      android_only: true
+
   delivery-live:
     if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
-    needs: [plan, package, crypto-web, web]
+    needs: [plan, package, crypto-web, web, delivery-android]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -557,10 +563,36 @@ jobs:
         with:
           name: web-${{ github.sha }}
           path: crates/node/web/dist/client
-      - name: Generate seven genuine local proofs and observe exact settlement
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: vibeface-android-${{ github.sha }}
+          path: .artifacts/vdp/live-android
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Prepare host Web and Android drivers without model calls
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/vdp/live-ui/browsers
+        run: |
+          pnpm install --frozen-lockfile --filter .
+          pnpm test:e2e:check
+          pnpm exec e2e-web install chromium --with-deps
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+          command -v ffmpeg
+          command -v ffprobe
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+      - name: Generate genuine local proofs and verify actual Web and Android delivery
         env:
           SOURCE_COMMIT: ${{ github.sha }}
-        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --source-commit "$SOURCE_COMMIT"
+        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --android .artifacts/vdp/live-android --source-commit "$SOURCE_COMMIT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ !cancelled() }}
         with:
@@ -572,6 +604,58 @@ jobs:
             .artifacts/vdp/live-public/relation-*-window-*.json
             .artifacts/vdp/live-public/settlement.json
             .artifacts/vdp/live-public/settlement-observation.json
+            .artifacts/vdp/live-public/key-lifecycle/rotate.receipt
+            .artifacts/vdp/live-public/key-lifecycle/rotate.json
+            .artifacts/vdp/live-public/key-lifecycle/revoke.receipt
+            .artifacts/vdp/live-public/key-lifecycle/revoke.json
+            .artifacts/vdp/live-public/key-lifecycle/register.receipt
+            .artifacts/vdp/live-public/key-lifecycle/register.json
+            .artifacts/vdp/live-public/key-lifecycle/summary.json
+            .artifacts/vdp/live-public/key-lifecycle/mixed-held.json
+            .artifacts/vdp/live-public/ordinary-settlement/key-binding.receipt
+            .artifacts/vdp/live-public/ordinary-settlement/key-binding.json
+            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.receipt
+            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.json
+            .artifacts/vdp/live-public/ordinary-settlement/settlement.json
+            .artifacts/vdp/live-public/ordinary-settlement/settlement-observation.json
+            .artifacts/vdp/live-public/branches/index.json
+            .artifacts/vdp/live-public/branches/core-restored.json
+            .artifacts/vdp/live-public/branches/key-rotate.json
+            .artifacts/vdp/live-public/branches/key-revoke.json
+            .artifacts/vdp/live-public/branches/key-register.json
+            .artifacts/vdp/live-public/branches/branch-offline-refund.json
+            .artifacts/vdp/live-public/branches/branch-partial-refund.json
+            .artifacts/vdp/live-public/branches/branch-held-timeout.json
+            .artifacts/vdp/live-public/branches/branch-strict-late-open.json
+            .artifacts/vdp/live-public/branches/branch-late-priority.json
+            .artifacts/vdp/live-public/branches/branch-hold-reorg.json
+            .artifacts/vdp/live-public/branches/branch-capsule-reorg.json
+            .artifacts/vdp/live-public/branches/branch-keeper.json
+            .artifacts/vdp/live-public/branches/branch-token-false.json
+            .artifacts/vdp/live-public/branches/branch-token-frozen.json
+            .artifacts/vdp/live-public/branches/branch-token-fee.json
+            .artifacts/vdp/live-public/branches/branch-token-sender-tax.json
+            .artifacts/vdp/live-public/branches/branch-token-precision.json
+            .artifacts/vdp/live-public/branches/branch-token-nonreturn.json
+            .artifacts/vdp/live-public/branches/branch-token-reentrancy.json
+            .artifacts/vdp/live-public/branches/branch-node-refund-hook.json
+            .artifacts/vdp/live-public/branches/branch-incoming-false.json
+            .artifacts/vdp/live-public/branches/branch-incoming-frozen.json
+            .artifacts/vdp/live-public/branches/branch-incoming-fee.json
+            .artifacts/vdp/live-public/branches/branch-incoming-sender-tax.json
+            .artifacts/vdp/live-public/branches/branch-incoming-precision.json
+            .artifacts/vdp/live-public/branches/branch-incoming-reentrancy.json
+            .artifacts/vdp/live-public/branches/branch-incoming-nonreturn.json
+            .artifacts/vdp/live-public/branches/branch-mixed-held-rotate.json
+            .artifacts/vdp/live-public/ui/web.json
+            .artifacts/vdp/live-public/ui/android.json
+            .artifacts/vdp/live-public/ui/web.png
+            .artifacts/vdp/live-public/ui/android-offline.png
+            .artifacts/vdp/live-public/ui/android.png
+            .artifacts/vdp/live-public/ui/video-metadata.json
+            .artifacts/vdp/live-public/ui/web-confirm.mp4
+            .artifacts/vdp/live-public/ui/android-accept-offline.mp4
+            .artifacts/vdp/live-public/ui/android-resume-save.mp4
             .artifacts/vdp/live-public/summary.json
             .artifacts/vdp/live-public/resources.json
           if-no-files-found: warn

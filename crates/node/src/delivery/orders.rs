@@ -28,6 +28,38 @@ pub(super) struct Quotation {
     pub grants: Vec<ServiceGrant>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RefundAction {
+    Window(u16),
+    Bonus,
+}
+
+fn next_refund(
+    terms: &Terms,
+    state: &chain::OrderState,
+    key: &chain::KeyRecord,
+    at: u64,
+) -> Option<RefundAction> {
+    for (index, window) in state.windows.iter().enumerate() {
+        let refundable = match window.phase {
+            0 => at > terms.hold_deadline || !key.active || key.serial != terms.binding.serial,
+            1 => at > terms.key_deadline,
+            2 => {
+                terms.acceptance == vibeface_delivery::Acceptance::Strict
+                    && at > terms.open_deadline
+            }
+            _ => false,
+        };
+        if refundable {
+            return Some(RefundAction::Window(index as u16));
+        }
+    }
+    (!state.bonus_earned
+        && !state.bonus_refunded
+        && (at > terms.priority_deadline || state.windows.iter().any(|window| window.phase == 4)))
+    .then_some(RefundAction::Bonus)
+}
+
 impl Delivery {
     pub(super) async fn reconcile(
         &self,
@@ -38,42 +70,50 @@ impl Delivery {
         if stored.view.role == Role::Receiver && !stored.accepted {
             return Ok(stored);
         }
+        if stored.view.mode == Mode::Paid {
+            if stored.view.role == Role::Sender
+                && matches!(
+                    stored.view.phase,
+                    Phase::Prepared | Phase::FundingPending | Phase::Reconciling
+                )
+            {
+                let fund_id = format!("{}/fund", stored.view.order_id);
+                let funded = self.with_store(|store| store.find_transaction(&fund_id))?;
+                let Some(tx) = funded else {
+                    return Ok(stored);
+                };
+                let observed = self.chain().await?.observe(&tx).await?;
+                self.with_store(|store| {
+                    store.observe_transaction(
+                        &fund_id,
+                        &observed.phase,
+                        observed.block_number,
+                        observed.block_hash.as_deref(),
+                        observed.error.as_deref(),
+                    )
+                })?;
+                if observed.phase != "confirmed" {
+                    stored.view.chain_unknown();
+                    self.save(&mut stored)?;
+                    return Ok(stored);
+                }
+            }
+            if let Err(error) = self.update_paid_view(&mut stored).await {
+                stored.view.chain_unknown();
+                self.save(&mut stored)?;
+                return Err(error);
+            }
+            self.save(&mut stored)?;
+        }
         self.authorize_order_effect(&stored).await?;
         match stored.view.role {
             Role::Sender => {
-                if matches!(
-                    stored.view.phase,
-                    Phase::Prepared | Phase::FundingPending | Phase::Reconciling
-                ) {
-                    if stored.view.mode == Mode::Paid {
-                        let fund_id = format!("{}/fund", stored.view.order_id);
-                        let funded = self.with_store(|store| store.find_transaction(&fund_id))?;
-                        let Some(tx) = funded else {
-                            return Ok(stored);
-                        };
-                        let observed = self.chain().await?.observe(&tx).await?;
-                        self.with_store(|store| {
-                            store.observe_transaction(
-                                &fund_id,
-                                &observed.phase,
-                                observed.block_number,
-                                observed.block_hash.as_deref(),
-                                observed.error.as_deref(),
-                            )
-                        })?;
-                        if observed.phase != "confirmed" {
-                            stored.view.chain_unknown();
-                            self.save(&mut stored)?;
-                            return Ok(stored);
-                        }
-                        stored.view.payment.state = PaymentState::Confirmed;
-                    } else if stored.view.phase == Phase::Prepared {
-                        return Ok(stored);
-                    }
+                if stored.view.mode == Mode::Charity && stored.view.phase == Phase::Prepared {
+                    return Ok(stored);
                 }
-                self.refund_expired(&mut stored).await?;
+                let refunding = self.refund_expired(&mut stored).await?;
                 self.save(&mut stored)?;
-                if matches!(stored.view.phase, Phase::Paid | Phase::Refunded) {
+                if refunding || matches!(stored.view.phase, Phase::Paid | Phase::Refunded) {
                     return Ok(stored);
                 }
                 let offer = ServiceRequest::Offer {
@@ -554,52 +594,41 @@ impl Delivery {
             json!({"name":name,"content_base64":STANDARD.encode(content),"sha256":digest,"bytes":content.len()}),
         )
     }
-    async fn refund_expired(&self, stored: &mut StoredOrder) -> Result<()> {
+    async fn refund_expired(&self, stored: &mut StoredOrder) -> Result<bool> {
         let chain = self.chain().await?;
         let state = self.paid_state(&stored.order).await?;
         let terms = &stored.order.unsigned.terms;
         let at = chain.confirmed_position().await?.timestamp;
         let key = chain.current_key(terms.binding.receiver_peer).await?;
-        for (index, window) in state.windows.iter().enumerate() {
-            let refundable = match window.phase {
-                0 => at > terms.hold_deadline || !key.active || key.serial != terms.binding.serial,
-                1 => at > terms.key_deadline,
-                2 => {
-                    terms.acceptance == vibeface_delivery::Acceptance::Strict
-                        && at > terms.open_deadline
-                }
-                _ => false,
-            };
-            if refundable {
-                chain
-                    .execute(
-                        self,
-                        &format!("{}/refund-{index}", stored.view.order_id),
-                        chain::Call::Refund {
-                            order_id: terms.order_id()?,
-                            index: index as u16,
-                        },
-                        &stored.view.payment.gas_cap,
-                    )
-                    .await?;
-            }
-        }
-        if !state.bonus_earned
-            && !state.bonus_refunded
-            && (at > terms.priority_deadline || state.windows.iter().any(|w| w.phase == 4))
-        {
-            chain
-                .execute(
-                    self,
-                    &format!("{}/refund-bonus", stored.view.order_id),
+        let action = next_refund(terms, &state, &key, at);
+        let refunding = action.is_some();
+        if let Some(action) = action {
+            let (suffix, call) = match action {
+                RefundAction::Window(index) => (
+                    format!("refund-{index}"),
+                    chain::Call::Refund {
+                        order_id: terms.order_id()?,
+                        index,
+                    },
+                ),
+                RefundAction::Bonus => (
+                    "refund-bonus".into(),
                     chain::Call::RefundBonus {
                         order_id: terms.order_id()?,
                     },
+                ),
+            };
+            chain
+                .execute(
+                    self,
+                    &format!("{}/{suffix}", stored.view.order_id),
+                    call,
                     &stored.view.payment.gas_cap,
                 )
                 .await?;
         }
-        self.update_paid_view(stored).await
+        self.update_paid_view(stored).await?;
+        Ok(refunding)
     }
     pub(super) async fn prepare(
         &self,
@@ -1157,4 +1186,95 @@ pub(super) fn view(
         updated_at_ms: crate::runtime::now_ms(),
         error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_refunds_precede_bonus_and_each_new_snapshot_selects_only_one_action() {
+        let profile = chain::tests::config().profile;
+        let peer = parse_word(&LocalIdentity::generate().device_id().unwrap()).unwrap();
+        let mut chain_id = [0; 32];
+        chain_id[24..].copy_from_slice(&31337u64.to_be_bytes());
+        let terms = Terms {
+            profile_id: profile.digest().unwrap(),
+            guest_image_id: profile.guest_image_id,
+            binding: KeyBinding {
+                chain_id,
+                escrow: [0x11; 20],
+                receiver_peer: peer,
+                receiver_public: receiving_public(&Secret32::new([7; 32]).unwrap()).unwrap(),
+                key_id: [0x22; 32],
+                serial: 1,
+                valid_from: 100,
+                valid_until: 700,
+                action: BindingAction::Active,
+            },
+            source_peer: peer,
+            provider_peer: peer,
+            payer: [0x33; 20],
+            provider_wallet: [0x44; 20],
+            asset: [0x55; 20],
+            acceptance: vibeface_delivery::Acceptance::Strict,
+            total_plaintext_bytes: 8,
+            window_count: 2,
+            whole_order_bonus: Amount::from_u64(5),
+            escrow_amount: Amount::from_u64(29),
+            quote_expires_at: 200,
+            hold_deadline: 300,
+            key_deadline: 400,
+            open_deadline: 500,
+            retain_until: 600,
+            priority_deadline: 350,
+            payer_order_nonce: [0x66; 32],
+        };
+        terms.validate().unwrap();
+        let key = chain::KeyRecord {
+            binding_hash: terms.binding.digest().unwrap(),
+            serial: 1,
+            valid_from: 100,
+            valid_until: 700,
+            active: true,
+        };
+        let mut state = chain::OrderState {
+            payer: format!("0x{}", "33".repeat(20)),
+            provider_wallet: format!("0x{}", "44".repeat(20)),
+            earned: "0".into(),
+            withdrawn: "0".into(),
+            refunded: "0".into(),
+            bonus_earned: false,
+            bonus_refunded: false,
+            windows: vec![
+                chain::WindowState {
+                    phase: 1,
+                    decryption_proven: false,
+                    capsule: Vec::new(),
+                    ciphertext_hash: [0x77; 32],
+                    capsule_hash: [0x88; 32],
+                };
+                2
+            ],
+        };
+        assert_eq!(next_refund(&terms, &state, &key, 350), None);
+        assert_eq!(
+            next_refund(&terms, &state, &key, 351),
+            Some(RefundAction::Bonus)
+        );
+        assert_eq!(
+            next_refund(&terms, &state, &key, 401),
+            Some(RefundAction::Window(0))
+        );
+        state.windows[0].phase = 4;
+        state.bonus_refunded = true;
+        state.refunded = "17".into();
+        assert_eq!(
+            next_refund(&terms, &state, &key, 401),
+            Some(RefundAction::Window(1))
+        );
+        state.windows[1].phase = 4;
+        state.refunded = "29".into();
+        assert_eq!(next_refund(&terms, &state, &key, 401), None);
+    }
 }

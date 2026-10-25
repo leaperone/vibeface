@@ -83,3 +83,70 @@ The public bundle has this schema. Addresses have a `0x` prefix. The order ID an
 `approve` is optional. `withdraw` contains one or two actual transactions. Array positions for hold, publish and open identify the window. Gas totals cover listed operations and exclude deployments, faucets, proving costs and any unlisted pre-existing approval.
 
 The local fixture uses a fixed two-confirmation experimental policy. The observer reads at `latest - 1`, checks transaction block hashes and verifies the anchor hash again afterward. This does not establish absolute finality. Exit 0 means `PASS`, exit 1 means `FAIL`, and exit 2 means `UNVERIFIED`. Missing or shallow receipts, unavailable historical balances, a changed anchor, unexplained token movements or money transactions sharing a block prevent a receipt claim. The current local token has no Transfer events, so this tool requires isolated money transactions to attribute historical balance changes. The machine-readable result is `.artifacts/vdp/contracts/settlement-observation.json`. Repeating the observation sends no transactions.
+
+The default observer case remains strict: two windows, seven proofs, acceptance 1, fees 10 + 2 per window, bonus 5, and total earned and withdrawn 29. The ordinary UI supplement is a separate case.
+
+```sh
+node contracts/delivery/observe-settlement.mjs --settlement /absolute/path/to/ordinary-settlement.json --rpc-url http://127.0.0.1:8545 --case ordinary
+```
+
+Ordinary requires one window, four public proofs, recoverable acceptance 0, total 17, final active Register4 key binding and its actual registration transaction. It checks the expected envelope for the 4096-byte `ordinary-paid-ui.bin`; the UI runner separately checks the recovered file bytes and SHA. `proofs` contains relation 1 and window 0 relations 2, 3 and 4. Each action array has one transaction. The report is `.artifacts/vdp/contracts/ordinary-settlement-observation.json`; the strict report is preserved. Stdout is the complete JSON for this invocation, so the runner can save it beside the corresponding bundle. Shared registration references count once by transaction hash when aggregating task gas.
+
+## Exercise cached genuine branches
+
+`exercise-settlement.mjs` is a finite JSONL controller on the original local 31337 RPC. It never reads Node directories, witnesses, wallet keys or unbroadcast raw transactions, and never copies Node data. Before branches it requires the existing strict observer to pass the original genuine bundle. It reconstructs only already-broadcast signed transactions from public signatures and checks their hashes. Snapshot and branch commands are not a general RPC interface.
+
+```sh
+node contracts/delivery/exercise-settlement.mjs --settlement /absolute/path/to/future-strict-bundle.json --rpc-url http://127.0.0.1:8545 --deployment /absolute/path/to/public-deployment.json
+```
+
+Start the controller while the original deployment is alive, before the initial prepare. The future bundle path need not exist until `verify-core`. Each input is one JSON object with a unique `id` label and an `op`. Each output is one public JSON event. The acceptance runner alone stops and starts the task S/R/P processes, checks that inherited provers have ended, and copies their complete stopped data into private task checkpoints. It never applies this mechanism to installed Nodes or another task. Branch data and signed raws remain backed up; no table or raw row is deleted to clean a branch.
+
+Every mutating command includes `quiesced` with `nodesStopped:true`, `walletsLocked:true`, `proversIdle:true`, and a bounded opaque `nodeDataCheckpoint` label. Labels are not paths or commands.
+
+| Operation | Additional fields and effect |
+| --- | --- |
+| `capture-pre-prepare` | `wallets:{S,R,P}` contains public Ethereum addresses, and `receiverPeer` is a 0x-prefixed 32-byte PeerID. Captures C0 after genuine registration and faucets, before prepare. |
+| `capture-source-ready` | Same `wallets` and `receiverPeer`, plus `orderId`. Captures C0Prime at the real approve-estimate barrier, after both source proofs and before any approve or fund transaction. |
+| `capture-post-fund` | Same `wallets`, plus `orderId` and `fundTxHash`. Captures C1 after two-confirmation fund/offer, before accept and any hold. Both windows must actually be Funded. |
+| `resume-main` | Only `id/op`. Resumes mining after a capture or restoration. The runner separately resumes Nodes. |
+| `verify-core` | `fileSha256` is the original file SHA without 0x. Uses the existing strict observer, caches public original signatures and seven seals, and associates the complete `MainSuccessData` checkpoint. |
+| `exercise-case` | `case` is one of the finite names below. Reverts/recreates C1, requests owner data handling, runs the case, then resets C1 again. |
+| `restore-core` | Replays original signed raws with original nonces, restores matching owner-held data and reruns the unmodified strict success oracle. No new signature or replacement fee is generated. |
+| `lifecycle-held` | After core restoration, reverts C1, replays original hold0 and requests the sole real Rotate from the owner. Checks mixed held/unheld rights and actual old-key file read. Requires another `restore-core` afterward. |
+| `record-key` | `action` is `rotate`, `revoke` or `register`, with the actual `txHash`. Observes a real owner operation already performed on the restored chain. After mixed-held Rotate, continue with Revoke and Register only. |
+| `abort` | Stops mining and preserves backups. Does not pretend the chain or Node data has been restored. |
+
+Finite C1 cases are `offline-refund`, `partial-refund`, `held-timeout`, `strict-late-open`, `late-priority`, `hold-reorg`, `capsule-reorg`, `keeper`, `token-false`, `token-frozen`, `token-fee`, `token-sender-tax`, `token-precision`, `token-nonreturn`, `token-reentrancy`, and `node-refund-hook`. They use the same seven genuine proofs and original terms. The late-priority outcome is earned/withdrawn 24 and bonus refund 5, never strict core success 29.
+
+The seven incoming cases are `incoming-false`, `incoming-frozen`, `incoming-fee`, `incoming-sender-tax`, `incoming-precision`, `incoming-reentrancy`, and `incoming-nonreturn`. They restore C0Prime, or C0 if no source-ready barrier was captured, and replay only the original public approve and fund transactions. They then rebuild C1 from those same signed bytes and require the runner to restore its matching C1 data. Snapshot capture alone is not a passing incoming test. Each failed transaction must reproduce its expected contract error with the original gas limit at its receipt block; an unrelated failure or exhausted gas cannot pass.
+
+`node contracts/delivery/exercise-settlement.mjs --self-test` checks finite command and acknowledgement boundaries, public transaction reconstruction and confirmation metadata without starting a chain or generating a proof. Actual branches still require the original genuine strict bundle.
+
+At each `checkpoint`, the controller pauses chain actions and emits `checkpointId`, current public `state`, the two-confirmation anchor, `nodeMode`, and the requested `nodeDataCheckpoint`. The runner handles the matching whole task data and replies as follows.
+
+```json
+{
+  "op": "checkpoint-ack",
+  "checkpointId": "case-id-result",
+  "quiesced": { "nodesStopped": true, "walletsLocked": true, "proversIdle": true, "nodeDataCheckpoint": "BranchData" },
+  "nodeObservation": "observed",
+  "rawBroadcastDelta": 0,
+  "views": {
+    "R": { "phase": "partial", "evidence": "none", "payment": { "earned": "12", "withdrawn": "12", "refunded": "17" },
+      "windows": [{ "state": "earned", "decryption_proven": true }, { "state": "refunded", "decryption_proven": false }] }
+  }
+}
+```
+
+For data restore alone, use `nodeObservation:"not_observed"` and omit `views`. Observed roles are recorded explicitly. The controller compares supplied public money/window/proof projections with the real chain, and permits no raw broadcast in a locked observation. Optional `readSha256` must match the original file. A read after reorg does not prove that already-seen E or plaintext was erased.
+
+`owner-native-refund` checkpoints resume the miner while the acceptance runner restores C1 data and unlocks only the required task Source wallet to execute its actual refund. Afterward the runner locks/stops everything, privately retains the branch data/raws, and includes actual `nodeTransactions` in the acknowledgement. The helper verifies successful Source-signed refund calls and exact chain balances; it does not send the refund. Keeper cases remain explicitly distinct from Node autonomy.
+
+`owner-key-rotate` is the only point that requests the first real Rotate. The owner calls its existing asynchronous key helper once with a new UUID, then stops Nodes and preserves a distinct whole `AfterRotateData` checkpoint. Its acknowledgement includes the sole actual Rotate hash in `nodeTransactions`; order views may be omitted at this stage. The subsequent mixed-held-result checkpoint requires an observed receiver view and the actual old-key `readSha256`. Do not generate another Rotate after canonical restoration: `restore-core` replays the same original Rotate raw after the original success transactions, preserving new key2 while restoring the original order. It refreshes the Rotate observation to its current canonical receipt. Revoke3 and Register4 then advance once on that canonical chain through the owner's CLI, followed by `record-key`. Restoration is forbidden after those canonical lifecycle operations.
+
+New certificates use real host time. If it cannot fit the immutable old hold/key deadlines, the mixed-held case is UNVERIFIED and needs an appropriately planned order; the tool never backdates a certificate or changes a journal. Node-data snapshots are paired deliberately with chain checkpoints by the runner. They are not evidence that chain reorgs automatically roll back local state.
+
+Public outputs are `.artifacts/vdp/contracts/branch-observations/<sessionId>/index.json`, `branch-<case>.json`, `key-rotate.json`, `key-revoke.json`, `key-register.json`, and `core-restored.json`. Branch status `EVM_PASS` describes the named genuine-backed chain case and separately records observed Node roles/autonomy. It is not the strict core oracle. The acceptance exporter owns the sole `key-lifecycle/summary.json` and actual receipt/public files; these observations do not replace host verification or its unique-proof accounting.
+
+Already-broadcast signed raw backups and private checkpoint acknowledgements are kept with 0700/0600 permissions under `.artifacts/vdp/contracts/private-branches/<sessionId>/`. Never upload this directory or full Node checkpoints. Only explicit public output files are collectible. Snapshot IDs expire when reverted or when the original Ganache exits. A case error stops mining and requires explicit restoration or abort. The session cannot claim completion without the final genuine strict observer passing on current canonical receipts. This tool has no proving, Node spawning or device control entry point.
