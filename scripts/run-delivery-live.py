@@ -238,6 +238,8 @@ class AndroidHost:
     def start(self):
         self.sdk = UI / "android-sdk"
         self.sdk.mkdir(parents=True, exist_ok=False)
+        for name in ("android-user", "android-emulator", "avd"):
+            (UI / name).mkdir(mode=0o700)
         self.server_port = available_port()
         self.environment = {**os.environ, "ANDROID_SDK_ROOT": str(self.sdk), "ANDROID_HOME": str(self.sdk), "ANDROID_USER_HOME": str(UI / "android-user"),
             "ANDROID_EMULATOR_HOME": str(UI / "android-emulator"), "ANDROID_AVD_HOME": str(UI / "avd"),
@@ -1343,10 +1345,16 @@ def self_test_ui(directory):
             assert cleanup_owned(host, running, running, "vdp-live-self-test", None, True) is True
             assert stop.call_count == 2
             host.close.assert_called_once()
+    def checked_android_homes(*args, env, **kwargs):
+        for variable, name in (("ANDROID_USER_HOME", "android-user"), ("ANDROID_EMULATOR_HOME", "android-emulator"), ("ANDROID_AVD_HOME", "avd")):
+            home = Path(env[variable])
+            assert home == directory / "android-start" / name
+            assert home.is_dir() and home.stat().st_mode & 0o777 == 0o700, "Private Android homes must exist before SDK commands"
+
     with (
         patch(f"{__name__}.UI", directory / "android-start"),
         patch(f"{__name__}.android_tool", side_effect=lambda name: "/bootstrap-sdk/cmdline-tools/20.0/bin/" + name) as bootstrap,
-        patch(f"{__name__}.command") as setup,
+        patch(f"{__name__}.command", side_effect=checked_android_homes) as setup,
         patch(f"{__name__}.available_port", return_value=12345),
         patch(f"{__name__}.port_free", return_value=True),
         patch(f"{__name__}.wait_owned"),

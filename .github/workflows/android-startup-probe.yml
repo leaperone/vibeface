@@ -32,6 +32,7 @@ jobs:
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/vdp/live-ui/browsers
         run: |
+          printf 'https://archive.ubuntu.com/ubuntu\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg acl
           pnpm install --frozen-lockfile --filter .

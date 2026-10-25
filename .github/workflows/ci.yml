@@ -595,6 +595,7 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - name: Install recording and KVM access tools
         run: |
+          printf 'https://archive.ubuntu.com/ubuntu\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg acl
       - name: Prepare host Web and Android drivers without model calls
