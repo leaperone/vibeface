@@ -21,7 +21,7 @@ import { BotPanelButton } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { backTo } from "@vibeface/client/workspace/home.ts"
-import { addressName } from "@vibeface/client/workspace/labels.ts"
+import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { LocalSession } from "./local-session"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
@@ -234,7 +234,7 @@ export function ConnectionCapsule() {
     <Popover.Portal>
       <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">访问地址</p>
-        <p className="break-all text-muted-foreground">{address}</p>
+        <p className="break-all text-muted-foreground" title={address}>{hostOf(address) || address}</p>
         {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p> : null}

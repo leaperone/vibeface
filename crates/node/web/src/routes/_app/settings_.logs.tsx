@@ -85,7 +85,7 @@ function LogsPage() {
     </div>
     <InlineError error={error} />
     {records === null ? null : records.length === 0
-      ? <EmptyState icon={ScrollText} title="没有符合条件的记录"
+      ? <EmptyState icon={ScrollText} title={level || sources.length || query ? "没有符合条件的记录" : "还没有日志"}
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>

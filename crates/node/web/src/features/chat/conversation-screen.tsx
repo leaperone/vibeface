@@ -170,7 +170,7 @@ export function ConversationScreen() {
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
   // An empty chat already offers the setup button in its middle.
-  const hint = notice || (bot && !agentReady ? (unready ? (entries.length ? '运行 Bot 的设备需设置' : '') : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
+  const hint = notice || (bot && !agentReady ? (managerOffline && !unready ? '能运行 Bot 的设备离线了' : !entries.length ? '' : unready ? '运行 Bot 的设备需设置' : '还没设置运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
