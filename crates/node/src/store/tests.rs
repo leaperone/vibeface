@@ -3574,7 +3574,7 @@ fn the_pending_list_holds_exactly_the_unanswered_questions() -> Result<()> {
 }
 
 #[test]
-fn a_session_owner_is_written_once_and_follows_the_users_latest_choice() -> Result<()> {
+fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()> {
     let net = net()?;
     let (mut local, _) = bot_with_message(&net)?;
     second_bot(&mut local, &net, "Other")?;
@@ -3605,35 +3605,36 @@ fn a_session_owner_is_written_once_and_follows_the_users_latest_choice() -> Resu
             .is_err()
     );
     assert_eq!(owner(&local)?.as_deref(), Some("c"));
+    let mut hand = |from: &str, session: &str, target: Option<&str>, at: i64| {
+        local.hand_over_session(&net.a, &net.network, from, session, target, at)
+    };
+    assert!(hand("c", "s1", Some("nope"), 5).is_err());
+    assert!(hand("c", "s2", None, 5).is_err());
+    let theirs = hand("d", "s1", Some("d"), 5).expect_err("d does not follow s1");
     assert!(
-        local
-            .hand_over_session(&net.a, &net.network, "s1", Some("nope"), 5)
-            .is_err()
-    );
-    assert!(
-        local
-            .hand_over_session(&net.a, &net.network, "s2", None, 5)
-            .is_err()
+        theirs.to_string().contains("Helper follows it"),
+        "only the bot that follows a session hands it over: {theirs}"
     );
 
-    let (before, moved) = local.hand_over_session(&net.a, &net.network, "s1", Some("d"), 5)?;
+    let (before, moved) = hand("c", "s1", Some("d"), 5)?;
     assert_eq!((before.as_str(), moved.is_some()), ("c", true));
-    let again = local.hand_over_session(&net.a, &net.network, "s1", Some("d"), 6)?;
+    let again = hand("c", "s1", Some("d"), 6)?;
     assert!(again.1.is_none(), "a repeated hand-over writes nothing");
+    assert!(
+        hand("c", "s1", None, 6).is_err(),
+        "a session handed over is no longer the sender's"
+    );
     assert_eq!(owner(&local)?.as_deref(), Some("d"));
     assert!(local.attributed_sessions(&net.network, "c")?.is_empty());
 
+    let mut hand = |from: &str, session: &str, target: Option<&str>, at: i64| {
+        local.hand_over_session(&net.a, &net.network, from, session, target, at)
+    };
+    assert!(hand("d", "s1", None, 7)?.1.is_some());
+    assert!(hand("d", "s1", None, 8)?.1.is_none());
     assert!(
-        local
-            .hand_over_session(&net.a, &net.network, "s1", None, 7)?
-            .1
-            .is_some()
-    );
-    assert!(
-        local
-            .hand_over_session(&net.a, &net.network, "s1", None, 8)?
-            .1
-            .is_none()
+        hand("c", "s1", Some("c"), 8).is_err(),
+        "a muted session stays with the bot that stopped following it"
     );
     assert!(local.session_muted(&net.network, &node, "s1")?);
     assert!(
@@ -3673,7 +3674,7 @@ fn a_session_owner_is_written_once_and_follows_the_users_latest_choice() -> Resu
     );
     assert!(other.session_muted(&net.network, &node, "s1")?);
 
-    local.hand_over_session(&net.a, &net.network, "s1", Some("c"), 10)?;
+    local.hand_over_session(&net.a, &net.network, "d", "s1", Some("c"), 10)?;
     assert_eq!(owner(&local)?.as_deref(), Some("c"));
     assert!(
         !local.session_muted(&net.network, &node, "s1")?,
@@ -3884,7 +3885,7 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         .map(|i| json!({"memory_id":format!("n{i}"),"text":"y".repeat(400)}))
         .collect::<Vec<_>>();
     let full_bot = json!({"configured_bot":{"name":"Helper","instructions":"i".repeat(MAX_INSTRUCTIONS_BYTES)},
-        "skills":notes,"schedules":notes,"memory":notes,"bots":notes});
+        "skills":notes,"schedules":notes,"memory":notes,"sessions":notes,"bots":notes});
     let prompt = materialize(full_bot)?;
     assert!(prompt.len() <= crate::scheduler::PROMPT_LIMIT);
     let tight = prompt_data(&prompt)?;
@@ -3932,6 +3933,61 @@ fn the_bot_prompt_keeps_its_newest_notes() -> Result<()> {
         .map(|i| format!("Note {i:02}"))
         .collect();
     assert_eq!(notes, expected, "the newest notes, oldest first");
+    Ok(())
+}
+
+#[test]
+fn the_bot_prompt_lists_the_newest_sessions_it_follows() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    second_bot(&mut store, &net, "Other")?;
+    let node = net.a.device_id()?;
+    let about = |session: &str| Subject {
+        node: node.clone(),
+        agent: "codex".into(),
+        session_id: session.into(),
+        cwd: "/work/project".into(),
+        summary: format!("{session}: {}", "tests fail again. ".repeat(6)),
+        request_id: None,
+    };
+    for i in 0..20 {
+        store.claim_session(
+            &net.a,
+            &net.network,
+            "c",
+            &about(&format!("s{i:02}")),
+            10 + i,
+        )?;
+    }
+    store.claim_session(&net.a, &net.network, "d", &about("theirs"), 40)?;
+    store.hand_over_session(&net.a, &net.network, "c", "s19", None, 50)?;
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    let shown = listed(&bot, "/sessions", "session_id");
+    let omitted = bot["sessions_omitted"].as_u64().context("omitted")? as usize;
+    assert!(
+        omitted > 0 && shown.len() + omitted == 20,
+        "the index stays within its budget: {} shown, {omitted} omitted",
+        shown.len()
+    );
+    let expected: Vec<Value> = (20 - shown.len()..20)
+        .map(|i| json!(format!("s{i:02}")))
+        .collect();
+    assert_eq!(shown, expected, "the newest sessions, oldest first");
+    let muted = &bot["sessions"][shown.len() - 1];
+    assert_eq!(
+        (
+            muted["following"].clone(),
+            muted["cwd"].clone(),
+            muted["node"].clone()
+        ),
+        (json!(false), json!("/work/project"), json!(node))
+    );
+    assert_eq!(bot["sessions"][0]["following"], json!(true));
+    let theirs = crate::scheduler::bot_value(&store, &net.network, "d", 100)?;
+    assert_eq!(
+        listed(&theirs, "/sessions", "session_id"),
+        vec![json!("theirs")]
+    );
     Ok(())
 }
 

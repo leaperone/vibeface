@@ -1,7 +1,7 @@
 //! Triage workers (design 4): capture into one queue, hand batches to the coordination Agent,
 //! ask the user in the chat of the bot that owns each session, deliver webhooks from a
 //! local outbox, hold App Server requests for the Agent, and give sessions no bot started
-//! to the primary bot until the user hands them to another or stops following them.
+//! to the primary bot until it hands them to another or stops following them.
 use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
@@ -258,7 +258,7 @@ impl Runtime {
 
     /// Takes one event from a hook, a scan or the App Server. Test events are acknowledged and
     /// dropped; so is everything while no coordination Agent is configured to judge it, and
-    /// everything of a session the user stopped following. A session no bot owns goes to the
+    /// everything of a session its bot stopped following. A session no bot owns goes to the
     /// primary bot first; without a bot its events drop. An event ID seen before is a
     /// duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
@@ -893,44 +893,30 @@ impl Runtime {
         Ok(())
     }
 
-    /// `session_owner`: the user hands a session a bot owns to another bot, or stops following
-    /// it when `conversation_id` is null. The device running the session writes the change.
-    pub(super) async fn set_session_owner(&self, access: &Access, input: &Value) -> Result<Value> {
-        ensure!(access.human, "only the user hands sessions over");
-        let node = super::field(input, "node")?;
-        let session = super::field(input, "session_id")?;
-        let target = match &input["conversation_id"] {
-            Value::Null => None,
-            value => Some(
-                value
-                    .as_str()
-                    .context("conversation_id is a bot's conversation or null")?,
-            ),
-        };
-        if node != self.identity.device_id()? {
-            return self
-                .peer_request(
-                    &access.network_id,
-                    node,
-                    json!({"type":"session_owner","session_id":session,"conversation_id":target,"human":true}),
-                )
-                .await;
-        }
-        self.hand_over_session(&access.network_id, session, target)
-            .await
-    }
-
-    /// Hands a session this device runs to `target`, or mutes it when `None`; a repeat writes
-    /// nothing.
+    /// `from`'s bot hands a session it follows to `target`, or stops following it when `None`.
+    /// The device running the session writes the change, so another device's session goes there
+    /// over peer RPC. Asking for what stands writes nothing.
     pub(super) async fn hand_over_session(
         &self,
         network: &str,
+        from: &str,
+        node: &str,
         session: &str,
         target: Option<&str>,
     ) -> Result<Value> {
+        if node != self.identity.device_id()? {
+            return self
+                .peer_request(
+                    network,
+                    node,
+                    json!({"type":"hand_over_session","session_id":session,"from":from,"conversation_id":target}),
+                )
+                .await;
+        }
         let (before, event) = self.store.lock().await.hand_over_session(
             &self.identity,
             network,
+            from,
             session,
             target,
             now_ms(),
@@ -945,7 +931,7 @@ impl Runtime {
                 },
                 conversation_id = owner,
                 thread_id = session,
-                "the user changed who follows a session"
+                "a bot changed who follows a session"
             );
             self.publish_changed(network, owner, Changed::Event(&event.hash));
             if owner != before {
@@ -953,7 +939,7 @@ impl Runtime {
             }
         }
         Ok(
-            json!({"session_id":session,"conversation_id":owner,"muted":target.is_none(),
+            json!({"node":node,"session_id":session,"conversation_id":owner,"muted":target.is_none(),
             "changed":event.is_some()}),
         )
     }
@@ -1896,15 +1882,6 @@ mod tests {
             .session_owner(&network, &local, session)
     }
 
-    fn the_user(network: &str) -> Access {
-        Access {
-            network_id: network.into(),
-            human: true,
-            conversation_id: None,
-            manager: None,
-        }
-    }
-
     #[tokio::test]
     async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1951,32 +1928,72 @@ mod tests {
             assert_eq!(owner_of(&node, "s2").await?.as_deref(), Some("d"), "the next goes to the new primary");
             assert_eq!(attributions(&node, "c").await?, 1);
 
-            let hand = json!({"node":local,"session_id":"s1","conversation_id":"d"});
-            let not_user = Access { human: false, ..the_user(&network) };
-            assert!(node.set_session_owner(&not_user, &hand).await.is_err());
-            let moved = node.set_session_owner(&the_user(&network), &hand).await?;
-            assert_eq!((moved["conversation_id"].clone(), moved["changed"].clone()), (json!("d"), json!(true)));
-            let retried = node.set_session_owner(&the_user(&network), &hand).await?;
-            assert_eq!(retried["changed"], false, "a retried hand-over writes nothing");
-            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("d"));
-            assert!(node.store.lock().await.attributed_sessions(&network, "c")?.is_empty());
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let idle = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger)
+                .await?;
+            let live = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..idle.clone()
+            };
+            let hand = |access: &Access, session: &str, how: Value| {
+                let mut args = json!({"node":local,"session_id":session});
+                args.as_object_mut().unwrap().extend(how.as_object().unwrap().clone());
+                node.tool(access.clone(), "hand_over_session", args)
+            };
+            let turn_result = async {
+                assert!(
+                    hand(&idle, "s1", json!({"to":"后端"})).await.is_err(),
+                    "only a live bot turn hands a session over"
+                );
+                let theirs = hand(&live, "s2", json!({"to":"前端"})).await.expect_err("s2 is d's");
+                assert!(theirs.to_string().contains("后端 follows it"), "{theirs:#}");
+                assert!(hand(&live, "s1", json!({"to":"后端","stop_following":true})).await.is_err());
 
-            let accepted = node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
-            let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
-            assert_eq!(node.triage_command(raise).await?["conversation_id"], "d");
+                let mute = json!({"stop_following":true});
+                let muted = hand(&live, "s1", mute.clone()).await?;
+                assert_eq!((muted["muted"].clone(), muted["changed"].clone()), (json!(true), json!(true)));
+                assert_eq!(hand(&live, "s1", mute).await?["changed"], false, "a retried mute writes nothing");
+                let quiet = node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
+                assert_eq!(quiet["status"], "muted");
+                assert!(
+                    node.pending_events().await?.iter().all(|event| event.event_id != quiet["event_id"]),
+                    "a muted session's events drop"
+                );
+                assert_eq!(attributions(&node, "c").await?, 1, "a muted session is not claimed again");
 
-            let mute = json!({"node":local,"session_id":"s1","conversation_id":null});
-            let muted = node.set_session_owner(&the_user(&network), &mute).await?;
-            assert_eq!((muted["muted"].clone(), muted["changed"].clone()), (json!(true), json!(true)));
-            assert_eq!(node.set_session_owner(&the_user(&network), &mute).await?["changed"], false);
-            let quiet = node.ingest_agent_event(turn("s1", "t5", "/w")).await?;
-            assert_eq!(quiet["status"], "muted");
-            assert!(
-                node.pending_events().await?.iter().all(|event| event.event_id != quiet["event_id"]),
-                "a muted session's events drop"
-            );
-            assert_eq!(attributions(&node, "c").await?, 1, "a muted session is not claimed again");
-            Ok::<_, anyhow::Error>(())
+                let to_d = json!({"to":"后端"});
+                let moved = hand(&live, "s1", to_d.clone()).await?;
+                assert_eq!(
+                    (moved["conversation_id"].clone(), moved["muted"].clone(), moved["changed"].clone()),
+                    (json!("d"), json!(false), json!(true))
+                );
+                let retried = hand(&live, "s1", to_d).await?;
+                assert_eq!(retried["changed"], false, "a retried hand-over reads back what stands");
+                assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("d"));
+                assert_eq!(attributions(&node, "d").await?, 2, "each hand-over is written once");
+                assert!(node.store.lock().await.attributed_sessions(&network, "c")?.is_empty());
+                assert!(
+                    hand(&live, "s1", json!({"stop_following":true})).await.is_err(),
+                    "a session handed over is no longer the sender's"
+                );
+
+                let accepted = node.ingest_agent_event(turn("s1", "t5", "/w")).await?;
+                let raise = json!({"action":"raise","event_id":accepted["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+                assert_eq!(node.triage_command(raise).await?["conversation_id"], "d");
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            node.finish_manager_attempt(&attempt).await;
+            turn_result
         }
         .await;
         cleanup(node, dir).await?;

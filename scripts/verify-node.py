@@ -1118,7 +1118,7 @@ def fixture_codex(arguments):
 
 
 READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot"}
-WORK_TOOLS = {"dispatch_work", "interrupt_work"}
+WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
                   "create_bot", "configure_bot", "delete_bot"}
@@ -1204,7 +1204,9 @@ def fixture_manager(run, initial, bot):
               "checkpoint": context["conversation"]["checkpoint"] is not None,
               "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
               "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
-              "bot": context["bot"].get("configured_bot"), "bot_prompt_markers": [marker for marker in
+              "bot": context["bot"].get("configured_bot"),
+              "sessions": [row["session_id"] for row in context["bot"].get("sessions") or []],
+              "bot_prompt_markers": [marker for marker in
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in initial["history"]],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
@@ -2082,8 +2084,8 @@ def triage_checks(run, workspace, a, network, passed):
 
 
 def foreign_session_checks(run, workspace, a, network, passed):
-    """A session no bot started goes to the primary bot once, with no question; the user hands it to another bot or
-    stops following it from the bot's chat, and a session nobody drives is left alone."""
+    """A session no bot started goes to the primary bot once, with no question; that bot sees it in its turn and hands
+    it to another bot or stops following it with hand_over_session, and a session nobody drives is left alone."""
     labels = ("keep", "hand", "mute", "next", "exec")
     sessions = {label: "foreign-" + label + "-" + uuid.uuid4().hex[:8] for label in labels}
     directory = workspace / "foreign"
@@ -2106,9 +2108,8 @@ def foreign_session_checks(run, workspace, a, network, passed):
         return [event["body"] for scope in ("bot-history-alpha", "bot-history-beta") for event in scope_events(a, network, scope)
                 if event["body"]["type"] == kind and event["body"]["session_id"] in sessions.values()]
 
-    def hand(label, conversation):
-        return [a.client.rpc("session_owner", node=a.device_id, session_id=sessions[label], conversation_id=conversation)
-                for _ in range(2)]
+    def hand_over(label, **how):
+        return {"name": "hand_over_session", "arguments": {"node": a.device_id, "session_id": sessions[label], **how}}
 
     require(a.client.rpc("bots")["primary"] == "bot-history-alpha", "the first bot created is the primary one")
     for label in ("keep", "hand", "mute"):
@@ -2123,11 +2124,22 @@ def foreign_session_checks(run, workspace, a, network, passed):
     require(sorted(body["session_id"] for body in owner_events("session_attributed")) == sorted(sessions[label] for label in ("keep", "hand", "mute"))
             and all(not row["muted"] for row in listed("bot-history-alpha").values()), "a repeated hook attributes a session once")
 
-    handed = hand("hand", "bot-history-beta")
+    receipt = a.client.rpc("message", conversation_id="bot-history-alpha", message_id="hand-over", text=json.dumps({
+        "chat_agent": True, "tools": [
+            hand_over("hand", to="bot-history-beta"), hand_over("hand", to="bot-history-beta"),
+            {**hand_over("hand", stop_following=True), "accepted": False, "rejection": "follows it"},
+            hand_over("mute", stop_following=True), hand_over("mute", stop_following=True)]}))
+    wait_for("the bot's hand-over turn finishes", lambda:
+             (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed", timeout=90)
+    seen = next(row for row in fixture_records(run) if row["trigger"] == receipt["trigger"])
+    require({sessions[label] for label in ("keep", "hand", "mute")} <= set(seen["sessions"]),
+            "the bot's turn lists the sessions it follows")
+    calls = [row["result"] for row in fixture_records(run, "manager-tools.jsonl")
+             if row["trigger"] == receipt["trigger"] and row["name"] == "hand_over_session" and row["accepted"]]
+    handed, muted = calls[:2], calls[2:]
     require([row["changed"] for row in handed] == [True, False] and handed[0]["conversation_id"] == "bot-history-beta",
-            "转给 hands the session over once; the retry writes nothing")
-    muted = hand("mute", None)
-    require([row["changed"] for row in muted] == [True, False] and muted[0]["muted"], "不再关注 is written once")
+            "hand_over_session hands the session over once; the retry reads back what stands")
+    require([row["changed"] for row in muted] == [True, False] and muted[0]["muted"], "stop_following is written once")
     wait_for("the hand-over moves the session between chats", lambda: sessions["hand"] in listed("bot-history-beta")
              and sessions["hand"] not in listed("bot-history-alpha"), timeout=60)
     require(listed("bot-history-alpha")[sessions["mute"]]["muted"], "the muted session stays in its bot's chat, marked")
@@ -2149,7 +2161,8 @@ def foreign_session_checks(run, workspace, a, network, passed):
     require(sorted(body["session_id"] for body in attributed) == sorted(sessions[label] for label in ("keep", "hand", "hand", "mute", "next"))
             and [body["session_id"] for body in owner_events("session_muted")] == [sessions["mute"]],
             "each attribution, hand-over and mute is written exactly once")
-    passed("a session no bot started goes to the primary bot once; 转给 and 不再关注 are written once; a codex exec session is skipped",
+    passed("a session no bot started goes to the primary bot once; its bot hands it over and stops following it once each; "
+           "a codex exec session is skipped",
            kept=sessions["keep"], handed=sessions["hand"], muted=sessions["mute"], next=sessions["next"],
            skipped=sessions["exec"], later=later["question_id"])
 

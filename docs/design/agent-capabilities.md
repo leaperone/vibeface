@@ -105,7 +105,7 @@ BotMessaged {
 | 工具类别 | 工具 | 本人 | 回答 | 工作结果 | schedule | bot 消息 | Agent 任务、路由 |
 |---|---|---|---|---|---|---|---|
 | 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| 工作 | `dispatch_work` `interrupt_work` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 工作 | `dispatch_work` `interrupt_work` `hand_over_session` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | |
 
@@ -127,6 +127,7 @@ BotMessaged {
 
 - `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的；
 - `memory`：`{memory_id, text}`，以及 `memory_omitted`；
+- `sessions`：它名下的外来会话 `{node, session_id, agent, cwd, summary, following}`，最新优先截在 3000 字节内，以及 `sessions_omitted`；
 - `bots`：其他 bot 的 `{conversation_id, name}`。
 
 trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder}`，`reminder` 表示深度大于 0、由 bot 自己定的提醒。bot 消息时带那条消息和发送者。

@@ -18,7 +18,7 @@ import { answerBody, answerId } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, SessionHandoff, WriteState, WriteStatus, OpenWork, ScheduleAction,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction,
 } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
@@ -683,15 +683,6 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       await connection.rpc("resolve", { conversation_id: id, check_id: check.check_id })
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
-    }),
-    /**
-     * Hands a session no bot started to another bot, or with null stops following it. The device running it writes the
-     * change once; asking for what already stands writes nothing, so a retry is safe.
-     */
-    setSessionOwner: (session: SessionHandoff, conversationId: string | null) => withMutation(`session:${session.node}:${session.session_id}`, async () => {
-      await connection.rpc("session_owner", { node: session.node, session_id: session.session_id, conversation_id: conversationId })
-      requireCurrent()
-      await refreshRef.current()
     }),
     readArtifactBytes: async (hash: string, offset = 0) => {
       requireCurrent()

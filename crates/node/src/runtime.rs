@@ -681,7 +681,6 @@ impl Runtime {
             "bots" => self.bots(&access).await,
             "questions" => self.questions(&access).await,
             "answer" => self.answer_question(&access, &input).await,
-            "session_owner" => self.set_session_owner(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
             "delete_bot" => self.delete_bot(&access, &input).await,
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
