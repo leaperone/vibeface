@@ -511,8 +511,8 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => 'Mac mini' }, '@vibeface/client/workspace/questions.ts': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
-  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
   const labelled = (elements: Element[], label: string) => elements.find(({ props }) => props.onClick && text(props.children).includes(label))
@@ -521,7 +521,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   try {
     let elements: Element[] = app.render('QuestionCard', { question })
     assert.match(words(elements), /web/, 'the meta line names the project')
-    assert.match(words(elements), /Mac mini/, 'and the device')
+    assert.match(words(elements), /工作电脑/, 'and the device')
     assert.equal(elements.some(({ type }) => type === 'Link'), false, 'in its own chat the card does not link to it')
     labelled(elements, '停下')?.props.onClick?.(); await settleComponent()
     assert.deepEqual(plain(sent[0]), [question, '停下'], 'a choice answers with its label')
@@ -591,7 +591,7 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
 })
 
 test("bot projects use online manager capabilities and preserve device names", () => {
-  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/Users/me/a/long/path/to/project'] } }
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/path/to/a/long/path/to/project'] } }
   const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName }, '@vibeface/client/workspace/questions.ts': { projectName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)

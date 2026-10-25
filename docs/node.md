@@ -68,7 +68,7 @@ bash scripts/build-web.sh
 
 协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：在本机或另一台设备的 Codex App Server 上开一个 turn，或把任务交给另一台设备的协调 Agent，由它在那台设备上执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
 
-通过 `manager.model` 选择账户实际可用的快模型。`auto` 或默认模型不是速度保证。2026-10-18 的独立 SDK 两轮对话测得首个模型输出约 7 至 10 秒，只验证了对应环境的模型对话与本机原生会话延续，不代表整个 Node、网页和后台任务的响应时间。
+通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
 在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex 和 Cursor 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；Codex 行的任务图标开关本机执行任务。模型、Bot 工作文件夹和组件路径在 Bot 所在服务的**设置**里，允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
@@ -155,16 +155,16 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 手机或另一台电脑要从外网打开网页，需要一个 HTTPS 入口。有两种做法：
 
-- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它只提供网页、relay 和密文转发，不保存你的任何数据。家里的设备不需要入站端口。推荐用这种方式。
+- **公共入口**：在有公网地址的机器上运行一个不加入个人网络的 `vibeface`，它只提供网页、relay 和密文转发，不保存你的任何数据。个人设备不需要入站端口。推荐用这种方式。
 - **成员 Gateway**：让公网机器上的 Node 作为普通成员加入个人网络，同时提供网页，见本节末尾。
 
-### 公共入口：PVE 加 nginx
+### 公共入口：Linux 服务器加 nginx
 
-下面以 PVE 上的一台 Linux 虚拟机为公共入口，域名 `vb.example.com`，家里的 Mac 是个人网络里的 Node。
+下面以一台 Linux 服务器为公共入口，域名为 `vb.example.com`。个人电脑运行加入个人网络的 Node。
 
-1. 域名解析到 PVE 的公网地址，用 certbot 或其他方式为它签发证书。
+1. 域名解析到服务器的公网地址，用 certbot 或其他方式为它签发证书。
 
-2. 在 PVE 上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
+2. 在服务器上初始化公共入口并启动。网页监听 `127.0.0.1:4790`，relay 监听 `127.0.0.1:3340`，两者都只对 nginx 开放：
 
    ```sh
    vibeface init --data-dir "$HOME/.vibeface-entry" \
@@ -212,9 +212,9 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
    `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
 
-4. 把 PVE 上的 `entry-token` 复制到 Mac，例如 `scp pve:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
+4. 通过安全通道把服务器上的 `entry-token` 复制到个人电脑的 `~/vb-entry-token`，并执行 `chmod 600 ~/vb-entry-token`。
 
-5. 在 Mac 上初始化 Node 时指向公共入口，然后启动：
+5. 在个人电脑上初始化 Node 时指向公共入口，然后启动：
 
    ```sh
    vibeface init --data-dir "$HOME/.vibeface" \
@@ -224,11 +224,11 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
    vibeface
    ```
 
-   `init` 把令牌复制进 Mac 的数据目录，之后可以删掉 `~/vb-entry-token`。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
+   `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `~/vb-entry-token`。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
 
-6. 在 Mac 上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在 Mac 上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
+6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
 
-公共入口只搬运浏览器与 Mac 之间的 Noise 密文，看不到对话内容，也不保存事件或附件。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
+公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存事件或附件。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
 
 已经初始化的 Node 要改用公共入口，停掉它，在 `config.json` 的 `network` 中加入 `"entry": {"url": "https://vb.example.com", "relay": "https://vb.example.com"}`，把令牌放到数据目录的 `entry-token`（权限 600），再启动。
 
@@ -260,7 +260,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-公网 Node 承担 relay 角色。例如 PVE 用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
+公网 Node 承担 relay 角色。例如服务器用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
 ```sh
 vibeface init --data-dir "$HOME/.vibeface" \
@@ -269,7 +269,7 @@ vibeface init --data-dir "$HOME/.vibeface" \
 vibeface join '<管理设备给出的加入链接>' --data-dir "$HOME/.vibeface"
 ```
 
-家里的 Mac mini 用 `--relay https://relay.example` 初始化，无需入站端口。邀请链接写明发出邀请的 Node 自己的 relay。relay 只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
+个人设备上的 Node 用 `--relay https://relay.example` 初始化，无需入站端口。邀请链接写明发出邀请的 Node 自己的 relay。relay 只认本 Node 登记的邀请，所以只能经 relay 连通的新 Node 要用运行 relay 的那台 Node 发出的邀请加入。
 
 公网 Node 也是普通成员，可同时运行调度或执行。relay 不读取会话内容，也不给其他设备增加任何权限。不想让公网机器保存个人网络数据时，改用 [公共入口](#配置公共入口)。
 

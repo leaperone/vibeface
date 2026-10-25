@@ -30,7 +30,7 @@
 flowchart LR
     U[本人的网页或手机浏览器]
     G[公共入口<br>网页、relay 与密文转发]
-    A[Mac mini Node<br>协调 Agent]
+    A[Node A<br>协调 Agent]
     B[Node B<br>协调 Agent 与本机工具]
     C[Node C<br>协调 Agent 与历史副本]
     U -->|HTTPS 内的 Noise| G
@@ -151,7 +151,7 @@ vibeface join '<加入链接>'
 
 ### 公网部署
 
-有公网地址的机器（例如 PVE）有两种用法。用 `init --public-entry` 运行公共入口，家里的 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
+有公网地址的服务器有两种用法。用 `init --public-entry` 运行公共入口，个人设备上的 Node 用 `--entry` 指向它。或者作为成员用 `init --relay-listen` 为个人网络运行 relay，其他 Node 用 `--relay` 指向它。见 [配置公共入口](docs/node.md#配置公共入口) 和 [Node 之间的连接](docs/node.md#node-之间的连接)。
 
 ## 🛠️ 从源码构建
 
@@ -161,7 +161,7 @@ vibeface join '<加入链接>'
 rustup target add wasm32-unknown-unknown
 bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
-cargo build --release -p vibeface --locked
+bash scripts/package-node.sh
 ./target/release/vibeface init \
 	--data-dir "$HOME/.vibeface" \
 	--root /absolute/path/to/projects

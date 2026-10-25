@@ -52,7 +52,6 @@ export function placeByTime<T extends { created_at_ms: number }>(messages: reado
   return { before, rest }
 }
 
-/** "/Users/me/project/web/" → "web". */
 export const projectName = (cwd: string) => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd
 
 const agents: Record<string, string> = { codex: "Codex", claude: "Claude Code" }

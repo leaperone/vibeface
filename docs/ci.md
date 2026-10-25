@@ -51,13 +51,15 @@ CI 不使用真实 AI Provider 或模型密钥。各模式都使用受控 SDK �
 
 开发者修改同步、恢复、调度或工具执行时，除 PR 核心检查外，必须执行对应专项并记录命令及结果；不能只依赖下次定期运行。每次只跑相关模式。安装器或平台交付改动应额外手动触发 `ci`，确认目标平台制品。
 
-无需编译即可验证 CI 规则：
+无需编译项目即可验证 CI 规则和发布隐私检查：
 
 ```sh
 python3 scripts/ci.py --self-test
 python3 scripts/ci.py plan --base origin/main --head HEAD --event pull_request
 actionlint .github/workflows/ci.yml
 ```
+
+自检会编译一个独立 Rust 夹具并打包，核对调用方编译参数仍有效、源码路径已替换、归档不含构建账号或扩展属性。
 
 Rust 快、慢组可独立运行。Clippy 默认不安装 MSRV，需要时显式提供：
 
