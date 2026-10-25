@@ -244,9 +244,10 @@ class AndroidHost:
             "ANDROID_ADB_SERVER_PORT": str(self.server_port), "ADB_SERVER_SOCKET": f"tcp:127.0.0.1:{self.server_port}",
             "AGENT_DEVICE_HOME": str(UI / "agent-device"), "AGENT_DEVICE_STATE_DIR": str(UI / "agent-device"),
             "PLAYWRIGHT_BROWSERS_PATH": str(UI / "browsers"), "E2E_TELEMETRY_DISABLED": "1"}
-        manager, avdmanager = android_tool("sdkmanager"), android_tool("avdmanager")
+        manager = android_tool("sdkmanager")
         log = UI / "private-android-setup.log"
-        command("install task Android runtime", [manager, "--sdk_root=" + str(self.sdk), "platform-tools", "emulator", "system-images;android-35;default;x86_64"], log, env=self.environment, input=b"y\n" * 64, timeout=900)
+        command("install task Android runtime", [manager, "--sdk_root=" + str(self.sdk), "cmdline-tools;20.0", "platform-tools", "emulator", "system-images;android-35;default;x86_64"], log, env=self.environment, input=b"y\n" * 64, timeout=900)
+        avdmanager = str(self.sdk / "cmdline-tools/20.0/bin/avdmanager")
         name = "vdp-paid-" + uuid.uuid4().hex[:12]
         command("create dedicated task AVD", [avdmanager, "create", "avd", "--name", name, "--package", "system-images;android-35;default;x86_64", "--device", "pixel_6", "--path", str(UI / "avd" / (name + ".avd"))], log, env=self.environment, input=b"no\n", timeout=120)
         self.environment["PATH"] = str(self.sdk / "platform-tools") + os.pathsep + self.environment["PATH"]
@@ -1342,6 +1343,29 @@ def self_test_ui(directory):
             assert cleanup_owned(host, running, running, "vdp-live-self-test", None, True) is True
             assert stop.call_count == 2
             host.close.assert_called_once()
+    with (
+        patch(f"{__name__}.UI", directory / "android-start"),
+        patch(f"{__name__}.android_tool", side_effect=lambda name: "/bootstrap-sdk/cmdline-tools/20.0/bin/" + name) as bootstrap,
+        patch(f"{__name__}.command") as setup,
+        patch(f"{__name__}.available_port", return_value=12345),
+        patch(f"{__name__}.port_free", return_value=True),
+        patch(f"{__name__}.wait_owned"),
+        patch("subprocess.Popen"),
+    ):
+        host = AndroidHost()
+        host.adb = Mock(side_effect=["", "", "", "0", "x86_64"])
+        try:
+            environment = host.start()
+            install, create = setup.call_args_list
+            tool = Path(create.args[1][0])
+            assert tool.name == "avdmanager" and tool.parents[3] == host.sdk
+            assert "cmdline-tools;" + tool.parents[1].name in install.args[1]
+            assert "--sdk_root=" + str(host.sdk) in install.args[1]
+            assert environment["ANDROID_SDK_ROOT"] == environment["ANDROID_HOME"] == str(host.sdk)
+            bootstrap.assert_called_once_with("sdkmanager")
+        finally:
+            if host.log is not None:
+                host.log.close()
     host = AndroidHost()
     host.server_port, host.serial = 12345, "emulator-5554"
     host.reverse = {"tcp:43210": "tcp:43210", "tcp:43211": None}
