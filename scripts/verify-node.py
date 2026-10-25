@@ -2108,8 +2108,11 @@ def foreign_session_checks(run, workspace, a, network, passed):
         return [event["body"] for scope in ("bot-history-alpha", "bot-history-beta") for event in scope_events(a, network, scope)
                 if event["body"]["type"] == kind and event["body"]["session_id"] in sessions.values()]
 
+    versions = {}
+
     def hand_over(label, **how):
-        return {"name": "hand_over_session", "arguments": {"node": a.device_id, "session_id": sessions[label], **how}}
+        return {"name": "hand_over_session", "arguments": {"node": a.device_id, "session_id": sessions[label],
+                                                           "version": versions[label], **how}}
 
     require(a.client.rpc("bots")["primary"] == "bot-history-alpha", "the first bot created is the primary one")
     for label in ("keep", "hand", "mute"):
@@ -2124,11 +2127,14 @@ def foreign_session_checks(run, workspace, a, network, passed):
     require(sorted(body["session_id"] for body in owner_events("session_attributed")) == sorted(sessions[label] for label in ("keep", "hand", "mute"))
             and all(not row["muted"] for row in listed("bot-history-alpha").values()), "a repeated hook attributes a session once")
 
+    alpha = listed("bot-history-alpha")
+    versions.update({label: alpha[sessions[label]]["version"] for label in ("hand", "mute")})
     receipt = a.client.rpc("message", conversation_id="bot-history-alpha", message_id="hand-over", text=json.dumps({
         "chat_agent": True, "tools": [
             hand_over("hand", to="bot-history-beta"), hand_over("hand", to="bot-history-beta"),
             {**hand_over("hand", stop_following=True), "accepted": False, "rejection": "follows it"},
-            hand_over("mute", stop_following=True), hand_over("mute", stop_following=True)]}))
+            hand_over("mute", stop_following=True), hand_over("mute", stop_following=True),
+            {**hand_over("mute", to="bot-history-beta"), "accepted": False, "rejection": "it is at version"}]}))
     wait_for("the bot's hand-over turn finishes", lambda:
              (scheduler_record(a, network, receipt["trigger"]) or {}).get("state") == "completed", timeout=90)
     seen = next(row for row in fixture_records(run) if row["trigger"] == receipt["trigger"])
@@ -2139,7 +2145,8 @@ def foreign_session_checks(run, workspace, a, network, passed):
     handed, muted = calls[:2], calls[2:]
     require([row["changed"] for row in handed] == [True, False] and handed[0]["conversation_id"] == "bot-history-beta",
             "hand_over_session hands the session over once; the retry reads back what stands")
-    require([row["changed"] for row in muted] == [True, False] and muted[0]["muted"], "stop_following is written once")
+    require([row["changed"] for row in muted] == [True, False] and muted[0]["muted"]
+            and muted[0]["version"] == muted[1]["version"] != versions["mute"], "stop_following is written once")
     wait_for("the hand-over moves the session between chats", lambda: sessions["hand"] in listed("bot-history-beta")
              and sessions["hand"] not in listed("bot-history-alpha"), timeout=60)
     require(listed("bot-history-alpha")[sessions["mute"]]["muted"], "the muted session stays in its bot's chat, marked")

@@ -1,6 +1,7 @@
 //! Questions live in the chat of the bot that owns their session. A question's one answer is
 //! the user message `a-<question_id>`; a question is unanswered while no such message exists.
-//! A session gets its owner from a work bound to it or from the device running it.
+//! A session gets its owner from a work bound to it or from the device running it. A deleted
+//! bot owns nothing: its sessions, muted or not, are unowned again.
 use super::{
     Store, authorize_node_from,
     bots::bot_for_conversation_from,
@@ -98,6 +99,21 @@ pub(super) fn question_from(
     .pop())
 }
 
+/// The `session_owners` row of `(?1, ?2, ?3)` while its bot is not deleted.
+const OWNED: &str = "FROM session_owners s WHERE s.network_id=?1 AND s.node=?2 AND s.session_id=?3
+    AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=s.network_id AND d.conversation_id=s.conversation_id)";
+
+/// What a bot names to change a session: the start of the hash of the event that last set its
+/// row, which ends the row's rank. Any change to the session gives it a new version.
+fn session_version(rank: &str) -> String {
+    rank.rsplit(':')
+        .next()
+        .unwrap_or(rank)
+        .chars()
+        .take(16)
+        .collect()
+}
+
 pub(crate) fn session_owner_from(
     connection: &Connection,
     network: &str,
@@ -106,7 +122,7 @@ pub(crate) fn session_owner_from(
 ) -> Result<Option<ScopeId>> {
     Ok(connection
         .query_row(
-            "SELECT conversation_id FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+            &format!("SELECT conversation_id {OWNED}"),
             params![network, node, session],
             |r| r.get(0),
         )
@@ -148,24 +164,32 @@ impl Store {
     }
 
     /// Sessions the device running them attributed to this conversation's bot, muted ones
-    /// included, for the lines in its chat.
+    /// included, with the version a hand-over names, for the lines in its chat.
     pub fn attributed_sessions(&self, network: &str, scope: &str) -> Result<Vec<Value>> {
         let mut statement = self.connection.prepare(
-            "SELECT node,session_id,attribution,muted,created_at_ms FROM session_owners
+            "SELECT node,session_id,attribution,muted,created_at_ms,rank FROM session_owners
              WHERE network_id=? AND conversation_id=? AND attribution IS NOT NULL ORDER BY rank",
         )?;
-        let rows: Vec<(String, String, String, bool, i64)> = statement
+        let rows: Vec<(String, String, String, bool, i64, String)> = statement
             .query_map(params![network, scope], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter()
-            .map(|(node, session, attribution, muted, created_at_ms)| {
+            .map(|(node, session, attribution, muted, created_at_ms, rank)| {
                 let mut row: Value = serde_json::from_str(&attribution)?;
                 row["node"] = json!(node);
                 row["session_id"] = json!(session);
                 row["muted"] = json!(muted);
                 row["created_at_ms"] = json!(created_at_ms);
+                row["version"] = json!(session_version(&rank));
                 Ok(row)
             })
             .collect()
@@ -176,7 +200,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT muted FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+                &format!("SELECT muted {OWNED}"),
                 params![network, node, session],
                 |r| r.get(0),
             )
@@ -233,8 +257,8 @@ impl Store {
     }
 
     /// Gives a session this device runs and no bot owns to `conversation`. Writes nothing
-    /// once the session has an owner or was muted, so a repeated event or a restart does not
-    /// attribute it again.
+    /// once a bot owns the session or muted it, so a repeated event or a restart does not
+    /// attribute it again; once that bot is deleted, the next call gives it away again.
     pub fn claim_session(
         &mut self,
         identity: &LocalIdentity,
@@ -274,33 +298,40 @@ impl Store {
     }
 
     /// `from`'s bot hands an attributed session this device runs to `target`, or mutes it in
-    /// its own conversation when `None`. Only the bot that owns the session changes it; asking
-    /// for the state that stands writes nothing, so a retry reads it back. Returns the owner
-    /// before, and the event when this call wrote one.
+    /// its own conversation when `None`. Only the bot that owns the session changes it, and only
+    /// at the version `seen` it read, so a retry after the session moved on writes nothing;
+    /// asking for the state that stands writes nothing, so a retry reads it back. Returns the
+    /// owner before, the version after, and the event when this call wrote one.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a hand-over names the session, the version it read and the new owner"
+    )]
     pub fn hand_over_session(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
         from: &str,
         session: &str,
+        seen: &str,
         target: Option<&str>,
         created_at_ms: i64,
-    ) -> Result<(ScopeId, Option<SignedEvent>)> {
+    ) -> Result<(ScopeId, String, Option<SignedEvent>)> {
         let node = identity.device_id()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (owner, attribution, muted): (String, Option<String>, bool) = tx
+        let (owner, attribution, muted, rank): (String, Option<String>, bool, String) = tx
             .query_row(
-                "SELECT conversation_id,attribution,muted FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+                &format!("SELECT conversation_id,attribution,muted,rank {OWNED}"),
                 params![network, node, session],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
             .context("no bot follows this session on this device")?;
+        let version = session_version(&rank);
         match target {
-            Some(target) if target == owner && !muted => return Ok((owner, None)),
-            None if muted && owner == from => return Ok((owner, None)),
+            Some(target) if target == owner && !muted => return Ok((owner, version, None)),
+            None if muted && owner == from => return Ok((owner, version, None)),
             _ if owner != from => {
                 let name =
                     bot_for_conversation_from(&tx, network, &owner)?.map_or(owner, |bot| bot.name);
@@ -308,6 +339,10 @@ impl Store {
             }
             _ => {}
         }
+        ensure!(
+            seen == version,
+            "this session changed since version {seen}; it is at version {version} now"
+        );
         let attribution: Value = serde_json::from_str(
             &attribution.context("this session belongs to the work that started it")?,
         )?;
@@ -343,7 +378,7 @@ impl Store {
             created_at_ms,
         )?;
         tx.commit()?;
-        Ok((owner, Some(event)))
+        Ok((owner, session_version(&event.hash), Some(event)))
     }
 
     /// Posts the one answer to `question`. A retry with the same text returns it; a different

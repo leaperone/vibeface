@@ -234,7 +234,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；只有会话当前所属的 Bot 能操作，运行该会话的设备写入，状态已成立时不写、重试只读回，返回 `{node, session_id, conversation_id, muted, changed}`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 
@@ -289,7 +289,7 @@ Event {
 
 `context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）、`schedule_run_claimed` 和 `bot_messaged` 只能由对应会话的负责人写：前三者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。`schedule_run_claimed` 的 `owner_epoch` 还必须等于这个最大 epoch。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。同一 `(会话, schedule_id, slot_ms)` 的领取投影为 `schedule_claims`，`owner_epoch` 大者胜，相同时作者较小者胜，与到达顺序无关。
 
-通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`：工作记录 rank 最小者胜，`session_attributed` rank 最大者胜并覆盖工作记录，`session_muted` 置 `muted`。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
+通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`：工作记录 rank 最小者胜，`session_attributed` rank 最大者胜并覆盖工作记录，`session_muted` 置 `muted`；所属 Bot 已删除的行读取时视为无主。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
 入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
 
@@ -366,7 +366,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `interrupt_work` | 停止目标上的工作 |
 | `codex_state` | 转发本人读状态，要求 `human: true` |
 | `codex_respond` | 另一台设备的 Bot 应答本设备挂起的 App Server 请求，同一请求只应答一次 |
-| `hand_over_session` | 另一台设备上的 Bot 转交或不再关注本设备运行的会话，带发起 Bot 的会话 `from`；本设备核对归属后写入，状态已成立时不写 |
+| `hand_over_session` | 另一台设备上的 Bot 转交或不再关注本设备运行的会话，带发起 Bot 的会话 `from` 和它看到的 `version`；本设备核对归属与版本后写入，状态已成立时不写 |
 | `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
 

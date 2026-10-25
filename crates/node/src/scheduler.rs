@@ -576,8 +576,9 @@ pub(crate) fn bot_value(
             .into_iter()
             .rev()
             .map(|row| {
-                json!({"node":row["node"],"session_id":row["session_id"],"agent":row["agent"],
-                    "cwd":row["cwd"],"summary":row["summary"],"following":row["muted"] != true})
+                json!({"node":row["node"],"session_id":row["session_id"],"version":row["version"],
+                    "agent":row["agent"],"cwd":row["cwd"],"summary":row["summary"],
+                    "following":row["muted"] != true})
             }),
         INDEX_BUDGET,
     );

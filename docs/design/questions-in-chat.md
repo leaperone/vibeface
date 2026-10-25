@@ -22,10 +22,10 @@ Codex 线程或 Claude Code 会话（统称 session）属于某个 Bot，只有�
 外来会话：
 
 - 只看用户在用的会话。Codex rollout 首行 `session_meta` 的 `source` 为 `exec`/`mcp`、`source` 是子代理对象或 `originator` 以 `_exec` 结尾时跳过；App Server 的 `thread/started` 按同样规则记下后台线程；hook 进程按 rollout 首行（Codex）或 `CLAUDE_CODE_ENTRYPOINT=sdk-*`（Claude）在发出前跳过。普通 Stop 事件照常进分诊。
-- 第一个事件到来时，运行它的 Node 直接把它归给主 Bot，写一次 `SessionAttributed`，不提问。归属已存在（含不再关注）就不再写，所以重复事件、重启和同步都不会再写；之后按普通归属路由，App Server 请求交给该 Bot 处理。没有 Bot 时事件丢弃，请求立即按方法兜底。
+- 第一个事件到来时，运行它的 Node 直接把它归给主 Bot，写一次 `SessionAttributed`，不提问。归属已存在（含不再关注）就不再写，所以重复事件、重启和同步都不会再写；所属 Bot 被删除后，它名下的会话（含不再关注的）读取时视为无主，下一个事件到来时同样归给当时的主 Bot、只写一次，不在删除时批量改写；之后按普通归属路由，App Server 请求交给该 Bot 处理。没有 Bot 时事件丢弃，请求立即按方法兜底。
 - 协调 Agent 自己的线程登记在 `coordination_threads`，永不清理，不会被归属。
-- 交接由 Bot 自己判断，网页和手机都不做手动路由。Bot 每轮的 `bot.sessions` 列出它名下的会话（设备、会话 ID、项目、摘要、是否还在关注），按最新优先截在 3000 字节内，省略条数记在 `sessions_omitted`。它用工具 `hand_over_session` 转给另一个 Bot（写新的 `SessionAttributed`），或不再关注（写 `SessionMuted`）。只有会话当前所属的 Bot 能操作；运行该会话的设备在同一事务里核对归属再写，不在本机时经节点间 RPC `hand_over_session` 转过去。请求的状态已成立时不写，所以重试只读回；结果未知时用同样的参数再调一次即对账。
-- 不再关注后该会话的事件在分诊前丢弃，不进待处理。它仍在原 Bot 名下，主 Bot 不会重新认领；原 Bot 转给某个 Bot，或转给自己（重新关注）即恢复。
+- 交接由 Bot 自己判断，网页和手机都不做手动路由。Bot 每轮的 `bot.sessions` 列出它名下的会话（设备、会话 ID、版本、项目、摘要、是否还在关注），按最新优先截在 3000 字节内，省略条数记在 `sessions_omitted`。它用工具 `hand_over_session` 转给另一个 Bot（写新的 `SessionAttributed`），或不再关注（写 `SessionMuted`）。只有会话当前所属的 Bot 能操作，且要带上它看到的版本；运行该会话的设备在同一事务里核对归属和版本再写，不在本机时经节点间 RPC `hand_over_session` 转过去。请求的状态已成立时不写，所以重试只读回；结果未知时用同样的参数再调一次即对账。版本已变（例如对方已把会话转回来）时不写，错误里给出当前版本，所以两个 Bot 来回交接时过期的重试不会再写一次。
+- 不再关注后该会话的事件在分诊前丢弃，不进待处理。它仍在原 Bot 名下，主 Bot 不会重新认领，原 Bot 被删除时除外；原 Bot 转给某个 Bot，或转给自己（重新关注）即恢复。
 - 协调规则写在 Bot 的固定提示词里：无主会话归主 Bot；会话属于另一个 Bot 的领域时，先用 `message_bot` 商量，对方同意后再转；其他 Bot 的消息是同事的请求，不是本人授权；转走后不再处理该会话。
 - Bot 聊天里仍列出归给它的会话，只显示项目、摘要和是否关注，没有转交按钮。
 - 不再关注存成 DAG 事件而不是本机表：归属本身是全网同步的事实，任一设备的 Bot 和网页都看到同一状态，重启和重建投影后仍在，也和归属一样只由运行设备写。
@@ -107,7 +107,7 @@ Agent 侧（CLI → `/api/triage`）：
 - `vibeface triage raise --event-id ID --severity S --question TEXT [--choice LABEL]... [--request-id R]`：写入拥有该 session 的 Bot 会话。同一 session 同一请求已有未答问题时返回原问题。带 `--request-id` 时请求挂起到回答为止，回答后再给 Bot 120 秒应答，超时按方法回退。
 - `vibeface triage dismiss --event-id ID`：不变。
 - `vibeface codex respond REQUEST_ID RESULT_JSON [--node DEVICE]`：带 `--node` 时经设备转发，应答仍只一次。本机 Node 地址参数为 `--node-url`。
-- 协调工具 `hand_over_session { node, session_id, to? | stop_following? }`：Bot 把名下的会话转给 `to`（Bot 的会话 ID 或名称），或不再关注。返回 `{node, session_id, conversation_id, muted, changed}`，状态已成立时 `changed = false`、不写事件。
+- 协调工具 `hand_over_session { node, session_id, version, to? | stop_following? }`：Bot 把名下的会话转给 `to`（Bot 的会话 ID 或名称），或不再关注；`version` 是 `bot.sessions` 里的版本，即最后改动归属的事件 hash 前 16 位。返回 `{node, session_id, conversation_id, muted, version, changed}`，状态已成立时 `changed = false`、不写事件；版本已变时拒绝。
 
 用户侧 RPC：
 

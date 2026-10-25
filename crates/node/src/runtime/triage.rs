@@ -258,9 +258,9 @@ impl Runtime {
 
     /// Takes one event from a hook, a scan or the App Server. Test events are acknowledged and
     /// dropped; so is everything while no coordination Agent is configured to judge it, and
-    /// everything of a session its bot stopped following. A session no bot owns goes to the
-    /// primary bot first; without a bot its events drop. An event ID seen before is a
-    /// duplicate, whichever source sent it first.
+    /// everything of a session its bot stopped following. A session no bot owns, or whose bot
+    /// was deleted, goes to the primary bot first; without a bot its events drop. An event ID
+    /// seen before is a duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
         self.queue_event(AgentEvent {
             request_id: None,
@@ -782,13 +782,18 @@ impl Runtime {
         Ok(result)
     }
 
-    /// Asks in the chat of the bot that owns the event's session. An unanswered question
-    /// about the same session and request stands instead of a new one; a request it names waits
-    /// for the answer.
+    /// Asks in the chat of the bot that owns the event's session, the primary bot's when its
+    /// bot was deleted after the event came. An unanswered question about the same session and
+    /// request stands instead of a new one; a request it names waits for the answer.
     async fn raise(&self, network: &str, event: &AgentEvent, question: EventBody) -> Result<Value> {
         let (asked, hash, owner) = {
             let mut store = self.store.lock().await;
-            let owner = owner(&store, network, event)?.context("no bot owns this session")?;
+            let owner = match owner(&store, network, event)? {
+                Some(owner) => owner,
+                None => self
+                    .claim_session(&mut store, network, event)?
+                    .context("no bot owns this session")?,
+            };
             let (asked, written) =
                 store.ask(&self.identity, network, &owner, question, now_ms())?;
             (asked, written.map(|event| event.hash), owner)
@@ -893,15 +898,16 @@ impl Runtime {
         Ok(())
     }
 
-    /// `from`'s bot hands a session it follows to `target`, or stops following it when `None`.
-    /// The device running the session writes the change, so another device's session goes there
-    /// over peer RPC. Asking for what stands writes nothing.
+    /// `from`'s bot hands a session it follows to `target`, or stops following it when `None`,
+    /// at the version it read. The device running the session writes the change, so another
+    /// device's session goes there over peer RPC. Asking for what stands writes nothing.
     pub(super) async fn hand_over_session(
         &self,
         network: &str,
         from: &str,
         node: &str,
         session: &str,
+        seen: &str,
         target: Option<&str>,
     ) -> Result<Value> {
         if node != self.identity.device_id()? {
@@ -909,15 +915,16 @@ impl Runtime {
                 .peer_request(
                     network,
                     node,
-                    json!({"type":"hand_over_session","session_id":session,"from":from,"conversation_id":target}),
+                    json!({"type":"hand_over_session","session_id":session,"version":seen,"from":from,"conversation_id":target}),
                 )
                 .await;
         }
-        let (before, event) = self.store.lock().await.hand_over_session(
+        let (before, version, event) = self.store.lock().await.hand_over_session(
             &self.identity,
             network,
             from,
             session,
+            seen,
             target,
             now_ms(),
         )?;
@@ -940,7 +947,7 @@ impl Runtime {
         }
         Ok(
             json!({"node":node,"session_id":session,"conversation_id":owner,"muted":target.is_none(),
-            "changed":event.is_some()}),
+            "version":version,"changed":event.is_some()}),
         )
     }
 
@@ -1882,6 +1889,22 @@ mod tests {
             .session_owner(&network, &local, session)
     }
 
+    /// The version of a session as its bot's chat lists it.
+    async fn version_of(node: &Runtime, session: &str) -> Result<String> {
+        let network = node.network_id().await?;
+        let store = node.store.lock().await;
+        for scope in ["c", "d", "e"] {
+            if let Some(row) = store
+                .attributed_sessions(&network, scope)?
+                .into_iter()
+                .find(|row| row["session_id"] == session)
+            {
+                return Ok(row["version"].as_str().context("version")?.to_owned());
+            }
+        }
+        Ok(String::new())
+    }
+
     #[tokio::test]
     async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1945,9 +1968,13 @@ mod tests {
                 ..idle.clone()
             };
             let hand = |access: &Access, session: &str, how: Value| {
-                let mut args = json!({"node":local,"session_id":session});
-                args.as_object_mut().unwrap().extend(how.as_object().unwrap().clone());
-                node.tool(access.clone(), "hand_over_session", args)
+                let (node, local, access, session) = (&node, &local, access.clone(), session.to_owned());
+                async move {
+                    let seen = version_of(node, &session).await?;
+                    let mut args = json!({"node":local,"session_id":session,"version":seen});
+                    args.as_object_mut().unwrap().extend(how.as_object().unwrap().clone());
+                    node.tool(access, "hand_over_session", args).await
+                }
             };
             let turn_result = async {
                 assert!(
@@ -1994,6 +2021,91 @@ mod tests {
             .await;
             node.finish_manager_attempt(&attempt).await;
             turn_result
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    async fn delete_bot(node: &Runtime, admin: &LocalIdentity, scope: &str) -> Result<()> {
+        let network = node.network_id().await?;
+        let deleted = admin.attest(
+            &network,
+            scope,
+            EventBody::BotDeleted {
+                attestation: None,
+                cause: None,
+            },
+        )?;
+        let signed = deleted.attestation().cloned().context("signed")?;
+        node.store
+            .lock()
+            .await
+            .delete_bot(&node.identity, &network, scope, signed, now_ms())?
+            .context("deleted")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_bots_sessions_go_to_the_primary_bot() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            bot(&node, &admin, "e", "运维", &[]).await?;
+            let network = node.network_id().await?;
+            for session in ["s1", "s2", "s3"] {
+                node.ingest_agent_event(turn(session, "t1", "/w")).await?;
+            }
+            for (from, session, to) in [
+                ("c", "s1", Some("d")),
+                ("c", "s2", Some("d")),
+                ("d", "s2", None),
+                ("c", "s3", Some("e")),
+            ] {
+                let seen = version_of(&node, session).await?;
+                node.store.lock().await.hand_over_session(
+                    &node.identity,
+                    &network,
+                    from,
+                    session,
+                    &seen,
+                    to,
+                    now_ms(),
+                )?;
+            }
+            let queued = node.ingest_agent_event(turn("s1", "t2", "/w")).await?;
+            assert_eq!(queued["status"], "accepted");
+            delete_bot(&node, &admin, "d").await?;
+
+            assert_eq!(owner_of(&node, "s3").await?.as_deref(), Some("e"), "another bot's session stays");
+            assert_eq!(owner_of(&node, "s1").await?, None, "a deleted bot follows nothing");
+            let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+            assert_eq!(
+                node.triage_command(raise).await?["conversation_id"], "c",
+                "an event queued before the deletion asks in the primary bot's chat"
+            );
+            let spoke = node.ingest_agent_event(turn("s2", "t2", "/w")).await?;
+            assert_eq!(spoke["status"], "accepted", "a deleted bot's mute no longer holds");
+            for (session, step) in [("s1", "t3"), ("s3", "t2")] {
+                node.ingest_agent_event(turn(session, step, "/w")).await?;
+            }
+            assert_eq!(owner_of(&node, "s1").await?.as_deref(), Some("c"));
+            assert_eq!(owner_of(&node, "s2").await?.as_deref(), Some("c"));
+            assert_eq!(owner_of(&node, "s3").await?.as_deref(), Some("e"));
+            assert_eq!(attributions(&node, "c").await?, 5, "each session goes back to the primary bot once");
+
+            delete_bot(&node, &admin, "c").await?;
+            assert_eq!(node.store.lock().await.primary_bot(&network)?.as_deref(), Some("e"));
+            node.ingest_agent_event(turn("s1", "t4", "/w")).await?;
+            assert_eq!(
+                owner_of(&node, "s1").await?.as_deref(),
+                Some("e"),
+                "with the primary bot deleted, its sessions go to the earliest bot left"
+            );
+            assert_eq!(attributions(&node, "e").await?, 2);
+            Ok::<_, anyhow::Error>(())
         }
         .await;
         cleanup(node, dir).await?;
