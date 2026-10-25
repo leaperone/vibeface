@@ -258,9 +258,9 @@ impl Runtime {
 
     /// Takes one event from a hook, a scan or the App Server. Test events are acknowledged and
     /// dropped; so is everything while no coordination Agent is configured to judge it, and
-    /// everything of a session its bot stopped following. A session no bot owns goes to the
-    /// primary bot first; without a bot its events drop. An event ID seen before is a
-    /// duplicate, whichever source sent it first.
+    /// everything of a session its bot stopped following. A session no bot owns, or whose bot
+    /// was deleted, goes to the primary bot first; without a bot its events drop. An event ID
+    /// seen before is a duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
         self.queue_event(AgentEvent {
             request_id: None,
@@ -782,13 +782,18 @@ impl Runtime {
         Ok(result)
     }
 
-    /// Asks in the chat of the bot that owns the event's session. An unanswered question
-    /// about the same session and request stands instead of a new one; a request it names waits
-    /// for the answer.
+    /// Asks in the chat of the bot that owns the event's session, the primary bot's when its
+    /// bot was deleted after the event came. An unanswered question about the same session and
+    /// request stands instead of a new one; a request it names waits for the answer.
     async fn raise(&self, network: &str, event: &AgentEvent, question: EventBody) -> Result<Value> {
         let (asked, hash, owner) = {
             let mut store = self.store.lock().await;
-            let owner = owner(&store, network, event)?.context("no bot owns this session")?;
+            let owner = match owner(&store, network, event)? {
+                Some(owner) => owner,
+                None => self
+                    .claim_session(&mut store, network, event)?
+                    .context("no bot owns this session")?,
+            };
             let (asked, written) =
                 store.ask(&self.identity, network, &owner, question, now_ms())?;
             (asked, written.map(|event| event.hash), owner)

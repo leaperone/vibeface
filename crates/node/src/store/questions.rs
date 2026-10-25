@@ -1,6 +1,7 @@
 //! Questions live in the chat of the bot that owns their session. A question's one answer is
 //! the user message `a-<question_id>`; a question is unanswered while no such message exists.
-//! A session gets its owner from a work bound to it or from the device running it.
+//! A session gets its owner from a work bound to it or from the device running it. A deleted
+//! bot owns nothing: its sessions, muted or not, are unowned again.
 use super::{
     Store, authorize_node_from,
     bots::bot_for_conversation_from,
@@ -98,6 +99,10 @@ pub(super) fn question_from(
     .pop())
 }
 
+/// The `session_owners` row of `(?1, ?2, ?3)` while its bot is not deleted.
+const OWNED: &str = "FROM session_owners s WHERE s.network_id=?1 AND s.node=?2 AND s.session_id=?3
+    AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=s.network_id AND d.conversation_id=s.conversation_id)";
+
 pub(crate) fn session_owner_from(
     connection: &Connection,
     network: &str,
@@ -106,7 +111,7 @@ pub(crate) fn session_owner_from(
 ) -> Result<Option<ScopeId>> {
     Ok(connection
         .query_row(
-            "SELECT conversation_id FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+            &format!("SELECT conversation_id {OWNED}"),
             params![network, node, session],
             |r| r.get(0),
         )
@@ -176,7 +181,7 @@ impl Store {
         Ok(self
             .connection
             .query_row(
-                "SELECT muted FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+                &format!("SELECT muted {OWNED}"),
                 params![network, node, session],
                 |r| r.get(0),
             )
@@ -233,8 +238,8 @@ impl Store {
     }
 
     /// Gives a session this device runs and no bot owns to `conversation`. Writes nothing
-    /// once the session has an owner or was muted, so a repeated event or a restart does not
-    /// attribute it again.
+    /// once a bot owns the session or muted it, so a repeated event or a restart does not
+    /// attribute it again; once that bot is deleted, the next call gives it away again.
     pub fn claim_session(
         &mut self,
         identity: &LocalIdentity,
@@ -292,7 +297,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (owner, attribution, muted): (String, Option<String>, bool) = tx
             .query_row(
-                "SELECT conversation_id,attribution,muted FROM session_owners WHERE network_id=? AND node=? AND session_id=?",
+                &format!("SELECT conversation_id,attribution,muted {OWNED}"),
                 params![network, node, session],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )

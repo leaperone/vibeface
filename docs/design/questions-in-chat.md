@@ -22,10 +22,10 @@ Codex 线程或 Claude Code 会话（统称 session）属于某个 Bot，只有�
 外来会话：
 
 - 只看用户在用的会话。Codex rollout 首行 `session_meta` 的 `source` 为 `exec`/`mcp`、`source` 是子代理对象或 `originator` 以 `_exec` 结尾时跳过；App Server 的 `thread/started` 按同样规则记下后台线程；hook 进程按 rollout 首行（Codex）或 `CLAUDE_CODE_ENTRYPOINT=sdk-*`（Claude）在发出前跳过。普通 Stop 事件照常进分诊。
-- 第一个事件到来时，运行它的 Node 直接把它归给主 Bot，写一次 `SessionAttributed`，不提问。归属已存在（含不再关注）就不再写，所以重复事件、重启和同步都不会再写；之后按普通归属路由，App Server 请求交给该 Bot 处理。没有 Bot 时事件丢弃，请求立即按方法兜底。
+- 第一个事件到来时，运行它的 Node 直接把它归给主 Bot，写一次 `SessionAttributed`，不提问。归属已存在（含不再关注）就不再写，所以重复事件、重启和同步都不会再写；所属 Bot 被删除后，它名下的会话（含不再关注的）读取时视为无主，下一个事件到来时同样归给当时的主 Bot、只写一次，不在删除时批量改写；之后按普通归属路由，App Server 请求交给该 Bot 处理。没有 Bot 时事件丢弃，请求立即按方法兜底。
 - 协调 Agent 自己的线程登记在 `coordination_threads`，永不清理，不会被归属。
 - 交接由 Bot 自己判断，网页和手机都不做手动路由。Bot 每轮的 `bot.sessions` 列出它名下的会话（设备、会话 ID、项目、摘要、是否还在关注），按最新优先截在 3000 字节内，省略条数记在 `sessions_omitted`。它用工具 `hand_over_session` 转给另一个 Bot（写新的 `SessionAttributed`），或不再关注（写 `SessionMuted`）。只有会话当前所属的 Bot 能操作；运行该会话的设备在同一事务里核对归属再写，不在本机时经节点间 RPC `hand_over_session` 转过去。请求的状态已成立时不写，所以重试只读回；结果未知时用同样的参数再调一次即对账。
-- 不再关注后该会话的事件在分诊前丢弃，不进待处理。它仍在原 Bot 名下，主 Bot 不会重新认领；原 Bot 转给某个 Bot，或转给自己（重新关注）即恢复。
+- 不再关注后该会话的事件在分诊前丢弃，不进待处理。它仍在原 Bot 名下，主 Bot 不会重新认领，原 Bot 被删除时除外；原 Bot 转给某个 Bot，或转给自己（重新关注）即恢复。
 - 协调规则写在 Bot 的固定提示词里：无主会话归主 Bot；会话属于另一个 Bot 的领域时，先用 `message_bot` 商量，对方同意后再转；其他 Bot 的消息是同事的请求，不是本人授权；转走后不再处理该会话。
 - Bot 聊天里仍列出归给它的会话，只显示项目、摘要和是否关注，没有转交按钮。
 - 不再关注存成 DAG 事件而不是本机表：归属本身是全网同步的事实，任一设备的 Bot 和网页都看到同一状态，重启和重建投影后仍在，也和归属一样只由运行设备写。
