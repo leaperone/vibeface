@@ -490,7 +490,7 @@ async fn serve_session(
                             } else {
                                 dispatch(&node, &mut session, &request.method, request.params).await
                             };
-                            let response = match result { Ok(result) => Response { id: request.id, result, error: None }, Err(error) => Response { id: request.id, result: Value::Null, error: Some(error.to_string()) } };
+                            let response = match result { Ok(result) => Response { id: request.id, result, error: None }, Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())) } };
                             send_value(&mut socket, &mut channel, &response).await?;
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }
@@ -591,29 +591,31 @@ async fn dispatch(
     match method {
         "info" => {
             let device_id = node.identity.device_id()?;
-            // A joining browser confirms the device by the name its owner gave it, not the host name.
-            let (network_id, name) = match node.has_membership().await? {
-                true => {
-                    let state = node.membership_state().await?;
-                    let name = state
-                        .project()?
-                        .members
-                        .into_iter()
-                        .find(|m| m.device_id == device_id)
-                        .map(|m| m.name);
-                    (Some(state.genesis.network_id), name)
+            let initialized = node.has_membership().await?;
+            let mut info = json!({"initialized":initialized,"network_id":null,"device_id":device_id,
+                "name":crate::config::UNNAMED_NODE,"public_entry":node.config.public_entry,
+                "version":env!("CARGO_PKG_VERSION")});
+            if initialized && principal(node, session).await.is_ok() {
+                let state = node.membership_state().await?;
+                if let Some(member) = state
+                    .project()?
+                    .members
+                    .iter()
+                    .find(|m| m.device_id == device_id)
+                {
+                    info["name"] = json!(member.name);
                 }
-                false => (None, None),
-            };
-            Ok(
-                json!({"initialized":network_id.is_some(),"network_id":network_id,"device_id":device_id,"name":name.unwrap_or_else(crate::config::hostname),"public_entry":node.config.public_entry,"version":env!("CARGO_PKG_VERSION"),"connection_entry":connection_entry(node).await?}),
-            )
+                info["network_id"] = json!(state.genesis.network_id);
+                info["connection_entry"] = connection_entry(node).await?;
+            }
+            Ok(info)
         }
         "authenticate" => {
             let authenticated = authentication(node, session).await?;
             if let Some(network) = params
                 .get("network_id")
                 .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+                && authenticated.get("network_id").is_some()
                 && authenticated["network_id"] != *network
             {
                 bail!("client requested another personal network");
@@ -843,6 +845,7 @@ async fn dispatch(
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
                 let state = node.membership_state().await?;
+                state.project()?.member(&session.device_id)?;
                 result["addresses"] = json!(node.store.lock().await.address_book()?);
                 result["state"] = serde_json::to_value(state)?;
             }
@@ -1255,7 +1258,7 @@ async fn authentication(node: &Runtime, session: &Session) -> Result<Value> {
             )
         }
         Err(_) => Ok(
-            json!({"principal":null,"initialized":true,"network_id":view.network_id,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
+            json!({"principal":null,"initialized":true,"revoked":view.cutoff(&session.device_id).is_some(),"recovery":recovery_status(&state, &view, &session.device_id)?,"now_ms":now}),
         ),
     }
 }
@@ -1788,6 +1791,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = true;
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -1873,6 +1877,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = true;
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2036,7 +2041,7 @@ mod tests {
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
         assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
         assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
-        assert_eq!(node.info()["manager_available"], true);
+        assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
                 Access {
@@ -2131,6 +2136,7 @@ mod tests {
         crate::logging::capture(&logs)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.providers.execution = true;
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2318,7 +2324,7 @@ mod tests {
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
-        assert!(node.providers().codex_target() == crate::providers::CodexTarget::Off);
+        assert!(node.providers().codex_target(false) == crate::providers::CodexTarget::Off);
         assert!(
             off["providers"][0]["env"]
                 .as_array()
@@ -2856,7 +2862,11 @@ mod tests {
             };
             let (root, admin) = (LocalIdentity::generate(), LocalIdentity::generate());
             let mut manager = connect(admin.clone()).await?;
-            assert_eq!(manager.call("info", json!({})).await?["initialized"], false);
+            let public_info = manager.call("info", json!({})).await?;
+            assert_eq!(public_info["initialized"], false);
+            assert_eq!(public_info["name"], "Node");
+            assert!(public_info["network_id"].is_null());
+            assert!(public_info.get("connection_entry").is_none());
             assert!(manager.call("directory", json!({})).await.is_err());
             let genesis = Genesis::create(&root, Member::client(&admin, "admin", true)?, Member::node(&node.identity, "node")?)?;
             let recover = json!({"genesis":genesis,"capability":capability.capability});
@@ -2888,7 +2898,13 @@ mod tests {
             let phone = LocalIdentity::generate();
             let join_id = manager.call("invite", invite([1; 32])?).await?["join_id"].clone();
             let mut joiner = connect(phone.clone()).await?;
-            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"], Value::Null);
+            let guest_auth = joiner.call("authenticate", json!({"network_id":network})).await?;
+            assert_eq!(guest_auth["principal"], Value::Null);
+            assert!(guest_auth.get("network_id").is_none());
+            let public_info = joiner.call("info", json!({})).await?;
+            assert_eq!(public_info["name"], "Node");
+            assert!(public_info["network_id"].is_null());
+            assert!(public_info.get("connection_entry").is_none());
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert!(joiner.call("join", join(&LocalIdentity::generate(), [1; 32], &"aa".repeat(32))?).await.is_err(), "join key must be the channel key");
             let nonce = "11".repeat(32);
@@ -2910,6 +2926,10 @@ mod tests {
             let joined = joiner.call("join_status", json!({"join_id":join_id})).await?;
             assert_eq!(joined["state"]["genesis"]["network_id"], network);
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            let member_info = joiner.call("info", json!({})).await?;
+            assert_eq!(member_info["name"], "node");
+            assert_eq!(member_info["network_id"], network);
+            assert!(member_info.get("connection_entry").is_some());
 
             let (liar, nonce) = (LocalIdentity::generate(), "33".repeat(32));
             let liar_id = manager.call("invite", invite([2; 32])?).await?["join_id"].clone();
@@ -2933,6 +2953,11 @@ mod tests {
             manager.call("revoke", json!({"event":revoke})).await?;
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
+            assert!(joiner.call("join_status", json!({"join_id":join_id})).await.is_err());
+            let revoked_info = joiner.call("info", json!({})).await?;
+            assert_eq!(revoked_info["name"], "Node");
+            assert!(revoked_info["network_id"].is_null());
+            assert!(revoked_info.get("connection_entry").is_none());
             assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
 
             let replacement = LocalIdentity::generate();

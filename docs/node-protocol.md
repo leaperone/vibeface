@@ -32,8 +32,8 @@
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
-| `providers.execution` | 默认 `true`，本机 Codex App Server 执行派发的工作；`false` 时不连接 App Server，也不向其他设备提供执行能力 |
-| `providers.codex_app_server` | `{mode, socket}`：`system`（默认）连接本机已运行的 App Server，`socket` 为 `null` 时自动查找；`spawn` 时 Node 自行托管 |
+| `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不连接 App Server，也不向其他设备提供执行能力 |
+| `providers.codex_app_server` | `{mode, socket}`：`system` 要求明确 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境明确设置 `CODEX_HOME` |
 | `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
@@ -47,7 +47,7 @@
 | `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
 | `relay_paths_only` | `--relay-paths-only` | 不绑定直连 socket，只经 relay 连接 |
 | `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 iroh relay 的地址，明文 HTTP，公网经反向代理提供 HTTPS |
-| `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，默认 `http://<relay_listen>`；监听全部网卡时必填 |
+| `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
 
 配置了 `network.bind` 或 `relay_paths_only` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。

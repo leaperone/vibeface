@@ -26,7 +26,7 @@ enum Action {
         channel: Channel,
         #[arg(long, action = clap::ArgAction::Set)]
         automatic: bool,
-        #[arg(long, default_value_os_t = default_install_root())]
+        #[arg(long)]
         install_root: PathBuf,
         #[command(flatten)]
         data: Data,
@@ -47,7 +47,7 @@ enum Action {
 
 #[derive(Args)]
 struct Data {
-    #[arg(long, default_value_os_t = config::default_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR")]
     data_dir: PathBuf,
 }
 
@@ -57,16 +57,6 @@ struct Policy {
     channel: Channel,
     automatic: bool,
     install_root: PathBuf,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            channel: Channel::Stable,
-            automatic: false,
-            install_root: default_install_root(),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -94,20 +84,11 @@ struct Journal {
     backup: PathBuf,
 }
 
-fn default_install_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/vibeface")
-}
-
 fn policy(data: &Path) -> Result<Policy> {
     let path = data.join("update.json");
-    if path.exists() {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
-    } else {
-        Ok(Policy::default())
-    }
+    Ok(serde_json::from_slice(&fs::read(path).context(
+        "configure updates with an explicit --install-root before using the updater",
+    )?)?)
 }
 
 /// Resolve the same managed installation used by this node's update policy.
@@ -938,7 +919,8 @@ mod tests {
             &data.join("update.json"),
             &Policy {
                 install_root: root.clone(),
-                ..Policy::default()
+                channel: Channel::Stable,
+                automatic: false,
             },
         )
         .unwrap();
@@ -1097,7 +1079,8 @@ mod tests {
         (
             Policy {
                 install_root: root,
-                ..Policy::default()
+                channel: Channel::Stable,
+                automatic: false,
             },
             data,
             journal,

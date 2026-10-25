@@ -79,7 +79,7 @@ test("questions and hand-offs sit where they happened in the chat", () => {
 })
 
 test("questions go to the web, or to the web and Grok; nothing else", () => {
-  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: true, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 } })
+  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: false, codex_sessions: null, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 } })
   assert.equal(parseTriageSettings(settings("both")).default_outlet, "both")
   assert.equal(parseTriageSettings(settings("record")).default_outlet, "record")
   for (const old of ["webhook", "off"]) assert.throws(() => parseTriageSettings(settings(old)), /无法识别/)

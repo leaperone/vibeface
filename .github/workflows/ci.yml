@@ -113,6 +113,8 @@ jobs:
             crates/node/web/generated/vibeface_secure.js
             crates/node/web/generated/vibeface_secure_bg.wasm
             crates/node/web/generated/*.d.ts
+            crates/node/web/generated/.vibeface-build.json
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
 

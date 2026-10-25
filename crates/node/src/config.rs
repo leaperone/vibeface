@@ -14,9 +14,6 @@ pub const DATA_EPOCH_SCHEMA_SHA256: &str =
     "ecb4dc0c26094fa76ae457870c9d4603e5e0825438d847e54ab533035701f24a";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
-/// The name a removed Node had, which its fresh data directory offers when it joins again.
-pub const FORMER_NAME_FILE: &str = "former-name";
-
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }
@@ -24,44 +21,7 @@ pub fn data_epoch_marker() -> Vec<u8> {
 pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
-/// This machine's name, the default device name shown when creating or joining a network.
-/// On macOS it is the name set in System Settings, which people recognize better than the host name.
-pub fn hostname() -> String {
-    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| computer_name().unwrap_or_else(host_name))
-        .clone()
-}
-
-#[cfg(target_os = "macos")]
-fn computer_name() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/scutil")
-        .args(["--get", "ComputerName"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    let name = String::from_utf8(output.stdout).ok()?;
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.chars().take(128).collect())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn computer_name() -> Option<String> {
-    None
-}
-
-fn host_name() -> String {
-    let mut buffer = [0u8; 256];
-    // SAFETY: the buffer is writable for its full length and gethostname NUL-terminates within it.
-    let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
-    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-    let name = String::from_utf8_lossy(&buffer[..end]);
-    let name = name.trim().trim_end_matches(".local");
-    if ok && !name.is_empty() {
-        name.chars().take(128).collect()
-    } else {
-        "Node".into()
-    }
-}
+pub const UNNAMED_NODE: &str = "Node";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,8 +78,32 @@ impl Config {
     }
     pub fn load(dir: &Path) -> Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        config.register_private_paths(dir);
         config.validate()?;
         Ok(config)
+    }
+    fn register_private_paths(&self, dir: &Path) {
+        for path in std::iter::once(dir)
+            .chain(self.roots.iter().map(PathBuf::as_path))
+            .chain(std::iter::once(self.codex_bin.as_path()))
+            .chain(
+                self.providers
+                    .codex_app_server
+                    .socket
+                    .iter()
+                    .map(PathBuf::as_path),
+            )
+            .chain(self.triage.codex_sessions.iter().map(PathBuf::as_path))
+        {
+            crate::logging::add_private_path(path);
+        }
+        if let Some(manager) = &self.manager {
+            crate::logging::add_private_path(&manager.workspace);
+            crate::logging::add_private_path(&manager.cursor_sdk_bin);
+        }
+        for project in &self.triage.projects {
+            crate::logging::add_private_path(Path::new(&project.prefix));
+        }
     }
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
@@ -162,7 +146,11 @@ impl Config {
             );
         }
         self.triage.validate()?;
-        self.providers.validate()?;
+        self.providers.validate(
+            self.manager
+                .as_ref()
+                .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk),
+        )?;
         ensure!(
             !self.codex_bin.as_os_str().is_empty(),
             "the Codex program path must not be empty"
@@ -217,6 +205,7 @@ impl Config {
         Ok(origins)
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
+        self.register_private_paths(dir);
         self.validate()?;
         private_write(&dir.join("config.json"), &serde_json::to_vec_pretty(self)?)
     }
@@ -235,12 +224,6 @@ pub fn http_origin(value: &str) -> Result<reqwest::Url> {
         "URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
     );
     Ok(url)
-}
-pub fn default_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".vibeface")
 }
 pub fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;

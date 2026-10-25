@@ -1,5 +1,7 @@
 # 安装与管理节点
 
+本文的命令使用[部署配置](deployment.md)中显式设置的 `VIBEFACE_DATA_DIR`、`VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`。先设置所需变量，再执行对应步骤。
+
 Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
 ## npm Nightly
@@ -37,13 +39,13 @@ vibeface status
 首次安装最新正式版，默认渠道是 Stable：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
 当前尚无 Stable Release，使用上述命令会明确失败。要安装开发预览版，请显式选择 Nightly：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly
+curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh | bash -s -- --channel nightly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
 安装器依赖系统 Bash、curl、tar、gzip 和 SHA256 工具，不需要 Python、jq、Rust 或 Node.js。它按数值版本选择已公开的渠道版本，不选择 rc，也不会因最新包缺少当前平台而退回旧版。网络或 GitHub API 限流失败会保留错误。
@@ -53,20 +55,20 @@ curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/leaperone/vibeface/main/install.sh -o install.sh
 bash install.sh --help
-bash install.sh --channel nightly
+bash install.sh --channel nightly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-dir "$VIBEFACE_BIN_DIR"
 ```
 
 安装器下载完整包和准确同名的 checksum，经 SHA256、包路径、版本、target、tag 源码提交、协议及 data epoch 检查后，建立：
 
 ```text
-~/.local/share/vibeface/releases/<version>/
-~/.local/share/vibeface/current -> releases/<version>
-~/.local/bin/vibeface -> ~/.local/share/vibeface/current/vibeface
+<安装根目录>/releases/<version>/
+<安装根目录>/current -> releases/<version>
+<命令目录>/vibeface -> <安装根目录>/current/vibeface
 ```
 
-它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后按提示把 `~/.local/bin` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
+它不创建节点数据、不创建个人网络、不启动后台服务、不安装 Provider，也不开启自动更新。安装后把明确指定的 `--bin-dir` 加入 PATH，或直接使用该目录下的 CLI。SHA256 与包同由 GitHub 提供，不能替代独立发布签名。
 
-已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。包协议 2 的受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。包协议 1 的旧预览版需要 [一次性手动更换程序](releasing.md#手动建立受管安装或更换程序)，不支持自动跨命名更新。不要只复制 binary；更新和服务管理需要完整包。
+已有 `current` 或同名 bin 文件时，安装器保留原文件并拒绝安装。受管安装通过 `update apply` 升级，不能绕过正在运行节点的维护检查。更新和服务管理需要完整包。
 
 自定义位置需使用绝对路径，并保持安装根目录和 bin 目录为普通目录：
 
@@ -84,11 +86,11 @@ vibeface --help
 vibeface
 ```
 
-直接运行默认使用 `~/.vibeface`。首次仅在不存在或为空的真实目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
+先按[部署配置](deployment.md)设置 `VIBEFACE_DATA_DIR`。首次仅在指定的空目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
 保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
 
-另一台节点加入已有个人网络时，先在它上面执行 `vibeface init`，不要在它的本机网页上建网。然后在管理设备的**添加设备**里生成加入链接，在新节点上执行 `vibeface join <链接>`，终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
+另一台节点加入已有个人网络时，先在它上面执行 `vibeface init`，不要在它的本机网页上建网。然后在管理设备的**添加设备**里生成加入链接，在新节点上执行 `vibeface join <链接> --name <设备显示名称>`，终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
 
 使用签名管理身份或可信本机会话进入工作区后，在**设置**中选择管理 Agent、模型和允许 Agent 访问的项目目录。默认 Agent 工作目录在首次保存时自动创建，无需编辑配置文件或重启 Node。编码执行和管理 Agent 仍需事先安装并登录对应 Provider，角色授权也必须满足要求。见 [配置管理 Agent](node.md#配置管理-agent)。
 
@@ -115,7 +117,7 @@ vibeface init --relay https://relay.example                                     
 要让手机从外网打开网页而公网机器不保存你的数据，在公网机器上运行公共入口，个人设备上的 Node 指向它：
 
 ```sh
-vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340   # 公网机器
+vibeface init --public-entry --public-url https://vb.example.com --relay-listen 127.0.0.1:3340 --relay-url https://vb.example.com   # 公网机器
 vibeface init --entry https://vb.example.com --relay-token-file /path/to/entry-token             # 个人设备上的 Node
 ```
 

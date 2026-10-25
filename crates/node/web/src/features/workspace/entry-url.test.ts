@@ -882,6 +882,9 @@ test("device id boundaries require the device_id field", () => {
     assert.equal(Object.hasOwn(entry, "relay"), false)
   }
   assert.equal(parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, device_id: id }).device_id, id)
+  const guest = parsers.parseInfo({ name: "Node", version: "1", initialized: true, network_id: null, device_id: id })
+  assert.equal(guest.network_id, null)
+  assert.equal(guest.connection_entry, undefined)
   assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, device_id: id }] })[0].device_id, id)
   assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备地址无效/)
   assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备地址无效/)

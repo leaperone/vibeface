@@ -8,6 +8,7 @@ import { defineConfig } from 'vite'
 const cryptoModule = fileURLToPath(new URL('./generated/vibeface_secure.js', import.meta.url))
 
 const config = defineConfig({
+  envDir: false,
   resolve: { tsconfigPaths: true },
   plugins: [
     {

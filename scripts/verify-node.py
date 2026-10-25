@@ -548,6 +548,12 @@ class Node:
         configuration.update(values)
         if app_server is not None:
             configuration["providers"]["codex_app_server"] = app_server
+            configuration["providers"]["execution"] = True
+            if app_server["mode"] == "spawn":
+                env_path = self.directory / "provider-env.json"
+                providers = json.loads(env_path.read_text()) if env_path.exists() else {"codex": {}, "cursor": {}}
+                providers["codex"]["CODEX_HOME"] = str(self.directory / "home/.codex")
+                private_json(env_path, providers)
         private_json(path, configuration)
 
     def configure_network(self, **values):
@@ -1984,7 +1990,7 @@ def triage_checks(run, workspace, a, network, passed):
         raise_dir = workspace / "triage-raise"
         raise_dir.mkdir()
         settings = a.client.call("configure_triage", {"default_outlet": "both", "webhook_url": receiver.url,
-                                 "scan_codex_sessions": True, "webhook_secret": secret})
+                                 "scan_codex_sessions": True, "codex_sessions": str(a.directory / "home/.codex/sessions"), "webhook_secret": secret})
         require(settings["webhook_secret_set"] and secret not in json.dumps(settings)
                 and secret not in (a.directory / "config.json").read_text(), "the webhook secret is write-only and stays out of config")
         tested = a.client.call("test_webhook")
