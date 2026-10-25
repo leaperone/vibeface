@@ -69,8 +69,6 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
     <InlineError error={action.error} />
     <Details>
       <DetailRow label="设备编号" value={request.device_id} mono />
-      <DetailRow label="邀请编号" value={request.invite_id} mono />
-      <DetailRow label="个人网络" value={request.network_id} mono />
     </Details>
   </ActionCard>
 }

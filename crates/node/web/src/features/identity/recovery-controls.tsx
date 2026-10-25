@@ -57,13 +57,15 @@ function useRecoveryCode(key: string | undefined) {
   return key && code?.key === key ? code.value : null
 }
 
-/** The file that still works: the code in its name and the day it was made. */
+/** The file that still works: its name as it was saved, so the code reads as part of a file name, and the day it was made. */
 export function CurrentRecoveryFile() {
   const { directory, recoverySince } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   if (!code) return null
-  return <SettingsRow icon={FileKey} label="恢复文件" description={recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</time> : undefined}>
-    <code title={recoveryFileStem(code)} className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-meta text-foreground"><span className="sr-only">{recoveryFileStem("")}</span>{code}</code>
+  return <SettingsRow icon={FileKey} label="恢复文件" description={<span title={recoveryFileStem(code)} className="flex min-w-0 font-mono whitespace-nowrap">
+    <span className="truncate">{recoveryFileStem('')}</span><span className="font-medium tracking-wide text-foreground">{code}</span>
+  </span>}>
+    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN')}</time> : null}
   </SettingsRow>
 }
 

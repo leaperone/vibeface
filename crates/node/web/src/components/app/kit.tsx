@@ -130,10 +130,11 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
 }
 
 /** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
-export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className }: {
-  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string
+/** `stacked`: on a phone the control gets its own full line under the label, lined up with it. */
+export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false }: {
+  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean
 }) {
-  const end = children ? <span className="ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground">{children}</span> : null
+  const end = children ? <span className={cn("ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground", stacked && "max-sm:basis-full max-sm:ps-11")}>{children}</span> : null
   if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
     <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
@@ -158,10 +159,11 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
  * On a phone, options with icons show only the icon; pair it with `SegmentedValue` so the choice still reads in words.
  * `labels` keeps the words on a phone too, for options an icon alone can't explain.
  */
-export function Segmented<T extends string>({ label, value, options, onChange, disabled, labels = false }: {
+export function Segmented<T extends string>({ label, value, options, onChange, disabled, labels = false, fill = false }: {
   label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean; labels?: boolean
+  /** On a phone, spread the options evenly across the full width. */ fill?: boolean
 }) {
-  return <div role="radiogroup" aria-label={label} className="inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5">
+  return <div role="radiogroup" aria-label={label} className={cn("inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
     {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined} disabled={disabled}
       onClick={() => { if (option !== value) onChange(option) }}
       className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 disabled:opacity-50 max-md:h-11 max-md:px-3",
