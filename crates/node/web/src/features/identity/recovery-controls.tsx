@@ -96,7 +96,8 @@ export function RecoveryPendingCard() {
   ]
   return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms - device.nodeClockOffset)} 小时后生效`} actions={<>
     <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我</Button>
-    <Button type="button" variant="destructive" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
+    {/* Solid here, unlike the soft global destructive: the time-limited step must outrank every other button on the page. */}
+    <Button type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
       await device.vetoRecovery(pending.checkpoint)
       if (device.ready) setRotateHint(device.ready.principal.network_id, true)
       toast('已拦下', { tone: 'success' })
