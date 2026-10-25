@@ -62,8 +62,8 @@ export function TriageSettings() {
   const { pending, delivered, dead } = settings.outbox
 
   return <>
-    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时">
-      <Segmented label="会话等你时" labels value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
+    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时" stacked>
+      <Segmented label="会话等你时" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
 
     <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>
