@@ -219,7 +219,7 @@ export function ConversationScreen() {
         </div> : null}
       />
       <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-10 max-md:ps-3"
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
           <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
@@ -320,14 +320,14 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
           <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
         </span>
       </span>
-      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
+      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50 max-md:size-11 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
         <ArrowRightLeft aria-hidden="true" className="size-4" />
         <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
           <option value="" disabled>转给…</option>
           {others.map((bot) => <option key={bot.conversation_id} value={bot.conversation_id}>{bot.name}</option>)}
         </select>
       </label> : null}
-      <Button type="button" variant="ghost" size="icon" className="size-9 text-muted-foreground max-md:size-10" aria-label={follow} title={follow} disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>
+      <Button type="button" variant="ghost" size="icon" className="size-9 text-muted-foreground max-md:size-11" aria-label={follow} title={follow} disabled={disabled} aria-busy={busy} onClick={() => void handTo(session.muted ? workspace.conversationId : null)}>
         {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : session.muted ? <Bell aria-hidden="true" /> : <BellOff aria-hidden="true" />}
       </Button>
     </div>

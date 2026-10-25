@@ -76,7 +76,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
           </MessageScrollerContent>
         </MessageScrollerViewport>
         {/* Sits at the composer's end, level with the waiting pill at its start, so the two never crowd each other. */}
-        <MessageScrollerButton aria-label="回到最新消息" title="回到最新" className="size-8 inset-s-auto translate-x-0 rounded-full shadow-sm rtl:translate-x-0 data-[direction=end]:bottom-0 inset-e-[max(1rem,calc(50%-23rem))] max-md:size-10 sm:inset-e-[max(1.5rem,calc(50%-22.5rem))] lg:inset-e-[max(2rem,calc(50%-22rem))]" />
+        <MessageScrollerButton aria-label="回到最新消息" title="回到最新" className="size-8 inset-s-auto translate-x-0 rounded-full shadow-sm rtl:translate-x-0 data-[direction=end]:bottom-0 inset-e-[max(1rem,calc(50%-23rem))] max-md:size-11 sm:inset-e-[max(1.5rem,calc(50%-22.5rem))] lg:inset-e-[max(2rem,calc(50%-22rem))]" />
       </MessageScroller>
     </MessageScrollerProvider>
   )
