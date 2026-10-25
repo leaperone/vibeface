@@ -1,9 +1,10 @@
 import { useSyncExternalStore } from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
-import { Smartphone, X } from "lucide-react"
+import { Monitor, Smartphone, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"
@@ -18,11 +19,14 @@ const subscribe = (listener: () => void) => {
 
 /** While a new network holds only this computer and this browser, a quiet way into 添加设备. */
 export function SecondDeviceHint({ className }: { className?: string }) {
-  const { ready, directory } = useDevice()
+  const { ready, directory, entrances } = useDevice()
   const rows = useDeviceRows()
   const onDevices = useRouterState({ select: (state) => state.location.pathname.startsWith("/devices") })
   const dismissed = useSyncExternalStore(subscribe, dismissedBefore, () => false)
   if (dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
+  // A loopback-only link opens on no phone; another computer still joins it with `vibeface join`.
+  const localOnly = isLoopback(ready.entry.address) && !entrances.some((entrance) => entrance.public)
+  const Icon = localOnly ? Monitor : Smartphone
   function dismiss() {
     closed = true
     try { localStorage.setItem(key, "dismissed") } catch {}
@@ -30,7 +34,7 @@ export function SecondDeviceHint({ className }: { className?: string }) {
   }
   return <div className={cn("flex min-w-0 items-center rounded-lg text-meta text-muted-foreground hover:bg-muted/50", className)}>
     <Link to="/devices" search={{ add: true }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 hover:text-foreground max-md:min-h-11">
-      <Smartphone aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">在手机或其他电脑上使用</span>
+      <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{localOnly ? "在另一台电脑上使用" : "在手机或其他电脑上使用"}</span>
     </Link>
     <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 hover:bg-transparent max-md:size-11" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
   </div>
