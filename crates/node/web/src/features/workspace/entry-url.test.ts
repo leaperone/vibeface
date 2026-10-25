@@ -738,7 +738,7 @@ test("a long message of the user's folds behind an icon button; a short one does
 })
 
 test("a toast's action is a 44px touch target on phones and stays compact on desktop", () => {
-  const app = componentHarness('../../components/app/kit.tsx', { cn: { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
   app.render('Toaster')
   const kit = app.module
   ;(kit.toast as (text: string, options: object) => void)('已发出', { persist: true, action: { label: '查看', onClick() {} } })

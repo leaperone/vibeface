@@ -1,5 +1,6 @@
-import { CircleQuestionMark, Copy, KeyRound, Lock, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
+import { Copy, KeyRound, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useOpenJoins } from "@/features/devices/join"
+import { terms } from "@/lib/glossary"
 import { useRotateHint } from "@/lib/rotate-hint"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
@@ -29,7 +30,7 @@ export function useInbox(): InboxItem[] {
   const rotate = useRotateHint(device.ready?.principal.can_manage ? device.ready.principal.network_id : undefined)
   if (device.pendingRecovery) items.push({ key: "recovery", icon: ShieldAlert, title: "有人正在用恢复文件找回", to: "/inbox", kind: "recovery" })
   if (rotate) items.push({ key: "rotate", icon: KeyRound, title: "换个恢复密码", to: "/inbox", kind: "rotate" })
-  if (write.state === "read_only") items.push({ key: "write:read_only", icon: Lock, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
+  if (write.state === "read_only") items.push({ key: "write:read_only", icon: terms.readOnly.icon, title: "这台设备暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台设备的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
   for (const question of openQuestions(workspace.questions)) items.push({
@@ -37,8 +38,8 @@ export function useInbox(): InboxItem[] {
     to: question.bot ? `/b/${question.bot.bot_id}` : "/inbox", kind: "question", question, done: question.question_id in workspace.answered,
   })
   const checks = [...workChecks(workspace.openWorks, workspace.nodes), ...(data?.checks ?? []).map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail }))]
-  for (const check of checks) items.push({ key: check.check_id, icon: CircleQuestionMark, title: "待确认", to: "/inbox", kind: "confirm", check })
-  if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: CircleQuestionMark, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
+  for (const check of checks) items.push({ key: check.check_id, icon: terms.confirm.icon, title: terms.confirm.label, to: "/inbox", kind: "confirm", check })
+  if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", icon: terms.undelivered.icon, title: "消息可能没送达", meta: bot?.name, to: chat, kind: "confirm" })
   for (const join of joins) items.push({ key: `join:${join.join_id}`, icon: MonitorSmartphone, title: `${join.name || "新设备"} 想加入`, to: "/devices", kind: "join", join })
   for (const note of workspace.notifications) {
     if (note.kind !== "manager_attention") continue

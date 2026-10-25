@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Check, Copy, Globe, Info, Server, Wifi, WifiOff, X } from 'lucide-react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { Details, InlineError, SettingsDisclosure, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'

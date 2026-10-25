@@ -2,10 +2,10 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, RotateCw, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { BotAvatar, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
@@ -40,7 +40,7 @@ const CreateBot = createContext<() => void>(() => {})
 export const useCreateBot = () => useContext(CreateBot)
 
 const JOINS_SEEN = "vibeface.joins-seen"
-const titles: Record<string, string> = { "/": "消息", "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
+const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志" }
 
 function WorkspaceLayout({ children }: { children: ReactNode }) {
   const workspace = useWorkspace()
@@ -55,7 +55,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
-  const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? "我的设备" : "")
+  const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
@@ -83,7 +83,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     if (!fresh.length) return
     try { sessionStorage.setItem(JOINS_SEEN, JSON.stringify([...seen, ...fresh.map((join) => join.join_id)].slice(-50))) } catch {}
     if (pathname === "/devices" || pathname === "/inbox") return
-    for (const join of fresh) toast(`${join.name || "新设备"} 想加入`, { icon: MonitorSmartphone, action: { label: "查看", onClick: () => { void navigate({ to: "/devices" }) } } })
+    for (const join of fresh) toast(`${join.name || "新设备"} 想加入`, { icon: terms.myDevices.icon, action: { label: "查看", onClick: () => { void navigate({ to: "/devices" }) } } })
   }, [joinIds, pathname])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
@@ -105,7 +105,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
         <SidebarContent className="gap-1 pb-3">
           <SidebarGroup className="pb-0">
             <SidebarMenu>
-              <NavItem to="/inbox" icon={Inbox} label="待处理" active={pathname === "/inbox"} badge={waiting || undefined} />
+              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} />
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
@@ -135,8 +135,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           <SecondDeviceHint />
           <ConnectionCapsule />
           <SidebarMenu>
-            <NavItem to="/devices" icon={MonitorSmartphone} label="设备" active={pathname.startsWith("/devices")} dot={devicesAttention} />
-            <NavItem to="/settings" icon={Settings} label="设置" active={pathname.startsWith("/settings")} />
+            <NavItem to="/devices" icon={terms.myDevices.icon} label={terms.myDevices.label} active={pathname.startsWith("/devices")} dot={devicesAttention} />
+            <NavItem to="/settings" icon={terms.settings.icon} label={terms.settings.label} active={pathname.startsWith("/settings")} />
           </SidebarMenu>
         </SidebarFooter>
       </Sidebar>
@@ -159,15 +159,15 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           <div className="col-start-3 flex items-center justify-end ps-2 empty:hidden">
           {phoneHome ? <div className="-me-3 flex">
             <Button asChild variant="ghost" size="icon" className="relative">
-              <Link to="/devices" aria-label={devicesAttention ? "设备，需要留意" : "设备"} title="设备">
-                <MonitorSmartphone aria-hidden="true" />
+              <Link to="/devices" aria-label={devicesAttention ? `${terms.myDevices.label}，需要留意` : terms.myDevices.label} title={terms.myDevices.label}>
+                <terms.myDevices.icon aria-hidden="true" />
                 {devicesAttention ? <Dot tone="warning" className="absolute top-1.5 right-1.5 ring-2 ring-background" /> : null}
               </Link>
             </Button>
-            <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label="设置" title="设置"><Settings aria-hidden="true" /></Link></Button>
+            <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
-            <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"} title="待处理">
-              <Inbox aria-hidden="true" />
+            <Link to="/inbox" aria-label={waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
+              <terms.inbox.icon aria-hidden="true" />
               {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}

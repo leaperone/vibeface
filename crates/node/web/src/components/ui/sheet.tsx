@@ -1,4 +1,4 @@
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 import { Dialog as SheetPrimitive } from "radix-ui"
 import * as React from "react"
 
@@ -90,7 +90,7 @@ function SheetTitle({
     <SheetPrimitive.Title
       data-slot="sheet-title"
       className={cn(
-        "font-heading text-base font-medium text-foreground",
+        "font-heading text-heading font-semibold text-foreground",
         className
       )}
       {...props}

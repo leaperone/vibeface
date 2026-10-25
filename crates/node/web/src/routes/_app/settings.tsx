@@ -1,7 +1,7 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { Bell, BellOff, Check, ChevronRight, CircleCheck, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
@@ -73,7 +73,7 @@ function SettingsPage() {
     <Sheet open={leaving} onOpenChange={setLeaving}>
       <SheetContent side="bottom" showCloseButton={false} className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
         <SheetHeader className="gap-1.5 px-5 pt-5">
-          <SheetTitle className="flex items-center gap-2 text-heading font-semibold"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
+          <SheetTitle className="flex items-center gap-2"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
           <SheetDescription>要回来，得重新打开本机页面或用加入链接</SheetDescription>
         </SheetHeader>
         <div className="flex justify-end gap-2 px-5 pt-2 pb-5">
