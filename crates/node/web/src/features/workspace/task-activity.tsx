@@ -52,6 +52,9 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const settle = (work: WorkCheck, choice: "completed" | "interrupted", text = "") => async () => { await workspace.resolveCheck(work, choice, text); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = nodeName(check.target_node, lookup)
   const botOf = (work: WorkCheck) => inbox ? workspace.bots.find((item) => item.conversation_id === work.conversation_id) : undefined
+  // In the chat this card stands in for the task, so its title opens the task.
+  const chatBot = inbox ? undefined : workspace.selectedBot
+  const taskLink = (work: WorkCheck, title: string, className = "") => chatBot ? <Link to="/b/$botId/work/$workId" params={{ botId: chatBot.bot_id, workId: work.work_id }} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
   if (check.kind === "device") return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.works.length} 个任务`}
@@ -63,9 +66,9 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
         const bot = botOf(work)
         return <li key={work.work_id} className="flex min-h-13 min-w-0 items-center gap-3 py-2 ps-3 pe-2">
           <span className="grid min-w-0 flex-1">
-            <span className="line-clamp-2 font-medium [overflow-wrap:anywhere]" title={work.title}>{work.title || "任务结果"}</span>
+            <span className="line-clamp-2 font-medium [overflow-wrap:anywhere]" title={work.title}>{taskLink(work, work.title || "任务结果")}</span>
             {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
-              <BotAvatar id={bot.bot_id} name={bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
+              <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
           </span>
           <span className="flex shrink-0 gap-1.5">
             <ActionButton variant="ghost" disabled={disabled} action={settle(work, "interrupted")}>没做完</ActionButton>
@@ -79,7 +82,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const bot = botOf(check)
   return <ActionCard
     icon={confirmIcons[check.reason]}
-    title={`待确认 · ${check.title || "任务结果"}`}
+    title={<>待确认 · {taskLink(check, check.title || "任务结果", "max-md:py-3")}</>}
     meta={device}
     actions={<>
       <ActionButton disabled={disabled} action={settle(check, "interrupted", note)}>没做完</ActionButton>
@@ -88,7 +91,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   >
     <p>{reason}那个任务实际做完了吗？</p>
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline max-md:min-h-11">
-      <BotAvatar id={bot.bot_id} name={bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
+      <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>

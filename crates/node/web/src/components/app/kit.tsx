@@ -40,15 +40,12 @@ export function Wordmark({ className }: { className?: string }) {
   return <span className={cn("inline-flex items-center gap-2 text-heading font-semibold tracking-tight", className)}><BrandMark />Vibeface</span>
 }
 
-/** Each bot keeps one hue, picked from its id, so the same bot looks the same in the list, the header and the chat. */
-export function BotAvatar({ id, name, size = "md", className }: { id: string; name: string; size?: "sm" | "md" | "lg"; className?: string }) {
-  let hash = 2166136261
-  for (const char of id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0
-  const hue = Math.round((hash * 0.618033988749895 % 1) * 360)
+/** Bots share one quiet tile with their initial; only the primary bot takes the brand color. */
+export function BotAvatar({ name, primary = false, size = "md", className }: { name: string; primary?: boolean; size?: "sm" | "md" | "lg"; className?: string }) {
   // "我的" says whose bot it is, not which; a name left with only "Bot" shows the bot icon.
   const rest = name.trim().replace(/^我的\s*/, "")
   const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
-  return <span aria-hidden="true" style={{ "--avatar-hue": hue } as CSSProperties} className={cn("bot-avatar grid shrink-0 place-items-center font-semibold select-none",
+  return <span aria-hidden="true" className={cn("grid shrink-0 place-items-center font-semibold ring-1 select-none ring-inset", primary ? "bg-brand-soft text-brand ring-brand/20" : "bg-muted text-muted-foreground ring-border",
     size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
 

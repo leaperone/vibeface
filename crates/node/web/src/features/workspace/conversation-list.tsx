@@ -25,7 +25,7 @@ export function ConversationList() {
     const last = bot.last_message
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
-      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotAvatar id={bot.bot_id} name={bot.name} size="lg" className="size-11 rounded-xl" />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
+      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" className="size-11 rounded-xl" />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
         name={bot.name} mark={workspace.primary === bot.conversation_id ? <Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /> : null} />
     </li>
   })}</ul>
