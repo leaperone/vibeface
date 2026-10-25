@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { Laptop, Link2, ListChecks, RotateCw, Server, Square, X } from "lucide-react"
+import { ChevronLeft, Laptop, Link2, ListChecks, RotateCw, Server, Square, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
+import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { humanError, rawError } from "@vibeface/client/lib/errors.ts"
+import { rawError, taskError } from "@vibeface/client/lib/errors.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { confirmReason } from "@vibeface/client/workspace/model.ts"
 import { confirmText } from "./task-activity"
@@ -21,8 +22,11 @@ function holdFocus(node: HTMLElement | null) {
   return () => { if (opener instanceof HTMLElement && opener.isConnected) opener.focus({ preventScroll: true }) }
 }
 
-/** /b/:botId/work/:workId — side panel beside the chat on wide screens, an overlay on tablets, full screen on phones. */
-export function TaskDetail({ botId, workId }: { botId: string; workId: string }) {
+/**
+ * /b/:botId/work/:workId — side panel beside the chat on wide screens, an overlay on tablets, full screen on phones.
+ * `from`: opened from 待处理, so leaving goes back there instead of to the chat.
+ */
+export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const action = useAction()
@@ -38,14 +42,15 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   // Any entry forwards the stop; an unreachable device gets it when it is back.
   const canStop = work && state !== "awaiting_confirmation" && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
   const navigate = useNavigate()
-  const close = () => void navigate({ to: "/b/$botId", params: { botId } })
+  const leave = from === "inbox" ? { to: "/inbox" as const } : { to: "/b/$botId" as const, params: { botId } }
+  const close = () => void navigate(leave)
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && !event.defaultPrevented) close() }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [botId])
+  }, [botId, from])
   // The last progress line is stale once a task ends, so it never stands in for a result.
-  const result = work?.result_text || (work?.failure_reason ? humanError(work.failure_reason, undefined, "这个任务") : state === "completed" ? "没有返回文字" : "")
+  const result = work?.result_text || (work?.failure_reason ? taskError(work.failure_reason) : state === "completed" ? "没有返回文字" : "")
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
@@ -54,17 +59,19 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   <div aria-hidden="true" onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in dark:bg-black/60 fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
   <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:bg-popover md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:bg-background lg:shadow-none">
     <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
-      <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+      {/* Full screen on a phone, so it leaves like a page, from the start of its header. */}
+      <Button asChild variant="ghost" size="icon" className="-ms-2 md:hidden"><Link {...leave} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button>
+      <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground max-md:hidden" />
       <h2 className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
       {state ? <StatusPill tone={tone(state)}>{taskLabel(state)}</StatusPill> : null}
-      <Button asChild variant="ghost" size="icon"><Link to="/b/$botId" params={{ botId }} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
+      <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
       {device ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
-      {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{work.failure_reason && !work.result_text ? "原因" : "结果"}</h3><p className="whitespace-pre-wrap break-words">{result}</p></section> : null}
+      {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{work.failure_reason && !work.result_text ? "原因" : "结果"}</h3>{work.result_text ? <Markdown text={result} /> : <p className="whitespace-pre-wrap break-words">{result}</p>}</section> : null}
       {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。</p> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
@@ -78,8 +85,9 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
         <InlineError error={action.error} />
       </div> : null}
       {["failed", "interrupted", "rejected"].includes(state) ? <div className="grid gap-2">
-        <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
-          if (await workspace.sendMessage(`再试一次「${work.title || "这个任务"}」`)) close()
+        {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
+        <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
+          if (await workspace.sendMessage(`再试一次「${work.title || "这个任务"}」`)) void navigate({ to: "/b/$botId", params: { botId } })
         })}><BusyIcon busy={action.busy === "retry"} icon={RotateCw} />让 Bot 再试</Button>
         <InlineError error={action.error} />
       </div> : null}

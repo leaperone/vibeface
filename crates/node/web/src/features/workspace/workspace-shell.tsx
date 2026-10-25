@@ -50,6 +50,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
   const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
+  const taskOpen = /^\/b\/[^/]+\/work\//.test(pathname)
   const back = backTo(pathname)
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
@@ -141,7 +142,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
       </Sidebar>
       <SidebarInset id="main" tabIndex={-1} className="min-h-0 min-w-0 overflow-hidden">
         {/* The middle column has the pages' width, so the title and the page's actions line up with the content below. */}
-        <header className="grid h-14 shrink-0 grid-cols-[minmax(max-content,1fr)_minmax(0,var(--page-width))_minmax(max-content,1fr)] items-center border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]">
+        {/* Beside an open task panel the chat column narrows, so the title keeps over it rather than over the gap. */}
+        <header className={cn("grid h-14 shrink-0 grid-cols-[minmax(max-content,1fr)_minmax(0,var(--page-width))_minmax(max-content,1fr)] items-center border-b ps-[max(1rem,env(safe-area-inset-left))] pe-[max(1rem,env(safe-area-inset-right))] sm:ps-[max(1.5rem,env(safe-area-inset-left))] sm:pe-[max(1.5rem,env(safe-area-inset-right))]", taskOpen && "lg:pe-[420px]")}>
           <div className="flex items-center pe-2 empty:hidden">
             {/* A page inside another page goes back from its header at any width; the sidebar covers the rest on wide screens. */}
             {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}

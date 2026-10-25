@@ -5,7 +5,7 @@ import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { humanError } from '@vibeface/client/lib/errors.ts'
+import { humanError, taskError } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton } from '@/features/workspace/workspace-shell'
@@ -16,6 +16,7 @@ import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkR
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
+import { firstLine } from '@/lib/markdown'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
@@ -263,7 +264,7 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  const result = (task.work.result_text || (task.work.failure_reason ? humanError(task.work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
+  const result = task.work.result_text ? firstLine(task.work.result_text) : task.work.failure_reason ? taskError(task.work.failure_reason).split('\n')[0] : ''
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.

@@ -7,6 +7,7 @@ const codes: Record<string, string> = {
   target_unreachable: '访问地址连不上这台设备。它可能关机或断网了，稍后会自动重试。',
 }
 
+const malformed = /invalid|is required|must be|missing/i
 const patterns: [RegExp, string][] = [
   [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
   [/log has forked/i, '这台设备的数据被复制过，已暂停发送。去待处理看看。'],
@@ -84,7 +85,7 @@ const patterns: [RegExp, string][] = [
   [/recovery (key|proof)/i, '恢复文件和这组设备对不上，或恢复授权已过期。'],
   [/signature|proof|handshake|identity/i, '设备身份校验没通过，已断开。'],
   [/too large|too long|exceeds|limit/i, '内容超过了大小限制。'],
-  [/invalid|is required|must be|missing/i, '请求内容不完整或格式不对。请刷新页面后重试。'],
+  [malformed, '请求内容不完整或格式不对。请刷新页面后重试。'],
 ]
 
 const chinese = /[一-鿿]/
@@ -94,6 +95,12 @@ export function humanError(raw: string, code?: unknown, action = '这次操作')
   if (typeof code === 'string' && codes[code]) return codes[code]
   if (chinese.test(raw)) return raw
   return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? `${action}没有成功，请再试一次。`
+}
+
+/** A task's own failure: its agent's words are not a page request, so advice to refresh the page would mislead. */
+export function taskError(raw: string): string {
+  if (chinese.test(raw)) return raw
+  return patterns.find(([pattern]) => pattern !== malformed && pattern.test(raw))?.[1] ?? '这个任务没有成功，请再试一次。'
 }
 
 /** The untranslated text, for 详细信息; empty when the shown message already is the original. */

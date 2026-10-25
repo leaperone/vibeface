@@ -23,3 +23,14 @@ md.renderer.rules.table_close = () => "</table></div>"
 export function renderMarkdown(text: string) {
   return md.render(text)
 }
+
+/** The first line as plain words, for a one-line preview of a reply written in markdown. */
+export function firstLine(text: string) {
+  const inline = md.parse(text, {}).find((token) => token.type === "inline")
+  const words: string[] = []
+  for (const token of inline?.children ?? []) {
+    if (token.type === "softbreak" || token.type === "hardbreak") break
+    if (token.type === "text" || token.type === "code_inline") words.push(token.content)
+  }
+  return words.join("").trim() || text.split("\n")[0]
+}
