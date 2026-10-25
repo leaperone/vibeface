@@ -45,7 +45,7 @@ export function Onboarding() {
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(3)}>上一步</Button>
           <div className="flex gap-2">
             <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
-            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "创建"}</Button>
+            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "完成"}</Button>
           </div>
         </div>
       </form>
