@@ -2,7 +2,7 @@ import { inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 
-export type SendGate = {
+type SendGate = {
   hasConversation: boolean
   loaded: boolean
   busy: boolean

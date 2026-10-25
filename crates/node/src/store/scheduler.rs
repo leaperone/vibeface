@@ -135,7 +135,6 @@ fn load_job(
     .pop())
 }
 
-/// Queued jobs are the conversation's inbox, oldest first.
 fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<SchedulerJob>> {
     query_jobs(
         connection,
@@ -327,32 +326,12 @@ fn forget_process(connection: &Connection, attempt_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The reply's App Server turn while it runs, if it runs on one and its turn is known.
 fn manager_turn(connection: &Connection, attempt_id: &str) -> Result<Option<(String, String)>> {
     Ok(connection
         .query_row(
             "SELECT thread_id,turn_id FROM manager_turns WHERE attempt_id=? AND turn_id IS NOT NULL",
             [attempt_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?)
-}
-
-fn outbox_entry(
-    connection: &Connection,
-    conversation: &str,
-    trigger: &str,
-) -> Result<Option<OutboxEntry>> {
-    Ok(connection
-        .query_row(
-            "SELECT conversation_id,trigger FROM scheduler_outbox WHERE conversation_id=? AND trigger=?",
-            params![conversation, trigger],
-            |r| {
-                Ok(OutboxEntry {
-                    conversation_id: r.get(0)?,
-                    trigger: r.get(1)?,
-                })
-            },
         )
         .optional()?)
 }
@@ -870,7 +849,6 @@ fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Resu
         match work.trigger.split_once(':') {
             Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
             Some(("work" | "task", parent)) => work_id = parent.into(),
-            // A schedule run has no message; its result answers the run.
             Some(("schedule", _)) => return Ok(Some(work.trigger)),
             _ => return Ok(None),
         }
@@ -1270,19 +1248,6 @@ impl Store {
         load_job(&self.connection, conversation, trigger)
     }
 
-    pub fn scheduler_status(
-        &self,
-        network: &str,
-        conversation: &str,
-        trigger: &str,
-    ) -> Result<Option<AdmissionReceipt>> {
-        if let Some(job) = self.scheduler_job(conversation, trigger)? {
-            return Ok(Some(job.receipt(network)));
-        }
-        Ok(outbox_entry(&self.connection, conversation, trigger)?
-            .map(|entry| entry.receipt(network)))
-    }
-
     pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
     }
@@ -1431,9 +1396,7 @@ impl Store {
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
         }
-        // A queued turn reads what came before it ran, such as the reply to the message ahead.
         job.basis = log::version_vector_from(&tx, network)?;
-        // Reused only under the same ownership and when this basis contains what it saw.
         let resumable = job.kind != TriggerKind::AgentTask
             && session.native_id.is_some()
             && session

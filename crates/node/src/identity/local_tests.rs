@@ -261,7 +261,6 @@ fn only_the_joining_device_withdraws_and_a_withdrawn_request_cannot_be_approved(
             .is_err()
     );
 
-    // Approved first: the withdrawal reports the join instead of undoing it.
     let late = invite(&fixture, [5; 32])?;
     let nonce = random_hex(32);
     fixture

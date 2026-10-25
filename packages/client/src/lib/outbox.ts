@@ -29,7 +29,7 @@ export async function enqueue(store: OutboxStore, item: OutboxItem): Promise<Out
   return item
 }
 
-export type Settled = { confirmed: string[]; resubmitted: string[]; rejected: string[]; unknown: string | null }
+type Settled = { confirmed: string[]; resubmitted: string[]; rejected: string[]; unknown: string | null }
 
 /**
  * Checks each pending write by its business ID, then resubmits the unchanged request.

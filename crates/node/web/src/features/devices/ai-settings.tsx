@@ -85,7 +85,7 @@ function AppServerSettings({ server, working, blocked, busy, save, test }: {
       </Button>
     </div>
     {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
-    {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <code className="font-mono text-meta break-all text-muted-foreground">{shown.reason}</code> : null}
+    {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     {server.mode === "system" ? <Details label="手动指定">
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
       <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
@@ -233,9 +233,9 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     {issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
-      {onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
-        : issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
+      {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
           onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改为自己启动</button>
+        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
       <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />

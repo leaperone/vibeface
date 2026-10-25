@@ -61,6 +61,11 @@ pub struct Store {
 }
 
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
+///
+/// A recovery takes effect with time alone, and a late veto can put the earlier directory back, so
+/// this also rebuilds whenever the same history now has another recovery key in effect; that voids
+/// every invite and join request. Nothing here is refused for undoing a recovery: the directory in
+/// effect is a function of the signed history and the wall clock, and the rebuild follows it.
 pub(crate) fn install_trust_bundle_in(
     connection: &Connection,
     network_id: &str,
@@ -78,33 +83,33 @@ pub(crate) fn install_trust_bundle_in(
             |r| r.get(0),
         )
         .optional()?;
-    let previous_state = previous
-        .as_deref()
-        .map(serde_json::from_str::<NetworkState>)
-        .transpose()?;
-    let merged = match &previous_state {
-        Some(previous) => previous.merge(state)?,
+    let merged = match &previous {
+        Some(previous) => serde_json::from_str::<NetworkState>(previous)?.merge(state)?,
         None => state.clone(),
     };
     let encoded = serde_json::to_string(&merged)?;
-    if previous.as_ref() == Some(&encoded) {
+    let view = merged.project()?;
+    let changed = previous.as_ref() != Some(&encoded);
+    let flipped = recovery_since_ms(connection, &view.recovery_key)?.is_none();
+    if !changed && !flipped {
         return Ok(false);
     }
-    connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
-    if previous_state.as_ref().map(NetworkState::recovery_key) != Some(merged.recovery_key()) {
+    if changed {
+        connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
+    }
+    if flipped {
         connection.execute(
             "INSERT INTO identity_meta(key,value) VALUES('recovery_since',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("{}:{}", merged.recovery_key(), crate::runtime::now_ms())],
+            [format!("{}:{}", view.recovery_key, crate::runtime::now_ms())],
         )?;
+        connection.execute("DELETE FROM invites", [])?;
     }
-    log::recompute(connection, &merged.project()?)
+    log::recompute(connection, &view)
 }
 
-/// When this Node first saw `recovery_key`; signed records carry no time of their own.
-pub(crate) fn recovery_since_ms(
-    connection: &Connection,
-    recovery_key: &str,
-) -> Result<Option<i64>> {
+/// The recovery key this Node last saw in effect, and since when. Shown only, never a reason to
+/// refuse a history.
+fn recovery_since(connection: &Connection) -> Result<Option<(String, i64)>> {
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM identity_meta WHERE key='recovery_since'",
@@ -115,8 +120,17 @@ pub(crate) fn recovery_since_ms(
     Ok(value
         .as_deref()
         .and_then(|value| value.split_once(':'))
-        .filter(|(key, _)| *key == recovery_key)
-        .and_then(|(_, ms)| ms.parse().ok()))
+        .and_then(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?))))
+}
+
+/// When this Node first saw `recovery_key`; signed records carry no time of their own.
+pub(crate) fn recovery_since_ms(
+    connection: &Connection,
+    recovery_key: &str,
+) -> Result<Option<i64>> {
+    Ok(recovery_since(connection)?
+        .filter(|(key, _)| key == recovery_key)
+        .map(|(_, ms)| ms))
 }
 
 /// Total order shared by prompts and UI: a Kahn sort of the DAG with ties broken by
@@ -270,13 +284,6 @@ impl Store {
     /// The member record of a current, unrevoked Node.
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
-    }
-    /// A write signed by a device this network has admitted and not revoked.
-    pub fn authorize_attestation(&self, network_id: &str, body: &EventBody) -> Result<()> {
-        if let Some(attestation) = body.attestation() {
-            membership_from(&self.connection, network_id)?.client(&attestation.device_id)?;
-        }
-        Ok(())
     }
     /// Stores each event or reports why not; one bad event never aborts the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards. Also returns

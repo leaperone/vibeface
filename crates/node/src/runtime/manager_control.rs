@@ -94,7 +94,6 @@ impl Runtime {
                 &manager.trigger,
                 &manager.attempt_id,
             )?;
-            // Wait for admitted tools before declaring this attempt unable to write.
             let _drained = active.admission.clone().write_owned().await;
         }
         Ok(())

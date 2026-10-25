@@ -104,7 +104,6 @@ impl Runtime {
             && matches!(record.state, WorkState::Running { .. })
             && self.waiting_stop(work_id).await?
         {
-            // Left waiting when unconfirmed; `deliver_work_requests` tries again.
             match Box::pin(self.stop_bound_work(network, work_id)).await {
                 Ok(stopped) => return Ok(stopped),
                 Err(error) => tracing::warn!(%error, work_id, "stop of a just-bound work waits"),
@@ -636,7 +635,6 @@ impl Runtime {
                 self.signal_work(network, work_id, Signal::InterruptRequested)
                     .await?;
             }
-            // An agent task stops with its coordination turn.
             WorkState::Accepted if record.kind == WorkKind::Task => {
                 let job = self.store.lock().await.request_manager_cancel(
                     &self.identity,
@@ -651,7 +649,6 @@ impl Runtime {
                 }
                 self.publish_changed(network, &record.conversation, Changed::Work(work_id));
             }
-            // No turn to interrupt yet: the request waits here and stops the turn once bound.
             WorkState::Accepted | WorkState::Starting { .. } if record.kind == WorkKind::Codex => {
                 let at = now_ms();
                 self.store.lock().await.save_stop_request(&StopRequest {
@@ -667,7 +664,6 @@ impl Runtime {
             }
             _ => {}
         }
-        // Stopping a work stops what it delegated.
         let children = {
             let store = self.store.lock().await;
             let mut children = Vec::new();
@@ -783,7 +779,6 @@ impl Runtime {
             if request.timed_out {
                 continue;
             }
-            // Bounded like the first attempt, so an offline device cannot hold up the outbox.
             let attempt =
                 tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request));
             if matches!(attempt.await, Ok(Ok(_))) {

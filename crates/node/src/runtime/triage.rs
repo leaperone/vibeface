@@ -219,7 +219,7 @@ fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
 
 fn outbox_from(connection: &Connection) -> Result<Vec<OutboxEntry>> {
     let mut statement = connection.prepare(
-        "SELECT event_id,body,state,attempts,next_ms,created_ms,last_error FROM triage_outbox ORDER BY event_id",
+        "SELECT event_id,body,state,attempts,next_ms FROM triage_outbox ORDER BY event_id",
     )?;
     let rows = statement.query_map([], |r| {
         Ok((
@@ -228,20 +228,16 @@ fn outbox_from(connection: &Connection) -> Result<Vec<OutboxEntry>> {
             r.get::<_, String>(2)?,
             r.get(3)?,
             r.get(4)?,
-            r.get(5)?,
-            r.get(6)?,
         ))
     })?;
     rows.map(|row| {
-        let (event_id, body, state, attempts, next_ms, created_ms, last_error) = row?;
+        let (event_id, body, state, attempts, next_ms) = row?;
         Ok(OutboxEntry {
             event_id,
             body,
             state: from_name(state)?,
             attempts,
             next_ms,
-            created_ms,
-            last_error,
         })
     })
     .collect()
@@ -279,7 +275,6 @@ impl Runtime {
             tracing::info!(event_id = event.event_id, "triage test event received");
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
         }
-        // Nothing is triaged before the Node joins a network.
         let network = self.network_id().await?;
         if self.manager().is_none() {
             return Ok(json!({"status":"dropped","event_id":event.event_id}));
@@ -622,9 +617,9 @@ impl Runtime {
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
         let record = |thread: String| async move {
             self.store.lock().await.connection.execute(
-                "INSERT INTO coordination_threads(thread_id,created_ms) VALUES(?,?)
+                "INSERT INTO coordination_threads(thread_id) VALUES(?)
                  ON CONFLICT(thread_id) DO NOTHING",
-                params![thread, now_ms()],
+                [thread],
             )?;
             Ok(())
         };
@@ -884,16 +879,14 @@ impl Runtime {
     async fn queue_webhook(&self, event_id: &str, body: &Value) -> Result<()> {
         let entry = OutboxEntry::new(event_id, body.to_string(), now_ms());
         self.store.lock().await.connection.execute(
-            "INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms,created_ms,last_error)
-             VALUES(?,?,?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING",
+            "INSERT INTO triage_outbox(event_id,body,state,attempts,next_ms)
+             VALUES(?,?,?,?,?) ON CONFLICT(event_id) DO NOTHING",
             params![
                 entry.event_id,
                 entry.body,
                 name(entry.state)?,
                 entry.attempts,
                 entry.next_ms,
-                entry.created_ms,
-                entry.last_error
             ],
         )?;
         self.triage.outbox.notify_one();
@@ -992,21 +985,20 @@ impl Runtime {
                 continue;
             }
             let (status, error) = post_webhook(&url, &secret, &entry.event_id, &entry.body).await;
-            entry.record(status, error, now_ms());
+            entry.record(status, now_ms());
             if entry.state == Delivery::Dead {
                 tracing::warn!(
                     event_id = entry.event_id,
-                    error = entry.last_error,
+                    error = error.or_else(|| status.map(|value| format!("HTTP {value}"))),
                     "webhook delivery dead-lettered"
                 );
             }
             self.store.lock().await.connection.execute(
-                "UPDATE triage_outbox SET state=?,attempts=?,next_ms=?,last_error=? WHERE event_id=?",
+                "UPDATE triage_outbox SET state=?,attempts=?,next_ms=? WHERE event_id=?",
                 params![
                     name(entry.state)?,
                     entry.attempts,
                     entry.next_ms,
-                    entry.last_error,
                     entry.event_id
                 ],
             )?;
@@ -1030,7 +1022,6 @@ impl Runtime {
                 let _ = std::fs::remove_file(path);
             }
         }
-        // Scan marks advance only once scanned events can be queued, which needs a network.
         if !self.has_membership().await? {
             return Ok(());
         }
@@ -1071,7 +1062,6 @@ impl Runtime {
             };
             let offset = match mark {
                 Some(mark) => mark,
-                // History from before this Node started is not news.
                 None if modified_ms(&path) < self.triage.started_ms => text.len(),
                 None => 0,
             };
@@ -1089,8 +1079,6 @@ impl Runtime {
         }
         Ok(())
     }
-
-    // ---- settings (local operator RPCs) ----
 
     pub(crate) async fn triage_settings(&self) -> Result<Value> {
         let config = self.triage.config();
@@ -1227,8 +1215,6 @@ impl Runtime {
             .iter()
             .fold(false, |found, t| net::same_token(&t.hash, &hash) | found)
     }
-
-    // ---- network RPCs ----
 
     pub(super) async fn questions(&self, access: &Access) -> Result<Value> {
         Ok(json!({"questions":self.store.lock().await.unanswered_questions(&access.network_id)?}))
@@ -1495,7 +1481,6 @@ mod tests {
         });
     }
 
-    /// A bot's conversation scheduled by `node`, which owns the sessions in `threads`.
     async fn bot(
         node: &Runtime,
         admin: &LocalIdentity,
@@ -1573,8 +1558,6 @@ mod tests {
         serde_json::from_str(message.to_text().unwrap()).unwrap()
     }
 
-    /// A fake App Server on the Node's socket that sends one approval request on thread `t-1`,
-    /// which the bridge hands to the Node.
     async fn app_server(node: &Runtime) -> Result<(Server, Value)> {
         use futures_util::SinkExt as _;
         let listener = tokio::net::UnixListener::bind(named_socket(node))?;
@@ -1595,7 +1578,6 @@ mod tests {
         Ok((server, handed))
     }
 
-    /// The answer the fake App Server got for request 41, and that nothing else follows it.
     async fn answered_once(server: &mut Server) -> Value {
         let answer = read(server).await;
         assert_eq!(answer["id"], 41);
@@ -1611,7 +1593,6 @@ mod tests {
         Ok(())
     }
 
-    /// A fake App Server on the Node's socket that answers every request and passes each on.
     fn answering_app_server(node: &Runtime) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
         let listener = tokio::net::UnixListener::bind(named_socket(node))?;
@@ -1649,8 +1630,6 @@ mod tests {
         result
     }
 
-    /// A stop while the Agent is still starting the work is kept, not dropped: the turn is
-    /// interrupted as soon as it is bound, once.
     #[tokio::test]
     async fn a_work_stopped_while_starting_is_interrupted_once_bound() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1821,8 +1800,6 @@ mod tests {
         result
     }
 
-    /// A raised question holds the request; once answered, the bot gets an `answer` turn
-    /// and the request a deadline, and the bot's response reaches Codex once.
     #[tokio::test]
     async fn a_question_holds_the_request_until_it_is_answered() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -1900,7 +1877,6 @@ mod tests {
         }
     }
 
-    /// How many times a session was attributed in `scope`.
     async fn attributions(node: &Runtime, scope: &str) -> Result<usize> {
         let network = node.network_id().await?;
         let context = node.store.lock().await.context(&network, scope, None)?;
@@ -1929,9 +1905,6 @@ mod tests {
         }
     }
 
-    /// A session no bot started goes to the primary bot once, however often it reports and
-    /// whichever bot is primary later; nobody is asked whose it is. The user hands it to
-    /// another bot, whose chat its next question goes to, or stops following it.
     #[tokio::test]
     async fn an_unowned_session_goes_to_the_primary_bot_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -2010,8 +1983,6 @@ mod tests {
         result
     }
 
-    /// Without a bot nothing gets an owner and a request falls back at once; a thread nobody
-    /// drives (`codex exec`, a sub-agent) is never given to a bot.
     #[tokio::test]
     async fn unattended_sessions_get_no_owner() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -2044,7 +2015,6 @@ mod tests {
         result
     }
 
-    /// Posts the user's message `id` in `c` and starts its reply; returns its trigger and attempt.
     async fn start_reply(
         node: &Runtime,
         admin: &LocalIdentity,
@@ -2088,8 +2058,6 @@ mod tests {
         Ok((trigger, attempt))
     }
 
-    /// A pending check closes only from the App Server its turn ran on: after a switch to
-    /// another one, the old turn is unknown there, not missing.
     #[tokio::test]
     async fn a_check_from_another_app_server_stays_pending() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -2146,8 +2114,6 @@ mod tests {
         result
     }
 
-    /// A bot's own reply thread belongs to its chat: triage never asks whose it is, and no
-    /// bot sends work into it.
     #[tokio::test]
     async fn a_bots_reply_thread_is_its_chats_and_takes_no_work() -> Result<()> {
         let (node, admin, dir) = node().await?;
@@ -2212,8 +2178,6 @@ mod tests {
         result
     }
 
-    /// The coordination Agent's own Codex thread is known before its turn starts: its hook,
-    /// scan and App Server events, requests included, neither ask the user nor wake the Agent.
     #[tokio::test]
     async fn the_coordination_agents_thread_is_not_triaged() -> Result<()> {
         use futures_util::{SinkExt as _, StreamExt as _};
@@ -2256,15 +2220,10 @@ mod tests {
                 }
             });
             node.coordination_turn(|_| Ok("triage".into())).await?;
-            // A week later the scan's cleanup still knows the thread.
             *node.triage.config.lock().unwrap() = TriageConfig {
                 scan_codex_sessions: false,
                 ..Default::default()
             };
-            node.store.lock().await.connection.execute(
-                "UPDATE coordination_threads SET created_ms=?",
-                [now_ms() - 8 * 24 * 3600 * 1000],
-            )?;
             node.scan_sources().await?;
 
             let ended = node
@@ -2380,7 +2339,6 @@ mod tests {
                 "question_id":question,"text":"修"}));
             assert_eq!(node.triage_settings().await?["outbox"]["delivered"], 2);
 
-            // Another device's answer to the same question won by rank and replaced this one.
             let winner = "0".repeat(64);
             node.store.lock().await.connection.execute(
                 "UPDATE messages SET text='不修',event_hash=?1 WHERE network_id=?2 AND message_id=?3",

@@ -123,5 +123,5 @@ function Button({ className, variant, size, instant, style, onPressIn, onPressOu
   );
 }
 
-export { Button, buttonTextVariants, buttonVariants };
+export { Button };
 export type { ButtonProps };

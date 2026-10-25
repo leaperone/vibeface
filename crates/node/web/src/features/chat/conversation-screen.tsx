@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, Bell, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, MessageSquareWarning, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError, toast } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -64,12 +64,12 @@ export function ConversationScreen() {
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
     return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: work.summary, trigger: work.trigger, work, joined: joined?.title }
   })
-  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting' || task.state === 'awaiting_confirmation')
+  const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting')
   const placed = new Set<string>()
   const taskRows = (task: TaskRow) => {
     placed.add(task.id)
-    // A task held on an approval shows as that approval card, which names and links the task.
-    if (task.state === 'waiting') return []
+    // A task held on an approval or waiting for confirmation shows as that card, which names and links the task.
+    if (task.state === 'waiting' || task.state === 'awaiting_confirmation') return []
     return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
   }
 
@@ -170,7 +170,7 @@ export function ConversationScreen() {
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
   // An empty chat already offers the setup button in its middle.
-  const hint = notice || (bot && !agentReady ? (unready ? (entries.length ? '运行 Bot 的设备需设置' : '') : managerOffline ? '能运行 Bot 的设备离线了' : '暂时没有能运行 Bot 的设备')
+  const hint = notice || (bot && !agentReady ? (managerOffline && !unready ? '能运行 Bot 的设备离线了' : !entries.length ? '' : unready ? '运行 Bot 的设备需设置' : '还没设置运行 Bot 的设备')
     : bot ? composerHint(gate) : '')
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
@@ -210,7 +210,7 @@ export function ConversationScreen() {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotAvatar id={bot.bot_id} name={bot.name} size="lg" />
+          <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
           {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
             : <div className="flex flex-wrap justify-center gap-2">
@@ -219,8 +219,8 @@ export function ConversationScreen() {
         </div> : null}
       />
       <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 max-md:h-10 max-md:ps-3"
-          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: 'smooth' })}>
+        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-10 max-md:ps-3"
+          onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
           <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
@@ -266,14 +266,13 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
-  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground">
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
     {task.state === 'abandoned' ? <Ban aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} /></span>{result ? <span className="block break-words">{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} quiet={task.state === 'completed'} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
-  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 rounded-xl border bg-card shadow-xs px-4 py-2 hover:bg-muted/50">
+  return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
-      : task.state === 'awaiting_confirmation' ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>
@@ -283,14 +282,13 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
 }
 
 /** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
-function TaskMeta({ device, here, state, className = '' }: { device: string; here: boolean; state: string; className?: string }) {
-  const Icon = here ? Laptop : Server
+/** Only another device is named on screen. `quiet`: the icon already says the state, so its word is only read out. */
+function TaskMeta({ device, here, state, quiet = false, className = '' }: { device: string; here: boolean; state: string; quiet?: boolean; className?: string }) {
+  if (here && quiet) return <span className="sr-only">{device} · {taskLabel(state)}</span>
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
-    <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-    <span className="truncate">{device}</span>
-    <span aria-hidden="true">·</span>
-    <span className="shrink-0">{taskLabel(state)}</span>
+    {here ? <span className="sr-only">{device}</span> : <><Server aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : <span aria-hidden="true">·</span>}</>}
+    <span className={quiet ? 'sr-only' : 'shrink-0'}>{taskLabel(state)}</span>
   </span>
 }
 
@@ -322,7 +320,7 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
           <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
         </span>
       </span>
-      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/40 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
+      {others.length ? <label title="转给其他 Bot" className={`relative grid size-9 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-muted hover:text-foreground has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50 max-md:size-10 ${disabled ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}>
         <ArrowRightLeft aria-hidden="true" className="size-4" />
         <select aria-label="转给其他 Bot" value="" disabled={disabled} className="absolute inset-0 size-full cursor-pointer appearance-none opacity-0" onChange={(event) => { if (event.target.value) void handTo(event.target.value) }}>
           <option value="" disabled>转给…</option>
@@ -337,15 +335,16 @@ function HandoffRow({ session }: { session: SessionHandoff }) {
   </div>
 }
 
+/** Shaped like a message from another bot, its name above the text, so both directions read as one kind of thing. */
 function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot_id?: string } }) {
-  return <div className="grid min-w-0 gap-1 rounded-lg border px-3 py-2 text-meta">
-    <p className="flex min-w-0 items-center gap-2 text-muted-foreground">
+  return <div className="flex min-w-0 flex-col items-start gap-1">
+    <p className="flex min-w-0 max-w-full items-center gap-1.5 text-meta text-muted-foreground">
       <Send aria-hidden="true" className="size-4 shrink-0" />
       <span className="shrink-0">发给</span>
-      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="min-w-0 truncate font-medium text-foreground underline-offset-4 hover:underline">{to.name}</Link>
+      {to.bot_id ? <Link to="/b/$botId" params={{ botId: to.bot_id }} className="hit-area relative flex min-w-0 font-medium text-foreground underline-offset-4 hover:underline"><span className="truncate">{to.name}</span></Link>
         : <span className="min-w-0 truncate font-medium text-foreground">{to.name}</span>}
     </p>
-    <p className="line-clamp-3 whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]" title={sent.text}>{sent.text}</p>
+    <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
   </div>
 }
 

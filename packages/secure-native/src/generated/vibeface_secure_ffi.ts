@@ -398,18 +398,10 @@ const FfiConverterTypeSecureError = (() => {
     return new FFIConverter();
 })();
 
-export interface ChannelLike {
-    
-    openRecord(record: ArrayBuffer) /*throws*/: ArrayBuffer | undefined;
-    sealMessage(payload: ArrayBuffer) /*throws*/: Array<ArrayBuffer>;
-}
-/**
- * @deprecated Use `ChannelLike` instead.
- */
-export type ChannelInterface = ChannelLike;
+export type ChannelLike = Channel;
 
 
-export class Channel extends UniffiAbstractObject implements ChannelLike {
+export class Channel extends UniffiAbstractObject {
 
     readonly [uniffiTypeNameSymbol] = "Channel";
     readonly [destructorGuardSymbol]: UniffiGcObject;
@@ -530,23 +522,10 @@ const uniffiTypeChannelObjectFactory: UniffiObjectFactory<ChannelLike> = (() => 
 }})();
 const FfiConverterTypeChannel = new FfiConverterObject(uniffiTypeChannelObjectFactory);
 
-export interface HandshakeLike {
-    
-    finish() /*throws*/: ChannelLike;
-    isFinished(): boolean;
-    read(message: ArrayBuffer) /*throws*/: ArrayBuffer;
-    remoteId(): string | undefined;
-    setProof(deviceId: string, signature: string) /*throws*/: void;
-    signingBytes(): ArrayBuffer;
-    write(payload: ArrayBuffer) /*throws*/: ArrayBuffer;
-}
-/**
- * @deprecated Use `HandshakeLike` instead.
- */
-export type HandshakeInterface = HandshakeLike;
+export type HandshakeLike = Handshake;
 
 
-export class Handshake extends UniffiAbstractObject implements HandshakeLike {
+export class Handshake extends UniffiAbstractObject {
 
     readonly [uniffiTypeNameSymbol] = "Handshake";
     readonly [destructorGuardSymbol]: UniffiGcObject;
@@ -745,23 +724,10 @@ const uniffiTypeHandshakeObjectFactory: UniffiObjectFactory<HandshakeLike> = (()
 }})();
 const FfiConverterTypeHandshake = new FfiConverterObject(uniffiTypeHandshakeObjectFactory);
 
-export interface IdentityLike {
-    
-    deviceId(): string;
-    secretHex(): string;
-    sign(domain: string, payload: ArrayBuffer) /*throws*/: string;
-/**
- * Signs raw bytes, e.g. a Noise handshake's `signing_bytes`.
- */
-    signMessage(message: ArrayBuffer): string;
-}
-/**
- * @deprecated Use `IdentityLike` instead.
- */
-export type IdentityInterface = IdentityLike;
+export type IdentityLike = Identity;
 
 
-export class Identity extends UniffiAbstractObject implements IdentityLike {
+export class Identity extends UniffiAbstractObject {
 
     readonly [uniffiTypeNameSymbol] = "Identity";
     readonly [destructorGuardSymbol]: UniffiGcObject;
@@ -940,21 +906,10 @@ const uniffiTypeIdentityObjectFactory: UniffiObjectFactory<IdentityLike> = (() =
 }})();
 const FfiConverterTypeIdentity = new FfiConverterObject(uniffiTypeIdentityObjectFactory);
 
-export interface MembershipLike {
-    
-    createKeyRotation(root: IdentityLike, next: string) /*throws*/: string;
-    createRecoveryCheckpoint(root: IdentityLike, next: string, membersJson: string, headsJson: string) /*throws*/: string;
-    governanceTemplate(issuer: string, actionJson: string) /*throws*/: string;
-    stateJson() /*throws*/: string;
-    viewJson() /*throws*/: string;
-}
-/**
- * @deprecated Use `MembershipLike` instead.
- */
-export type MembershipInterface = MembershipLike;
+export type MembershipLike = Membership;
 
 
-export class Membership extends UniffiAbstractObject implements MembershipLike {
+export class Membership extends UniffiAbstractObject {
 
     readonly [uniffiTypeNameSymbol] = "Membership";
     readonly [destructorGuardSymbol]: UniffiGcObject;

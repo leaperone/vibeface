@@ -20,9 +20,9 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> 
 
 /**
  * A question waiting on the person, in its chat and in 待处理: tap a choice or type an answer. Answered, it is one line.
- * `answer`: what the chat already holds for it. `inbox`: also names the bot and links to its chat.
+ * `answer`: what the chat already holds for it. `inbox`: also names the bot and links to its chat. `inTask`: inside the task's own panel, which already names the task and device.
  */
-export function QuestionCard({ question, answer, inbox = false }: { question: Question; answer?: string; inbox?: boolean }) {
+export function QuestionCard({ question, answer, inbox = false, inTask = false }: { question: Question; answer?: string; inbox?: boolean; inTask?: boolean }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const action = useAction()
@@ -64,16 +64,16 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
     tone={tone}
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{question.text}</span></>}
   >
-    <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
+    {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
       {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
       </Link> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>
       {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">
-        <BotAvatar id={question.bot.bot_id} name={question.bot.name} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        <BotAvatar name={question.bot.name} primary={workspace.primary === question.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       </Link> : null}
-    </p>
+    </p>}
     {pending ? <p role="status" className="flex min-w-0 flex-wrap items-center gap-x-2 text-meta text-muted-foreground">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0 text-warning" />
       <span className="min-w-0 truncate text-foreground">{pending.text}</span>
@@ -113,9 +113,9 @@ export function QuestionCard({ question, answer, inbox = false }: { question: Qu
 const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-card px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"
 const badge = "grid size-7 shrink-0 place-items-center rounded-md text-meta font-semibold tabular-nums"
 
-/** `compact`: on a phone only the icon shows, so the line keeps to one row. */
+/** `compact`: on a phone it gives way to the task link, so the line keeps to one row. */
 function Meta({ icon: Icon, label, title, compact = false, children }: { icon: LucideIcon; label: string; title?: string; compact?: boolean; children: ReactNode }) {
-  return <span className="inline-flex min-w-0 items-center gap-1" title={title}>
-    <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{label} </span><span className={compact ? "truncate max-sm:sr-only" : "truncate"}>{children}</span>
+  return <span className={compact ? "inline-flex min-w-0 items-center gap-1 max-sm:hidden" : "inline-flex min-w-0 items-center gap-1"} title={title}>
+    <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{label} </span><span className="truncate">{children}</span>
   </span>
 }

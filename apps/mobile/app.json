@@ -10,6 +10,9 @@
     ],
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+    "experiments": {
+      "autolinkingModuleResolution": true
+    },
     "ios": {
       "bundleIdentifier": "one.leaper.vibeface",
       "supportsTablet": true,

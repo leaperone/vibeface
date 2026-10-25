@@ -51,8 +51,8 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
 
   return <>
-  <div aria-hidden="true" onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
-  <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:shadow-none">
+  <div aria-hidden="true" onClick={close} className="fixed inset-0 z-40 hidden bg-black/40 animate-in dark:bg-black/60 fade-in-0 motion-reduce:animate-none md:block lg:hidden" />
+  <aside ref={holdFocus} tabIndex={-1} aria-label="任务详情" className="fixed inset-0 z-40 flex flex-col bg-background outline-none md:left-auto md:z-50 md:w-[min(420px,90vw)] md:border-l md:bg-popover md:shadow-xl md:max-lg:animate-in md:max-lg:slide-in-from-right motion-reduce:animate-none lg:static lg:z-auto lg:w-[420px] lg:shrink-0 lg:bg-background lg:shadow-none">
     <header className="flex min-h-14 shrink-0 items-center gap-2 border-b px-4 py-2">
       <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       <h2 className="line-clamp-2 min-w-0 flex-1 text-heading font-semibold [overflow-wrap:anywhere]" title={work?.title}>{work?.title || "任务"}</h2>
@@ -68,7 +68,7 @@ export function TaskDetail({ botId, workId }: { botId: string; workId: string })
       {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。</p> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
-      {asking ? <QuestionCard question={asking} /> : null}
+      {asking ? <QuestionCard question={asking} inTask /> : null}
       {stop ? <div className="grid gap-2">
         {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="destructive" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>

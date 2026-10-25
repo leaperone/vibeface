@@ -435,4 +435,4 @@ vibeface service uninstall --data-dir "$HOME/.vibeface"
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 1，数据库 `user_version` 为 1，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 3，数据库 `user_version` 为 3，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。

@@ -14,7 +14,7 @@ export type DeviceKeys = {
   remove(): Promise<void>
   sign(message: Uint8Array): Promise<string>
 }
-export type ConnectOptions = {
+type ConnectOptions = {
   onEvent?: (event: unknown) => void
   onClose?: (error: unknown) => void
   signal?: AbortSignal

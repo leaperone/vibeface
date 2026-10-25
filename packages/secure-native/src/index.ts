@@ -12,7 +12,7 @@ export interface NativeIdentity extends SecureIdentity {
   signMessage(message: Uint8Array): string
 }
 
-export type NativeSecure = Omit<SecureApi, 'Identity'> & {
+type NativeSecure = Omit<SecureApi, 'Identity'> & {
   Identity: { generate(): NativeIdentity; fromSecretHex(secret: string): NativeIdentity }
 }
 
@@ -28,7 +28,7 @@ function call<T>(run: () => T): T {
 }
 
 function toBuffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  return new Uint8Array(bytes).buffer
 }
 
 function unwrap(identity: SecureIdentity): ffi.Identity {
@@ -38,11 +38,11 @@ function unwrap(identity: SecureIdentity): ffi.Identity {
 
 class Identity implements NativeIdentity {
   static generate(): Identity {
-    return new Identity(call(() => ffi.Identity.generate()) as ffi.Identity)
+    return new Identity(call(() => ffi.Identity.generate()))
   }
 
   static fromSecretHex(secret: string): Identity {
-    return new Identity(call(() => ffi.Identity.fromSecretHex(secret)) as ffi.Identity)
+    return new Identity(call(() => ffi.Identity.fromSecretHex(secret)))
   }
 
   private constructor(readonly native: ffi.Identity) {}
@@ -97,7 +97,7 @@ class Handshake implements SecureHandshake {
   }
 
   finish(): SecureChannel {
-    return new Channel(call(() => this.native.finish()) as ffi.Channel)
+    return new Channel(call(() => this.native.finish()))
   }
 
   isFinished(): boolean {
@@ -174,7 +174,5 @@ export const secure: NativeSecure = {
   verify: (deviceId, domain, payload, signature) =>
     call(() => ffi.verify(deviceId, domain, toBuffer(payload), signature)),
   verifyMembership: (stateJson, expectedNetwork) =>
-    new Membership(call(() => ffi.verifyMembership(stateJson, expectedNetwork)) as ffi.Membership),
+    new Membership(call(() => ffi.verifyMembership(stateJson, expectedNetwork))),
 }
-
-secure satisfies SecureApi

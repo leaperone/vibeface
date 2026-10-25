@@ -85,7 +85,7 @@ function LogsPage() {
     </div>
     <InlineError error={error} />
     {records === null ? null : records.length === 0
-      ? <EmptyState icon={ScrollText} title="没有符合条件的记录"
+      ? <EmptyState icon={ScrollText} title={level || sources.length || query ? "没有符合条件的记录" : "还没有日志"}
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
@@ -107,7 +107,7 @@ function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord
   const look = levelLook[record.level]
   const ids: Array<[string, string | undefined]> = [['对话', chat ?? record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]
   return <li>
-    <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-muted/50 focus-visible:bg-muted/50 outline-none">
+    <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
       <look.icon aria-label={look.label} className={cn('mt-0.5 size-4 shrink-0', look.tone)} />
       <span className="grid min-w-0 flex-1 gap-1">
         <span className={cn('break-words', !open && 'line-clamp-2')}>{record.message || record.event}</span>

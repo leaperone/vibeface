@@ -19,8 +19,6 @@ const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
   works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
 }
-test("conversation navigation stays in the trusted web and carries no credentials", () => {
-})
 test("attachment names are signed clean and files once each in content order", () => {
   assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
   assert.equal(attachmentName("/\\"), "file", "a name with nothing left falls back")
@@ -40,7 +38,7 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
   assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false }] }), "Mac Studio")
-  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, recovery_key: "n", heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [] } }), "工作机")
+  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, recovery_key: "n", heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [], pending: null, stopped: [] } }), "工作机")
   assert.equal(nodeName(id), "另一台设备")
 })
 

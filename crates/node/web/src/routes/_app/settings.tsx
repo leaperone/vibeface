@@ -9,7 +9,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
-import { CurrentRecoveryFile, RecoveredStep, RecoveryControls, RecoveryReview, useJustRecovered } from '@/features/identity/recovery-controls'
+import { CurrentRecoveryFile, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -26,7 +26,6 @@ function SettingsPage() {
   const [leaving, setLeaving] = useState(false)
   const [range, setRange] = useState(86_400_000)
   const [exported, setExported] = useState<'idle' | 'busy' | 'done'>('idle')
-  const recovered = useJustRecovered()
   useEffect(() => {
     if (exported !== 'done') return
     const timer = setTimeout(() => setExported('idle'), 2000)
@@ -47,12 +46,12 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
-    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : recovered ? <RecoveredStep /> : <SettingsGroup title="恢复" footer="恢复文件只有一份有效，丢了不能补">
+    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="恢复" footer="恢复文件只有一份有效，丢了不能补">
       <CurrentRecoveryFile />
       <RecoveryControls />
     </SettingsGroup> : null}
     {operator ? <SettingsGroup title="排障" footer="诊断包不含登录信息和加入链接">
-      <Link to="/settings/logs" className="block transition-colors outline-none hover:bg-muted/50 focus-visible:bg-muted/60">
+      <Link to="/settings/logs" className="interactive-row block">
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
       <SettingsRow icon={Download} label="诊断包">

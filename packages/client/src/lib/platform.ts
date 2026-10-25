@@ -21,6 +21,8 @@ export type LocalPage = {
   origin: string
   /** The invitation or local launch in the address the page opened with, read once and cleared from it. */
   takeLaunch(): { invitation: string; localLaunch: LocalLaunch | null }
+  /** Calls `listener` with each invitation opened later in this page; a link differing only in its hash does not reload it. */
+  watchInvitation(listener: (invitation: string) => void): () => void
   /** This computer's setup on localhost, `null` anywhere else. */
   discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null>
   /** The cookie-bound local session of this page, exchanged from `launch` when given. */
@@ -29,7 +31,7 @@ export type LocalPage = {
   open(url: string): void
 }
 /** Instances of the app on one device that share its storage; one leads and settles the outbox. */
-export type JoinTabs = <T>(name: string, handlers: { lead(): void | (() => void); message(value: T): void }) => { post(value: T): void; close(): void }
+type JoinTabs = <T>(name: string, handlers: { lead(): void | (() => void); message(value: T): void }) => { post(value: T): void; close(): void }
 
 /** What differs between the browser and the phone; everything else in this package is shared. */
 export type Platform = {

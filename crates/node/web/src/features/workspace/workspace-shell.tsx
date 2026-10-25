@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, RotateCw, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, Inbox, LoaderCircle, MonitorSmartphone, Plus, RefreshCw, RotateCw, Settings, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "cn"
@@ -21,7 +21,7 @@ import { BotPanelButton } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
 import { backTo } from "@vibeface/client/workspace/home.ts"
-import { addressName } from "@vibeface/client/workspace/labels.ts"
+import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { LocalSession } from "./local-session"
 
 export function WorkspaceShell({ children }: { children: ReactNode }) {
@@ -39,6 +39,7 @@ const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
 
+const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": "待处理", "/devices": "我的设备", "/settings": "设置", "/settings/logs": "日志" }
 
 function WorkspaceLayout({ children }: { children: ReactNode }) {
@@ -71,6 +72,18 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
     const timer = setInterval(refresh, 30_000)
     return () => clearInterval(timer)
   }, [device.ready])
+  // Each request toasts once, also across reloads of this tab; on a page that lists it, seeing it there counts.
+  const joinIds = joins.map((join) => join.join_id).join()
+  useEffect(() => {
+    if (!joinIds) return
+    let seen: string[] = []
+    try { seen = JSON.parse(sessionStorage.getItem(JOINS_SEEN) ?? "[]") } catch {}
+    const fresh = joins.filter((join) => !seen.includes(join.join_id))
+    if (!fresh.length) return
+    try { sessionStorage.setItem(JOINS_SEEN, JSON.stringify([...seen, ...fresh.map((join) => join.join_id)].slice(-50))) } catch {}
+    if (pathname === "/devices" || pathname === "/inbox") return
+    for (const join of fresh) toast(`${join.name || "新设备"} 想加入`, { icon: MonitorSmartphone, action: { label: "查看", onClick: () => { void navigate({ to: "/devices" }) } } })
+  }, [joinIds, pathname])
   useEffect(() => { if (workspace.noticeText) toast(workspace.noticeText) }, [workspace.noticeText])
   useEffect(() => { if (workspace.error) toast(workspace.error.text, { tone: "danger", action: workspace.error.retry ? { label: "重试", onClick: workspace.error.retry } : undefined }) }, [workspace.error])
 
@@ -105,7 +118,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
-                        <BotAvatar id={bot.bot_id} name={bot.name} size="sm" />
+                        <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
                         {workspace.primary === bot.conversation_id ? <span title="主 Bot" className="inline-flex shrink-0"><Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
                         {marked ? <Dot label="有新进展" /> : null}
@@ -153,7 +166,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
             <Link to="/inbox" aria-label={waiting ? `待处理 ${waiting}` : "待处理"} title="待处理">
               <Inbox aria-hidden="true" />
-              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 md:-top-0.5 md:-right-0.5" /> : null}
+              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
           </div>
@@ -212,7 +225,7 @@ export function ConnectionCapsule() {
         : { label: "在线", icon: Wifi, tone: "text-success" }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
         <span className="min-w-0 flex-1 truncate">{name}</span>
         <span className={cn("shrink-0", state.tone)}>{state.label}</span>
@@ -221,7 +234,7 @@ export function ConnectionCapsule() {
     <Popover.Portal>
       <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">访问地址</p>
-        <p className="break-all text-muted-foreground">{address}</p>
+        <p className="break-all text-muted-foreground" title={address}>{hostOf(address) || address}</p>
         {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><ShieldCheck aria-hidden="true" className="size-4" />端到端加密，已验证设备</p> : null}
@@ -229,7 +242,7 @@ export function ConnectionCapsule() {
         {others.length ? <>
           <p className="mt-1 font-medium">换一台设备</p>
           <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={`${item.address}:${item.device_id}`}>
-            <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
+            <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted active:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
               <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(item.address)}</span>
               <ArrowRightLeft aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             </button>
@@ -250,21 +263,29 @@ export function ConnectionCapsule() {
 /** Same layout as the workspace, shown while the browser loads its keys and connects. */
 /** `home`: the conversation list loads on a phone, the last conversation on a wide screen. */
 export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: { retry?: number | null; onRetry?: () => void; onLeave?: () => void; home?: boolean } = {}) {
-  const status = retry === null
-    ? <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
-    : <><WifiOff aria-hidden="true" className="size-4" />连不上，{retry} 秒后重试</>
-  return <div className="flex h-dvh" aria-busy={retry === null}>
+  // A tap on reconnect holds the offline view with a turning icon until the attempt ends: connected, or a new countdown.
+  const [retrying, setRetrying] = useState(false)
+  useEffect(() => { if (retry !== null) setRetrying(false) }, [retry])
+  const shown = useRef(retry)
+  if (retry !== null) shown.current = retry
+  const offline = retry !== null || retrying
+  // Offline, the page says it once in the middle; the corner status is only for a connection still in progress.
+  const status = offline ? null : <><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />连接中</>
+  return <div className="flex h-dvh" aria-busy={!offline}>
     <div className="hidden w-64 shrink-0 flex-col gap-3 border-r bg-sidebar p-4 md:flex">
       <Wordmark />
       <Skeleton className="mt-2 h-9" /><Skeleton className="h-4 w-12" /><Skeleton className="h-9" /><Skeleton className="h-9" />
-      <div className={cn("mt-auto flex items-center gap-2 px-2 text-meta", retry === null ? "text-info" : "text-muted-foreground")} role="status">{status}</div>
+      {status ? <div className="mt-auto flex items-center gap-2 px-2 text-meta text-info" role="status">{status}</div> : null}
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} /><span className={cn("ml-auto flex items-center gap-2 text-meta md:hidden", retry === null ? "text-info" : "text-muted-foreground")}>{status}</span></div>
-      {retry !== null ? <EmptyState icon={WifiOff} title="连不上设备" className="my-auto" action={<div className="flex flex-wrap justify-center gap-2">
-        {onRetry ? <Button type="button" onClick={onRetry}><RotateCw aria-hidden="true" />立即重连</Button> : null}
+      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} />{status ? <span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden">{status}</span> : null}</div>
+      {offline ? <div className="my-auto"><EmptyState icon={WifiOff} title="连不上设备" action={<div className="grid justify-items-center gap-3">
+        <p className="flex items-center gap-1 text-meta text-muted-foreground"><span role="status">{retrying ? "正在重连" : `${shown.current} 秒后自动重试`}</span>
+          {onRetry ? <Button type="button" variant="ghost" size="icon-sm" className="hit-area relative text-muted-foreground" aria-label="立即重连" title="立即重连" disabled={retrying} aria-busy={retrying || undefined}
+            onClick={() => { setRetrying(true); onRetry() }}><RefreshCw aria-hidden="true" className={cn(retrying && "animate-spin")} /></Button> : null}
+        </p>
         {onLeave ? <Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button> : null}
-      </div>} /> : <>
+      </div>} /></div> : <>
         {onLeave ? <div className="flex justify-center px-4 pt-6"><Button type="button" variant="ghost" onClick={onLeave}>换个方式连接</Button></div> : null}
         {home ? <div className="grid gap-2 p-4 md:hidden" aria-hidden="true">{[0, 1, 2, 3].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div> : null}
         <div className={cn("contents", home && "max-md:hidden")}><ChatSkeleton /></div>

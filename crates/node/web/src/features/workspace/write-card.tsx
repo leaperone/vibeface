@@ -22,7 +22,6 @@ function Steps({ items }: { items: string[] }) {
   return <ol className="grid list-decimal gap-1 ps-5 text-muted-foreground">{items.map((item) => <li key={item}>{item}</li>)}</ol>
 }
 
-/** 只读确认 and the two copies of a device's records, from docs/design/unified-network.md 5.7 and 5.8. */
 export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const workspace = useWorkspace()
   const device = useDevice()

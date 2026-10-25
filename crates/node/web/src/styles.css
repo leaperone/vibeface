@@ -8,6 +8,19 @@
 @custom-variant dark (&:where(.dark, .dark *));
 @custom-variant light (&:where(:not(.dark)));
 
+/* A tappable list row: tinted on hover, darker while pressed, an inset ring on keyboard focus so a card's overflow cannot clip it. */
+@utility interactive-row {
+  outline: none;
+  transition-property: background-color, color, box-shadow;
+  transition-duration: var(--default-transition-duration);
+  transition-timing-function: var(--default-transition-timing-function);
+  @media (hover: hover) {
+    &:hover { background-color: color-mix(in oklch, var(--muted) 60%, transparent); }
+  }
+  &:focus-visible { background-color: color-mix(in oklch, var(--muted) 60%, transparent); box-shadow: inset 0 0 0 2px color-mix(in oklch, var(--ring) 50%, transparent); }
+  &:active { background-color: var(--muted); }
+}
+
 /* A small control keeps its look but takes a 44px touch; the element must be positioned. */
 @utility hit-area {
   &::after {
@@ -51,6 +64,9 @@ body {
   --shadow-sm: var(--elevation-sm);
   --shadow-lg: var(--elevation-lg);
   --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: var(--ease-out);
 }
 
 :root {
@@ -60,6 +76,14 @@ body {
   --elevation-sm: 0 1px 2px oklch(0.2 0.02 270 / 0.05), 0 2px 8px -2px oklch(0.2 0.02 270 / 0.07);
   --elevation-lg: 0 2px 4px oklch(0.2 0.02 270 / 0.04), 0 12px 32px -8px oklch(0.2 0.02 270 / 0.18);
 }
+
+/* Dark: the workspace sidebar is lifted a step above the page, as a card is, and a hairline parts them. Web only; the shared theme and the sign-in page keep theirs. */
+:root.dark .workspace-shell {
+  --sidebar: oklch(0.2 0.007 270);
+  --sidebar-accent: oklch(0.26 0.009 270);
+  --sidebar-border: oklch(1 0 0 / 10%);
+}
+.workspace-shell [data-slot="sidebar-container"] { border-color: var(--sidebar-border); }
 
 :root.dark {
   --elevation-xs: 0 1px 2px oklch(0 0 0 / 0.3);
@@ -71,6 +95,14 @@ body {
   * {
     @apply border-border outline-ring/50;
   }
+  /* Raw links and buttons fade their hover instead of snapping; a utility transition on the element still wins. */
+  :where(a, button, summary, label, [role=button], [role=radio]) {
+    transition-property: color, background-color, border-color, text-decoration-color, box-shadow, opacity;
+    transition-duration: var(--default-transition-duration);
+    transition-timing-function: var(--default-transition-timing-function);
+  }
+  /* One keyboard ring for everything that does not draw its own: components that do set outline-none. */
+  :focus-visible { outline: 2px solid color-mix(in oklch, var(--ring) 70%, transparent); outline-offset: 2px; }
   body {
     @apply bg-background text-foreground;
   }
@@ -134,9 +166,6 @@ svg.lucide { stroke-width: 1.75; }
 .switch:checked::before { transform: translateX(1rem); }
 .switch:disabled { cursor: not-allowed; opacity: .35; }
 .switch:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
-
-.bot-avatar { background: oklch(0.94 0.045 var(--avatar-hue)); color: oklch(0.42 0.13 var(--avatar-hue)); box-shadow: inset 0 0 0 1px oklch(0.42 0.13 var(--avatar-hue) / 0.1); }
-.dark .bot-avatar { background: oklch(0.31 0.06 var(--avatar-hue)); color: oklch(0.9 0.08 var(--avatar-hue)); box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.06); }
 
 /* Streaming reply: three dots that breathe in turn. */
 .typing-dots { display: inline-flex; align-items: center; gap: 4px; height: 1.5rem; color: var(--muted-foreground); }

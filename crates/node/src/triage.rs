@@ -433,8 +433,6 @@ pub struct OutboxEntry {
     pub state: Delivery,
     pub attempts: u32,
     pub next_ms: i64,
-    pub created_ms: i64,
-    pub last_error: Option<String>,
 }
 
 impl OutboxEntry {
@@ -445,19 +443,15 @@ impl OutboxEntry {
             state: Delivery::Pending,
             attempts: 0,
             next_ms: now_ms,
-            created_ms: now_ms,
-            last_error: None,
         }
     }
 
     /// Applies one attempt's result: an HTTP status, or `None` when the request failed.
-    pub fn record(&mut self, status: Option<u16>, error: Option<String>, now_ms: i64) {
+    pub fn record(&mut self, status: Option<u16>, now_ms: i64) {
         self.attempts += 1;
-        self.last_error = error.or_else(|| status.map(|s| format!("HTTP {s}")));
         let retry = match status {
             Some(200..=299) => {
                 self.state = Delivery::Delivered;
-                self.last_error = None;
                 return;
             }
             None | Some(408 | 429 | 500..=599) => true,
@@ -682,22 +676,22 @@ mod tests {
     #[test]
     fn outbox_retries_transient_failures_and_dead_letters_the_rest() {
         let mut entry = OutboxEntry::new("e", "{}".into(), 0);
-        entry.record(Some(503), None, 0);
+        entry.record(Some(503), 0);
         assert_eq!((entry.state, entry.next_ms), (Delivery::Pending, 10_000));
-        entry.record(None, Some("timeout".into()), 10_000);
+        entry.record(None, 10_000);
         assert_eq!(entry.next_ms, 30_000);
         for _ in 2..MAX_ATTEMPTS {
-            entry.record(Some(429), None, 0);
+            entry.record(Some(429), 0);
         }
         assert_eq!(
             (entry.state, entry.attempts),
             (Delivery::Dead, MAX_ATTEMPTS)
         );
         let mut rejected = OutboxEntry::new("e", "{}".into(), 0);
-        rejected.record(Some(401), None, 0);
+        rejected.record(Some(401), 0);
         assert_eq!((rejected.state, rejected.attempts), (Delivery::Dead, 1));
         let mut ok = OutboxEntry::new("e", "{}".into(), 0);
-        ok.record(Some(202), None, 0);
+        ok.record(Some(202), 0);
         assert_eq!(ok.state, Delivery::Delivered);
     }
 

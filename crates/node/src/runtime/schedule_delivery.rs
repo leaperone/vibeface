@@ -645,7 +645,6 @@ mod tests {
             settle(&[turn("r", "interrupted", false)]),
             Some(Some(JobState::Queued))
         );
-        // A read that does not show the target turn proves nothing.
         assert_eq!(settle(&[]), None);
         assert_eq!(settle(&[turn("x", "completed", false)]), None);
     }
@@ -671,7 +670,6 @@ mod tests {
             next(Some(&running), Some(5), None, 7),
             steering(None, Some(7))
         );
-        // One failure after a good read starts a new wait instead of ending as unknown.
         assert_eq!(
             next(None, None, Some(7), limit + 6),
             steering(Some(limit + 6), Some(7))
@@ -702,7 +700,6 @@ mod tests {
             };
             assert_eq!(next(None, Some(5), limit + 4), None);
             assert_eq!(next(None, Some(5), limit + 5), unknown);
-            // Failed reads in between do not restart the wait.
             assert_eq!(next(Some(limit), Some(5), limit + 5), unknown);
         }
     }

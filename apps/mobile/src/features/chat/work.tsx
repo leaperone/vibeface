@@ -114,7 +114,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
 const confirmIcons: Record<WorkCheck['reason'], LucideIcon> = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
 /** The person says whether a work its device cannot report finished, or that a leftover program stopped. Nothing is re-run. */
-export function ConfirmCard({ check }: { check: PendingCheck }) {
+function ConfirmCard({ check }: { check: PendingCheck }) {
   const shared = useLive()
   const { directory } = useDevice()
   const [note, setNote] = useState('')

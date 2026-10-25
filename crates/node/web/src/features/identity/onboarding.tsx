@@ -1,7 +1,7 @@
 import { useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
 import { Bot, MessageSquarePlus } from "lucide-react"
-import { BusyIcon, InlineError, Panel, Steps, Wordmark } from "@/components/app/kit"
+import { AuthPage, BusyIcon, InlineError, Panel, Steps } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AiSettings } from "@/features/devices/ai-settings"
@@ -28,25 +28,25 @@ export function Onboarding() {
     } catch (cause) { if (workspace.isCurrent()) setError(cause) }
     finally { if (workspace.isCurrent()) setBusy(false) }
   }
-  return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain">
-    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 py-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:min-h-full sm:content-center sm:py-16">
-      <header className="grid gap-3"><Wordmark /><Steps step={step} /></header>
-      {step === 3 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
-        <AiSettings onboarding onBot={setBotOn} />
+  return <AuthPage header={<Steps step={step} />}>
+    {step === 3 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
+      <AiSettings onboarding onBot={setBotOn} />
+      <div className="flex justify-between gap-2 border-t pt-4">
+        <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(4)}>稍后设置</Button>
+        <Button type="button" disabled={!botOn} onClick={() => setOnboardingStep(4)}>下一步</Button>
+      </div>
+    </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
+      <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("请填写名称。")) }}>
+        <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
+        <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">
-          <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(4)}>稍后设置</Button>
-          <Button type="button" disabled={!botOn} onClick={() => setOnboardingStep(4)}>下一步</Button>
-        </div>
-      </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
-        <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("请填写名称。")) }}>
-          <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
-          <InlineError error={error} />
-          <div className="flex justify-between gap-2">
-            <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={done}>跳过</Button>
+          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(3)}>上一步</Button>
+          <div className="flex gap-2">
+            <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
             <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />开始对话</Button>
           </div>
-        </form>
-      </Panel>}
-    </div>
-  </main>
+        </div>
+      </form>
+    </Panel>}
+  </AuthPage>
 }

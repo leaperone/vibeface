@@ -724,7 +724,6 @@ impl Session {
             PendingKind::Request(execute) => {
                 let _ = execute.reply.send(Err(CodexError {
                     uncertain: uncertain && pending.uncertain,
-                    // Only a reply error is failed as certain.
                     answered: !uncertain,
                     message: reason.into(),
                 }));

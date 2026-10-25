@@ -325,7 +325,6 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             &prompt,
             claimed.previous_native_id.as_deref(),
             move |id| async move {
-                // A new thread in place of the resumed one gets the fresh prompt.
                 if resumed_thread.is_some_and(|resumed| resumed != id)
                     && let Some(fresh) = fresh_shown
                 {
@@ -801,7 +800,6 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
     })
 }
 
-/// One work as the Agent reads it: target and place, latest progress, open questions, result.
 fn work_row(work: &WorkProjection) -> Value {
     json!({"work_id":work.work_id,"target_node":work.target_node,"kind":work.kind,"cwd":work.cwd,
         "prompt":prefix(&work.prompt,500),"phase":work.phase,"progress":prefix(&work.summary,500),
@@ -950,7 +948,6 @@ pub(crate) fn materialize(
         };
         (prompt, shown_works)
     };
-    // Works, then the checkpoint, then the oldest messages give way until the prompt fits.
     let mut budgets = [WORK_BUDGET, CHECKPOINT_BUDGET, MESSAGE_BUDGET];
     let (mut prompt, mut shown_works) = render(budgets);
     for index in 0..budgets.len() {
@@ -1007,8 +1004,6 @@ mod tests {
         assert_eq!(partial.text(), "hello\n\nworld");
     }
 
-    /// A Codex thread takes the model per turn, so a new model keeps it; new thread
-    /// instructions open a new one. Cursor keeps its session per model.
     #[test]
     fn the_session_key_follows_what_the_native_session_holds() -> Result<()> {
         let settings = |model: &str, provider| crate::config::ManagerSettings {
