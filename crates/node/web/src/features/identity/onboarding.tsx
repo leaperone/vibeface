@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AiSettings } from "@/features/devices/ai-settings"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { botReadiness } from "@vibeface/client/workspace/model.ts"
 import { finishOnboarding, setOnboardingStep, useOnboarding } from "./onboarding-flag"
 
 /** Steps 3 and 4 after creating a network here. Skipping step 3 still offers step 4; 待处理 and the composer point back to the device page. */
@@ -17,6 +18,7 @@ export function Onboarding() {
   const [busy, setBusy] = useState(false)
   const [botOn, setBotOn] = useState(false)
   const [error, setError] = useState<unknown>(null)
+  const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready")
   const done = () => { finishOnboarding(); void navigate({ to: "/" }) }
   async function create() {
     setBusy(true); setError(null)
@@ -43,7 +45,7 @@ export function Onboarding() {
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(3)}>上一步</Button>
           <div className="flex gap-2">
             <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
-            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />开始对话</Button>
+            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />{canReply ? "开始对话" : "创建"}</Button>
           </div>
         </div>
       </form>
