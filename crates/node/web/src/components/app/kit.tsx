@@ -1,6 +1,6 @@
 "use client"
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
 import { Bot, ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -98,11 +98,17 @@ export function AuthPage({ header, children }: { header?: ReactNode; children: R
   </main>
 }
 
+// For an element that replaces the control just pressed: focus would otherwise fall to <body>.
+export function claimFocus(node: HTMLElement | null) {
+  const active = node?.ownerDocument.activeElement
+  if (node && (!active || active === node.ownerDocument.body)) node.focus({ preventScroll: true })
+}
+
 /** One step of first-time setup: a raised card under an icon title. */
 export function Panel({ icon: Icon, title, busy = false, children }: { icon: LucideIcon; title: string; busy?: boolean; children: ReactNode }) {
   // A phone has no room for a frame inside the page's own margins, so there the card is only its content.
   return <section className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:rounded-2xl sm:border sm:bg-card sm:p-6 sm:shadow-sm">
-    <h2 className="flex items-center gap-3 text-title font-semibold"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className={cn("size-[1.125rem]", busy && "animate-spin")} /></span>{title}</h2>
+    <h2 ref={claimFocus} tabIndex={-1} className="flex items-center gap-3 text-title font-semibold outline-none"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className={cn("size-[1.125rem]", busy && "animate-spin")} /></span>{title}</h2>
     {children}
   </section>
 }
@@ -131,11 +137,11 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
 
 /** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
 /** `stacked`: on a phone the control gets its own full line under the label, lined up with it. */
-export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false }: {
-  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean
+export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false, ref }: {
+  icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean; ref?: Ref<HTMLButtonElement>
 }) {
   const end = children ? <span className={cn("ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground", stacked && "max-sm:basis-full max-sm:ps-11")}>{children}</span> : null
-  if (onClick) return <button type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
+  if (onClick) return <button ref={ref} type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
     <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
   </button>
@@ -163,10 +169,23 @@ export function Segmented<T extends string>({ label, value, options, onChange, d
   label: string; value: T; options: Array<{ value: T; label: string; icon?: LucideIcon }>; onChange(value: T): void; disabled?: boolean; labels?: boolean
   /** On a phone, spread the options evenly across the full width. */ fill?: boolean
 }) {
-  return <div role="radiogroup" aria-label={label} className={cn("inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
-    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined} disabled={disabled}
-      onClick={() => { if (option !== value) onChange(option) }}
-      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 disabled:opacity-50 max-md:h-11 max-md:px-3",
+  // WAI-ARIA radio group: one Tab stop on the checked option, arrows move and select.
+  const tabStop = options.some((option) => option.value === value) ? value : options[0]?.value
+  const move = (event: KeyboardEvent<HTMLDivElement>) => {
+    const step = ({ ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 } as Record<string, number | undefined>)[event.key]
+    if (disabled || (!step && event.key !== "Home" && event.key !== "End")) return
+    event.preventDefault()
+    const radios = [...event.currentTarget.querySelectorAll<HTMLElement>("[role=radio]")]
+    const current = radios.indexOf(event.target as HTMLElement)
+    const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : (current + step! + options.length) % options.length
+    radios[next]?.focus()
+    if (options[next].value !== value) onChange(options[next].value)
+  }
+  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
+    {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} tabIndex={option === tabStop ? 0 : -1} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined}
+      // Not `disabled`: a choice that saves disables the group while it does, and a disabled button drops focus to <body>.
+      aria-disabled={disabled || undefined} onClick={() => { if (!disabled && option !== value) onChange(option) }}
+      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 aria-disabled:opacity-50 max-md:h-11 max-md:px-3",
         Icon && !labels && "max-sm:w-11 max-sm:px-0",
         value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
       {Icon ? <><Icon aria-hidden="true" className="size-4" /><span className={labels ? undefined : "max-sm:hidden"}>{text}</span></> : text}

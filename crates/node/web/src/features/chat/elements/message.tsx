@@ -77,7 +77,8 @@ export function Message({ message, schedule, last = true, retry }: { message: Ch
       {schedule === '定时任务' ? null : <span className="sr-only">定时任务：</span>}
       <span className="min-w-0 truncate">{schedule}</span>
     </span> : null}
-    <div title={full} className="w-full min-w-0">
+    {/* Every streamed chunk redraws the reply inside the chat log, which would read it from the top each time; the finished reply lands as a new entry and is read once. */}
+    <div title={full} aria-live={message.state === 'streaming' ? 'off' : undefined} className="w-full min-w-0">
       <span className="sr-only">Bot：</span>
       <Markdown text={message.text} />
     </div>

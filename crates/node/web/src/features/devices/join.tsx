@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { ActionCard, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -50,6 +50,9 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
     void action.run("start", () => device.startApproval(request.join_id))
   }, [auto, request.status, request.join_id])
   const busy = action.busy !== null
+  // 显示安全码 is disabled while it works, which drops focus to <body>; once the code is up, 允许 is the next step.
+  const allow = useRef<HTMLButtonElement>(null)
+  useEffect(() => { if (request.code && !busy && allow.current && document.activeElement === document.body) allow.current.focus() }, [request.code, busy])
   // Only the admin that started the comparison can allow it (the Node enforces this too).
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   return <ActionCard
@@ -60,7 +63,7 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", () => device.rejectJoin(request.join_id), "已拒绝")}>拒绝</Button>
       {request.status === "pending" && !auto ? <Button type="button" disabled={busy} onClick={() => void action.run("start", () => device.startApproval(request.join_id))}>{action.busy === "start" ? "处理中" : "显示安全码"}</Button>
-      : <Button type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.(request.name || "新设备") }, onAllowed ? undefined : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
+      : <Button ref={allow} type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.(request.name || "新设备") }, onAllowed ? undefined : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
     <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的比对，不一致就拒绝" : "等新设备显示安全码"}</p>

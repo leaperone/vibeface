@@ -1,9 +1,9 @@
 "use client"
 
-import { useState, type ReactNode } from "react"
+import { useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
 import { ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
-import { ActionCard, BotAvatar, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
+import { ActionCard, BotAvatar, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -28,10 +28,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const action = useAction()
   const navigate = useNavigate()
   const [text, setText] = useState("")
+  // Answered here, the card turns into one line and the pressed choice goes with it; that line takes the focus.
+  const answering = useRef(false)
   const id = question.question_id
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
-  if (settled) return <p role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
+  if (settled) return <p ref={answering.current ? claimFocus : undefined} tabIndex={-1} role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 outline-none flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
       <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
@@ -50,6 +52,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const shown = question.choices
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   const send = (key: string, value: string) => action.run(key, async () => {
+    answering.current = true
     const result = await workspace.answer(question, value)
     if (result.status === "already_answered" && result.text !== value.trim()) workspace.announce("这个问题已经回答过了")
     else if (inbox) settledToast()
