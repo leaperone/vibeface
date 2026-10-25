@@ -212,7 +212,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
    `Host` 必须是 `public_url` 的主机名，Node 会拒绝其他 Host。
 
-4. 通过安全通道把服务器上的 `entry-token` 复制到个人电脑的 `~/vb-entry-token`，并执行 `chmod 600 ~/vb-entry-token`。
+4. 把公共入口服务器上的 `entry-token` 复制到个人电脑，例如 `scp user@vb.example.com:.vibeface-entry/entry-token ~/vb-entry-token && chmod 600 ~/vb-entry-token`。
 
 5. 在个人电脑上初始化 Node 时指向公共入口，然后启动：
 
@@ -260,7 +260,7 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
-公网 Node 承担 relay 角色。例如服务器用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
+公网 Node 承担 relay 角色。例如在服务器上用反向代理把 `https://relay.example` 转到本机 `127.0.0.1:3340`，并允许 WebSocket 升级：
 
 ```sh
 vibeface init --data-dir "$HOME/.vibeface" \
