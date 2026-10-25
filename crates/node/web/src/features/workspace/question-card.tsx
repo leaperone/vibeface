@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, Laptop, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BotAvatar, BusyIcon, InlineError, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -69,7 +69,9 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
       </Link> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
-      <Meta icon={question.about.node === ready?.entry.device_id ? Laptop : Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>
+      {/* As on task rows, only another device is named on screen. */}
+      {question.about.node === ready?.entry.device_id ? <span className="sr-only">设备 {node}</span>
+        : <Meta icon={Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>}
       {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
         <BotAvatar name={question.bot.name} primary={workspace.primary === question.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       </Link> : null}
