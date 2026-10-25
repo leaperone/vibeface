@@ -134,7 +134,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
 }) {
   const downloaded = !download || download.done
   return <>
-    <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />文件用恢复密码加密，没有密码打不开</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />没有恢复密码，这个文件打不开</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
@@ -164,7 +164,7 @@ export function UnsavedRecoveryFile() {
 
 /** This browser's recovery while it waits on the Node, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
-  const { recovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
+  const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
     <p className="text-muted-foreground">刚下载的新文件用不了</p>
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
@@ -176,7 +176,11 @@ export function RecoveryWaiting() {
       <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>生效后自动进入</p>
     </>}
     <p className="flex items-center gap-2 text-muted-foreground"><ShieldAlert aria-hidden="true" className="size-4 shrink-0" />期间你的其他设备可以拦下</p>
-    <UnsavedRecoveryFile />
+    {/* Saving the new file is a separate thing to do now, not part of the wait. */}
+    {unsavedRecovery ? <section className="grid gap-3 border-t pt-4">
+      <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />保存新的恢复文件</h3>
+      <UnsavedRecoveryFile />
+    </section> : null}
   </Panel>
 }
 

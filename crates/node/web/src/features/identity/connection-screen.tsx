@@ -228,7 +228,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const membership = device.error === NOT_JOINED || device.error === BROWSER_REMOVED ? device.error : ''
   const deviceError = membership ? '' : device.error
   const quiet = notice || (!error ? membership : '')
-  const alert = error || deviceError && device.phase !== 'reconnecting' ? <InlineError error={error || deviceError} />
+  const failed = Boolean(error || deviceError && device.phase !== 'reconnecting')
+  const alert = failed ? <InlineError error={error || deviceError} />
     : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
@@ -243,6 +244,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </div> : null
 
   let body: ReactNode
+  // The join card holds its own failure, next to where a new link goes in.
+  let alertInBody = false
   if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请用本机地址或 HTTPS 打开" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
@@ -271,34 +274,39 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     </li>)}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
-  else body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : '加入我的设备'}>
-    {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
-      <fieldset disabled={linking || !usable} className="grid gap-4">
-        {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
-        {purpose === 'empty' || purpose === 'invalid' ? <>
-          <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? '或粘贴加入链接' : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
-          {purpose === 'invalid' ? <p role="alert" className="flex items-center gap-2 text-meta text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />这不是有效的加入链接</p> : null}
-        </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
-          <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
-          <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>
-          <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
-        </p>}
-        {thisComputer
-          ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
-          : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
-        {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
-      </fieldset>
-    </form>}
-    <p className="text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>
-    {publicEntry || thisComputer ? null : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
-  </Panel>
+  else {
+    alertInBody = true
+    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : '加入我的设备'}>
+      {/* A failure already says where to go next. */}
+      {failed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
+      {alert}
+      {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
+        <fieldset disabled={linking || !usable} className="grid gap-4">
+          {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
+          {purpose === 'empty' || purpose === 'invalid' ? <>
+            <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? '或粘贴加入链接' : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
+            {purpose === 'invalid' ? <p role="alert" className="flex items-center gap-2 text-meta text-danger"><CircleAlert aria-hidden="true" className="size-4 shrink-0" />这不是有效的加入链接</p> : null}
+          </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+            <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
+            <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>
+            <Button type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
+          </p>}
+          {thisComputer
+            ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" key={hostName} defaultValue={formerName || hostName || defaultComputerName()} /></Field>
+            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
+          {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
+        </fieldset>
+      </form>}
+      {publicEntry || thisComputer ? null : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
+    </Panel>
+  }
 
   return <AuthPage header={<>
     {standalone() && !device.entries.length && !focused ? <p className="text-meta text-muted-foreground">主屏幕上的 Vibeface 需要单独加入一次</p> : null}
     {step ? <Steps step={step} /> : null}
   </>}>
     {linking && !focused ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />{device.phase === 'reconnecting' ? '正在重连' : '连接中'}</p> : null}
-    {alert}
+    {alertInBody ? null : alert}
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
     {device.identity && !focused ? <Details key={step ?? active}>
@@ -400,7 +408,7 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <p className="flex items-center gap-2 text-success"><ShieldCheck aria-hidden="true" className="size-4 shrink-0" />已确认是你的设备「{device.info.name}」</p> : null}
+    {device.info ? <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="truncate">已连上你的「{device.info.name}」</span></p> : null}
     <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
