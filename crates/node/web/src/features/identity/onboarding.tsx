@@ -39,9 +39,12 @@ export function Onboarding() {
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("请填写名称。")) }}>
         <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
         <InlineError error={error} />
-        <div className="flex justify-between gap-2">
-          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={done}>跳过</Button>
-          <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />开始对话</Button>
+        <div className="flex justify-between gap-2 border-t pt-4">
+          <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(3)}>上一步</Button>
+          <div className="flex gap-2">
+            <Button type="button" variant="ghost" disabled={busy} onClick={done}>跳过</Button>
+            <Button type="submit" disabled={busy || !workspace.writable}><BusyIcon busy={busy} />开始对话</Button>
+          </div>
         </div>
       </form>
     </Panel>}
