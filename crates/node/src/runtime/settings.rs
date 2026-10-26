@@ -682,7 +682,7 @@ impl Runtime {
                 agent: SETTINGS_AGENT.into(),
                 session_id: format!("provider-setup-{}", &question_id[2..18]),
                 cwd: String::new(),
-                summary: "AI 设置".into(),
+                summary: "Bot 与任务".into(),
                 request_id: None,
             },
         };

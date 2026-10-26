@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, TriangleAlert, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, EmptyState, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { humanError, taskError } from '@vibeface/client/lib/errors.ts'
+import { taskError } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
@@ -25,8 +25,9 @@ import { canSend, composerHint, threadReplies } from '@vibeface/client/chat/prot
 import './chat.css'
 
 const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
-const replyStates: Record<string, string> = { failed: '回复失败', rejected: '没有处理' }
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
+// The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
+const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
 
@@ -124,7 +125,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
-      if ((job.state === 'failed' || job.state === 'rejected') && !replied.has(job.reply_message_id ?? '')) entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+      if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
+      // Only a click sends it again, as a new message; once it is sent this message is no longer the newest.
+      const again = message.role === 'user' && message.message_id === newest?.message_id && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
+      entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
     const turn = placedChanges.after.get(message.message_id)
@@ -145,10 +149,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.
   const remote = data?.scheduler?.remote
-  if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" title={nodeName(remote.owner, lookup)} className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="size-4" />状态未知</p> })
+  if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
   // A question waiting on the person is the status already; a spinner under it would say the bot is still thinking.
   const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
-  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</p> })
+  const stopping = activeJobs.some((job) => job.state === 'cancelling')
+  if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <><CircleStop aria-hidden="true" className="size-4" />正在停止…</>
+    : <><LoaderCircle aria-hidden="true" className={`size-4 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />{status ? progressLabel(status) : '思考中'}</>}</p> })
   entries.push(...waiting)
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
@@ -238,7 +244,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       {bot ? <PromptInput
         above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <terms.inbox.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
         hint={hint}
@@ -279,7 +285,7 @@ type TaskRow = { id: string; state: string; device: string; summary: string; tri
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  const result = task.work.result_text ? firstLine(task.work.result_text) : task.work.failure_reason ? taskError(task.work.failure_reason).split('\n')[0] : ''
+  const result = task.work.result_text ? firstLine(task.work.result_text) : task.work.failure_reason ? failureReason(task.work.failure_reason) : ''
   const title = task.work.title || '任务'
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
@@ -290,9 +296,10 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   </Link></div>
   return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
+      : task.state === 'stop_timed_out' ? <TriangleAlert aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
     <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} className="text-meta" /></span>
-      {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">并入「{task.joined}」</span></span>
+      {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
         : taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
   </Link></div>
@@ -341,10 +348,11 @@ function ReplyCause({ raw }: { raw: string }) {
   return <Details className="-mt-2">{raw}</Details>
 }
 
-function JobLine({ job }: { job: ManagerJob }) {
-  return <p className="flex min-w-0 items-center gap-2 text-meta text-danger">
-    <CircleX aria-hidden="true" className="size-4 shrink-0" />
-    <span className="shrink-0">{replyStates[job.state] ?? '回复失败'}</span>
-    {job.error ? <span className="min-w-0 truncate" title={job.error}>{humanError(job.error.split('\n')[0], undefined, '这次回复')}</span> : null}
-  </p>
+/** `retry`: sends the message again as a new one; only offered while it is the newest. */
+function JobLine({ job, retry }: { job: ManagerJob; retry?: () => Promise<void> }) {
+  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+    <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
+    {job.error ? <span className="min-w-0 truncate text-muted-foreground" title={job.error}>{failureReason(job.error)}</span> : null}
+    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
+  </div>
 }

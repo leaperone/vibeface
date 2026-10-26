@@ -6,8 +6,8 @@ const stateNames: Record<string, string> = {
   accepted: "已接收",
   pending_delivery: "等待设备接收",
   queued: "等待处理",
-  steering: "正在并入当前回复",
-  steered: "已并入回复",
+  steering: "Bot 正在看这条补充",
+  steered: "已补充给 Bot",
   claimed: "正在准备",
   running: "执行中",
   waiting: "需要你同意",
@@ -33,7 +33,7 @@ const stateNames: Record<string, string> = {
   cancelled: "已取消",
   blocked: "受阻",
   ready: "就绪",
-  awaiting_input: "等你处理",
+  awaiting_input: "待处理",
   finishing: "收尾中",
 }
 
@@ -72,14 +72,14 @@ const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "待确认", unknown: "待确认", starting: "准备中", finished: "已完成", unverified: "待确认", awaiting_confirmation: "待确认",
-  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", stop_waiting: "已请求、等待设备确认", stop_timed_out: "设备没有确认停止",
+  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", stop_waiting: "等设备确认停止", stop_timed_out: "设备没有确认停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {
   running: "进行中", in_progress: "进行中", finishing: "收尾中", completed: "已完成", failed: "失败", interrupted: "已中断",
-  unknown: "结果未知", awaiting_input: "等你处理", declined: "已拒绝",
+  unknown: "结果未知", awaiting_input: "待处理", declined: "已拒绝",
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
