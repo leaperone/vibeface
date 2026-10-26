@@ -1,8 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
+import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -44,8 +44,8 @@ export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): Luc
   return /iphone|android|ipad|phone|手机/i.test(row.name) ? Smartphone : Monitor
 }
 
-function Tag({ children }: { children: ReactNode }) {
-  return <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
+function Tag({ children, title }: { children: ReactNode; title?: string }) {
+  return <span title={title} className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
 /** `compact`: the list names only the exception, so an online row shows the dot alone. */
@@ -65,7 +65,6 @@ function useEntryLabel() {
 export function DevicesPage() {
   const device = useDevice()
   const rows = useDeviceRows()
-  const { nodes } = useWorkspace()
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
@@ -82,19 +81,13 @@ export function DevicesPage() {
             <span className="flex flex-wrap gap-1 empty:hidden">
               {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
               {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : "Bot 需设置"}</Tag> : null}
-              {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+              {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
             </span>
           </span>
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>
-      <ul className="grid gap-1">{device.directory.revoked.map((item) => <li key={item.device_id} title={item.device_id} className="flex min-h-8 items-center gap-2">
-        <terms.remove.icon aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 truncate">{nodes.find((node) => node.device_id === item.device_id)?.name || device.knownName(item.device_id) || `设备 ${item.device_id.slice(0, 4).toUpperCase()}`}</span>
-      </li>)}</ul>
-    </Details> : null}
   </div>
 }
 
@@ -116,11 +109,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const action = useAction()
   const [removing, setRemoving] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
+  const entryName = rows.find((item) => item.entry)?.name
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
   const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
-  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
+  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry ? ready?.entry.address ?? "" : ""
   const saved = device.entries.find((item) => item.device_id === row.id)
@@ -133,9 +127,9 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-          {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+          {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
-        {row.online === false ? <p className="text-meta text-muted-foreground">确认它开着，并且和这台设备网络互通</p> : null}
+        {row.online === false ? <p className="text-meta text-muted-foreground">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : "确认它开着，并且已联网"}</p> : null}
       </div>
     </header>
 
@@ -147,7 +141,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
         <p>{row.bot === "ready" ? terms.canRunBot.label : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
-        <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : `只有${terms.admin.label}能修改`}</p>
+        <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
     </Section> : null}
@@ -155,7 +149,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.entry ? <Section title={terms.address.label}>
       <p className="break-all font-mono text-meta">{address}</p>
       {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
-        <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
+        <span className="flex items-center gap-1.5 text-muted-foreground"><Monitor aria-hidden="true" className="size-4 shrink-0" />只能在本机打开</span>
         <a className="hit-area relative font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
       {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
@@ -180,7 +174,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
-      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? "移除后这台设备无法再连接，已有的对话记录会保留" : undefined} onClick={removing ? undefined : () => setRemoving(true)}>
+      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? ["移除后它无法再连接，要再用需重新加入", row.bot ? "上面的 Bot 会停止" : null, "对话记录会保留"].filter(Boolean).join("，") : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
           <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast(`已移除「${row.name}」`, { tone: "success" }); void navigate({ to: "/devices" }) })}>

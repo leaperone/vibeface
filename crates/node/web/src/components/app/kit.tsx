@@ -1,10 +1,11 @@
 "use client"
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { rawError } from "@vibeface/client/lib/errors.ts"
 
@@ -76,12 +77,13 @@ export function EmptyState({ icon: Icon, title, description, action, className }
   </div>
 }
 
+const stepCount = 5
 /** Progress through first-time setup, shared by the connection screen and onboarding. */
 export function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
-    <span aria-hidden="true" className="tabular-nums">{step}/4</span>
-    <span className="sr-only">第 {step} 步，共 4 步</span>
+    <span className="flex gap-1" aria-hidden="true">{Array.from({ length: stepCount }, (_, index) => index + 1).map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span aria-hidden="true" className="tabular-nums">{step}/{stepCount}</span>
+    <span className="sr-only">第 {step} 步，共 {stepCount} 步</span>
   </div>
 }
 
@@ -181,7 +183,7 @@ export function Segmented<T extends string>({ label, value, options, onChange, d
     radios[next]?.focus()
     if (options[next].value !== value) onChange(options[next].value)
   }
-  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
+  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap justify-self-start gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
     {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} tabIndex={option === tabStop ? 0 : -1} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined}
       // Not `disabled`: a choice that saves disables the group while it does, and a disabled button drops focus to <body>.
       aria-disabled={disabled || undefined} onClick={() => { if (!disabled && option !== value) onChange(option) }}
@@ -272,6 +274,15 @@ function LongId({ value }: { value: string }) {
 
 export function DetailRow({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
   return <div className="grid gap-0.5"><span>{label}</span>{typeof value === "string" && /^[0-9a-f]{20,}$/.test(value) ? <LongId value={value} /> : <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>}</div>
+}
+
+/** A password field with an eye button that shows what was typed. */
+export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeof Input>, "type">) {
+  const [shown, setShown] = useState(false)
+  return <span className="relative">
+    <Input {...props} type={shown ? "text" : "password"} className={cn("pe-9 max-md:pe-11", className)} />
+    <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={shown ? "隐藏密码" : "显示密码"} aria-pressed={shown} onClick={() => setShown(!shown)}>{shown ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+  </span>
 }
 
 /** File input with a Chinese button; the native control's label follows the browser language. */

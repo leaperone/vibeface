@@ -1,6 +1,7 @@
 use super::Runtime;
 use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
+use crate::discovery::{self, Paths, Target};
 use crate::manager::{ManagerConfig, ManagerKind, Sdk};
 use crate::providers::{self, AppServer, AppServerMode, Provider, Role};
 use anyhow::{Context, Result, ensure};
@@ -34,21 +35,87 @@ pub struct ProviderChange {
     env: BTreeMap<String, Option<String>>,
 }
 
+impl ProviderChange {
+    /// Reads a leading `~` in the paths the owner typed as this computer's home folder.
+    fn expand(mut self, host: &discovery::Host) -> Self {
+        self.bin = self.bin.map(|bin| host.expand(&bin));
+        if let Some(socket) = self
+            .app_server
+            .as_mut()
+            .and_then(|server| server.socket.as_mut())
+        {
+            *socket = host.expand(socket);
+        }
+        if let Some(Some(home)) = self.env.get_mut(discovery::CODEX_HOME) {
+            *home = host.expand(Path::new(home)).to_string_lossy().into_owned();
+        }
+        self
+    }
+
+    /// `default` is the bot a provider starts when none runs yet.
+    fn apply(self, target: Target, default: Option<ManagerSettings>) -> Result<()> {
+        let kind = self.provider.manager_kind();
+        match self.bot {
+            Some(true) => {
+                let mut chosen = target
+                    .manager
+                    .take()
+                    .or(default)
+                    .context("no bot to start")?;
+                chosen.provider = kind;
+                // Cursor needs a model; Codex reads "auto" as a model name, so it gets its default.
+                match kind {
+                    ManagerKind::CursorSdk if chosen.model.trim().is_empty() => {
+                        chosen.model = "auto".into()
+                    }
+                    ManagerKind::CodexSdk if chosen.model == "auto" => chosen.model.clear(),
+                    _ => {}
+                }
+                *target.manager = Some(chosen);
+            }
+            Some(false) if target.manager.as_ref().is_some_and(|m| m.provider == kind) => {
+                *target.manager = None
+            }
+            _ => {}
+        }
+        if let Some(execution) = self.execution {
+            ensure!(
+                self.provider == Provider::Codex,
+                "only Codex executes dispatched work"
+            );
+            target.local.switches.execution = execution;
+        }
+        if let Some(bin) = self.bin {
+            ensure!(
+                self.provider == Provider::Codex,
+                "only Codex has a program path here"
+            );
+            let text = bin.to_string_lossy();
+            ensure!(
+                text.len() <= 4096 && !text.contains('\0'),
+                "invalid Codex program path"
+            );
+            target.local.codex_bin = match text.trim() {
+                "" => DEFAULT_CODEX_BIN.into(),
+                trimmed => trimmed.into(),
+            };
+        }
+        if let Some(app_server) = self.app_server {
+            ensure!(
+                self.provider == Provider::Codex,
+                "only Codex has an App Server"
+            );
+            target.local.switches.codex_app_server = app_server;
+        }
+        target.local.env.apply(self.provider, self.env)
+    }
+}
+
 const DEFAULT_CODEX_BIN: &str = "codex";
 const DEFAULT_CURSOR_BIN: &str = "cursor-sdk-bridge";
 
 fn executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let available = |path: &Path| {
-        path.metadata()
-            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-    };
-    if path.components().count() != 1 || path.is_absolute() {
-        return available(path);
-    }
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|directory| available(&directory.join(path)))
-    })
+    discovery::runnable(path, std::env::var_os("PATH").as_ref())
 }
 
 impl Runtime {
@@ -213,6 +280,8 @@ impl Runtime {
             "bin":(provider == Provider::Codex).then_some(&local.codex_bin),
             "app_server":(provider == Provider::Codex).then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
+            "home":(provider == Provider::Codex).then(|| configured.get(discovery::CODEX_HOME)),
+            "sessions":(provider == Provider::Codex).then(|| self.triage.config().codex_sessions),
             "env":env, "state":state, "issues":issues,
         })
     }
@@ -266,10 +335,10 @@ impl Runtime {
         for provider in Provider::ALL {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
-        Ok(
-            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing},
-                "providers":providers}),
-        )
+        let mut response = json!({"settings":settings,"defaults":defaults,
+            "readiness":{"manager":readiness,"missing":missing},"providers":providers});
+        response["display_paths"] = json!(self.host.display_paths(&response));
+        Ok(response)
     }
 
     /// Only the owner changes this Node's settings: a management device, or a browser on this
@@ -309,62 +378,54 @@ impl Runtime {
         let _save = self.config_save.lock().await;
         let _work = self.maintenance.enter()?;
         self.authorize_settings_write(subject, local_cookie).await?;
+        let kind = change.provider.manager_kind();
+        let default = match change.bot {
+            Some(true) if self.manager().is_none() => Some(self.default_manager(kind)?),
+            _ => None,
+        };
+        let change = change.expand(&self.host);
+        self.write_providers(|target| change.apply(target, default))
+            .await?;
+        self.node_settings().await
+    }
+
+    /// The one write of this device's provider settings. `edit` changes them; then what a use
+    /// that is on still misses is found on this computer and written with them, the
+    /// configuration and variables are saved, and what runs on the providers follows. The
+    /// caller holds `config_save`. Returns what discovery filled in.
+    pub(crate) async fn write_providers(
+        &self,
+        edit: impl FnOnce(Target) -> Result<()>,
+    ) -> Result<Paths> {
         let previous = self.providers();
         let mut next = previous.clone();
         let previous_manager = self.settings_snapshot().manager;
         let mut manager = previous_manager.clone();
-        let kind = change.provider.manager_kind();
-        match change.bot {
-            Some(true) => {
-                let mut chosen = match manager {
-                    Some(current) => current,
-                    None => self.default_manager(kind)?,
-                };
-                chosen.provider = kind;
-                // Cursor needs a model; Codex reads "auto" as a model name, so it gets its default.
-                match kind {
-                    ManagerKind::CursorSdk if chosen.model.trim().is_empty() => {
-                        chosen.model = "auto".into()
-                    }
-                    ManagerKind::CodexSdk if chosen.model == "auto" => chosen.model.clear(),
-                    _ => {}
-                }
-                self.ensure_default_workspace(&chosen.workspace)?;
-                manager = Some(chosen);
-            }
-            Some(false) if manager.as_ref().is_some_and(|m| m.provider == kind) => manager = None,
-            _ => {}
+        let previous_triage = self.triage.config();
+        let mut triage = previous_triage.clone();
+        edit(Target {
+            local: &mut next,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
+        let filled = discovery::missing(
+            &Target {
+                local: &mut next,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
+            false,
+            &self.host,
+        )?;
+        filled.apply(Target {
+            local: &mut next,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
+        if let Some(chosen) = &manager {
+            self.ensure_default_workspace(&chosen.workspace)?;
         }
-        if let Some(execution) = change.execution {
-            ensure!(
-                change.provider == Provider::Codex,
-                "only Codex executes dispatched work"
-            );
-            next.switches.execution = execution;
-        }
-        if let Some(bin) = change.bin {
-            ensure!(
-                change.provider == Provider::Codex,
-                "only Codex has a program path here"
-            );
-            let text = bin.to_string_lossy();
-            ensure!(
-                text.len() <= 4096 && !text.contains('\0'),
-                "invalid Codex program path"
-            );
-            next.codex_bin = match text.trim() {
-                "" => DEFAULT_CODEX_BIN.into(),
-                trimmed => trimmed.into(),
-            };
-        }
-        if let Some(app_server) = change.app_server {
-            ensure!(
-                change.provider == Provider::Codex,
-                "only Codex has an App Server"
-            );
-            next.switches.codex_app_server = app_server;
-        }
-        next.env.apply(change.provider, change.env)?;
+        triage.validate()?;
         let codex_agent = manager
             .as_ref()
             .is_some_and(|manager| manager.provider == ManagerKind::CodexSdk);
@@ -373,15 +434,20 @@ impl Runtime {
         if manager_changed
             || next.switches != previous.switches
             || next.codex_bin != previous.codex_bin
+            || triage != previous_triage
         {
             let mut configuration = Config::load(&self.data_dir)?;
             configuration.manager = manager.clone();
             configuration.providers = next.switches.clone();
             configuration.codex_bin = next.codex_bin.clone();
+            configuration.triage = triage.clone();
             configuration.save(&self.data_dir)?;
         }
         if next.env != previous.env {
             next.env.save(&self.data_dir)?;
+        }
+        if !filled.is_empty() {
+            tracing::info!(event = "providers.discovered", filled = ?filled.names(), "filled missing provider paths from this computer");
         }
         self.settings
             .lock()
@@ -391,12 +457,15 @@ impl Runtime {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
+        if triage != previous_triage {
+            self.triage.set_config(triage);
+        }
         self.codex.retarget(next.codex_target(codex_agent));
         if manager_changed || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor) {
             self.refresh_cursor();
         }
         self.schedule_wakeup.notify_one();
-        self.node_settings().await
+        Ok(filled)
     }
 
     /// Saves the folders and the current bot's details. Whether the bot runs, and on
@@ -421,6 +490,7 @@ impl Runtime {
             "at most 128 project roots are allowed"
         );
         for root in &mut settings.roots {
+            *root = self.host.expand(root);
             ensure!(
                 root.is_absolute(),
                 "project root must be an existing absolute directory"
@@ -431,6 +501,8 @@ impl Runtime {
         settings.roots.sort();
         settings.roots.dedup();
         if let Some(manager) = &mut settings.manager {
+            manager.workspace = self.host.expand(&manager.workspace);
+            manager.cursor_sdk_bin = self.host.expand(&manager.cursor_sdk_bin);
             ensure!(
                 manager.workspace.is_absolute(),
                 "manager workspace must be an existing absolute directory"
@@ -467,5 +539,258 @@ impl Runtime {
         }
         self.schedule_wakeup.notify_one();
         self.node_settings().await
+    }
+}
+
+/// The agent a settings card is about: the user's answer goes to `apply_provider_config`, not
+/// to a session.
+pub(crate) const SETTINGS_AGENT: &str = "vibeface";
+/// The answer that lets a proposal be written; any other answer writes nothing.
+pub(crate) const ALLOW: &str = "允许";
+const DENY: &str = "不允许";
+const MAX_PROPOSALS: usize = 64;
+
+/// Provider paths a bot asked the user to allow on this device, and what came of it.
+pub(crate) struct Proposal {
+    conversation: String,
+    paths: Paths,
+    outcome: Option<Value>,
+}
+
+/// What a bot proposes: paths it found itself, each optional.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalInput {
+    #[serde(default)]
+    execution: bool,
+    codex_home: Option<PathBuf>,
+    app_server_socket: Option<PathBuf>,
+    codex_sessions: Option<PathBuf>,
+    cursor_sdk_bin: Option<PathBuf>,
+}
+
+impl ProposalInput {
+    fn paths(self) -> Result<Paths> {
+        let existing = |path: Option<PathBuf>, what: &str, kind: fn(&Path) -> bool| {
+            path.map(|path| {
+                ensure!(
+                    path.is_absolute() && path.as_os_str().len() <= 1024 && kind(&path),
+                    "{what} must be an absolute path that exists on this device"
+                );
+                Ok(path)
+            })
+            .transpose()
+        };
+        Ok(Paths {
+            execution: self.execution.then_some(true),
+            app_server: existing(self.app_server_socket, "app_server_socket", |path| {
+                path.symlink_metadata().is_ok()
+            })?
+            .map(|socket| AppServer {
+                mode: AppServerMode::System,
+                socket: Some(socket),
+            }),
+            codex_home: existing(self.codex_home, "codex_home", Path::is_dir)?,
+            codex_bin: None,
+            codex_sessions: existing(self.codex_sessions, "codex_sessions", Path::is_dir)?,
+            cursor_sdk_bin: existing(self.cursor_sdk_bin, "cursor_sdk_bin", |path| {
+                discovery::runnable(path, None)
+            })?,
+        })
+    }
+}
+
+impl Runtime {
+    /// Resolves what a bot proposes against this device's settings, then asks the user in the
+    /// bot's chat. Nothing is written until `apply_provider_config` finds the user allowed it.
+    pub(crate) async fn propose_provider_config(
+        &self,
+        network: &str,
+        scope: &str,
+        trigger: &str,
+        input: Value,
+    ) -> Result<Value> {
+        let given = serde_json::from_value::<ProposalInput>(input)
+            .context("invalid provider proposal")?
+            .paths()?;
+        let codex = given.is_empty()
+            || given.execution.is_some()
+            || given.app_server.is_some()
+            || given.codex_home.is_some()
+            || given.codex_sessions.is_some();
+        let host = discovery::Host {
+            codex_home: given.codex_home.clone().or(self.host.codex_home.clone()),
+            ..self.host.clone()
+        };
+        let (mut local, mut manager, mut triage) = (
+            self.providers(),
+            self.settings_snapshot().manager,
+            self.triage.config(),
+        );
+        given.apply(Target {
+            local: &mut local,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
+        let found = discovery::missing(
+            &Target {
+                local: &mut local,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
+            codex,
+            &host,
+        )?;
+        let (mut local, mut manager, mut triage) = (
+            self.providers(),
+            self.settings_snapshot().manager,
+            self.triage.config(),
+        );
+        let paths = given.or(found).changes(&Target {
+            local: &mut local,
+            manager: &mut manager,
+            triage: &mut triage,
+        });
+        if paths.is_empty() {
+            return Ok(json!({"status":"unchanged"}));
+        }
+        let device = self.identity.device_id()?;
+        let question_id = format!(
+            "q-{}",
+            &crate::crypto::digest(
+                [
+                    device.as_str(),
+                    scope,
+                    trigger,
+                    &serde_json::to_string(&paths)?
+                ]
+                .join("\0")
+                .as_bytes()
+            )[..32]
+        );
+        let body = crate::model::EventBody::QuestionAsked {
+            question_id: question_id.clone(),
+            severity: crate::model::Severity::Attention,
+            text: self.proposal_text(&paths),
+            choices: [ALLOW, DENY]
+                .map(|label| crate::model::Choice {
+                    label: label.into(),
+                })
+                .into(),
+            about: crate::model::Subject {
+                node: device,
+                agent: SETTINGS_AGENT.into(),
+                session_id: format!("provider-setup-{}", &question_id[2..18]),
+                cwd: String::new(),
+                summary: "AI 设置".into(),
+                request_id: None,
+            },
+        };
+        let mut proposals = self.provider_proposals.lock().await;
+        let (_, written) =
+            self.store
+                .lock()
+                .await
+                .ask(&self.identity, network, scope, body, super::now_ms())?;
+        if let Some(event) = &written {
+            tracing::info!(event = "question.asked", conversation_id = scope, question_id, filled = ?paths.names(), "provider paths proposed");
+            self.publish_changed(network, scope, super::Changed::Event(&event.hash));
+        }
+        if proposals.len() >= MAX_PROPOSALS && !proposals.contains_key(&question_id) {
+            proposals.clear();
+        }
+        proposals
+            .entry(question_id.clone())
+            .or_insert_with(|| Proposal {
+                conversation: scope.into(),
+                paths: paths.clone(),
+                outcome: None,
+            });
+        Ok(json!({"status":"asked","question_id":question_id,"proposed":paths}))
+    }
+
+    /// One line per setting the card asks about. Paths are shortened so the full ones stay on
+    /// this computer; the card is a shared record.
+    fn proposal_text(&self, paths: &Paths) -> String {
+        let shown = |path: &PathBuf| self.host.display(path);
+        let mut lines = vec!["要把这台电脑的 AI 设置改成这样吗？".to_owned()];
+        if let Some(on) = paths.execution {
+            lines.push(
+                if on {
+                    "用 Codex 执行任务"
+                } else {
+                    "不再用 Codex 执行任务"
+                }
+                .into(),
+            );
+        }
+        if let Some(server) = &paths.app_server {
+            lines.push(match (&server.mode, &server.socket) {
+                (AppServerMode::System, Some(socket)) => {
+                    format!("连接已在运行的 Codex：{}", shown(socket))
+                }
+                _ => "由 Vibeface 启动 Codex".into(),
+            });
+        }
+        let named = [
+            ("Codex 目录", &paths.codex_home),
+            ("Codex 程序", &paths.codex_bin),
+            ("会话目录", &paths.codex_sessions),
+            ("Cursor 组件", &paths.cursor_sdk_bin),
+        ];
+        for (label, path) in named {
+            if let Some(path) = path {
+                lines.push(format!("{label}：{}", shown(path)));
+            }
+        }
+        let mut text = crate::logging::scrub(&lines.join("\n"));
+        while text.len() > 1024 {
+            text.pop();
+        }
+        text
+    }
+
+    /// Writes a proposal once the user's answer to its card allows it, through the same path
+    /// as Settings. A second call returns the first outcome.
+    pub(crate) async fn apply_provider_config(
+        &self,
+        network: &str,
+        scope: &str,
+        question_id: &str,
+    ) -> Result<Value> {
+        let mut proposals = self.provider_proposals.lock().await;
+        let proposal = proposals.get_mut(question_id).context(
+            "this device holds no proposal with that question_id; after a restart, propose it again",
+        )?;
+        ensure!(
+            proposal.conversation == scope,
+            "the proposal was made in another conversation"
+        );
+        if let Some(outcome) = &proposal.outcome {
+            return Ok(outcome.clone());
+        }
+        let question = self
+            .store
+            .lock()
+            .await
+            .question(network, question_id)?
+            .context("the proposal's question is missing")?;
+        let answer = question["answer"]["text"]
+            .as_str()
+            .context("the user has not answered yet; apply it in the turn their answer starts")?
+            .trim()
+            .to_owned();
+        let outcome = if answer == ALLOW {
+            let _save = self.config_save.lock().await;
+            let _work = self.maintenance.enter()?;
+            let paths = proposal.paths.clone();
+            let filled = self.write_providers(|target| paths.apply(target)).await?;
+            tracing::info!(event = "providers.applied", question_id, applied = ?paths.names(), "provider paths the user allowed were written");
+            json!({"status":"applied","question_id":question_id,"applied":paths.names(),"also_filled":filled.names()})
+        } else {
+            json!({"status":"declined","question_id":question_id,"answer":answer})
+        };
+        proposal.outcome = Some(outcome.clone());
+        Ok(outcome)
     }
 }

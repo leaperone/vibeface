@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod delivery;
+pub mod discovery;
 pub mod fetch;
 pub mod identity;
 pub mod local_access;

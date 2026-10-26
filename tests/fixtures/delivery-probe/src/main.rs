@@ -20,10 +20,10 @@ use vibeface_secure::membership::MembershipSigner;
 use vibeface_secure::{Handshake, Identity};
 use zeroize::Zeroizing;
 
-mod discovery {
+mod pkarr {
     include!(concat!(
         env!("VIBEFACE_PROBE_SOURCE_ROOT"),
-        "/crates/node/src/net/discovery.rs"
+        "/crates/node/src/net/pkarr.rs"
     ));
 }
 
@@ -215,7 +215,7 @@ async fn private_rejected(endpoint: &Endpoint, target: &Target, alpn: &[u8]) -> 
     Ok(())
 }
 async fn resolver_case(
-    resolver: &discovery::FreshResolver,
+    resolver: &pkarr::FreshResolver,
     peer: EndpointId,
     accepted: bool,
 ) -> Result<()> {
@@ -269,8 +269,8 @@ async fn discovery_checks(key: &SecretKey) -> Result<Value> {
             });
         }
     });
-    let resolver = discovery::FreshResolver::new(url.parse()?)?;
-    discovery::DiscoveryConfig {
+    let resolver = pkarr::FreshResolver::new(url.parse()?)?;
+    pkarr::PkarrConfig {
         publish: false,
         resolve: true,
         urls: vec![url],
@@ -298,7 +298,7 @@ async fn discovery_checks(key: &SecretKey) -> Result<Value> {
     server.abort();
     Ok(
         json!({"fresh":true,"expiredRejected":true,"futureRejected":true,"badSignatureRejected":true,"oversizeRejected":true,
-        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/crates/node/src/net/discovery.rs"))))}),
+        "productSourceSha256":hex::encode(Sha256::digest(include_bytes!(concat!(env!("VIBEFACE_PROBE_SOURCE_ROOT"), "/crates/node/src/net/pkarr.rs"))))}),
     )
 }
 #[tokio::main]

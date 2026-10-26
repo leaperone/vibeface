@@ -113,8 +113,11 @@ vibeface init \
 | `--workspace` | 协调 Agent 的工作目录，须与项目目录分开。 |
 | `--model` | 模型名。省略时 Codex 用自身默认配置，Cursor 默认 `auto`。 |
 | `--listen` | 监听地址，默认 `127.0.0.1:4790`。 |
+| `--no-web` | 启动时关闭网页和浏览器访问，保留节点传输及本地工具。 |
 | `--relay` / `--relay-listen` | 连接其他 Node 的 relay，或在本机运行 relay。 |
-| `--public-entry` | 只做公共入口（网页、relay、密文转发），不加入网络。 |
+| `--relay-mode discovery-only` | 公共服务只协助发现和直连，不转发业务数据。 |
+| `--discovery` | 配置钉住身份的公共发现服务，Node 自动选择连接路径。 |
+| `--public-entry` | 不加入个人网络的公共入口或发现服务。 |
 
 使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。全部字段见 [本机配置](docs/node-protocol.md#本机配置)。
 

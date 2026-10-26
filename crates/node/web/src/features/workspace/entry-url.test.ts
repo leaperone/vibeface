@@ -725,7 +725,7 @@ test("connection form keeps current errors and busy ownership when an earlier co
   }
   const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
-  const connect = () => render().find(({ props }) => props.children === '连接')?.props
+  const connect = () => render().find(({ type, props }) => type === 'Button' && props.title === 'https://node.example')?.props
   try {
     render(); render(); connect()?.onClick?.()
     assert.equal(connect()?.disabled, true)
@@ -905,7 +905,7 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
     '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
@@ -930,7 +930,7 @@ test("a link no phone can open shows no QR code", async () => {
   const shown = async (link: string, publicEntry: boolean) => {
     const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
-      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
       '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
     }, { setInterval: () => 0, clearInterval: () => {} })
     try {

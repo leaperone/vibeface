@@ -70,6 +70,13 @@ impl TriageState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+    pub(super) fn set_config(&self, config: TriageConfig) {
+        *self
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        self.outbox.notify_one();
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -383,12 +390,17 @@ impl Runtime {
     }
 
     /// A server request the bridge handed over: held for the coordination Agent, or answered by
-    /// the fallback at once when there is none or no bot owns its thread.
+    /// the fallback at once when there is none or no bot owns its thread. The same request asked
+    /// again, as after a reconnect, keeps its ID: it takes the new connection's JSON-RPC ID and
+    /// stays with the question or the Agent event it already has, so nothing is asked twice.
     pub(crate) async fn on_codex_request(self: &Arc<Self>, params: &Value) {
-        let request = CodexRequest {
-            request_id: uuid::Uuid::new_v4().simple().to_string(),
+        let method = params["method"].as_str().unwrap_or_default();
+        let request_id = triage::request_id(method, &params["params"])
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        let mut request = CodexRequest {
+            request_id: request_id.clone(),
             rpc_id: params["id"].clone(),
-            method: params["method"].as_str().unwrap_or_default().into(),
+            method: method.into(),
             thread_id: params["threadId"].as_str().map(str::to_owned),
             turn_id: params["params"]["turnId"].as_str().map(str::to_owned),
             params: params["params"].clone(),
@@ -396,9 +408,41 @@ impl Runtime {
             answer_by_ms: Some(now_ms() + AGENT_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
         };
+        // Asked again, the App Server never got the earlier answer.
+        lock(&self.triage.answered).remove(&request_id);
+        let standing = async {
+            let network = self.network_id().await?;
+            let node = self.identity.device_id()?;
+            self.store
+                .lock()
+                .await
+                .request_question(&network, &node, &request_id)
+        }
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, request = %request_id, "could not look up the request's question");
+            None
+        });
+        if let Some(question) = standing {
+            let closed = !question["closed"].is_null();
+            tracing::info!(request = %request_id, method = %request.method, closed,
+                "App Server request asked again");
+            if !closed {
+                request.question_id = question["question_id"].as_str().map(str::to_owned);
+                if question["answer"].is_null() {
+                    request.answer_by_ms = None;
+                }
+            }
+            lock(&self.triage.requests).insert(request_id.clone(), request);
+            if closed {
+                let _ = self
+                    .answer_codex_request(&request_id, None, "fallback")
+                    .await;
+            }
+            return;
+        }
         tracing::info!(request = %request.request_id, method = %request.method,
             thread = ?request.thread_id, "App Server request received");
-        let request_id = request.request_id.clone();
         lock(&self.triage.requests).insert(request_id.clone(), request.clone());
         let cwd = request
             .thread_id
@@ -417,7 +461,24 @@ impl Runtime {
             ..Default::default()
         };
         let queued = self.queue_event(event).await;
-        if !matches!(&queued, Ok(result) if result["status"] == "accepted") {
+        let waiting = match &queued {
+            Ok(result) if result["status"] == "accepted" => true,
+            // Its event still waits for the Agent from the earlier connection.
+            Ok(result) if result["status"] == "duplicate" => self
+                .store
+                .lock()
+                .await
+                .connection
+                .query_row(
+                    "SELECT 1 FROM triage_queue WHERE event_id=?",
+                    [result["event_id"].as_str().unwrap_or_default()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .is_ok_and(|queued| queued.is_some()),
+            _ => false,
+        };
+        if !waiting {
             if let Err(error) = &queued {
                 tracing::warn!(%error, "App Server request could not reach the Agent");
             }
@@ -517,6 +578,32 @@ impl Runtime {
             tracing::info!(request = %request_id, method = %request.method,
                 "App Server request lost with its connection");
         }
+    }
+
+    /// Once the App Server finished observing this device's threads after a connect, any request
+    /// it still wants has been asked again. An open question about a request that did not come
+    /// back can never be answered, so this device, which asked it, closes it.
+    pub(crate) async fn close_lost_questions(&self) -> Result<()> {
+        if !self.has_membership().await? {
+            return Ok(());
+        }
+        let network = self.network_id().await?;
+        let held: HashSet<String> = lock(&self.triage.requests).keys().cloned().collect();
+        let closed = self.store.lock().await.close_lost_questions(
+            &self.identity,
+            &network,
+            &held,
+            now_ms(),
+        )?;
+        for (scope, event) in closed {
+            tracing::info!(
+                event = "question.closed",
+                conversation_id = scope,
+                "a question about a lost App Server request was closed"
+            );
+            self.publish_changed(&network, &scope, Changed::Event(&event.hash));
+        }
+        Ok(())
     }
 
     /// Turn ends of every thread the managed App Server reports, not only the Node's own work.
@@ -1158,9 +1245,21 @@ impl Runtime {
             .and_then(|o| o.remove("webhook_secret"));
         let triage: TriageConfig =
             serde_json::from_value(input).context("invalid triage settings")?;
-        triage.validate()?;
-        match secret {
+        match &secret {
             None => {}
+            Some(Value::Null) => {}
+            Some(Value::String(secret)) => ensure!(
+                (16..=512).contains(&secret.len()),
+                "the webhook secret must be 16 to 512 characters"
+            ),
+            Some(_) => bail!("webhook_secret must be a string or null"),
+        }
+        self.write_providers(|target| {
+            *target.triage = triage;
+            Ok(())
+        })
+        .await?;
+        match secret {
             Some(Value::Null) => match std::fs::remove_file(self.data_dir.join(WEBHOOK_KEY)) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     return Err(error.into());
@@ -1168,23 +1267,10 @@ impl Runtime {
                 _ => {}
             },
             Some(Value::String(secret)) => {
-                ensure!(
-                    (16..=512).contains(&secret.len()),
-                    "the webhook secret must be 16 to 512 characters"
-                );
                 config::private_write(&self.data_dir.join(WEBHOOK_KEY), secret.as_bytes())?;
             }
-            Some(_) => bail!("webhook_secret must be a string or null"),
+            _ => {}
         }
-        let mut configuration = config::Config::load(&self.data_dir)?;
-        configuration.triage = triage.clone();
-        configuration.save(&self.data_dir)?;
-        *self
-            .triage
-            .config
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = triage;
-        self.triage.outbox.notify_one();
         drop(_save);
         self.triage_settings().await
     }
@@ -1899,6 +1985,161 @@ mod tests {
                 answered_once(&mut server).await["result"],
                 json!({"decision":"decline"})
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    /// The App Server asks `rpc` for the approval of item `i-1` in turn `u-1` of thread `t-1`;
+    /// returns what the bridge hands the Node.
+    async fn ask_approval(node: &Runtime, server: &mut Server, rpc: u64) -> Result<Value> {
+        use futures_util::SinkExt as _;
+        let params = json!({"threadId":"t-1","turnId":"u-1","itemId":"i-1","command":"rm -rf build","reason":"clean"});
+        let method = "item/commandExecution/requestApproval";
+        server
+            .send(
+                json!({"id":rpc,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            )
+            .await?;
+        while !node.codex.client().snapshot().await["pending_requests"]
+            .as_array()
+            .is_some_and(|pending| pending.iter().any(|request| request["id"] == rpc))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(json!({"id":rpc,"method":method,"threadId":"t-1","params":params}))
+    }
+
+    async fn raise_for(node: &Runtime) -> Result<(String, String)> {
+        let event = node.triage_command(json!({"action":"events"})).await?["events"][0].clone();
+        let request_id = event["request_id"]
+            .as_str()
+            .context("request event")?
+            .to_owned();
+        let raised = node
+            .triage_command(json!({"action":"raise","event_id":event["event_id"],
+            "severity":"attention","question":"要清理 build 吗？","request_id":request_id,
+            "choices":["允许","拒绝"]}))
+            .await?;
+        Ok((
+            raised["question_id"]
+                .as_str()
+                .context("question")?
+                .to_owned(),
+            request_id,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_request_asked_again_keeps_its_one_question() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &["t-1"]).await?;
+            let (mut server, _) = app_server(&node).await?;
+            let handed = ask_approval(&node, &mut server, 51).await?;
+            node.on_codex_request(&handed).await;
+            let (question, request_id) = raise_for(&node).await?;
+            node.drop_codex_requests();
+            let again = ask_approval(&node, &mut server, 52).await?;
+            node.on_codex_request(&again).await;
+            let asked = unanswered(&node).await?;
+            assert_eq!(asked.len(), 1, "one question for the request asked twice");
+            assert_eq!(asked[0]["question_id"], question.as_str());
+            let held = node.triage_command(json!({"action":"requests"})).await?["requests"].clone();
+            assert_eq!(
+                (
+                    held[0]["request_id"].clone(),
+                    held[0]["question_id"].clone(),
+                    held[0]["answer_by_ms"].clone()
+                ),
+                (json!(request_id), json!(question), Value::Null),
+                "the request asked again stays held by its question"
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"events"})).await?["events"],
+                json!([]),
+                "the Agent is not asked again"
+            );
+            node.close_lost_questions().await?;
+            assert_eq!(
+                unanswered(&node).await?.len(),
+                1,
+                "a held request keeps its question open"
+            );
+            assert_eq!(answer(&node, &question, "允许").await?, "answered");
+            node.triage_command(
+                json!({"action":"respond","request_id":request_id,"result":{"decision":"accept"}}),
+            )
+            .await?;
+            let sent = loop {
+                let message = read(&mut server).await;
+                if message.get("result").is_some() {
+                    break message;
+                }
+            };
+            assert_eq!(
+                (sent["id"].clone(), sent["result"].clone()),
+                (json!(52), json!({"decision":"accept"})),
+                "the answer goes to the request as asked on the latest connection"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_question_about_a_lost_request_closes_and_refuses_answers() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &["t-1"]).await?;
+            let (mut server, _) = app_server(&node).await?;
+            let handed = ask_approval(&node, &mut server, 61).await?;
+            node.on_codex_request(&handed).await;
+            let (question, _) = raise_for(&node).await?;
+            node.drop_codex_requests();
+            node.close_lost_questions().await?;
+            assert!(
+                unanswered(&node).await?.is_empty(),
+                "待处理 no longer lists it"
+            );
+            let network = node.network_id().await?;
+            let chat = node
+                .store
+                .lock()
+                .await
+                .conversation_questions(&network, "c")?;
+            assert_eq!(
+                (chat[0]["question_id"].clone(), chat[0]["closed"].clone()),
+                (json!(question), json!("request_lost"))
+            );
+            let refused = answer(&node, &question, "允许")
+                .await
+                .err()
+                .context("refused")?;
+            assert!(refused.to_string().contains("closed"), "{refused}");
+
+            let late = ask_approval(&node, &mut server, 62).await?;
+            node.on_codex_request(&late).await;
+            let sent = loop {
+                let message = read(&mut server).await;
+                if message.get("result").is_some() {
+                    break message;
+                }
+            };
+            assert_eq!(
+                (sent["id"].clone(), sent["result"].clone()),
+                (json!(62), json!({"decision":"decline"})),
+                "a request asked again after its question closed gets the fallback"
+            );
+            assert!(unanswered(&node).await?.is_empty(), "and no new question");
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -2658,6 +2899,105 @@ mod tests {
             node.revoke_decision_token(created["token_id"].as_str().unwrap())
                 .await?;
             assert!(!node.decision_token_valid(&token));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn provider_paths_a_bot_proposes_are_written_only_after_the_user_allows() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let codex = dir.join("fixture-codex");
+            std::fs::create_dir_all(codex.join("sessions"))?;
+            std::fs::create_dir_all(codex.join("archived"))?;
+            let saved = || Config::load(&dir).map(|config| config.triage.codex_sessions);
+
+            let asked = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "m-1",
+                    json!({"codex_sessions": codex.join("sessions")}),
+                )
+                .await?;
+            assert_eq!(asked["status"], "asked");
+            let question = asked["question_id"].as_str().unwrap().to_owned();
+            let card = unanswered(&node).await?;
+            assert_eq!(card.len(), 1);
+            assert!(
+                !card[0].to_string().contains(&*dir.to_string_lossy()),
+                "the card names no full local path"
+            );
+            assert!(
+                node.apply_provider_config(&network, "c", &question)
+                    .await
+                    .is_err(),
+                "nothing is written before an answer"
+            );
+            assert_eq!(saved()?, None);
+
+            answer(&node, &question, "不允许").await?;
+            assert_eq!(
+                node.apply_provider_config(&network, "c", &question).await?["status"],
+                "declined"
+            );
+            assert_eq!(saved()?, None, "a declined proposal writes nothing");
+            assert_eq!(node.triage.config().codex_sessions, None);
+
+            let asked = node
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "m-2",
+                    json!({"codex_sessions": codex.join("archived")}),
+                )
+                .await?;
+            let question = asked["question_id"].as_str().unwrap().to_owned();
+            assert!(
+                node.apply_provider_config(&network, "other", &question)
+                    .await
+                    .is_err(),
+                "another chat cannot apply it"
+            );
+            answer(&node, &question, "允许").await?;
+            let applied = node.apply_provider_config(&network, "c", &question).await?;
+            assert_eq!(applied["status"], "applied");
+            assert_eq!(saved()?, Some(codex.join("archived")));
+            assert_eq!(
+                node.triage.config().codex_sessions,
+                Some(codex.join("archived"))
+            );
+            assert_eq!(
+                node.apply_provider_config(&network, "c", &question).await?,
+                applied,
+                "a retry reads the first outcome back"
+            );
+            assert_eq!(
+                node.propose_provider_config(
+                    &network,
+                    "c",
+                    "m-3",
+                    json!({"codex_sessions": codex.join("archived")})
+                )
+                .await?["status"],
+                "unchanged"
+            );
+            assert!(
+                node.propose_provider_config(
+                    &network,
+                    "c",
+                    "m-4",
+                    json!({"codex_sessions": "relative"})
+                )
+                .await
+                .is_err(),
+                "only absolute paths that exist are proposed"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

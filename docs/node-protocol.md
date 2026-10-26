@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=3`，数据库 `user_version=3`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=4`，数据库 `user_version=4`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -8,13 +8,13 @@
 
 个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。每个 `RootCheckpoint` 带下一把恢复密钥 `recovery_key`，由上一把签名，第一把是根密钥。恢复私钥只在加密恢复文件里，Node 不持有。
 
-`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 单独决定是否运行 relay；`public_entry` 是不入网的公共入口。两者都可显式启用独立的文件交付服务，服务权限不改变成员关系。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 在 `forward` 模式决定是否运行 relay；`public_entry` 是不入网的公共入口，也可选择只发现而不转发业务的模式。两者都可显式启用独立的文件交付服务，服务权限不改变成员关系。
 
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由当前恢复密钥签名、epoch 加一的 checkpoint 建立新授权并换恢复密钥；`directory` 为空的 checkpoint 只换恢复密钥，目录沿用上一 epoch，立即生效；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。
 
 换目录的 checkpoint 带签名时间 `issued_at_ms` 和 `heads`（签名时恢复密钥所在 epoch 的管理事件 heads，rotation 为空），从这时起等 48 小时（`RECOVERY_DELAY_MS`）才生效，之前视图仍是原目录，`pending` 给出它的哈希、`effective_at_ms` 和待生效成员。等待期内，原目录里的管理设备可以在原 epoch 签 `veto`：`{"type":"veto","checkpoint":<checkpoint 哈希>,"at_ms":<签名时间>}`。否决算不算数只看它自己和它的因果祖先，之后到达的事件改变不了：因果祖先须包含该 checkpoint 的全部 `heads`，签发者在这些祖先里是管理设备且未被撤销（否则整份状态无效），`at_ms` 早于生效时刻；目标不符或祖先不全的否决不起作用。所以改写 `parents` 绕不过找回前的撤销，而先否决、后被撤销的设备，否决仍然有效。`heads` 含本机没有的事件的 checkpoint 不生效，`recover` 直接拒绝（`this recovery rests on device changes this Node has not received; sync it first`），同步合并时它保持等待，补齐事件后再按签名时间判定。同一把恢复密钥在找回生效前签出的 rotation（`issued_at_ms` 早于该找回的生效时刻）也会让它作废，换恢复密码不受等待中的找回阻塞。被否决或被 rotation 取代的 checkpoint 及建在它上面的 checkpoint 作废，哈希列入视图的 `stopped`，原目录继续有效。同一把恢复密钥只能出现一次；一把密钥再签时，此前签的每个找回要么有合法否决，要么被这次 rotation 取代，否则整份状态无效。最多 64 个未被否决的 checkpoint。生效不是终局：生效目录是签名记录和墙钟的纯函数，Node 不拒绝任何合法历史。窗口内签的否决（或倒签到窗口内的 rotation）晚到时，已按墙钟翻转的 Node 回到旧目录，与其他 Node 收敛；回滚前，它可能短暂按新目录放行。所以翻转时不往共享日志写不可撤回的记录：找回移出的 Node 上未完成的工作不记为放弃，它超出上限的写入只是在投影里不计入，回滚后重新计入；只有管理设备签名的 `revoke` 才把被移除设备的工作记为放弃。作废邀请、`identity_meta.recovery_since`（首次见到某把密钥生效的时间，只用于展示）和地址簿清理都是本机可重做的。认为对方已被移除的 Node 仍接受对方推来的成员状态，所以被找回移出、又因否决回到目录的 Node 也能收敛。未被移除的被偷管理设备可以随时拦下找回（含补签迟到否决），这个限制早已存在，补救是先移除它再找回。曾考虑过的方案：生效即终局会让休眠错过窗口的 Node 拒绝否决、永久分叉；成员时钟会让丢失的 Node 永远拦住找回，且两台都过期的 Node 互相交换后仍会分叉；否决按 epoch 最终投影计数会让事后撤销否决人立即复活找回。视图的 `epoch` 是生效的 epoch。`attestation` 的签名设备须在任一 epoch 做过客户端。
 
-一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。地址默认只在个人网络内部交换，显式启用 `network.discovery.publish` 才向指定目录发布地址。
+一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。地址默认只在个人网络内传播；`network.discovery` 是明确选择公开临时传输地址的配置，显式启用 `network.pkarr.publish` 才向指定 pkarr 目录发布地址。
 
 ## 本机配置
 
@@ -24,16 +24,17 @@
 |---|---|
 | `listen` | HTTP 监听地址，默认 `127.0.0.1:4790`，决定可接入的网卡；iroh 默认在同一端口号上监听 UDP |
 | `local_listen` | 本机会话的固定回环地址，默认 `127.0.0.1:4791`，让本机 origin 和浏览器存储跨重启不变 |
-| `public_url` | 本 Node 的网页 origin，公网为 HTTPS；没有公共入口时作为地址记录的 `gateway_url` |
+| `public_url` | 本 Node 的网页 origin，公网为 HTTPS；没有公共入口且网页开启时作为地址记录的 `gateway_url` |
 | `allowed_origins` | 额外允许的浏览器 origin 数组，默认空；`init --allowed-origin` 可重复指定 |
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
-| `public_entry` | `true` 表示本进程是公共入口，默认提供网页、relay 和密文转发，不加入个人网络；可另行启用独立文件交付服务 |
+| `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
+| `public_entry` | `true` 表示不加入个人网络。默认提供网页、relay 和密文转发；`discovery-only` 时仅提供发现服务和可选静态网页；两种模式都可另行启用独立文件交付服务 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
 | `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
-| `providers.codex_app_server` | `{mode, socket}`：`system` 要求明确 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境明确设置 `CODEX_HOME` |
+| `providers.codex_app_server` | `{mode, socket}`：`system` 要求 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境设置 `CODEX_HOME`。用到 Codex 而缺失时，`init`、启动和 `configure_provider` 从本机找出并写入，见[部署配置](deployment.md#配置-sdk-与-app-server) |
 | `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
@@ -45,13 +46,14 @@
 | `bind` | 无 | iroh 的 UDP 地址；省略时在 `listen` 端口上绑定 IPv4 与 IPv6 通配地址，IPv6 失败不阻止启动 |
 | `relays` | `--relay URL` | 个人网络中其他 Node 的 relay，最多 16 个 |
 | `n0_relays` | 无 | 同时使用 n0 公共 relay，默认 `false` |
-| `relay_paths_only` | `--relay-paths-only` | 不绑定直连 socket，只经 relay 连接 |
-| `relay_listen` | `--relay-listen ADDR` | 本 Node 运行 iroh relay 的地址，明文 HTTP，公网经反向代理提供 HTTPS |
+| `relay_listen` | `--relay-listen ADDR` | `forward` 模式的 TCP relay 地址，或 `discovery-only` 模式的 UDP 发现地址 |
+| `relay_mode` | `--relay-mode MODE` | `forward` 默认，或 `discovery-only`；后者要求 `public_entry=true` |
+| `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
 | `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
-| `discovery` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
+| `pkarr` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
 
-配置了 `network.bind` 或 `relay_paths_only` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。
+配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。`discovery-only` 还要求非零 UDP 端口，不能配置 `bind`、`relays`、`n0_relays`、`relay_url` 或其他发现服务。
 
 启用管理 Agent 时，`manager` 对象包含以下全部字段。程序路径在后台运行时使用绝对路径。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
@@ -72,8 +74,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":3}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=3` |
+| `data-epoch.json` | `{"data_epoch":4}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=4` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -137,9 +139,9 @@
 | `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
 | `log` | `records`：1 到 20 条 `{level, event, message, conversation_id?, work_id?, fields?}` | 浏览器写日志，来源记为 `web`，每条 JSON 不超过 8 KiB，每台设备每分钟 120 条 |
 | `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
-| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}` 和 `providers`。`providers` 每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置 |
-| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型、工作目录和程序路径；不能开关 Bot 或更换它的服务 |
-| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`execution` 只用于 Codex。`bin` 和 `app_server` 只用于 Codex。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件 |
+| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}` 和 `providers`。`providers` 每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
+| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型、工作目录和程序路径，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
+| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`execution` 只用于 Codex。`bin` 和 `app_server` 只用于 Codex。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
@@ -240,7 +242,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。`propose_provider_config { execution?, codex_home?, app_server_socket?, codex_sessions?, cursor_sdk_bin? }` 提议本设备的路径：给出的必须是存在的绝对路径，其余由 Node 补齐，只留与现有设置不同的项；都相同时返回 `{status: "unchanged"}`。否则在本聊天写一张「允许 / 不允许」提问卡片，卡片里的路径缩写成 `~/…`，返回 `{status: "asked", question_id, proposed}`，此时什么都不写。本人回答后的那一轮，Bot 用 `apply_provider_config { question_id }`：回答为「允许」时经 `configure_provider` 的同一写入路径写入，返回 `{status: "applied", applied, also_filled}`；其他回答返回 `{status: "declined"}`，不写。同一提问重复调用只读回第一次的结果。提议只存在内存，Node 重启后要重新提议。密钥和其他变量不经这两个工具。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 
@@ -248,7 +250,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 Node 接纳工作时核对派发方是成员 Node 且处于进行中的调度轮次，并核对 `cwd` 位于自己的 `roots` 内。本机工作（`kind=codex`）：`track_work` 写 `WorkDispatched` 并返回 `{work_id, call_ref, state, may_send, send_by_ms, cwd, thread_id?}`，只有第一次登记 `may_send=true`；CLI 用 `thread/start`（`approvalPolicy=never`、`danger-full-access`）开线程，`bind_work {work_id, thread_id}` 绑定后才发 `turn/start`，`clientUserMessageId` 为 `work_id`，再 `bind_work {work_id, turn_id | unknown | failed}`。`send_by_ms` 为登记后 60 秒，之后不再发送；再过 30 秒仍没有回合时 Node 按 `clientId` 复查线程，找不到就记为 `rejected`。`target_node` 是其他设备时，任务（`kind=task`）作为那台设备协调 Agent 的一轮执行，由它在本机直连派发。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。`thread` 是本机已有的 App Server 线程（`vibeface codex send`）：CLI 先 `thread/read` 取 `cwd`，Node 登记时即为 `starting`，不核对 `roots`，与 `continues` 互斥；发送时回合进行中则 `turn/steer`，否则 `turn/start`。几项工作可共用一个回合，各自结束并各自回报。
 
-Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --question … --choice <标签>` 在负责该会话的 Bot 聊天里提问，提问挂住请求直到有回答，回答后 Bot 有 120 秒用 `vibeface codex respond … --node <设备>` 应答。不属于任何 Bot 的会话先归给主 Bot 再按归属处理；没有 Bot、不属于线程或后台线程（`codex exec`、子代理）上的请求立即兜底。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。
+Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --question … --choice <标签>` 在负责该会话的 Bot 聊天里提问，提问挂住请求直到有回答，回答后 Bot 有 120 秒用 `vibeface codex respond … --node <设备>` 应答。不属于任何 Bot 的会话先归给主 Bot 再按归属处理；没有 Bot、不属于线程或后台线程（`codex exec`、子代理）上的请求立即兜底。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。请求 ID 由方法、线程、回合、`itemId` 或 `callId` 及 `approvalId` 的哈希确定，缺少这些字段时随机生成。重连后同一请求再次到达时沿用原有提问或 Agent 事件，只改用新连接的 JSON-RPC ID，不会再提问一次。连接后 App Server 读完 Node 订阅的线程，本设备提过问、仍未回答但请求未再到达的提问由本设备写 `question_closed` 关闭；之后同一请求再到达时按方法兜底。
 
 工作状态为 `accepted`、`starting`、`running`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
@@ -285,6 +287,7 @@ Event {
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
 | `question_asked` | `question_id`、`severity`、`text`、`choices: [{label}]`、`about {node, agent, session_id, cwd, summary, request_id?}` | 提问的 Node；写在拥有该会话的 Bot 会话 |
+| `question_closed` | `question_id`、`reason`（`request_lost`） | 提问且挂着该请求的 Node，写在提问所在会话；其他作者的关闭不计入。已有回答时回答为准，与到达顺序无关；关闭后回答被拒绝 |
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary` | 运行该会话的 Node，写在接手 Bot 的会话；rank 最大者为准 |
 | `session_muted` | `node`、`session_id` | 运行该会话的 Node，写在当前接手 Bot 的会话：不再关注，新的 `session_attributed` 撤销 |
 | `bot_changed` | `change_id`、`cause`、`change` | 负责人 |
@@ -324,12 +327,13 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### iroh Endpoint
 
-每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS、pkarr 或局域网发布地址，对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.discovery` 后，还可向指定 pkarr 目录发布或解析地址。连接优先打洞直连，失败时经 relay 转发 QUIC 密文。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS、pkarr 或局域网发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
 
 `Router` 按 ALPN 分发连接。私人 Node 请求每次占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。`service` 的独立 Noise 帧和容量见[服务传输](#服务传输)。
 
 | ALPN | 用途 | 接受的对端 |
 |---|---|---|
+| `vibeface/discovery/1` | 固定的地址登记、查找与空探测 | 任意通过 TLS 证明身份的设备；不授予业务权限 |
 | `vibeface/sync/1` | `hello`、`membership`、`pull`、`forks`、`have` | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
@@ -385,7 +389,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ## 免费节点发现
 
-`network.discovery` 的字段为 `publish`、`resolve`、`urls`、`publish_direct`。布尔值默认均为 `false`，`urls` 默认空，最多 4 个。发布或解析必须指定非空目录列表。URL 只接受无凭证、查询参数和 fragment 的 HTTPS，或字面回环地址的 HTTP。
+`network.pkarr` 的字段为 `publish`、`resolve`、`urls`、`publish_direct`。布尔值默认均为 `false`，`urls` 默认空，最多 4 个。发布或解析必须指定非空目录列表。URL 只接受无凭证、查询参数和 fragment 的 HTTPS，或字面回环地址的 HTTP。
 
 发现只搬运签名地址包，不调用钱包、合约或付费服务。`publish=true` 发布本 Node 的 PeerID 和可达地址，默认过滤直连 IP；只有 `publish_direct=true` 才请求发布直连地址。成员关系、会话和项目不进入记录。目录不提供成员授权，也不证明节点在线或愿意接单。
 
@@ -428,6 +432,16 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 证明收据以 statement digest 固定本机任务路径，私密输入不进入 argv、日志、公共 fixtures 或 DAG。收据完成验证后原子发布，重启先验真并恢复原 seal。签名前在事务中固定 nonce、calldata 和 gas 预算，raw transaction 持久化后广播。结果未知只对账或在授权仍有效时重播同一字节。
 
 接收 key 的注册、轮换和撤销只通过同用户维护 socket。注册、轮换和撤销均使用显式稳定 UUID，重试不能更换 action、gas、部署、profile 或 serial。状态读取不自动续期或重新启用 key，registry 确认前不宣称生效。旧 KeyId 私密材料保留，已 Held 窗口继续使用原 key，未 Held 的旧 serial 窗口按合约终止或退款。个人恢复文件和独立钱包备份都不包含这些订单解密材料，恢复必须保留完整 Node 数据目录。
+
+### 仅发现协议
+
+`relay_mode=discovery-only` 的公共入口只注册 `vibeface/discovery/1`，不启动 `iroh-relay`，不提供 HTTP 浏览器转发，也不接受 `SYNC`、`BLOB`、`RPC`、`CLIENT`、`JOIN` 或 `DECISION` 业务 ALPN。网页开启时只提供静态资源和服务信息。
+
+发现协议使用长度前缀 JSON，单帧最多 512 字节，未知字段被拒绝。请求只有 `register`、`lookup {device_id}` 和空的 `probe`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
+
+总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个请求。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
+
+已知设备编号可以查询在线状态和观察地址，不提供枚举接口。运营者可见设备、IP 和查询关系。仅发现不能补偿被封锁或不可打洞的 UDP 路径；普通 relay 仍由用户另行配置并由 iroh 自动回退。部署步骤见[运行公共发现服务](node.md#运行不转发业务数据的公共发现服务)。
 
 ## 通知和自动后续
 

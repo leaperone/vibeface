@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { CircleCheck, Copy, Link2, Plus, Smartphone } from "lucide-react"
+import { CircleCheck, Clock, Copy, Link2, Plus, Smartphone } from "lucide-react"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
+import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
@@ -90,7 +91,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
       <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     </PageActions>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
-      {/* A waiting request leads the sheet; its first control is 设为管理员, which should not take focus on its own. */}
+      {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
       <SheetContent ref={sheet} className="!w-full overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
@@ -103,7 +104,10 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
           {result && !used ? <div className="grid gap-3">
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用手机相机扫码打开" /> : null}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? "已复制" : "复制链接"}</Button>
-            <p className="text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</p>
+            <ul className="grid gap-1.5 text-meta text-muted-foreground">
+              <li className="flex items-center gap-1.5"><terms.safetyCode.icon aria-hidden="true" className="size-4 shrink-0" />新设备打开后，回这里比对{terms.safetyCode.label}</li>
+              <li className="flex items-center gap-1.5"><Clock aria-hidden="true" className="size-4 shrink-0" />只发给自己的设备，10 分钟内有效</li>
+            </ul>
             {result.qr ? null : <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
               <span className="flex items-center gap-1.5"><Smartphone aria-hidden="true" className="size-4 shrink-0" />{local ? "手机打不开本机地址" : "手机打不开这个地址"}</span>
               <Link className="hit-area relative font-medium text-foreground underline underline-offset-4" to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>怎么设置</Link>

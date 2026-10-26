@@ -23,6 +23,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    net::SocketAddr,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -1377,8 +1378,9 @@ struct PendingJoin {
 /// The joining Node's side of `vibeface/join/1`, through the ticket's addresses. The relay
 /// admits a non-member holding the invite's derived token.
 struct JoinLink {
-    net: Net,
+    net: Arc<Net>,
     entry: String,
+    _router: iroh::protocol::Router,
 }
 impl JoinLink {
     async fn open(node: &Runtime, ticket: &Ticket) -> Result<Self> {
@@ -1411,17 +1413,27 @@ impl JoinLink {
                 .map(TransportAddr::Ip),
         );
         ensure!(
-            !addrs.is_empty(),
-            "this invite carries no address of its entry Node"
+            !addrs.is_empty() || !node.config.network.discovery.is_empty(),
+            "this invite carries no address and no discovery server is configured"
         );
         let config = NetworkConfig {
-            relay_paths_only: node.config.network.relay_paths_only,
+            discovery: node.config.network.discovery.clone(),
+            bind: node
+                .config
+                .network
+                .bind
+                .map(|address| SocketAddr::new(address.ip(), 0)),
             ..NetworkConfig::default()
         };
-        let link = Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?;
+        let link = Arc::new(Net::bind(&node.identity.secret_key_hex, &config, 0, relays).await?);
+        let router = link.discovery_router();
         link.learn(&EndpointAddr::from_parts(net::endpoint_id(&entry)?, addrs))
             .await;
-        Ok(Self { net: link, entry })
+        Ok(Self {
+            net: link,
+            entry,
+            _router: router,
+        })
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {

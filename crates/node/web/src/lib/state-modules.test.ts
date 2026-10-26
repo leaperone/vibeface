@@ -4,7 +4,7 @@ import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
 import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { humanError, rawError } from '@vibeface/client/lib/errors.ts'
+import { humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }
@@ -116,7 +116,7 @@ test('after a reload an older address record never replaces a newer one, withdra
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
-  assert.equal(humanError('unknown member', 'target_not_member'), '这台设备不在我的设备里，访问地址不会转发给它。')
+  assert.equal(humanError('unknown member', 'target_not_member'), '那台电脑不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
   assert.match(humanError('Codex SDK failed: Missing environment variable: `CPA_API_KEY`.'), /缺少密钥/)
   assert.match(humanError('CURSOR_API_KEY is required for the Cursor SDK manager'), /缺少密钥/)
@@ -125,11 +125,21 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
   assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)
-  assert.equal(humanError('set an explicit App Server socket before enabling system execution'), '还没选怎么连 Codex。')
+  assert.equal(humanError('set an explicit App Server socket before enabling system execution'), '还没填 Codex 的连接路径。')
   assert.equal(humanError('the App Server socket must be an absolute path'), '连接路径要是绝对路径。')
-  assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /CODEX_HOME/)
+  assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /Codex 目录/)
+  assert.match(humanError("this computer's Codex folder has no sessions folder yet"), /先用 Codex 跑一次对话/)
+  assert.match(humanError('no Codex folder found on this computer: install Codex so $HOME/.codex exists, set CODEX_HOME for the Node, or enter the Codex folder'), /没找到这台电脑上的 Codex 目录/)
   assert.equal(humanError('something nobody mapped'), '这次操作没有成功，请再试一次。')
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')
   assert.equal(rawError(new Error('已断开')), '')
+})
+
+test('a spent join link reads the same, and clears the field the same, whether the Node or the page says so', () => {
+  for (const raw of ['ticket has already been used', 'ticket is unknown or already expired', 'ticket has expired', spentInviteText]) {
+    assert.ok(spentInvite.test(raw), raw)
+    assert.equal(humanError(raw), spentInviteText)
+  }
+  assert.equal(spentInvite.test('这次加入被拒绝了。要再试，请在已有设备上重新添加。'), false)
 })

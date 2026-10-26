@@ -161,7 +161,7 @@ impl Runtime {
         ensure!(self.net.set(net.clone()).is_ok(), "network already started");
         let weak = Arc::downgrade(self);
         let mut router = Router::builder(net.endpoint.clone());
-        for alpn in net::ALPNS {
+        for alpn in net::alpns(&self.config.network) {
             router = router.accept(
                 alpn,
                 Inbound {
@@ -171,7 +171,12 @@ impl Runtime {
             );
         }
         *self.router.lock().await = Some(router.spawn());
-        if let Some(listen) = self.config.network.relay_listen {
+        if let Some(listen) = self
+            .config
+            .network
+            .relay_listen
+            .filter(|_| self.config.network.relay_mode == net::RelayServiceMode::Forward)
+        {
             let relay = net::spawn_relay(listen, Arc::new(RelayAccess(weak))).await?;
             tracing::info!(%listen, "relay started");
             *self.relay.lock().await = Some(relay);
@@ -269,6 +274,9 @@ impl Runtime {
         alpn: &'static [u8],
         connection: Connection,
     ) -> Result<()> {
+        if alpn == net::DISCOVERY {
+            return self.net()?.serve_discovery(connection).await;
+        }
         let remote = net::device_id(&connection.remote_id());
         if alpn == net::SERVICE {
             return self.delivery.serve(self.clone(), connection).await;
@@ -1003,6 +1011,10 @@ impl Runtime {
                         .filter(|state| state.failures > 0 || state.synced_ms.is_some())
                         .map(|state| state.failures == 0),
                     synced_ms: state.and_then(|state| state.synced_ms),
+                    path: self
+                        .net
+                        .get()
+                        .and_then(|net| net.path_kind(&member.device_id)),
                 }
             })
             .collect()
@@ -1304,11 +1316,17 @@ impl Runtime {
     }
 
     /// Where browsers reach this Node: its public entry, else its own URL.
-    pub(crate) fn gateway_url(&self) -> String {
-        match &self.config.network.entry {
-            Some(entry) => entry.url.clone(),
-            None => self.config.public_url.clone(),
-        }
+    pub(crate) fn gateway_url(&self) -> Option<String> {
+        self.config
+            .network
+            .entry
+            .as_ref()
+            .map(|entry| entry.url.clone())
+            .or_else(|| {
+                self.config
+                    .web_enabled
+                    .then(|| self.config.public_url.clone())
+            })
     }
 
     /// Re-signs this Node's record when its paths or Gateway changed; returns whether it did.
@@ -1316,7 +1334,7 @@ impl Runtime {
         let net = self.net()?;
         let device_id = self.identity.device_id()?;
         let endpoint = net.addr();
-        let gateway_url = Some(self.gateway_url());
+        let gateway_url = self.gateway_url();
         let mut store = self.store.lock().await;
         let previous = store
             .address_book()?
@@ -1398,7 +1416,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Signed records of current member Nodes that serve browsers.
+    /// Includes signed withdrawals so browsers can discard previously cached web entries.
     pub(crate) async fn entrances(&self, network: &str) -> Result<Vec<SignedAddress>> {
         let view = self.membership_state().await?.project()?;
         Ok(self
@@ -1408,9 +1426,9 @@ impl Runtime {
             .address_book()?
             .into_iter()
             .filter(|signed| {
-                signed.open(network).is_ok_and(|record| {
-                    record.gateway_url.is_some() && view.node(&record.device_id).is_ok()
-                })
+                signed
+                    .open(network)
+                    .is_ok_and(|record| view.node(&record.device_id).is_ok())
             })
             .collect())
     }
@@ -2609,7 +2627,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn nodes_without_direct_paths_sync_through_a_member_relay() -> Result<()> {
+    async fn nodes_with_disjoint_ip_families_sync_through_a_member_relay() -> Result<()> {
         let port = std::net::TcpListener::bind("127.0.0.1:0")?
             .local_addr()?
             .port();
@@ -2635,13 +2653,24 @@ mod tests {
             },
         )
         .await?;
-        let hidden = net::NetworkConfig {
-            relays: vec![relay_url.clone()],
-            relay_paths_only: true,
-            ..Default::default()
-        };
-        let (a, dir_a) = node_with(&ids[1], hidden.clone()).await?;
-        let (b, dir_b) = node_with(&ids[2], hidden).await?;
+        let (a, dir_a) = node_with(
+            &ids[1],
+            net::NetworkConfig {
+                bind: Some("127.0.0.1:0".parse()?),
+                relays: vec![relay_url.clone()],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let (b, dir_b) = node_with(
+            &ids[2],
+            net::NetworkConfig {
+                bind: Some("[::1]:0".parse()?),
+                relays: vec![relay_url.clone()],
+                ..Default::default()
+            },
+        )
+        .await?;
         let result = async {
             for node in [&relay, &a, &b] {
                 node.install_membership(state.clone()).await?;
@@ -2666,11 +2695,8 @@ mod tests {
             })
             .await
             .context("the hidden Node never reached its relay")??;
-            assert_eq!(
-                addr.ip_addrs().count(),
-                0,
-                "relay_paths_only advertises no IP path"
-            );
+            assert!(addr.ip_addrs().all(|address| address.is_ipv4()));
+            assert!(b.net()?.addr().ip_addrs().all(|address| address.is_ipv6()));
             b.net()?.learn(&addr).await;
             b.sync_peer(&network, &ids[1].device_id()?).await?;
             assert_eq!(

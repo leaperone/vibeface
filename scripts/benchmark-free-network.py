@@ -275,7 +275,7 @@ def run_sample(artifact, iteration, run, payload, digest, verify):
         a, p, b = nodes
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
-        b.configure_network(relays=[relay_url], relay_paths_only=True)
+        b.configure_network(relays=[relay_url], bind=f"[::1]:{b.quic_port}")
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -533,7 +533,7 @@ def main():
         "artifacts": [side.public() for side in sides], "message_bytes": MESSAGE_BYTES, "attachment_bytes": BLOB_BYTES,
         "attachment_sha256": digest, "fixture_sha256": sha256_file(ROOT / "scripts/verify-node.py"),
         "driver_sha256": sha256_file(Path(__file__).resolve()),
-        "scene": "three fresh member Nodes, B relay_paths_only through member P, execution and manager disabled; warm connections; sender and receiver restarts during attachment",
+        "scene": "three fresh member Nodes, B IPv6-only so it reaches IPv4-only peers through member P, execution and manager disabled; warm connections; sender and receiver restarts during attachment",
         "not_measured": ["QUIC wire duplicate bytes", "real NAT or public internet", "AI providers", "paid delivery performance"]}
     try:
         for iteration in range(1, SAMPLES_PER_SIDE + 1):

@@ -1,18 +1,21 @@
 import { useLayoutEffect, useRef } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { ChevronRight, Inbox } from 'lucide-react'
-import { claimFocus, EmptyState } from '@/components/app/kit'
+import { ChevronRight, Inbox, MessageCircle } from 'lucide-react'
+import { claimFocus, EmptyState, Skeleton } from '@/components/app/kit'
+import { Button } from '@/components/ui/button'
 import { useInbox } from '@/features/workspace/inbox'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { JoinCard } from '@/features/devices/join'
 import { WriteCard } from '@/features/workspace/write-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/identity/recovery-controls'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 
 export const Route = createFileRoute('/_app/inbox')({ component: InboxPage })
 
 function InboxPage() {
   const items = useInbox()
+  const workspace = useWorkspace()
   // A handled card leaves with the button just pressed; the card now in its place, or the page title, takes the focus.
   const list = useRef<HTMLUListElement>(null)
   const held = useRef<{ key: string; index: number } | null>(null)
@@ -25,7 +28,9 @@ function InboxPage() {
     const next = cards?.length ? cards[Math.min(last.index, cards.length - 1)] : document.getElementById('main')?.querySelector('h1')
     if (next instanceof HTMLElement) claimFocus(next)
   }, [keys])
-  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" />
+  // Every read lands with the device list, which always holds the computer this page reads from; until then 没有待处理 would be a guess.
+  if (!items.length && !workspace.nodes.length && !workspace.error) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
+  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" action={<Button asChild variant="outline"><Link to="/"><MessageCircle aria-hidden="true" />回到消息</Link></Button>} />
   return <ul ref={list} className="mx-auto grid w-full max-w-(--page-width) gap-3" onFocus={(event) => {
     const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))
     if (items[index]) held.current = { key: items[index].key, index }

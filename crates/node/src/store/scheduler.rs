@@ -908,7 +908,7 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
     ),
     (
         &["execution is turned off"],
-        "这台设备的 Codex 没开执行任务。去「设备 → Bot 与任务」打开后再发一次。",
+        "这台电脑的 Codex 没开执行任务。去「设备 → Bot 与任务」打开后再发一次。",
     ),
     (
         &[
@@ -917,7 +917,7 @@ const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
             "no cursor sdk bridge",
             "enoent",
         ],
-        "这台设备上找不到 AI 服务的程序。去「设备 → Bot 与任务」检查后再发一次。",
+        "这台电脑上找不到 AI 服务的程序。去「设备 → Bot 与任务」检查后再发一次。",
     ),
     (
         &["usage limit", "rate limit", "quota", "too many requests"],

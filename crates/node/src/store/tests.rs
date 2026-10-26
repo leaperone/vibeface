@@ -3506,6 +3506,61 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
 }
 
 #[test]
+fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let mut card = question(&net, "q-settings", "provider-setup-1")?;
+    if let EventBody::QuestionAsked { about, .. } = &mut card {
+        about.agent = crate::runtime::SETTINGS_AGENT.into();
+    }
+    store.ask(&net.a, &net.network, "c", card, 2)?;
+    store.ask(
+        &net.a,
+        &net.network,
+        "c",
+        question(&net, "q-session", "t1")?,
+        3,
+    )?;
+    let mut roles = std::collections::BTreeMap::new();
+    for (id, time) in [("q-settings", 4), ("q-session", 5)] {
+        let signed = Some(answer_signature(&net, "c", id, "继续")?);
+        store.accept_answer(&net.a, &net.network, id, "继续", signed, time)?;
+        let trigger = message_trigger(&questions::answer_id(id));
+        store.admit_delivery(&net.a.device_id()?, &net.network, "c", &trigger)?;
+        let job = store
+            .scheduler_jobs("c")?
+            .into_iter()
+            .find(|job| job.trigger == trigger)
+            .context("answer job")?;
+        let context = store.context(&net.network, "c", None)?;
+        let works = store.works(&net.network, "c")?;
+        let (prompt, _) = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            json!({}),
+            None,
+            &[],
+            None,
+            None,
+        )?;
+        roles.insert(id, prompt.lines().next().unwrap_or_default().to_owned());
+    }
+    assert!(
+        roles["q-settings"].contains("apply_provider_config")
+            && !roles["q-settings"].contains("dispatch_work"),
+        "a settings card's answer is applied, never sent to its placeholder session: {}",
+        roles["q-settings"]
+    );
+    assert!(
+        roles["q-session"].contains("dispatch_work"),
+        "an answer about a session still reaches the session"
+    );
+    Ok(())
+}
+
+#[test]
 fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
     let (mut a, mut b) = (store(&net)?, store(&net)?);
@@ -3538,6 +3593,127 @@ fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
             questions[0]["answer"]["author"],
             signer.as_str(),
             "the signing device answered, not the entry Node"
+        );
+    }
+    Ok(())
+}
+
+fn approval(net: &Net, id: &str, request: &str) -> Result<EventBody> {
+    let mut body = question(net, id, "t1")?;
+    if let EventBody::QuestionAsked { about, .. } = &mut body {
+        about.request_id = Some(request.into());
+    }
+    Ok(body)
+}
+
+fn closed(store: &Store, net: &Net, question: &str) -> Result<Value> {
+    Ok(store
+        .question(&net.network, question)?
+        .context("question")?["closed"]
+        .clone())
+}
+
+fn held(requests: &[&str]) -> std::collections::HashSet<String> {
+    requests
+        .iter()
+        .map(|request| (*request).to_owned())
+        .collect()
+}
+
+#[test]
+fn a_lost_request_closes_its_question_on_every_device_once() -> Result<()> {
+    let net = net()?;
+    let (mut a, mut b) = (store(&net)?, store(&net)?);
+    conversation(&mut a, &net)?;
+    a.ask(&net.a, &net.network, "c", approval(&net, "q-1", "r-1")?, 2)?;
+    a.ask(&net.a, &net.network, "c", approval(&net, "q-2", "r-2")?, 2)?;
+    a.ask(&net.a, &net.network, "c", question(&net, "q-3", "t3")?, 2)?;
+    let written = a.close_lost_questions(&net.a, &net.network, &held(&["r-2"]), 3)?;
+    assert_eq!(
+        written
+            .iter()
+            .map(|(scope, _)| scope.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c"],
+        "only the request no longer held closes its question"
+    );
+    assert!(
+        a.close_lost_questions(&net.a, &net.network, &held(&["r-2"]), 4)?
+            .is_empty(),
+        "a closed question is closed once"
+    );
+    sync(&a, &mut b, &net)?;
+    for store in [&a, &b] {
+        assert_eq!(unanswered(store, &net)?, vec!["q-2", "q-3"]);
+        assert_eq!(closed(store, &net, "q-1")?, "request_lost");
+        let chat = store.conversation_questions(&net.network, "c")?;
+        assert_eq!(chat.len(), 3, "a closed question stays in its chat");
+    }
+    let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
+    let refused = b
+        .accept_answer(&net.b, &net.network, "q-1", "允许", signed, 5)
+        .err()
+        .context("answering a closed question fails")?;
+    assert!(refused.to_string().contains("closed"), "{refused}");
+    assert!(
+        b.messages(&net.network, "c")?.is_empty(),
+        "nothing is posted"
+    );
+    Ok(())
+}
+
+#[test]
+fn only_the_asking_device_closes_its_question() -> Result<()> {
+    let net = net()?;
+    let (mut a, mut b) = (store(&net)?, store(&net)?);
+    conversation(&mut a, &net)?;
+    a.ask(&net.a, &net.network, "c", approval(&net, "q-1", "r-1")?, 2)?;
+    sync(&a, &mut b, &net)?;
+    assert!(
+        b.close_lost_questions(&net.b, &net.network, &held(&[]), 3)?
+            .is_empty(),
+        "another device holds none of this device's requests"
+    );
+    let forged = EventBody::QuestionClosed {
+        question_id: "q-1".into(),
+        reason: CloseReason::RequestLost,
+    };
+    b.append_event(&net.b, &net.network, "c", forged, vec![], 3)?;
+    sync(&b, &mut a, &net)?;
+    for store in [&a, &b] {
+        assert_eq!(unanswered(store, &net)?, vec!["q-1"]);
+        assert_eq!(closed(store, &net, "q-1")?, Value::Null);
+    }
+    Ok(())
+}
+
+#[test]
+fn an_answer_wins_over_a_close_in_either_order() -> Result<()> {
+    let net = net()?;
+    let (mut a, mut b) = (store(&net)?, store(&net)?);
+    conversation(&mut a, &net)?;
+    a.ask(&net.a, &net.network, "c", approval(&net, "q-1", "r-1")?, 2)?;
+    a.ask(&net.a, &net.network, "c", approval(&net, "q-2", "r-2")?, 2)?;
+    let signed = Some(answer_signature(&net, "c", "q-2", "继续")?);
+    a.accept_answer(&net.a, &net.network, "q-2", "继续", signed, 3)?;
+    sync(&a, &mut b, &net)?;
+    let signed = Some(answer_signature(&net, "c", "q-1", "允许")?);
+    b.accept_answer(&net.b, &net.network, "q-1", "允许", signed, 4)?;
+    let written = a.close_lost_questions(&net.a, &net.network, &held(&[]), 4)?;
+    assert_eq!(written.len(), 1, "an answered question is never closed");
+    assert_eq!(closed(&a, &net, "q-1")?, "request_lost");
+    sync(&a, &mut b, &net)?;
+    sync(&b, &mut a, &net)?;
+    for store in [&a, &b] {
+        assert!(unanswered(store, &net)?.is_empty());
+        let question = store.question(&net.network, "q-1")?.context("question")?;
+        assert_eq!(
+            (
+                question["answer"]["text"].clone(),
+                question["closed"].clone()
+            ),
+            (json!("允许"), Value::Null),
+            "the answer stands whether it or the close arrived first"
         );
     }
     Ok(())

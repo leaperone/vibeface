@@ -386,6 +386,18 @@ impl Runtime {
                 let id = field(&args, "work_id")?;
                 self.stop_work(network, &scope, id).await
             }
+            Tool::ProposeProviderConfig => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("a proposal requires an agent invocation")?;
+                self.propose_provider_config(network, &scope, &manager.trigger, args)
+                    .await
+            }
+            Tool::ApplyProviderConfig => {
+                self.apply_provider_config(network, &scope, field(&args, "question_id")?)
+                    .await
+            }
             Tool::HandOverSession => {
                 let target = match (args["to"].as_str(), args["stop_following"] == true) {
                     (Some(bot), false) => Some(

@@ -1,4 +1,4 @@
-//! Node-to-Node transport: one iroh `Endpoint` per Node, six ALPNs, and an optional relay.
+//! Node transport, typed address rendezvous, and an optional business relay on one iroh Endpoint.
 //!
 //! Every request is one QUIC bidirectional stream carrying length-prefixed JSON frames. The
 //! remote `EndpointId` is the peer's `DeviceId`, proven by the QUIC TLS handshake.
@@ -19,8 +19,10 @@ use std::{
     time::Duration,
 };
 
-pub mod discovery;
+mod discovery;
+pub mod pkarr;
 
+pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
 pub const SYNC: &[u8] = b"vibeface/sync/1";
 pub const BLOB: &[u8] = b"vibeface/blob/1";
 pub const RPC: &[u8] = b"vibeface/rpc/1";
@@ -39,7 +41,7 @@ const RELAY_TOKEN_DOMAIN: &[u8] = b"vibeface:relay:v1";
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default)]
-    pub discovery: discovery::DiscoveryConfig,
+    pub pkarr: pkarr::PkarrConfig,
     /// UDP address of the iroh endpoint; defaults to all interfaces on the `listen` port.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
@@ -49,10 +51,12 @@ pub struct NetworkConfig {
     /// Also use n0's public relays.
     #[serde(default)]
     pub n0_relays: bool,
-    /// Reach other Nodes only through relays, as a Node behind a strict NAT would.
+    /// Infrastructure this Node uses for address discovery and simultaneous direct probes.
     #[serde(default)]
-    pub relay_paths_only: bool,
-    /// Run an iroh relay for the personal network on this address.
+    pub discovery: Vec<String>,
+    #[serde(default)]
+    pub relay_mode: RelayServiceMode,
+    /// Run an iroh relay or a UDP discovery service on this address.
     #[serde(default)]
     pub relay_listen: Option<SocketAddr>,
     /// The relay's URL as other Nodes reach it; defaults to `http://<relay_listen>`.
@@ -62,6 +66,32 @@ pub struct NetworkConfig {
     /// token is the data directory's `entry-token` file.
     #[serde(default)]
     pub entry: Option<PublicEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelayServiceMode {
+    #[default]
+    Forward,
+    DiscoveryOnly,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PathKind {
+    Direct,
+    Relay,
+}
+
+pub fn alpns(config: &NetworkConfig) -> Vec<&'static [u8]> {
+    if config.relay_mode == RelayServiceMode::DiscoveryOnly {
+        vec![DISCOVERY]
+    } else {
+        ALPNS
+            .into_iter()
+            .chain(std::iter::once(DISCOVERY))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,8 +127,24 @@ pub fn same_token(a: &str, b: &str) -> bool {
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
-        self.discovery.validate()?;
+        self.pkarr.validate()?;
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
+        ensure!(self.discovery.len() <= 4, "too many discovery servers");
+        for server in &self.discovery {
+            discovery::validate_server(server)?;
+        }
+        if self.relay_mode == RelayServiceMode::DiscoveryOnly {
+            ensure!(
+                self.relay_listen.is_some_and(|listen| listen.port() != 0)
+                    && self.relay_url.is_none()
+                    && self.entry.is_none()
+                    && self.relays.is_empty()
+                    && !self.n0_relays
+                    && self.bind.is_none()
+                    && self.discovery.is_empty(),
+                "discovery-only needs relay_listen and cannot configure data relay paths or another bind address"
+            );
+        }
         for url in self.relays.iter().chain(&self.relay_url) {
             relay_url(url)?;
         }
@@ -120,7 +166,10 @@ impl NetworkConfig {
             self.relay_url.is_none() || self.relay_listen.is_some(),
             "relay_url requires relay_listen"
         );
-        if let Some(listen) = self.relay_listen {
+        if let Some(listen) = self
+            .relay_listen
+            .filter(|_| self.relay_mode == RelayServiceMode::Forward)
+        {
             ensure!(
                 self.relay_url.is_some() || !listen.ip().is_unspecified(),
                 "a relay on all interfaces needs relay_url"
@@ -130,6 +179,9 @@ impl NetworkConfig {
     }
     /// The URL other Nodes use for this Node's relay.
     pub fn own_relay(&self) -> Result<Option<RelayUrl>> {
+        if self.relay_mode == RelayServiceMode::DiscoveryOnly {
+            return Ok(None);
+        }
         match (&self.relay_url, self.relay_listen) {
             (Some(url), _) => relay_url(url).map(Some),
             (None, Some(listen)) => relay_url(&format!("http://{listen}")).map(Some),
@@ -230,6 +282,7 @@ impl SignedAddress {
 pub struct Net {
     pub endpoint: Endpoint,
     lookup: MemoryLookup,
+    discovery: discovery::Discovery,
     relays: Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
 }
@@ -240,8 +293,8 @@ impl std::fmt::Debug for Net {
 }
 
 impl Net {
-    /// Binds the endpoint. No address is published anywhere; peers learn it from tickets and
-    /// the personal network's signed address book.
+    /// Binds the endpoint. Addresses stay in tickets and the personal network unless the
+    /// operator explicitly configures a discovery service.
     pub async fn bind(
         secret_key_hex: &str,
         config: &NetworkConfig,
@@ -275,52 +328,79 @@ impl Net {
         let lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(SecretKey::from_bytes(&seed))
-            .alpns(ALPNS.iter().map(|alpn| alpn.to_vec()).collect())
+            .alpns(
+                alpns(config)
+                    .into_iter()
+                    .map(|alpn| alpn.to_vec())
+                    .collect(),
+            )
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
-        for url in &config.discovery.urls {
+        for url in &config.pkarr.urls {
             let url = reqwest::Url::parse(url)?;
-            if config.discovery.publish {
+            if config.pkarr.publish {
                 let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone());
-                let publisher = if config.discovery.publish_direct {
+                let publisher = if config.pkarr.publish_direct {
                     publisher.addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
                 } else {
                     publisher
                 };
                 builder = builder.address_lookup(publisher);
             }
-            if config.discovery.resolve {
-                builder = builder.address_lookup(discovery::FreshResolver::new(url)?);
+            if config.pkarr.resolve {
+                builder = builder.address_lookup(pkarr::FreshResolver::new(url)?);
             }
         }
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();
         // A router mapping would publish an address the user did not configure.
-        if config.bind.is_some() || config.relay_paths_only {
+        let bind = if config.relay_mode == RelayServiceMode::DiscoveryOnly {
+            config.relay_listen
+        } else {
+            config.bind
+        };
+        if bind.is_some() {
             builder = builder.portmapper_config(PortmapperConfig::Disabled);
         }
-        if !config.relay_paths_only {
-            let invalid = |error| anyhow!("invalid QUIC bind address: {error}");
-            builder = match config.bind {
-                Some(bind) => builder.bind_addr(bind).map_err(invalid)?,
-                None => builder
-                    .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port))
+        let invalid = |error| anyhow!("invalid QUIC bind address: {error}");
+        builder = match bind {
+            Some(bind)
+                if config.relay_mode == RelayServiceMode::DiscoveryOnly
+                    && bind.ip().is_unspecified() =>
+            {
+                builder
+                    .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), bind.port()))
                     .map_err(invalid)?
                     .bind_addr_with_opts(
-                        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), listen_port),
+                        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), bind.port()),
                         BindOpts::default().set_is_required(false),
                     )
-                    .map_err(invalid)?,
-            };
-        }
+                    .map_err(invalid)?
+            }
+            Some(bind) => builder.bind_addr(bind).map_err(invalid)?,
+            None => builder
+                .bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), listen_port))
+                .map_err(invalid)?
+                .bind_addr_with_opts(
+                    SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), listen_port),
+                    BindOpts::default().set_is_required(false),
+                )
+                .map_err(invalid)?,
+        };
         let endpoint = builder
             .bind()
             .await
             .context("QUIC endpoint failed to start")?;
+        let discovery = discovery::Discovery::new(
+            &endpoint,
+            &config.discovery,
+            config.relay_mode == RelayServiceMode::DiscoveryOnly,
+        )?;
         Ok(Self {
             endpoint,
             lookup,
+            discovery,
             relays: Mutex::new(known),
             connections: Mutex::new(HashMap::new()),
         })
@@ -395,15 +475,61 @@ impl Net {
         {
             return Ok(connection.clone());
         }
-        let connection = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(id, alpn))
-            .await
-            .context("peer did not answer in time")?
-            .map_err(|error| anyhow!("peer is unreachable: {error}"))?;
+        let connection = tokio::time::timeout(DIAL_TIMEOUT, async {
+            let hint = self.discovery.resolve(id).await;
+            let mut addresses = self
+                .lookup
+                .get_endpoint_info(id)
+                .map(|info| info.addrs().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if let Some(address) = hint {
+                addresses.push(iroh::TransportAddr::Ip(address));
+            }
+            self.endpoint
+                .connect(EndpointAddr::from_parts(id, addresses), alpn)
+                .await
+        })
+        .await
+        .context("peer did not answer in time")?
+        .map_err(|error| anyhow!("peer is unreachable: {error}"))?;
         self.connections
             .lock()
             .expect("connection cache")
             .insert((id, alpn), connection.clone());
         Ok(connection)
+    }
+
+    pub(crate) fn discovery_router(self: &Arc<Self>) -> iroh::protocol::Router {
+        iroh::protocol::Router::builder(self.endpoint.clone())
+            .accept(DISCOVERY, discovery::Handler(Arc::downgrade(self)))
+            .spawn()
+    }
+
+    pub async fn serve_discovery(&self, connection: Connection) -> Result<()> {
+        self.discovery.serve(connection).await
+    }
+
+    pub fn path_kind(&self, device_id: &str) -> Option<PathKind> {
+        let id = endpoint_id(device_id).ok()?;
+        let connections = self.connections.lock().expect("connection cache");
+        connections
+            .iter()
+            .filter(|((peer, _), connection)| *peer == id && connection.close_reason().is_none())
+            .find_map(|(_, connection)| {
+                connection
+                    .paths()
+                    .iter()
+                    .find(|path| path.is_selected())
+                    .and_then(|path| {
+                        if path.is_ip() {
+                            Some(PathKind::Direct)
+                        } else if path.is_relay() {
+                            Some(PathKind::Relay)
+                        } else {
+                            None
+                        }
+                    })
+            })
     }
 
     /// One request on its own stream; the response is the stream's only frame.

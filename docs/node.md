@@ -100,7 +100,7 @@ Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `
 
 ### 使用 Codex SDK
 
-Codex Bot 的回合在明确配置的 Codex App Server 上运行。先启动并登录该服务，再指定它的 socket；由 Node 启动独立实例时，按[部署配置](deployment.md#配置-sdk-与-app-server)设置目录和运行模式。
+Codex Bot 的回合在 Codex App Server 上运行。装好并登录 Codex 后，`init` 从本机找出 Codex 目录、App Server socket 和会话目录并写进配置，找法见[部署配置](deployment.md#配置-sdk-与-app-server)；`--codex-socket` 可直接指定。
 
 ```sh
 ./vibeface init \
@@ -256,9 +256,17 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 成员 Gateway 保存个人网络的完整副本。反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**怎么设置**链接指向本节。
 
+## 不提供网页
+
+默认启动网页。只运行节点传输、同步、Agent 与本地工具时，执行 `vibeface serve --data-dir /absolute/node-data --no-web`。直接启动同样支持 `vibeface --data-dir /absolute/node-data --no-web`。
+
+`--no-web` 不绑定浏览器公开 listener，不提供网页、浏览器会话或浏览器转发。本地 hook、分诊、日志、SDK 工具和维护接口继续运行。其他设备仍可经个人网络连接这个 Node。关闭后不发布本机网页入口；已配置的远端公共入口仍可访问这个 Node。
+
+后台服务要保持关闭网页时，在 `init` 时传入 `--no-web`，或把 `config.json` 的 `web_enabled` 设为 `false` 后重启。直接启动和 `serve` 的开关只影响本次运行。
+
 ## Node 之间的连接
 
-Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的地址只来自个人网络内部交换的签名地址记录。
+Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的持久地址来自邀请和个人网络内部交换的签名地址记录。显式配置发现服务后，还可查询临时直连地址。
 
 每台 Node 定期为自己签一条地址记录，内容是 iroh 地址（relay URL 和直连 IP）以及网页入口 `gateway_url`。同步时双方交换记录，地址变化后几秒内传到其他成员。浏览器从当前入口读取这些记录，自己验签后作为可切换的访问地址，见下文“多个访问地址”。
 
@@ -267,9 +275,10 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 参数 | `config.json` 中的 `network` 字段 | 作用 |
 |---|---|---|
 | `--relay <URL>` | `relays` | 个人网络中另一台 Node 的 relay，可重复，最多 16 个 |
-| `--relay-listen <ADDR>` | `relay_listen` | 本 Node 在这个地址运行 relay |
+| `--relay-listen <ADDR>` | `relay_listen` | 普通模式运行 TCP relay，`discovery-only` 模式提供 UDP 发现服务 |
+| `--relay-mode <MODE>` | `relay_mode` | 默认 `forward`；`discovery-only` 只提供连接协助，需要 `--public-entry` |
+| `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
-| `--relay-paths-only` | `relay_paths_only` | 只经 relay 连接，用于模拟严格 NAT 或排障 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
@@ -311,10 +320,10 @@ S 是发送 Node，R 是接收 Node，P 是服务 Node。
    vibeface wallet --data-dir /path/to/node-data configure /path/to/delivery-charity.json
    ```
 
-3. 确保 S、R 和 P 能按 PeerID 建立连接。沿用已有地址和 relay，或在停掉 Node 后为 `config.json` 的 `network` 增加明确选择的发现目录，再重启。以下设置发布 relay 地址并解析 PeerID，默认不发布直连 IP。
+3. 确保 S、R 和 P 能按 PeerID 建立连接。沿用已有地址和 relay，或在停掉 Node 后为 `config.json` 的 `network` 增加明确选择的 pkarr 发现目录，再重启。以下设置发布 relay 地址并解析 PeerID，默认不发布直连 IP。
 
    ```json
-   "discovery": {
+   "pkarr": {
        "publish": true,
        "resolve": true,
        "urls": ["https://discovery.example/pkarr"],
@@ -344,6 +353,33 @@ vibeface wallet --data-dir /path/to/node-data backup /path/to/new-wallet-backup.
 自动化可用 `--passphrase-fd` 从所有者私有文件或管道读取口令。不要把口令写进命令参数或环境变量。钱包每次重启都保持锁定，损坏时显示 `unavailable`，只能在本机从独立备份恢复，不能覆盖创建。
 
 钱包备份和个人恢复文件都不包含订单接收私钥。停掉 Node 后备份完整数据目录，尤其是整个 `delivery/`。注册、轮换和撤销接收密钥的命令及原意图重试规则见[接收密钥和恢复材料](paid-delivery.md#接收密钥和恢复材料)。
+## 运行不转发业务数据的公共发现服务
+
+运营者可只提供发现和连接协助，不加入用户的个人网络，也不承担业务流量。初始化时选择 `discovery-only`：
+
+```sh
+vibeface init --data-dir /srv/vibeface-discovery \
+	--public-entry --relay-mode discovery-only \
+	--relay-listen 0.0.0.0:4792 --no-web
+vibeface serve --data-dir /srv/vibeface-discovery
+```
+
+`init` 输出发现服务的设备编号。UDP 4792 必须能从公网直接访问，不能用 HTTP 反向代理替代。监听地址的端口必须非零；使用 `0.0.0.0` 或 `[::]` 时同时尝试监听 IPv4 和 IPv6。此模式不使用 `--relay-url`，也不生成 `entry-token`。省略 `--no-web` 时仍提供静态网页，但不提供 `/api/client`、`/api/decision` 或建网入口。
+
+用户在自己的 Node 上明确配置这个发现服务的编号和公网地址：
+
+```sh
+vibeface init --data-dir /absolute/personal-node \
+	--discovery 'vibeface://<发现服务设备编号>@discovery.example:4792'
+```
+
+已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
+
+Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证连接上观察到的地址，并通知双方发起直连探测。服务端没有转发客户端数据报的实现，也不接受个人网络的业务 ALPN。加入设备仍需有效邀请，读取、同步和执行仍按原有成员权限校验。
+
+发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址和查询关系。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，单帧最多 512 字节。连接通知队列和并发探测也有上限。
+
+仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。需要这类网络仍可自动连接时，用户可另行配置普通 `--relay`。Node 自动选择直连或普通 relay；发现节点始终不承载业务流量。本项目不默认连接任何官方发现服务。
 
 ## 多个访问地址
 
@@ -382,7 +418,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface codex requests` 查看，`vibeface codex respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface codex respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。没有协调 Agent 时分诊事件直接丢弃。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
-Node 默认不启用 Codex。启用 Codex Bot 或任务执行前，先明确配置 App Server。`providers.codex_app_server.mode` 为 `system` 时只连接配置的 socket，不启动也不结束服务，见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
+Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺的路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议路径，经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。`providers.codex_app_server.mode` 为 `system` 时只连接配置的 socket，不启动也不结束服务，见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `codex_bin` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
 App Server 重启或重连后，Node 只读复查未结束的工作，不重发旧指令。读不到原 turn 的工作标为“待核对”，由本人附证据结清。
 
@@ -503,4 +539,4 @@ vibeface service uninstall --data-dir "$VIBEFACE_DATA_DIR"
 
 停掉 Node 后备份完整数据目录，保留 SQLite 数据库及未合并的 WAL。模型 key、本机私钥和 SDK session 留在本机，不进入共享 DAG。完整目录备份含敏感信息，按本机凭证保管。不要复制运行中的 SQLite 文件来实现节点同步。
 
-存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 3，数据库 `user_version` 为 3，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。
+存储使用 `rusqlite`，没有 ORM。设备授权、配对回执和业务记录共用单一 `node.sqlite3` 及同一个 Store 事务。Atlas HCL 为 `crates/node/schema.hcl`，唯一 initial SQL 和校验清单位于 `crates/node/migrations/`。数据格式为 epoch 4，数据库 `user_version` 为 4，直接初始化最终结构，不提供库迁移。不同 epoch 的程序和数据目录不能混用。程序不会自动清空旧目录。监控历史正文、附件和服务日志的磁盘占用。

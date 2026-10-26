@@ -7,11 +7,11 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 3;
+pub const DATA_EPOCH: u32 = 4;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
-    "ecb4dc0c26094fa76ae457870c9d4603e5e0825438d847e54ab533035701f24a";
+    "05e9d5a8379821893bb8b5d0b7ca472b6abbf931c9579b1eaeb62433891a08f7";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
 pub fn data_epoch_marker() -> Vec<u8> {
@@ -39,6 +39,7 @@ pub struct Config {
     /// Loopback-only local session listener; fixed so its origin and browser storage persist.
     pub local_listen: SocketAddr,
     pub public_url: String,
+    pub web_enabled: bool,
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
@@ -71,6 +72,7 @@ impl Config {
             listen,
             local_listen: DEFAULT_LOCAL_LISTEN,
             public_url: format!("http://{listen}"),
+            web_enabled: true,
             allowed_origins: vec![],
             allow_insecure_lan,
             local_auto_access: true,
@@ -145,6 +147,11 @@ impl Config {
                 "project root must be an existing absolute directory"
             );
         }
+        ensure!(
+            self.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly
+                || self.public_entry,
+            "discovery-only runs as a public entry outside personal networks"
+        );
         if self.public_entry {
             ensure!(
                 self.network.relay_listen.is_some()

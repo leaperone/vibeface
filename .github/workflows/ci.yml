@@ -18,7 +18,7 @@ on:
         default: false
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -322,13 +322,15 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24'
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         with:
           version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'pnpm' || '' }}
+          cache-dependency-path: pnpm-lock.yaml
       - name: Import Developer ID signing identity
         if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         env:
@@ -464,6 +466,15 @@ jobs:
           path: .artifacts/ci-delivery/delivery-charity-*/report.json
           if-no-files-found: warn
           retention-days: 7
+      - name: Use official Ubuntu package mirror
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: printf 'https://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+      - name: Cache Chromium binaries
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: .artifacts/e2e/browsers
+          key: ${{ matrix.runner }}-${{ runner.arch }}-chromium-${{ hashFiles('pnpm-lock.yaml') }}
       - name: Verify packaged Web onboarding in Chromium
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
@@ -509,6 +520,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+      - name: Verify discovery-only assistance and headless Nodes
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
@@ -541,6 +557,8 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
             .artifacts/ci-phase4/phase4-*/report.json
             .artifacts/ci-phase4/phase4-*/*/node.log
+            .artifacts/ci-discovery/discovery-*/report.json
+            .artifacts/ci-discovery/discovery-*/*/node.log
             .artifacts/ci-public-entry/public-entry-*/report.json
             .artifacts/ci-public-entry/public-entry-*/*/node.log
             .artifacts/ci-phase5/phase5-*/report.json

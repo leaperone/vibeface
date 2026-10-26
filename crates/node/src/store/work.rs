@@ -264,7 +264,7 @@ impl Store {
                 Signal::Concluded {
                     outcome: WorkOutcome::Interrupted,
                     text: String::new(),
-                    reason: Some("这台设备在这个对话里还有没做完的任务".into()),
+                    reason: Some("这台电脑在这个对话里还有没做完的任务".into()),
                 },
                 at,
             )?

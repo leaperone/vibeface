@@ -19,7 +19,7 @@ use vibeface::{
     local_access::Launcher,
     maintenance,
     manager::ManagerKind,
-    net::{self, NetworkConfig, PublicEntry},
+    net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -39,6 +39,9 @@ struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
     #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
+    /// Disable browser access for this run; local tools and hooks remain available.
+    #[arg(long)]
+    no_web: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -196,6 +199,9 @@ enum WalletAction {
 struct Serve {
     #[command(flatten)]
     data: DataDir,
+    /// Disable browser access for this run; local tools and hooks remain available.
+    #[arg(long)]
+    no_web: bool,
 }
 
 #[derive(Args)]
@@ -209,6 +215,9 @@ struct Init {
     local_listen: SocketAddr,
     #[arg(long)]
     public_url: Option<String>,
+    /// Keep browser access off when this node starts.
+    #[arg(long)]
+    no_web: bool,
     /// Additional browser origins allowed to reach this node. May be repeated.
     #[arg(long = "allowed-origin")]
     allowed_origins: Vec<String>,
@@ -228,7 +237,7 @@ struct Init {
     model: Option<String>,
     #[arg(long, default_value = "cursor-sdk-bridge")]
     cursor_sdk_bin: PathBuf,
-    /// Explicit socket of the existing Codex App Server to use.
+    /// Socket of the running Codex App Server; found under the Codex folder when omitted.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
@@ -236,17 +245,19 @@ struct Init {
     /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
-    /// Run an iroh relay for the personal network on this address.
-    #[arg(long, value_name = "ADDR", requires = "relay_url")]
+    /// Pin a discovery server, e.g. vibeface://<device-id>@discovery.example:4790. May be repeated.
+    #[arg(long = "discovery", value_name = "URL")]
+    discovery: Vec<String>,
+    /// Forward business ciphertext, or only exchange observed addresses for direct connections.
+    #[arg(long, value_enum, default_value = "forward")]
+    relay_mode: RelayServiceMode,
+    /// Run a TCP data relay or a UDP discovery service on this address.
+    #[arg(long, value_name = "ADDR")]
     relay_listen: Option<SocketAddr>,
     /// The relay's explicitly configured URL as other Nodes reach it.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
-    /// Reach other Nodes only through relays, as behind a strict NAT.
-    #[arg(long)]
-    relay_paths_only: bool,
-    /// Serve only the web app, a relay and ciphertext forwarding for other people's Nodes;
-    /// this Node never joins a personal network.
+    /// Run public web and the selected relay service outside personal networks.
     #[arg(long, requires = "relay_listen", conflicts_with_all = ["manager", "roots", "entry"])]
     public_entry: bool,
     /// Public entry that browsers use to reach this Node, e.g. `https://vb.example`.
@@ -444,11 +455,17 @@ async fn main() -> Result<()> {
                 .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
             ensure!(data_dir.is_absolute(), "specify an absolute data directory");
             if !data_dir.join("config.json").exists() {
-                check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
+                check_ports(
+                    DEFAULT_LISTEN,
+                    config::DEFAULT_LOCAL_LISTEN,
+                    !cli.no_web,
+                    false,
+                )?;
             }
             prepare_start(&data_dir)?;
             Action::Serve(Serve {
                 data: DataDir { data_dir },
+                no_web: cli.no_web,
             })
         }
     };
@@ -458,14 +475,26 @@ async fn main() -> Result<()> {
     });
     match command {
         Action::Init(options) => {
-            check_ports(options.listen, options.local_listen)?;
+            check_ports(
+                options.listen,
+                options.local_listen,
+                !options.no_web,
+                options.public_entry,
+            )?;
             init(*options)
         }
         Action::Serve(options) => {
-            let runtime = Arc::new(Runtime::open(&options.data.data_dir).await?);
+            let mut runtime = Runtime::open(&options.data.data_dir).await?;
+            runtime.config.web_enabled &= !options.no_web;
+            let runtime = Arc::new(runtime);
             runtime.start().await?;
-            eprintln!("Web: {}", runtime.config.public_url);
-            if !runtime.config.public_entry
+            if runtime.config.web_enabled {
+                eprintln!("Web: {}", runtime.config.public_url);
+            } else {
+                eprintln!("Web: disabled");
+            }
+            if runtime.config.web_enabled
+                && !runtime.config.public_entry
                 && (runtime.config.listen.ip().is_loopback()
                     || runtime.config.listen.ip().is_unspecified())
             {
@@ -920,8 +949,19 @@ async fn codex_requests(local: &LocalNode, body: serde_json::Value) -> Result<()
 }
 
 /// Fails before any file is written, so a busy port never leaves a half-made data directory.
-fn check_ports(listen: SocketAddr, local_listen: SocketAddr) -> Result<()> {
-    for (address, flag) in [(listen, "--listen"), (local_listen, "--local-listen")] {
+fn check_ports(
+    listen: SocketAddr,
+    local_listen: SocketAddr,
+    web_enabled: bool,
+    public_entry: bool,
+) -> Result<()> {
+    for (address, flag) in [
+        web_enabled.then_some((listen, "--listen")),
+        (!public_entry).then_some((local_listen, "--local-listen")),
+    ]
+    .into_iter()
+    .flatten()
+    {
         std::net::TcpListener::bind(address)
             .with_context(|| format!("端口 {} 被占用，可用 {flag} 更换", address.port()))?;
     }
@@ -941,7 +981,7 @@ fn prepare_start(dir: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     if empty {
-        initialize_announced(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
+        initialize(dir, Config::local(DEFAULT_LISTEN, vec![], false), None)?;
     }
     Ok(())
 }
@@ -979,6 +1019,7 @@ async fn status(options: Access) -> Result<()> {
             json!({
                 "status":state, "device_id":device_id, "data_dir":data,
                 "listen":configuration.listen, "public_entry":configuration.public_entry,
+                "web_enabled":health.as_ref().map_or(configuration.web_enabled, |health| health.web_enabled),
                 "version":health.as_ref().ok().map(|health| &health.version),
                 "write_state":health.as_ref().ok().and_then(|health| health.write_state),
                 "peers":health.as_ref().ok().map(|health| &health.peers),
@@ -993,6 +1034,14 @@ async fn status(options: Access) -> Result<()> {
         );
         if let Ok(health) = &health {
             println!("Version: {}", health.version);
+            println!(
+                "Web: {}",
+                if health.web_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             if let Some(state) = health.write_state {
                 println!("Writes: {}", state.as_str());
             }
@@ -1029,6 +1078,7 @@ fn init(options: Init) -> Result<()> {
         .collect::<Result<_>>()?;
     let mut configuration = Config::local(options.listen, roots, options.allow_insecure_lan);
     configuration.local_listen = options.local_listen;
+    configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
     configuration.providers.codex_app_server.socket = options.codex_socket;
     configuration.codex_bin = options.codex_bin;
@@ -1051,18 +1101,26 @@ fn init(options: Init) -> Result<()> {
         }
         None => None,
     };
+    if options.relay_mode == RelayServiceMode::Forward && options.relay_listen.is_some() {
+        ensure!(
+            options.relay_url.is_some(),
+            "--relay-listen requires --relay-url for a forwarding relay"
+        );
+    }
     configuration.network = NetworkConfig {
         relays: options.relays,
+        discovery: options.discovery,
+        relay_mode: options.relay_mode,
         relay_listen: options.relay_listen,
         relay_url: options.relay_url,
-        relay_paths_only: options.relay_paths_only,
         entry,
         ..NetworkConfig::default()
     };
     configuration.public_entry = options.public_entry;
     let entry_token = match &options.relay_token_file {
         Some(path) => Some(net::read_token_file(path)?),
-        None => options.public_entry.then(|| random_hex(32)),
+        None => (options.public_entry && options.relay_mode == RelayServiceMode::Forward)
+            .then(|| random_hex(32)),
     };
     if let Some(manager) = options.manager {
         let workspace = options
@@ -1083,7 +1141,17 @@ fn init(options: Init) -> Result<()> {
             cursor_sdk_bin: options.cursor_sdk_bin,
         });
     }
-    initialize_announced(dir, configuration, entry_token)
+    let mut env = vibeface::providers::ProviderEnv::default();
+    vibeface::discovery::complete(
+        &mut configuration,
+        &mut env,
+        &vibeface::discovery::Host::current(),
+    )?;
+    initialize_announced(dir, configuration, entry_token)?;
+    if env != vibeface::providers::ProviderEnv::default() {
+        env.save(dir)?;
+    }
+    Ok(())
 }
 
 fn initialize_announced(
@@ -1092,6 +1160,8 @@ fn initialize_announced(
     entry_token: Option<String>,
 ) -> Result<()> {
     let public_entry = configuration.public_entry;
+    let discovery_only = configuration.network.relay_mode == RelayServiceMode::DiscoveryOnly;
+    let web_enabled = configuration.web_enabled;
     let local = !public_entry
         && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified());
     let open = if local {
@@ -1101,8 +1171,15 @@ fn initialize_announced(
     };
     initialize(dir, configuration, entry_token)?;
     println!("Vibeface 已就绪");
-    println!("打开 {open}");
-    if public_entry {
+    if web_enabled {
+        println!("打开 {open}");
+    }
+    if discovery_only {
+        println!(
+            "Discovery device ID: {}",
+            config::identity(dir)?.device_id()?
+        );
+    } else if public_entry {
         println!(
             "Relay token: {} (copy it to your Node and pass --relay-token-file)",
             dir.join(net::ENTRY_TOKEN_FILE).display()
@@ -1275,6 +1352,13 @@ async fn access(entry: LocalEntry) -> Result<()> {
         }
         configuration = Config::load(dir)?;
     }
+    ensure!(
+        configuration.web_enabled
+            && maintenance::probe(dir)
+                .await
+                .map_or(true, |health| health.web_enabled),
+        "browser access is disabled; restart without --no-web or enable web_enabled in config.json"
+    );
     let identity = config::identity(dir)?;
     if configuration.public_entry {
         if options.json {
@@ -1970,6 +2054,20 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
+        assert!(!default.no_web && !options.no_web);
+        assert!(
+            Cli::try_parse_from(["vibeface", "--data-dir", "/data/node", "--no-web"])
+                .unwrap()
+                .no_web
+        );
+        let Some(Action::Serve(headless)) =
+            Cli::try_parse_from(["vibeface", "serve", "--data-dir", "/data/node", "--no-web"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected serve")
+        };
+        assert!(headless.no_web);
         for value in ["", "relative-node"] {
             for command in [
                 vec![],
@@ -2015,16 +2113,31 @@ mod tests {
             "127.0.0.1:0",
             "--relay-url",
             "https://relay.test",
-            "--relay-paths-only",
+            "--no-web",
         ])?;
         let Some(Action::Init(options)) = cli.command else {
             bail!("expected init command")
         };
         init(*options)?;
-        let network = Config::load(&dir)?.network;
+        let configuration = Config::load(&dir)?;
+        assert!(
+            !configuration.web_enabled,
+            "init --no-web persists the headless service setting"
+        );
+        let network = configuration.network;
         assert_eq!(network.relays, ["https://relay.test"]);
         assert_eq!(network.relay_listen, Some("127.0.0.1:0".parse()?));
-        assert!(network.relay_paths_only);
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "init",
+                "--data-dir",
+                "/data/node",
+                "--relay-paths-only"
+            ])
+            .is_err()
+        );
+        assert!(serde_json::from_value::<NetworkConfig>(json!({"relay_paths_only":true})).is_err());
         for url in [
             "file:///tmp/node",
             "https://fixture-user:fixture-password@relay.test",

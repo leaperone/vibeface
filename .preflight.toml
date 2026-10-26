@@ -18,7 +18,7 @@ command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts
 
 [[domain_check]]
 name = "Delivery service probe"
-trigger_paths = ["tests/fixtures/delivery-probe/**", "crates/node/src/delivery/**", "crates/node/src/net.rs", "crates/node/src/net/discovery.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/verify-node.py"]
+trigger_paths = ["tests/fixtures/delivery-probe/**", "crates/node/src/delivery/**", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/verify-node.py"]
 command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check && VIBEFACE_PROBE_SOURCE_ROOT=\"$PWD\" CARGO_TARGET_DIR=\"$PWD/.artifacts/delivery-probe/target\" cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked"
 
 [[domain_check]]

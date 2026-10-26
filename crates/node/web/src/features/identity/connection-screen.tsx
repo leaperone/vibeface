@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AuthPage, Details, EmptyState, InlineError, Panel, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
+import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { spentInvite } from '@vibeface/client/lib/errors.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
@@ -73,7 +74,7 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
   const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
-  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '这台设备已被移出'}>
+  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '所连的电脑已被移出'}>
     {canRejoin ? <>
       <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
       <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
@@ -150,7 +151,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const scannable = canScan()
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
   const computerName = savedName || '这台电脑'
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed: device.error === BROWSER_REMOVED })
+  const removed = device.error === BROWSER_REMOVED
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -186,9 +188,15 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     const form = event.currentTarget
     setNotice('')
     void run(async () => {
-      if (!thisComputer) { rememberBrowserName(value(form, 'name')); return device.join(invitation, value(form, 'name')) }
-      // The entry spent the invite on the cancelled request, so it cannot be used again.
-      if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+      try {
+        if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name')) }
+        // The entry spent the invite on the cancelled request, so it cannot be used again.
+        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+      } catch (cause) {
+        // A spent link only fails again, so the field opens for a new one.
+        if (cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
+        throw cause
+      }
     })
   }
 
@@ -201,11 +209,11 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
-  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
+  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 3 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
-      {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
+      {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />用加入链接</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
     </div>
@@ -236,17 +244,24 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
-    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
-      <span className="min-w-0 flex-1 truncate" title={entry.address}>{device.entryName(entry) || addressName(entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(entry.address)}</span></span>
-      <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
-    </li>)}</ul>
+    <ul className="grid gap-1">{device.entries.map((entry) => {
+      const name = device.entryName(entry) || addressName(entry.address), host = hostOf(entry.address)
+      return <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex min-h-11 items-center rounded-lg bg-muted/60">
+        <Button type="button" variant="ghost" className="h-auto min-h-11 min-w-0 flex-1 justify-start" title={entry.address} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
+          <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-meta text-muted-foreground">{host}</span> : null}</span>
+        </Button>
+        <Button type="button" variant="ghost" size="icon" className="size-11 shrink-0 text-muted-foreground" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {
+          try { device.removeEntry(entry); if (device.entries.length === 1) setLane(null) } catch (cause) { setError(messageOf(cause)) }
+        }}><X aria-hidden="true" /></Button>
+      </li>
+    })}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else {
     alertInBody = true
-    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : '加入我的设备'}>
-      {/* A failure already says where to go next. */}
-      {failed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
+    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : removed ? '重新加入' : '加入我的设备'}>
+      {/* A failure or the removal notice already says where to go next. */}
+      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
@@ -261,7 +276,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           </p>}
           {thisComputer
             ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
-            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
+            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></Field>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
         </fieldset>
       </form>}
@@ -315,10 +330,9 @@ function NamesStep({ computer, initial, onNext }: { computer?: string; initial: 
 
 type Run = (action: () => Promise<void>) => Promise<void>
 
-/** Step 2a: the recovery password; the file is sealed with it right away. */
+/** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
-  const [show, setShow] = useState(false)
   const [short, setShort] = useState(false)
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
@@ -334,10 +348,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
-          <span className="relative">
-            <Input type={show ? 'text' : 'password'} name="password" className="pe-9 max-md:pe-11" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-            <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={show ? '隐藏密码' : '显示密码'} aria-pressed={show} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
-          </span>
+          <PasswordInput name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
           <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">
@@ -349,7 +360,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   </Panel>
 }
 
-/** Step 2b: download the sealed file, confirm it is stored apart from the password, then create. */
+/** Step 3: download the sealed file, confirm it is stored apart from the password, then create. */
 function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const [downloaded, setDownloaded] = useState(false)
@@ -376,7 +387,7 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="truncate">已连上你的「{device.info.name}」</span></p> : null}
+    {device.info ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />已连上你的设备</p> : null}
     <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>

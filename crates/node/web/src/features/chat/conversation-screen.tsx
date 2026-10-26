@@ -1,21 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ActionCard, BotAvatar, Details, EmptyState, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { humanError, taskError } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
-import { ChatSkeleton } from '@/features/workspace/workspace-shell'
+import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
+import { agentName, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
@@ -30,7 +30,16 @@ const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'runnin
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
 
-export function ConversationScreen() {
+function NoBot() {
+  const { bots } = useWorkspace()
+  const create = useCreateBot()
+  return bots.length
+    ? <EmptyState icon={Bot} title="找不到这个 Bot" className="my-auto" action={<Button asChild variant="outline"><Link to="/">查看 Bot</Link></Button>} />
+    : <EmptyState icon={Bot} title="还没有 Bot" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
+}
+
+/** `missing`: the route names a bot this network does not have. */
+export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
@@ -59,7 +68,7 @@ export function ConversationScreen() {
   // Tasks sit right after the message that started them.
   const works = data?.works ?? []
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
-  const asking = new Set((data?.questions ?? []).filter((question) => !question.answer && question.about.request_id).map((question) => question.about.session_id))
+  const asking = new Set((data?.questions ?? []).filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const tasks: TaskRow[] = works.map((work, index) => {
     const state = shownState(work, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
@@ -179,6 +188,7 @@ export function ConversationScreen() {
   // A device that only needs setup is fixable now, so it comes before one that is offline.
   const away = managerOffline && !unready
   const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
+  const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -204,6 +214,7 @@ export function ConversationScreen() {
   }
   const setText = (value: string) => setDrafts((current) => new Map(current).set(conversationId, value))
 
+  if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   if (bot && !data) return <section className="conversation-screen" aria-label="对话"><ChatSkeleton /></section>
 
   return (
@@ -216,17 +227,18 @@ export function ConversationScreen() {
           <h2 className="text-heading font-semibold">{bot.name}</h2>
           {needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
-            <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+              : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
-        </div> : null}
+        </div> : workspace.writable ? <NoBot /> : null}
       />
-      <PromptInput
+      {bot ? <PromptInput
         above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
         hint={hint}
@@ -243,8 +255,8 @@ export function ConversationScreen() {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
-      </PromptInput>
+        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+      </PromptInput> : null}
     </section>
   )
 }

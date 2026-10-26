@@ -241,7 +241,9 @@ impl Runtime {
             let event: Event = serde_json::from_str(&event.canonical_body)?;
             match &event.body {
                 EventBody::MessagePosted { message_id: id, .. } => message_id = Some(id.clone()),
-                EventBody::QuestionAsked { .. } | EventBody::NotificationAcked { .. } => {}
+                EventBody::QuestionAsked { .. }
+                | EventBody::QuestionClosed { .. }
+                | EventBody::NotificationAcked { .. } => {}
                 body => match body.work_id() {
                     Some(id) => work_id = Some(id.into()),
                     None => return Ok(None),

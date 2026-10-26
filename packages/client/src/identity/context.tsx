@@ -5,6 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
+import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
 import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
@@ -69,7 +70,6 @@ type DeviceContextValue = {
   /** Drops the kept file once the person confirmed it is saved, or it no longer matters. */
   forgetUnsavedRecovery(): void
   /** The name this browser last saw a device listed under, kept past its removal. */
-  knownName(deviceId: string): string | null
   joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
@@ -296,7 +296,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
   function managing() {
-    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理员能做这个操作。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理设备能做这个操作。')
     return ready
   }
   async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
@@ -308,7 +308,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         : expected
       verified = verifyAuthentication(authValue, own(), trust)
       const pinnedNetwork = load(`network-for.${active.entry.device_id}`)
-      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这台设备属于另一组设备。请先确认连接的是自己的设备。')
+      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这台电脑属于另一组设备。请先确认连接的是自己的设备。')
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
@@ -337,7 +337,6 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       isCurrent: () => session.current === active && generation.current === active.generation,
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
-    noteNames(principal.network_id, view.members)
     setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setNodeClockOffset((nodeNow(verified.auth) ?? Date.now()) - Date.now()); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
@@ -386,7 +385,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const local = identityRef.current && await localEntry(identityRef.current, null)
       if (reconnect.current !== target) return true
       if (!local || entryKey(local) !== entryKey(target.entry)) {
-        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用邀请加入。')
+        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或用加入链接加入。')
         return true
       }
     }
@@ -395,7 +394,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       let active: Session | null = null
       try {
         active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
-        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台设备已属于另一组设备。')
+        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台电脑已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (candidate === target.entry && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
@@ -559,19 +558,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const me = own().deviceId
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    noteNames(ready.principal.network_id, view.members)
     setDirectory(view); setRecoverySince(sinceOf(response)); setNodeClockOffset((nodeNow(response) ?? Date.now()) - Date.now()); setJoins(pending)
-  }
-  /** A revocation carries no name, so the removed list names a device by what this browser saw while it was a member. */
-  function noteNames(networkId: string, members: Member[]) {
-    const saved = load(`device-names.${networkId}`), current = members.filter(member => member.name)
-    const kept = Object.entries(saved && typeof saved === 'object' ? saved : {}).filter(([id]) => !current.some(member => member.device_id === id))
-    try { store(`device-names.${networkId}`, Object.fromEntries([...kept, ...current.map(member => [member.device_id, member.name])].slice(-100))) } catch {}
-  }
-  function knownName(deviceId: string) {
-    const saved = ready && load(`device-names.${ready.principal.network_id}`)
-    const name = saved && typeof saved === 'object' ? (saved as Record<string, unknown>)[deviceId] : null
-    return typeof name === 'string' ? name : null
   }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
@@ -647,7 +634,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   async function revoke(deviceId: string) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
-    if (!member) throw new Error('找不到这台设备，请刷新后再试。')
+    if (!member) throw new Error('找不到这个设备，请刷新后再试。')
     if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的电脑。`)
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
@@ -712,7 +699,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
         if (active) break
       }
-      if (!active) throw new Error('连不上这台设备。')
+      if (!active) throw new Error('连不上这台电脑。')
       // A browser removed from this network joins again as a new device; its old key stays revoked.
       if (record(await scoped(active)('authenticate')).revoked === true) {
         const fresh = publicIdentity(await replaceClient())
@@ -725,7 +712,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
       if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error('这条加入链接已失效。请在已有设备上重新添加。')
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error(spentInviteText)
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
     } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
@@ -921,8 +908,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
           store('recovery-wait', wait)
           let auth: Record<string, unknown>
           try { auth = record(await request('recover', { genesis, checkpoints: prepared.checkpoints, events, ...(fresh ? { capability } : {}) })) }
-          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“恢复”会重试同一次恢复，不会再下载文件。`) }
-          if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并用刚下载的恢复文件。')
+          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“找回”会重试同一次找回，不会再下载文件。`) }
+          if (released) throw new Error('找回已提交，但这里已取消。请重新连接看一下结果，并用刚下载的恢复文件。')
           try {
             if (auth.principal !== null) await recoveredAs(auth, active, wait)
             // A waiting browser is a guest, whose channel times out; the wait is checked over fresh ones.
@@ -1143,7 +1130,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const pendingRecovery = ready?.principal.can_manage && directory?.pending && directory.pending.checkpoint !== recoveryOk ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
-    identity, ready, entries, phase, error, entry, info, directory, recoverySince, knownName, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
