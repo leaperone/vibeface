@@ -50,6 +50,8 @@ export type AppServer = { mode: AppServerMode; socket: string | null; link: AppS
  */
 export type ProviderStatus = {
   provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; app_server: AppServer | null
+  /** Codex only: the Codex folder and the sessions folder the device uses. */
+  home: string | null; sessions: string | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
   state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
 }
@@ -209,6 +211,7 @@ function parseProvider(value: unknown): ProviderStatus {
     provider: oneOf(v.provider, providerIds),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     bin: v.bin === null ? null : text(v.bin), app_server: parseAppServer(v.app_server),
+    home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
   }
