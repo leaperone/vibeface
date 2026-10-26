@@ -8,6 +8,8 @@ const codes: Record<string, string> = {
 }
 
 const malformed = /invalid|is required|must be|missing/i
+/** A join link the Node will not take again: already answered, or past its time. */
+export const spentInvite = /ticket has already been used|ticket is unknown or already expired|ticket has expired/i
 const patterns: [RegExp, string][] = [
   [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
   [/log has forked/i, '这台设备的数据被复制过，已暂停发送。去待处理看看。'],
@@ -83,7 +85,7 @@ const patterns: [RegExp, string][] = [
   [/only the user|requires the user|agents cannot|Agent tokens/i, '只有你自己能做这个操作，Bot 不能代办。'],
   [/management client|management permission|management control/i, '只有管理设备能做这个操作。'],
   [/local browser (session|cookie|access)|local (cookie|token) missing|session cookie|local session identity/i, '本机会话已失效。请在这台电脑上重新打开。'],
-  [/ticket has already been used|ticket is unknown or already expired|ticket has expired/i, '这条加入链接已用过或已过期。请在已有设备上点“添加设备”重新生成。'],
+  [spentInvite, '这条加入链接已用过或已过期。请在已有设备上点“添加设备”重新生成。'],
   [/invite link|ticket/i, '加入链接无效或不完整。请重新复制。'],
   [/already belongs to a personal network|already initialized/i, '这台设备已经加入了一组设备。'],
   [/revoked/i, '这台设备已被移除。'],

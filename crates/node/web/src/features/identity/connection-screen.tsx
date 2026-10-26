@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { spentInvite } from '@vibeface/client/lib/errors.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
@@ -186,9 +187,15 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     const form = event.currentTarget
     setNotice('')
     void run(async () => {
-      if (!thisComputer) { rememberBrowserName(value(form, 'name')); return device.join(invitation, value(form, 'name')) }
-      // The entry spent the invite on the cancelled request, so it cannot be used again.
-      if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+      try {
+        if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name')) }
+        // The entry spent the invite on the cancelled request, so it cannot be used again.
+        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+      } catch (cause) {
+        // A spent link only fails again, so the field opens for a new one.
+        if (cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
+        throw cause
+      }
     })
   }
 
@@ -372,7 +379,7 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="truncate">已连上你的「{device.info.name}」</span></p> : null}
+    {device.info ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />已连上你的设备</p> : null}
     <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
