@@ -70,7 +70,6 @@ type DeviceContextValue = {
   /** Drops the kept file once the person confirmed it is saved, or it no longer matters. */
   forgetUnsavedRecovery(): void
   /** The name this browser last saw a device listed under, kept past its removal. */
-  knownName(deviceId: string): string | null
   joins: JoinRequest[]; joining: Joining | null; review: Review | null; initialInvitation: string; localSetup: LocalSetup | null
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
@@ -338,7 +337,6 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       isCurrent: () => session.current === active && generation.current === active.generation,
       catchingUp: () => linkRef.current.kind === 'online' && linkRef.current.catchingUp,
     }
-    noteNames(principal.network_id, view.members)
     setDirectory(view); setRecoverySince(sinceOf(verified.auth)); setNodeClockOffset((nodeNow(verified.auth) ?? Date.now()) - Date.now()); setReady(connection); setPhase('ready'); setError(''); joiningRef.current = null; setJoining(null)
     setLocalSetup(local => local && entryKey(local.entry) === entryKey(active.entry) ? { kind: 'initialized', entry: local.entry, removed: false } : local)
     step({ type: 'ready', joined: true }, { type: 'connect' }, { type: 'connected', behind: lagging })
@@ -560,19 +558,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const me = own().deviceId
     const pending = ready.principal.can_manage ? array(record(await request('join_status')).requests).map(parseJoinRequest).map(item => managerCode(item, ready.principal.network_id, me)) : []
     if (session.current !== active || active.generation !== generation.current) throw changed()
-    noteNames(ready.principal.network_id, view.members)
     setDirectory(view); setRecoverySince(sinceOf(response)); setNodeClockOffset((nodeNow(response) ?? Date.now()) - Date.now()); setJoins(pending)
-  }
-  /** A revocation carries no name, so the removed list names a device by what this browser saw while it was a member. */
-  function noteNames(networkId: string, members: Member[]) {
-    const saved = load(`device-names.${networkId}`), current = members.filter(member => member.name)
-    const kept = Object.entries(saved && typeof saved === 'object' ? saved : {}).filter(([id]) => !current.some(member => member.device_id === id))
-    try { store(`device-names.${networkId}`, Object.fromEntries([...kept, ...current.map(member => [member.device_id, member.name])].slice(-100))) } catch {}
-  }
-  function knownName(deviceId: string) {
-    const saved = ready && load(`device-names.${ready.principal.network_id}`)
-    const name = saved && typeof saved === 'object' ? (saved as Record<string, unknown>)[deviceId] : null
-    return typeof name === 'string' ? name : null
   }
   async function setLocalAutoAccess(enabled: boolean) {
     const active = current(), connection = ready
@@ -1144,7 +1130,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const pendingRecovery = ready?.principal.can_manage && directory?.pending && directory.pending.checkpoint !== recoveryOk ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
-    identity, ready, entries, phase, error, entry, info, directory, recoverySince, knownName, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
+    identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,

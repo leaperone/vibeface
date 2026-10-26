@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -244,10 +244,17 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
-    <ul className="grid gap-2">{device.entries.map((entry) => <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex items-center gap-3 rounded-lg bg-muted/60 px-3 py-2">
-      <span className="min-w-0 flex-1 truncate" title={entry.address}>{device.entryName(entry) || addressName(entry.address)}<span className="ms-2 text-meta text-muted-foreground">{hostOf(entry.address)}</span></span>
-      <Button type="button" variant="outline" disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>连接</Button>
-    </li>)}</ul>
+    <ul className="grid gap-1">{device.entries.map((entry) => {
+      const name = device.entryName(entry) || addressName(entry.address), host = hostOf(entry.address)
+      return <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex min-h-11 items-center rounded-lg bg-muted/60">
+        <Button type="button" variant="ghost" className="h-auto min-h-11 min-w-0 flex-1 justify-start" title={entry.address} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
+          <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-meta text-muted-foreground">{host}</span> : null}</span>
+        </Button>
+        <Button type="button" variant="ghost" size="icon" className="size-11 shrink-0 text-muted-foreground" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {
+          try { device.removeEntry(entry); if (device.entries.length === 1) setLane(null) } catch (cause) { setError(messageOf(cause)) }
+        }}><X aria-hidden="true" /></Button>
+      </li>
+    })}</ul>
   </Panel>
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else {

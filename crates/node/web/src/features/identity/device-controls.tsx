@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Check, Copy, Globe, Info, Server, Wifi, WifiOff, X } from 'lucide-react'
+import { Check, Copy, Globe, Info, Server, Unplug, Wifi, WifiOff, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { terms } from '@/lib/glossary'
 import { Details, InlineError, SettingsDisclosure, SettingsRow } from '@/components/app/kit'
@@ -32,6 +32,7 @@ export function ConnectionSettings() {
   const { connectionOnline } = useWorkspace()
   const { ready, identity, entries, directory } = device
   const [error, setError] = useState<unknown>(null)
+  const [removing, setRemoving] = useState(false)
   const current = ready ? keyOf(ready.entry) : ''
   const others = entries.filter((entry) => keyOf(entry) !== current)
   return <>
@@ -59,5 +60,11 @@ export function ConnectionSettings() {
         </form>
       </Details>
     </SettingsDisclosure>
+    {ready ? <SettingsRow icon={Unplug} tone="danger" label="移除当前地址" description={removing ? '会断开连接并回到登录页' : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
+      {removing ? <>
+        <Button type="button" variant="ghost" className="min-h-11" onClick={() => setRemoving(false)}>取消</Button>
+        <Button type="button" variant="destructive" className="min-h-11" onClick={() => { const entry = ready.entry; device.disconnect(); try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}>断开并移除</Button>
+      </> : null}
+    </SettingsRow> : null}
   </>
 }
