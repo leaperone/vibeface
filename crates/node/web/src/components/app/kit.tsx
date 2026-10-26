@@ -77,12 +77,13 @@ export function EmptyState({ icon: Icon, title, description, action, className }
   </div>
 }
 
+const stepCount = 5
 /** Progress through first-time setup, shared by the connection screen and onboarding. */
 export function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1" aria-hidden="true">{[1, 2, 3, 4].map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
-    <span aria-hidden="true" className="tabular-nums">{step}/4</span>
-    <span className="sr-only">第 {step} 步，共 4 步</span>
+    <span className="flex gap-1" aria-hidden="true">{Array.from({ length: stepCount }, (_, index) => index + 1).map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span aria-hidden="true" className="tabular-nums">{step}/{stepCount}</span>
+    <span className="sr-only">第 {step} 步，共 {stepCount} 步</span>
   </div>
 }
 
@@ -182,7 +183,7 @@ export function Segmented<T extends string>({ label, value, options, onChange, d
     radios[next]?.focus()
     if (options[next].value !== value) onChange(options[next].value)
   }
-  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
+  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap justify-self-start gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
     {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} tabIndex={option === tabStop ? 0 : -1} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined}
       // Not `disabled`: a choice that saves disables the group while it does, and a disabled button drops focus to <body>.
       aria-disabled={disabled || undefined} onClick={() => { if (!disabled && option !== value) onChange(option) }}
