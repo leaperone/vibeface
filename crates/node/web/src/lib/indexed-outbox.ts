@@ -5,13 +5,13 @@ export function indexedOutbox(name = 'vibeface-outbox'): OutboxStore {
   const run = <T,>(mode: IDBTransactionMode, operation: (store: IDBObjectStore) => IDBRequest<T>) => new Promise<T>((resolve, reject) => {
     const open = indexedDB.open(name, 1)
     open.onupgradeneeded = () => open.result.createObjectStore('writes', { keyPath: 'key' })
-    open.onerror = () => reject(new Error('无法打开浏览器待确认记录。'))
+    open.onerror = () => reject(new Error('无法读取这个浏览器里未发出的消息。'))
     open.onsuccess = () => {
       const db = open.result
       const transaction = db.transaction('writes', mode)
       const request = operation(transaction.objectStore('writes'))
       transaction.oncomplete = () => { db.close(); resolve(request.result) }
-      transaction.onerror = transaction.onabort = () => { db.close(); reject(new Error('无法保存浏览器待确认记录。')) }
+      transaction.onerror = transaction.onabort = () => { db.close(); reject(new Error('无法在这个浏览器里保存未发出的消息。')) }
     }
   })
   return {

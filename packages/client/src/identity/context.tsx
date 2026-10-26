@@ -296,7 +296,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   function scoped(active = current()) { return (method: string, params: Record<string, unknown> = {}) => callSession(active, method, params) }
   function managing() {
-    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理员能做这个操作。')
+    if (!ready?.isCurrent() || !ready.principal.can_manage || !directory) throw new Error('只有管理设备能做这个操作。')
     return ready
   }
   async function authenticate(authValue: unknown, active = current(), expected: AuthenticationTrust | null = null) {
@@ -385,7 +385,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const local = identityRef.current && await localEntry(identityRef.current, null)
       if (reconnect.current !== target) return true
       if (!local || entryKey(local) !== entryKey(target.entry)) {
-        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或使用邀请加入。')
+        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或用加入链接加入。')
         return true
       }
     }

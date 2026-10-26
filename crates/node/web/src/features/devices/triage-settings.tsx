@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, Webhook, X, Zap, type LucideIcon } from "lucide-react"
+import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton, toast } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -28,6 +28,7 @@ export function TriageSettings() {
   const [token, setToken] = useState("")
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
   const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState("")
   const sequence = useRef(0)
 
   async function call(key: string, method: string, params?: Record<string, unknown>) {
@@ -87,13 +88,16 @@ export function TriageSettings() {
       </div>
     </SettingsDisclosure>
 
-    <SettingsDisclosure icon={Webhook} label={chat} value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
+    <SettingsDisclosure icon={terms.externalChat.icon} label={chat} value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
         <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
         <Input aria-label={`${chat}地址`} type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
         <div className="flex min-w-0 gap-2">
           <Input aria-label={`${chat}密钥`} type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : `${chat}密钥`} value={secret} onChange={(event) => setSecret(event.target.value)} />
-          {settings.webhook_secret_set ? <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => void save("webhook", {}, { webhook_secret: null })}><Trash2 aria-hidden="true" /></Button> : null}
+          {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
+            <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
+            <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
+          </> : <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => setConfirming("secret")}><Trash2 aria-hidden="true" /></Button>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button type="submit" variant="outline" disabled={Boolean(busy) || (url.trim() === settings.webhook_url && !secret)}><BusyIcon busy={busy === "webhook"} />保存</Button>
@@ -123,7 +127,10 @@ export function TriageSettings() {
         {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <span className="min-w-0 flex-1 truncate text-meta">{item.label || "未命名"}</span>
           <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
-          <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => void call("revoke", "revoke_decision_token", { token_id: item.token_id })}><Trash2 aria-hidden="true" /></Button>
+          {confirming === item.token_id ? <>
+            <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
+            <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void call("revoke", "revoke_decision_token", { token_id: item.token_id }) }}>撤销</Button>
+          </> : <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>}
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
           <Input aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />
