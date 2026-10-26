@@ -123,6 +123,10 @@ pub struct Runtime {
     pub(crate) data_dir: PathBuf,
     settings: std::sync::Mutex<NodeSettings>,
     providers: std::sync::Mutex<crate::providers::Local>,
+    /// Where this computer keeps what the providers need, as the Node's environment says.
+    pub(crate) host: crate::discovery::Host,
+    /// Provider paths a bot proposed, by the question that asks the user; kept until restart.
+    pub(crate) provider_proposals: Mutex<HashMap<String, settings::Proposal>>,
     pub(crate) config_save: Mutex<()>,
     pub identity: LocalIdentity,
     pub store: Arc<Mutex<Store>>,
@@ -216,11 +220,13 @@ impl Runtime {
             "this Node requires an initialized data epoch {} directory",
             crate::config::DATA_EPOCH
         );
+        let process_lock = Arc::new(config::lock_data_dir(dir)?);
+        let host = crate::discovery::Host::current();
+        crate::discovery::complete_saved(dir, &host)?;
         let config = Config::load(dir)?;
         let entry_token = (config.public_entry || config.network.entry.is_some())
             .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
             .transpose()?;
-        let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
@@ -256,6 +262,8 @@ impl Runtime {
                 manager: config.manager.clone(),
             }),
             providers: std::sync::Mutex::new(providers),
+            host,
+            provider_proposals: Mutex::new(HashMap::new()),
             config_save: Mutex::new(()),
             config,
             identity,
