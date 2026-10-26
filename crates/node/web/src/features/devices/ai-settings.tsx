@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
@@ -67,7 +67,7 @@ function PathField({ id, label, value, placeholder, working, busy, onSave }: {
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); if (dirty) void onSave(draft.trim()) }}>
     <label htmlFor={id} className="text-meta font-medium text-muted-foreground">{label}</label>
     <div className="flex min-w-0 gap-2">
-      <Input id={id} className="min-w-0 font-mono placeholder:font-sans" placeholder={placeholder} spellCheck={false} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
+      <Input id={id} className="min-w-0 font-mono text-foreground placeholder:font-sans" placeholder={placeholder} spellCheck={false} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
       {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
     </div>
   </form>
@@ -75,11 +75,12 @@ function PathField({ id, label, value, placeholder, working, busy, onSave }: {
 
 /**
  * Where Codex work runs: the App Server already running on this computer, at its socket, or one the device starts with the
- * Codex folder. The device fills both in from this computer when they are missing; here they show and can be changed.
+ * Codex folder. The device fills both in from this computer when they are missing; the paths stay folded until one is missing or broken.
+ * `children`: other paths the provider uses, folded with these.
  */
-function AppServerSettings({ server, home, sessions, working, blocked, busy, save, test }: {
+function AppServerSettings({ server, home, sessions, working, blocked, busy, save, test, children }: {
   server: AppServer; home: string | null; sessions: string | null; working: boolean; blocked: boolean; busy: string
-  save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
+  save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>; children?: ReactNode
 }) {
   const [tested, setTested] = useState<AppServerLink | null>(null)
   const [testing, setTesting] = useState(false)
@@ -87,6 +88,10 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
   const link = server.link
   const shown = tested ?? link
   const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
+  // Opens by itself when a path needs attention and stays open after it is fixed, so a saved field does not fold away under the cursor.
+  const needsPaths = blocked || (server.mode === "system" ? !server.socket : !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
+  const [pathsOpen, setPathsOpen] = useState(needsPaths)
+  useEffect(() => { if (needsPaths) setPathsOpen(true) }, [needsPaths])
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-3">
@@ -101,23 +106,29 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
       {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
       {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     </div>
-    {server.mode === "system"
-      ? <PathField id="codex-socket" label="连接路径" value={server.socket} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
-          onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
-      : <PathField id="codex-home" label="Codex 目录" value={home} placeholder="例如 /Users/你的用户名/.codex" working={working} busy={busy.endsWith(":home")}
-          onSave={(path) => save("home", { env: { CODEX_HOME: path || null } })} />}
-    {sessions ? <p className="grid gap-1 text-meta"><span className="font-medium text-muted-foreground">会话目录</span><code className="font-mono break-all">{sessions}</code></p> : null}
+    <Details label="路径" open={pathsOpen || needsPaths || undefined}>
+      {server.mode === "system"
+        ? <PathField id="codex-socket" label="连接路径" value={server.socket} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
+            onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
+        : <PathField id="codex-home" label="Codex 目录" value={home} placeholder="例如 /Users/你的用户名/.codex" working={working} busy={busy.endsWith(":home")}
+            onSave={(path) => save("home", { env: { CODEX_HOME: path || null } })} />}
+      {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} /></span></p> : null}
+      {children}
+    </Details>
   </div>
 }
 
-/** When the device found no Codex on this computer: the folder or the running App Server's socket, typed in, turns on what was asked in one write. */
-function ManualCodex({ working, busy, save }: { working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
+/**
+ * When the device found no Codex on this computer: the folder or the running App Server's socket, typed in, turns on what was asked in one write.
+ * `onboarding`: only the folder; the socket stays on the device page.
+ */
+function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
       <PathField id="manual-codex-home" label="Codex 目录" value={null} placeholder="例如 /Users/你的用户名/.codex" working={working} busy={busy.endsWith(":home")}
         onSave={(path) => save("home", { app_server: { mode: "spawn", socket: null }, env: { CODEX_HOME: path } })} />
-      <PathField id="manual-codex-socket" label="连接路径" value={null} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
-        onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />
+      {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
+        onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />}
     </div>
   </Details>
 }
@@ -128,7 +139,9 @@ function openProvider(provider: ProviderId) {
   if (!card) return
   if (card instanceof HTMLDetailsElement) card.open = true
   card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
-  card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
+  const target = card.querySelector<HTMLElement>("[data-fix]") ?? card.querySelector<HTMLElement>("input")
+  for (let fold = target?.closest("details"); fold && fold !== card; fold = fold.parentElement?.closest("details")) fold.open = true
+  target?.focus({ preventScroll: true })
 }
 
 type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
@@ -248,7 +261,15 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, { [role]: true }).then((ok) => { if (!ok) void reconcile() }) }
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
     .then((ok) => { if (!ok) void reconcile(); return ok })
-  const serverSettings = server ? <AppServerSettings server={server} home={item.home} sessions={item.sessions} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test} /> : null
+  const binForm = item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
+      <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
+      <div className="flex min-w-0 gap-2">
+        <Input id={`${item.provider}-bin`} className="min-w-0 font-mono text-foreground" placeholder="codex" value={bin} disabled={working}
+          data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
+        {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
+      </div>
+    </form> : null
+  const serverSettings = server ? <AppServerSettings server={server} home={item.home} sessions={item.sessions} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
   const fix = () => {
     if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
     openProvider(item.provider)
@@ -275,7 +296,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     </div>
     {notFound ? <div className="grid gap-2 px-3 pb-2 text-meta">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
-      <ManualCodex working={working} busy={busy} save={manual} />
+      <ManualCodex onboarding={onboarding} working={working} busy={busy} save={manual} />
     </div> : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
@@ -294,15 +315,6 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       </summary>
       <div className="grid gap-4 px-3 pb-3">
         {serverSettings}
-
-        {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
-          <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
-          <div className="flex min-w-0 gap-2">
-            <Input id={`${item.provider}-bin`} className="min-w-0 font-mono" placeholder="codex" value={bin} disabled={working}
-              data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
-            {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
-          </div>
-        </form> : null}
 
         {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
