@@ -123,7 +123,7 @@ export function parsePrincipal(value: unknown): ClientPrincipal {
     if (v.can_manage !== false) throw new Error('本机会话不能取得设备管理权限。')
     return { ...principal, source: 'local_session', can_manage: false }
   }
-  if (v.source !== 'membership') throw new Error('设备返回了未知授权来源。')
+  if (v.source !== 'membership') throw new Error('设备返回的身份信息认不出来。')
   return { ...principal, source: 'membership', can_manage: boolean(v.can_manage) }
 }
 const hex32 = (value: unknown) => value === null || value === undefined ? null : validTarget(value)

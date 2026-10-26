@@ -908,8 +908,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
           store('recovery-wait', wait)
           let auth: Record<string, unknown>
           try { auth = record(await request('recover', { genesis, checkpoints: prepared.checkpoints, events, ...(fresh ? { capability } : {}) })) }
-          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“恢复”会重试同一次恢复，不会再下载文件。`) }
-          if (released) throw new Error('恢复已提交，但这里已取消。请重新连接看一下结果，并用刚下载的恢复文件。')
+          catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“找回”会重试同一次找回，不会再下载文件。`) }
+          if (released) throw new Error('找回已提交，但这里已取消。请重新连接看一下结果，并用刚下载的恢复文件。')
           try {
             if (auth.principal !== null) await recoveredAs(auth, active, wait)
             // A waiting browser is a guest, whose channel times out; the wait is checked over fresh ones.

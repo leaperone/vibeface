@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -26,8 +26,9 @@ const checks: Record<ProviderId, { key: string; label: string }[]> = {
   codex: [{ key: "Codex CLI", label: "缺少 Codex 命令行" }],
   cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件" }],
 }
-/** A variable the provider needs, named as its service names it where there is such a name. */
-const keyName = (name: string) => name === "CURSOR_API_KEY" ? "Cursor API Key" : name
+const services: Record<string, string> = { CURSOR_API_KEY: "Cursor", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
+/** A variable the provider needs, named after its service where there is one; the variable itself goes in a tooltip. */
+const keyName = (name: string) => services[name] ? `${services[name]} ${terms.secret.label}` : name
 
 function issueText(provider: ProviderId, issue: ProviderIssue): string {
   const name = providerNames[provider]
@@ -398,7 +399,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
     event.preventDefault()
     if (value) void save(name, value).then((ok) => { if (ok) setValue("") })
   }}>
-    <label htmlFor={`key-${name}`} className="flex min-w-0 items-center gap-1.5 text-meta text-warning">
+    <label htmlFor={`key-${name}`} title={name} className="flex min-w-0 items-center gap-1.5 text-meta text-warning">
       <terms.secret.icon aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
     </label>
     <div className="flex min-w-0 gap-2">
@@ -406,8 +407,9 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
         value={value} disabled={working} onChange={(event) => setValue(event.target.value)} />
       <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
     </div>
+    <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Lock aria-hidden="true" className="size-4 shrink-0" />只存在这台电脑上</p>
     {name === "CURSOR_API_KEY" ? <a className="hit-area relative inline-flex w-fit items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" href="https://cursor.com/dashboard" target="_blank" rel="noopener noreferrer">
-      获取 Key<ExternalLink aria-hidden="true" className="size-3.5" />
+      获取{terms.secret.label}<ExternalLink aria-hidden="true" className="size-3.5" />
     </a> : null}
   </form>
 }
