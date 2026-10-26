@@ -238,7 +238,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       {bot ? <PromptInput
         above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
-          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项等你处理` : '等你处理'}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <terms.approval.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
         hint={hint}
@@ -255,7 +255,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去配置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )

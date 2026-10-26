@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Inbox, Laptop, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, NotebookPen, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BotAvatar, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
@@ -86,7 +86,7 @@ export function BotPanelButton() {
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
             </SettingsRow>
           </SettingsGroup>
-          {empty ? <p className="flex items-center justify-center gap-2 py-2 text-meta text-muted-foreground"><Inbox aria-hidden="true" className="size-4 shrink-0" />还没有说明、定时任务和笔记</p> : null}
+          {empty ? <p className="flex items-center justify-center gap-2 py-2 text-meta text-muted-foreground"><NotebookPen aria-hidden="true" className="size-4 shrink-0" />还没有说明、定时任务和笔记</p> : null}
           {bot.instructions.trim() ? <SettingsGroup title="说明">
             <p className="px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
           </SettingsGroup> : null}

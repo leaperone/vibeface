@@ -33,7 +33,7 @@ const frame = (bytes: Uint8Array) => bytes as Uint8Array<ArrayBuffer>
 const page = () => (globalThis as { location?: { origin: string; protocol: string } }).location
 
 export function validTarget(value: unknown): string {
-  if (typeof value !== 'string' || !devicePattern.test(value)) throw new Error('这个设备地址无效。请使用邀请链接或本机页面给的地址。')
+  if (typeof value !== 'string' || !devicePattern.test(value)) throw new Error('这个设备地址无效。请用加入链接或本机页面给的地址。')
   return value
 }
 
@@ -153,9 +153,9 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys) {
   /** Trust comes from the ticket's device key; the address in a link is only a hint. */
   async function parseJoinLink(value: string): Promise<JoinLink> {
     await initClient()
-    if (value.trim().length > 8192) throw new Error('邀请链接过长。请重新复制管理设备上的链接。')
+    if (value.trim().length > 8192) throw new Error('加入链接过长。请重新复制管理设备上的链接。')
     const found = joinTicket(value)
-    if (!found) throw new Error('这不是 Vibeface 邀请链接。')
+    if (!found) throw new Error('这不是 Vibeface 加入链接。')
     const ticket = JSON.parse(secure.ticketDecode(found.ticket))
     let origin: string | null = null
     try { origin = found.origin && validEndpoint(found.origin) } catch {}

@@ -1,6 +1,6 @@
 import {
   Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
-  Laptop, Link, ListChecks, Lock, MessageSquareShare, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
+  KeyRound, Laptop, Link, ListChecks, Lock, MessageSquareShare, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
   Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
 
@@ -17,10 +17,10 @@ export const terms = {
   joinLink: { label: "加入链接", icon: Link },
   qr: { label: "二维码", icon: QrCode },
   safetyCode: { label: "安全码", icon: ShieldCheck },
-  admin: { label: "管理员", icon: Crown },
+  admin: { label: "管理设备", icon: Crown },
   remove: { label: "移除设备", icon: Ban },
   recoveryFile: { label: "恢复文件", icon: FileKey },
-  recoveryPassword: { label: "恢复密码", icon: Lock },
+  recoveryPassword: { label: "恢复密码", icon: KeyRound },
   restore: { label: "用恢复文件找回", icon: ArchiveRestore },
   bot: { label: "Bot", icon: Bot },
   ai: { label: "Bot 与任务", icon: Sparkles },

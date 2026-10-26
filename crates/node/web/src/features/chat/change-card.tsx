@@ -12,7 +12,7 @@ function cardTitle(changes: BotChange[]) {
   if (kind === 'profile') return '已更新 Bot'
   const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
   const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
-  if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'
+  if (kind === 'skill') return added ? '已存为 Skill' : removed ? '已删除 Skill' : '已更新 Skill'
   if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
   return added ? '已设定定时任务' : removed ? '已删除定时任务' : '已更新定时任务'
 }
@@ -37,7 +37,7 @@ function ChangeRows({ change, schedules }: { change: BotChange; schedules: reado
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
     {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} /></Row> : null}
-    {change.skills ? <Row icon={BookOpen} label='skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
+    {change.skills ? <Row icon={BookOpen} label='Skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
   if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
@@ -98,7 +98,7 @@ function SkillRow({ before, after }: { before: BotSkill | null; after: BotSkill 
   const renamed = before && after && before.name !== after.name
   const body = !after ? null : !before ? <p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{after.body}</p>
     : before.body !== after.body ? <DiffLines lines={lineDiff(before.body, after.body)} limit={Infinity} /> : null
-  return <Row icon={BookOpen} label={skill.name} tag={!before ? '新 skill' : !after ? '已删除' : '已更新'} removed={!after}>
+  return <Row icon={BookOpen} label={skill.name} tag={!before ? '新 Skill' : !after ? '已删除' : '已更新'} removed={!after}>
     {renamed ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {after?.description ? <p className="text-meta text-muted-foreground">{after.description}</p> : null}
     {body ? <Details label={before ? '内容改动' : '内容'}>{body}</Details> : null}
