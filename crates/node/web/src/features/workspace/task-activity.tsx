@@ -27,6 +27,11 @@ export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device:
 
 const confirmIcons = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
+/** An offline device reports by itself once back, so waiting also settles it. */
+export function BackOnline({ device }: { device: string }) {
+  return <p className="text-meta text-muted-foreground">{device} 上线后会自动更新</p>
+}
+
 /**
  * "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run.
  * `inbox`: also names the bot and links to its chat.
@@ -61,6 +66,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     meta={device}
   >
     <p className="text-muted-foreground">{check.reason === "offline" ? "设备离线了" : "Codex 断开了"}，这些任务做完了吗？</p>
+    {check.reason === "offline" ? <BackOnline device={device} /> : null}
     <ul className="divide-y overflow-hidden rounded-lg border bg-card">
       {check.works.map((work) => {
         const bot = botOf(work)
@@ -90,6 +96,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     </>}
   >
     <p>{reason}那个任务实际做完了吗？</p>
+    {check.reason === "offline" ? <BackOnline device={device} /> : null}
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline max-md:min-h-11">
       <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" className="size-4 rounded text-[9px]" /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>

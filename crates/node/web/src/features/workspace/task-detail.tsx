@@ -8,7 +8,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { rawError, taskError } from "@vibeface/client/lib/errors.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
-import { confirmText } from "./task-activity"
+import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
@@ -108,6 +108,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {check ? <section className="grid gap-3 rounded-xl border border-warning-border bg-warning-soft p-3">
         <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
         <p className="text-meta text-muted-foreground">{confirmText(check, nodeName(device, lookup))}</p>
+        {check.reason === "offline" ? <BackOnline device={nodeName(device, lookup)} /> : null}
         <div className="flex flex-wrap justify-end gap-2">
           <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
           <ActionButton variant="default" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
