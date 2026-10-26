@@ -97,7 +97,7 @@ function openSocket(url: string, signal: AbortSignal | undefined, onClose: (erro
     else close(new Error('对方发送的数据过多，已关闭连接。'))
   })
   socket.addEventListener('close', () => close())
-  socket.addEventListener('error', () => close(new Error('连不上这台设备。请确认它开着，并且和这里网络互通。')))
+  socket.addEventListener('error', () => close(new Error('连不上这台电脑。请确认它开着，并且和这里网络互通。')))
   if (signal?.aborted) abort()
   return {
     socket, close, ready() { clearTimeout(timer) },

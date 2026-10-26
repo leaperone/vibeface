@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -347,7 +347,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
             return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
               <div className="flex min-h-8 min-w-0 items-center gap-2">
                 <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
-                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
+                {deleting === row.name && row.set ? <span className="shrink-0 text-meta text-foreground">删除后 Bot 用不到它</span>
+                  : <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>}
                 {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
                   data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
                 {!row.set ? null : deleting === row.name ? <>
@@ -398,7 +399,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
     if (value) void save(name, value).then((ok) => { if (ok) setValue("") })
   }}>
     <label htmlFor={`key-${name}`} className="flex min-w-0 items-center gap-1.5 text-meta text-warning">
-      <KeyRound aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
+      <terms.secret.icon aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
     </label>
     <div className="flex min-w-0 gap-2">
       <Input id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}

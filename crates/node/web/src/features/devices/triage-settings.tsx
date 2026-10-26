@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, KeyRound, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, X, Zap, type LucideIcon } from "lucide-react"
+import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton, toast } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -92,6 +92,7 @@ export function TriageSettings() {
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
         <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
         <Input aria-label={`${chat}地址`} type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+        {confirming === "secret" ? <p className="text-meta text-foreground">清除后提醒发不出去</p> : null}
         <div className="flex min-w-0 gap-2">
           <Input aria-label={`${chat}密钥`} type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : `${chat}密钥`} value={secret} onChange={(event) => setSecret(event.target.value)} />
           {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
@@ -117,7 +118,7 @@ export function TriageSettings() {
       </form>
 
       <Details label={`让${chat}代你回答`}>
-        <p className="flex items-center gap-2 text-meta text-foreground"><KeyRound aria-hidden="true" className="size-4" />{chat}用这个地址和授权码回话</p>
+        <p className="flex items-center gap-2 text-meta text-foreground"><terms.secret.icon aria-hidden="true" className="size-4" />{chat}用这个地址和授权码回话</p>
         <code className="truncate rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta" title={settings.decision_url}>{settings.decision_url}</code>
         {token ? <div role="status" className="flex min-w-0 items-center gap-2 rounded-lg border border-warning-border bg-warning-soft px-3 py-2">
           <code className="min-w-0 flex-1 break-all font-mono text-meta">{token}</code>
@@ -126,11 +127,14 @@ export function TriageSettings() {
         </div> : null}
         {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
           <span className="min-w-0 flex-1 truncate text-meta">{item.label || "未命名"}</span>
-          <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
           {confirming === item.token_id ? <>
+            <span className="shrink-0 text-meta text-foreground">撤销后它不能再代你回答</span>
             <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
             <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void call("revoke", "revoke_decision_token", { token_id: item.token_id }) }}>撤销</Button>
-          </> : <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>}
+          </> : <>
+            <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
+            <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>
+          </>}
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
           <Input aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />

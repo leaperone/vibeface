@@ -13,7 +13,7 @@ import type { ConflictVersion } from "@vibeface/client/workspace/types.ts"
 export type WriteCardKind = "read_only" | "forked" | "conflicts"
 
 const summary = (version: ConflictVersion | null) => {
-  if (!version) return "这台设备上没有"
+  if (!version) return "这台电脑上没有"
   const text = version.body.text
   return `${new Date(version.created_at_ms).toLocaleString('zh-CN')} · ${typeof text === "string" && text ? text.slice(0, 120) : String(version.body.type ?? "")}`
 }
@@ -28,7 +28,7 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const [waiting, setWaiting] = useState(false)
   const lookup = { nodes: workspace.nodes, directory: device.directory }
   const entry = device.ready?.entry.device_id
-  const here = entry ? nodeName(entry, lookup) : "这台设备"
+  const here = entry ? nodeName(entry, lookup) : "这台电脑"
   const canManage = device.ready?.principal.can_manage === true
   const away = workspace.nodes.filter((node) => !node.revoked && !node.online && node.device_id !== entry).map((node) => nodeName(node.device_id, lookup)).join("、")
   const unreached = `${away ? `${away} ` : "其他设备都"}连不上，没法确认数据是最新的。`
