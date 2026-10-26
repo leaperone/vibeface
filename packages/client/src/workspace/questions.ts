@@ -19,10 +19,13 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
   return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
 }
 
-/** What 待处理 lists: questions nobody answered, urgent ones first, then newest first. */
+/** Nobody answered it and the device that asked did not close it. */
+export const questionOpen = (question: Question) => question.answer === null && question.closed === null
+
+/** What 待处理 lists: open questions, urgent ones first, then newest first. */
 export function openQuestions(questions: readonly Question[]): Question[] {
   const urgent = (question: Question) => question.severity === "urgent" ? 0 : 1
-  return questions.filter((question) => question.answer === null).sort((a, b) => urgent(a) - urgent(b) || b.created_at_ms - a.created_at_ms)
+  return questions.filter(questionOpen).sort((a, b) => urgent(a) - urgent(b) || b.created_at_ms - a.created_at_ms)
 }
 
 /**

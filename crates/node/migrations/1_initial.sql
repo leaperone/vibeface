@@ -27,7 +27,7 @@ CREATE TABLE `works` (`network_id` text NOT NULL, `work_id` text NOT NULL, `conv
 CREATE INDEX `works_conversation` ON `works` (`network_id`, `conversation_id`);
 CREATE TABLE `notifications` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `text` text NOT NULL, `rank` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`));
 CREATE TABLE `notification_acks` (`network_id` text NOT NULL, `notification_id` text NOT NULL, `client_id` text NOT NULL, PRIMARY KEY (`network_id`, `notification_id`, `client_id`));
-CREATE TABLE `questions` (`network_id` text NOT NULL, `question_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `created_at_ms` integer NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `request_id` text NULL, `body` text NOT NULL, PRIMARY KEY (`network_id`, `question_id`));
+CREATE TABLE `questions` (`network_id` text NOT NULL, `question_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `author` text NOT NULL, `created_at_ms` integer NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `request_id` text NULL, `body` text NOT NULL, `closed` text NULL, PRIMARY KEY (`network_id`, `question_id`));
 CREATE INDEX `questions_session` ON `questions` (`network_id`, `node`, `session_id`);
 CREATE INDEX `questions_conversation` ON `questions` (`network_id`, `conversation_id`, `rank`);
 CREATE TABLE `session_owners` (`network_id` text NOT NULL, `node` text NOT NULL, `session_id` text NOT NULL, `conversation_id` text NOT NULL, `rank` text NOT NULL, `attribution` text NULL, `muted` integer NOT NULL DEFAULT 0, `created_at_ms` integer NOT NULL, PRIMARY KEY (`network_id`, `node`, `session_id`));

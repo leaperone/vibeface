@@ -2,7 +2,7 @@
 
 import { useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronRight, CircleAlert, CircleCheck, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BotAvatar, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -19,7 +19,7 @@ const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> 
 }
 
 /**
- * A question waiting on the person, in its chat and in 待处理: tap a choice or type an answer. Answered, it is one line.
+ * A question waiting on the person, in its chat and in 待处理: tap a choice or type an answer. Answered or closed, it is one line.
  * `answer`: what the chat already holds for it. `inbox`: also names the bot and links to its chat. `inTask`: inside the task's own panel, which already names the task and device.
  */
 export function QuestionCard({ question, answer, inbox = false, inTask = false }: { question: Question; answer?: string; inbox?: boolean; inTask?: boolean }) {
@@ -38,6 +38,14 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
       <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
       <span className="min-w-0 flex-1 text-foreground [overflow-wrap:anywhere]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+    </span>
+  </p>
+
+  if (question.closed) return <p className="-mx-2 flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
+    <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+    <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
+      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
+      <span className="min-w-0 flex-1">已失效</span>
     </span>
   </p>
 

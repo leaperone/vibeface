@@ -110,6 +110,14 @@ pub enum Severity {
     Urgent,
 }
 
+/// Why the device that asked a question closed it unanswered.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    /// The App Server request it held is gone, so no answer can reach it.
+    RequestLost,
+}
+
 /// Scope of the user's choice of primary bot, the one that judges what comes in without an
 /// owner. Its latest event by rank stands; nothing projects it.
 pub const BOTS_SCOPE: &str = "bots";
@@ -632,6 +640,12 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         choices: Vec<Choice>,
         about: Subject,
+    },
+    /// Written by the device that asked, in the question's conversation, once nothing can act
+    /// on an answer. An answer that stands keeps the question answered, whichever came first.
+    QuestionClosed {
+        question_id: String,
+        reason: CloseReason,
     },
     /// Written by the device running the session, in the conversation of the bot that owns
     /// it from now on: the primary bot when the session shows up without an owner, its bot

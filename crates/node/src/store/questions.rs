@@ -1,5 +1,7 @@
 //! Questions live in the chat of the bot that owns their session. A question's one answer is
 //! the user message `a-<question_id>`; a question is unanswered while no such message exists.
+//! The device that asked may close an unanswered one it can no longer act on; an answer that
+//! stands wins over a close, in any order they meet.
 //! A session gets its owner from a work bound to it or from the device running it. A deleted
 //! bot owns nothing: its sessions, muted or not, are unowned again.
 use super::{
@@ -25,13 +27,14 @@ pub struct Answered {
     pub receipt: Option<AdmissionReceipt>,
 }
 
-const QUESTION: &str = "SELECT q.body,q.conversation_id,q.author,q.created_at_ms,m.message_id,m.text,m.author,m.created_at_ms FROM questions q LEFT JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id WHERE q.network_id=?1";
+const QUESTION: &str = "SELECT q.body,q.conversation_id,q.author,q.created_at_ms,q.closed,m.message_id,m.text,m.author,m.created_at_ms FROM questions q LEFT JOIN messages m ON m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id WHERE q.network_id=?1";
 
 type Row = (
     String,
     String,
     String,
     i64,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -57,12 +60,13 @@ fn questions_from(
                 r.get(5)?,
                 r.get(6)?,
                 r.get(7)?,
+                r.get(8)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     rows.into_iter()
         .map(
-            |(body, scope, author, created_at_ms, answer, text, by, at)| {
+            |(body, scope, author, created_at_ms, closed, answer, text, by, at)| {
                 let mut question: Value = serde_json::from_str(&body)?;
                 if let Some(object) = question.as_object_mut() {
                     object.remove("type");
@@ -73,11 +77,12 @@ fn questions_from(
                 question["bot"] = json!(bot);
                 question["author"] = json!(author);
                 question["created_at_ms"] = json!(created_at_ms);
-                question["answer"] = match answer {
-                    Some(message_id) => {
-                        json!({"message_id":message_id,"text":text,"author":by,"created_at_ms":at})
-                    }
-                    None => Value::Null,
+                (question["answer"], question["closed"]) = match answer {
+                    Some(message_id) => (
+                        json!({"message_id":message_id,"text":text,"author":by,"created_at_ms":at}),
+                        Value::Null,
+                    ),
+                    None => (Value::Null, json!(closed)),
                 };
                 Ok(question)
             },
@@ -143,12 +148,28 @@ impl Store {
         question_from(&self.connection, network, question)
     }
 
-    /// Every question no one has answered yet, across conversations.
+    /// The question `node` asked about its App Server request `request`, in whatever state.
+    pub fn request_question(
+        &self,
+        network: &str,
+        node: &str,
+        request: &str,
+    ) -> Result<Option<Value>> {
+        Ok(questions_from(
+            &self.connection,
+            network,
+            "AND q.author=?2 AND q.node=?2 AND q.request_id=?3",
+            params![network, node, request],
+        )?
+        .pop())
+    }
+
+    /// Every open question: no one answered it and its device did not close it.
     pub fn unanswered_questions(&self, network: &str) -> Result<Vec<Value>> {
         questions_from(
             &self.connection,
             network,
-            "AND m.message_id IS NULL",
+            "AND m.message_id IS NULL AND q.closed IS NULL",
             params![network],
         )
     }
@@ -254,6 +275,55 @@ impl Store {
         let asked = question_from(&tx, network, &question)?.context("question missing")?;
         tx.commit()?;
         Ok((asked, Some(event)))
+    }
+
+    /// Closes this device's open questions whose App Server request is not in `held`, the
+    /// requests waiting now. Returns each close it wrote with its conversation; another call
+    /// writes no more for them.
+    pub fn close_lost_questions(
+        &mut self,
+        identity: &LocalIdentity,
+        network: &str,
+        held: &std::collections::HashSet<String>,
+        created_at_ms: i64,
+    ) -> Result<Vec<(ScopeId, SignedEvent)>> {
+        let node = identity.device_id()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lost: Vec<(String, String, String)> = tx
+            .prepare(
+                "SELECT q.question_id,q.conversation_id,q.request_id FROM questions q
+                 WHERE q.network_id=?1 AND q.author=?2 AND q.node=?2 AND q.request_id IS NOT NULL AND q.closed IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.network_id=q.network_id AND m.conversation_id=q.conversation_id AND m.answers=q.question_id)
+                 ORDER BY q.rank",
+            )?
+            .query_map(params![network, node], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut written = Vec::new();
+        for (question, scope, request) in lost {
+            if held.contains(&request) {
+                continue;
+            }
+            let event = log::append_from(
+                &tx,
+                &self.blob_dir,
+                identity,
+                network,
+                &scope,
+                EventBody::QuestionClosed {
+                    question_id: question,
+                    reason: CloseReason::RequestLost,
+                },
+                vec![],
+                created_at_ms,
+            )?;
+            written.push((scope, event));
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     /// Gives a session this device runs and no bot owns to `conversation`. Writes nothing
@@ -398,11 +468,11 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         authorize_node_from(&tx, network, &local)?;
-        let scope: String = tx
+        let (scope, closed): (String, Option<String>) = tx
             .query_row(
-                "SELECT conversation_id FROM questions WHERE network_id=? AND question_id=?",
+                "SELECT conversation_id,closed FROM questions WHERE network_id=? AND question_id=?",
                 params![network, question],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
             .context("no such question on this device")?;
@@ -414,6 +484,9 @@ impl Store {
                 message,
                 receipt: None,
             });
+        }
+        if let Some(reason) = closed {
+            bail!("this question was closed ({reason}); nothing can act on an answer now");
         }
         log::append_from(
             &tx,

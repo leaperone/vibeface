@@ -906,13 +906,22 @@ impl Runtime {
     }
 
     pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<Value>) {
-        self.codex.start();
         let node = self.clone();
         tokio::spawn(async move {
+            // Known before the first connect, so requests on these threads come back to the Node
+            // before the client reports its threads observed.
+            node.observe_live_threads().await;
+            node.codex.start();
             while let Some(event) = events.recv().await {
                 match event["method"].as_str() {
                     Some("bridge.codex_request") => {
                         node.on_codex_request(&event["params"]).await;
+                        continue;
+                    }
+                    Some("bridge.codex_observed") => {
+                        if let Err(error) = node.close_lost_questions().await {
+                            tracing::warn!(%error, "could not close questions about lost requests");
+                        }
                         continue;
                     }
                     Some("bridge.codex_connected") => node.codex.connected(),
