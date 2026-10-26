@@ -33,10 +33,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const id = question.question_id
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
+  // The first line asks; lines after it list what the answer applies to.
+  const [ask, ...lines] = question.text.split("\n")
   if (settled) return <p ref={answering.current ? claimFocus : undefined} tabIndex={-1} role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 outline-none flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
+      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{ask}</span>
       <span className="min-w-0 flex-1 text-foreground [overflow-wrap:anywhere]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
     </span>
   </p>
@@ -44,7 +46,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   if (question.closed) return <p className="-mx-2 flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{question.text}</span>
+      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{ask}</span>
       <span className="min-w-0 flex-1">已失效</span>
     </span>
   </p>
@@ -73,8 +75,14 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   return <ActionCard
     icon={icon}
     tone={tone}
-    title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{question.text}</span></>}
+    title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
+    {lines.length ? <ul className="grid gap-1">{lines.map((line, index) => {
+      const colon = line.indexOf("：")
+      return <li key={index} className="flex min-w-0 flex-wrap gap-x-2 [overflow-wrap:anywhere]">
+        {colon > 0 ? <><span className="text-muted-foreground">{line.slice(0, colon)}</span><span className="min-w-0 font-medium">{line.slice(colon + 1)}</span></> : <span className="font-medium">{line}</span>}
+      </li>
+    })}</ul> : null}
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
       {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} search={inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
