@@ -72,7 +72,7 @@ const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "待确认", unknown: "待确认", starting: "准备中", finished: "已完成", unverified: "待确认", awaiting_confirmation: "待确认",
-  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", stop_waiting: "等设备确认停止", stop_timed_out: "设备没有确认停止",
+  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 
@@ -84,8 +84,8 @@ const progressStates: Record<string, string> = {
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
 
 /**
- * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop sent to
- * an unreachable device as that request.
+ * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop not yet
+ * confirmed as that stop, which keeps being retried.
  */
 export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state

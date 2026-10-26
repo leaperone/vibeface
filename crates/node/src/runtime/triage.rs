@@ -1563,6 +1563,13 @@ mod tests {
     };
 
     async fn bare_node() -> Result<(Arc<Runtime>, PathBuf)> {
+        node_at(LocalIdentity::generate(), Default::default()).await
+    }
+
+    async fn node_at(
+        identity: LocalIdentity,
+        network: crate::net::NetworkConfig,
+    ) -> Result<(Arc<Runtime>, PathBuf)> {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("triage-{}", uuid::Uuid::new_v4()));
@@ -1575,15 +1582,13 @@ mod tests {
         );
         configuration.providers.codex_app_server.socket = Some(socket.into());
         configuration.providers.execution = true;
+        configuration.network = network;
         configuration.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
             &crate::config::data_epoch_marker(),
         )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&LocalIdentity::generate())?,
-        )?;
+        config::private_write(&dir.join("identity.json"), &serde_json::to_vec(&identity)?)?;
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
@@ -1721,6 +1726,14 @@ mod tests {
     }
 
     fn answering_app_server(node: &Runtime) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
+        scripted_app_server(node, |_| json!({"result":{}}))
+    }
+
+    /// An App Server fixture: `answer` gives each request's reply, `{"result":…}` or `{"error":…}`.
+    fn scripted_app_server(
+        node: &Runtime,
+        mut answer: impl FnMut(&Value) -> Value + Send + 'static,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
         let listener = tokio::net::UnixListener::bind(named_socket(node))?;
         let (sent, received) = tokio::sync::mpsc::unbounded_channel();
@@ -1736,11 +1749,11 @@ mod tests {
                     continue;
                 };
                 if request.get("id").is_some() {
-                    let result = match request["method"].as_str() {
-                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
-                        _ => json!({}),
+                    let mut reply = match request["method"].as_str() {
+                        Some("initialize") => json!({"result":{"userAgent":"codex/fixture"}}),
+                        _ => answer(&request),
                     };
-                    let reply = json!({"id":request["id"],"result":result});
+                    reply["id"] = request["id"].clone();
                     let _ = server.send(reply.to_string().into()).await;
                 }
                 let _ = sent.send(request);
@@ -1815,8 +1828,14 @@ mod tests {
                 interrupt["params"],
                 json!({"threadId":"t-9","turnId":"u-1"})
             );
-            assert!(node.store.lock().await.stop_requests()?.is_empty());
+            let held = node.store.lock().await.stop_requests()?;
+            assert!(
+                held.iter()
+                    .any(|request| request.work_id == "w-stop" && !request.timed_out),
+                "the stop is held until the turn ends"
+            );
             node.deliver_work_requests(&network).await?;
+            node.reconcile_works(&network).await?;
             while let Ok(request) = requests.try_recv() {
                 assert_ne!(request["method"], "turn/interrupt", "the stop is sent once");
             }
@@ -1824,6 +1843,277 @@ mod tests {
         }
         .await;
         cleanup(node, dir).await?;
+        result
+    }
+
+    /// A Codex work on `node` whose turn `u-1` runs in thread `t-9`.
+    async fn running_work(node: &Arc<Runtime>, work_id: &str) -> Result<()> {
+        let network = node.network_id().await?;
+        let local = node.identity.device_id()?;
+        let spec = crate::work::WorkSpec {
+            work_id: work_id.into(),
+            conversation: "c".into(),
+            trigger: "message:m1".into(),
+            target: local.clone(),
+            dispatcher: local,
+            call_ref: work_id.into(),
+            kind: crate::model::WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".into(),
+            continues: None,
+            parent: None,
+            thread: Some("t-9".into()),
+        };
+        node.store
+            .lock()
+            .await
+            .accept_work(&node.identity, &network, spec, now_ms())?;
+        let epoch = node.codex_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let turn = crate::work::Signal::TurnStarted {
+            turn_id: "u-1".into(),
+            epoch,
+        };
+        let running = node.signal_work(&network, work_id, turn).await?;
+        assert!(matches!(
+            running.state,
+            crate::work::WorkState::Running { .. }
+        ));
+        Ok(())
+    }
+
+    async fn connected(node: &Runtime) {
+        while node.codex.status().await["connection"]["state"] != "connected" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    fn methods(requests: &mut tokio::sync::mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        std::iter::from_fn(|| requests.try_recv().ok())
+            .filter_map(|request| request["method"].as_str().map(str::to_owned))
+            .filter(|method| ["turn/interrupt", "thread/read"].contains(&method.as_str()))
+            .collect()
+    }
+
+    async fn state(node: &Runtime, work_id: &str) -> Result<crate::work::WorkState> {
+        Ok(node
+            .store
+            .lock()
+            .await
+            .work_record(work_id)?
+            .context("work")?
+            .state)
+    }
+
+    async fn held_stop(node: &Runtime, work_id: &str) -> Result<Option<crate::work::StopRequest>> {
+        Ok(node
+            .store
+            .lock()
+            .await
+            .stop_requests()?
+            .into_iter()
+            .find(|request| request.work_id == work_id))
+    }
+
+    #[tokio::test]
+    async fn a_held_stop_outlives_a_failed_interrupt_and_ends_with_its_work() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let refuse = Arc::new(AtomicBool::new(true));
+            let refusing = refuse.clone();
+            let mut requests =
+                scripted_app_server(&node, move |request| match request["method"].as_str() {
+                    Some("turn/interrupt") if refusing.load(Ordering::SeqCst) => {
+                        json!({"error":{"code":-32603,"message":"busy"}})
+                    }
+                    Some("thread/read") => json!({"result":{"thread":{"turns":[
+                        {"id":"u-1","status":"inProgress","items":[]}]}}}),
+                    _ => json!({"result":{}}),
+                })?;
+            connected(&node).await;
+            let network = node.network_id().await?;
+            running_work(&node, "w-held").await?;
+
+            let stopped = node.interrupt_work(&network, "w-held").await?;
+            assert_eq!(stopped["retrying"], true);
+            assert!(matches!(
+                state(&node, "w-held").await?,
+                crate::work::WorkState::Running { .. }
+            ));
+            assert!(
+                held_stop(&node, "w-held").await?.is_some(),
+                "a failed interrupt keeps the stop"
+            );
+            assert_eq!(methods(&mut requests), ["turn/interrupt"]);
+            node.reconcile_works(&network).await?;
+            assert_eq!(methods(&mut requests), [] as [&str; 0], "retries back off");
+
+            // Only the pacing is in memory, as after a restart; the stop itself is stored.
+            refuse.store(false, Ordering::SeqCst);
+            node.stop_retries.lock().unwrap().clear();
+            node.reconcile_works(&network).await?;
+            assert_eq!(
+                methods(&mut requests),
+                ["thread/read", "turn/interrupt"],
+                "the turn is read before the interrupt is sent again"
+            );
+            assert!(matches!(
+                state(&node, "w-held").await?,
+                crate::work::WorkState::Interrupting { .. }
+            ));
+            let held = held_stop(&node, "w-held").await?.context("held")?;
+            assert!(!held.timed_out && held.deadline_ms > now_ms());
+            node.reconcile_works(&network).await?;
+            assert_eq!(
+                methods(&mut requests),
+                [] as [&str; 0],
+                "before the deadline"
+            );
+
+            // The stored deadline passes with the turn still running: it is asked again and
+            // shows as still trying.
+            let mut late = held;
+            late.deadline_ms = now_ms() - 1;
+            node.store.lock().await.save_stop_request(&late)?;
+            node.reconcile_works(&network).await?;
+            assert_eq!(methods(&mut requests), ["thread/read", "turn/interrupt"]);
+            assert!(held_stop(&node, "w-held").await?.context("held")?.timed_out);
+            assert!(matches!(
+                state(&node, "w-held").await?,
+                crate::work::WorkState::Interrupting { .. }
+            ));
+
+            let ended = crate::work::Signal::TurnCompleted {
+                turn_id: "u-1".into(),
+                status: "interrupted".into(),
+                text: String::new(),
+                error: None,
+            };
+            node.signal_work(&network, "w-held", ended).await?;
+            assert!(held_stop(&node, "w-held").await?.is_none());
+            node.stop_retries.lock().unwrap().clear();
+            node.reconcile_works(&network).await?;
+            let again = node.interrupt_work(&network, "w-held").await?;
+            assert_eq!(again["retrying"], false);
+            assert_eq!(
+                methods(&mut requests),
+                [] as [&str; 0],
+                "an ended turn is never interrupted again"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_past_its_deadline_reaches_a_device_that_comes_back() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let target = ib.device_id()?;
+        let membership = ia.sign_network_fixture(1, vec![ia.device_id()?, target.clone()])?;
+        let admin = ia.fixture_admin();
+        let networked = || crate::net::NetworkConfig {
+            bind: Some("127.0.0.1:0".parse().expect("address")),
+            ..Default::default()
+        };
+        let (a, dir_a) = node_at(ia, networked()).await?;
+        let (b, dir_b) = node_at(ib, networked()).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(membership.clone()).await?;
+            }
+            let network = b.network_id().await?;
+            bot(&b, &admin, "c", "前端", &[]).await?;
+            let mut requests = answering_app_server(&b)?;
+            connected(&b).await;
+            running_work(&b, "w-far").await?;
+
+            // B is offline and the stop is past its deadline.
+            a.start_network().await?;
+            let at = now_ms();
+            let stop = crate::work::StopRequest {
+                work_id: "w-far".into(),
+                conversation: "c".into(),
+                target: target.clone(),
+                requested_at_ms: at - 60_000,
+                deadline_ms: at - 30_000,
+                timed_out: true,
+            };
+            a.store.lock().await.save_stop_request(&stop)?;
+            a.deliver_work_requests(&network).await?;
+            assert!(
+                held_stop(&a, "w-far")
+                    .await?
+                    .is_some_and(|held| held.timed_out),
+                "an unconfirmed stop is never given up"
+            );
+
+            b.start_network().await?;
+            a.net()?.learn(&b.net()?.addr()).await;
+            let interrupt = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let request = requests.recv().await.context("the App Server closed")?;
+                    if request["method"] == "turn/interrupt" {
+                        return Ok::<_, anyhow::Error>(request);
+                    }
+                }
+            })
+            .await??;
+            assert_eq!(
+                interrupt["params"],
+                json!({"threadId":"t-9","turnId":"u-1"})
+            );
+            while held_stop(&a, "w-far").await?.is_some() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(matches!(
+                state(&b, "w-far").await?,
+                crate::work::WorkState::Interrupting { .. }
+            ));
+            assert!(
+                held_stop(&b, "w-far").await?.is_some(),
+                "B holds the stop it took"
+            );
+
+            let ended = crate::work::Signal::TurnCompleted {
+                turn_id: "u-1".into(),
+                status: "interrupted".into(),
+                text: String::new(),
+                error: None,
+            };
+            b.signal_work(&network, "w-far", ended).await?;
+            a.sync_peer(&network, &target).await?;
+            assert!(
+                a.store
+                    .lock()
+                    .await
+                    .works(&network, "c")?
+                    .iter()
+                    .any(|work| work.work_id == "w-far" && work.outcome.is_some())
+            );
+            a.store.lock().await.save_stop_request(&stop)?;
+            a.stop_retries.lock().unwrap().clear();
+            a.deliver_work_requests(&network).await?;
+            assert!(held_stop(&a, "w-far").await?.is_none());
+            b.stop_retries.lock().unwrap().clear();
+            b.reconcile_works(&network).await?;
+            assert_eq!(
+                methods(&mut requests),
+                [] as [&str; 0],
+                "an ended work gets no stop"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        cleanup(a, dir_a).await?;
+        cleanup(b, dir_b).await?;
         result
     }
 

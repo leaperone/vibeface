@@ -14,7 +14,7 @@ import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
 import { questionOpen } from "@vibeface/client/workspace/questions.ts"
 
-const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 // The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
 function holdFocus(node: HTMLElement | null) {
