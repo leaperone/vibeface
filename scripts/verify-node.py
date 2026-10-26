@@ -831,6 +831,15 @@ def fixture_codex(arguments):
     socket_path = Path(address.removeprefix("unix://"))
     state_path = run / "fixture-codex-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
+    # The Node starts this App Server after killing the previous one, as with real Codex: a turn
+    # that process left in progress was interrupted with it, and its request is never asked again.
+    for thread in state["threads"].values():
+        if thread["turns"] and thread["turns"][-1]["status"] == "inProgress":
+            thread["turns"][-1]["status"] = "interrupted"
+            thread["status"] = {"type": "idle"}
+            if "answer" not in (thread.get("request") or {"answer": None}):
+                del thread["request"]
+            private_json(state_path, state)
     state_lock = threading.Lock()
     slow_start = run / "fixture-codex-slow-start"
     if slow_start.exists():
@@ -2336,12 +2345,13 @@ def bot_settings_checks(run, a, network, passed):
     reminder_prefix = "schedule:" + reminder_id + ":"
     wait_for("the reminder fires once", lambda: replies_to(reminder_prefix), timeout=90)
     require(not replies_to("schedule:" + paused["schedule_id"] + ":"), "a paused schedule does not run")
-    before = len(fixture_records(run))
+    fired = lambda: [row for row in fixture_records(run) if row["trigger"].startswith("schedule:")]
+    before = len(fired())
     a.stop()
     a.start()
     a.client.connect()
     a.client.authenticate()
-    require_quiet("a restart never replays a reminder", lambda: len(fixture_records(run)) == before)
+    require_quiet("a restart never replays a reminder", lambda: len(fired()) == before)
     view = snapshot()
     require(len(replies_to(reminder_prefix)) == 1 and all(row["schedule_id"] != reminder_id for row in view["bot_settings"]["schedules"]),
             "a fired reminder stays fired after restart")

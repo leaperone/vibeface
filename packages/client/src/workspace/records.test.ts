@@ -57,12 +57,13 @@ test("the owner's jobs stay through a push of this device's records and replace 
 
 test("pushed records update the network-wide lists for their conversation only", () => {
   const pushed = records({
-    conversation_id: "chat", questions: [question("open", "chat"), question("done", "chat", { message_id: "a", text: "好", author: "b", created_at_ms: 2 })],
+    conversation_id: "chat", questions: [question("open", "chat"), question("done", "chat", { message_id: "a", text: "好", author: "b", created_at_ms: 2 }),
+      { ...question("lost", "chat"), closed: "request_lost" }],
     notifications: [{ notification_id: "n2", kind: "question", text: "?", conversation_id: "chat" }],
     last_message: { text: "hi", role: "assistant", created_at_ms: 5 },
   })
   const questions = mergeQuestions(parseQuestions({ questions: [question("old", "chat"), question("other", "other")] }), pushed)
-  assert.deepEqual(questions.map((item) => item.question_id), ["other", "open"], "answered ones leave the list")
+  assert.deepEqual(questions.map((item) => item.question_id), ["other", "open"], "answered and closed ones leave the list")
   assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "other", questions: [] }).map((item) => item.question_id), ["open"])
   const notifications = mergeNotifications([{ notification_id: "n1", kind: "question", text: "", conversation_id: "chat" }, { notification_id: "x", kind: "question", text: "", conversation_id: "other" }], pushed)
   assert.deepEqual(notifications.map((item) => item.notification_id), ["x", "n2"])

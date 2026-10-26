@@ -15,7 +15,7 @@ import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vib
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, foldAnswers, placeByTime, projectName } from '@vibeface/client/workspace/questions.ts'
+import { agentName, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
@@ -68,7 +68,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Tasks sit right after the message that started them.
   const works = data?.works ?? []
   // A running turn paused on an approval reads as waiting; a steered input names the task it joined.
-  const asking = new Set((data?.questions ?? []).filter((question) => !question.answer && question.about.request_id).map((question) => question.about.session_id))
+  const asking = new Set((data?.questions ?? []).filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const tasks: TaskRow[] = works.map((work, index) => {
     const state = shownState(work, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined

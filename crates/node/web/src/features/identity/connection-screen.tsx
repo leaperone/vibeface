@@ -209,7 +209,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
-  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 2 : null
+  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 3 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
@@ -323,7 +323,7 @@ function NamesStep({ computer, initial, onNext }: { computer?: string; initial: 
 
 type Run = (action: () => Promise<void>) => Promise<void>
 
-/** Step 2a: the recovery password; the file is sealed with it right away. */
+/** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
   const [short, setShort] = useState(false)
@@ -353,7 +353,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   </Panel>
 }
 
-/** Step 2b: download the sealed file, confirm it is stored apart from the password, then create. */
+/** Step 3: download the sealed file, confirm it is stored apart from the password, then create. */
 function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const [downloaded, setDownloaded] = useState(false)
