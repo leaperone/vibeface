@@ -4,12 +4,14 @@ import { Monitor, Smartphone, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"
 const listeners = new Set<() => void>()
 let closed = false
+let replied = false
 const dismissedBefore = () => { try { return closed || localStorage.getItem(key) === "dismissed" } catch { return closed } }
 // The sidebar and the narrow-screen list each show the hint; closing one closes both, and other tabs.
 const subscribe = (listener: () => void) => {
@@ -17,13 +19,16 @@ const subscribe = (listener: () => void) => {
   return () => { listeners.delete(listener); window.removeEventListener("storage", listener) }
 }
 
-/** While a new network holds only this computer and this browser, a quiet way into 添加设备. */
+/** Once a Bot has replied, while the network holds only this computer and this browser, a quiet way into 添加设备. */
 export function SecondDeviceHint({ className }: { className?: string }) {
   const { ready, directory, entrances } = useDevice()
+  const { bots } = useWorkspace()
+  // Kept for the page's life so the hint does not blink out while the next reply is pending.
+  replied ||= bots.some((bot) => bot.last_message?.role === "assistant")
   const rows = useDeviceRows()
   const onDevices = useRouterState({ select: (state) => state.location.pathname.startsWith("/devices") })
   const dismissed = useSyncExternalStore(subscribe, dismissedBefore, () => false)
-  if (dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
+  if (!replied || dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
   // A loopback-only link opens on no phone; another computer still joins it with `vibeface join`.
   const localOnly = isLoopback(ready.entry.address) && !entrances.some((entrance) => entrance.public)
   const Icon = localOnly ? Monitor : Smartphone
