@@ -82,6 +82,20 @@ fn hex32(parts: &[&str]) -> String {
     hex::encode(hash.finalize())[..32].to_owned()
 }
 
+/// The Node's ID for an App Server request: the same request asked again, on this connection or
+/// a later one, gets the same ID. `None` when the request names no item to tell it apart.
+pub fn request_id(method: &str, params: &Value) -> Option<String> {
+    let thread = params["threadId"]
+        .as_str()
+        .or_else(|| params["conversationId"].as_str())?;
+    let item = params["itemId"]
+        .as_str()
+        .or_else(|| params["callId"].as_str())?;
+    let turn = params["turnId"].as_str().unwrap_or_default();
+    let approval = params["approvalId"].as_str().unwrap_or_default();
+    Some(hex32(&[method, thread, turn, item, approval]))
+}
+
 /// A bot's question about an event: one per event wherever it is raised.
 pub fn question_id(node: &str, event_id: &str) -> String {
     format!("q-{}", hex32(&[node, event_id]))

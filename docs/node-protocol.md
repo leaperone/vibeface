@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=3`，数据库 `user_version=3`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=4`，数据库 `user_version=4`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -71,8 +71,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":3}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=3` |
+| `data-epoch.json` | `{"data_epoch":4}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=4` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -242,7 +242,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 Node 接纳工作时核对派发方是成员 Node 且处于进行中的调度轮次，并核对 `cwd` 位于自己的 `roots` 内。本机工作（`kind=codex`）：`track_work` 写 `WorkDispatched` 并返回 `{work_id, call_ref, state, may_send, send_by_ms, cwd, thread_id?}`，只有第一次登记 `may_send=true`；CLI 用 `thread/start`（`approvalPolicy=never`、`danger-full-access`）开线程，`bind_work {work_id, thread_id}` 绑定后才发 `turn/start`，`clientUserMessageId` 为 `work_id`，再 `bind_work {work_id, turn_id | unknown | failed}`。`send_by_ms` 为登记后 60 秒，之后不再发送；再过 30 秒仍没有回合时 Node 按 `clientId` 复查线程，找不到就记为 `rejected`。`target_node` 是其他设备时，任务（`kind=task`）作为那台设备协调 Agent 的一轮执行，由它在本机直连派发。`continues` 在原工作的 thread 上开新 turn，原目标不可达时报错，不改派。`thread` 是本机已有的 App Server 线程（`vibeface codex send`）：CLI 先 `thread/read` 取 `cwd`，Node 登记时即为 `starting`，不核对 `roots`，与 `continues` 互斥；发送时回合进行中则 `turn/steer`，否则 `turn/start`。几项工作可共用一个回合，各自结束并各自回报。
 
-Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --question … --choice <标签>` 在负责该会话的 Bot 聊天里提问，提问挂住请求直到有回答，回答后 Bot 有 120 秒用 `vibeface codex respond … --node <设备>` 应答。不属于任何 Bot 的会话先归给主 Bot 再按归属处理；没有 Bot、不属于线程或后台线程（`codex exec`、子代理）上的请求立即兜底。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。
+Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线程的请求由 Node 挂起并交给协调 Agent：Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答，需要本人时用 `vibeface triage raise --request-id … --question … --choice <标签>` 在负责该会话的 Bot 聊天里提问，提问挂住请求直到有回答，回答后 Bot 有 120 秒用 `vibeface codex respond … --node <设备>` 应答。不属于任何 Bot 的会话先归给主 Bot 再按归属处理；没有 Bot、不属于线程或后台线程（`codex exec`、子代理）上的请求立即兜底。没有协调 Agent 或 120 秒内无人处理时按方法拒绝并记录（见 `docs/codex-app-server.md`）。其他客户端的请求留给原客户端。Node 不自动重试写请求。请求 ID 由方法、线程、回合、`itemId` 或 `callId` 及 `approvalId` 的哈希确定，缺少这些字段时随机生成。重连后同一请求再次到达时沿用原有提问或 Agent 事件，只改用新连接的 JSON-RPC ID，不会再提问一次。连接后 App Server 读完 Node 订阅的线程，本设备提过问、仍未回答但请求未再到达的提问由本设备写 `question_closed` 关闭；之后同一请求再到达时按方法兜底。
 
 工作状态为 `accepted`、`starting`、`running`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
@@ -279,6 +279,7 @@ Event {
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
 | `question_asked` | `question_id`、`severity`、`text`、`choices: [{label}]`、`about {node, agent, session_id, cwd, summary, request_id?}` | 提问的 Node；写在拥有该会话的 Bot 会话 |
+| `question_closed` | `question_id`、`reason`（`request_lost`） | 提问且挂着该请求的 Node，写在提问所在会话；其他作者的关闭不计入。已有回答时回答为准，与到达顺序无关；关闭后回答被拒绝 |
 | `session_attributed` | `node`、`agent`、`session_id`、`cwd`、`summary` | 运行该会话的 Node，写在接手 Bot 的会话；rank 最大者为准 |
 | `session_muted` | `node`、`session_id` | 运行该会话的 Node，写在当前接手 Bot 的会话：不再关注，新的 `session_attributed` 撤销 |
 | `bot_changed` | `change_id`、`cause`、`change` | 负责人 |

@@ -584,6 +584,16 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 );
             }
         }
+        EventBody::QuestionClosed {
+            question_id: question,
+            ..
+        } => {
+            question_id(question)?;
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a question is closed in its conversation"
+            );
+        }
         EventBody::SessionAttributed {
             node,
             agent,

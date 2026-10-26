@@ -1,4 +1,5 @@
 import { withDeliveries } from "./model.ts"
+import { questionOpen } from "./questions.ts"
 import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
 
 const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
@@ -23,9 +24,9 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   }
 }
 
-/** The network's unanswered questions, with this conversation's replaced by what it holds now. */
+/** The network's open questions, with this conversation's replaced by what it holds now. */
 export function mergeQuestions(questions: Question[], records: ConversationRecords): Question[] {
-  return [...questions.filter((item) => item.conversation_id !== records.conversation_id), ...records.questions.filter((item) => !item.answer)]
+  return [...questions.filter((item) => item.conversation_id !== records.conversation_id), ...records.questions.filter(questionOpen)]
 }
 
 export function mergeNotifications(notifications: NotificationRecord[], records: ConversationRecords): NotificationRecord[] {

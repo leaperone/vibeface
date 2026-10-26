@@ -28,7 +28,7 @@ test("questions parse from the list and the chat snapshot, and fail closed on sh
   assert.equal(chat.questions[0].answer?.text, "继续", "answered questions stay in the chat")
   assert.equal(chat.sessions[0].muted, true)
   assert.equal(chat.messages[0].answers, "q2")
-  for (const bad of [{ severity: "loud" }, { about: null }, { answer: { text: "继续" } }, { choices: [{}] }, { conversation_id: 1 }, { conversation_id: null }])
+  for (const bad of [{ severity: "loud" }, { about: null }, { answer: { text: "继续" } }, { choices: [{}] }, { conversation_id: 1 }, { conversation_id: null }, { closed: "gone" }])
     assert.throws(() => parseQuestions({ questions: [row("q", 1, bad)] }), Error, JSON.stringify(bad))
   assert.throws(() => parseConversation(snapshot({ sessions: [{ node: "worker" }] })))
 })
@@ -50,8 +50,10 @@ test("an answer is signed as one message per question", () => {
   assert.deepEqual(answerBody("q1", "继续"), { type: "message_posted", message_id: "a-q1", role: "user", text: "继续", report_results: true, answers: "q1" })
 })
 
-test("待处理 lists exactly the unanswered questions, urgent first, then newest first", () => {
-  const questions = parseQuestions({ questions: [row("old", 1), row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("new", 2), row("urgent", 0, { severity: "urgent" })] })
+test("待处理 lists exactly the open questions, urgent first, then newest first", () => {
+  const questions = parseQuestions({ questions: [row("old", 1), row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("new", 2), row("urgent", 0, { severity: "urgent" }),
+    row("lost", 5, { about: { ...about, request_id: "r" }, closed: "request_lost" })] })
+  assert.equal(questions[4].closed, "request_lost")
   assert.deepEqual(openQuestions(questions).map((question) => question.question_id), ["urgent", "new", "old"])
 })
 
