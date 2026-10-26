@@ -95,8 +95,8 @@ export function TriageSettings() {
         <div className="flex min-w-0 gap-2">
           <Input aria-label={`${chat}密钥`} type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : `${chat}密钥`} value={secret} onChange={(event) => setSecret(event.target.value)} />
           {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
-            <Button type="button" variant="ghost" onClick={() => setConfirming("")}>取消</Button>
-            <Button type="button" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
+            <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
+            <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
           </> : <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => setConfirming("secret")}><Trash2 aria-hidden="true" /></Button>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -128,7 +128,7 @@ export function TriageSettings() {
           <span className="min-w-0 flex-1 truncate text-meta">{item.label || "未命名"}</span>
           <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
           {confirming === item.token_id ? <>
-            <Button type="button" size="sm" variant="ghost" onClick={() => setConfirming("")}>取消</Button>
+            <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
             <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void call("revoke", "revoke_decision_token", { token_id: item.token_id }) }}>撤销</Button>
           </> : <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>}
         </li>)}</ul> : null}

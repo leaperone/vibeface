@@ -348,10 +348,10 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
               <div className="flex min-h-8 min-w-0 items-center gap-2">
                 <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
                 <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
-                {deleting === row.name ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
+                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
                   data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
                 {!row.set ? null : deleting === row.name ? <>
-                  <Button type="button" size="sm" variant="ghost" onClick={() => setDeleting(null)}>取消</Button>
+                  <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
                   <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
                 </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
                   onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}

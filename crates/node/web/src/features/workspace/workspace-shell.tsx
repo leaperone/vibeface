@@ -244,7 +244,7 @@ export function ConnectionCapsule() {
         <p className="break-all text-muted-foreground" title={address}>{hostOf(address) || address}</p>
         {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
-          : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><terms.encrypted.icon aria-hidden="true" className="size-4" />{terms.encrypted.label}，只有你的设备能看</p> : null}
+          : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><terms.encrypted.icon aria-hidden="true" className="size-4" />{terms.encrypted.label}，设备已验证</p> : null}
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}
         {others.length ? <>
           <p className="mt-1 font-medium">换一台设备</p>

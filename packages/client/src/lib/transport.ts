@@ -124,7 +124,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys) {
 
   function initClient({ replaceLostKey = false } = {}): Promise<{ deviceId: string }> {
     initializing ??= keys.load({ replaceLostKey }).then(loaded => {
-      if (!devicePattern.test(loaded.deviceId)) throw new Error('设备密钥损坏。请重新加入。')
+      if (!devicePattern.test(loaded.deviceId)) throw new Error('这台设备保存的登录信息坏了。请重新加入。')
       device = { deviceId: loaded.deviceId }
       return { deviceId: loaded.deviceId }
     }).catch(error => { initializing = null; throw error })
