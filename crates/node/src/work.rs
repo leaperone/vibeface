@@ -51,8 +51,10 @@ pub enum DispatchState {
     Rejected { reason: String },
 }
 
-/// A stop request for another Node's work that has not reached it yet. It is retried until the
-/// target confirms, the work ends, or `deadline_ms` passes.
+/// A stop the user asked for, stored before anything is sent. For another Node's work it is
+/// delivered until that Node takes it or the work ends; for this Node's own work it is kept and
+/// retried until the work ends. `timed_out` only shows that `deadline_ms` passed unconfirmed; it
+/// never ends the retries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StopRequest {
     pub work_id: String,

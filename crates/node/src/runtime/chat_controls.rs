@@ -305,8 +305,8 @@ fn without_work_checks(checks: Vec<PendingCheck>, works: &[WorkProjection]) -> V
         .collect()
 }
 
-/// Requests this device still carries to another one; the DAG learns of them only once the
-/// target answers.
+/// Requests this device still carries: dispatches the DAG learns of only once the target
+/// answers, and stops not yet confirmed.
 fn deliveries(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<Vec<Value>> {
     let mut deliveries = Vec::new();
     for dispatch in store.dispatches()? {
