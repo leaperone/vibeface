@@ -306,6 +306,7 @@ async fn bounded_run(
         let writer = async {
             stdin.write_all(input).await?;
             stdin.shutdown().await?;
+            drop(stdin);
             Ok::<_, anyhow::Error>(())
         };
         let reader = async {
