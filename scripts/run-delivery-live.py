@@ -542,7 +542,7 @@ def command(label, arguments, log, **kwargs):
 
 def failed_acceptance_diagnostic(run, log):
     reports, files = [], [log, run / "deployment.log"]
-    kinds = ("AssertionError", "RuntimeError", "TimeoutError", "OSError", "PermissionError", "FileNotFoundError", "CalledProcessError")
+    kinds = ("AssertionError", "RuntimeError", "TimeoutError", "TypeError", "ValueError", "OSError", "PermissionError", "FileNotFoundError", "CalledProcessError")
     for mode in ("charity", "paid"):
         directories = list((run / "process").glob("delivery-" + mode + "-*"))
         if len(directories) > 1:
@@ -559,13 +559,26 @@ def failed_acceptance_diagnostic(run, log):
                     "summarySha256": digest(file)})
             files.extend(directory / name / "process.log" for name in ("S", "R", "P", "X"))
             files.append(directory / "register-before-crash.log")
-    samples = []
+    samples, task_lines = {}, b""
     for file in files:
         if file.is_file() and not file.is_symlink():
             with file.open("rb") as stream:
-                stream.seek(max(0, file.stat().st_size - 65536))
-                samples.append(stream.read(65536))
-    data = b"\n".join(samples)
+                offset = max(0, file.stat().st_size - 65536)
+                stream.seek(offset)
+                samples[file] = stream.read(65536)
+                if file == log:
+                    task_lines = samples[file]
+                    if offset:
+                        stream.seek(offset - 1)
+                        if stream.read(1) != b"\n":
+                            task_lines = task_lines.partition(b"\n")[2]
+    data = b"\n".join(samples.values())
+    entries = re.findall(rb'(?:^|\n)FAIL ([A-Za-z][A-Za-z0-9_]{0,63}): ([^\r\n]*)', task_lines)
+    entry_failure = None
+    if entries:
+        kind, message = entries[-1]
+        name = kind.decode("ascii")
+        entry_failure = {"type": name if name in kinds else "other", "messageSha256": hashlib.sha256(message).hexdigest()}
     patterns = {"thread-or-process-limit": rb"Resource temporarily unavailable|can't start new thread|pthread_create|ThreadPoolBuildError|os error 11",
                 "memory-allocation": rb"out of memory|memory allocation of [0-9]+ bytes failed|AllocError",
                 "missing-file": rb"No such file or directory|ENOENT", "permission-denied": rb"Permission denied|EACCES",
@@ -573,6 +586,7 @@ def failed_acceptance_diagnostic(run, log):
                 "node-exited": rb"Node exited [0-9-]+", "rust-panic": rb"panicked at"}
     lines = [int(value) for value in re.findall(rb'File "/work/scripts/verify-node\.py", line ([0-9]{1,5}),', data)]
     return {"reports": reports, "verifyNodeLines": list(dict.fromkeys(lines))[-8:],
+            "entryFailure": entry_failure,
             "sampledLogMarkers": [name for name, pattern in patterns.items() if re.search(pattern, data, re.I)],
             "privateTaskLogSha256": digest(log)}
 
@@ -1527,6 +1541,31 @@ def self_test_ui(directory):
         with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "private-wallet-marker"}), patch("runpy.run_path") as loader:
             driver["delivery_progress"](options)("first-proof-starting")
             loader.assert_not_called()
+    profile = json.loads((ROOT / "proofs/delivery/profile.json").read_bytes())
+    chain = {"rpc_url": "http://127.0.0.1:12345", "chain_id": 31337, "confirmations": 2, "profile": profile,
+             "escrow": "0x" + "1" * 40, "asset": "0x" + "2" * 40}
+    configuration = {"prover": {"program": "/prover", "r0vm": "/r0vm", "cgroup": "/sys/fs/cgroup", "profile": profile},
+                     **{key: "1" for key in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei")}}
+    options = argparse.Namespace(delivery_ui_control=None, delivery_profile=ROOT / "proofs/delivery/profile.json")
+    stop_before_nodes = RuntimeError("self-test stops at the existing free-network gate")
+    checkpoint = Mock(side_effect=stop_before_nodes)
+    with patch.dict(driver["delivery_paid_run"].__globals__, {"delivery_charity_acceptance": checkpoint}):
+        for url in ("http://127.0.0.1:12345", "http://[::1]:12345"):
+            try:
+                driver["delivery_paid_run"](options, configuration, {**chain, "rpc_url": url})
+            except RuntimeError as error:
+                assert error is stop_before_nodes
+            else:
+                raise AssertionError("Valid loopback RPC must reach the existing free-network gate")
+        for url in ("https://127.0.0.1:12345", "http://203.0.113.1:12345", "http://user:pass@127.0.0.1:12345", "http://127.0.0.1:12345/other"):
+            checkpoint.reset_mock()
+            try:
+                driver["delivery_paid_run"](options, configuration, {**chain, "rpc_url": url})
+            except AssertionError as error:
+                assert str(error) == "paid acceptance RPC is a literal loopback HTTP origin"
+            else:
+                raise AssertionError("A non-loopback origin must not reach the free-network gate")
+            checkpoint.assert_not_called()
     def checked_android_homes(*args, env, **kwargs):
         for variable, name in (("ANDROID_USER_HOME", "android-user"), ("ANDROID_EMULATOR_HOME", "android-emulator"), ("ANDROID_AVD_HOME", "avd")):
             home = Path(env[variable])
@@ -2124,7 +2163,7 @@ def self_test():
         node = diagnostic / "process/delivery-paid-fixture/S"
         node.mkdir(parents=True)
         failure_log = diagnostic / "private-task.log"
-        failure_log.write_text('File "/work/scripts/verify-node.py", line 6105, in genuine_prover_started\nprivate-wallet-marker\n')
+        failure_log.write_text('File "/work/scripts/verify-node.py", line 6105, in genuine_prover_started\nprivate-wallet-marker\nFAIL TypeError: private-entry-marker\n')
         (node / "process.log").write_text("private-witness-marker: Resource temporarily unavailable (os error 11)\n")
         failed = {"status": "failed", "failure": {"type": "RuntimeError", "message": "private-error-marker"},
                   "cases": {"private-case-name": {"witness": "private-case-marker"}}}
@@ -2133,10 +2172,21 @@ def self_test():
         assert actual["verifyNodeLines"] == [6105] and actual["sampledLogMarkers"] == ["thread-or-process-limit"]
         assert actual["reports"][0]["completedCases"] == 1 and actual["reports"][0]["failureType"] == "RuntimeError"
         assert actual["reports"][0]["failureMessageSha256"] == hashlib.sha256(b"private-error-marker").hexdigest()
-        assert "private-" not in json.dumps(actual) and set(actual) == {"reports", "verifyNodeLines", "sampledLogMarkers", "privateTaskLogSha256"}
+        assert actual["entryFailure"] == {"type": "TypeError", "messageSha256": hashlib.sha256(b"private-entry-marker").hexdigest()}
+        assert "private-" not in json.dumps(actual) and set(actual) == {"reports", "verifyNodeLines", "sampledLogMarkers", "privateTaskLogSha256", "entryFailure"}
         failed["failure"]["type"] = "private-unknown-type"
         (node.parent / "summary.json").write_text(json.dumps(failed))
         assert failed_acceptance_diagnostic(diagnostic, failure_log)["reports"][0]["failureType"] == "other"
+        failure_log.write_text("FAIL PrivateWalletError: private-entry-marker\n")
+        hidden = failed_acceptance_diagnostic(diagnostic, failure_log)
+        assert hidden["entryFailure"]["type"] == "other" and "PrivateWalletError" not in json.dumps(hidden)
+        failure_log.write_text("prefix FAIL TypeError: private-entry-marker\n")
+        assert failed_acceptance_diagnostic(diagnostic, failure_log)["entryFailure"] is None
+        line = b"FAIL TypeError: private-entry-marker\n"
+        failure_log.write_bytes(b"x" + line + b"z" * (65536 - len(line)))
+        assert failed_acceptance_diagnostic(diagnostic, failure_log)["entryFailure"] is None
+        failure_log.write_bytes(b"\n" + line + b"z" * (65536 - len(line)))
+        assert failed_acceptance_diagnostic(diagnostic, failure_log)["entryFailure"] == actual["entryFailure"]
         file = Path(directory) / "private.json"
         write_private(file, {"configured": True})
         assert file.stat().st_mode & 0o777 == 0o600 and json.loads(regular(file)) == {"configured": True}

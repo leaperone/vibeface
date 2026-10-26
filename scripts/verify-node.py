@@ -5119,7 +5119,7 @@ def delivery_paid_run(options, configuration, deployment):
     require(chain["chain_id"] == 31337 and chain["confirmations"] == 2 and chain["profile"] == profile,
             "paid acceptance uses the exact local deployment, product profile and two confirmations")
     url = urllib.parse.urlsplit(chain["rpc_url"])
-    require(url.scheme == "http" and url.hostname and ipaddress.ip_address(url.hostname).is_loopback()
+    require(url.scheme == "http" and url.hostname and ipaddress.ip_address(url.hostname).is_loopback
             and url.port and not url.username and not url.password and url.path in ("", "/")
             and not url.query and not url.fragment, "paid acceptance RPC is a literal loopback HTTP origin")
     for name in ("escrow", "asset"):
