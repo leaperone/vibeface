@@ -125,16 +125,14 @@ export function TriageSettings() {
           <Button type="button" variant="ghost" size="icon" aria-label="复制授权码" title="只显示这一次" onClick={() => void navigator.clipboard?.writeText(token).then(() => toast("已复制", { tone: "success" }))}><Copy aria-hidden="true" /></Button>
           <Button type="button" variant="ghost" size="icon" aria-label="收起" title="收起" onClick={() => setToken("")}><X aria-hidden="true" /></Button>
         </div> : null}
-        {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+        {settings.decision_tokens.length ? <ul className="grid gap-1">{settings.decision_tokens.map((item) => <li key={item.token_id} className="flex min-h-9 min-w-0 flex-wrap items-center gap-x-2 rounded-lg bg-muted/60 ps-3">
+          {confirming === item.token_id ? <span className="order-first basis-full pt-2 text-meta text-foreground">撤销后它不能再代你回答</span> : null}
           <span className="min-w-0 flex-1 truncate text-meta">{item.label || "未命名"}</span>
+          <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
           {confirming === item.token_id ? <>
-            <span className="shrink-0 text-meta text-foreground">撤销后它不能再代你回答</span>
             <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
             <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void call("revoke", "revoke_decision_token", { token_id: item.token_id }) }}>撤销</Button>
-          </> : <>
-            <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{new Date(item.created_ms).toLocaleDateString('zh-CN', { dateStyle: 'long' })}</span>
-            <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>
-          </>}
+          </> : <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => setConfirming(item.token_id)}><Trash2 aria-hidden="true" /></Button>}
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
           <Input aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />

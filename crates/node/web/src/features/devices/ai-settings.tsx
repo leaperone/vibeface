@@ -345,10 +345,10 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
           {env.length ? <ul className="grid gap-1">{env.map((row) => {
             const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
             return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
-              <div className="flex min-h-8 min-w-0 items-center gap-2">
+              <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
+                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
                 <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
-                {deleting === row.name && row.set ? <span className="shrink-0 text-meta text-foreground">删除后 Bot 用不到它</span>
-                  : <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>}
+                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
                 {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
                   data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
                 {!row.set ? null : deleting === row.name ? <>
