@@ -405,7 +405,7 @@ JSON
   cp "$fixture/supported-build" "$fixture/source/$package/BUILD-INFO.json"
   repack_fixture
   local unsupported_epoch
-  for unsupported_epoch in 0 2 4; do
+  for unsupported_epoch in 0 3 5; do
     case_dir="$test_dir/data-epoch-$unsupported_epoch"
     mkdir "$case_dir"
     sed "s/\"data_epoch\":4/\"data_epoch\":$unsupported_epoch/" "$fixture/supported-build" > "$fixture/unsupported-build"
