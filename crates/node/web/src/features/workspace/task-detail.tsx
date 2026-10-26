@@ -1,14 +1,15 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, CircleStop, Laptop, Link2, ListChecks, RotateCw, Server, X } from "lucide-react"
-import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
+import { ChevronLeft, CircleQuestionMark, CircleStop, Laptop, Link2, ListChecks, RotateCw, Server, X } from "lucide-react"
+import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { rawError, taskError } from "@vibeface/client/lib/errors.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { confirmReason } from "@vibeface/client/workspace/model.ts"
+import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { confirmText } from "./task-activity"
+import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
 
@@ -58,6 +59,9 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const shown = work ? shownState(work, workspace.nodes) : ""
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
+  // Its device cannot say whether it finished, so the person settles it here; nothing is re-run.
+  const check = work && state === "awaiting_confirmation" ? workChecks([{ ...work, conversation_id: workspace.data?.conversation?.conversation_id ?? "" }], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
+  const settle = (choice: "completed" | "interrupted") => async () => { if (!check) return; await workspace.resolveCheck(check, choice, ""); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = work?.target_node ?? ""
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   // Any entry forwards the stop; an unreachable device gets it when it is back.
@@ -98,8 +102,15 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}
-      {result && !taskActive(state) ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{work.failure_reason && !work.result_text ? "原因" : "结果"}</h3>{work.result_text ? <Markdown text={result} /> : <p className="whitespace-pre-wrap break-words">{result}</p>}</section> : null}
-      {state === "awaiting_confirmation" ? <p className="text-meta text-muted-foreground">{confirmText({ reason: confirmReason(work, workspace.nodes) ?? "unverified", detail: work.failure_reason ?? "" }, nodeName(device, lookup))}到对话或待处理里确认它做完没有。</p> : null}
+      {result && !taskActive(state) && !check ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">{work.failure_reason && !work.result_text ? "原因" : "结果"}</h3>{work.result_text ? <Markdown text={result} /> : <p className="whitespace-pre-wrap break-words">{result}</p>}</section> : null}
+      {check ? <section className="grid gap-3 rounded-xl border border-warning-border bg-warning-soft p-3">
+        <h3 className="flex items-center gap-2 font-medium"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0 text-warning" />还不知道做完没有</h3>
+        <p className="text-meta text-muted-foreground">{confirmText(check, nodeName(device, lookup))}</p>
+        <div className="flex flex-wrap justify-end gap-2">
+          <ActionButton disabled={!workspace.writable} action={settle("interrupted")}>没做完</ActionButton>
+          <ActionButton variant="default" disabled={!workspace.writable} action={settle("completed")}>做完了</ActionButton>
+        </div>
+      </section> : null}
       {sharing.length && stop ? <section className="grid gap-1"><h3 className="text-meta font-medium text-muted-foreground">会一起停止</h3>
         <ul className="grid gap-1">{sharing.map((item) => <li key={item.work_id} className="flex min-w-0 items-center gap-2"><Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /><span className="truncate">{item.title || "任务"}</span></li>)}</ul></section> : null}
       {asking ? <QuestionCard question={asking} inTask /> : null}
@@ -120,7 +131,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </div> : null}
       <Details>
         {work.prompt ? <DetailRow label="交代的事" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} /> : null}
-        {work.failure_reason && rawError(work.failure_reason) ? <DetailRow label="原始错误" value={<span className="break-words">{work.failure_reason}</span>} /> : null}
+        {work.failure_reason && (check || rawError(work.failure_reason)) ? <DetailRow label="原始错误" value={<span className="break-words">{work.failure_reason}</span>} /> : null}
         <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         {device ? <DetailRow label="设备编号" value={device} mono /> : null}

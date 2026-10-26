@@ -177,7 +177,7 @@ export function RecoveryWaiting() {
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
-  return <Panel icon={Hourglass} title="等待生效">
+  return <Panel icon={Hourglass} title="找回等待生效">
     {at === null ? null : <>
       <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{at > Date.now() ? `剩余 ${hoursUntil(at)} 小时` : '马上生效'}</p>
       <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>生效后自动进入</p>
