@@ -4,7 +4,7 @@ import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
 import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { humanError, rawError } from '@vibeface/client/lib/errors.ts'
+import { humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }
@@ -132,4 +132,12 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')
   assert.equal(rawError(new Error('已断开')), '')
+})
+
+test('a spent join link reads the same, and clears the field the same, whether the Node or the page says so', () => {
+  for (const raw of ['ticket has already been used', 'ticket is unknown or already expired', 'ticket has expired', spentInviteText]) {
+    assert.ok(spentInvite.test(raw), raw)
+    assert.equal(humanError(raw), spentInviteText)
+  }
+  assert.equal(spentInvite.test('这次加入被拒绝了。要再试，请在已有设备上重新添加。'), false)
 })

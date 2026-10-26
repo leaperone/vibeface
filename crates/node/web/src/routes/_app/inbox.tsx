@@ -1,7 +1,8 @@
 import { useLayoutEffect, useRef } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { ChevronRight, Inbox } from 'lucide-react'
+import { ChevronRight, Inbox, MessageCircle } from 'lucide-react'
 import { claimFocus, EmptyState } from '@/components/app/kit'
+import { Button } from '@/components/ui/button'
 import { useInbox } from '@/features/workspace/inbox'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { JoinCard } from '@/features/devices/join'
@@ -25,7 +26,7 @@ function InboxPage() {
     const next = cards?.length ? cards[Math.min(last.index, cards.length - 1)] : document.getElementById('main')?.querySelector('h1')
     if (next instanceof HTMLElement) claimFocus(next)
   }, [keys])
-  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" />
+  if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" action={<Button asChild variant="outline"><Link to="/"><MessageCircle aria-hidden="true" />回到消息</Link></Button>} />
   return <ul ref={list} className="mx-auto grid w-full max-w-(--page-width) gap-3" onFocus={(event) => {
     const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))
     if (items[index]) held.current = { key: items[index].key, index }

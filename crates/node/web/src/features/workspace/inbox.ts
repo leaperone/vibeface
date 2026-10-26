@@ -48,6 +48,8 @@ export function useInbox(): InboxItem[] {
   }
   const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
   const setupDevice = unready?.device_id ?? device.ready?.entry.device_id
-  if (workspace.nodes.length && !workspace.nodes.some((node) => botReadiness(node) === "ready")) items.push({ key: "setup", icon: Sparkles, title: unready ? "运行 Bot 的设备需设置" : "设置运行 Bot 的设备", to: setupDevice ? `/devices/${setupDevice}` : "/devices", kind: "setup" })
+  // Only an admin, or this computer's own page, may set one up; elsewhere the card would lead nowhere.
+  const canSetUp = device.ready?.principal.can_manage === true || device.ready?.principal.source === "local_session"
+  if (canSetUp && workspace.nodes.length && !workspace.nodes.some((node) => botReadiness(node) === "ready")) items.push({ key: "setup", icon: Sparkles, title: unready ? "运行 Bot 的设备需设置" : "设置运行 Bot 的设备", to: setupDevice ? `/devices/${setupDevice}` : "/devices", kind: "setup" })
   return items
 }

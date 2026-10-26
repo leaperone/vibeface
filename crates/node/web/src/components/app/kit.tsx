@@ -1,10 +1,11 @@
 "use client"
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { Bot, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { rawError } from "@vibeface/client/lib/errors.ts"
 
@@ -272,6 +273,15 @@ function LongId({ value }: { value: string }) {
 
 export function DetailRow({ label, value, mono = false }: { label: string; value: ReactNode; mono?: boolean }) {
   return <div className="grid gap-0.5"><span>{label}</span>{typeof value === "string" && /^[0-9a-f]{20,}$/.test(value) ? <LongId value={value} /> : <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>}</div>
+}
+
+/** A password field with an eye button that shows what was typed. */
+export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeof Input>, "type">) {
+  const [shown, setShown] = useState(false)
+  return <span className="relative">
+    <Input {...props} type={shown ? "text" : "password"} className={cn("pe-9 max-md:pe-11", className)} />
+    <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={shown ? "隐藏密码" : "显示密码"} aria-pressed={shown} onClick={() => setShown(!shown)}>{shown ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+  </span>
 }
 
 /** File input with a Chinese button; the native control's label follows the browser language. */
