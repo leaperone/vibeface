@@ -201,22 +201,26 @@ fn queued(connection: &Connection) -> Result<Vec<AgentEvent>> {
 
 /// The bot that owns this device's session. A thread this device's work bound counts at
 /// once: the App Server can ask before the turn's start is recorded. A bot's own reply thread
-/// belongs to its conversation.
+/// belongs to its conversation. A deleted bot owns neither, so they go to the primary bot.
 fn owner(store: &crate::store::Store, network: &str, event: &AgentEvent) -> Result<Option<String>> {
     if let Some(owner) = store.session_owner(network, &event.node, &event.session_id)? {
         return Ok(Some(owner));
     }
-    if let Some(conversation) = store.native_thread_conversation(&event.session_id)? {
-        return Ok(Some(conversation));
-    }
-    Ok(store
-        .connection
-        .query_row(
-            "SELECT conversation_id FROM work_runs WHERE thread_id=? ORDER BY work_id LIMIT 1",
-            [&event.session_id],
-            |r| r.get(0),
-        )
-        .optional()?)
+    let bound = match store.native_thread_conversation(&event.session_id)? {
+        Some(conversation) => Some(conversation),
+        None => store
+            .connection
+            .query_row(
+                "SELECT conversation_id FROM work_runs WHERE thread_id=? ORDER BY work_id LIMIT 1",
+                [&event.session_id],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+    Ok(match bound {
+        Some(conversation) if !store.bot_deleted(network, &conversation)? => Some(conversation),
+        _ => None,
+    })
 }
 
 /// A turn this device's coordination Agent or a bot's reply runs: it answers in its own chat,
@@ -2166,6 +2170,55 @@ mod tests {
                 "with the primary bot deleted, its sessions go to the earliest bot left"
             );
             assert_eq!(attributions(&node, "e").await?, 2);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_deleted_bots_work_thread_goes_to_the_primary_bot() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let spec = crate::work::WorkSpec {
+                work_id: "w-d".into(),
+                conversation: "d".into(),
+                trigger: "message:m1".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "r".into(),
+                kind: crate::model::WorkKind::Codex,
+                cwd: "/w".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some("wt".into()),
+            };
+            node.store
+                .lock()
+                .await
+                .accept_work(&node.identity, &network, spec, now_ms())?;
+            let queued = node.ingest_agent_event(turn("wt", "t1", "/w")).await?;
+            assert_eq!(queued["status"], "accepted");
+            assert_eq!(attributions(&node, "d").await?, 0, "a work's thread is its bot's at once");
+            delete_bot(&node, &admin, "d").await?;
+
+            let raise = json!({"action":"raise","event_id":queued["event_id"],"severity":"attention","question":"测试失败，要修吗？"});
+            assert_eq!(
+                node.triage_command(raise).await?["conversation_id"], "c",
+                "a deleted bot's work thread asks in the primary bot's chat"
+            );
+            let next = node.ingest_agent_event(turn("wt", "t2", "/w")).await?;
+            assert_eq!(next["status"], "accepted");
+            assert_eq!(owner_of(&node, "wt").await?.as_deref(), Some("c"));
+            assert_eq!(attributions(&node, "c").await?, 1, "the thread goes to the primary bot once");
             Ok::<_, anyhow::Error>(())
         }
         .await;

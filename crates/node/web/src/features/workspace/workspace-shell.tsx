@@ -6,7 +6,7 @@ import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, S
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
-import { BotAvatar, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { BotAvatar, claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -24,7 +24,8 @@ import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { LocalSession } from "./local-session"
 
-export function WorkspaceShell({ children }: { children: ReactNode }) {
+/** `landing`: the title takes the focus when the shell replaces the page the person was on. */
+export function WorkspaceShell({ children, landing = false }: { children: ReactNode; landing?: boolean }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
   useEffect(() => {
     const wide = window.matchMedia("(min-width: 1024px)")
@@ -32,7 +33,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     wide.addEventListener("change", follow)
     return () => wide.removeEventListener("change", follow)
   }, [])
-  return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout>{children}</WorkspaceLayout></SidebarProvider>
+  return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout landing={landing}>{children}</WorkspaceLayout></SidebarProvider>
 }
 
 const CreateBot = createContext<() => void>(() => {})
@@ -42,7 +43,7 @@ export const useCreateBot = () => useContext(CreateBot)
 const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志" }
 
-function WorkspaceLayout({ children }: { children: ReactNode }) {
+function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
   const device = useDevice()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
@@ -152,7 +153,7 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {chatRoute ? <BotPanelButton /> : null}
-              <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className="min-w-0 truncate text-heading font-semibold outline-none" title={title}>{title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
