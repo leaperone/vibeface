@@ -5,6 +5,7 @@ import { Link, useNavigate } from "@tanstack/react-router"
 import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BotAvatar, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { terms } from "@/lib/glossary"
+import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -35,21 +36,12 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const settled = settledAnswer(standing, workspace.answered[id])
   // The first line asks; lines after it list what the answer applies to.
   const [ask = question.text, ...lines] = question.text.split(/\r?\n/).filter((line) => line.trim())
-  if (settled) return <p ref={answering.current ? claimFocus : undefined} tabIndex={-1} role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 outline-none flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
-    {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
-    <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{ask}</span>
-      <span className="min-w-0 flex-1 text-foreground [overflow-wrap:anywhere]">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
-    </span>
-  </p>
+  if (settled) return <Settled ask={ask} lines={lines} focus={answering.current} role={standing === undefined || settled.elsewhere ? "status" : undefined}
+    mark={settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+    <span className="text-foreground">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+  </Settled>
 
-  if (question.closed) return <p className="-mx-2 flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
-    <CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-    <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={question.text}>{ask}</span>
-      <span className="min-w-0 flex-1">已失效</span>
-    </span>
-  </p>
+  if (question.closed) return <Settled ask={ask} lines={lines} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)
   const { tone, label, icon: severityIcon } = looks[question.severity]
@@ -77,12 +69,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     tone={tone}
     title={<>{label ? <span className="sr-only">{label}：</span> : null}<span className="[overflow-wrap:anywhere]">{ask}</span></>}
   >
-    {lines.length ? <ul className="grid gap-1">{lines.map((line, index) => {
-      const colon = line.indexOf("：")
-      return <li key={index} className="flex min-w-0 flex-wrap gap-x-2 [overflow-wrap:anywhere]">
-        {colon > 0 ? <><span className="text-muted-foreground">{line.slice(0, colon)}</span><span className="min-w-0 font-medium">{line.slice(colon + 1)}</span></> : <span className="font-medium">{line}</span>}
-      </li>
-    })}</ul> : null}
+    <Lines lines={lines} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
       {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} search={inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
@@ -129,6 +116,36 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
     </div>}
     <InlineError error={pending ? null : action.error} />
   </ActionCard>
+}
+
+/** What an answer applies to, one line each: a label before "：" and its value. */
+function Lines({ lines, className }: { lines: string[]; className?: string }) {
+  if (!lines.length) return null
+  return <ul className={cn("grid gap-1", className)}>{lines.map((line, index) => {
+    const colon = line.indexOf("：")
+    return <li key={index} className="flex min-w-0 flex-wrap gap-x-2 [overflow-wrap:anywhere]">
+      {colon > 0 ? <><span className="text-muted-foreground">{line.slice(0, colon)}</span><span className="min-w-0 font-medium text-foreground">{line.slice(colon + 1)}</span></> : <span className="font-medium text-foreground">{line}</span>}
+    </li>
+  })}</ul>
+}
+
+/**
+ * An answered or closed question as one line. With lines of detail, tapping the line opens them, so a phone without hover still sees what
+ * the answer applied to. `focus`: answered here, the line takes the focus. `role`: "status" to announce it when it appears.
+ */
+function Settled({ ask, lines, mark, focus = false, role, children }: { ask: string; lines: string[]; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
+  const line = <span role={role} className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
+    <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0">{ask}</span>
+    <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{children}</span>
+  </span>
+  const settled = "flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 outline-none"
+  if (!lines.length) return <p ref={focus ? claimFocus : undefined} tabIndex={-1} className={cn("-mx-2 text-meta text-muted-foreground", settled)}>{mark}{line}</p>
+  return <details className="group -mx-2 text-meta text-muted-foreground">
+    <summary ref={focus ? claimFocus : undefined} className={cn(settled, "cursor-pointer list-none rounded-md hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden")}>
+      {mark}{line}<ChevronRight aria-hidden="true" className="mt-0.5 size-4 shrink-0 transition-transform duration-150 group-open:rotate-90" />
+    </summary>
+    <Lines lines={lines} className="ps-8 pe-2 pb-2" />
+  </details>
 }
 
 const row = "flex min-h-12 w-full min-w-0 items-center gap-3 rounded-lg border bg-card px-3 py-2 text-start font-medium transition-colors outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-muted disabled:pointer-events-none disabled:opacity-50"

@@ -32,6 +32,7 @@ mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
+pub(crate) use settings::SETTINGS_AGENT;
 pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {

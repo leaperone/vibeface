@@ -3506,6 +3506,61 @@ fn an_answer_reaches_the_agent_once_across_retries_and_restarts() -> Result<()> 
 }
 
 #[test]
+fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let mut card = question(&net, "q-settings", "provider-setup-1")?;
+    if let EventBody::QuestionAsked { about, .. } = &mut card {
+        about.agent = crate::runtime::SETTINGS_AGENT.into();
+    }
+    store.ask(&net.a, &net.network, "c", card, 2)?;
+    store.ask(
+        &net.a,
+        &net.network,
+        "c",
+        question(&net, "q-session", "t1")?,
+        3,
+    )?;
+    let mut roles = std::collections::BTreeMap::new();
+    for (id, time) in [("q-settings", 4), ("q-session", 5)] {
+        let signed = Some(answer_signature(&net, "c", id, "继续")?);
+        store.accept_answer(&net.a, &net.network, id, "继续", signed, time)?;
+        let trigger = message_trigger(&questions::answer_id(id));
+        store.admit_delivery(&net.a.device_id()?, &net.network, "c", &trigger)?;
+        let job = store
+            .scheduler_jobs("c")?
+            .into_iter()
+            .find(|job| job.trigger == trigger)
+            .context("answer job")?;
+        let context = store.context(&net.network, "c", None)?;
+        let works = store.works(&net.network, "c")?;
+        let (prompt, _) = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            json!({}),
+            None,
+            &[],
+            None,
+            None,
+        )?;
+        roles.insert(id, prompt.lines().next().unwrap_or_default().to_owned());
+    }
+    assert!(
+        roles["q-settings"].contains("apply_provider_config")
+            && !roles["q-settings"].contains("dispatch_work"),
+        "a settings card's answer is applied, never sent to its placeholder session: {}",
+        roles["q-settings"]
+    );
+    assert!(
+        roles["q-session"].contains("dispatch_work"),
+        "an answer about a session still reaches the session"
+    );
+    Ok(())
+}
+
+#[test]
 fn an_answer_on_one_device_is_answered_for_every_reader() -> Result<()> {
     let net = net()?;
     let (mut a, mut b) = (store(&net)?, store(&net)?);

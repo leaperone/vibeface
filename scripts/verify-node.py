@@ -1285,7 +1285,11 @@ def fixture_manager(run, initial, bot):
     if kind == "answer":
         question, answer = context["trigger"]["question"], body["text"]
         about = question["about"]
-        if about.get("request_id"):
+        if about.get("agent") == "vibeface":
+            replies = [tool("apply_provider_config", {"question_id": question["question_id"]}) for _ in range(2)]
+            require(replies[0] == replies[1] and replies[0]["status"] in ("applied", "declined"),
+                    "a settings card's answer is applied once; a repeat reads it back")
+        elif about.get("request_id"):
             result = json.dumps({"decision": "accept" if answer == "允许" else "decline"})
             replies = [json.loads(fixture_cli(initial, "codex", "respond", about["request_id"], result, "--node", about["node"]).stdout)
                        for _ in range(2)]
@@ -1345,6 +1349,8 @@ def fixture_manager(run, initial, bot):
     # Screens show these replies, so only an explicit test label is echoed back.
     explicit = directive.get("label")
     spoken = "已看过任务结果" if autonomous else "收到，已处理"
+    if kind == "answer" and question["about"].get("agent") == "vibeface":
+        spoken = "设置已更新" if replies[0]["status"] == "applied" else "没有改动设置"
     while True:
         sequence += 1
         bot.say(f"{explicit}:{sequence}" if explicit else spoken)
