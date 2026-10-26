@@ -275,6 +275,17 @@ pub(crate) fn apply(
             )?;
             notify(connection, network, hash, scope, "question", question, rank)?;
         }
+        // Follows the question in its author's log. Only the device that asked and held the
+        // request closes it; an answer, if one stands, still wins when the question is read.
+        EventBody::QuestionClosed {
+            question_id,
+            reason,
+        } => {
+            connection.execute(
+                "UPDATE questions SET closed=? WHERE network_id=? AND question_id=? AND conversation_id=? AND author=?5 AND node=?5 AND request_id IS NOT NULL AND closed IS NULL",
+                params![text(reason)?, network, question_id, scope, event.author],
+            )?;
+        }
         EventBody::SessionAttributed {
             node,
             agent,

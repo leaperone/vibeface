@@ -28,6 +28,7 @@ const patterns: [RegExp, string][] = [
   [/no configured management SDK/i, '这台设备没开 Bot。去设备页的 AI 设置里选一个。'],
   [/configured executable was not found/i, '这台设备上的 Bot 程序找不到了。去设备页检查 AI 设置。'],
   [/Cursor SDK|cursor-sdk-bridge/i, 'Cursor 没能完成这次回复。请再发一次；一直不行就去设备页检查 Cursor。'],
+  [/question was closed/i, '这个请求已失效，不能再回答。'],
   [/answered meanwhile|no App Server request is waiting/i, '这个请求已经回答过或已过期。'],
   [/usage limit|rate limit|quota|too many requests/i, 'AI 服务的用量到上限了。等额度恢复后让 Bot 再试。'],
   [/no rollout found/i, 'Codex 新对话还没准备好，任务没有开始。请再派一次。'],

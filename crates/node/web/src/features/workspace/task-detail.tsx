@@ -12,6 +12,7 @@ import { confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
+import { questionOpen } from "@vibeface/client/workspace/questions.ts"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
@@ -55,7 +56,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const lookup = { nodes: workspace.nodes, directory }
   const work = workspace.data?.works.find((item) => item.work_id === workId)
   // A running turn held on an approval reads as 需要你同意, as in the chat, and the question is answered right here.
-  const asking = work?.thread_id ? workspace.data?.questions.find((question) => !question.answer && question.about.request_id && question.about.session_id === work.thread_id) : undefined
+  const asking = work?.thread_id ? workspace.data?.questions.find((question) => questionOpen(question) && question.about.request_id && question.about.session_id === work.thread_id) : undefined
   const shown = work ? shownState(work, workspace.nodes) : ""
   const state = shown === "running" && asking ? "waiting" : shown
   const [confirming, setConfirming] = useState(false)
