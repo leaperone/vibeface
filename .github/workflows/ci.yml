@@ -422,6 +422,11 @@ jobs:
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-public-entry --public-entry
+      - name: Verify discovery-only assistance and headless Nodes
+        if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+        run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-discovery --discovery
       - name: Verify write protection, status and diagnostics
         if: needs.plan.outputs.package_mode == 'node' && matrix.target == 'aarch64-apple-darwin'
         env:
@@ -454,6 +459,8 @@ jobs:
             .artifacts/ci-chat-agent/chat-agent-process-*/manager-tool-errors.jsonl
             .artifacts/ci-phase4/phase4-*/report.json
             .artifacts/ci-phase4/phase4-*/*/node.log
+            .artifacts/ci-discovery/discovery-*/report.json
+            .artifacts/ci-discovery/discovery-*/*/node.log
             .artifacts/ci-public-entry/public-entry-*/report.json
             .artifacts/ci-public-entry/public-entry-*/*/node.log
             .artifacts/ci-phase5/phase5-*/report.json

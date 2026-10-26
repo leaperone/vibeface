@@ -256,9 +256,17 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 成员 Gateway 保存个人网络的完整副本。反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**怎么设置**链接指向本节。
 
+## 不提供网页
+
+默认启动网页。只运行节点传输、同步、Agent 与本地工具时，执行 `vibeface serve --data-dir /absolute/node-data --no-web`。直接启动同样支持 `vibeface --data-dir /absolute/node-data --no-web`。
+
+`--no-web` 不绑定浏览器公开 listener，不提供网页、浏览器会话或浏览器转发。本地 hook、分诊、日志、SDK 工具和维护接口继续运行。其他设备仍可经个人网络连接这个 Node。关闭后不发布本机网页入口；已配置的远端公共入口仍可访问这个 Node。
+
+后台服务要保持关闭网页时，在 `init` 时传入 `--no-web`，或把 `config.json` 的 `web_enabled` 设为 `false` 后重启。直接启动和 `serve` 的开关只影响本次运行。
+
 ## Node 之间的连接
 
-Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的地址只来自个人网络内部交换的签名地址记录。
+Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的持久地址来自邀请和个人网络内部交换的签名地址记录。显式配置发现服务后，还可查询临时直连地址。
 
 每台 Node 定期为自己签一条地址记录，内容是 iroh 地址（relay URL 和直连 IP）以及网页入口 `gateway_url`。同步时双方交换记录，地址变化后几秒内传到其他成员。浏览器从当前入口读取这些记录，自己验签后作为可切换的访问地址，见下文“多个访问地址”。
 
@@ -267,9 +275,10 @@ Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就�
 | 参数 | `config.json` 中的 `network` 字段 | 作用 |
 |---|---|---|
 | `--relay <URL>` | `relays` | 个人网络中另一台 Node 的 relay，可重复，最多 16 个 |
-| `--relay-listen <ADDR>` | `relay_listen` | 本 Node 在这个地址运行 relay |
+| `--relay-listen <ADDR>` | `relay_listen` | 普通模式运行 TCP relay，`discovery-only` 模式提供 UDP 发现服务 |
+| `--relay-mode <MODE>` | `relay_mode` | 默认 `forward`；`discovery-only` 只提供连接协助，需要 `--public-entry` |
+| `--discovery <URL>` | `discovery` | 钉住身份的发现服务，格式为 `vibeface://<device-id>@<host>:<UDP-port>`，最多 4 个 |
 | `--relay-url <URL>` | `relay_url` | 其他 Node 访问本 relay 的 URL，必须明确提供其他 Node 可访问的 URL |
-| `--relay-paths-only` | `relay_paths_only` | 只经 relay 连接，用于模拟严格 NAT 或排障 |
 | 无 | `bind` | iroh 的 UDP 监听地址，默认在 `listen` 的端口上监听全部 IPv4 和 IPv6 网卡 |
 | 无 | `n0_relays` | 同时使用 n0 公共 relay，默认关闭 |
 
@@ -289,6 +298,34 @@ vibeface join '<管理设备给出的加入链接>' --name '<设备显示名称>
 历史按每台设备一条签名日志同步：双方交换版本向量，只拉对方缺的区间，入库前逐条验签并去重，中断后从已入库的位置续拉。对端重启后，它发来的同步请求带新的启动编号，本机随即关闭旧连接并重新同步，不等 QUIC 空闲超时。同步只写入历史和投影，不会重新执行历史中的操作；调度和执行只发生在被指定的 Node 上，见[事件 DAG 协议](node-protocol.md#事件-dag)。
 
 网页按 1 MiB 分块把附件上传到当前入口 Node，入口重启后从已落盘的位置继续，消息只引用附件的 hash 和大小。附件下载的已收部分保存在本机私有暂存文件。断线或重启后，Node 重新核验授权并从已保存的位置继续；只有最终大小和 hash 校验通过的完整附件才能使用。暂存最多占用 256 MiB、64 个对象。连接恢复只继续传输，不重发业务操作。
+
+## 运行不转发业务数据的公共发现服务
+
+运营者可只提供发现和连接协助，不加入用户的个人网络，也不承担业务流量。初始化时选择 `discovery-only`：
+
+```sh
+vibeface init --data-dir /srv/vibeface-discovery \
+	--public-entry --relay-mode discovery-only \
+	--relay-listen 0.0.0.0:4792 --no-web
+vibeface serve --data-dir /srv/vibeface-discovery
+```
+
+`init` 输出发现服务的设备编号。UDP 4792 必须能从公网直接访问，不能用 HTTP 反向代理替代。监听地址的端口必须非零；使用 `0.0.0.0` 或 `[::]` 时同时尝试监听 IPv4 和 IPv6。此模式不使用 `--relay-url`，也不生成 `entry-token`。省略 `--no-web` 时仍提供静态网页，但不提供 `/api/client`、`/api/decision` 或建网入口。
+
+用户在自己的 Node 上明确配置这个发现服务的编号和公网地址：
+
+```sh
+vibeface init --data-dir /absolute/personal-node \
+	--discovery 'vibeface://<发现服务设备编号>@discovery.example:4792'
+```
+
+已有 Node 可在 `config.json` 的 `network.discovery` 数组里添加同一 URL 后重启。发现服务的编号通过 QUIC TLS 校验，域名解析结果不能冒充运营者。不要把这个地址传给 `--relay` 或 `--entry`，它没有业务转发能力。
+
+Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证连接上观察到的地址，并通知双方发起直连探测。服务端没有转发客户端数据报的实现，也不接受个人网络的业务 ALPN。加入设备仍需有效邀请，读取、同步和执行仍按原有成员权限校验。
+
+发现服务不会列出所有用户；知道设备编号的人可以查询它是否在线及其公网地址。运营者能看到设备编号、UDP 地址和查询关系。地址登记只保存在内存中，连接租约到期或断开后移除，不保存会话、附件、事件或个人网络。每个服务最多接纳 512 条控制连接，每个来源 IP 最多 8 条；单连接最多处理 60 个固定请求，租约为 60 秒，单帧最多 512 字节。连接通知队列和并发探测也有上限。
+
+仅发现不保证所有 NAT 类型都能直连。对称 NAT、UDP 被封锁或双方没有可用直连路径时，仅发现会报告不可达。需要这类网络仍可自动连接时，用户可另行配置普通 `--relay`。Node 自动选择直连或普通 relay；发现节点始终不承载业务流量。本项目不默认连接任何官方发现服务。
 
 ## 多个访问地址
 
