@@ -434,7 +434,7 @@ class Client:
             require(observed == status, f"{path}: expected HTTP {status}, received {observed}")
             return json.loads(encoded) if encoded and "application/json" in response.headers.get("Content-Type", "") else encoded or None
 
-    def invite(self):
+    def invite(self, *, discovery_only=False):
         """A one-time ticket link to the entry this manager is connected to."""
         made = self.command("invite", network_id=self.network_id, entry_id=self.device_id)
         tampered = copy.deepcopy(made["record"])
@@ -442,7 +442,8 @@ class Client:
         self.call("invite", {"record": tampered}, status=400)
         entry = self.call("invite", {"record": made["record"]}).get("entry") or {}
         ticket = self.command("invite_ticket", invite_hash=made["record"]["invite_hash"], entry_id=self.device_id,
-                              relay_url=entry.get("relay_url"), direct_addrs=entry.get("direct_addrs") or [])
+                              relay_url=None if discovery_only else entry.get("relay_url"),
+                              direct_addrs=[] if discovery_only else entry.get("direct_addrs") or [])
         return f"{self.url}/join#{ticket}"
 
     def directory_state(self):
@@ -534,7 +535,8 @@ class Node:
         require(json.loads((self.directory / "data-epoch.json").read_text()) == {"data_epoch": DATA_EPOCH},
                 "new private Node data uses the current data epoch")
         self.configure(timeout_secs=60)
-        self.configure_network(bind=f"127.0.0.1:{self.port}")
+        if json.loads((self.directory / "config.json").read_text())["network"]["relay_mode"] != "discovery-only":
+            self.configure_network(bind=f"127.0.0.1:{self.port}")
         result = subprocess.run([str(binary), "access", "--json", "--data-dir", str(self.directory)],
                                 capture_output=True, timeout=15)
         require(result.returncode == 0, f"{name}: local access material is available")
@@ -566,15 +568,21 @@ class Node:
         (home / ".codex" / "sessions").mkdir(parents=True, exist_ok=True)
         return {**os.environ, "HOME": str(home), "CODEX_HOME": str(home / ".codex")}
 
-    def start(self, *, env=None):
+    def start(self, *, env=None, no_web=False, bare=False):
         require(self.process is None, f"{self.name}: process is stopped before start")
         self.log = (self.directory / "process.log").open("ab")
         self.process = subprocess.Popen(
-            [str(self.binary), "serve", "--data-dir", str(self.directory)],
+            [str(self.binary), *([] if bare else ["serve"]), "--data-dir", str(self.directory),
+             *(["--no-web"] if no_web else [])],
             stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
             start_new_session=True, env=env or self.environment())
-        info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
-        require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
+        if no_web or not json.loads((self.directory / "config.json").read_text())["web_enabled"]:
+            health = wait_for(f"{self.name} headless maintenance socket", lambda: (
+                value if (value := node_status(self))["status"] == "running" and value["web_enabled"] is False else None))
+            require(health["device_id"] == self.device_id, f"{self.name}: maintenance pins its identity")
+        else:
+            info = wait_for(f"{self.name} HTTP listener", lambda: self.client.request("/api/info"))
+            require(info["device_id"] == self.device_id, f"{self.name}: serves its own device identity")
         require(self.process.poll() is None, f"{self.name}: independent process remains running")
 
     def stop(self, *, crash=False):
@@ -595,11 +603,17 @@ class Node:
             self.log = None
             return returncode
 
-    def pair(self, owner):
+    def pair(self, owner, *, discovery_only=False):
         """`vibeface join <link>` on this stopped Node; the owner approves once the short codes match."""
         require(self.process is None, f"{self.name}: joins while stopped")
         owner = getattr(owner, "client", owner)
-        link = owner.invite()
+        link = owner.invite(discovery_only=discovery_only)
+        if discovery_only:
+            encoded = link.split("#vibeface1", 1)[1].upper()
+            ticket = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
+            # The browser decoder hides transport fields, so inspect this fixture's postcard entry.
+            require(len(ticket) == 67 and ticket[0] == 1 and ticket[33:35] == b"\x00\x00",
+                    "discovery-only CLI join ticket contains no relay or direct address")
         log_path = self.directory / f"join-cli-{uuid.uuid4().hex[:8]}.log"
         log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
         process = None
@@ -2770,12 +2784,6 @@ def gateway_refusal(client, device_id):
 
 
 def acceptance(options):
-    """Phase-3 multi-Node acceptance over iroh with real Node processes and fixture SDKs.
-
-    P plays the public Node: it runs the personal network's iroh relay and a Gateway. A owns the
-    conversation and schedules it. B is behind a simulated strict NAT (relay paths only). C is
-    another home Node. One browser identity uses every Gateway as an entrance.
-    """
     binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
     require(module.with_name("vibeface_secure_bg.wasm").read_bytes().startswith(b"\x00asm"),
             "packaged browser WASM is available")
@@ -2790,7 +2798,7 @@ def acceptance(options):
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
               "coverage": "four real Node processes over iroh with a member relay; WASM browser client; fixture SDK",
-              "not_checked": ["real NAT and public ingress (relay_paths_only simulates a strict NAT on loopback)",
+              "not_checked": ["real NAT and public ingress (disjoint loopback IP families require the relay)",
                               "attachment resume: no product path writes attachments yet; the Rust test "
                               "member_nodes_sync_ranges_and_attachments_without_jobs_and_refuse_outsiders resumes 3 MiB",
                               "non-member endpoints refused by sync and RPC (same Rust test)",
@@ -2822,7 +2830,7 @@ def acceptance(options):
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
         c.configure_network(relays=[relay_url])
-        b.configure_network(relays=[relay_url], relay_paths_only=True)
+        b.configure_network(relays=[relay_url], bind=f"[::1]:{b.port}")
         a.start()
         network = a.bootstrap()
         p.pair(a)
@@ -2838,12 +2846,14 @@ def acceptance(options):
         a.client.rpc("create_conversation", conversation_id=conversation, title="Phase 3 acceptance")
         a.client.call("rpc", signed_message(a.client, conversation, "m1", "first message from A"))
         members = (a, p, b, c)
-        synced = wait_for("A, P, B (relay paths only) and C converge", lambda: converged(members, network), timeout=60)
+        synced = wait_for("A, P, B (IPv6-only) and C converge", lambda: converged(members, network), timeout=60)
         dags = {node.name: verify_dag(node, network)["events"] for node in members}
         require(all(scheduler_records(node, network) == [] for node in (p, b, c)),
                 "syncing history creates no scheduler job on replicas")
         b_config = json.loads((b.directory / "config.json").read_text())["network"]
-        require(b_config["relay_paths_only"] and b_config["relays"] == [relay_url], "B reaches others only through P's relay")
+        require(b_config["bind"] == f"[::1]:{b.port}" and b_config["relays"] == [relay_url], "B has no IP family in common with the IPv4-only peers")
+        require(wait_for("B actually selects a relay data path", lambda: any(
+            row.get("path") == "relay" for row in node_status(b).get("peers", []))), "B uses a real relay path")
         passed("join-and-sync-over-iroh", heads=synced, events=dags, relay=relay_url)
 
         entrances = a.client.call("entrances")["entrances"]
@@ -2860,8 +2870,11 @@ def acceptance(options):
                 "a record whose gateway_url was changed fails verification")
         by_device = {item["device_id"]: item for item in opened}
         require(by_device[p.device_id]["gateway_url"] == p.url, "P's record names its own Gateway URL")
-        require([list(addr) for addr in by_device[b.device_id]["endpoint"]["addrs"]] == [["Relay"]],
-                "B advertises only P's relay, no direct IP path")
+        b_paths = by_device[b.device_id]["endpoint"]["addrs"]
+        require([address["Relay"].rstrip("/") for address in b_paths if "Relay" in address] == [relay_url],
+                "B advertises exactly P's relay")
+        require([address["Ip"] for address in b_paths if "Ip" in address] == [f"[::1]:{b.port}"],
+                "B advertises its configured IPv6-only direct candidate")
         require(all(addr["Ip"].startswith("127.0.0.1:") for node in (a, p, c)
                     for addr in by_device[node.device_id]["endpoint"]["addrs"] if "Ip" in addr),
                 "Nodes advertise only the loopback address they were told to bind")
@@ -2928,7 +2941,7 @@ def acceptance(options):
         p.stop()
         a.client.call("rpc", signed_message(a.client, conversation, "m3", "written while the relay is down"))
         wait_for("C still syncs directly while P is down", lambda: heads(c, network) == heads(a, network))
-        require_quiet("B (relay paths only) cannot sync while P is down", lambda: heads(b, network) != heads(a, network))
+        require_quiet("B (IPv6-only) cannot sync while P is down", lambda: heads(b, network) != heads(a, network))
         p.start()
         healed = wait_for("B catches up once P's relay returns", lambda: converged(members, network), timeout=90)
         passed("relay-outage-and-recovery", heads=healed)
@@ -3428,7 +3441,7 @@ def public_entry_acceptance(options):
     helper.chmod(0o600)
     nodes, clients = [], []
     report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
-              "coverage": "public entry P (not a member) with its relay; member M on relay paths only; "
+              "coverage": "public entry P (not a member) with its relay; member M on IPv6-only transport; "
                           "Node X holding a wrong relay token; WASM browser client on P's origin",
               "not_checked": ["real NAT and TLS reverse proxy (loopback ports stand in for nginx paths)",
                               "rendered browser UI (see the browser screenshots)"]}
@@ -3463,7 +3476,7 @@ def public_entry_acceptance(options):
             "--root", str(workspace), "--entry", p.url, "--entry-relay", relay_url, "--relay-token-file", str(wrong)])
         nodes += [m, x]
         for node in (m, x):
-            node.configure_network(relay_paths_only=True)
+            node.configure_network(bind=f"[::1]:{node.port}")
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
                     codex_bin=str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex")),
                     app_server=SPAWN_APP_SERVER)
@@ -3566,6 +3579,184 @@ def public_entry_acceptance(options):
             node.client.close()
             node.stop()
         stop_fixture_processes(run / "fixture-M") if (run / "fixture-M").exists() else None
+        private_json(run / "report.json", report)
+        print("REPORT " + str(run / "report.json"), flush=True)
+
+
+def discovery_acceptance(options):
+    binary, module = options.binary.resolve(strict=True), options.crypto_module.resolve(strict=True)
+    options.artifacts.mkdir(parents=True, exist_ok=True)
+    run = options.artifacts.resolve() / ("discovery-" + uuid.uuid4().hex[:10])
+    run.mkdir(mode=0o700)
+    workspace = run / "workspace"
+    workspace.mkdir(mode=0o700)
+    helper = run / "client.mjs"
+    helper.write_text(CLIENT_SOURCE.replace("MODULE_URL", module.as_uri()))
+    helper.chmod(0o600)
+    nodes = []
+    report = {"status": "running", "cases": {}, "provider_calls": 0, "binary_sha256": file_sha256(binary),
+              "not_checked": ["public NAT types and UDP-blocked networks", "rendered browser UI", "live Agent tool execution"]}
+
+    def passed(name, **evidence):
+        report["cases"][name] = evidence
+        print("PASS " + name, flush=True)
+
+    def clear_addresses(*members):
+        for node in members:
+            require(node.process is None, "only stopped task-owned Nodes have their cached paths cleared")
+            with sqlite3.connect(node.directory / "node.sqlite3") as database:
+                database.execute("DELETE FROM addresses")
+
+    def peer(node, target):
+        return next((row for row in node_status(node).get("peers", []) if row["device_id"] == target.device_id), {})
+
+    def reconnect(node, network, *, writable=True):
+        node.client.close()
+        node.client.connect(node.device_id)
+        node.client.authenticate(network)
+        if writable:
+            wait_for("the management Node is aligned and writable", lambda: node_status(node).get("write_state") == "writable", timeout=60)
+
+    def stopped_browser(node):
+        try:
+            with socket.create_connection(("127.0.0.1", node.port), timeout=1):
+                raise AssertionError("a headless Node still has a public TCP listener")
+        except (ConnectionRefusedError, TimeoutError):
+            pass
+        local = Client(f"http://127.0.0.1:{node.local_port}", None)
+        for path in ("/", "/api/info", "/api/client", "/api/local/info", "/generated/vibeface_secure_bg.wasm"):
+            local.request(path, status=404)
+        hook = json.loads(node_cli(node, "hook", "codex", "--test").stdout)
+        require(hook["status"] == "accepted", "the headless Node handles a real local hook")
+        tool_port = int((node.directory / "tool-port").read_text())
+        tools = Client(f"http://127.0.0.1:{tool_port}", None)
+        tools.request("/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                      {"toolName": "info", "agentId": "not-an-agent", "args": {}},
+                      status=401, origin=False, headers={"Authorization": "Bearer invalid-acceptance-token"})
+        return node_status(node)
+
+    try:
+        discovery_port = available_port()
+        d = Node(run, "D", binary, workspace, helper, init_args=[
+            "--public-entry", "--relay-mode", "discovery-only", "--relay-listen", f"0.0.0.0:{discovery_port}"])
+        nodes.append(d)
+        require(not (d.directory / "entry-token").exists(), "discovery has no data-relay operator token")
+        d.start()
+        require(b"<html" in d.client.request("/").lower(), "discovery defaults to serving its embedded webpage")
+        for path in ("/api/client", "/api/decision", "/api/local/setup"):
+            d.client.request(path, status=404)
+        try:
+            with socket.create_connection(("127.0.0.1", discovery_port), timeout=1):
+                raise AssertionError("discovery must not run the TCP business relay")
+        except ConnectionRefusedError:
+            pass
+        passed("discovery-has-no-business-relay-or-http-proxy")
+        address = f"vibeface://{d.device_id}@localhost:{discovery_port}"
+        a, b = [Node(run, name, binary, workspace, helper) for name in ("A", "B")]
+        nodes += [a, b]
+        for node in (a, b):
+            node.configure_network(discovery=[address])
+        a.start()
+        network = a.bootstrap()
+        b.pair(a, discovery_only=True)
+        b.start()
+        wait_for("discovery establishes A-to-B direct sync", lambda: peer(a, b).get("path") == "direct", timeout=60)
+        a.client.rpc("create_conversation", conversation_id="discovery-first", title="Discovery direct sync")
+        wait_for("discovery members sync their first event", lambda: converged((a, b), network), timeout=60)
+        passed("cli-join-with-only-target-id-and-invite-uses-discovery", path=peer(a, b)["path"])
+
+        for node in (a, b):
+            node.client.close()
+            node.stop()
+        clear_addresses(a, b)
+        d.stop()
+        d.start(no_web=True)
+        a.start()
+        b.start()
+        wait_for("fresh caches recover through restarted discovery", lambda: peer(a, b).get("path") == "direct", timeout=60)
+        reconnect(a, network)
+        a.client.rpc("create_conversation", conversation_id="discovery-restart", title="Discovery restart")
+        wait_for("restarted discovery restores synchronization", lambda: converged((a, b), network), timeout=60)
+        passed("discovery-restart-restores-direct-sync-with-empty-address-caches", path=peer(a, b)["path"], web_enabled=node_status(d)["web_enabled"])
+
+        for node in (a, b):
+            node.client.close()
+            node.stop()
+        b.configure_network(bind=f"[::1]:{b.port}")
+        clear_addresses(a, b)
+        a.start()
+        b.start()
+        wait_for("disjoint IP families cannot complete business through discovery", lambda: peer(a, b).get("reachable") is False, timeout=45)
+        reconnect(a, network, writable=False)
+        require(a.client.call("confirm_writable")["state"] == "writable", "the test manager explicitly permits an isolated write")
+        a.client.rpc("create_conversation", conversation_id="discovery-blocked", title="Direct path blocked")
+        require_quiet("discovery never forwards the blocked event", lambda: heads(b, network) != heads(a, network))
+        require(peer(a, b).get("path") is None, "no data path is hidden behind discovery")
+        passed("blocked-direct-path-does-not-fall-back-to-discovery")
+
+        b.stop()
+        b.configure_network(bind=f"127.0.0.1:{b.port}")
+        b.start()
+        wait_for("restored IP path catches up", lambda: converged((a, b), network), timeout=60)
+        relay_port = available_port()
+        relay_url = f"http://127.0.0.1:{relay_port}"
+        r = Node(run, "R", binary, workspace, helper, init_args=[
+            "--relay-listen", f"127.0.0.1:{relay_port}", "--relay-url", relay_url])
+        nodes.append(r)
+        r.pair(a)
+        r.start()
+        for node in (a, b):
+            node.client.close()
+            node.stop()
+            node.configure_network(relays=[relay_url])
+            node.start()
+        reconnect(a, network)
+        wait_for("members publish normal relay paths", lambda: all(
+            any("Relay" in item for item in json.loads(row["payload"])["endpoint"]["addrs"])
+            for row in a.client.call("entrances")["entrances"]), timeout=60)
+        wait_for("relay members align before isolating B", lambda: converged((a, b, r), network), timeout=60)
+        for node in (a, b):
+            node.client.close()
+            node.stop()
+        b.configure_network(bind=f"[::1]:{b.port}")
+        a.start()
+        b.start()
+        wait_for("ordinary relay recovers the disjoint direct paths automatically", lambda: peer(a, b).get("path") == "relay", timeout=60)
+        reconnect(a, network)
+        a.client.rpc("create_conversation", conversation_id="discovery-relay", title="Automatic relay fallback")
+        wait_for("business sync succeeds on the normal relay", lambda: converged((a, b, r), network), timeout=60)
+        passed("normal-relay-fallback-is-automatic", path=peer(a, b)["path"])
+
+        b.stop()
+        b.start(no_web=True)
+        status = stopped_browser(b)
+        a.client.rpc("create_conversation", conversation_id="discovery-headless", title="Headless sync")
+        wait_for("headless B still synchronizes", lambda: converged((a, b, r), network), timeout=60)
+        wait_for("B withdraws its closed webpage", lambda: any(
+            json.loads(row["payload"])["device_id"] == b.device_id and json.loads(row["payload"])["gateway_url"] is None
+            for row in a.client.call("entrances")["entrances"]), timeout=60)
+        passed("serve-no-web-keeps-hooks-tool-auth-maintenance-and-sync", web_enabled=status["web_enabled"])
+        b.stop()
+        b.start(no_web=True, bare=True)
+        stopped_browser(b)
+        b.stop()
+        b.configure(web_enabled=False)
+        b.start()
+        stopped_browser(b)
+        passed("bare-no-web-and-persisted-web-off")
+        with sqlite3.connect(f"file:{d.directory / 'node.sqlite3'}?mode=ro", uri=True) as database:
+            counts = {table: database.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                      for table in ("networks", "events", "conversations", "log_heads")}
+        require(all(count == 0 for count in counts.values()), "discovery stores no personal network or business records")
+        passed("discovery-stores-no-business-records", **counts)
+        report["status"] = "passed"
+    except BaseException as error:
+        report.update(status="failed", failure=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
+        raise
+    finally:
+        for node in reversed(nodes):
+            node.client.close()
+            node.stop()
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
 
@@ -3982,11 +4173,14 @@ if __name__ == "__main__":
         modes.add_argument("--chat-agent", action="store_true", help="run direct App Server work, triage, decisions, cancellation and native observation process checks")
         modes.add_argument("--auto-route", action="store_true", help="check entry joins, origins, forwarding, recovery and uncertain writes")
         modes.add_argument("--phase4", action="store_true", help="check cross-entrance coordination, agent tasks, owner moves, revocation, checks and attachments")
+        modes.add_argument("--discovery", action="store_true", help="check discovery-only connection assistance, automatic normal-relay fallback, and headless Nodes")
         modes.add_argument("--public-entry", action="store_true", help="check a public entry that forwards browsers and decisions to a member Node through its relay")
         modes.add_argument("--phase5", action="store_true", help="check write protection after a restore, alone and as a copied data directory, status, logs and diagnostics")
         arguments = parser.parse_args()
         try:
-            if arguments.phase5:
+            if arguments.discovery:
+                discovery_acceptance(arguments)
+            elif arguments.phase5:
                 phase5_acceptance(arguments)
             elif arguments.public_entry:
                 public_entry_acceptance(arguments)

@@ -225,9 +225,11 @@ impl Runtime {
         let host = crate::discovery::Host::current();
         crate::discovery::complete_saved(dir, &host)?;
         let config = Config::load(dir)?;
-        let entry_token = (config.public_entry || config.network.entry.is_some())
-            .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
-            .transpose()?;
+        let entry_token = ((config.public_entry
+            && config.network.relay_mode == crate::net::RelayServiceMode::Forward)
+            || config.network.entry.is_some())
+        .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
+        .transpose()?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
