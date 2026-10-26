@@ -8,8 +8,7 @@ function browser() {
   const value = ua()
   return /Edg\//.test(value) ? 'Edge' : /Firefox\//.test(value) ? 'Firefox' : /Chrome\//.test(value) ? 'Chrome' : /Safari\//.test(value) ? 'Safari' : '浏览器'
 }
-/** `deviceId` tells apart two browsers of the same kind joining one network. */
-export const defaultBrowserName = (deviceId = '') => `${platform()} 上的 ${browser()}${deviceId ? ` ${deviceId.slice(0, 4).toUpperCase()}` : ''}`
+export const defaultBrowserName = () => `${platform()} 上的 ${browser()}`
 export const defaultComputerName = () => `我的 ${platform()}`
 const LAST_BROWSER_NAME = 'vibeface.browser-name'
 /** A refused or removed browser asks again with the name the person last gave it. */
