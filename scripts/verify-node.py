@@ -27,6 +27,7 @@ import ipaddress
 import json
 import os
 import re
+import runpy
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -5102,7 +5103,16 @@ def delivery_paid_acceptance(options):
         log.close()
 
 
+def delivery_progress(options):
+    commit = os.environ.get("VIBEFACE_DELIVERY_PROGRESS_COMMIT", "")
+    if options.delivery_ui_control is None or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        return lambda stage: None
+    runner = Path(__file__).resolve().parents[1] / "scripts/run-delivery-live.py"
+    return runpy.run_path(str(runner))["progress_writer"]("paid", commit)
+
+
 def delivery_paid_run(options, configuration, deployment):
+    enter = delivery_progress(options)
     fields = ("rpc_url", "chain_id", "escrow", "asset", "profile", "confirmations")
     chain = {name: deployment[name] for name in fields}
     profile = json.loads(options.delivery_profile.resolve(strict=True).read_text())
@@ -5122,6 +5132,7 @@ def delivery_paid_run(options, configuration, deployment):
     for name in ("max_service_amount", "source_gas_cap_wei", "provider_gas_cap_wei", "register_key_gas_cap_wei"):
         require(isinstance(configuration[name], str) and re.fullmatch(r"[1-9][0-9]{0,70}", configuration[name]),
                 "paid acceptance financial caps are explicit positive decimal strings")
+    enter("free-checks")
     free = delivery_charity_acceptance(options)
     require(free["status"] == "passed", "full paid acceptance also requires the free-network safety checks")
     repository = Path(__file__).resolve().parents[1]
@@ -6044,6 +6055,7 @@ def delivery_paid_run(options, configuration, deployment):
         return ordinary_bundle
 
     try:
+        enter("wallet-bootstrap")
         accounts = rpc("eth_accounts", [])
         require(accounts and deployment.get("funder", accounts[0]).lower() == accounts[0].lower(),
                 "only the controlled fixture's unlocked local funder is used")
@@ -6087,6 +6099,7 @@ def delivery_paid_run(options, configuration, deployment):
         wait_for("controlled sender TestToken funding", lambda: confirmed(token_tx), timeout=60)
         register_intent = str(uuid.uuid4())
         registration_log = (run / "register-before-crash.log").open("wb")
+        enter("first-proof-starting")
         registration_process = subprocess.Popen([str(binary), "wallet", "--data-dir", str(receiver.directory),
             "register-key", "--intent-id", register_intent, "--gas-cap", configuration["register_key_gas_cap_wei"]],
             stdin=subprocess.DEVNULL, stdout=registration_log, stderr=registration_log, start_new_session=True)
@@ -6106,6 +6119,7 @@ def delivery_paid_run(options, configuration, deployment):
             return None
 
         inherited_proof = wait_for("actual trusted host and r0vm inherit the exclusive Node proof lock", genuine_prover_started, timeout=120)
+        enter("first-proof-observed")
         responsiveness = []
         for sample in range(3):
             require(proof_busy(lock) and any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()),
@@ -6133,6 +6147,7 @@ def delivery_paid_run(options, configuration, deployment):
         receipt = Path(receipt_name)
         require(receipt.resolve().is_relative_to(receiver.directory.resolve()) and not receipt.exists(),
                 "the genuine crash checkpoint precedes publication of its original receipt")
+        enter("receiver-crash")
         receiver.stop(crash=True)
         require(any(same_process(fact) and owns_proof_lock(fact, lock) for fact in inherited_proof.values()) and proof_busy(lock),
                 "the actual authorized proof retains the lock after its Node is killed")
@@ -6173,7 +6188,9 @@ def delivery_paid_run(options, configuration, deployment):
                     "the authorized prover remains observable until it publishes its receipt")
             return False
 
+        enter("original-receipt-wait")
         wait_for("the original genuine receiving-key proof completes without a duplicate job", original_receipt_ready, timeout=7400)
+        enter("original-receipt-ready")
         original_receipt_sha = file_sha256(receipt)
         require(cli(receiver, ["status"])["state"] == "locked", "waiting for the authorized receipt does not unlock the receiving wallet")
         cli(receiver, ["unlock"], password=passwords["R"])
@@ -6183,11 +6200,13 @@ def delivery_paid_run(options, configuration, deployment):
             if value["phase"] in ("reverted", "conflicted", "failed"):
                 raise RuntimeError("receiving-key registration reached a terminal chain failure")
             return value if value["phase"] == "confirmed" and value.get("registry_confirmed") is True else None
+        enter("registration-reconcile")
         wait_for("actual receiving-key proof registration confirmation", registration, timeout=7400)
         require(delivery_rows(receiver, "SELECT digest,path FROM proof_jobs") == jobs
                 and file_sha256(receipt) == original_receipt_sha
                 and len(delivery_rows(receiver, "SELECT id FROM transactions WHERE id=?", (f"key-{register_intent}/register",))) == 1,
                 "same registry intent reuses the original genuine receipt and has exactly one durable transaction")
+        enter("registration-confirmed")
         passed("genuine-prover-survives-node-sigkill-without-a-duplicate-job", proof_digest=proof_digest,
                original_receipt_sha256=original_receipt_sha, inherited_lock=True,
                restarted_wallet_locked=True, same_intent=True, proof_reservations=1, registry_transactions=1)
@@ -6216,9 +6235,11 @@ def delivery_paid_run(options, configuration, deployment):
             for node in nodes:
                 cli(node, ["lock"])
                 known_locked.add(node.name)
+            enter("controller-start")
             ui_control = DeliveryUiControl(options.delivery_ui_control.resolve(), repository, original_path,
                                             {"web": source, "android": receiver, "provider": provider}, configuration)
             ui_control.start()
+            enter("controller-published")
 
             def observers_ready():
                 require(ui_control.failure is None, "both actual UI observers remain healthy during pre-C0 pairing")

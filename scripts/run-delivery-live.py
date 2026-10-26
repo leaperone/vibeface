@@ -28,6 +28,13 @@ PUBLIC = ARTIFACTS / "live-public"
 UI = ARTIFACTS / "live-ui"
 UI_TIMEOUT_MS = 3_600_000
 LIVE_TIMEOUT_SECONDS = 20_700
+LIVE_PROGRESS = {
+    "inside": ("verify-inputs", "packaged-runtime", "node-rebuild", "guest-toolchain", "guest-build", "guest-info",
+               "probe-build", "evm-install", "paid-acceptance", "public-export"),
+    "paid": ("free-checks", "wallet-bootstrap", "first-proof-starting", "first-proof-observed", "receiver-crash",
+             "original-receipt-wait", "original-receipt-ready", "registration-reconcile", "registration-confirmed",
+             "controller-start", "controller-published"),
+}
 PROOFS = ["key-binding", *[f"relation-{relation}-window-{index}" for index in range(2) for relation in (2, 3, 4)]]
 ANDROID_ABIS = {"arm64-v8a": 183, "x86_64": 62}
 UI_EVENTS = ("prepared", "confirmed", "accepted", "offline-visible", "settled-offline", "saved")
@@ -211,8 +218,10 @@ def controller(value, path, body=None):
     return result["result"]
 
 
-def wait_owned(description, deadline, predicate, processes=()):
+def wait_owned(description, deadline, predicate, processes=(), observe=None):
     while time.monotonic() < deadline:
+        if observe is not None:
+            observe()
         if any(process.poll() is not None for process in processes):
             raise RuntimeError(description + " stopped before readiness")
         value = predicate()
@@ -342,8 +351,10 @@ def terminate_owned(process):
         process.wait(timeout=5)
 
 
-def join_owned(container, ui, android, deadline):
+def join_owned(container, ui, android, deadline, observe=None):
     while time.monotonic() < deadline:
+        if observe is not None:
+            observe()
         proof_status, ui_status = container.poll(), ui.poll()
         if proof_status not in (None, 0) or ui_status not in (None, 0) or android.poll() is not None:
             raise RuntimeError("A genuine proof, actual UI or dedicated Android process failed")
@@ -413,7 +424,7 @@ def dispatch(package_input, android_input, expected):
     if UI.is_symlink() or UI.stat().st_uid != os.getuid() or UI.stat().st_gid != os.getgid():
         raise ValueError("Live UI requires this host user's dedicated task directory")
     UI.chmod(0o700)
-    if any((UI / path).exists() or (UI / path).is_symlink() for path in ("control.json", "ordinary-paid-ui.bin", "android-sdk", "public", "e2e", "agent-device")):
+    if any((UI / path).exists() or (UI / path).is_symlink() for path in ("control.json", "ordinary-paid-ui.bin", "android-sdk", "public", "e2e", "agent-device", "inside-progress.json", "paid-progress.json")):
         raise ValueError("Live acceptance requires fresh task UI, Android and driver state")
     PUBLIC.mkdir(parents=True, mode=0o755, exist_ok=False)
     PUBLIC.chmod(0o755)
@@ -435,6 +446,7 @@ def dispatch(package_input, android_input, expected):
     name = "vdp-live-" + uuid.uuid4().hex
     deadline = time.monotonic() + LIVE_TIMEOUT_SECONDS
     success, cleanup_failure = False, False
+    observe = progress_observer(expected)
     previous_term = signal.getsignal(signal.SIGTERM)
 
     def interrupted(*_):
@@ -448,7 +460,7 @@ def dispatch(package_input, android_input, expected):
                                              stdout=proof_log, stderr=proof_log, start_new_session=True)
             control = UI / "control.json"
             descriptor = wait_owned("early paid UI pairing controller", deadline,
-                lambda: control_descriptor(control) if control.exists() else None, (proof_process, android.process))
+                lambda: control_descriptor(control) if control.exists() else None, (proof_process, android.process), observe=observe)
             facts = controller(descriptor, "/facts")
             if facts.get("stage") not in ("bootstrap", "inspections"):
                 raise ValueError("The first paid UI controller must expose pairing and inspections before ordinary mutations")
@@ -465,10 +477,16 @@ def dispatch(package_input, android_input, expected):
                 "--error-file", str(UI / "private-display.log"), "--server-args=-screen 0 1440x1000x24 -nolisten tcp",
                 "pnpm", "exec", "e2e", "run", "--config", "e2e.paid.config.ts", "--workers", "2", "--headed",
                 "--no-cache", "--retries", "0", "--video=off"], cwd=ROOT, env=environment, stdout=ui_log, stderr=ui_log, start_new_session=True)
-            join_owned(proof_process, ui_process, android.process, deadline)
+            join_owned(proof_process, ui_process, android.process, deadline, observe=observe)
             finalize_ui(android_provenance)
             success = True
-    except BaseException:
+    except BaseException as error:
+        observe()
+        reason = "deadline-exceeded" if isinstance(error, TimeoutError) else "interrupted" if isinstance(error, InterruptedError) else "failed"
+        try:
+            print("STAGE delivery-live host-stop " + reason, flush=True)
+        except OSError:
+            pass
         finish_failed_ui_evidence(proof_process, ui_process, descriptor, deadline)
         raise
     finally:
@@ -477,7 +495,7 @@ def dispatch(package_input, android_input, expected):
         finally:
             signal.signal(signal.SIGTERM, previous_term)
         if not success or cleanup_failure:
-            mark_host_failure(expected, "owned_cleanup_failed" if cleanup_failure else "live_ui_or_proof_failed")
+            mark_host_failure(expected, "owned_cleanup_failed" if cleanup_failure else "live_ui_or_proof_failed", observe())
         if cleanup_failure:
             raise RuntimeError("Live acceptance failed to confirm cleanup of its owned processes")
     print("PASS delivery-live thirteen genuine proofs and actual Web and Android paid delivery", flush=True)
@@ -589,6 +607,51 @@ def replace_public(file, value):
     write_private(temporary, value)
     temporary.chmod(0o644)
     os.replace(temporary, file)
+
+
+def progress_writer(actor, expected):
+    stages = LIVE_PROGRESS[actor]
+
+    def enter(stage):
+        if stage not in stages:
+            raise ValueError("Unknown live progress stage")
+        try:
+            replace_public(UI / (actor + "-progress.json"), {"schemaVersion": 1, "kind": "delivery-live-progress",
+                           "sourceCommit": expected, "stage": stage})
+        except OSError:
+            pass
+
+    return enter
+
+
+def progress_observer(expected):
+    seen, verified = {}, {}
+
+    def observe():
+        for actor, stages in LIVE_PROGRESS.items():
+            file = UI / (actor + "-progress.json")
+            try:
+                if not file.exists() and not file.is_symlink():
+                    continue
+                value = json.loads(regular(file, 1024))
+                if (not isinstance(value, dict) or set(value) != {"schemaVersion", "kind", "sourceCommit", "stage"}
+                        or type(value["schemaVersion"]) is not int or value["schemaVersion"] != 1
+                        or value["kind"] != "delivery-live-progress" or value["sourceCommit"] != expected
+                        or value["stage"] not in stages):
+                    raise ValueError("Invalid live progress snapshot")
+                stage = value["stage"]
+                verified[actor] = stage
+            except (OSError, ValueError, TypeError, KeyError):
+                stage = "unavailable"
+            if seen.get(actor) != stage:
+                seen[actor] = stage
+                try:
+                    print("STAGE delivery-live " + actor + " " + stage, flush=True)
+                except OSError:
+                    pass
+        return dict(verified)
+
+    return observe
 
 
 def public_proof(directory, name, relation):
@@ -1160,13 +1223,15 @@ def finalize_ui(android_provenance):
     replace_public(PUBLIC / "summary.json", summary)
 
 
-def mark_host_failure(expected, reason):
+def mark_host_failure(expected, reason, last_stages=None):
     file = PUBLIC / "summary.json"
     try:
         summary = json.loads(regular(file, 65536))
     except (OSError, ValueError):
         summary = {"schemaVersion": 1, "sourceCommit": expected}
     summary.update(status="FAIL", hostFailure=reason)
+    if last_stages:
+        summary["lastStages"] = last_stages
     replace_public(file, summary)
 
 
@@ -1194,6 +1259,7 @@ def inside(package, expected):
     public_ui = PUBLIC / "ui"
     if PUBLIC.is_symlink() or not PUBLIC.is_dir() or PUBLIC.stat().st_uid != int(owner[0]) or PUBLIC.stat().st_gid != int(owner[1]) or set(PUBLIC.iterdir()) != {public_ui} or public_ui.is_symlink() or not public_ui.is_dir() or public_ui.stat().st_uid != int(owner[0]) or public_ui.stat().st_gid != int(owner[1]) or list(public_ui.iterdir()):
         raise ValueError("The host must create one fresh public directory owned by its task user")
+    enter = progress_writer("inside", expected)
     log = run / "private-task.log"
     cgroup, initial = resources()
     summary = {"schemaVersion": 1, "status": "FAIL", "sourceCommit": expected, "mode": "local TestToken on loopback chain 31337",
@@ -1201,12 +1267,15 @@ def inside(package, expected):
     environment = {**os.environ, "CARGO_BUILD_JOBS": "2", "TOKIO_WORKER_THREADS": "2"}
     started = time.monotonic()
     try:
+        enter("verify-inputs")
         for component in ("crypto", "web"):
             command("verify " + component + " build inputs", ["python3", "scripts/build-inputs.py", "check", component], log)
         info = checked_package(package, expected)
         binary, module = package / "vibeface", package / "web/vibeface_secure.js"
         provenance = "same-run verified Linux package"
+        enter("packaged-runtime")
         if not runtime(binary, module, run / "packaged-runtime", log, environment):
+            enter("node-rebuild")
             flags = subprocess.check_output(["python3", "scripts/release-rustflags.py"], cwd=ROOT, env={**environment, "CARGO_TARGET_DIR": "/artifacts/node-target"}, text=True).strip()
             command("build current Node for sandbox libc", ["cargo", "+1.98.1", "build", "--release", "--locked", "-p", "vibeface", "--target-dir", "/artifacts/node-target"],
                     log, env={**environment, "CARGO_ENCODED_RUSTFLAGS": flags})
@@ -1216,16 +1285,21 @@ def inside(package, expected):
             provenance = "actual current-source build after explicit packaged GLIBC incompatibility"
         summary["node"] = {"origin": provenance, "sha256": digest(binary), "packageSourceCommit": info["source_commit"],
                            "webRuntimePassed": True, "wasmSha256": digest(package / "web/vibeface_secure_bg.wasm")}
+        enter("guest-toolchain")
         command("install fixed guest compiler", ["python3", "scripts/install-delivery-toolchain.py"], log, env=environment)
+        enter("guest-build")
         command("build canonical actual guest and host", ["bash", "proofs/delivery/build.sh"], log, env=environment)
         prover = Path("/artifacts/proof-target/release/vibeface-delivery-prover")
+        enter("guest-info")
         compiled = json.loads(subprocess.check_output([str(prover), "info"], cwd=ROOT, env=environment))
         checks = runpy.run_path(str(ROOT / "scripts/check-delivery.py"))
         profile = checks["load_profile"](compiled)
         summary["guest"] = compiled
         probe_target = Path("/artifacts/delivery-probe-target")
+        enter("probe-build")
         command("build real source-bound QUIC probe", ["cargo", "+1.98.1", "build", "--manifest-path", "tests/fixtures/delivery-probe/Cargo.toml", "--locked", "--target-dir", str(probe_target)],
                 log, env={**environment, "VIBEFACE_PROBE_SOURCE_ROOT": "/work"})
+        enter("evm-install")
         command("install local EVM dependencies", ["node", "contracts/delivery/install.mjs"], log)
         configuration = run / "acceptance.json"
         write_private(configuration, {"schema_version": 1, "deployment_file": str(run / "deployment.json"),
@@ -1234,10 +1308,12 @@ def inside(package, expected):
             "provider_gas_cap_wei": "1000000000000000000", "register_key_gas_cap_wei": "1000000000000000000",
             "settlement_observer": "/work/contracts/delivery/observe-settlement.mjs"})
         try:
+            enter("paid-acceptance")
             command("thirteen genuine proofs, actual Web and Android order and independent observers", ["python3", "scripts/verify-node.py", "--delivery", "--binary", str(binary),
                 "--crypto-module", str(module), "--artifacts", str(run / "process"), "--delivery-probe", str(probe_target / "debug/vibeface-delivery-probe"),
                 "--delivery-config", str(configuration), "--delivery-source-root", "/work", "--delivery-profile", "/work/proofs/delivery/profile.json",
-                "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log, env=environment)
+                "--delivery-ui-control", str(UI / "control.json"), "--delivery-ui-timeout-ms", str(UI_TIMEOUT_MS)], log,
+                env={**environment, "VIBEFACE_DELIVERY_PROGRESS_COMMIT": expected})
         except RuntimeError:
             summary["failureStage"] = "paid-process-acceptance"
             try:
@@ -1251,6 +1327,7 @@ def inside(package, expected):
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                 print("UNVERIFIED delivery-live strict-only partial evidence unavailable", flush=True)
             raise
+        enter("public-export")
         results = list((run / "process").glob("delivery-paid-*/summary.json"))
         if len(results) != 1:
             raise ValueError("Expected exactly one actual paid process acceptance result")
@@ -1386,6 +1463,70 @@ def self_test_ui(directory):
             assert cleanup_owned(host, running, running, "vdp-live-self-test", None, True) is True
             assert stop.call_count == 2
             host.close.assert_called_once()
+    progress_ui, progress_public = directory / "progress-private", directory / "progress-public"
+    progress_ui.mkdir(mode=0o700)
+    progress_public.mkdir(mode=0o700)
+    (progress_public / "ui").mkdir()
+    driver = runpy.run_path(str(ROOT / "scripts/verify-node.py"))
+    with patch(f"{__name__}.UI", progress_ui), patch(f"{__name__}.PUBLIC", progress_public), patch("builtins.print") as output:
+        enter = progress_writer("inside", "1" * 40)
+        observe = progress_observer("1" * 40)
+        assert not list(progress_ui.iterdir()) and observe() == {}
+        enter("guest-build")
+        options = argparse.Namespace(delivery_ui_control=progress_ui / "control.json")
+        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "1" * 40}), patch("runpy.run_path", return_value={"progress_writer": progress_writer}) as loader:
+            driver["delivery_progress"](options)("first-proof-starting")
+            loader.assert_called_once_with(str(ROOT / "scripts/run-delivery-live.py"))
+        expected = {"inside": "guest-build", "paid": "first-proof-starting"}
+        assert observe() == expected and len(output.call_args_list) == 2
+        assert observe() == expected and len(output.call_args_list) == 2
+        assert set(progress_public.iterdir()) == {progress_public / "ui"}
+        enter("probe-build")
+        with patch("time.monotonic", side_effect=[0, 2]), patch("time.sleep"):
+            try:
+                wait_owned("pending command", 1, lambda: None, (running,), observe=observe)
+            except TimeoutError as error:
+                assert str(error) == "pending command exceeded its explicit runtime limit"
+            else:
+                raise AssertionError("Progress must not accept an unfinished command")
+        assert output.call_args_list[-1].args == ("STAGE delivery-live inside probe-build",)
+        expected["inside"] = "probe-build"
+        original = RuntimeError("private-business-error")
+        with patch("time.monotonic", return_value=0):
+            try:
+                wait_owned("failing command", 1, Mock(side_effect=original), observe=observe)
+            except RuntimeError as error:
+                assert error is original
+        enter("paid-acceptance")
+        with patch("time.monotonic", side_effect=[0, 2]), patch("time.sleep"):
+            rejected(lambda: join_owned(running, ready, running, 1, observe=observe))
+        assert output.call_args_list[-1].args == ("STAGE delivery-live inside paid-acceptance",)
+        expected["inside"] = "paid-acceptance"
+        snapshot = progress_ui / "paid-progress.json"
+        valid = json.loads(snapshot.read_bytes())
+        for changed in ({**valid, "stage": "private-wallet-marker"}, {**valid, "sourceCommit": "2" * 40},
+                        {**valid, "witness": "private-wallet-marker"}, {**valid, "schemaVersion": True}):
+            replace_public(snapshot, changed)
+            assert observe() == expected
+        snapshot.write_bytes(b"x" * 1025)
+        assert observe() == expected
+        snapshot.unlink()
+        snapshot.symlink_to(progress_ui / "inside-progress.json")
+        assert observe() == expected
+        mark_host_failure("1" * 40, "live_ui_or_proof_failed", observe())
+        summary = json.loads((progress_public / "summary.json").read_bytes())
+        assert summary["status"] == "FAIL" and summary["lastStages"] == expected
+        assert "private-" not in json.dumps(summary) + str(output.call_args_list)
+        assert set(progress_public.iterdir()) == {progress_public / "ui", progress_public / "summary.json"}
+        rejected(lambda: enter("private-wallet-marker"))
+        with patch(f"{__name__}.replace_public", side_effect=OSError("private-observation-error")):
+            enter("guest-build")
+        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "1" * 40}), patch("runpy.run_path") as loader:
+            driver["delivery_progress"](argparse.Namespace(delivery_ui_control=None))("first-proof-starting")
+            loader.assert_not_called()
+        with patch.dict(os.environ, {"VIBEFACE_DELIVERY_PROGRESS_COMMIT": "private-wallet-marker"}), patch("runpy.run_path") as loader:
+            driver["delivery_progress"](options)("first-proof-starting")
+            loader.assert_not_called()
     def checked_android_homes(*args, env, **kwargs):
         for variable, name in (("ANDROID_USER_HOME", "android-user"), ("ANDROID_EMULATOR_HOME", "android-emulator"), ("ANDROID_AVD_HOME", "avd")):
             home = Path(env[variable])
