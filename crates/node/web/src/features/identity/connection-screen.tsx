@@ -269,7 +269,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           </p>}
           {thisComputer
             ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
-            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName(device.identity?.deviceId)} /></Field>}
+            : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></Field>}
           {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
         </fieldset>
       </form>}
