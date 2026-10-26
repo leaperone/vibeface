@@ -209,7 +209,8 @@ function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; ic
   </SidebarMenuItem>
 }
 
-export function ConnectionCapsule() {
+/** `side`: where the details open; the phone home list puts it below, so the Bot list above stays in view. */
+export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" }) {
   const workspace = useWorkspace()
   const device = useDevice()
   const { link, entrances } = device
@@ -239,7 +240,7 @@ export function ConnectionCapsule() {
       </button>
     </Popover.Trigger>
     <Popover.Portal>
-      <Popover.Content side="top" align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
+      <Popover.Content side={side} align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">{terms.address.label}</p>
         <p className="break-all text-muted-foreground" title={address}>{hostOf(address) || address}</p>
         {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>

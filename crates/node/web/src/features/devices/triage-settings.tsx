@@ -83,7 +83,7 @@ export function TriageSettings() {
         <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${project.prefix}`} title="移除" disabled={Boolean(busy)} onClick={() => void save("projects", { projects: config.projects.filter((item) => item.prefix !== project.prefix) })}><X aria-hidden="true" /></Button>
       </li>)}</ul> : null}
       <div className="flex min-w-0 gap-2">
-        <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/path/to/project" value={prefix} disabled={Boolean(busy)} onChange={(event) => setPrefix(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addProject() } }} />
+        <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={prefix} disabled={Boolean(busy)} onChange={(event) => setPrefix(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addProject() } }} />
         <Button type="button" variant="outline" disabled={Boolean(busy) || !prefix.trim()} onClick={addProject}><Plus aria-hidden="true" />添加</Button>
       </div>
     </SettingsDisclosure>
