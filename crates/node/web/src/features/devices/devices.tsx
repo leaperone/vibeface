@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
 import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
+import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -65,7 +65,6 @@ function useEntryLabel() {
 export function DevicesPage() {
   const device = useDevice()
   const rows = useDeviceRows()
-  const { nodes } = useWorkspace()
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
@@ -89,12 +88,6 @@ export function DevicesPage() {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
-    {device.directory?.revoked.length ? <Details label={`已移除的设备（${device.directory.revoked.length}）`}>
-      <ul className="grid gap-1">{device.directory.revoked.map((item) => <li key={item.device_id} title={item.device_id} className="flex min-h-8 items-center gap-2">
-        <terms.remove.icon aria-hidden="true" className="size-4 shrink-0" />
-        <span className="min-w-0 truncate">{nodes.find((node) => node.device_id === item.device_id)?.name || device.knownName(item.device_id) || `设备 ${item.device_id.slice(0, 4).toUpperCase()}`}</span>
-      </li>)}</ul>
-    </Details> : null}
   </div>
 }
 
