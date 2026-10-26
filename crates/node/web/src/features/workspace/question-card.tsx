@@ -135,7 +135,7 @@ function Lines({ lines, className }: { lines: string[]; className?: string }) {
  */
 function Settled({ ask, lines, mark, focus = false, role, children }: { ask: string; lines: string[]; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
   const line = <span role={role} className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-    <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0">{ask}</span>
+    <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={ask}>{ask}</span>
     <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{children}</span>
   </span>
   const settled = "flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 outline-none"

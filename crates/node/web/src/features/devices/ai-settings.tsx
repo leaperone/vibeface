@@ -313,10 +313,10 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
       <div className="flex flex-wrap items-center gap-2">
         <Button asChild variant="outline" size="sm"><a href={install.codex} target="_blank" rel="noopener noreferrer"><Download aria-hidden="true" />怎么装</a></Button>
-        <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => turnOn(asked ?? "bot")}><BusyIcon busy={busy === `${item.provider}:${asked ?? "bot"}`} icon={RotateCw} />再找一次</Button>
+        {asked ? <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => turnOn(asked)}><BusyIcon busy={busy === `${item.provider}:${asked}`} icon={RotateCw} />再找一次</Button> : null}
       </div>
       <ManualCodex onboarding={onboarding} working={working} busy={busy} save={manual} />
-    </div> : issue?.code === "env_missing" ? <KeyField name={issue.name} working={working} busy={busy === `${item.provider}:env:${issue.name}`} more={item.issues.length - 1} save={saveKey} />
+    </div> : issue?.code === "env_missing" ? <KeyField key={issue.name} name={issue.name} working={working} busy={busy === `${item.provider}:env:${issue.name}`} more={item.issues.length - 1} save={saveKey} />
     : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
@@ -397,7 +397,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
       <KeyRound aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
     </label>
     <div className="flex min-w-0 gap-2">
-      <Input id={`key-${name}`} type="password" autoComplete="off" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
+      <Input id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
         value={value} disabled={working} onChange={(event) => setValue(event.target.value)} />
       <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
     </div>
