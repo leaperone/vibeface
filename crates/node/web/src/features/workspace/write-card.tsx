@@ -3,26 +3,25 @@ import { Link } from "@tanstack/react-router"
 import { Copy, Lock } from "lucide-react"
 import { ActionCard, DetailRow, Details } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
-import { useDevice } from "@/features/identity/context"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { terms } from "@/lib/glossary"
-import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
-import type { ConflictVersion } from "./types"
+import type { ConflictVersion } from "@vibeface/client/workspace/types.ts"
 
 export type WriteCardKind = "read_only" | "forked" | "conflicts"
 
 const summary = (version: ConflictVersion | null) => {
   if (!version) return "这台设备上没有"
   const text = version.body.text
-  return `${new Date(version.created_at_ms).toLocaleString()} · ${typeof text === "string" && text ? text.slice(0, 120) : String(version.body.type ?? "")}`
+  return `${new Date(version.created_at_ms).toLocaleString('zh-CN')} · ${typeof text === "string" && text ? text.slice(0, 120) : String(version.body.type ?? "")}`
 }
 
 function Steps({ items }: { items: string[] }) {
   return <ol className="grid list-decimal gap-1 ps-5 text-muted-foreground">{items.map((item) => <li key={item}>{item}</li>)}</ol>
 }
 
-/** 只读确认 and the two copies of a device's records, from docs/design/unified-network.md 5.7 and 5.8. */
 export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const workspace = useWorkspace()
   const device = useDevice()
@@ -31,13 +30,15 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const entry = device.ready?.entry.device_id
   const here = entry ? nodeName(entry, lookup) : "这台设备"
   const canManage = device.ready?.principal.can_manage === true
+  const away = workspace.nodes.filter((node) => !node.revoked && !node.online && node.device_id !== entry).map((node) => nodeName(node.device_id, lookup)).join("、")
+  const unreached = `${away ? `${away} ` : "其他设备都"}连不上，没法确认数据是最新的。`
   if (kind === "read_only") return <ActionCard icon={Lock} title={`${here} 暂时只读`} actions={!canManage ? undefined : waiting
     ? <Button type="button" variant="ghost" onClick={() => setWaiting(false)}>返回</Button>
     : <>
       <Button type="button" variant="ghost" onClick={() => setWaiting(true)}>是，等其他设备</Button>
       <ActionButton variant="default" action={() => workspace.confirmWritable()}>不是，继续使用</ActionButton>
     </>}>
-    <p className="text-muted-foreground">{!canManage ? "其他设备都连不上，没法确认数据是最新的。打开其他设备，或在管理设备上确认。" : waiting ? "打开你的其他设备，连上后会自动同步，然后就能用。" : "其他设备都连不上，没法确认数据是最新的。它是从备份恢复的吗？"}</p>
+    <p className="text-muted-foreground">{!canManage ? `${unreached}打开其他设备，或在管理设备上确认。` : waiting ? `打开${away ? ` ${away}` : "你的其他设备"}，连上后会自动同步，然后就能用。` : `${unreached}它是从备份恢复的吗？`}</p>
   </ActionCard>
   const conflicts = workspace.writeState.conflicts
   const authors = [...new Set(conflicts.map((item) => item.author))]

@@ -1,6 +1,6 @@
 import { createFileRoute, Outlet } from '@tanstack/react-router'
 import { useEffect } from 'react'
-import { useWorkspace } from '@/features/workspace/context'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 
 export const Route = createFileRoute('/_app/b/$botId')({ component: ChatRoute })
 

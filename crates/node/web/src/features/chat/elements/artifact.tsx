@@ -1,22 +1,15 @@
-import { Paperclip } from 'lucide-react'
+import { Download, Eye, EyeOff, File } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import { useWorkspace } from '@/features/workspace/context'
-import { formatSize } from '@/features/workspace/model'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { formatSize } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/features/workspace/present'
+import { FileName } from './prompt-input'
+import type { Attachment } from '@vibeface/client/chat/types.ts'
 
-const signatures: Array<[number[], string]> = [[[0x89, 0x50, 0x4e, 0x47], 'png'], [[0xff, 0xd8, 0xff], 'jpg'], [[0x47, 0x49, 0x46], 'gif'], [[0x25, 0x50, 0x44, 0x46], 'pdf'], [[0x50, 0x4b, 0x03, 0x04], 'zip']]
-
-/** Messages keep only the hash, so the name comes from the content: a few known formats, else text or bin. */
-function extension(bytes: Uint8Array) {
-  const known = signatures.find(([magic]) => magic.every((byte, index) => bytes[index] === byte))
-  if (known) return known[1]
-  try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); return 'txt' } catch { return 'bin' }
-}
-
-/** A long result, or a file the user attached (`attachment`). */
-export function Artifact({ hash, size, attachment = false }: { hash: string; size: number; attachment?: boolean }) {
+/** A file the user attached: read it here as text, or download it under its own name. */
+export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
   const workspace = useWorkspace()
   const [content, setContent] = useState('')
   const [nextOffset, setNextOffset] = useState<number | null>(0)
@@ -41,11 +34,16 @@ export function Artifact({ hash, size, attachment = false }: { hash: string; siz
     } finally { if (inFlight.current === generation) inFlight.current = null; setReadingGeneration(owner => owner === generation ? null : owner) }
   }
   return <Card className="w-full min-w-0 gap-0 py-0">
-    <CardContent className="space-y-3 p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="mr-auto flex items-center gap-1.5 text-sm">{attachment ? <Paperclip aria-hidden="true" className="size-4" /> : null}{attachment ? '附件' : '完整结果'} · {formatSize(size)}</span>
-        {!opened ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}>{attachment ? '打开' : '打开结果'}</ActionButton> : <Button type="button" variant="ghost" onClick={() => setOpened(false)}>收起结果</Button>}
-        <ActionButton disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
+    <CardContent className={opened ? 'space-y-3 p-3' : 'py-1 ps-3 pe-1'}>
+      <div className="flex items-center gap-1">
+        <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5 text-sm">
+          <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0" title={name}><FileName name={name} /></span>
+          <span className="shrink-0 text-meta text-muted-foreground">{formatSize(size)}</span>
+        </span>
+        {!opened ? <ActionButton variant="ghost" label="打开" disabled={!workspace.connectionOnline || reading} action={() => workspace.run(async () => { if (nextOffset === 0) await readNext(); else setOpened(true) }, '打开')}><Eye aria-hidden="true" /></ActionButton>
+          : <Button type="button" variant="ghost" size="icon" aria-label="收起" title="收起" onClick={() => setOpened(false)}><EyeOff aria-hidden="true" /></Button>}
+        <ActionButton variant="ghost" label="下载" disabled={!workspace.connectionOnline} action={() => workspace.run(async () => {
           const parts: Uint8Array<ArrayBuffer>[] = []
           let offset: number | null = 0
           while (offset !== null) {
@@ -62,14 +60,14 @@ export function Artifact({ hash, size, attachment = false }: { hash: string; siz
           const url = URL.createObjectURL(new Blob([whole]))
           const link = document.createElement('a')
           link.href = url
-          link.download = `${attachment ? 'attachment' : 'result'}-${hash.slice(0, 12)}.${extension(whole)}`
+          link.download = name
           link.click()
           window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-        }, '下载')}>下载</ActionButton>
+        }, '下载')}><Download aria-hidden="true" /></ActionButton>
       </div>
       {opened ? <>
-        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '结果为空。'}</pre>
-        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-xs text-muted-foreground">已读取完整结果。</p>}
+        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '文件是空的'}</pre>
+        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-xs text-muted-foreground">已显示全部内容</p>}
       </> : null}
     </CardContent>
   </Card>

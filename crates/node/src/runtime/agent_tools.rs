@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    store::assistant::{ChangeRequest, change_id},
+    store::{
+        bot_settings::{ChangeRequest, bot_message_id, change_id},
+        bots::created_bot_id,
+    },
     tools::{Effect, Tool},
     work::{Dispatch, DispatchState, WorkSpec},
 };
@@ -59,6 +62,21 @@ impl Runtime {
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
         );
+        if let Some(manager) = &access.manager
+            && tool.effect() != Effect::Read
+        {
+            let kind = self
+                .store
+                .lock()
+                .await
+                .scheduler_job(&scope, &manager.trigger)?
+                .context("this turn is not running here")?
+                .kind;
+            ensure!(
+                tool.effect().offered(kind),
+                "{name} is not offered in a {kind:?} turn"
+            );
+        }
         let _lease =
             tokio::time::timeout(Duration::from_secs(20), self.manager_tool_lease(&access))
                 .await
@@ -100,10 +118,188 @@ impl Runtime {
                 if let Some(dispatch) = store.dispatch(&id)? {
                     return Ok(dispatch_value(&dispatch));
                 }
-                let change = store
-                    .assistant_change(network, &change_id(&scope, &manager.trigger, call_ref))?
-                    .context("nothing was dispatched or changed with this call_ref")?;
-                Ok(json!(change))
+                if let Some(change) =
+                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
+                {
+                    return Ok(json!(change));
+                }
+                if let Some(message) = store
+                    .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
+                {
+                    return Ok(json!(message));
+                }
+                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
+                let bot = store
+                    .bots(network)?
+                    .into_iter()
+                    .find(|bot| bot.bot_id == bot_id)
+                    .context(
+                        "nothing was dispatched, changed, sent or created with this call_ref",
+                    )?;
+                Ok(json!(bot))
+            }
+            Tool::Recall => {
+                let query = args["query"].as_str().map(str::to_lowercase);
+                let notes: Vec<_> = self
+                    .store
+                    .lock()
+                    .await
+                    .memories(network, &scope)?
+                    .into_iter()
+                    .filter(|note| {
+                        query
+                            .as_ref()
+                            .is_none_or(|query| note.text.to_lowercase().contains(query))
+                    })
+                    .collect();
+                Ok(json!({ "memory": notes }))
+            }
+            Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
+            Tool::ListBots => {
+                let now = now_ms();
+                let store = self.store.lock().await;
+                let mut bots = Vec::new();
+                for bot in store.bots(network)? {
+                    let schedules: Vec<_> = store
+                        .schedules(network, &bot.conversation_id)?
+                        .iter()
+                        .filter(|entry| crate::scheduling::ahead(&entry.schedule, now))
+                        .map(|entry| {
+                            json!({"name":entry.schedule.name,"every_minutes":entry.schedule.every_minutes,
+                                "enabled":entry.schedule.enabled,
+                                "next_run_at_ms":crate::scheduling::next_run(&entry.schedule, now)})
+                        })
+                        .collect();
+                    let instructions: String = bot.instructions.chars().take(200).collect();
+                    bots.push(
+                        json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
+                        "name":bot.name,"instructions":instructions,
+                        "instructions_truncated":instructions.len() < bot.instructions.len(),
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,
+                        "schedules":schedules,"this_bot":bot.conversation_id == scope}),
+                    );
+                }
+                Ok(json!({ "bots": bots }))
+            }
+            Tool::ReadBot => {
+                let now = now_ms();
+                let store = self.store.lock().await;
+                let bot = store.find_bot(network, field(&args, "bot")?)?;
+                let schedules: Vec<_> = store
+                    .schedules(network, &bot.conversation_id)?
+                    .iter()
+                    .map(|entry| crate::scheduler::schedule_row(entry, now))
+                    .collect();
+                let memory = store.memories(network, &bot.conversation_id)?;
+                let library = store.skills(network)?;
+                let skills = bot.skills.as_ref().map(|set| {
+                    library
+                        .iter()
+                        .filter(|entry| set.contains(&entry.skill_id))
+                        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
+                        .collect::<Vec<_>>()
+                });
+                Ok(
+                    json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
+                    "instructions":bot.instructions,"project":bot.project,
+                    "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+                    "schedules":schedules,"memory":memory}),
+                )
+            }
+            Tool::DeleteBot => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("deleting a bot requires an agent invocation")?;
+                let (deleted, event) = self.store.lock().await.delete_bot_in_turn(
+                    &self.identity,
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    field(&args, "bot")?,
+                    now_ms(),
+                )?;
+                if let Some(event) = &event {
+                    self.bot_deleted(network, &deleted, &event.hash);
+                }
+                Ok(
+                    json!({"conversation_id":deleted,"deleted":true,"written":event.is_some(),
+                    "primary":self.store.lock().await.primary_bot(network)?}),
+                )
+            }
+            Tool::CreateBot => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("creating a bot requires an agent invocation")?;
+                let call_ref = field(&args, "call_ref")?;
+                let optional = |key: &str| args[key].as_str().filter(|value| !value.is_empty());
+                let project = match (optional("project_node"), optional("project_cwd")) {
+                    (Some(node), Some(cwd)) => Some(BotProject {
+                        target_node: node.into(),
+                        cwd: cwd.into(),
+                    }),
+                    (None, None) => None,
+                    _ => bail!("give project_node and project_cwd together"),
+                };
+                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
+                let existing = self
+                    .store
+                    .lock()
+                    .await
+                    .bots(network)?
+                    .iter()
+                    .any(|bot| bot.bot_id == bot_id);
+                if !existing && let Some(project) = &project {
+                    self.validate_bot_project(network, project).await?;
+                }
+                let (bot, created) = self.store.lock().await.create_bot_in_turn(
+                    &self.identity,
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    call_ref,
+                    (
+                        field(&args, "name")?,
+                        optional("instructions").unwrap_or(""),
+                        project,
+                    ),
+                    now_ms(),
+                )?;
+                if created {
+                    self.publish_changed(
+                        network,
+                        &bot.conversation_id,
+                        Changed::Event(&bot.event_hash),
+                    );
+                }
+                Ok(json!(bot))
+            }
+            Tool::MessageBot => {
+                let manager = access
+                    .manager
+                    .as_ref()
+                    .context("messaging a bot requires an agent invocation")?;
+                let (message, receipt, written) = self.store.lock().await.message_bot(
+                    &self.identity,
+                    network,
+                    &scope,
+                    &manager.trigger,
+                    field(&args, "call_ref")?,
+                    field(&args, "bot")?,
+                    field(&args, "text")?,
+                    now_ms(),
+                )?;
+                if written {
+                    self.publish_changed(
+                        network,
+                        &receipt.conversation_id,
+                        Changed::Event(&message.event_hash),
+                    );
+                    self.schedule_wakeup.notify_one();
+                    self.outbox_wakeup.notify_one();
+                }
+                Ok(json!({"message":message,"delivery":receipt}))
             }
             Tool::ReadSkill => {
                 let id = field(&args, "skill_id")?;
@@ -118,14 +314,18 @@ impl Runtime {
                 Ok(value)
             }
             Tool::UpdateProfile
+            | Tool::ConfigureBot
             | Tool::SaveSkill
             | Tool::RemoveSkill
-            | Tool::SaveRoutine
-            | Tool::RemoveRoutine => {
+            | Tool::SaveSchedule
+            | Tool::RemoveSchedule
+            | Tool::Remember
+            | Tool::Forget
+            | Tool::Remind => {
                 let manager = access
                     .manager
                     .as_ref()
-                    .context("assistant changes require an agent invocation")?;
+                    .context("bot changes require an agent invocation")?;
                 let call_ref = field(&args, "call_ref")?.to_owned();
                 let mut request = args;
                 let fields = request
@@ -134,25 +334,35 @@ impl Runtime {
                 fields.remove("call_ref");
                 fields.insert("tool".into(), json!(name));
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
-                    anyhow::anyhow!("{error}. Model, provider and folders change only in Settings")
+                    anyhow::anyhow!("{error}. Provider and folders change only in Settings")
                 })?;
-                let (record, written) = self.store.lock().await.change_assistant(
+                let provider = crate::providers::Provider::of(
+                    self.settings_snapshot()
+                        .manager
+                        .context("this Node has no configured management SDK")?
+                        .provider,
+                );
+                let (record, written) = self.store.lock().await.change_bot(
                     &self.identity,
                     network,
                     &scope,
                     &manager.trigger,
                     &call_ref,
                     request,
+                    provider,
                     now_ms(),
                 )?;
                 if written {
-                    self.publish_changed(network, &scope, Changed::Event(&record.event_hash));
+                    self.publish_changed(
+                        network,
+                        &record.conversation_id,
+                        Changed::Event(&record.event_hash),
+                    );
                 }
                 Ok(json!(record))
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
             Tool::BindWork => self.bind_work(network, &scope, &args).await,
-            // The wait holds neither the invocation's admission nor maintenance.
             Tool::WaitCodex => {
                 drop((_lease, _work));
                 Ok(json!({"connected": self.codex.ready().await}))
@@ -175,6 +385,28 @@ impl Runtime {
             Tool::InterruptWork => {
                 let id = field(&args, "work_id")?;
                 self.stop_work(network, &scope, id).await
+            }
+            Tool::HandOverSession => {
+                let target = match (args["to"].as_str(), args["stop_following"] == true) {
+                    (Some(bot), false) => Some(
+                        self.store
+                            .lock()
+                            .await
+                            .find_bot(network, bot)?
+                            .conversation_id,
+                    ),
+                    (None, true) => None,
+                    _ => bail!("give either to or stop_following=true"),
+                };
+                self.hand_over_session(
+                    network,
+                    &scope,
+                    field(&args, "node")?,
+                    field(&args, "session_id")?,
+                    field(&args, "version")?,
+                    target.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -205,7 +437,7 @@ impl Runtime {
     }
 
     /// Registers a dispatch before anything is sent. On this device it returns `may_send` only to
-    /// the call that created the work; another device's assistant gets the task instead.
+    /// the call that created the work; another device's bot gets the task instead.
     async fn track_work(
         self: &Arc<Self>,
         access: &Access,
@@ -221,7 +453,6 @@ impl Runtime {
         vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
         let local = self.identity.device_id()?;
         let optional = |key: &str| args[key].as_str().map(String::from);
-        // An agent task's turn only starts work here, as children of its task.
         let task = manager.trigger.strip_prefix("task:");
         let target = match task {
             Some(_) => local.clone(),
@@ -237,6 +468,14 @@ impl Runtime {
             ensure!(
                 args["continues"].is_null(),
                 "thread and continues are exclusive"
+            );
+            ensure!(
+                self.store
+                    .lock()
+                    .await
+                    .native_thread_conversation(thread)?
+                    .is_none(),
+                "this thread is a bot's own reply thread; message that bot with message_bot instead"
             );
         }
         let spec = WorkSpec {
@@ -267,10 +506,7 @@ impl Runtime {
             return Ok(dispatch_value(&dispatch));
         }
         ensure!(
-            self.providers().serves(
-                crate::providers::Provider::Codex,
-                crate::providers::Role::Execution
-            ),
+            self.providers().switches.execution,
             "Codex execution is turned off on this device"
         );
         let cwd = spec.cwd.clone();

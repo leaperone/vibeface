@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react"
 import { useNavigate } from "@tanstack/react-router"
+import { Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BusyIcon, InlineError } from "@/components/app/kit"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
@@ -9,12 +10,12 @@ import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Textarea } from "@/components/ui/textarea"
-import { useDevice } from "@/features/identity/context"
-import { messageOf } from "@/lib/node"
-import { useWorkspace } from "./context"
-import { nodeName } from "./labels"
-import { projectName } from "./questions"
-import type { BotProject } from "./types"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { messageOf } from "@vibeface/client/lib/node.ts"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { projectName } from "@vibeface/client/workspace/questions.ts"
+import type { BotProject } from "@vibeface/client/workspace/types.ts"
 
 type BotFormProps = {
   open: boolean
@@ -38,6 +39,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const submitting = useRef(false)
   const wasOpen = useRef(false)
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
+  // Folders come only from devices that run a bot, so with none of those the hint points at setting one up.
+  const botDevice = workspace.nodes.some((node) => !node.revoked && node.online && node.capabilities?.manager)
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.capabilities?.manager) return []
     const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
@@ -63,7 +66,8 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (submitting.current || !event.currentTarget.reportValidity()) return
+    if (submitting.current) return
+    if (!pending && !name.trim()) { setError("还没填名称"); return }
     const selected = selectedProject ? projects.find((item) => item.key === selectedProject) : undefined
     if (!pending && selectedProject && !selected) {
       setError("这个文件夹现在用不了，换一个或不选。")
@@ -74,7 +78,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
       const bot = await workspace.createBot(pending ? {
         name: pending.name, instructions: pending.instructions, project: pending.project,
       } : {
-        name, instructions, project: selected?.project,
+        name: name.trim(), instructions, project: selected?.project,
       })
       if (workspace.isCurrent()) { onOpenChange(false); if (bot) void navigate({ to: "/b/$botId", params: { botId: bot.bot_id } }) }
     } catch (cause) { if (workspace.isCurrent()) setError(messageOf(cause)) }
@@ -85,14 +89,14 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent className="!w-full overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <SheetHeader className="pr-14">
-          <SheetTitle>{pending ? "再试一次" : "新助手"}</SheetTitle>
+          <SheetTitle>{pending ? "再试一次" : "新 Bot"}</SheetTitle>
           <SheetDescription className={pending ? undefined : "sr-only"}>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>
         </SheetHeader>
-        <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" onSubmit={(event) => { void submit(event) }}>
+        <form className="space-y-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]" noValidate onSubmit={(event) => { void submit(event) }}>
           {pending && rejected && !busy ? <p role="status" className="rounded-lg bg-muted p-3 text-meta">上次没建成，确认后可以修改。</p> : null}
           <Field>
             <FieldLabel htmlFor="bot-name">名称</FieldLabel>
-            <Input id="bot-name" name="bot-name" className="min-h-11" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目助手" />
+            <Input id="bot-name" name="bot-name" className="min-h-11" autoComplete="off" required maxLength={512} value={name} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="例如：项目 Bot" />
           </Field>
           <Field>
             <FieldLabel htmlFor="bot-instructions">它负责什么 <span className="font-normal text-muted-foreground">可选</span></FieldLabel>
@@ -107,14 +111,14 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
                 {projects.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect>
             )}
-            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">还没有可用的文件夹，可在「设备」里添加</FieldDescription>}
+            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">{botDevice ? "还没有可用的文件夹，可在「设备」里添加" : "设备能运行 Bot 后就能选"}</FieldDescription>}
           </Field>
           <InlineError error={error} />
-          <div className="flex flex-wrap gap-3">
-            <Button type="submit" className="min-h-11" disabled={busy || !workspace.writable} aria-busy={busy}>
-              <BusyIcon busy={busy} />{pending ? "再试一次" : "创建"}
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>取消</Button>
+            <Button type="submit" disabled={busy || !workspace.writable} aria-busy={busy || undefined}>
+              <BusyIcon busy={busy} icon={Plus} />{pending ? "再试一次" : "创建"}
             </Button>
-            <Button type="button" className="min-h-11" variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
           </div>
           {!workspace.writable ? <p role="status" className="text-meta text-muted-foreground">{workspace.writeNotice || "连上后就能创建。"}</p> : null}
         </form>

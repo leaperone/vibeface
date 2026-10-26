@@ -83,6 +83,22 @@ impl LocalIdentity {
             ),
         }
     }
+    /// The recovery key of `sign_network_fixture`'s network in `epoch`.
+    #[cfg(test)]
+    pub(crate) fn fixture_root_at(&self, epoch: u64) -> Self {
+        match epoch {
+            0 | 1 => self.fixture_root(),
+            _ => Self {
+                secret_key_hex: digest(
+                    format!(
+                        "vibeface:network-fixture-root:{epoch}:{}",
+                        self.secret_key_hex
+                    )
+                    .as_bytes(),
+                ),
+            },
+        }
+    }
     #[cfg(test)]
     pub fn fixture_network_id(&self) -> Result<String> {
         self.fixture_root().device_id()
@@ -110,10 +126,12 @@ impl LocalIdentity {
         match &mut body {
             EventBody::ConversationOwner { attestation, .. }
             | EventBody::BotCreated { attestation, .. }
+            | EventBody::BotDeleted { attestation, .. }
             | EventBody::MessagePosted { attestation, .. }
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
-            | EventBody::PrimaryAssistantSet { attestation, .. } => *attestation = value,
+            | EventBody::PrimaryBotSet { attestation, .. }
+            | EventBody::ScheduleControlled { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
         Ok(body)
@@ -125,6 +143,7 @@ impl LocalIdentity {
             scheduler_node: node.into(),
             epoch: 1,
             attestation: None,
+            cause: None,
         };
         let attestation = self
             .fixture_admin()
@@ -160,10 +179,22 @@ impl LocalIdentity {
             members.push(Member::new(&node, IdentityKind::Node, &name, false)?);
         }
         let mut state = NetworkState::new(genesis)?;
-        let epoch = revision
-            .checked_add(1)
-            .context("network fixture revision overflow")?;
-        state.recover(RootCheckpoint::create(&root, epoch, members, vec![])?)?;
+        for epoch in 2..=revision {
+            let next = self.fixture_root_at(epoch).device_id()?;
+            let signer = self.fixture_root_at(epoch - 1);
+            state.recover(RootCheckpoint::rotation(&state, &signer, &next, 0)?)?;
+        }
+        let epoch = revision + 1;
+        let next = self.fixture_root_at(epoch).device_id()?;
+        let signer = self.fixture_root_at(epoch - 1);
+        state.recover(RootCheckpoint::recovery(
+            &state,
+            &signer,
+            &next,
+            members,
+            vec![],
+            0,
+        )?)?;
         Ok(state)
     }
 }
@@ -201,8 +232,8 @@ fn verify(public_key: &str, signature: &str, message: &[u8]) -> Result<()> {
     key.verify_strict(message, &signature)
         .context("invalid signature")
 }
-/// Checks the event and its author's signature; the author's `DeviceId` is its public key.
-pub fn verify_signed_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
+#[cfg(test)]
+fn verify_signed_event(network_id: &str, event: &SignedEvent) -> Result<Event> {
     let body = check_event(network_id, event)?;
     verify_event_signature(event, &body.author)?;
     Ok(body)
@@ -275,19 +306,25 @@ fn validate_attestation(event: &Event) -> Result<()> {
             answers: Some(_),
             ..
         } => UserSignature::Optional,
+        // A bot created in another bot's turn stands on the user's message; see `store::log`.
+        EventBody::ConversationOwner { cause: Some(_), .. }
+        | EventBody::BotCreated { cause: Some(_), .. }
+        | EventBody::BotDeleted { cause: Some(_), .. } => UserSignature::Forbidden,
         EventBody::MessagePosted {
             role: Role::User, ..
         }
         | EventBody::ConversationOwner { .. }
         | EventBody::BotCreated { .. }
+        | EventBody::BotDeleted { .. }
         | EventBody::NotificationAcked { .. }
-        | EventBody::PrimaryAssistantSet { .. } => UserSignature::Required,
+        | EventBody::PrimaryBotSet { .. }
+        | EventBody::ScheduleControlled { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
             ..
         } => UserSignature::Optional,
         // It stands on the user's signed message among its parents; see `store::log`.
-        EventBody::AssistantChanged { .. } => UserSignature::Forbidden,
+        EventBody::BotChanged { .. } => UserSignature::Forbidden,
         _ => UserSignature::Forbidden,
     };
     match (rule, event.body.attestation()) {
@@ -313,13 +350,20 @@ pub fn verify_attestation(network_id: &str, scope_id: &str, body: &EventBody) ->
     .context("the device signature does not match this write")
 }
 
-/// Assistants' questions start with `q-`; questions about sessions no assistant owns with `s-`.
-fn question_id(scope: &str, question: &str) -> Result<()> {
+/// Bots' questions start with `q-`.
+fn question_id(question: &str) -> Result<()> {
     vibeface_protocol::validate_id(question).map_err(anyhow::Error::msg)?;
-    let prefix = if scope == SESSIONS_SCOPE { "s-" } else { "q-" };
+    ensure!(question.starts_with("q-"), "a question ID starts with q-");
+    Ok(())
+}
+
+/// A bot's turn creates another conversation; the cause sits in the creating one.
+fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
+    vibeface_protocol::validate_id(&cause.conversation_id).map_err(anyhow::Error::msg)?;
+    vibeface_protocol::validate_id(&cause.message_id).map_err(anyhow::Error::msg)?;
     ensure!(
-        question.starts_with(prefix),
-        "a question ID in this scope starts with {prefix}"
+        cause.conversation_id != scope,
+        "a bot creates or deletes only another bot's conversation"
     );
     Ok(())
 }
@@ -394,21 +438,29 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             ..
         } => {
             id(message_id)?;
-            ensure!(
-                answers.is_some() || event.scope_id != SESSIONS_SCOPE,
-                "only answers are posted to the sessions scope"
-            );
             match role {
                 Role::User => {
                     ensure!(
                         report_results.is_some()
                             && in_reply_to.is_none()
                             && status.is_none()
-                            && *attachments == event.blobs,
+                            && attachments
+                                .iter()
+                                .map(Attachment::blob)
+                                .eq(event.blobs.iter().cloned()),
                         "a user message carries only its reporting choice and its signed attachments"
                     );
+                    ensure!(
+                        attachments
+                            .windows(2)
+                            .all(|pair| pair[0].hash < pair[1].hash)
+                            && attachments
+                                .iter()
+                                .all(|attachment| valid_attachment_name(&attachment.name)),
+                        "attachments are ordered by content, once each, with clean file names"
+                    );
                     if let Some(question) = answers {
-                        question_id(&event.scope_id, question)?;
+                        question_id(question)?;
                         ensure!(
                             *message_id == format!("a-{question}"),
                             "an answer's message ID is derived from its question"
@@ -421,23 +473,45 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                             && status.is_some()
                             && attachments.is_empty()
                             && answers.is_none(),
-                        "an assistant reply carries its turn status"
+                        "a bot reply carries its turn status"
                     );
                     if let Some(answered) = in_reply_to
-                        && crate::scheduling::parse_routine_trigger(answered).is_none()
+                        && crate::scheduling::parse_schedule_trigger(answered).is_none()
                     {
                         id(answered)?;
                     }
                 }
+                Role::Bot => anyhow::bail!("bots message each other through their own event"),
             }
         }
         EventBody::ConversationOwner {
             scheduler_node,
             epoch,
+            cause,
             ..
         } => {
             decode32(scheduler_node)?;
             ensure!(*epoch > 0, "owner epoch starts at 1");
+            if let Some(cause) = cause {
+                ensure!(
+                    *epoch == 1,
+                    "only a created bot's first owner stands on a cause"
+                );
+                cause_id(&event.scope_id, cause)?;
+            }
+        }
+        EventBody::BotCreated {
+            cause: Some(cause), ..
+        } => cause_id(&event.scope_id, cause)?,
+        EventBody::BotDeleted { cause, .. } => {
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a bot is deleted in its own conversation"
+            );
+            cause
+                .as_ref()
+                .map(|cause| cause_id(&event.scope_id, cause))
+                .transpose()?;
         }
         EventBody::WorkDispatched {
             work_id,
@@ -451,10 +525,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         } => {
             id(work_id)?;
             match trigger.split_once(':').unwrap_or_default() {
-                ("message" | "work" | "task", trigger_id) => id(trigger_id)?,
-                ("routine", _) => ensure!(
-                    crate::scheduling::parse_routine_trigger(trigger).is_some(),
-                    "invalid routine trigger"
+                ("message" | "work" | "task" | "bot_message", trigger_id) => id(trigger_id)?,
+                ("schedule", _) => ensure!(
+                    crate::scheduling::parse_schedule_trigger(trigger).is_some(),
+                    "invalid schedule trigger"
                 ),
                 _ => anyhow::bail!("invalid work trigger"),
             }
@@ -468,15 +542,15 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             id(work_id)?
         }
         EventBody::ConversationCreated { .. } => ensure!(
-            event.scope_id != SESSIONS_SCOPE && event.scope_id != ASSISTANTS_SCOPE,
-            "the sessions and assistants scopes are not conversations"
+            event.scope_id != BOTS_SCOPE,
+            "the bots scope is not a conversation"
         ),
-        EventBody::PrimaryAssistantSet {
+        EventBody::PrimaryBotSet {
             conversation_id, ..
         } => {
             ensure!(
-                event.scope_id == ASSISTANTS_SCOPE,
-                "the primary assistant is set in the assistants scope"
+                event.scope_id == BOTS_SCOPE,
+                "the primary bot is set in the bots scope"
             );
             id(conversation_id)?;
         }
@@ -487,7 +561,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             about,
             ..
         } => {
-            question_id(&event.scope_id, question)?;
+            question_id(question)?;
             ensure!(
                 !text.trim().is_empty() && text.len() <= 1024,
                 "a question is 1-1024 bytes"
@@ -508,13 +582,6 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                         && choices[..index].iter().all(|c| c.label != choice.label),
                     "choice labels are 1-120 characters and unique"
                 );
-                if let Some(conversation) = &choice.conversation_id {
-                    ensure!(
-                        event.scope_id == SESSIONS_SCOPE && conversation != SESSIONS_SCOPE,
-                        "only a session question hands a session to an assistant"
-                    );
-                    id(conversation)?;
-                }
             }
         }
         EventBody::SessionAttributed {
@@ -523,32 +590,88 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             session_id,
             cwd,
             summary,
-            question_id: question,
         } => {
             ensure!(
-                event.scope_id != SESSIONS_SCOPE,
-                "a session is attributed in its assistant's conversation"
+                event.scope_id != BOTS_SCOPE,
+                "a session is attributed in its bot's conversation"
             );
             ensure!(
                 *node == event.author,
                 "only the device running a session hands it over"
             );
-            question_id(SESSIONS_SCOPE, question)?;
             subject(node, agent, session_id, cwd, summary)?;
+        }
+        EventBody::SessionMuted { node, session_id } => {
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a session is muted in its bot's conversation"
+            );
+            ensure!(
+                *node == event.author,
+                "only the device running a session mutes it"
+            );
+            subject(node, "-", session_id, "", "")?;
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {
                 decode32(author)?;
             }
         }
-        EventBody::AssistantChanged {
+        EventBody::BotChanged {
             change_id,
             cause,
             change,
         } => {
             id(change_id)?;
-            id(cause)?;
+            if let Some(cause) = cause {
+                id(&cause.conversation_id)?;
+                id(&cause.message_id)?;
+            }
             change.validate()?;
+        }
+        EventBody::ScheduleControlled { schedule_id, .. } => id(schedule_id)?,
+        EventBody::MessageSteered { message_id, reply } => {
+            id(message_id)?;
+            id(reply)?;
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a message is steered in its bot's conversation"
+            );
+        }
+        EventBody::ScheduleRunClaimed { schedule_id, .. } => {
+            id(schedule_id)?;
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a schedule runs in its bot's conversation"
+            );
+        }
+        EventBody::BotMessaged {
+            message_id,
+            from,
+            text,
+            hops,
+        } => {
+            id(message_id)?;
+            id(&from.conversation_id)?;
+            ensure!(
+                from.conversation_id != event.scope_id && event.scope_id != BOTS_SCOPE,
+                "a bot messages another bot's conversation"
+            );
+            ensure!(
+                from.name.chars().count() <= crate::model::MAX_SCHEDULE_NAME_CHARS
+                    && !from.name.contains('\n'),
+                "a sender name is one short line"
+            );
+            ensure!(
+                !text.trim().is_empty() && text.len() <= crate::model::MAX_BOT_MESSAGE_BYTES,
+                "a bot message is 1-{} bytes",
+                crate::model::MAX_BOT_MESSAGE_BYTES
+            );
+            ensure!(
+                (1..=crate::model::MAX_CHAIN_DEPTH).contains(hops),
+                "a bot message is at most {} hops deep",
+                crate::model::MAX_CHAIN_DEPTH
+            );
         }
         _ => {}
     }
@@ -603,6 +726,73 @@ mod tests {
     }
 
     #[test]
+    fn user_attachments_are_named_ordered_and_match_the_event_blobs() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let network = identity.fixture_network_id()?;
+        let client = identity.fixture_admin();
+        let file = |seed: &[u8], name: &str| Attachment {
+            hash: digest(seed),
+            size: 3,
+            name: name.into(),
+        };
+        let mut files = vec![file(b"a", "报告 v2.pdf"), file(b"b", "notes.txt")];
+        files.sort();
+        let sign = |attachments: Vec<Attachment>, blobs: Vec<BlobRef>| -> Result<SignedEvent> {
+            let body = client.attest(
+                &network,
+                "conversation",
+                EventBody::MessagePosted {
+                    message_id: "m-1".into(),
+                    role: Role::User,
+                    text: "see files".into(),
+                    attachments,
+                    report_results: Some(true),
+                    in_reply_to: None,
+                    status: None,
+                    answers: None,
+                    attestation: None,
+                },
+            )?;
+            identity.sign_event(Event {
+                version: WIRE_VERSION,
+                network_id: network.clone(),
+                author: identity.device_id()?,
+                seq: 1,
+                prev: None,
+                deps: vec![],
+                scope_id: "conversation".into(),
+                created_at_ms: 0,
+                body,
+                blobs,
+            })
+        };
+        let blobs = |files: &[Attachment]| files.iter().map(Attachment::blob).collect::<Vec<_>>();
+        let signed = sign(files.clone(), blobs(&files))?;
+        match verify_signed_event(&network, &signed)?.body {
+            EventBody::MessagePosted { attachments, .. } => assert_eq!(attachments, files),
+            _ => unreachable!(),
+        }
+        assert!(
+            sign(files.clone(), blobs(&files[..1])).is_err(),
+            "every attachment's content travels with the event"
+        );
+        let reversed: Vec<_> = files.iter().rev().cloned().collect();
+        assert!(sign(reversed.clone(), blobs(&reversed)).is_err());
+        let twice = vec![files[0].clone(), files[0].clone()];
+        assert!(sign(twice.clone(), blobs(&twice)).is_err());
+        for name in ["", "../etc/passwd", "a\\b", "bell\u{7}", &"x".repeat(256)] {
+            let bad = vec![file(b"a", name)];
+            assert!(
+                sign(bad.clone(), blobs(&bad)).is_err(),
+                "{name:?} is not a clean name"
+            );
+        }
+        let longest = vec![file(b"a", &"名".repeat(85))];
+        assert!(sign(longest.clone(), blobs(&longest)).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn message_roles_and_log_links_are_part_of_the_signed_shape() -> Result<()> {
         let identity = LocalIdentity::generate();
         let message = |role, report_results, status| EventBody::MessagePosted {
@@ -639,7 +829,6 @@ mod tests {
         let verified = verify_signed_event(&event.network_id, &signed)?;
         assert_eq!(verified.deps.len(), 2);
         assert!(verified.deps.windows(2).all(|pair| pair[0] < pair[1]));
-        // The Node cannot write the user's message alone, change it, or move it to another conversation.
         event.body = message(Role::User, Some(true), None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = signed_user.clone();
@@ -664,11 +853,10 @@ mod tests {
                         ..event.clone()
                     })
                     .is_err()),
-            "assistant replies carry no device signature"
+            "bot replies carry no device signature"
         );
         event.body = message(Role::User, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
-        // An answer may come unsigned through a decision token, under the ID its question fixes.
         let answer = |id: &str, role, report_results, status| {
             let mut body = message(role, report_results, status);
             if let EventBody::MessagePosted {
@@ -688,12 +876,6 @@ mod tests {
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = answer("a-q-1", Role::Assistant, None, Some(ReplyStatus::Stopped));
         assert!(identity.sign_event(event.clone()).is_err());
-        event.scope_id = SESSIONS_SCOPE.into();
-        assert!(
-            identity.sign_event(event.clone()).is_err(),
-            "q- questions live in conversations"
-        );
-        event.scope_id = "conversation".into();
         event.body = message(Role::Assistant, None, None);
         assert!(identity.sign_event(event.clone()).is_err());
         event.body = message(Role::Assistant, None, Some(ReplyStatus::Stopped));

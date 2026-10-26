@@ -26,7 +26,7 @@ enum Action {
         channel: Channel,
         #[arg(long, action = clap::ArgAction::Set)]
         automatic: bool,
-        #[arg(long, default_value_os_t = default_install_root())]
+        #[arg(long)]
         install_root: PathBuf,
         #[command(flatten)]
         data: Data,
@@ -47,7 +47,7 @@ enum Action {
 
 #[derive(Args)]
 struct Data {
-    #[arg(long, default_value_os_t = config::default_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: PathBuf,
 }
 
@@ -57,16 +57,6 @@ struct Policy {
     channel: Channel,
     automatic: bool,
     install_root: PathBuf,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            channel: Channel::Stable,
-            automatic: false,
-            install_root: default_install_root(),
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -94,20 +84,11 @@ struct Journal {
     backup: PathBuf,
 }
 
-fn default_install_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/vibeface")
-}
-
 fn policy(data: &Path) -> Result<Policy> {
     let path = data.join("update.json");
-    if path.exists() {
-        Ok(serde_json::from_slice(&fs::read(path)?)?)
-    } else {
-        Ok(Policy::default())
-    }
+    Ok(serde_json::from_slice(&fs::read(path).context(
+        "configure updates with an explicit --install-root before using the updater",
+    )?)?)
 }
 
 /// Resolve the same managed installation used by this node's update policy.
@@ -181,10 +162,9 @@ pub async fn run(options: Update) -> Result<()> {
             ),
         }
     }
-    let policy_path = data.join("update.json");
-    let policy = policy(&data)?;
     match options.action {
         Action::Status(_) => {
+            let policy = policy(&data)?;
             let current = installed(&policy.install_root)
                 .and_then(|path| manifest(&path).map(|m| m.version))
                 .ok();
@@ -219,11 +199,12 @@ pub async fn run(options: Update) -> Result<()> {
             };
             // Keep the old policy if the platform cannot install the requested timer.
             configure_timer(&new, &data).await?;
-            persist(&policy_path, &new)?;
+            persist(&data.join("update.json"), &new)?;
             println!("{}", serde_json::to_string(&new)?);
             Ok(())
         }
         Action::Check(_) => {
+            let policy = policy(&data)?;
             let current = manifest(&installed(&policy.install_root)?)?.version;
             let latest = release::check(policy.channel).await?;
             let newer = latest.as_ref().filter(|r| r.version > current);
@@ -236,6 +217,7 @@ pub async fn run(options: Update) -> Result<()> {
             Ok(())
         }
         Action::Apply { automatic, .. } => {
+            let policy = policy(&data)?;
             recover(&policy, &data).await?;
             if automatic && !policy.automatic {
                 println!("Automatic updates are disabled.");
@@ -255,7 +237,6 @@ pub async fn run(options: Update) -> Result<()> {
                 manifest(&candidate)?.version == latest.version,
                 "staged version changed"
             );
-            prepare_sidecar(&data, &policy.install_root, &previous, &candidate).await?;
             prepare_firewall(&data, &policy.install_root, &candidate).await?;
             let service = Service::load(&data).await?;
             let lease = match maintenance::acquire(&data).await {
@@ -431,7 +412,6 @@ async fn activate(
     service.stop().await?;
     let lock = wait_for_node_lock(data).await?;
     backup(data, &journal.backup)?;
-    normalize_sidecar(data, &policy.install_root, &journal.previous)?;
     switch(&policy.install_root, &journal.candidate)?;
     drop(lock);
     service.start().await?;
@@ -623,64 +603,6 @@ fn backup(source: &Path, destination: &Path) -> Result<()> {
         }
     }
     File::open(destination)?.sync_all()?;
-    Ok(())
-}
-
-fn uses_bundled_sidecar(script: &Path, root: &Path, previous: &Path) -> bool {
-    script == previous.join("sidecars/codex-manager.mjs")
-        || script == root.join("current/sidecars/codex-manager.mjs")
-}
-
-async fn prepare_sidecar(
-    data: &Path,
-    root: &Path,
-    previous: &Path,
-    candidate: &Path,
-) -> Result<()> {
-    let config = config::Config::load(data)?;
-    let Some(manager) = config.manager else {
-        return Ok(());
-    };
-    if manager.provider != crate::manager::ManagerKind::CodexSdk
-        || !uses_bundled_sidecar(&manager.codex_sdk_script, root, previous)
-    {
-        return Ok(());
-    }
-    let mut npm = Command::new("npm");
-    if manager.node_bin.is_absolute() {
-        let directory = manager
-            .node_bin
-            .parent()
-            .context("node executable has no parent")?;
-        let executable = directory.join("npm");
-        ensure!(
-            executable.is_file(),
-            "npm must be installed alongside the configured Node executable"
-        );
-        npm = Command::new(executable);
-        let mut paths = vec![directory.to_path_buf()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        npm.env("PATH", std::env::join_paths(paths)?);
-    }
-    npm.args(["ci", "--omit=dev", "--ignore-scripts"])
-        .current_dir(candidate.join("sidecars"));
-    checked(
-        &mut npm,
-        "install the new Codex SDK dependencies before stopping the node",
-    )
-    .await
-}
-
-fn normalize_sidecar(data: &Path, root: &Path, previous: &Path) -> Result<()> {
-    let mut config = config::Config::load(data)?;
-    if let Some(manager) = &mut config.manager
-        && uses_bundled_sidecar(&manager.codex_sdk_script, root, previous)
-    {
-        manager.codex_sdk_script = root.join("current/sidecars/codex-manager.mjs");
-        config.save(data)?;
-    }
     Ok(())
 }
 
@@ -954,6 +876,60 @@ mod tests {
         directory
     }
 
+    #[tokio::test]
+    async fn first_update_configuration_creates_an_explicit_policy() -> Result<()> {
+        let root = sandbox();
+        let data = root.join("data");
+        config::private_dir(&data)?;
+        let identity = crate::crypto::LocalIdentity::generate();
+        persist(&data.join("identity.json"), &identity)?;
+        let package = package(&root, "1.0.0");
+        std::os::unix::fs::symlink(&package, root.join("current"))?;
+        let installer = package.join("scripts/install-node-service.sh");
+        fs::write(
+            &installer,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\n",
+        )?;
+        fs::set_permissions(&installer, fs::Permissions::from_mode(0o700))?;
+
+        assert!(
+            run(Update {
+                action: Action::Status(Data {
+                    data_dir: data.clone()
+                }),
+            })
+            .await
+            .is_err()
+        );
+        run(Update {
+            action: Action::Configure {
+                channel: Channel::Nightly,
+                automatic: false,
+                install_root: root.clone(),
+                data: Data {
+                    data_dir: data.clone(),
+                },
+            },
+        })
+        .await?;
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(data.join("update.json"))?)?;
+        assert_eq!(
+            saved,
+            serde_json::json!({"channel":"nightly","automatic":false,"install_root":root})
+        );
+        assert_eq!(
+            fs::read_to_string(installer.with_extension("sh.args"))?,
+            format!("uninstall-updater\n--data-dir\n{}\n", data.display())
+        );
+        run(Update {
+            action: Action::Status(Data { data_dir: data }),
+        })
+        .await?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn npm_installation_requires_matching_package_metadata() {
         let root = sandbox();
@@ -998,7 +974,8 @@ mod tests {
             &data.join("update.json"),
             &Policy {
                 install_root: root.clone(),
-                ..Policy::default()
+                channel: Channel::Stable,
+                automatic: false,
             },
         )
         .unwrap();
@@ -1070,7 +1047,7 @@ mod tests {
     }
 
     #[test]
-    fn service_and_sidecar_paths_match_only_the_managed_defaults() {
+    fn service_paths_match_only_the_managed_data_dir() {
         let root = sandbox();
         let data = root.join("data");
         fs::create_dir(&data).unwrap();
@@ -1082,17 +1059,6 @@ mod tests {
         ];
         assert!(service_data_matches(&args, &data));
         assert!(!service_data_matches(&args, &root));
-        let old = root.join("releases/1.0.0");
-        assert!(uses_bundled_sidecar(
-            &old.join("sidecars/codex-manager.mjs"),
-            &root,
-            &old
-        ));
-        assert!(!uses_bundled_sidecar(
-            &root.join("custom/codex-manager.mjs"),
-            &root,
-            &old
-        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1168,7 +1134,8 @@ mod tests {
         (
             Policy {
                 install_root: root,
-                ..Policy::default()
+                channel: Channel::Stable,
+                automatic: false,
             },
             data,
             journal,

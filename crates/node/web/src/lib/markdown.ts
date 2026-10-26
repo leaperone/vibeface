@@ -7,14 +7,30 @@ md.renderer.rules.link_open = (tokens, index, options, _env, self) => {
   tokens[index].attrSet("rel", "noopener noreferrer")
   return self.renderToken(tokens, index, options)
 }
+const FOLD_LINES = 16
+const chevron = '<svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>'
 md.renderer.rules.fence = (tokens, index) => {
   const token = tokens[index]
   const lang = md.utils.escapeHtml(token.info.trim().split(/\s+/)[0] ?? "")
-  return `<div class="md-code"><div class="md-code-head"><span>${lang}</span><button type="button" data-copy aria-label="复制">复制</button></div><pre><code>${md.utils.escapeHtml(token.content)}</code></pre></div>`
+  const fold = token.content.replace(/\n$/, "").split("\n").length > FOLD_LINES
+    ? `<button type="button" class="md-fold" data-fold aria-expanded="false">${chevron}<span class="md-fold-more">展开</span><span class="md-fold-less">收起</span></button>`
+    : ""
+  return `<div class="md-code"><div class="md-code-head"><span>${lang}</span><button type="button" class="hit-area relative" data-copy aria-label="复制">复制</button></div><pre><code>${md.utils.escapeHtml(token.content)}</code></pre>${fold}</div>`
 }
 md.renderer.rules.table_open = () => '<div class="md-table"><table>'
 md.renderer.rules.table_close = () => "</table></div>"
 
 export function renderMarkdown(text: string) {
   return md.render(text)
+}
+
+/** The first line as plain words, for a one-line preview of a reply written in markdown. */
+export function firstLine(text: string) {
+  const inline = md.parse(text, {}).find((token) => token.type === "inline")
+  const words: string[] = []
+  for (const token of inline?.children ?? []) {
+    if (token.type === "softbreak" || token.type === "hardbreak") break
+    if (token.type === "text" || token.type === "code_inline") words.push(token.content)
+  }
+  return words.join("").trim() || text.split("\n")[0]
 }

@@ -84,16 +84,115 @@ impl Runtime {
                 value
             })
             .collect();
-        Ok(json!({"bots":bots,"primary":store.primary_assistant(&access.network_id)?}))
+        Ok(json!({"bots":bots,"primary":store.primary_bot(&access.network_id)?}))
     }
 
-    /// The user's choice of the assistant that judges what comes in without an owner.
-    pub(super) async fn set_primary_assistant(
-        &self,
+    /// The user pauses, resumes or deletes a schedule; the scheduler reads the projection, so a
+    /// paused one is not queued and a queued run is cancelled when claimed.
+    pub(super) async fn control_schedule(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user pauses or deletes a schedule");
+        let scope = id(input, "conversation_id")?;
+        let schedule_id = id(input, "schedule_id")?;
+        let action: ScheduleAction = serde_json::from_value(input["action"].clone())
+            .context("action is pause, resume or delete")?;
+        let written = self.store.lock().await.control_schedule(
+            &self.identity,
+            &access.network_id,
+            &scope,
+            &schedule_id,
+            action,
+            attestation(input)?,
+            now_ms(),
+        )?;
+        if let Some(hash) = &written {
+            self.publish_changed(&access.network_id, &scope, Changed::Event(hash));
+            self.schedule_wakeup.notify_one();
+        }
+        Ok(json!({"written":written.is_some()}))
+    }
+
+    /// The user deletes a bot from the web. Deleting one already gone writes nothing.
+    pub(super) async fn delete_bot(
+        self: &Arc<Self>,
         access: &Access,
         input: &Value,
     ) -> Result<Value> {
-        ensure!(access.human, "only the user picks the primary assistant");
+        ensure!(access.human, "only the user deletes a bot here");
+        let scope = id(input, "conversation_id")?;
+        if let Some(allowed) = &access.conversation_id {
+            ensure!(allowed == &scope, "outside this client's conversation");
+        }
+        let network = &access.network_id;
+        let written = self.store.lock().await.delete_bot(
+            &self.identity,
+            network,
+            &scope,
+            attestation(input)?,
+            now_ms(),
+        )?;
+        if let Some(event) = &written {
+            self.bot_deleted(network, &scope, &event.hash);
+        }
+        Ok(
+            json!({"written":written.is_some(),"primary":self.store.lock().await.primary_bot(network)?}),
+        )
+    }
+
+    /// Stops what a deleted bot was doing here, apart from the caller, which may be another
+    /// bot's tool call: its running turn ends as a stopped reply (an unknown outcome goes to
+    /// the pending check) and its queued turns are cancelled when claimed.
+    pub(crate) fn bot_deleted(self: &Arc<Self>, network: &str, scope: &str, hash: &str) {
+        tracing::info!(
+            event = "bot.deleted",
+            conversation_id = scope,
+            "bot deleted"
+        );
+        self.publish_changed(network, scope, Changed::Event(hash));
+        let (node, network, scope) = (self.clone(), network.to_owned(), scope.to_owned());
+        tokio::spawn(async move {
+            if let Err(error) = node.stop_bot_turns(&network, &scope).await {
+                tracing::warn!(event = "bot.stop_failed", conversation_id = scope, error = %format!("{error:#}"), "a deleted bot's turn could not be stopped");
+            }
+            node.schedule_wakeup.notify_one();
+        });
+    }
+
+    async fn stop_bot_turns(&self, network: &str, scope: &str) -> Result<()> {
+        let running: Vec<String> = self
+            .store
+            .lock()
+            .await
+            .scheduler_jobs(scope)?
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    crate::scheduling::JobState::Claimed { .. }
+                        | crate::scheduling::JobState::Running { .. }
+                )
+            })
+            .map(|job| job.trigger)
+            .collect();
+        for trigger in running {
+            let job = self.store.lock().await.request_manager_cancel(
+                &self.identity,
+                network,
+                scope,
+                &trigger,
+            )?;
+            if let Some(crate::scheduling::JobState::Cancelling { attempt }) =
+                job.map(|job| job.state)
+            {
+                self.fence_manager_attempt(&attempt.id).await?;
+            }
+            self.publish_changed(network, scope, Changed::Job(&trigger));
+        }
+        Ok(())
+    }
+
+    /// The user's choice of the bot that judges what comes in without an owner.
+    pub(super) async fn set_primary_bot(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user picks the primary bot");
         let scope = id(input, "conversation_id")?;
         if let Some(allowed) = &access.conversation_id {
             ensure!(allowed == &scope, "outside this client's conversation");
@@ -104,28 +203,28 @@ impl Runtime {
                 .await
                 .bot_for_conversation(&access.network_id, &scope)?
                 .is_some(),
-            "no such assistant"
+            "no such bot"
         );
         let event = self
             .append(
                 &access.network_id,
-                ASSISTANTS_SCOPE,
-                EventBody::PrimaryAssistantSet {
+                BOTS_SCOPE,
+                EventBody::PrimaryBotSet {
                     conversation_id: scope,
                     attestation: Some(attestation(input)?),
                 },
             )
             .await?;
-        tracing::info!(event = "assistant.primary", "primary assistant set");
-        self.publish_changed(
-            &access.network_id,
-            ASSISTANTS_SCOPE,
-            Changed::Event(&event.hash),
-        );
-        Ok(json!({"primary":self.store.lock().await.primary_assistant(&access.network_id)?}))
+        tracing::info!(event = "bot.primary", "primary bot set");
+        self.publish_changed(&access.network_id, BOTS_SCOPE, Changed::Event(&event.hash));
+        Ok(json!({"primary":self.store.lock().await.primary_bot(&access.network_id)?}))
     }
 
-    async fn validate_bot_project(&self, network: &str, project: &BotProject) -> Result<()> {
+    pub(super) async fn validate_bot_project(
+        &self,
+        network: &str,
+        project: &BotProject,
+    ) -> Result<()> {
         self.store
             .lock()
             .await
@@ -143,7 +242,7 @@ impl Runtime {
         );
         if project.target_node == self.identity.device_id()? {
             ensure!(
-                self.assistant().is_some(),
+                self.manager().is_some(),
                 "project Node coordination Agent is unavailable"
             );
             self.allowed_path(&project.cwd)?;

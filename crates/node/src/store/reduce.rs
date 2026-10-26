@@ -1,6 +1,6 @@
 //! Incremental projections. Each event updates its rows once, as it is stored; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
-//! Assistant settings, skills and routines keep the last change by rank; a removal is a `NULL`
+//! Bot settings, skills, schedules and notes keep the last change by rank; a removal is a `NULL`
 //! row, so an older change arriving later cannot bring it back.
 use crate::model::*;
 use anyhow::Result;
@@ -48,14 +48,18 @@ fn request_key(network: &str, event: &Event) -> Result<String> {
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
-pub(crate) const TABLES: [&str; 12] = [
+pub(crate) const TABLES: [&str; 16] = [
     "conversations",
     "messages",
     "bots",
-    "assistant_profiles",
+    "bot_profiles",
+    "bot_models",
+    "bot_deletions",
     "skills",
-    "routines",
-    "assistant_changes",
+    "schedules",
+    "schedule_claims",
+    "memories",
+    "bot_changes",
     "works",
     "notifications",
     "notification_acks",
@@ -63,20 +67,24 @@ pub(crate) const TABLES: [&str; 12] = [
     "session_owners",
 ];
 
-/// The first record of a session by rank decides which assistant owns it.
-#[allow(clippy::too_many_arguments)]
+/// Who owns a session, in any order the records arrive: the latest attribution or mute by
+/// rank, or else the first work bound to it.
 fn own_session(
     connection: &Connection,
     network: &str,
-    node: &str,
-    session: &str,
+    (node, session): (&str, &str),
     scope: &str,
     rank: &str,
     attribution: Option<String>,
     created_at_ms: i64,
 ) -> Result<()> {
+    let wins = if attribution.is_some() {
+        "attribution IS NULL OR excluded.rank>rank"
+    } else {
+        "attribution IS NULL AND excluded.rank<rank"
+    };
     connection.execute(
-        "INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,created_at_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(network_id,node,session_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,attribution=excluded.attribution,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+        &format!("INSERT INTO session_owners(network_id,node,session_id,conversation_id,rank,attribution,muted,created_at_ms) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(network_id,node,session_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,attribution=excluded.attribution,muted=0,created_at_ms=excluded.created_at_ms WHERE {wins}"),
         params![network, node, session, scope, rank, attribution, created_at_ms],
     )?;
     Ok(())
@@ -122,11 +130,12 @@ pub(crate) fn apply(
             name,
             instructions,
             project,
+            cause,
             ..
         } => {
             connection.execute(
-                "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,project,event_hash,rank) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET bot_id=excluded.bot_id,name=excluded.name,instructions=excluded.instructions,project=excluded.project,event_hash=excluded.event_hash,rank=excluded.rank WHERE excluded.rank<rank",
-                params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank],
+                "INSERT INTO bots(network_id,conversation_id,bot_id,name,instructions,project,event_hash,rank,cause) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET bot_id=excluded.bot_id,name=excluded.name,instructions=excluded.instructions,project=excluded.project,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause WHERE excluded.rank<rank",
+                params![network, scope, bot_id, name, instructions, project.as_ref().map(serde_json::to_string).transpose()?, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?],
             )?;
         }
         EventBody::MessagePosted {
@@ -137,17 +146,18 @@ pub(crate) fn apply(
             in_reply_to,
             status,
             answers,
+            attachments,
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,blobs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,blobs=excluded.blobs WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
                     message_id,
                     hash,
                     rank,
-                    event.author,
+                    event.body.attestation().map_or(event.author.as_str(), |attestation| attestation.device_id.as_str()),
                     text(role)?,
                     body,
                     event.created_at_ms,
@@ -155,7 +165,7 @@ pub(crate) fn apply(
                     status.map(text).transpose()?,
                     report_results,
                     answers,
-                    serde_json::to_string(&event.blobs)?
+                    serde_json::to_string(attachments)?
                 ],
             )?;
             if *role == Role::Assistant {
@@ -166,6 +176,12 @@ pub(crate) fn apply(
                 };
                 notify(connection, network, hash, scope, kind, body, rank)?;
             }
+        }
+        EventBody::MessageSteered { message_id, reply } => {
+            connection.execute(
+                "UPDATE messages SET steered_into=? WHERE network_id=? AND conversation_id=? AND message_id=? AND role='user'",
+                params![reply, network, scope, message_id],
+            )?;
         }
         EventBody::WorkDispatched { work_id, .. } => {
             connection.execute(
@@ -187,8 +203,7 @@ pub(crate) fn apply(
                 own_session(
                     connection,
                     network,
-                    &event.author,
-                    thread_id,
+                    (&event.author, thread_id),
                     scope,
                     rank,
                     None,
@@ -218,7 +233,6 @@ pub(crate) fn apply(
             {
                 return Ok(());
             }
-            // A proven outcome beats an unverified one, and both beat an abandonment, in any order.
             let precedence = match outcome {
                 WorkOutcome::Unverified => 1,
                 WorkOutcome::Abandoned => 2,
@@ -256,12 +270,10 @@ pub(crate) fn apply(
             ..
         } => {
             connection.execute(
-                "INSERT INTO questions(network_id,question_id,conversation_id,event_hash,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
-                params![network, question_id, scope, hash, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
+                "INSERT INTO questions(network_id,question_id,conversation_id,rank,author,created_at_ms,node,session_id,request_id,body) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,question_id) DO UPDATE SET conversation_id=excluded.conversation_id,rank=excluded.rank,author=excluded.author,created_at_ms=excluded.created_at_ms,node=excluded.node,session_id=excluded.session_id,request_id=excluded.request_id,body=excluded.body WHERE excluded.rank<rank",
+                params![network, question_id, scope, rank, event.author, event.created_at_ms, about.node, about.session_id, about.request_id, serde_json::to_string(&event.body)?],
             )?;
-            if scope != SESSIONS_SCOPE {
-                notify(connection, network, hash, scope, "question", question, rank)?;
-            }
+            notify(connection, network, hash, scope, "question", question, rank)?;
         }
         EventBody::SessionAttributed {
             node,
@@ -269,40 +281,68 @@ pub(crate) fn apply(
             session_id,
             cwd,
             summary,
-            question_id,
         } => {
-            let attribution = serde_json::json!({"agent":agent,"cwd":cwd,"summary":summary,"question_id":question_id});
+            let attribution = serde_json::json!({"agent":agent,"cwd":cwd,"summary":summary});
             own_session(
                 connection,
                 network,
-                node,
-                session_id,
+                (node, session_id),
                 scope,
                 rank,
                 Some(attribution.to_string()),
                 event.created_at_ms,
             )?;
         }
-        EventBody::AssistantChanged {
+        // Follows the attribution it mutes in its author's log, so that row is already here.
+        EventBody::SessionMuted { node, session_id } => {
+            connection.execute(
+                "UPDATE session_owners SET muted=1,rank=?1,created_at_ms=?2 WHERE network_id=?3 AND node=?4 AND session_id=?5 AND conversation_id=?6 AND attribution IS NOT NULL AND ?1>rank",
+                params![rank, event.created_at_ms, network, node, session_id, scope],
+            )?;
+        }
+        EventBody::BotChanged {
             change_id,
             cause,
             change,
         } => {
             connection.execute(
-                "INSERT INTO assistant_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
-                params![network, change_id, scope, hash, rank, cause, serde_json::to_string(change)?, event.created_at_ms],
+                "INSERT INTO bot_changes(network_id,change_id,conversation_id,event_hash,rank,cause,change,created_at_ms) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(network_id,change_id) DO UPDATE SET conversation_id=excluded.conversation_id,event_hash=excluded.event_hash,rank=excluded.rank,cause=excluded.cause,change=excluded.change,created_at_ms=excluded.created_at_ms WHERE excluded.rank<rank",
+                params![network, change_id, scope, hash, rank, cause.as_ref().map(serde_json::to_string).transpose()?, serde_json::to_string(change)?, event.created_at_ms],
             )?;
             match change {
-                AssistantChange::Profile { name, instructions } => {
-                    for (field, edit) in [("name", name), ("instructions", instructions)] {
-                        let Some(edit) = edit else { continue };
+                BotChange::Profile {
+                    name,
+                    instructions,
+                    model,
+                    skills,
+                } => {
+                    let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
+                    if let Some(model) = model {
                         connection.execute(
-                            "INSERT INTO assistant_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
-                            params![network, scope, field, edit.after, rank],
+                            "INSERT INTO bot_models(network_id,conversation_id,provider,model,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,provider) DO UPDATE SET model=excluded.model,rank=excluded.rank WHERE excluded.rank>rank",
+                            params![network, scope, serde_json::to_value(model.provider)?.as_str(), model.after, rank],
+                        )?;
+                    }
+                    let fields = [
+                        ("name", after(name)),
+                        ("instructions", after(instructions)),
+                        (
+                            "skills",
+                            skills
+                                .as_ref()
+                                .map(|edit| serde_json::to_string(&edit.after))
+                                .transpose()?,
+                        ),
+                    ];
+                    for (field, value) in fields {
+                        let Some(value) = value else { continue };
+                        connection.execute(
+                            "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                            params![network, scope, field, value, rank],
                         )?;
                     }
                 }
-                AssistantChange::Skill {
+                BotChange::Skill {
                     skill_id, after, ..
                 } => {
                     connection.execute(
@@ -310,19 +350,134 @@ pub(crate) fn apply(
                         params![network, skill_id, after.as_ref().map(serde_json::to_string).transpose()?, rank],
                     )?;
                 }
-                AssistantChange::Routine {
-                    routine_id, after, ..
+                BotChange::Schedule {
+                    schedule_id,
+                    after: Some(after),
+                    ..
                 } => {
                     connection.execute(
-                        "INSERT INTO routines(network_id,routine_id,conversation_id,routine,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,routine_id) DO UPDATE SET conversation_id=excluded.conversation_id,routine=excluded.routine,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE excluded.rank>rank",
-                        params![network, routine_id, scope, after.as_ref().map(serde_json::to_string).transpose()?, rank, event.created_at_ms],
+                        "INSERT INTO schedules(network_id,schedule_id,conversation_id,schedule,rank,changed_at_ms,enabled,enabled_rank,enabled_at_ms,removed) VALUES(?1,?2,?3,?4,?5,?6,?7,?5,?6,0) ON CONFLICT(network_id,schedule_id) DO UPDATE SET schedule=excluded.schedule,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE removed=0 AND conversation_id=excluded.conversation_id AND excluded.rank>rank",
+                        params![network, schedule_id, scope, serde_json::to_string(after)?, rank, event.created_at_ms, after.enabled],
+                    )?;
+                    set_schedule_enabled(
+                        connection,
+                        network,
+                        schedule_id,
+                        scope,
+                        after.enabled,
+                        rank,
+                        event.created_at_ms,
+                    )?;
+                }
+                BotChange::Schedule {
+                    schedule_id,
+                    after: None,
+                    ..
+                } => remove_schedule(
+                    connection,
+                    network,
+                    schedule_id,
+                    scope,
+                    rank,
+                    event.created_at_ms,
+                )?,
+                BotChange::Memory {
+                    memory_id, after, ..
+                } => {
+                    connection.execute(
+                        "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE conversation_id=excluded.conversation_id AND excluded.rank>rank",
+                        params![network, memory_id, scope, after, rank, event.created_at_ms],
                     )?;
                 }
             }
         }
-        // Read from the log by rank; see `store::bots::primary_assistant_from`.
-        EventBody::ContextCheckpoint { .. } | EventBody::PrimaryAssistantSet { .. } => {}
+        EventBody::BotDeleted { .. } => {
+            connection.execute(
+                "INSERT OR IGNORE INTO bot_deletions(network_id,conversation_id) VALUES(?,?)",
+                params![network, scope],
+            )?;
+        }
+        EventBody::ScheduleControlled {
+            schedule_id,
+            action,
+            ..
+        } => match action {
+            ScheduleAction::Pause | ScheduleAction::Resume => set_schedule_enabled(
+                connection,
+                network,
+                schedule_id,
+                scope,
+                *action == ScheduleAction::Resume,
+                rank,
+                event.created_at_ms,
+            )?,
+            ScheduleAction::Delete => remove_schedule(
+                connection,
+                network,
+                schedule_id,
+                scope,
+                rank,
+                event.created_at_ms,
+            )?,
+        },
+        EventBody::ScheduleRunClaimed {
+            schedule_id,
+            slot_ms,
+            owner_epoch,
+        } => {
+            connection.execute(
+                "INSERT INTO schedule_claims(network_id,conversation_id,schedule_id,slot_ms,owner_epoch,author) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,schedule_id,slot_ms) DO UPDATE SET owner_epoch=excluded.owner_epoch,author=excluded.author WHERE excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.author<author)",
+                params![network, scope, schedule_id, slot_ms, owner_epoch, event.author],
+            )?;
+        }
+        EventBody::BotMessaged {
+            message_id,
+            from,
+            text: body,
+            ..
+        } => {
+            connection.execute(
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,attachments,sender) VALUES(?,?,?,?,?,?,?,?,?,'[]',?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,sender=excluded.sender WHERE excluded.rank<rank",
+                params![network, scope, message_id, hash, rank, event.author, text(Role::Bot)?, body, event.created_at_ms, serde_json::to_string(from)?],
+            )?;
+        }
+        // Read from the log by rank; see `store::bots::primary_bot_from`.
+        EventBody::ContextCheckpoint { .. } | EventBody::PrimaryBotSet { .. } => {}
     }
+    Ok(())
+}
+
+/// A schedule's pause state wins by its own rank, apart from its definition, so a pause and an
+/// edit that crossed converge in any order.
+fn set_schedule_enabled(
+    connection: &Connection,
+    network: &str,
+    schedule_id: &str,
+    scope: &str,
+    enabled: bool,
+    rank: &str,
+    at: i64,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE schedules SET enabled=?,enabled_rank=?,enabled_at_ms=? WHERE network_id=? AND schedule_id=? AND conversation_id=? AND removed=0 AND ?2>enabled_rank",
+        params![enabled, rank, at, network, schedule_id, scope],
+    )?;
+    Ok(())
+}
+
+/// Removal is final: no change of any rank brings a schedule back.
+fn remove_schedule(
+    connection: &Connection,
+    network: &str,
+    schedule_id: &str,
+    scope: &str,
+    rank: &str,
+    at: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO schedules(network_id,schedule_id,conversation_id,schedule,rank,changed_at_ms,enabled,enabled_rank,enabled_at_ms,removed) VALUES(?1,?2,?3,NULL,?4,?5,0,?4,?5,1) ON CONFLICT(network_id,schedule_id) DO UPDATE SET schedule=NULL,removed=1 WHERE conversation_id=excluded.conversation_id",
+        params![network, schedule_id, scope, rank, at],
+    )?;
     Ok(())
 }
 

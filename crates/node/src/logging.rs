@@ -25,6 +25,43 @@ pub const MAX_BATCH: usize = 20;
 /// Submitted records per sender per minute.
 pub const RATE_PER_MINUTE: u32 = 120;
 pub const MAX_READ: usize = 20_000;
+static PRIVATE_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+pub fn add_private_path(path: &Path) {
+    if !path.is_absolute() || path.parent().is_none() {
+        return;
+    }
+    let mut paths = PRIVATE_PATHS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("private paths");
+    let text = path.to_string_lossy().trim_end_matches('/').to_owned();
+    let mut additions = vec![text];
+    let parts: Vec<_> = path.components().collect();
+    if parts.len() >= 3 && matches!(parts[1].as_os_str().to_str(), Some("Users" | "home")) {
+        additions.push(
+            parts[..3]
+                .iter()
+                .collect::<PathBuf>()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    for value in additions {
+        for encoded in [
+            value.clone(),
+            serde_json::to_string(&value)
+                .unwrap()
+                .trim_matches('"')
+                .to_owned(),
+        ] {
+            if encoded.len() > 1 && !paths.contains(&encoded) {
+                paths.push(encoded);
+            }
+        }
+    }
+    paths.sort_by_key(|value| std::cmp::Reverse(value.len()));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,6 +123,11 @@ pub struct Record {
 /// Blanks known secrets, invite tickets and bearer credentials. Every log line passes here.
 pub fn redact(text: &str, secrets: &[String]) -> String {
     let mut text = text.to_owned();
+    if let Some(paths) = PRIVATE_PATHS.get() {
+        for path in paths.lock().expect("private paths").iter() {
+            text = text.replace(path, "[local-path]");
+        }
+    }
     for secret in secrets.iter().filter(|secret| secret.len() >= 8) {
         text = text.replace(secret.as_str(), "[redacted]");
     }
@@ -508,7 +550,8 @@ pub fn read(dir: &Path, filter: &Filter) -> Result<Vec<Record>> {
             continue;
         };
         for line in std::io::BufReader::new(file).split(b'\n') {
-            let Ok(record) = serde_json::from_slice::<Record>(&line?) else {
+            let text = String::from_utf8_lossy(&line?).into_owned();
+            let Ok(record) = serde_json::from_str::<Record>(&scrub(&text)) else {
                 continue;
             };
             if filter.matches(&record) {
@@ -759,6 +802,14 @@ mod tests {
         assert_eq!(
             redact("Authorization: Bearer sk.abc-123/x= ok", &[]),
             "Authorization: Bearer [redacted] ok"
+        );
+        add_private_path(Path::new("/private-redaction-fixture/project"));
+        assert_eq!(
+            redact(
+                "failed at /private-redaction-fixture/project/src/lib.rs",
+                &[]
+            ),
+            "failed at [local-path]/src/lib.rs"
         );
         let dir = scratch("log-redact");
         let sink = Sink::open(&dir, MAX_FILE_BYTES, 2).unwrap();

@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { lstat, open, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createHash, createPrivateKey, sign } from 'node:crypto';
 
 const args = process.argv.slice(2);
 const argument = (name, fallback) => args.includes(name) ? args[args.indexOf(name) + 1] : fallback;
@@ -14,34 +13,11 @@ await crypto.default({ module_or_path: await readFile(join(dirname(modulePath), 
 const hex = value => Buffer.from(value).toString('hex');
 const bytes = value => Uint8Array.from(Buffer.from(value, 'hex'));
 
-/** A signer like the browser's: a non-extractable WebCrypto key, or a fixture secret through WASM. */
 async function webKey() {
   const pair = await globalThis.crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
   const deviceId = hex(await globalThis.crypto.subtle.exportKey('raw', pair.publicKey));
   return { deviceId, raw: async message => hex(await globalThis.crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, message)) };
 }
-function secretKey(secretHex) {
-  const identity = crypto.Identity.fromSecretHex(secretHex);
-  const deviceId = identity.deviceId(), secret = identity.secretHex();
-  identity.free();
-  const key = createPrivateKey({ key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(secret, 'hex')]), format: 'der', type: 'pkcs8' });
-  return { deviceId, raw: async message => sign(null, Buffer.from(message), key).toString('hex') };
-}
-async function fixtureSecret(file) {
-  try {
-    const metadata = await lstat(file);
-    assert(metadata.isFile() && !metadata.isSymbolicLink() && !(metadata.mode & 0o077), 'fixture identity must be a private regular file');
-    return JSON.parse(await readFile(file, 'utf8')).secret_key_hex;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    const created = crypto.Identity.generate();
-    const secret = created.secretHex();
-    created.free();
-    await writeFile(file, JSON.stringify({ secret_key_hex: secret }) + '\n', { mode: 0o600, flag: 'wx' });
-    return secret;
-  }
-}
-
 function endpoint() {
   let key;
   let handshake;
@@ -51,47 +27,7 @@ function endpoint() {
     try {
       let result = null;
       switch (input.op) {
-        case 'fixture_identity': {
-          const fixture = secretKey(await fixtureSecret(input.identity_file));
-          assert(!input.expected_device_id || fixture.deviceId === input.expected_device_id, 'fixture identity must retain the pinned target');
-          key = fixture;
-          result = { device_id: key.deviceId };
-          break;
-        }
-        case 'fixture_event':
-        case 'fixture_chain': {
-          const secret = JSON.parse(await readFile(input.identity_file, 'utf8')).secret_key_hex;
-          const key = createPrivateKey({key:Buffer.concat([Buffer.from('302e020100300506032b657004220420','hex'),Buffer.from(secret,'hex')]),format:'der',type:'pkcs8'});
-          const signed = event => {
-            const canonical_body = JSON.stringify(event);
-            const hash = createHash('sha256').update(canonical_body).digest('hex');
-            return {hash,canonical_body,signature:sign(null,Buffer.from(`vibeface:event:v1:${hash}`),key).toString('hex')};
-          };
-          if (input.op === 'fixture_event') { result = signed(input.event); break; }
-          assert(Number.isInteger(input.count) && input.count >= 2 && input.count <= 100001, 'fixture chain count must be between 2 and 100001');
-          const output = await open(input.output_file, 'wx', 0o600);
-          const digest = createHash('sha256');
-          let first_hash, previous = null, page = '';
-          try {
-            for (let index = 0; index < input.count; index++) {
-              const event = {...input.event,sequence:index+1,previous,parents:previous ? [previous] : [],
-                body:index ? {type:'context_checkpoint',summary:'fixture',covered_heads:[]} : {type:'conversation_created',title:'NET-1 continuation fixture'},
-                blobs:index === input.count-1 ? [input.blob] : []};
-              const envelope = signed(event);
-              first_hash ??= envelope.hash;
-              previous = envelope.hash;
-              const line = `${JSON.stringify(envelope)}\n`;
-              digest.update(line); page += line;
-              if ((index+1) % 1024 === 0) { await output.writeFile(page); page = ''; }
-            }
-            if (page) await output.writeFile(page);
-            await output.sync();
-          } finally { await output.close(); }
-          result = {count:input.count,first_hash,head:previous,envelopes_sha256:digest.digest('hex')};
-          break;
-        }
         case 'identity':
-          if (input.secret_hex) key = secretKey(input.secret_hex);
           result = { device_id: (await signer()).deviceId }; break;
         case 'recovery_seal': result = hex(crypto.recoverySeal(bytes(input.data), input.password)); break;
         case 'recovery_open': result = hex(crypto.recoveryOpen(bytes(input.data), input.password)); break;

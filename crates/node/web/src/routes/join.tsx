@@ -1,6 +1,6 @@
 import { createFileRoute, Navigate } from '@tanstack/react-router'
 import { ConnectionScreen } from '@/features/identity/connection-screen'
-import { useDevice } from '@/features/identity/context'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 
 export const Route = createFileRoute('/join')({ component: Page })
 

@@ -39,6 +39,27 @@ fn exists(connection: &Connection, table: &str, network: &str, hash: &str) -> Re
         .is_some())
 }
 
+/// A stored event, by hash.
+pub(crate) fn event_from(
+    connection: &Connection,
+    network: &str,
+    hash: &str,
+) -> Result<Option<Event>> {
+    let envelope: Option<String> = connection
+        .query_row(
+            "SELECT envelope FROM events WHERE network_id=? AND hash=?",
+            params![network, hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    envelope
+        .map(|envelope| {
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            Ok(serde_json::from_str(&envelope.canonical_body)?)
+        })
+        .transpose()
+}
+
 pub(crate) fn scope_has_events(
     connection: &Connection,
     network: &str,
@@ -142,7 +163,6 @@ fn pending(
     connection: &Connection,
     network: &str,
     envelope: &SignedEvent,
-    event: &Event,
     missing: &str,
 ) -> Result<IngestStatus> {
     let count: i64 = connection.query_row(
@@ -154,8 +174,13 @@ fn pending(
         return Ok(IngestStatus::Rejected("too many pending events".into()));
     }
     connection.execute(
-        "INSERT INTO pending_events(network_id,hash,author,seq,envelope,missing) VALUES(?,?,?,?,?,?)",
-        params![network, envelope.hash, event.author, event.seq, serde_json::to_string(envelope)?, missing],
+        "INSERT INTO pending_events(network_id,hash,envelope,missing) VALUES(?,?,?,?)",
+        params![
+            network,
+            envelope.hash,
+            serde_json::to_string(envelope)?,
+            missing
+        ],
     )?;
     Ok(IngestStatus::Pending)
 }
@@ -181,7 +206,7 @@ fn place(
             None if event.seq <= max + 1
                 || exists(connection, "pending_events", network, prev)? =>
             {
-                return pending(connection, network, envelope, event, prev);
+                return pending(connection, network, envelope, prev);
             }
             None => {
                 return Ok(IngestStatus::Rejected(format!(
@@ -200,10 +225,14 @@ fn place(
     }
     for dep in &event.deps {
         if !exists(connection, "events", network, dep)? {
-            return pending(connection, network, envelope, event, dep);
+            return pending(connection, network, envelope, dep);
         }
     }
-    if let Err(error) = authorize_change(connection, network, event) {
+    if let Err(error) = authorize_cause(connection, network, event) {
+        return Ok(IngestStatus::Rejected(error.to_string()));
+    }
+    if let Err(error) = authorize_owner(connection, network, event) {
+        tracing::warn!(event = "sync.event_rejected", author = event.author, seq = event.seq, scope = event.scope_id, %error, "rejected a write only the conversation's scheduling Node makes");
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
     let main = match &event.prev {
@@ -218,34 +247,142 @@ fn place(
     })
 }
 
-/// The user's device signature on `cause` is what authorizes an assistant change, so one of its
-/// stored parents must be that signed user message in the same conversation.
-fn authorize_change(connection: &Connection, network: &str, event: &Event) -> Result<()> {
-    let EventBody::AssistantChanged { cause, .. } = &event.body else {
-        return Ok(());
+/// The user's device signature on `cause` is what authorizes a write a bot makes for the user:
+/// a bot change, or a bot it creates or deletes. One of the event's stored parents must be that
+/// signed user message. The one change without a cause is a new one-shot schedule: a reminder
+/// the bot sets itself.
+fn authorize_cause(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    let cause = match &event.body {
+        EventBody::BotDeleted {
+            cause: Some(cause), ..
+        } => cause,
+        EventBody::BotChanged {
+            cause: None,
+            change,
+            ..
+        } => {
+            ensure!(
+                matches!(
+                    change,
+                    BotChange::Schedule {
+                        before: None,
+                        after: Some(Schedule {
+                            every_minutes: None,
+                            depth: 1..,
+                            ..
+                        }),
+                        ..
+                    }
+                ),
+                "only a new one-time reminder may change a bot without the user's message"
+            );
+            return Ok(());
+        }
+        EventBody::BotChanged {
+            cause: Some(cause), ..
+        }
+        | EventBody::BotCreated {
+            cause: Some(cause), ..
+        }
+        | EventBody::ConversationOwner {
+            cause: Some(cause), ..
+        } => cause,
+        _ => return Ok(()),
     };
+    // A cause makes only a conversation its author just created, never an existing one.
+    if let EventBody::ConversationOwner { .. } = &event.body {
+        let created = match &event.prev {
+            Some(prev) => event_from(connection, network, prev)?,
+            None => None,
+        };
+        ensure!(
+            created.is_some_and(|created| created.scope_id == event.scope_id
+                && matches!(created.body, EventBody::ConversationCreated { .. })),
+            "a created bot's first owner follows its creation"
+        );
+    }
     for parent in event.prev.iter().chain(&event.deps) {
-        let Some(envelope) = connection
-            .query_row(
-                "SELECT envelope FROM events WHERE network_id=? AND hash=?",
-                params![network, parent],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-        else {
+        let Some(parent) = event_from(connection, network, parent)? else {
             continue;
         };
-        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
-        let parent: Event = serde_json::from_str(&envelope.canonical_body)?;
-        if parent.scope_id == event.scope_id
+        if parent.scope_id == cause.conversation_id
             && matches!(&parent.body, EventBody::MessagePosted {
                 message_id, role: Role::User, answers: None, attestation: Some(_), ..
-            } if message_id == cause)
+            } if *message_id == cause.message_id)
         {
             return Ok(());
         }
     }
-    bail!("an assistant change must follow the user's own signed message in this conversation")
+    bail!("a bot's write for the user must follow the user's own signed message")
+}
+
+/// The conversation whose scheduling Node alone makes this write: a checkpoint, a reminder its
+/// bot set itself, a schedule time it takes, or its bot's message to another bot.
+fn owner_scope(event: &Event) -> Option<&str> {
+    match &event.body {
+        EventBody::ContextCheckpoint { .. }
+        | EventBody::BotChanged { cause: None, .. }
+        | EventBody::ScheduleRunClaimed { .. } => Some(&event.scope_id),
+        EventBody::BotMessaged { from, .. } => Some(&from.conversation_id),
+        _ => None,
+    }
+}
+
+/// An owner-only write must come from the owner its author knew when writing: of the owner
+/// records the event's parents hold (its author's earlier events, and each dependency's log up
+/// to that dependency), those of the highest epoch must name the author. An owner change the
+/// author had not seen yet does not count against it. A schedule claim names that epoch. The
+/// parents are stored before an event is placed, so every replica reads the same records.
+fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Result<()> {
+    let Some(scope) = owner_scope(event) else {
+        return Ok(());
+    };
+    let mut seen = BTreeMap::from([(event.author.clone(), event.seq - 1)]);
+    for dep in &event.deps {
+        let (author, seq): (String, u64) = connection.query_row(
+            "SELECT author,seq FROM events WHERE network_id=? AND hash=?",
+            params![network, dep],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let known = seen.entry(author).or_default();
+        *known = (*known).max(seq);
+    }
+    let mut statement = connection.prepare(
+        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+    )?;
+    let mut rows = statement.query(params![network, scope])?;
+    let mut newest: Option<(u64, bool)> = None;
+    while let Some(row) = rows.next()? {
+        let (author, seq): (String, u64) = (row.get(0)?, row.get(1)?);
+        if seen.get(&author).is_none_or(|known| seq > *known) {
+            continue;
+        }
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let EventBody::ConversationOwner {
+            scheduler_node,
+            epoch,
+            ..
+        } = serde_json::from_str::<Event>(&envelope.canonical_body)?.body
+        else {
+            continue;
+        };
+        let named = scheduler_node == event.author;
+        newest = match newest {
+            Some((best, any)) if best == epoch => Some((best, any || named)),
+            Some((best, _)) if best > epoch => newest,
+            _ => Some((epoch, named)),
+        };
+    }
+    let Some((epoch, true)) = newest else {
+        bail!("only the conversation's scheduling Node makes this write");
+    };
+    if let EventBody::ScheduleRunClaimed { owner_epoch, .. } = &event.body {
+        ensure!(
+            *owner_epoch == epoch,
+            "a schedule claim names its author's owner epoch"
+        );
+    }
+    Ok(())
 }
 
 fn has_forks(connection: &Connection, network: &str, author: &str) -> Result<bool> {
@@ -426,7 +563,7 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
 
 /// Appends to this device's log. `deps` name every other author's latest event in the
 /// conversation, so the new event follows everything this Node has seen there, and an
-/// assistant change also names the user message that caused it.
+/// bot change also names the user message that caused it.
 #[expect(clippy::too_many_arguments, reason = "an event's fields")]
 pub(crate) fn append_from(
     connection: &Connection,
@@ -465,12 +602,17 @@ pub(crate) fn append_from(
         .prepare("SELECT author FROM log_heads WHERE network_id=? AND author<>?")?
         .query_map(params![network, author], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
+    // A bot's message also follows its own conversation, where its sender's ownership is.
+    let sender = match &body {
+        EventBody::BotMessaged { from, .. } => from.conversation_id.as_str(),
+        _ => scope,
+    };
     let mut deps = Vec::new();
     for other in authors {
         if let Some(hash) = connection
             .query_row(
-                "SELECT hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND main=1 ORDER BY seq DESC LIMIT 1",
-                params![network, scope, other],
+                "SELECT hash FROM events WHERE network_id=? AND scope_id IN (?,?) AND author=? AND main=1 ORDER BY seq DESC LIMIT 1",
+                params![network, scope, sender, other],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
@@ -479,9 +621,26 @@ pub(crate) fn append_from(
         }
     }
     let prev = (max > 0).then_some(head_hash);
-    if let EventBody::AssistantChanged { cause, .. } = &body {
-        let message = super::message_from(connection, network, scope, cause)?
-            .context("the user's message is not stored on this device")?;
+    if let EventBody::BotChanged {
+        cause: Some(cause), ..
+    }
+    | EventBody::BotCreated {
+        cause: Some(cause), ..
+    }
+    | EventBody::BotDeleted {
+        cause: Some(cause), ..
+    }
+    | EventBody::ConversationOwner {
+        cause: Some(cause), ..
+    } = &body
+    {
+        let message = super::message_from(
+            connection,
+            network,
+            &cause.conversation_id,
+            &cause.message_id,
+        )?
+        .context("the user's message is not stored on this device")?;
         if prev.as_ref() != Some(&message.event_hash) {
             deps.push(message.event_hash);
         }
@@ -499,7 +658,8 @@ pub(crate) fn append_from(
         blobs,
     })?;
     let event = check_event(network, &envelope).context("appended event is invalid")?;
-    authorize_change(connection, network, &event)?;
+    authorize_cause(connection, network, &event)?;
+    authorize_owner(connection, network, &event)?;
     ensure!(
         insert_event(connection, &view, &envelope, &event, true)?,
         "this Node's log has forked and it no longer writes"

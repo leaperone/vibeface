@@ -2,6 +2,8 @@ use super::*;
 use crate::{scheduling::PendingCheck, work::DispatchState};
 
 const ARTIFACT_PAGE: usize = 65_536;
+/// Progress sources one conversation view follows, within the observer's own limit.
+const MAX_OBSERVED: usize = 8;
 /// Raw bytes per upload request, well inside the client channel's message limit.
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
@@ -141,40 +143,64 @@ impl Runtime {
         let scope = field(input, "conversation_id")?;
         self.require_scope(access, scope).await?;
         let network = &access.network_id;
-        let (jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let (mut jobs, checks) = self.scheduler_snapshot_jobs(network, scope).await?;
+        let owner = self.merge_owner_jobs(network, scope, &mut jobs).await?;
+        let local = self.identity.device_id()?;
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
         let checks = without_work_checks(checks, &works);
         let deliveries = deliveries(&store, scope, &works)?;
         let conversation = store.conversation(network, scope)?;
+        // Devices whose live progress this conversation shows: its owner and those running its open works.
+        let mut targets = Vec::new();
+        let sources = conversation.iter().filter_map(|c| c.owner.as_ref()).chain(
+            works
+                .iter()
+                .filter(|work| work.outcome.is_none())
+                .map(|work| &work.target_node),
+        );
+        for source in sources {
+            if source != &local
+                && !targets.contains(source)
+                && targets.len() < MAX_OBSERVED
+                && store.authorize_node(network, source).is_ok()
+            {
+                targets.push(source.clone());
+            }
+        }
         let bot = store.bot_for_conversation(network, scope)?;
-        let messages = store
-            .messages(network, scope)?
-            .into_iter()
-            .map(|message| message_value(&store, network, message))
-            .collect::<Result<Vec<_>>>()?;
-        let changes = store.assistant_changes(network, scope)?;
+        let messages = store.messages(network, scope)?;
+        let changes = store.bot_changes(network, scope)?;
+        let sent = store.sent_bot_messages(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
         let now = now_ms();
+        let enabled = bot.as_ref().and_then(|bot| bot.skills.as_ref());
         let skills: Vec<_> = store
             .skills(network)?
             .into_iter()
+            .filter(|entry| enabled.is_none_or(|set| set.contains(&entry.skill_id)))
             .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name,"description":entry.skill.description}))
             .collect();
-        let routines: Vec<_> = store
-            .routines(network, scope)?
+        let schedules: Vec<_> = store
+            .schedules(network, scope)?
             .into_iter()
+            .filter(|entry| crate::scheduling::ahead(&entry.schedule, now))
             .map(|entry| {
-                let mut value = json!(entry.routine);
-                value["routine_id"] = json!(entry.routine_id);
-                value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.routine, now));
+                let mut value = json!(entry.schedule);
+                value["schedule_id"] = json!(entry.schedule_id);
+                value["next_run_at_ms"] = json!(crate::scheduling::next_run(&entry.schedule, now));
                 value
             })
             .collect();
+        let memory = store.memories(network, scope)?;
+        let unanswered = store.unanswered_messages(network, &local, scope)?;
         drop(store);
-        let assistant = self.assistant();
-        let manager = assistant.as_ref();
+        let (remote, metadata) = match owner {
+            Some((remote, metadata)) if metadata.is_object() => (remote, metadata),
+            Some((remote, _)) => (remote, self.scheduler_manager_metadata()),
+            None => (Value::Null, self.scheduler_manager_metadata()),
+        };
         Ok(json!({
             "conversation":conversation,
             "bot":bot,
@@ -182,13 +208,15 @@ impl Runtime {
             "works":works,
             "deliveries":deliveries,
             "changes":changes,
+            "sent":sent,
             "questions":questions,
             "sessions":sessions,
-            "assistant":{"skills":skills,"routines":routines},
+            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
             "checks":checks,
-            "local_node":self.identity.device_id()?,
-            "scheduler":{"jobs":jobs,"provider":manager.map(|m|&m.provider),"model":manager.map(|m|&m.model),
-                "capabilities":manager.map(|m| m.provider.capabilities())},
+            "local_node":local,
+            "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
+                "capabilities":metadata["capabilities"],"remote":remote},
+            "observation_targets":targets,
         }))
     }
 
@@ -234,9 +262,7 @@ impl Runtime {
             Some(_) => store.last_messages(network)?.remove(scope),
             None => None,
         };
-        let messages = message
-            .map(|message| message_value(&store, network, message))
-            .transpose()?;
+        let messages = message.map(|message| json!(message));
         let works = store.works(network, scope)?;
         let changed: Vec<_> = works
             .iter()
@@ -254,10 +280,12 @@ impl Runtime {
             "works":changed,
             "last_message":last_message,
             "questions":store.conversation_questions(network, scope)?,
+            "sent":store.sent_bot_messages(network, scope)?,
             "notifications":notifications,
             "deliveries":deliveries(&store, scope, &works)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
+            "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
         })))
     }
 }
@@ -305,13 +333,4 @@ fn deliveries(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<Ve
         }
     }
     Ok(deliveries)
-}
-
-fn message_value(store: &Store, network: &str, message: Message) -> Result<Value> {
-    let attachments = store.event_blobs(network, &message.event_hash)?;
-    let mut value = json!(message);
-    if !attachments.is_empty() {
-        value["blobs"] = json!(attachments);
-    }
-    Ok(value)
 }

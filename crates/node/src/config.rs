@@ -7,12 +7,13 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 1;
+pub const DATA_EPOCH: u32 = 3;
+/// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
+/// Any schema change fails a test until both constants change together.
+pub const DATA_EPOCH_SCHEMA_SHA256: &str =
+    "ecb4dc0c26094fa76ae457870c9d4603e5e0825438d847e54ab533035701f24a";
 /// Bumped whenever a release package stops being installable by the previous updater.
 pub const UPDATE_PROTOCOL: u32 = 1;
-/// The name a removed Node had, which its fresh data directory offers when it joins again.
-pub const FORMER_NAME_FILE: &str = "former-name";
-
 pub fn data_epoch_marker() -> Vec<u8> {
     format!(r#"{{"data_epoch":{DATA_EPOCH}}}"#).into_bytes()
 }
@@ -20,18 +21,14 @@ pub fn data_epoch_marker() -> Vec<u8> {
 pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
-/// This machine's name, the default device name shown when creating or joining a network.
-pub fn hostname() -> String {
-    let mut buffer = [0u8; 256];
-    // SAFETY: the buffer is writable for its full length and gethostname NUL-terminates within it.
-    let ok = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } == 0;
-    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
-    let name = String::from_utf8_lossy(&buffer[..end]);
-    let name = name.trim().trim_end_matches(".local");
-    if ok && !name.is_empty() {
-        name.chars().take(128).collect()
+pub const UNNAMED_NODE: &str = "Node";
+
+pub fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(path)
     } else {
-        "Node".into()
+        Err("specify an absolute path".into())
     }
 }
 
@@ -67,8 +64,6 @@ pub struct ManagerSettings {
     pub workspace: PathBuf,
     pub model: String,
     pub cursor_sdk_bin: PathBuf,
-    pub node_bin: PathBuf,
-    pub codex_sdk_script: PathBuf,
 }
 impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
@@ -92,8 +87,32 @@ impl Config {
     }
     pub fn load(dir: &Path) -> Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
+        config.register_private_paths(dir);
         config.validate()?;
         Ok(config)
+    }
+    fn register_private_paths(&self, dir: &Path) {
+        for path in std::iter::once(dir)
+            .chain(self.roots.iter().map(PathBuf::as_path))
+            .chain(std::iter::once(self.codex_bin.as_path()))
+            .chain(
+                self.providers
+                    .codex_app_server
+                    .socket
+                    .iter()
+                    .map(PathBuf::as_path),
+            )
+            .chain(self.triage.codex_sessions.iter().map(PathBuf::as_path))
+        {
+            crate::logging::add_private_path(path);
+        }
+        if let Some(manager) = &self.manager {
+            crate::logging::add_private_path(&manager.workspace);
+            crate::logging::add_private_path(&manager.cursor_sdk_bin);
+        }
+        for project in &self.triage.projects {
+            crate::logging::add_private_path(Path::new(&project.prefix));
+        }
     }
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
@@ -136,7 +155,11 @@ impl Config {
             );
         }
         self.triage.validate()?;
-        self.providers.validate()?;
+        self.providers.validate(
+            self.manager
+                .as_ref()
+                .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk),
+        )?;
         ensure!(
             !self.codex_bin.as_os_str().is_empty(),
             "the Codex program path must not be empty"
@@ -191,6 +214,7 @@ impl Config {
         Ok(origins)
     }
     pub fn save(&self, dir: &Path) -> Result<()> {
+        self.register_private_paths(dir);
         self.validate()?;
         private_write(&dir.join("config.json"), &serde_json::to_vec_pretty(self)?)
     }
@@ -209,12 +233,6 @@ pub fn http_origin(value: &str) -> Result<reqwest::Url> {
         "URL must be an HTTP(S) origin without credentials, a path, query, or fragment"
     );
     Ok(url)
-}
-pub fn default_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".vibeface")
 }
 pub fn private_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
@@ -268,6 +286,31 @@ pub fn lock_data_dir(dir: &Path) -> Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_changes_bump_the_data_epoch() {
+        use sha2::{Digest, Sha256};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migrations in {}", dir.display());
+        let mut hasher = Sha256::new();
+        for path in files {
+            let name = path.file_name().unwrap().to_str().unwrap();
+            let body = std::fs::read(&path).unwrap();
+            hasher.update(format!("{name}\0{}\0", body.len()));
+            hasher.update(body);
+        }
+        let actual = hex::encode(hasher.finalize());
+        assert_eq!(
+            actual, DATA_EPOCH_SCHEMA_SHA256,
+            "schema changed: bump DATA_EPOCH and update the recorded fingerprint DATA_EPOCH_SCHEMA_SHA256 in crates/node/src/config.rs"
+        );
+    }
 
     #[test]
     fn browser_aliases_do_not_change_network_exposure() {

@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) mod assistant;
+pub(crate) mod bot_settings;
 pub(crate) mod bots;
 mod log;
 pub(crate) mod questions;
@@ -61,6 +61,11 @@ pub struct Store {
 }
 
 /// Merges `state` into the stored history. Returns whether the projections were rebuilt.
+///
+/// A recovery takes effect with time alone, and a late veto can put the earlier directory back, so
+/// this also rebuilds whenever the same history now has another recovery key in effect; that voids
+/// every invite and join request. Nothing here is refused for undoing a recovery: the directory in
+/// effect is a function of the signed history and the wall clock, and the rebuild follows it.
 pub(crate) fn install_trust_bundle_in(
     connection: &Connection,
     network_id: &str,
@@ -78,17 +83,54 @@ pub(crate) fn install_trust_bundle_in(
             |r| r.get(0),
         )
         .optional()?;
-    let merged = if let Some(previous) = &previous {
-        serde_json::from_str::<NetworkState>(previous)?.merge(state)?
-    } else {
-        state.clone()
+    let merged = match &previous {
+        Some(previous) => serde_json::from_str::<NetworkState>(previous)?.merge(state)?,
+        None => state.clone(),
     };
     let encoded = serde_json::to_string(&merged)?;
-    if previous.as_ref() == Some(&encoded) {
+    let view = merged.project()?;
+    let changed = previous.as_ref() != Some(&encoded);
+    let flipped = recovery_since_ms(connection, &view.recovery_key)?.is_none();
+    if !changed && !flipped {
         return Ok(false);
     }
-    connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
-    log::recompute(connection, &merged.project()?)
+    if changed {
+        connection.execute("INSERT INTO networks(network_id,bundle) VALUES(?,?) ON CONFLICT(network_id) DO UPDATE SET bundle=excluded.bundle",params![network_id,encoded])?;
+    }
+    if flipped {
+        connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES('recovery_since',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [format!("{}:{}", view.recovery_key, crate::runtime::now_ms())],
+        )?;
+        connection.execute("DELETE FROM invites", [])?;
+    }
+    log::recompute(connection, &view)
+}
+
+/// The recovery key this Node last saw in effect, and since when. Shown only, never a reason to
+/// refuse a history.
+fn recovery_since(connection: &Connection) -> Result<Option<(String, i64)>> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM identity_meta WHERE key='recovery_since'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(value
+        .as_deref()
+        .and_then(|value| value.split_once(':'))
+        .and_then(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?))))
+}
+
+/// When this Node first saw `recovery_key`; signed records carry no time of their own.
+pub(crate) fn recovery_since_ms(
+    connection: &Connection,
+    recovery_key: &str,
+) -> Result<Option<i64>> {
+    Ok(recovery_since(connection)?
+        .filter(|(key, _)| key == recovery_key)
+        .map(|(_, ms)| ms))
 }
 
 /// Total order shared by prompts and UI: a Kahn sort of the DAG with ties broken by
@@ -171,7 +213,9 @@ impl Store {
             0 => {
                 let tables:i64 = connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",[],|r|r.get(0))?;
                 ensure!(tables == 0, "unversioned database is not supported");
-                connection.execute_batch(&format!("BEGIN IMMEDIATE;{INITIAL_SCHEMA}COMMIT;"))?;
+                connection.execute_batch(&format!(
+                    "BEGIN IMMEDIATE;{INITIAL_SCHEMA}PRAGMA user_version = {SCHEMA_VERSION};COMMIT;"
+                ))?;
             }
             SCHEMA_VERSION => {}
             _ => bail!(
@@ -240,13 +284,6 @@ impl Store {
     /// The member record of a current, unrevoked Node.
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
-    }
-    /// A write signed by a device this network has admitted and not revoked.
-    pub fn authorize_attestation(&self, network_id: &str, body: &EventBody) -> Result<()> {
-        if let Some(attestation) = body.attestation() {
-            membership_from(&self.connection, network_id)?.client(&attestation.device_id)?;
-        }
-        Ok(())
     }
     /// Stores each event or reports why not; one bad event never aborts the batch.
     /// Signatures are verified here, once; stored events are trusted afterwards. Also returns
@@ -478,39 +515,6 @@ impl Store {
             .map(|row| row?)
             .collect()
     }
-    /// A conversation's latest messages other than answers, oldest first: `(role, text)`.
-    pub fn recent_messages(
-        &self,
-        network_id: &str,
-        scope_id: &str,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>> {
-        let mut statement = self.connection.prepare(
-            "SELECT role,text FROM messages WHERE network_id=? AND conversation_id=? AND answers IS NULL ORDER BY rank DESC LIMIT ?",
-        )?;
-        let mut rows = statement
-            .query_map(params![network_id, scope_id, limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.reverse();
-        Ok(rows)
-    }
-    /// Attachments an event carries, in its signed order.
-    pub fn event_blobs(&self, network: &str, event_hash: &str) -> Result<Vec<BlobRef>> {
-        let mut statement = self.connection.prepare(
-            "SELECT blob,size FROM event_blobs WHERE network_id=? AND hash=? ORDER BY blob",
-        )?;
-        statement
-            .query_map(params![network, event_hash], |r| {
-                Ok(BlobRef {
-                    hash: r.get(0)?,
-                    size: r.get(1)?,
-                })
-            })?
-            .map(|row| Ok(row?))
-            .collect()
-    }
     pub fn message(&self, network: &str, scope: &str, message_id: &str) -> Result<Option<Message>> {
         message_from(&self.connection, network, scope, message_id)
     }
@@ -655,6 +659,7 @@ pub(crate) fn create_conversation_from(
             scheduler_node: owner.scheduler_node,
             epoch: 1,
             attestation: Some(owner.attestation),
+            cause: None,
         },
         vec![],
         created_at_ms,
@@ -696,12 +701,12 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,blobs,answers,rank";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
     let status: Option<String> = r.get(7)?;
-    let blobs: String = r.get(9)?;
+    let attachments: String = r.get(9)?;
     let message_id: String = r.get(0)?;
     let text: String = r.get(2)?;
     let event_hash: String = r.get(3)?;
@@ -711,6 +716,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let report_results: Option<bool> = r.get(8)?;
     let answers: Option<String> = r.get(10)?;
     let rank: String = r.get(11)?;
+    let sender: Option<String> = r.get(12)?;
     Ok((|| {
         Ok(Message {
             message_id,
@@ -725,7 +731,8 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
                 .transpose()?,
             report_results,
             answers,
-            blobs: serde_json::from_str(&blobs)?,
+            sender: optional_json(sender)?,
+            attachments: serde_json::from_str(&attachments)?,
             rank,
         })
     })())

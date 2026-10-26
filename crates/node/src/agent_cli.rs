@@ -109,8 +109,31 @@ where
     bind(report).await
 }
 
-/// `vibeface codex call|watch`: a plain passthrough to the App Server socket.
+/// App Server methods that start, steer or stop a turn. A turn the Node did not register is
+/// one it cannot watch, report or stop, so these go through dispatch_work and interrupt_work.
+const TURN_WRITES: &[&str] = &[
+    "turn/start",
+    "turn/steer",
+    "turn/interrupt",
+    "thread/start",
+    "thread/fork",
+    "thread/compact/start",
+    "thread/shellCommand",
+    "thread/revert",
+    "thread/inject_items",
+    "review/start",
+];
+
+/// `vibeface codex call|watch`: a passthrough to the App Server socket for everything but
+/// the turn writes above.
 pub async fn run(socket: &Path, command: Command) -> Result<()> {
+    if let Command::Call { method, .. } = &command
+        && TURN_WRITES.contains(&method.as_str())
+    {
+        bail!(
+            "`codex call {method}` would start, steer or stop a turn the Node does not track; inside a bot turn start or steer with `vibeface codex send` or dispatch_work and stop with interrupt_work"
+        );
+    }
     let mut session = DirectSession::connect(socket)
         .await
         .map_err(|error| anyhow::anyhow!(error.message))?;

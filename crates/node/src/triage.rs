@@ -82,14 +82,9 @@ fn hex32(parts: &[&str]) -> String {
     hex::encode(hash.finalize())[..32].to_owned()
 }
 
-/// An assistant's question about an event: one per event wherever it is raised.
+/// A bot's question about an event: one per event wherever it is raised.
 pub fn question_id(node: &str, event_id: &str) -> String {
     format!("q-{}", hex32(&[node, event_id]))
-}
-
-/// The one question about a session no assistant owns, so its answer holds for the session.
-pub fn session_question_id(node: &str, session: &str) -> String {
-    format!("s-{}", hex32(&[node, session]))
 }
 
 impl AgentEvent {
@@ -158,7 +153,7 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         session_id: s(input, "session_id"),
         turn_id: s(input, "turn_id"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
+        last_message: s(input, "last_bot_message"),
         detail,
         ..Default::default()
     })
@@ -195,22 +190,45 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
         session_id: s(input, "session_id"),
         turn_id: format!("tx:{transcript_bytes}"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_assistant_message"),
+        last_message: s(input, "last_bot_message"),
         detail,
         ..Default::default()
     })
 }
 
-/// Turn ends in the complete lines of a Codex rollout after `offset`. Returns the events and
-/// the offset after the last complete line.
-pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
-    let meta = text
-        .lines()
-        .next()
-        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+/// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
+/// is one the user drives. `codex exec`, MCP and sub-agent sessions run without anyone
+/// watching them.
+pub fn interactive_codex(source: &Value, originator: Option<&str>) -> bool {
+    let background = match source {
+        Value::String(source) => matches!(source.to_ascii_lowercase().as_str(), "exec" | "mcp"),
+        Value::Object(source) => source
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("subagent")),
+        _ => false,
+    };
+    !background && !originator.is_some_and(|originator| originator.ends_with("_exec"))
+}
+
+/// Whether a Claude Code hook runs in a session the user drives; `claude -p` and the SDKs set
+/// an `sdk-*` entry point.
+pub fn interactive_claude(entrypoint: Option<&str>) -> bool {
+    !entrypoint.is_some_and(|entrypoint| entrypoint.starts_with("sdk"))
+}
+
+/// The `session_meta` payload on a Codex rollout's first line, if it has one.
+pub fn rollout_meta(first_line: &str) -> Value {
+    serde_json::from_str::<Value>(first_line)
+        .ok()
         .filter(|line| line["type"] == "session_meta")
         .map(|line| line["payload"].clone())
-        .unwrap_or(Value::Null);
+        .unwrap_or(Value::Null)
+}
+
+/// Turn ends in the complete lines of a Codex rollout after `offset`, none for a session the
+/// user does not drive. Returns the events and the offset after the last complete line.
+pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
+    let meta = rollout_meta(text.lines().next().unwrap_or_default());
     let end = text
         .rfind('\n')
         .map_or(0, |at| at + 1)
@@ -219,6 +237,9 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
     let Some(tail) = text.get(offset.min(end)..end) else {
         return (events, end);
     };
+    if !interactive_codex(&meta["source"], meta["originator"].as_str()) {
+        return (events, end);
+    }
     for line in tail.lines() {
         let Ok(line) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -252,7 +273,7 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
 pub use crate::model::Severity;
 
 /// The coordination Agent's turn when new events wait: it decides, then answers through
-/// `vibeface triage raise|dismiss`. Each event comes with the assistant whose chat owns its session.
+/// `vibeface triage raise|dismiss`. Each event comes with the bot whose chat owns its session.
 pub fn wake_prompt(
     events: &[(AgentEvent, Value)],
     cli: &str,
@@ -260,11 +281,11 @@ pub fn wake_prompt(
 ) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
-        .map(|(e, assistant)| {
+        .map(|(e, bot)| {
             json!({"event_id":e.event_id,"agent":e.agent,"event":e.event,"status":e.status,
             "session_id":e.session_id,"turn_id":e.turn_id,"cwd":e.cwd,"repo":e.repo,
             "git_branch":e.git_branch,"last_message":clip(&e.last_message, 1500),
-            "detail":clip(&e.detail, 500),"request_id":e.request_id,"assistant":assistant})
+            "detail":clip(&e.detail, 500),"request_id":e.request_id,"bot":bot})
         })
         .collect();
     Ok(format!(
@@ -272,16 +293,16 @@ pub fn wake_prompt(
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
 - Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]...`. \
-It asks in the chat of the event's assistant. Write TEXT in the user's language and plain words: what is happening and what \
+It asks in the chat of the event's bot. Write TEXT in the user's language and plain words: what is happening and what \
 they need to decide, in one or two sentences, never a shell command, code or raw output. Each --choice is one short action \
 the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the likely answer first and never a destructive \
 one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
-The answer comes back to that assistant as a new turn, and it acts on it.\n\
+The answer comes back to that bot as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
 shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
 (the thread already runs with full access). Only when the user must decide, add `--request-id REQUEST_ID` \
-to the raise: the request then waits for the answer, and the assistant has {answer_within_secs} seconds \
+to the raise: the request then waits for the answer, and the bot has {answer_within_secs} seconds \
 after it to respond. A request neither answered nor raised is declined after {answer_within_secs} seconds \
 or when this turn ends.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
@@ -312,6 +333,7 @@ pub struct TriageConfig {
     pub projects: Vec<ProjectOutlet>,
     pub webhook_url: Option<String>,
     pub scan_codex_sessions: bool,
+    pub codex_sessions: Option<PathBuf>,
 }
 
 impl Default for TriageConfig {
@@ -320,7 +342,8 @@ impl Default for TriageConfig {
             default_outlet: Outlet::Record,
             projects: vec![],
             webhook_url: None,
-            scan_codex_sessions: true,
+            scan_codex_sessions: false,
+            codex_sessions: None,
         }
     }
 }
@@ -336,6 +359,14 @@ impl TriageConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.scan_codex_sessions {
+            ensure!(
+                self.codex_sessions
+                    .as_ref()
+                    .is_some_and(|path| path.is_absolute() && path.is_dir()),
+                "set codex_sessions to an existing absolute directory before enabling session scanning"
+            );
+        }
         ensure!(self.projects.len() <= 256, "at most 256 project outlets");
         for project in &self.projects {
             ensure!(
@@ -412,8 +443,6 @@ pub struct OutboxEntry {
     pub state: Delivery,
     pub attempts: u32,
     pub next_ms: i64,
-    pub created_ms: i64,
-    pub last_error: Option<String>,
 }
 
 impl OutboxEntry {
@@ -424,19 +453,15 @@ impl OutboxEntry {
             state: Delivery::Pending,
             attempts: 0,
             next_ms: now_ms,
-            created_ms: now_ms,
-            last_error: None,
         }
     }
 
     /// Applies one attempt's result: an HTTP status, or `None` when the request failed.
-    pub fn record(&mut self, status: Option<u16>, error: Option<String>, now_ms: i64) {
+    pub fn record(&mut self, status: Option<u16>, now_ms: i64) {
         self.attempts += 1;
-        self.last_error = error.or_else(|| status.map(|s| format!("HTTP {s}")));
         let retry = match status {
             Some(200..=299) => {
                 self.state = Delivery::Delivered;
-                self.last_error = None;
                 return;
             }
             None | Some(408 | 429 | 500..=599) => true,
@@ -580,7 +605,7 @@ mod tests {
     #[test]
     fn every_source_of_one_turn_gets_one_event_id() {
         let node = "n".repeat(64);
-        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_assistant_message":"done"}))
+        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_bot_message":"done"}))
             .unwrap()
             .seal(&node, "h", 1)
             .unwrap();
@@ -629,24 +654,54 @@ mod tests {
     }
 
     #[test]
+    fn sessions_nobody_drives_are_not_scanned() {
+        let rollout = |meta: Value| {
+            format!(
+                "{}\n{}\n",
+                json!({"type":"session_meta","payload":meta}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"u1"}})
+            )
+        };
+        for meta in [
+            json!({"id":"t1","source":"cli","originator":"codex_cli_rs"}),
+            json!({"id":"t1","source":"vscode"}),
+            json!({"id":"t1"}),
+        ] {
+            assert_eq!(scan_rollout(&rollout(meta.clone()), 0).0.len(), 1, "{meta}");
+        }
+        for meta in [
+            json!({"id":"t1","source":"exec","originator":"codex_exec"}),
+            json!({"id":"t1","source":"cli","originator":"codex_exec"}),
+            json!({"id":"t1","source":"mcp"}),
+            json!({"id":"t1","source":{"subagent":"review"}}),
+            json!({"id":"t1","source":{"subAgent":{"thread_spawn":{"depth":1}}}}),
+        ] {
+            let text = rollout(meta.clone());
+            assert_eq!(scan_rollout(&text, 0), (vec![], text.len()), "{meta}");
+        }
+        assert!(interactive_claude(None) && interactive_claude(Some("cli")));
+        assert!(!interactive_claude(Some("sdk-cli")) && !interactive_claude(Some("sdk-ts")));
+    }
+
+    #[test]
     fn outbox_retries_transient_failures_and_dead_letters_the_rest() {
         let mut entry = OutboxEntry::new("e", "{}".into(), 0);
-        entry.record(Some(503), None, 0);
+        entry.record(Some(503), 0);
         assert_eq!((entry.state, entry.next_ms), (Delivery::Pending, 10_000));
-        entry.record(None, Some("timeout".into()), 10_000);
+        entry.record(None, 10_000);
         assert_eq!(entry.next_ms, 30_000);
         for _ in 2..MAX_ATTEMPTS {
-            entry.record(Some(429), None, 0);
+            entry.record(Some(429), 0);
         }
         assert_eq!(
             (entry.state, entry.attempts),
             (Delivery::Dead, MAX_ATTEMPTS)
         );
         let mut rejected = OutboxEntry::new("e", "{}".into(), 0);
-        rejected.record(Some(401), None, 0);
+        rejected.record(Some(401), 0);
         assert_eq!((rejected.state, rejected.attempts), (Delivery::Dead, 1));
         let mut ok = OutboxEntry::new("e", "{}".into(), 0);
-        ok.record(Some(202), None, 0);
+        ok.record(Some(202), 0);
         assert_eq!(ok.state, Delivery::Delivered);
     }
 

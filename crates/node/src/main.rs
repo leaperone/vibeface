@@ -37,7 +37,7 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 )]
 struct Cli {
     /// Data directory for direct startup. Subcommands accept their own --data-dir.
-    #[arg(long)]
+    #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Action>,
@@ -63,7 +63,7 @@ enum Action {
     Hook(Hook),
     /// Install, remove, check or test this Node's Codex and Claude Code hooks.
     Hooks(Hooks),
-    /// The coordination Agent's triage answers: list pending events, ask about, dismiss or assign one.
+    /// The coordination Agent's triage answers: list pending events, ask about or dismiss one.
     Triage(Triage),
     /// Add a record to this device's Node log, e.g. from the coordination Agent or a script.
     Log(LogRecord),
@@ -95,7 +95,7 @@ enum CodexCommand {
         method: String,
         params: Option<String>,
     },
-    /// Add a message to a thread as a work of this assistant turn: it steers the running turn or
+    /// Add a message to a thread as a work of this bot turn: it steers the running turn or
     /// starts one, and its result comes back like dispatch_work's. Reusing --id only reads back.
     Send {
         thread: String,
@@ -132,7 +132,7 @@ enum CodexCommand {
 
 #[derive(Args)]
 struct DataDir {
-    #[arg(long, default_value_os_t = config::default_dir())]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
     data_dir: PathBuf,
 }
 
@@ -172,11 +172,7 @@ struct Init {
     model: Option<String>,
     #[arg(long, default_value = "cursor-sdk-bridge")]
     cursor_sdk_bin: PathBuf,
-    #[arg(long, default_value = "node")]
-    node_bin: PathBuf,
-    #[arg(long)]
-    codex_sdk_script: Option<PathBuf>,
-    /// The system Codex App Server's socket, when discovery should not choose it.
+    /// Explicit socket of the existing Codex App Server to use.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
@@ -185,9 +181,9 @@ struct Init {
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
     /// Run an iroh relay for the personal network on this address.
-    #[arg(long, value_name = "ADDR")]
+    #[arg(long, value_name = "ADDR", requires = "relay_url")]
     relay_listen: Option<SocketAddr>,
-    /// The relay's URL as other Nodes reach it; defaults to `http://<relay-listen>`.
+    /// The relay's explicitly configured URL as other Nodes reach it.
     #[arg(long, value_name = "URL", requires = "relay_listen")]
     relay_url: Option<String>,
     /// Reach other Nodes only through relays, as behind a strict NAT.
@@ -251,8 +247,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Home directory holding `.codex` and `.claude`; defaults to `$HOME` (and `$CODEX_HOME`).
-    #[arg(long, value_name = "DIR")]
+    /// Explicit home directory holding the `.codex` and `.claude` hook configuration.
+    #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
     #[arg(long)]
@@ -274,7 +270,7 @@ enum TriageAction {
         #[arg(long, value_name = "MS")]
         since: Option<i64>,
     },
-    /// The user should decide: ask in the chat of the assistant that owns the event's session.
+    /// The user should decide: ask in the chat of the bot that owns the event's session.
     Raise {
         #[arg(long)]
         event_id: String,
@@ -293,14 +289,6 @@ enum TriageAction {
     Dismiss {
         #[arg(long)]
         event_id: String,
-    },
-    /// Hand the session a session question is about to an assistant; a repeat returns the owner.
-    Assign {
-        #[arg(long)]
-        question: String,
-        /// The assistant's conversation ID.
-        #[arg(long)]
-        assistant: String,
     },
 }
 
@@ -383,9 +371,9 @@ struct Join {
     link: String,
     #[command(flatten)]
     data: DataDir,
-    /// Device name shown to the network; defaults to this machine's host name.
+    /// Device name chosen by its owner and shown to the network.
     #[arg(long)]
-    name: Option<String>,
+    name: String,
 }
 
 #[tokio::main]
@@ -394,7 +382,11 @@ async fn main() -> Result<()> {
     let command = match cli.command {
         Some(command) => command,
         None => {
-            let data_dir = cli.data_dir.unwrap_or_else(config::default_dir);
+            let data_dir = cli
+                .data_dir
+                .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
+                .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
+            ensure!(data_dir.is_absolute(), "specify an absolute data directory");
             if !data_dir.join("config.json").exists() {
                 check_ports(DEFAULT_LISTEN, config::DEFAULT_LOCAL_LISTEN)?;
             }
@@ -436,11 +428,9 @@ async fn main() -> Result<()> {
                 _ = terminate.recv() => Ok(()),
                 _ = tokio::signal::ctrl_c() => Ok(()),
             };
-            // The App Server group must not outlive the Node that manages it.
             runtime.shutdown().await;
             if rejoin {
-                let name = runtime.member_name().await;
-                return restart_fresh(&options.data.data_dir, name.as_deref());
+                return restart_fresh(&options.data.data_dir);
             }
             result
         }
@@ -475,7 +465,7 @@ async fn main() -> Result<()> {
                 } => {
                     ensure!(
                         std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
-                        "codex send runs inside an assistant turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one use `vibeface codex call turn/start`"
+                        "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one, ask the bot in its chat"
                     );
                     let args = json!({"thread":thread,"prompt":text,"call_ref":id,
                         "model":model,"effort":effort,"images":image});
@@ -588,7 +578,6 @@ async fn logs(options: Logs) -> Result<()> {
             continue;
         };
         if now_inode != inode {
-            // The file rotated: finish the old one, now `node.log.1`, then start the new one.
             if identity(&rotated).is_some_and(|(old, _)| old == inode) {
                 for record in tail_records(&rotated, offset)?.0 {
                     filter
@@ -820,6 +809,11 @@ fn init(options: Init) -> Result<()> {
     configuration.codex_bin = options.codex_bin;
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
+    } else {
+        ensure!(
+            configuration.listen.ip().is_loopback(),
+            "set --public-url when listening beyond loopback"
+        );
     }
     configuration.allowed_origins = options.allowed_origins;
     let entry = match options.entry {
@@ -862,14 +856,6 @@ fn init(options: Init) -> Result<()> {
                 }
             }),
             cursor_sdk_bin: options.cursor_sdk_bin,
-            node_bin: options.node_bin,
-            codex_sdk_script: match options.codex_sdk_script {
-                Some(path) => path,
-                None => std::env::current_exe()?
-                    .parent()
-                    .context("node executable has no parent directory")?
-                    .join("sidecars/codex-manager.mjs"),
-            },
         });
     }
     initialize_announced(dir, configuration, entry_token)
@@ -881,9 +867,16 @@ fn initialize_announced(
     entry_token: Option<String>,
 ) -> Result<()> {
     let public_entry = configuration.public_entry;
-    let peer = initialize(dir, configuration, entry_token)?;
-    println!("Initialized device with Peer ID {peer}");
-    println!("Configuration: {}", dir.join("config.json").display());
+    let local = !public_entry
+        && (configuration.listen.ip().is_loopback() || configuration.listen.ip().is_unspecified());
+    let open = if local {
+        format!("http://localhost:{}", configuration.listen.port())
+    } else {
+        configuration.public_url.clone()
+    };
+    initialize(dir, configuration, entry_token)?;
+    println!("Vibeface 已就绪");
+    println!("打开 {open}");
     if public_entry {
         println!(
             "Relay token: {} (copy it to your Node and pass --relay-token-file)",
@@ -893,8 +886,7 @@ fn initialize_announced(
     Ok(())
 }
 
-/// Writes a fresh data directory and returns its Peer ID.
-fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<String> {
+fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) -> Result<()> {
     ensure!(
         !dir.join("identity.json").exists() && !dir.join("config.json").exists(),
         "node already initialized; existing identity and configuration were preserved"
@@ -932,15 +924,14 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
     create_private(
         &dir.join("data-epoch.json"),
         &crate::config::data_epoch_marker(),
-    )?;
-    identity.device_id()
+    )
 }
 
 /// Restarts this removed Node fresh. Replacing the process image keeps its PID, so a service
 /// manager sees no exit and a Node started by hand keeps running; nothing of the old runtime
 /// survives to write into the data set aside.
-fn restart_fresh(dir: &Path, name: Option<&str>) -> Result<()> {
-    match start_over(dir, name) {
+fn restart_fresh(dir: &Path) -> Result<()> {
+    match start_over(dir) {
         Ok(archive) => tracing::warn!(archive = %archive.display(), "removed Node data set aside"),
         Err(error) => tracing::error!(%error, "removed Node data could not be set aside"),
     }
@@ -951,10 +942,7 @@ fn restart_fresh(dir: &Path, name: Option<&str>) -> Result<()> {
     Err(error).context("restart the Node")
 }
 
-/// Renames the data directory to `<name>-removed-<local time>`, never deleting it, and puts a
-/// fresh Node with the same settings and the former `name` in its place. The new directory is
-/// complete before either rename, so a failure leaves the old data where it was.
-fn start_over(dir: &Path, former_name: Option<&str>) -> Result<PathBuf> {
+fn start_over(dir: &Path) -> Result<PathBuf> {
     let configuration = Config::load(dir)?;
     let entry_token = configuration
         .network
@@ -974,10 +962,7 @@ fn start_over(dir: &Path, former_name: Option<&str>) -> Result<PathBuf> {
         "{} already exists",
         archive.display()
     );
-    let made = initialize(&fresh, configuration, entry_token).and_then(|_| match former_name {
-        Some(name) => config::private_write(&fresh.join(config::FORMER_NAME_FILE), name.as_bytes()),
-        None => Ok(()),
-    });
+    let made = initialize(&fresh, configuration, entry_token);
     if let Err(error) = made {
         let _ = fs::remove_dir_all(&fresh);
         return Err(error);
@@ -1138,6 +1123,12 @@ async fn access(entry: LocalEntry) -> Result<()> {
             entry["device_id"] == launcher.node_id && entry["url"] == launcher.origin,
             "local browser entry does not match this node"
         );
+        // The link opens the localhost page, which keeps a browser already joined there and
+        // sends only an unjoined one on to the launcher origin's temporary session.
+        let listen = configuration.listen.ip();
+        if listen.is_loopback() || listen.is_unspecified() {
+            url = origin(&format!("http://localhost:{}", configuration.listen.port()))?;
+        }
         url.set_fragment(Some(&format!("local={token}&node={}", launcher.node_id)));
         if options.json {
             println!(
@@ -1209,9 +1200,9 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 async fn join(options: Join) -> Result<()> {
-    let name = options.name.unwrap_or_else(config::hostname);
     let state =
-        vibeface::client::join_network(&options.data.data_dir, &options.link, &name).await?;
+        vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
+            .await?;
     println!(
         "已加入个人网络 {}。启动 Node 后即可连接。",
         state.genesis.network_id
@@ -1292,7 +1283,6 @@ async fn post_tool(name: &str, arguments: Value, call_id: &str) -> Result<Value>
     let status = response.status();
     let body = bounded_body(response).await?;
     if !status.is_success() {
-        // The Agent needs the reason to correct the call, not just the status.
         let reason = serde_json::from_slice::<Value>(&body)
             .ok()
             .and_then(|error| error["error"].as_str().map(str::to_owned))
@@ -1369,6 +1359,34 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
+/// Whether a hook comes from a session the user drives: Codex tells by its rollout's first
+/// line, Claude Code by the entry point it hands its hooks.
+fn interactive_hook(agent: HookAgent, input: &Value) -> bool {
+    use vibeface::triage;
+    match agent {
+        HookAgent::Codex => {
+            let first = input["transcript_path"]
+                .as_str()
+                .and_then(|path| fs::File::open(path).ok())
+                .and_then(|file| {
+                    let mut line = String::new();
+                    std::io::BufRead::read_line(
+                        &mut std::io::BufReader::new(file.take(1 << 20)),
+                        &mut line,
+                    )
+                    .ok()
+                    .map(|_| line)
+                })
+                .unwrap_or_default();
+            let meta = triage::rollout_meta(&first);
+            triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+        }
+        HookAgent::Claude => {
+            triage::interactive_claude(std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref())
+        }
+    }
+}
+
 async fn hook(options: Hook) -> Result<()> {
     use vibeface::triage::{self, AgentEvent};
     let mut event = if options.test {
@@ -1384,6 +1402,9 @@ async fn hook(options: Hook) -> Result<()> {
         let mut input = Vec::new();
         std::io::stdin().take(1 << 20).read_to_end(&mut input)?;
         let input: Value = serde_json::from_slice(&input).context("hook input is not JSON")?;
+        if !interactive_hook(options.agent, &input) {
+            return Ok(());
+        }
         let event = match options.agent {
             HookAgent::Codex => triage::from_codex_hook(&input),
             HookAgent::Claude => triage::from_claude_hook(
@@ -1463,21 +1484,17 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let home = match &options.home {
-        Some(home) => home.clone(),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),
-    };
-    let codex_home = match &options.home {
-        Some(_) => None,
-        None => std::env::var_os("CODEX_HOME").map(PathBuf::from),
-    };
+    let home = options
+        .home
+        .as_ref()
+        .context("--home is required for hook configuration")?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
         Err(_) => options.local.data.data_dir.clone(),
     };
     let stamp = vibeface::runtime::now_ms();
-    for file in triage::hook_files(&home, codex_home.as_deref()) {
+    for file in triage::hook_files(home, None) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -1530,9 +1547,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("{}: changed {}", file.path.display(), changed.join(", "));
     }
     if let HooksAction::Install = options.action {
-        let config = codex_home
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("config.toml");
+        let config = home.join(".codex/config.toml");
         let enabled = fs::read_to_string(&config)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -1570,10 +1585,6 @@ async fn triage(options: Triage) -> Result<()> {
                 "request_id":request_id,"choices":choices})
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
-        TriageAction::Assign {
-            question,
-            assistant,
-        } => json!({"action":"assign","question_id":question,"conversation_id":assistant}),
     };
     let result = post_local(
         &local_node_url(&options.local)?,
@@ -1590,6 +1601,45 @@ async fn triage(options: Triage) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn codex_call_refuses_turn_writes_before_reaching_the_app_server() {
+        use vibeface::agent_cli::{Command, run};
+        let socket = Path::new("/nonexistent/vibeface-codex.sock");
+        for method in [
+            "turn/start",
+            "turn/steer",
+            "turn/interrupt",
+            "thread/start",
+            "review/start",
+        ] {
+            let refused = run(
+                socket,
+                Command::Call {
+                    method: method.into(),
+                    params: None,
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                refused.contains(method) && refused.contains("codex send"),
+                "{refused}"
+            );
+        }
+        let read = run(
+            socket,
+            Command::Call {
+                method: "thread/list".into(),
+                params: None,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!read.contains("codex send"), "{read}");
+    }
+
     #[test]
     fn cli_direct_start_keeps_data_directory_arguments_unambiguous() {
         let default = Cli::try_parse_from(["vibeface"]).unwrap();
@@ -1604,6 +1654,19 @@ mod tests {
         };
         assert!(explicit.data_dir.is_none());
         assert_eq!(options.data.data_dir, Path::new("/private/node data"));
+        for value in ["", "relative-node"] {
+            for command in [
+                vec![],
+                vec!["serve"],
+                vec!["service", "status"],
+                vec!["update", "status"],
+            ] {
+                let mut arguments = vec!["vibeface"];
+                arguments.extend(command);
+                arguments.extend(["--data-dir", value]);
+                assert!(Cli::try_parse_from(arguments).is_err());
+            }
+        }
         for arguments in [
             vec!["vibeface", "--data-dir", "/one", "serve"],
             vec![
@@ -1634,6 +1697,8 @@ mod tests {
             "https://relay.test",
             "--relay-listen",
             "127.0.0.1:0",
+            "--relay-url",
+            "https://relay.test",
             "--relay-paths-only",
         ])?;
         let Some(Action::Init(options)) = cli.command else {
@@ -1747,15 +1812,37 @@ mod tests {
                 "join",
                 "https://node.example/join#vibeface1abc",
                 "--name",
-                "Build Node"
+                "Build Node",
+                "--data-dir",
+                "/data/node"
             ])
             .is_ok()
         );
-        assert!(Cli::try_parse_from(["vibeface", "access", "--json"]).is_ok());
-        assert!(Cli::try_parse_from(["vibeface", "access", "--enable"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "vibeface",
+                "join",
+                "https://node.example/join#vibeface1abc",
+                "--data-dir",
+                "/data/node"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["vibeface", "serve"]).is_err());
+        assert!(
+            Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["vibeface", "access", "--enable", "--data-dir", "/data/node"])
+                .is_ok()
+        );
         assert!(Cli::try_parse_from(["vibeface", "access", "--enable", "--disable"]).is_err());
         assert!(Cli::try_parse_from(["vibeface", "status", "--enable"]).is_err());
-        assert!(Cli::try_parse_from(["vibeface", "status", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["vibeface", "status", "--json", "--data-dir", "/data/node"])
+                .is_ok()
+        );
         for action in [
             "install",
             "start",
@@ -1782,6 +1869,8 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
+                "--data-dir",
+                "/data/node",
                 "--relay",
                 "https://relay.test",
                 "--relay-listen",
@@ -1795,6 +1884,8 @@ mod tests {
             Cli::try_parse_from([
                 "vibeface",
                 "init",
+                "--data-dir",
+                "/data/node",
                 "--manager",
                 "cursor_sdk",
                 "--workspace",

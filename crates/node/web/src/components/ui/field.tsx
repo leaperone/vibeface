@@ -1,22 +1,9 @@
 "use client"
 
 import { cva, type VariantProps } from "class-variance-authority"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 
 import { Label } from "#components/ui/label.tsx"
-
-function FieldGroup({ className, ...props }: React.ComponentProps<"div">) {
-  return (
-    <div
-      data-slot="field-group"
-      className={cn(
-        "group/field-group @container/field-group flex w-full flex-col gap-5 data-[slot=checkbox-group]:gap-3 *:data-[slot=field-group]:gap-4",
-        className
-      )}
-      {...props}
-    />
-  )
-}
 
 const fieldVariants = cva(
   "group/field flex w-full gap-2 data-[invalid=true]:text-destructive",
@@ -84,4 +71,4 @@ function FieldDescription({ className, ...props }: React.ComponentProps<"p">) {
   )
 }
 
-export { Field, FieldDescription, FieldGroup, FieldLabel }
+export { Field, FieldDescription, FieldLabel }

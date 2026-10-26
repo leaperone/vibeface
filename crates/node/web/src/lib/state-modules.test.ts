@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { nextLink, type Link } from './link.ts'
-import { enqueue, settle, type OutboxItem, type OutboxStore } from './outbox.ts'
+import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
+import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from './entrances.ts'
-import { humanError, rawError } from './errors.ts'
+import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }
@@ -75,7 +75,7 @@ test('one tab leads and the next takes over when it closes', { skip: !globalThis
 })
 
 const node = (id: string) => ({ device_id: id.repeat(64), kind: 'node' as const, name: id, manage: false })
-const view = { network_id: 'n'.repeat(64), epoch: 1, heads: [], members: [node('a'), node('b'), node('c'), { ...node('d'), kind: 'client' as const }], revoked: [{ device_id: 'c'.repeat(64), cutoff_seq: 0, cutoff_hash: null }], attesters: [] }
+const view = { network_id: 'n'.repeat(64), epoch: 1, recovery_key: 'n'.repeat(64), heads: [], members: [node('a'), node('b'), node('c'), { ...node('d'), kind: 'client' as const }], revoked: [{ device_id: 'c'.repeat(64), cutoff_seq: 0, cutoff_hash: null }], attesters: [], pending: null, stopped: [] }
 const address = (id: string, gateway: string | null, network = view.network_id, seq = 1) => ({ payload: JSON.stringify({ version: 1, network_id: network, device_id: id.repeat(64), seq, endpoint: { id: id.repeat(64), addrs: [] }, gateway_url: gateway }), signature: `signed-by-${id}` })
 const signedBySelf = (deviceId: string, _payload: string, signature: string) => signature === `signed-by-${deviceId[0]}`
 
@@ -125,8 +125,19 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
   assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)
+  assert.equal(humanError('set an explicit App Server socket before enabling system execution'), '还没选怎么连 Codex。')
+  assert.equal(humanError('the App Server socket must be an absolute path'), '连接路径要是绝对路径。')
+  assert.match(humanError('set an explicit absolute CODEX_HOME before starting a managed App Server'), /CODEX_HOME/)
   assert.equal(humanError('something nobody mapped'), '这次操作没有成功，请再试一次。')
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')
   assert.equal(rawError(new Error('已断开')), '')
+})
+
+test('a spent join link reads the same, and clears the field the same, whether the Node or the page says so', () => {
+  for (const raw of ['ticket has already been used', 'ticket is unknown or already expired', 'ticket has expired', spentInviteText]) {
+    assert.ok(spentInvite.test(raw), raw)
+    assert.equal(humanError(raw), spentInviteText)
+  }
+  assert.equal(spentInvite.test('这次加入被拒绝了。要再试，请在已有设备上重新添加。'), false)
 })

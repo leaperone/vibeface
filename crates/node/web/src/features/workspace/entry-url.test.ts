@@ -1,24 +1,33 @@
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import { dirname, extname, resolve } from "node:path"
+import { dirname, resolve } from "node:path"
 import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import type { ReadyConnection } from "../../lib/node.ts"
-import type { WorkRecord } from "./types.ts"
-import { nodeName } from "./labels.ts"
-import { inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize } from "./model.ts"
-import { placeChanges, routineName, routineTrigger } from "./assistant.ts"
-import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "./questions.ts"
-import { canSend, composerHint } from "../chat/protocol.ts"
-import { primaryLane } from "../identity/connection-lane.ts"
+import { parseEntry, parseInfo } from "@vibeface/client/lib/node.ts"
+import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
+import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
+import { nodeName } from "@vibeface/client/workspace/labels.ts"
+import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
+import { placeChanges, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
+import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { canSend, composerHint, threadReplies } from "@vibeface/client/chat/protocol.ts"
+import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 
 const context = {
   conversation: { conversation_id: "chat", title: "test", owner: "gateway", owner_epoch: 1 }, messages: [],
-  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], assistant: { skills: [], routines: [] }, questions: [], sessions: [],
+  works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
 }
-test("conversation navigation stays in the trusted web and carries no credentials", () => {
+test("attachment names are signed clean and files once each in content order", () => {
+  assert.equal(attachmentName("../etc/pass\\wd\u0007\n.txt"), "..etcpasswd.txt")
+  assert.equal(attachmentName("/\\"), "file", "a name with nothing left falls back")
+  const long = attachmentName("名".repeat(100))
+  assert.equal(new TextEncoder().encode(long).length, 255)
+  assert.equal(attachmentName("a" + "名".repeat(85)), "a" + "名".repeat(84), "a character is never split")
+  assert.equal(attachmentName("bad\ud800.txt"), "bad.txt", "a lone surrogate cannot reach the signed JSON")
+  const files = [{ hash: "b", size: 1, name: "b.txt" }, { hash: "a", size: 1, name: "a.txt" }, { hash: "b", size: 1, name: "copy of b.txt" }]
+  assert.deepEqual(signedOrder(files), [{ hash: "a", size: 1, name: "a.txt" }, { hash: "b", size: 1, name: "b.txt" }])
 })
 test("malformed conversation snapshots fail closed instead of authorizing writes", () => {
   assert.equal(parseConversation(context, "chat").conversation?.owner, "gateway")
@@ -29,7 +38,7 @@ test("malformed conversation snapshots fail closed instead of authorizing writes
 test("nodeName prefers rpc and directory names and never shows a peer id", () => {
   const id = "a".repeat(64)
   assert.equal(nodeName(id, { nodes: [{ device_id: id, name: "Mac Studio", local: false, online: true, revoked: false }] }), "Mac Studio")
-  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [] } }), "工作机")
+  assert.equal(nodeName(id, { directory: { network_id: "n", epoch: 1, recovery_key: "n", heads: [], members: [{ device_id: id, kind: "node", name: "工作机", manage: false }], revoked: [], attesters: [], pending: null, stopped: [] } }), "工作机")
   assert.equal(nodeName(id), "另一台设备")
 })
 
@@ -41,15 +50,17 @@ test("capabilities parse the actual provider name and reject malformed node list
 })
 test("works, reply status and pending checks keep their exact shape", () => {
   const work = { work_id: "work", trigger: "message:one", target_node: "worker", cwd: "/project", title: "检查项目", prompt: "检查项目", state: "running", summary: "进行中", outcome: null, result_text: "", failure_reason: null }
-  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], capabilities: { streaming: true, cancel: false, steer: false } }
-  const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped", blobs: [{ hash: "result", size: 20 }] }
-  const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message] })
+  const scheduler = { jobs: [{ trigger: "message:one", state: "queued", message_id: "one" }], unanswered: [], capabilities: { streaming: true, cancel: false, steer: false } }
+  const message = { message_id: "reply", event_hash: "event", role: "assistant", text: "部分回复", created_at_ms: 1, in_reply_to: "one", status: "stopped" }
+  const sent = { message_id: "one", event_hash: "sent", role: "user", text: "看附件", created_at_ms: 0, attachments: [{ hash: "file", size: 20, name: "报告.pdf" }] }
+  const parsed = parseConversation({ ...context, works: [work], scheduler, messages: [message, sent] })
   assert.equal(parsed.works[0].state, "running")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_approval" }] }), "approval states are gone")
   assert.equal(parseConversation({ ...context, works: [{ ...work, title: undefined }] }).works[0].title, "", "a dispatch row without a title still parses")
   assert.equal(parsed.messages[0].status, "stopped")
   assert.equal(parsed.messages[0].in_reply_to, "one")
-  assert.deepEqual(parsed.messages[0].blobs, [{ hash: "result", size: 20 }])
+  assert.deepEqual(parsed.messages[1].attachments, [{ hash: "file", size: 20, name: "报告.pdf" }])
+  assert.throws(() => parseConversation({ ...context, messages: [{ ...sent, attachments: [{ hash: "file", size: 20 }] }] }), "an attachment without a name fails closed")
   assert.equal(parseConversation(context).scheduler, null)
   for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
@@ -75,7 +86,8 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(delivered.works[1], { work_id: "new", trigger: "", target_node: "other", cwd: "/p", title: "新任务", prompt: "", state: "dispatch_rejected", summary: "", outcome: null, result_text: "", failure_reason: "project unavailable" })
   assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))
-  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }] } }).scheduler?.jobs[0].state, "pending_delivery")
+  assert.equal(parseConversation({ ...context, scheduler: { jobs: [{ trigger: "message:two", owner: "node", conversation_id: "c", state: "pending_delivery", message_id: "two" }], unanswered: [] } }).scheduler?.jobs[0].state, "pending_delivery")
+  assert.throws(() => parseConversation({ ...context, scheduler: { jobs: [] } }), "the unanswered list is always sent")
 })
 test("artifact pages stay bound to their original reference and advance without skipping the end", () => {
   const page = { blob_hash: "result", text: "first", offset: 0, next_offset: 5, size: 10 }
@@ -125,7 +137,8 @@ test("workspace preserves bot and message requests while routing native decision
     history: { replaceState(_state: unknown, _title: string, url: string) { browser.location.href = new URL(url, browser.location.href).href } }, setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
   }
   const sandbox = createContext({
-    window: browser, URL, TextEncoder, Error, crypto: globalThis.crypto,
+    window: browser, URL, TextEncoder, TextDecoder, Error, crypto: globalThis.crypto,
+    setTimeout: browser.setTimeout, clearTimeout: browser.clearTimeout, setInterval: browser.setInterval, clearInterval: browser.clearInterval,
     structuredClone, navigator: { locks: { request: async (_key: string, _options: unknown, run: (lock: object) => Promise<void>) => run({}) } },
     document: { hidden: false, addEventListener() {}, removeEventListener() {} },
   })
@@ -137,7 +150,8 @@ test("workspace preserves bot and message requests while routing native decision
     put: async (item: { key: string }) => { outboxItems.set(item.key, structuredClone(item)) },
     delete: async (key: string) => { outboxItems.delete(key) },
   }
-  const modules = new Map<string, { exports: Record<string, unknown> }>(), sourceRoot = fileURLToPath(new URL("../../", import.meta.url))
+  const modules = new Map<string, { exports: Record<string, unknown> }>()
+  const clientRoot = fileURLToPath(new URL("../../../../../../packages/client/src/", import.meta.url))
   function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
     if (cached) return cached.exports
@@ -148,22 +162,25 @@ test("workspace preserves bot and message requests while routing native decision
     const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
     const require = (specifier: string) => {
       if (specifier === "react") return react
-      if (specifier === "@/lib/node") return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+      if (specifier.endsWith("/lib/node.ts")) return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
-      if (specifier.endsWith("/generated/vibeface_secure.js")) return { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` }
-      if (specifier === "@/lib/outbox") return { ...load(resolve(sourceRoot, "lib/outbox.ts")), indexedOutbox: () => memoryOutbox }
-      if (specifier.endsWith("/transport.js")) return { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } }
-      const path = specifier.startsWith("@/") ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
-      return load(extname(path) ? path : `${path}.ts`)
+      return load(resolve(dirname(filename), specifier))
     }
     new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInContext(sandbox)(module.exports, require, module)
     return module.exports
   }
-  type Workspace = ReturnType<typeof import("./context.tsx").useWorkspace>
-  const workspaceModule = load(fileURLToPath(new URL("./context.tsx", import.meta.url)))
+  type Workspace = ReturnType<typeof import("@vibeface/client/workspace/context.tsx").useWorkspace>
+  const workspaceModule = load(resolve(clientRoot, "workspace/context.tsx"))
   assert.equal(typeof workspaceModule.useWorkspaceState, "function")
-  const { useWorkspaceState } = workspaceModule as { useWorkspaceState(connection: ReadyConnection): Workspace }
-  const bot = { bot_id: "bot", conversation_id: "chat", name: "助手", instructions: "处理项目", event_hash: "bot-event", last_message: null }
+  const { useWorkspaceState } = workspaceModule as { useWorkspaceState(platform: unknown, connection: ReadyConnection): Workspace }
+  const platform = {
+    secure: { attestationPayload: (network: string, scope: string, body: string) => `${network}|${scope}|${body}` },
+    transport: { signClient: async (domain: string, payload: string) => { signed.push(`${domain}|${payload}`); return "signature" } },
+    storage: browser.localStorage, outbox: memoryOutbox, self: "这个浏览器",
+    notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
+    onForeground: () => () => {}, foreground: () => true,
+  }
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, event_hash: "bot-event", last_message: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
@@ -178,9 +195,9 @@ test("workspace preserves bot and message requests while routing native decision
   let unreadNotifications: { notification_id: string; kind: string; text: string; conversation_id: string }[] = []
   const messages: Record<string, unknown>[] = [], controls: Record<string, unknown>[] = [], creations: Record<string, unknown>[] = []
   let failControl = false, failBotCheck = false, failMessage = false
-  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, assistant: { bot_id: "bot", name: "助手" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
-  const sessionRow = { ...questionRow, question_id: "s1", conversation_id: null, assistant: null }
-  let questionRows: Record<string, unknown>[] = [questionRow, sessionRow]
+  const questionRow = { question_id: "q1", conversation_id: "chat" as string | null, bot: { bot_id: "bot", name: "Bot" } as { bot_id: string; name: string } | null, severity: "attention", text: "要不要继续", choices: [{ label: "继续" }, { label: "停下" }], about: { node: "worker", agent: "codex", session_id: "thread", cwd: "/project", summary: "改登录" }, author: "gateway", created_at_ms: 1, answer: null }
+  const otherRow = { ...questionRow, question_id: "s1", conversation_id: "other" }
+  let questionRows: Record<string, unknown>[] = [questionRow, otherRow]
   const answers: Record<string, unknown>[] = []
   let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
@@ -209,7 +226,7 @@ test("workspace preserves bot and message requests while routing native decision
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
         if (createMode === "unknown") throw new Error("connection lost")
         if (createMode === "rejected") throw Object.assign(new Error("project unavailable"), { responded: true })
-        const created = parseBot({ ...body, event_hash: "new-bot-event" })
+        const created = parseBot({ ...body, models: {}, skills: null, event_hash: "new-bot-event" })
         knownBots = [...knownBots.filter((item) => item.bot_id !== created.bot_id), created]
         return { bot: created }
       }
@@ -229,7 +246,7 @@ test("workspace preserves bot and message requests while routing native decision
   let activeConnection = connection
   const render = () => {
     cursor = 0
-    const state = useWorkspaceState(activeConnection)
+    const state = useWorkspaceState(platform, activeConnection)
     afterRender.splice(0).forEach((run) => run())
     return state
   }
@@ -267,7 +284,7 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().messagePending, null)
     await render().interruptWork("work")
     assert.deepEqual(controls, [{ method: "interrupt_work", conversation_id: "chat", work_id: "work" }])
-    const [question, session] = render().questions
+    const [question, other] = render().questions
     assert.equal(question.text, "要不要继续")
     await assert.rejects(render().answer(question, "  "), /不能为空/)
     await assert.rejects(render().answer(question, " 继续 "), /connection lost/)
@@ -283,8 +300,8 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(render().pendingAnswers, [])
     assert.equal(render().answered.q1, "继续", "the answer shows before the next read")
     answerOutcome = "already_answered"
-    assert.equal((await render().answer(session, "处理")).text, "停下", "the answer that stood first is the one shown")
-    assert.equal(signed.at(-1), 'attestation|network|sessions|{"type":"message_posted","message_id":"a-s1","role":"user","text":"处理","report_results":true,"answers":"s1"}', "a session question is answered for sessions")
+    assert.equal((await render().answer(other, "继续")).text, "停下", "the answer that stood first is the one shown")
+    assert.equal(signed.at(-1), 'attestation|network|other|{"type":"message_posted","message_id":"a-s1","role":"user","text":"继续","report_results":true,"answers":"s1"}', "an answer is signed for its question's chat")
     // After a new connection the outbox asks the questions list before sending an unknown answer again.
     const later = { ...questionRow, question_id: "q2" }, elsewhere = { ...questionRow, question_id: "q3" }
     questionRows = [later, elsewhere]
@@ -321,7 +338,7 @@ test("workspace preserves bot and message requests while routing native decision
     assert.equal(render().pendingBot, null)
     await assert.rejects(render().createBot({ name: "n".repeat(512), instructions: "a".repeat(8192), project: { target_node: "executor", cwd: "/" + "p".repeat(4095) } }), /太长/)
     assert.equal(render().pendingBot, null)
-    await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /connection lost/)
     const originalCreation = creations[0]
     assert.equal(typeof originalCreation.bot_id, "string")
     assert.notEqual(originalCreation.bot_id, originalCreation.conversation_id)
@@ -330,11 +347,11 @@ test("workspace preserves bot and message requests while routing native decision
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     await assert.rejects(render().createBot({ name: "改名", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /内容已保留/)
     createMode = "rejected"
-    await assert.rejects(render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
+    await assert.rejects(render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } }), /project unavailable/)
     assert.deepEqual(botBody(render().pendingBot), originalCreation)
     assert.equal(render().pendingBot?.submission?.state, "unconfirmed")
     createMode = "success"
-    await render().createBot({ name: "项目助手", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
+    await render().createBot({ name: "项目 Bot", instructions: "只处理当前项目", project: { target_node: "executor", cwd: "/project" } })
     assert.deepEqual(creations.slice(1), [originalCreation, originalCreation, originalCreation], "the reload resubmits the unconfirmed creation from the outbox")
     assert.equal(render().pendingBot, null)
     createMode = "rejected"
@@ -441,20 +458,23 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
   let cursor = 0
+  function effect(run: () => (() => void) | void, dependencies: unknown[]) {
+    const index = cursor++, previous = effects.get(index)
+    if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
+      previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
+    })
+  }
   const react = {
+    createContext: () => ({}), useContext: () => null,
     useId: () => 'component',
+    useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useState(initial: unknown) {
       const index = cursor++
       if (!(index in values)) values[index] = typeof initial === 'function' ? initial() : initial
       return [values[index], (next: unknown) => { values[index] = typeof next === 'function' ? next(values[index]) : next }]
     },
     useRef(initial: unknown) { const index = cursor++; if (!(index in values)) values[index] = { current: initial }; return values[index] },
-    useEffect(run: () => (() => void) | void, dependencies: unknown[]) {
-      const index = cursor++, previous = effects.get(index)
-      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
-        previous?.cleanup?.(); effects.set(index, { dependencies, cleanup: run() ?? undefined })
-      })
-    },
+    useEffect: effect, useLayoutEffect: effect,
   }
   const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
@@ -473,6 +493,7 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       return elements
     },
     close() { for (const effect of effects.values()) effect.cleanup?.() },
+    module: module.exports,
   }
 }
 
@@ -486,13 +507,13 @@ const settleComponent = () => new Promise(setImmediate)
 test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
   const sent: unknown[][] = []
   const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
-    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目助手' }, { bot_id: 'main-bot', conversation_id: 'main', name: '主助手甲' }], primary: 'main',
+    bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }],
     answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { './context': { useWorkspace: () => workspace }, '../identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => 'Mac mini' }, './questions': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
-  const question = { question_id: 'q1', conversation_id: 'chat', assistant: { bot_id: 'bot', name: '项目助手' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/Users/me/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, projectName, settledAnswer }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
   type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
   const labelled = (elements: Element[], label: string) => elements.find(({ props }) => props.onClick && text(props.children).includes(label))
@@ -501,7 +522,7 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
   try {
     let elements: Element[] = app.render('QuestionCard', { question })
     assert.match(words(elements), /web/, 'the meta line names the project')
-    assert.match(words(elements), /Mac mini/, 'and the device')
+    assert.match(words(elements), /工作电脑/, 'and the device')
     assert.equal(elements.some(({ type }) => type === 'Link'), false, 'in its own chat the card does not link to it')
     labelled(elements, '停下')?.props.onClick?.(); await settleComponent()
     assert.deepEqual(plain(sent[0]), [question, '停下'], 'a choice answers with its label')
@@ -527,23 +548,23 @@ test("question cards answer with a choice or typed text, retry an unconfirmed an
     assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
     assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
     assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
-    const session = { ...question, question_id: 'q2', conversation_id: null, assistant: null, choices: [{ label: '忽略' }, { label: '处理' }, { label: '交给 项目助手', conversation_id: 'chat' }] }
-    assert.ok(app.render('QuestionCard', { question: session }).some(({ props }) => props['aria-label'] === '其他回答'), 'a session question takes a typed answer too')
-    for (const label of ['处理', '交给 项目助手', '忽略']) labelled(app.render('QuestionCard', { question: session, inbox: true }), label)?.props.onClick?.()
+    workspace.answered = {}
+    labelled(app.render('QuestionCard', { question: { ...question, question_id: 'q2' }, inbox: true }), '继续')?.props.onClick?.()
     await settleComponent()
-    assert.deepEqual(toasts.map(({ text }) => text), ['已交给主助手分派', '已交给 项目助手', '已忽略这个会话'], '待处理 says where each session went')
+    assert.deepEqual(toasts.map(({ text }) => text), ['已回答'], '待处理 says it was answered')
     toasts[0].action?.onClick()
-    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'main-bot' } }], 'and leads to the chat that took it')
+    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'bot' } }], 'and leads to the chat it went to')
   } finally { app.close() }
 })
 
-test("any entrance stops an unfinished task once, even on another device", async () => {
+test("any entrance stops an unfinished task once, after a confirming second tap, even on another device", async () => {
   const stopped: string[] = []
-  const data = { local_node: 'worker', works: [] as unknown[] }
+  const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, './context': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {} } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
+  const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
     const work = { work_id: 'work', target_node: 'worker', cwd: '/p', title: '工作', prompt: '工作', state: 'running', summary: '', outcome: null, result_text: '', failure_reason: null }
     data.works = [{ ...work, state: 'unverified' }]
@@ -551,6 +572,9 @@ test("any entrance stops an unfinished task once, even on another device", async
     data.works = [{ ...work, target_node: 'other', stop: 'stop_waiting' }]
     assert.equal(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' })), undefined, "a stop already on its way is not sent twice")
     data.works = [{ ...work, target_node: 'other' }]
+    const first = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    assert.equal(stop(first), undefined, 'one tap never stops a task')
+    ;(ask(first)?.props.onClick as () => void)()
     ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
     assert.deepEqual(stopped, ['work'])
@@ -560,15 +584,61 @@ test("any entrance stops an unfinished task once, even on another device", async
     const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
     assert.match(words(elements), /会一起停止/, 'a shared turn lists what stops with it')
     assert.match(words(elements), /一起停止 2 个任务/)
-    ;(stop(elements)?.props.onClick as () => void)()
+    ;(ask(elements)?.props.onClick as () => void)()
+    ;(stop(app.render('TaskDetail', { botId: 'bot', workId: 'work' }))?.props.onClick as () => void)()
     await settleComponent()
-    assert.deepEqual(stopped, ['work', 'work'], 'the button already names the count, so one tap stops')
+    assert.deepEqual(stopped, ['work', 'work'], 'the count is named before the confirming tap stops them all')
+  } finally { app.close() }
+})
+
+test("below lg the task panel is a modal dialog that makes the rest of the page inert, and beside the chat it is not", () => {
+  const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
+  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
+  let wide = false
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => false, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
+  // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
+  type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
+  const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
+    const self: Node = { name, attributes: new Set(attributes), parentElement: null, children, hasAttribute: (key) => self.attributes.has(key), setAttribute: (key) => { self.attributes.add(key) }, removeAttribute: (key) => { self.attributes.delete(key) } }
+    for (const child of children) child.parentElement = self
+    return self
+  }
+  const layer = node('layer'), chat = node('chat'), header = node('header'), sidebar = node('sidebar'), toasts = node('toasts', [], ['aria-live']), hidden = node('hidden', [], ['inert'])
+  const head = node('head')
+  node('html', [head, node('body', [node('shell', [sidebar, node('main', [header, node('row', [chat, layer])])]), toasts, hidden])])
+  const inert = () => [chat, header, sidebar, toasts, hidden, layer, head].filter((item) => item.hasAttribute('inert')).map((item) => item.name)
+  const render = () => {
+    const elements = app.render('TaskDetail', { botId: 'bot', workId: 'work' })
+    return { panel: elements.find(({ type }) => type === 'aside')?.props ?? {}, title: elements.find(({ type }) => type === 'h2')?.props ?? {}, layer: elements.find(({ props }) => props.className === 'contents')?.props.ref as { current: unknown } }
+  }
+  try {
+    const first = render()
+    assert.equal(first.panel.role, 'dialog')
+    assert.equal(first.panel['aria-modal'], true)
+    assert.equal(first.panel['aria-labelledby'], first.title.id, 'the dialog is named by its title')
+    first.layer.current = layer
+    wide = true
+    const beside = render().panel
+    assert.equal(beside.role, undefined, 'beside the chat the panel is not a dialog')
+    assert.equal(beside['aria-modal'], undefined)
+    assert.equal(beside['aria-label'], '任务详情')
+    assert.deepEqual(inert(), ['hidden'], 'and nothing else is made inert')
+    wide = false
+    render()
+    assert.deepEqual(inert(), ['chat', 'header', 'sidebar', 'hidden'], 'narrowing the window covers the page but not the panel, the toasts or <head>')
+    wide = true
+    render()
+    assert.deepEqual(inert(), ['hidden'], 'widening it gives the page back, leaving what was inert before alone')
+    wide = false
+    render()
+    app.close()
+    assert.deepEqual(inert(), ['hidden'], 'closing the panel gives the page back')
   } finally { app.close() }
 })
 
 test("bot projects use online manager capabilities and preserve device names", () => {
-  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/Users/me/a/long/path/to/project'] } }
-  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './labels': { nodeName }, './questions': { projectName } })
+  const node = { device_id: 'worker', name: '工作电脑', local: false, online: true, revoked: false, capabilities: { manager: 'codex', roots: ['/path/to/a/long/path/to/project'] } }
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation: 1, nodes: [node, { ...node, device_id: 'no-agent', name: '无 Agent', capabilities: { manager: null, roots: ['/unavailable'] } }], pendingBot: null, writable: true }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName }, '@vibeface/client/workspace/questions.ts': { projectName } })
   try {
     const projects = app.render('BotForm', { open: true, onOpenChange() {}, restoreFocus() {} }).filter(({ type, props }) => type === 'NativeSelectOption' && props.value)
     assert.equal(projects.length, 1)
@@ -581,7 +651,7 @@ test("bot drafts survive a new connection while old create completion cannot clo
   const closed: boolean[] = []
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, nodes: [], pendingBot: null, writable: true, createBot: () => work.promise } }
   let currentWorkspace = workspace()
-  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, './context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, '@/lib/node': { messageOf: (cause: Error) => cause.message } })
+  const app = componentHarness('./bot-form.tsx', { '@tanstack/react-router': { useNavigate: () => () => {} }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message } })
   const render = () => app.render('BotForm', { open: true, onOpenChange: (open: boolean) => closed.push(open), restoreFocus() {} })
   try {
     render(); let elements = render()
@@ -606,11 +676,11 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('keep original draft'); composer()?.onSubmit?.()
@@ -631,7 +701,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
 test("an old action completion cannot clear a new generation's busy state", async () => {
   let generation = 1
   const old = pendingResult(), fresh = pendingResult()
-  const app = componentHarness('./present.tsx', { './context': { useWorkspace: () => ({ generation }) } })
+  const app = componentHarness('./present.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ generation }) } })
   const render = (action: () => Promise<unknown>) => app.render('ActionButton', { children: 'check', action }).find(({ type }) => type === 'Button')?.props
   try {
     render(() => old.promise)?.onClick?.()
@@ -650,12 +720,12 @@ test("connection form keeps current errors and busy ownership when an earlier co
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
     connectionGeneration: () => generation, entries: [{ address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
-    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '',
+    identity: { deviceId: 'browser' }, phase: 'disconnected', error: '', entryName: () => '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { './context': { useDevice: () => device }, './connection-lane': { primaryLane }, '@/lib/node': { messageOf: (cause: Error) => cause.message }, '@/features/workspace/labels': { addressName: (address: string) => address } })
+  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
-  const connect = () => render().find(({ props }) => props.children === '连接')?.props
+  const connect = () => render().find(({ type, props }) => type === 'Button' && props.title === 'https://node.example')?.props
   try {
     render(); render(); connect()?.onClick?.()
     assert.equal(connect()?.disabled, true)
@@ -678,9 +748,9 @@ test("artifact reads retain their offset while old responses cannot append or un
   const workspace = () => { const owner = generation; return { generation: owner, isCurrent: () => owner === generation, connectionOnline: true,
     readArtifact: (_hash: string, offset: number) => { offsets.push(offset); return work.promise }, run: async (action: () => Promise<void>) => { try { await action() } catch {} } } }
   let currentWorkspace = workspace()
-  const app = componentHarness('../chat/elements/artifact.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/workspace/model': { formatSize } })
-  const render = () => app.render('Artifact', { hash: 'result', size: 5 })
-  const open = () => render().find(({ props }) => props.children === '打开结果')?.props
+  const app = componentHarness('../chat/elements/artifact.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/workspace/model.ts': { formatSize } })
+  const render = () => app.render('Artifact', { file: { hash: 'result', size: 5, name: 'notes.txt' } })
+  const open = () => render().find(({ props }) => props.label === '打开')?.props
   try {
     open()?.action?.(); assert.equal(open()?.disabled, true)
     const old = work
@@ -692,7 +762,62 @@ test("artifact reads retain their offset while old responses cannot append or un
     work.resolve({ size: 5, next_offset: null, text: 'fresh' }); await settleComponent()
     assert.equal(render().find(({ type }) => type === 'pre')?.props.children, 'fresh')
     assert.deepEqual(offsets, [0, 0])
+    assert.ok(render().some(({ type, props }) => type === 'span' && props.title === 'notes.txt' && (props.children as { props?: { name?: string } } | undefined)?.props?.name === 'notes.txt'), 'the card names the file')
   } finally { app.close() }
+})
+
+test("a long message of the user's folds behind an icon button; a short one does not", () => {
+  const app = componentHarness('../chat/elements/message.tsx', {})
+  const toggle = (text: string) => app.render('FoldedText', { text }).find(({ type }) => type === 'button')?.props
+  assert.equal(toggle('短消息'), undefined)
+  const lines = (count: number) => Array(count).fill('一行').join('\n')
+  assert.equal(toggle(lines(12)), undefined)
+  for (const text of [lines(13), 'x'.repeat(601)]) {
+    assert.equal(toggle(text)?.['aria-expanded'], false)
+    assert.ok(app.render('FoldedText', { text }).some(({ props }) => props.className === 'line-clamp-8'))
+    toggle(text)?.onClick?.()
+    assert.equal(toggle(text)?.['aria-expanded'], true)
+    assert.equal(toggle(text)?.['aria-label'], '收起')
+    assert.ok(!app.render('FoldedText', { text }).some(({ props }) => props.className === 'line-clamp-8'))
+    toggle(text)?.onClick?.()
+  }
+})
+
+test("a toast's action is a 44px touch target on phones and stays compact on desktop", () => {
+  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  app.render('Toaster')
+  const kit = app.module
+  ;(kit.toast as (text: string, options: object) => void)('已发出', { persist: true, action: { label: '查看', onClick() {} } })
+  const action = app.render('Toaster').find(({ props }) => props.children === '查看')?.props
+  assert.match(String(action?.className), /(^| )h-11( |$)/)
+  assert.match(String(action?.className), /md:h-7/)
+})
+
+test("a segmented control is one Tab stop whose arrow keys move and select, wrapping at the ends", () => {
+  const app = componentHarness('../../components/app/kit.tsx', { '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') } })
+  const options = ['light', 'dark', 'system'].map((value) => ({ value, label: value }))
+  let value = 'dark', focused = -1
+  const radios = options.map((_, index) => ({ focus: () => { focused = index } }))
+  const radio = () => radios[options.findIndex((option) => option.value === value)] ?? radios[focused]
+  const render = (props: object = {}) => app.render('Segmented', { label: '外观', value, options, onChange: (next: string) => { value = next }, ...props })
+  const press = (key: string, props?: object) => {
+    let prevented = false
+    ;(render(props).find(({ props }) => props.role === 'radiogroup')?.props.onKeyDown as (event: unknown) => void)({ key, preventDefault: () => { prevented = true }, target: radio(), currentTarget: { querySelectorAll: () => radios } })
+    return prevented
+  }
+  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [-1, 0, -1])
+  assert.ok(press('ArrowRight')); assert.equal(value, 'system'); assert.equal(focused, 2)
+  press('ArrowDown'); assert.equal(value, 'light', 'wraps past the last option'); assert.equal(focused, 0)
+  press('ArrowLeft'); assert.equal(value, 'system', 'wraps past the first option')
+  press('ArrowUp'); assert.equal(value, 'dark')
+  press('Home'); assert.equal(value, 'light')
+  press('End'); assert.equal(value, 'system'); assert.equal(focused, 2)
+  assert.equal(press('Tab'), false, 'Tab leaves the group')
+  assert.equal(press('ArrowLeft', { disabled: true }), false); assert.equal(value, 'system')
+  value = 'unknown'; focused = 1
+  press('ArrowRight'); assert.equal(value, 'system', "arrows move from the focused option even when a change did not take")
+  value = 'unknown'
+  assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
 })
 
 for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
@@ -702,10 +827,10 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
   const passwords = ['password', 'old_password', 'confirmation'].map(name => fields.get(name))
   const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
   const device = { connectionGeneration: () => generation, ready: null, review: null, entry: null,
-    beginRecovery: () => { generation++; return work.promise }, reencrypt: () => work.promise }
+    beginRecovery: () => { generation++; return work.promise }, replaceRecoveryFile: () => work.promise }
   const app = componentHarness('../identity/recovery-controls.tsx', {
-    './context': { useDevice: () => device }, '@/lib/node': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
-    '@/lib/secure': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
   }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
   const render = () => app.render('RecoveryControls', { only: mode })
   const submit = () => render().find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {}, currentTarget: form })
@@ -738,18 +863,38 @@ test("conversation blocks sending until an online node can run the manager Agent
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
-  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', roots: [] } }])
-  const app = componentHarness('../chat/conversation-screen.tsx', { '@/features/workspace/context': { useWorkspace: () => currentWorkspace }, '@/features/identity/context': { useDevice: () => ({ directory: null }) }, './protocol': { canSend, composerHint }, '@/features/workspace/assistant': { placeChanges, routineName, routineTrigger }, '@/features/workspace/model': { pendingChecks }, '@/features/workspace/questions': { agentName, foldAnswers, placeByTime, projectName } })
+  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
     assert.equal(composer()?.disabled, true)
-    assert.match(String(composer()?.hint), /运行助手/)
+    assert.match(String(composer()?.hint), /运行 Bot/)
     assert.equal(sent, 0)
-    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', roots: [] } }])
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: false, roots: [] } }])
+    assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
+    assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()
     assert.equal(sent, 1)
+  } finally { app.close() }
+})
+
+test("an owner's reply on its way keeps its streamed text until the reply lands", () => {
+  const job = { trigger: "message:m1", state: "publishing", message_id: "m1", reply_message_id: "r1", source_node: "owner" }
+  const ask = { message_id: "m1", event_hash: "m1", role: "user", text: "hi", created_at_ms: 1 }
+  const progress = { kind: "manager", key: "live", conversation_id: "chat", trigger: "message:m1", source_node: "owner", sequence: 1, text: "partial answer", items: [], needsRefresh: false }
+  let messages: object[] = [ask]
+  const app = componentHarness('../chat/conversation-screen.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({
+    generation: 1, isCurrent: () => true, conversationId: 'chat', data: { ...parseConversation(context, "chat"), messages, scheduler: { jobs: [job], unanswered: [] } }, messagePending: null, messageBusy: false,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [], liveProgress: [progress], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+  }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { canSend, composerHint, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } })
+  const streamed = () => (app.render('ConversationScreen').find(({ type }) => type === 'Chat')?.props.entries as { message?: { state?: string; text: string } }[]).filter((entry) => entry.message?.state === 'streaming').map((entry) => entry.message?.text).join()
+  try {
+    assert.equal(streamed(), "partial answer")
+    messages = [ask, { message_id: "r1", event_hash: "r1", role: "assistant", text: "full answer", created_at_ms: 2, in_reply_to: "m1" }]
+    assert.equal(streamed(), "")
   } finally { app.close() }
 })
 
@@ -760,8 +905,8 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@/features/identity/context': { useDevice: () => device }, '@/features/workspace/labels': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
-    '@/lib/node': { messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+    '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
   const labelled = (label: string) => render().find(({ props }) => [props.children].flat().includes(label))?.props
@@ -781,14 +926,28 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   } finally { app.close() }
 })
 
+test("a link no phone can open shows no QR code", async () => {
+  const shown = async (link: string, publicEntry: boolean) => {
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+    const app = componentHarness('../devices/add-device.tsx', {
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] },
+      '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
+    }, { setInterval: () => 0, clearInterval: () => {} })
+    try {
+      app.render('AddDevice'); app.render('AddDevice').find(({ props }) => [props.children].flat().includes('生成链接'))?.props.onClick?.(); await settleComponent()
+      return app.render('AddDevice')
+    } finally { app.close() }
+  }
+  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', false)
+  assert.equal(local.some(({ type }) => type === 'img'), false)
+  assert.ok(local.some(({ props }) => [props.children].flat().includes('手机打不开本机地址')))
+  const open = await shown('https://node.example/join#vibeface1test', true)
+  assert.equal(open.find(({ type }) => type === 'img')?.props.src, 'data:qr')
+})
+
 test("device id boundaries require the device_id field", () => {
   const id = "ab".repeat(32), other = "cd".repeat(32)
-  const transportSource = readFileSync(new URL("../../../transport.js", import.meta.url), "utf8")
-    .replace(/^import[^\n]+\n/, "").replace(/\bexport /g, "")
-  const transport = new Script(`${transportSource}\n({validEndpoint, validTarget})`).runInNewContext({ TextEncoder, TextDecoder, URL, location: { protocol: "https:" } })
-  const source = readFileSync(new URL("../../lib/node.ts", import.meta.url), "utf8")
-  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS } }).outputText
-  const parsers = new Script(`(function(require, exports) { ${compiled}\nreturn exports })`).runInNewContext()(() => transport, {})
+  const parsers = { parseEntry, parseInfo }
   assert.equal(parsers.parseEntry({ address: "https://node.example", device_id: id }).device_id, id)
   for (const relay of [false, true]) {
     const entry = parsers.parseEntry({ address: "https://node.example", device_id: id, relay })
@@ -796,9 +955,12 @@ test("device id boundaries require the device_id field", () => {
     assert.equal(Object.hasOwn(entry, "relay"), false)
   }
   assert.equal(parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, device_id: id }).device_id, id)
+  const guest = parsers.parseInfo({ name: "Node", version: "1", initialized: true, network_id: null, device_id: id })
+  assert.equal(guest.network_id, null)
+  assert.equal(guest.connection_entry, undefined)
   assert.equal(parseNodes({ nodes: [{ local: true, online: true, revoked: false, device_id: id }] })[0].device_id, id)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备编号无效/)
-  assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备编号无效/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", node_id: id }), /设备地址无效/)
+  assert.throws(() => parsers.parseInfo({ name: "node", version: "1", initialized: true, network_id: other, node_id: id }), /设备地址无效/)
+  assert.throws(() => parsers.parseEntry({ address: "https://node.example", device_id: "invalid" }), /设备地址无效/)
   assert.throws(() => parseNodes({ nodes: [{ local: true, online: true, revoked: false, node_id: id }] }), /缺少文字/)
 })

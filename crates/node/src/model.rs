@@ -1,5 +1,6 @@
+use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type NetworkId = String;
 pub type DeviceId = String;
@@ -19,11 +20,43 @@ pub struct BlobRef {
     pub size: u64,
 }
 
+pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
+
+/// A file the user attached to a message. The name belongs to the message, not the content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    pub hash: String,
+    pub size: u64,
+    pub name: String,
+}
+
+impl Attachment {
+    pub fn blob(&self) -> BlobRef {
+        BlobRef {
+            hash: self.hash.clone(),
+            size: self.size,
+        }
+    }
+}
+
+/// A file name as the web signs it: no path separators or control characters, at most
+/// `MAX_ATTACHMENT_NAME_BYTES`, never empty.
+pub fn valid_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_ATTACHMENT_NAME_BYTES
+        && !name
+            .chars()
+            .any(|c| c == '/' || c == '\\' || c.is_control())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
+    /// Another bot of this network wrote to this one; only `BotMessaged` makes it.
+    Bot,
 }
 
 /// How a coordination turn ended. Partial text of stopped or interrupted turns is kept.
@@ -77,12 +110,9 @@ pub enum Severity {
     Urgent,
 }
 
-/// Scope of the questions about sessions no assistant owns; they show only on the pending page.
-pub const SESSIONS_SCOPE: &str = "sessions";
-
-/// Scope of the user's choice of primary assistant, the one that judges what comes in without an
+/// Scope of the user's choice of primary bot, the one that judges what comes in without an
 /// owner. Its latest event by rank stands; nothing projects it.
-pub const ASSISTANTS_SCOPE: &str = "assistants";
+pub const BOTS_SCOPE: &str = "bots";
 
 /// The device, project and session a question is about.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,9 +135,6 @@ pub struct Subject {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub label: String,
-    /// Session questions only: choosing it attributes the session to this assistant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<ScopeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -129,10 +156,37 @@ pub const MAX_INSTRUCTIONS_BYTES: usize = 8192;
 pub const MAX_SKILL_NAME_CHARS: usize = 64;
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 512;
 pub const MAX_SKILL_BODY_BYTES: usize = 16 * 1024;
-pub const MAX_ROUTINE_NAME_CHARS: usize = 120;
-pub const MAX_ROUTINE_PROMPT_BYTES: usize = 8 * 1024;
+pub const MAX_SCHEDULE_NAME_CHARS: usize = 120;
+pub const MAX_SCHEDULE_PROMPT_BYTES: usize = 8 * 1024;
 /// Every 5 minutes up to every 4 weeks; a day is 1440 and a week 10080.
-pub const ROUTINE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+pub const SCHEDULE_MINUTES: std::ops::RangeInclusive<u32> = 5..=10080 * 4;
+/// Repeating schedules and one-shot ones still ahead, per bot.
+pub const MAX_ACTIVE_SCHEDULES: usize = 20;
+/// A one-shot time is set at least this far ahead, and at most `ONCE_MAX_LEAD_MS`.
+pub const ONCE_MIN_LEAD_MS: i64 = 60_000;
+pub const ONCE_MAX_LEAD_MS: i64 = 366 * 24 * 60 * 60_000;
+/// How many automatic wakes (reminders a bot sets itself, messages between bots)
+/// may follow one message of the user.
+pub const MAX_CHAIN_DEPTH: u8 = 4;
+pub const MAX_MEMORY_CHARS: usize = 500;
+pub const MAX_MEMORIES: usize = 50;
+pub const MAX_BOT_MESSAGE_BYTES: usize = 4000;
+pub const BOT_MESSAGES_PER_HOUR: usize = 10;
+/// Bots one message of the user may have a bot create.
+pub const BOTS_PER_TURN: usize = 3;
+pub const MAX_MODEL_CHARS: usize = 256;
+pub const MAX_BOT_SKILLS: usize = 200;
+
+/// The shared skills a bot uses: `None` is every skill in the library, later ones included.
+pub type SkillSet = Option<BTreeSet<String>>;
+
+/// A bot's skill set before and after a change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsEdit {
+    pub before: SkillSet,
+    pub after: SkillSet,
+}
 
 /// One setting's value before and after a change; `before` is what the writer saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,7 +196,21 @@ pub struct Edit {
     pub after: String,
 }
 
-/// A saved workflow in the library every assistant of the network shares.
+/// A bot's model on one provider, set from a device running that provider; an empty `after`
+/// follows the device's default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEdit {
+    pub provider: Provider,
+    pub before: String,
+    pub after: String,
+}
+
+/// A bot's model per provider. The provider is device-local, so a device runs the entry of its
+/// own provider or, without one, its default model.
+pub type BotModels = BTreeMap<Provider, String>;
+
+/// A saved workflow in the library every bot of the network shares.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Skill {
@@ -151,36 +219,81 @@ pub struct Skill {
     pub body: String,
 }
 
-/// A turn its assistant runs at `first_run_at_ms` and then every `every_minutes`.
+/// A turn its bot runs at `first_run_at_ms`, then every `every_minutes` when set: a routine
+/// repeats, a reminder runs once.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Routine {
+pub struct Schedule {
     pub name: String,
     pub prompt: String,
     pub first_run_at_ms: i64,
-    pub every_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_minutes: Option<u32>,
     pub enabled: bool,
+    /// Automatic wakes since the user's last message: 0 for what the user asked for, one more
+    /// than the setting turn for a reminder the bot set itself.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub depth: u8,
 }
 
-/// What a chat turn changed about its assistant. A `None` after removes the skill or routine.
+fn is_zero(value: &u8) -> bool {
+    *value == 0
+}
+
+/// What the user's web client does to a schedule; it never creates or edits one.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleAction {
+    Pause,
+    Resume,
+    Delete,
+}
+
+/// The user's own signed message that started the turn a write stands on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Cause {
+    pub conversation_id: ScopeId,
+    pub message_id: String,
+}
+
+/// The bot that wrote to another one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Sender {
+    pub conversation_id: ScopeId,
+    pub name: String,
+}
+
+/// What a chat turn changed about its bot. A `None` after removes the skill, schedule or
+/// note.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AssistantChange {
+pub enum BotChange {
     Profile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<Edit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instructions: Option<Edit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelEdit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skills: Option<SkillsEdit>,
     },
     Skill {
         skill_id: String,
         before: Option<Skill>,
         after: Option<Skill>,
     },
-    Routine {
-        routine_id: String,
-        before: Option<Routine>,
-        after: Option<Routine>,
+    Schedule {
+        schedule_id: String,
+        before: Option<Schedule>,
+        after: Option<Schedule>,
+    },
+    Memory {
+        memory_id: String,
+        before: Option<String>,
+        after: Option<String>,
     },
 }
 
@@ -199,6 +312,30 @@ pub fn validate_bot_name(name: &str) -> anyhow::Result<()> {
         !name.trim().is_empty() && name.len() <= 512 && !name.chars().any(char::is_control),
         "invalid Bot name"
     );
+    Ok(())
+}
+
+/// Empty means the device's default model.
+pub fn validate_model(model: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        model.trim() == model
+            && model.chars().count() <= MAX_MODEL_CHARS
+            && !model.chars().any(char::is_control),
+        "a model is one line of at most {MAX_MODEL_CHARS} characters, or empty for the device's default"
+    );
+    Ok(())
+}
+
+pub fn validate_skill_set(skills: &SkillSet) -> anyhow::Result<()> {
+    if let Some(skills) = skills {
+        anyhow::ensure!(
+            skills.len() <= MAX_BOT_SKILLS,
+            "a bot uses at most {MAX_BOT_SKILLS} skills"
+        );
+        for skill in skills {
+            vibeface_protocol::validate_id(skill).map_err(anyhow::Error::msg)?;
+        }
+    }
     Ok(())
 }
 
@@ -225,37 +362,120 @@ impl Skill {
     }
 }
 
-impl Routine {
+impl Schedule {
     pub fn validate(&self) -> anyhow::Result<()> {
-        validate_line(&self.name, "a routine name", MAX_ROUTINE_NAME_CHARS)?;
+        validate_line(&self.name, "a schedule name", MAX_SCHEDULE_NAME_CHARS)?;
         anyhow::ensure!(
-            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_ROUTINE_PROMPT_BYTES,
-            "a routine prompt must be 1-{MAX_ROUTINE_PROMPT_BYTES} bytes"
+            !self.prompt.trim().is_empty() && self.prompt.len() <= MAX_SCHEDULE_PROMPT_BYTES,
+            "a schedule prompt must be 1-{MAX_SCHEDULE_PROMPT_BYTES} bytes"
         );
         anyhow::ensure!(
             self.first_run_at_ms >= 0,
             "first_run_at_ms must be a Unix time in milliseconds"
         );
+        if let Some(every) = self.every_minutes {
+            anyhow::ensure!(
+                SCHEDULE_MINUTES.contains(&every),
+                "every_minutes must be between {} and {}",
+                SCHEDULE_MINUTES.start(),
+                SCHEDULE_MINUTES.end()
+            );
+        }
         anyhow::ensure!(
-            ROUTINE_MINUTES.contains(&self.every_minutes),
-            "every_minutes must be between {} and {}",
-            ROUTINE_MINUTES.start(),
-            ROUTINE_MINUTES.end()
+            self.depth <= MAX_CHAIN_DEPTH,
+            "at most {MAX_CHAIN_DEPTH} automatic wakes may follow the user's message"
         );
         Ok(())
     }
 }
 
-impl AssistantChange {
+/// A note a bot keeps across turns: short, and never a credential.
+pub fn validate_memory(text: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !text.trim().is_empty() && text.chars().count() <= MAX_MEMORY_CHARS,
+        "a note must be 1-{MAX_MEMORY_CHARS} characters"
+    );
+    anyhow::ensure!(
+        !looks_secret(text),
+        "this looks like a credential; keys, tokens and passwords are never remembered"
+    );
+    Ok(())
+}
+
+/// Obvious credentials: private key blocks, bearer tokens, secret assignments, well-known key
+/// prefixes and long unbroken runs that mix cases and digits as keys do.
+pub fn looks_secret(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "-----begin",
+        "bearer ",
+        "password=",
+        "password:",
+        "passwd=",
+        "secret=",
+        "api_key=",
+        "apikey=",
+        "token=",
+    ];
+    const PREFIXES: &[&str] = &[
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "xapp-",
+        "akia",
+        "aiza",
+        "glpat-",
+        "hf_",
+        "npm_",
+    ];
+    if MARKERS
+        .iter()
+        .any(|marker| text.to_lowercase().contains(marker))
+    {
+        return true;
+    }
+    text.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c))
+        .any(|word| {
+            let lower = word.to_ascii_lowercase();
+            (word.len() >= 20 && PREFIXES.iter().any(|prefix| lower.starts_with(prefix)))
+                || (word.len() >= 32
+                    && word
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-_+/=".contains(c))
+                    && word.chars().any(|c| c.is_ascii_digit())
+                    && word.chars().any(|c| c.is_ascii_uppercase())
+                    && word.chars().any(|c| c.is_ascii_lowercase()))
+        })
+}
+
+impl BotChange {
     /// Every change sets something new; a removal needs something to remove.
     pub fn validate(&self) -> anyhow::Result<()> {
         let id = |value: &str| vibeface_protocol::validate_id(value).map_err(anyhow::Error::msg);
         match self {
-            Self::Profile { name, instructions } => {
+            Self::Profile {
+                name,
+                instructions,
+                model,
+                skills,
+            } => {
                 anyhow::ensure!(
-                    name.is_some() || instructions.is_some(),
+                    name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
                     "a profile change names a field"
                 );
+                if let Some(model) = model {
+                    validate_model(&model.after)?;
+                    anyhow::ensure!(model.before != model.after, "the model is unchanged");
+                }
+                if let Some(skills) = skills {
+                    validate_skill_set(&skills.after)?;
+                    anyhow::ensure!(skills.before != skills.after, "the skills are unchanged");
+                }
                 if let Some(name) = name {
                     validate_bot_name(&name.after)?;
                     anyhow::ensure!(name.before != name.after, "the name is unchanged");
@@ -280,17 +500,29 @@ impl AssistantChange {
                 );
                 after.as_ref().map(Skill::validate).transpose()?;
             }
-            Self::Routine {
-                routine_id,
+            Self::Schedule {
+                schedule_id,
                 before,
                 after,
             } => {
-                id(routine_id)?;
+                id(schedule_id)?;
                 anyhow::ensure!(
                     (before.is_some() || after.is_some()) && before != after,
-                    "the routine is unchanged"
+                    "the schedule is unchanged"
                 );
-                after.as_ref().map(Routine::validate).transpose()?;
+                after.as_ref().map(Schedule::validate).transpose()?;
+            }
+            Self::Memory {
+                memory_id,
+                before,
+                after,
+            } => {
+                id(memory_id)?;
+                anyhow::ensure!(
+                    (before.is_some() || after.is_some()) && before != after,
+                    "the note is unchanged"
+                );
+                after.as_deref().map(validate_memory).transpose()?;
             }
         }
         Ok(())
@@ -304,12 +536,17 @@ pub enum EventBody {
         title: String,
     },
     /// The user's choice of scheduling Node; the highest epoch wins, ties pick the smaller hash.
+    /// A bot another bot creates gets its first owner through the user's message `cause`.
     ConversationOwner {
         scheduler_node: DeviceId,
         epoch: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
+    /// Signed by the user on the web, or written in a bot's turn the user's message `cause`
+    /// started, with that message among its parents.
     BotCreated {
         bot_id: String,
         name: String,
@@ -318,15 +555,17 @@ pub enum EventBody {
         project: Option<BotProject>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
     },
     /// `report_results` and `attachments` belong to user messages; `in_reply_to` and `status` to
-    /// assistant replies. `attachments` repeats the event's blobs so the user's signature covers them.
+    /// bot replies. `attachments` names the event's blobs so the user's signature covers them.
     MessagePosted {
         message_id: String,
         role: Role,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<BlobRef>,
+        attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         report_results: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -384,8 +623,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// In the conversation of the assistant that owns the session, or in `SESSIONS_SCOPE` for a
-    /// session no assistant owns. Its one answer is the user message `a-<question_id>`.
+    /// In the conversation of the bot that owns the session. Its one answer is the user
+    /// message `a-<question_id>`.
     QuestionAsked {
         question_id: String,
         severity: Severity,
@@ -394,34 +633,83 @@ pub enum EventBody {
         choices: Vec<Choice>,
         about: Subject,
     },
-    /// In the chosen assistant's conversation: that assistant owns the session from now on.
+    /// Written by the device running the session, in the conversation of the bot that owns
+    /// it from now on: the primary bot when the session shows up without an owner, its bot
+    /// deleted included, or the bot its owner hands it to. The latest by rank stands.
     SessionAttributed {
         node: DeviceId,
         agent: String,
         session_id: String,
         cwd: String,
         summary: String,
-        /// The session question that led to it.
-        question_id: String,
     },
-    /// In `ASSISTANTS_SCOPE`: the user makes this conversation's assistant the primary one.
-    PrimaryAssistantSet {
+    /// Written by the device running the session, in its owner's conversation: that bot stopped
+    /// following it, and its events are dropped until it is handed to a bot again or that bot
+    /// is deleted.
+    SessionMuted {
+        node: DeviceId,
+        session_id: String,
+    },
+    /// In `BOTS_SCOPE`: the user makes this conversation's bot the primary one.
+    PrimaryBotSet {
         conversation_id: ScopeId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
     /// Written by the owner in a turn the user's message `cause` started; that message is one
-    /// of its parents. `change_id` derives from the turn and the tool's `call_ref`.
-    AssistantChanged {
+    /// of its parents. A bot may change another bot, so the cause may sit in another
+    /// conversation. Only a new one-shot schedule, a reminder the bot sets itself in
+    /// another turn, has no `cause`. `change_id` derives from the turn and the tool's `call_ref`.
+    BotChanged {
         change_id: String,
-        cause: String,
-        change: AssistantChange,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
+        change: BotChange,
+    },
+    /// In the deleted bot's conversation: signed by the user on the web, or written in another
+    /// bot's turn the user's message `cause` started, with that message among its parents.
+    /// Nothing brings the bot back.
+    BotDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<Cause>,
+    },
+    /// The user pauses, resumes or deletes a schedule of this conversation from the web.
+    ScheduleControlled {
+        schedule_id: String,
+        action: ScheduleAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
+    /// Written only by the owner when it takes a schedule's due time, whether it runs or skips
+    /// it as too late; no Node takes a time someone already claimed. Of concurrent claims the
+    /// highest `owner_epoch` wins, ties pick the smaller author.
+    ScheduleRunClaimed {
+        schedule_id: String,
+        slot_ms: i64,
+        owner_epoch: u64,
+    },
+    /// Written by the Node that steered user message `message_id` into its bot's running reply
+    /// `reply`, once that reply completed with it: the message needs no reply of its own.
+    MessageSteered {
+        message_id: String,
+        reply: String,
+    },
+    /// In the receiving bot's conversation, written by the sender's scheduling Node.
+    /// `message_id` derives from the sending turn and the tool's `call_ref`.
+    BotMessaged {
+        message_id: String,
+        from: Sender,
+        text: String,
+        hops: u8,
     },
     /// Written only by the owner in a read-only closing turn; covered events stay stored.
     ContextCheckpoint {
         covers: VersionVector,
         summary: String,
-        standing_instructions: Vec<String>,
+        /// Excerpts of the newest user messages it covers; history, not instructions to keep.
+        recent_user_requests: Vec<String>,
         open_work: Vec<OpenWork>,
         decisions: Vec<String>,
     },
@@ -433,10 +721,12 @@ impl EventBody {
         match self {
             Self::ConversationOwner { attestation, .. }
             | Self::BotCreated { attestation, .. }
+            | Self::BotDeleted { attestation, .. }
             | Self::MessagePosted { attestation, .. }
             | Self::WorkFinished { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
-            | Self::PrimaryAssistantSet { attestation, .. } => attestation.as_ref(),
+            | Self::PrimaryBotSet { attestation, .. }
+            | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
     }
@@ -525,17 +815,28 @@ pub struct Bot {
     pub name: String,
     pub instructions: String,
     pub project: Option<BotProject>,
+    pub models: BotModels,
+    pub skills: SkillSet,
     pub event_hash: EventHash,
 }
 
-/// The earliest `AssistantChanged` of one `change_id`; the chat shows it as a card.
+impl Bot {
+    /// The model this bot runs on `provider`; `None` follows the device's default.
+    pub fn model(&self, provider: Provider) -> Option<&str> {
+        self.models.get(&provider).map(String::as_str)
+    }
+}
+
+/// The earliest `BotChanged` of one `change_id`; the chat shows it as a card.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeRecord {
     pub change_id: String,
-    pub cause: String,
+    /// The bot it changed; another bot's turn may have made it.
+    pub conversation_id: ScopeId,
+    pub cause: Option<Cause>,
     pub event_hash: EventHash,
     pub created_at_ms: i64,
-    pub change: AssistantChange,
+    pub change: BotChange,
 }
 
 /// Output only: `flatten` cannot read back a `deny_unknown_fields` struct.
@@ -546,14 +847,22 @@ pub struct SkillEntry {
     pub skill: Skill,
 }
 
-/// A routine that is not removed; `changed_at_ms` is when its current definition was written.
+/// A schedule that is not removed, with its current pause state. `changed_at_ms` is when its
+/// definition or its pause state last changed, whichever is later.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct RoutineEntry {
-    pub routine_id: String,
+pub struct ScheduleEntry {
+    pub schedule_id: String,
     pub conversation_id: ScopeId,
     #[serde(flatten)]
-    pub routine: Routine,
+    pub schedule: Schedule,
     pub changed_at_ms: i64,
+}
+
+/// A note one bot keeps.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub memory_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -576,7 +885,9 @@ pub struct Message {
     pub report_results: Option<bool>,
     /// The question this user message answers.
     pub answers: Option<String>,
-    pub blobs: Vec<BlobRef>,
+    /// The bot a bot message came from.
+    pub sender: Option<Sender>,
+    pub attachments: Vec<Attachment>,
     /// Its place in the conversation's shared order; clients merge pushed messages by it.
     pub rank: String,
 }
@@ -631,7 +942,6 @@ impl WorkStatus {
         match (outcome, phase) {
             (Some(WorkOutcome::Unverified), _) => Self::Unverified,
             (Some(_), _) => Self::Finished,
-            // An agent task runs as its device's coordination turn, without Codex phases.
             (None, _) if kind == WorkKind::Task => Self::Running,
             (None, Some(WorkPhase::Interrupting)) => Self::Interrupting,
             (None, Some(_)) => Self::Running,

@@ -12,21 +12,23 @@ import subprocess
 import tempfile
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi")
 DEPENDENTS = {
     "protocol": ("bridge", "node"),
     "bridge": ("node",),
-    "secure": ("node",),
+    "secure": ("node", "secure-ffi"),
     "node": (),
+    "secure-ffi": (),
 }
-CRATES = dict(zip(("protocol", "bridge", "secure", "node"), PACKAGES))
+CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi"), PACKAGES))
 PATH_RULES = (
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
-    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*", "crates/node/sdk/README.md")),
-    ("web", ("crates/node/web/*", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
+    ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
+    ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
     ("secure", ("crates/secure/*", "scripts/crypto-client.mjs")),
+    ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
 SLOW_TESTS = ("store::tests::append_100k_stays_flat",)
@@ -38,24 +40,22 @@ PLATFORMS = (
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "package", "npm-package", "npm-smoke")
 
 
-def make_plan(paths, event="pull_request", draft=False, ref_type="branch", channel="nightly"):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
     scopes = {
         next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full")
         for path in paths
     }
-    return dict(scope_plan(scopes, event, draft, ref_type, channel), changed_files=len(paths))
+    return dict(scope_plan(scopes, event, ref_type, channel), changed_files=len(paths))
 
 
-def scope_plan(scopes, event, draft, ref_type, channel):
+def scope_plan(scopes, event, ref_type, channel):
     if (
         scopes - {"full", "docs", "web", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
-        or type(draft) is not bool
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
     ):
         raise ValueError("Invalid CI scopes or scenario")
-    draft = event == "pull_request" and draft
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
     full = "full" in scopes or extended or event == "merge_group"
     affected = set(DEPENDENTS) if full else scopes & set(DEPENDENTS)
@@ -75,7 +75,6 @@ def scope_plan(scopes, event, draft, ref_type, channel):
         "extended": extended,
         "check_msrv": bool(packages) and extended,
         "docs_only": not web and not packages,
-        "draft": draft,
         "event": event,
         "ref_type": ref_type,
         "channel": channel,
@@ -119,11 +118,10 @@ def event_plan(args):
     ref_type = os.environ.get("GITHUB_REF_TYPE", "branch")
     payload_path = os.environ.get("GITHUB_EVENT_PATH")
     payload = json.loads(Path(payload_path).read_text()) if payload_path else {}
-    draft = args.draft
     base, head = args.base, args.head
     if not base and event == "pull_request":
         pr = payload["pull_request"]
-        base, head, draft = pr["base"]["sha"], pr["head"]["sha"], pr["draft"]
+        base, head = pr["base"]["sha"], pr["head"]["sha"]
     elif not base and event == "push":
         base, head = payload.get("before"), payload.get("after")
     forced = event in {"schedule", "workflow_dispatch", "merge_group"} or ref_type == "tag"
@@ -134,7 +132,7 @@ def event_plan(args):
     else:
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    plan = make_plan(paths, event, draft, ref_type, metadata["channel"])
+    plan = make_plan(paths, event, ref_type, metadata["channel"])
     plan.update(metadata)
     return plan
 
@@ -199,7 +197,7 @@ def gate(needs, plan=None):
         raise ValueError("CI plan did not succeed")
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
-    expected = scope_plan(set(plan["scopes"]), plan["event"], plan["draft"], plan["ref_type"], plan["channel"])
+    expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
     if any(plan[key] != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
     required = expected["required_jobs"]
@@ -260,21 +258,21 @@ def self_test():
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/node/web/src/content.md"])["web"]
-    docs = make_plan(["README.md", "docs/node.md", "crates/node/sdk/README.md"])
+    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web"]
+    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web"]
+    assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
+    docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["required_jobs"] == ["quick-check"]
     expected = {
         "node": ["vibeface"],
         "bridge": ["vibeface-bridge", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface"],
-        "secure": ["vibeface-secure", "vibeface"],
+        "secure": ["vibeface-secure", "vibeface", "vibeface-secure-ffi"],
     }
     for crate, packages in expected.items():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
-        draft = make_plan([f"crates/{crate}/src/lib.rs"], draft=True)
-        assert draft["rust_packages"] == packages and draft["test_tiers"] == ["fast"]
-        assert draft["package_matrix"]["include"] == list(PLATFORMS[:1])
     for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
@@ -287,7 +285,6 @@ def self_test():
     assert make_plan(["README.md"], "push", ref_type="tag")["test_tiers"] == ["fast", "slow"]
     assert make_plan(["README.md"], "push", ref_type="tag")["package_matrix"]["include"] == list(PLATFORMS)
     assert not make_plan(["crates/node/src/api.rs"])["npm"]
-    assert not make_plan(["crates/node/src/api.rs"], draft=True)["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="stable")["npm"]
     assert not make_plan(["crates/node/src/api.rs"], channel="rc")["npm"]
     for event in ("pull_request", "push", "merge_group"):
@@ -361,7 +358,7 @@ def self_test():
         new_base = git("rev-parse", "HEAD", cwd=directory).decode().strip()
         assert set(changed_paths(new_base, pr_head, "pull_request", cwd=directory)) == set(paths)
         event_file = Path(directory) / "event.json"
-        arguments = argparse.Namespace(event=None, base=new_base, head=pr_head, draft=False)
+        arguments = argparse.Namespace(event=None, base=new_base, head=pr_head)
         environment = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF_TYPE": "branch", "GITHUB_EVENT_PATH": str(event_file)}
         with patch.dict(os.environ, environment), patch(f"{__name__}.changed_paths", return_value=paths) as diff, patch(f"{__name__}.release_metadata", return_value={"channel": "nightly"}):
             for draft in (True, False):
@@ -369,7 +366,7 @@ def self_test():
                 arguments.base = None
                 selected = event_plan(arguments)
                 diff.assert_called_with(new_base, pr_head, "pull_request")
-                assert selected["draft"] == draft
+                assert selected == make_plan(paths)
                 assert selected["test_tiers"] == ["fast"]
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
@@ -392,10 +389,90 @@ def self_test():
                 ["cargo", "+1.89", "check", "--locked", "-p", "vibeface"],
             ] if check_msrv else [])
     root = Path(__file__).resolve().parent.parent
+    subprocess.run(["python3", str(root / "scripts/build-inputs.py"), "self-test"], check=True)
     config = (root / "crates/node/src/config.rs").read_text()
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
+    release_privacy_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def release_privacy_test(root, scratch):
+    import shutil
+    import tarfile
+
+    with tempfile.TemporaryDirectory(prefix="release-", dir=scratch) as directory:
+        repo = Path(directory)
+        for name in ("scripts/package-node.sh", "scripts/release-rustflags.py", "scripts/build-inputs.py", "scripts/install-node-service.sh", "Cargo.toml", "crates/node/src/config.rs", "README.md"):
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / name, target)
+        source = repo / "private build.rs"
+        source.write_text('#[cfg(not(privacy_flag))] compile_error!("caller flag lost"); fn main() { println!("{}", file!()); }')
+        binary = repo / "target/privacy-fixture/release/vibeface"
+        binary.parent.mkdir(parents=True)
+        environment = {**os.environ, "CARGO_TARGET_DIR": str(repo / "target"), "RUSTFLAGS": "--cfg privacy_flag"}
+        environment.pop("CARGO_ENCODED_RUSTFLAGS", None)
+        for encoded in (None, "--cfg\x1fprivacy_flag", ""):
+            if encoded is not None:
+                environment["CARGO_ENCODED_RUSTFLAGS"] = encoded
+                environment["RUSTFLAGS"] = "--cfg ignored_flag"
+            flags = subprocess.check_output(["python3", str(repo / "scripts/release-rustflags.py")], env=environment, text=True).strip().split("\x1f")
+            assert "ignored_flag" not in flags
+            if encoded == "":
+                assert "privacy_flag" not in flags
+                continue
+            subprocess.run(["rustc", "--crate-name", "privacy_fixture", "-Copt-level=3", "-Cdebuginfo=0", *flags, str(source), "-o", str(binary)], check=True)
+            assert str(repo).encode() not in binary.read_bytes(), "release binary contains its source directory"
+            assert subprocess.check_output([str(binary)], text=True).strip() == "/vibeface/private build.rs"
+        (repo / "docs").mkdir()
+        (repo / "docs/guide.md").write_text("public guide")
+        (repo / ".gitignore").write_text(".artifacts/\ntarget/\nbin/\nprivate build.rs\ncrates/node/web/generated/\ncrates/node/web/dist/\n.env\ncargo-called\n")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+
+        def generated():
+            tool = ["python3", str(repo / "scripts/build-inputs.py")]
+            for component, files in (
+                ("crypto", {"vibeface_secure.js": "fixture", "vibeface_secure_bg.wasm": "fixture"}),
+                ("web", {"_shell.html": "fixture"}),
+            ):
+                subprocess.run([*tool, "prepare", component], check=True)
+                output = repo / ("crates/node/web/generated" if component == "crypto" else "crates/node/web/dist/client")
+                for name, content in files.items():
+                    (output / name).write_text(content)
+                subprocess.run([*tool, "finish", component], check=True)
+
+        generated()
+        (repo / "docs/.env").write_text("PRIVATE_FIXTURE=must-not-be-packaged")
+        (repo / "docs/untracked-note.md").write_text("must-not-be-packaged")
+        if hasattr(os, "setxattr"):
+            os.setxattr(repo / "docs/guide.md", "user.build-host", b"private builder")
+        environment.update({name: "" for name in ("VIBEFACE_CODESIGN_IDENTITY", "VIBEFACE_NOTARY_KEY", "VIBEFACE_NOTARY_KEY_ID", "VIBEFACE_NOTARY_ISSUER")})
+        fake_cargo = repo / "bin/cargo"
+        fake_cargo.parent.mkdir()
+        fake_cargo.write_text('#!/bin/sh\ntouch "$CARGO_MARKER"\n')
+        fake_cargo.chmod(0o755)
+        marker = repo / "cargo-called"
+        environment.update(PATH=f"{fake_cargo.parent}{os.pathsep}{environment['PATH']}", CARGO_MARKER=str(marker))
+        subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, check=True, stdout=subprocess.PIPE)
+        assert marker.exists(), "packaging must always rebuild the native binary"
+        archive_path, = (repo / ".artifacts/packages").glob("*.tar.gz")
+        with tarfile.open(archive_path) as archive:
+            for entry in archive.getmembers():
+                assert entry.uid == entry.gid == 0 and entry.uname == entry.gname == ""
+                assert not set(entry.pax_headers) - {"mtime"}
+                assert not any(part.startswith("._") for part in Path(entry.name).parts)
+            package = archive.getmembers()[0].name
+            assert archive.extractfile(f"{package}/docs/guide.md").read() == b"public guide"
+            assert not any(entry.name.endswith(("/.env", "/untracked-note.md")) for entry in archive.getmembers())
+            assert archive.getmember(f"{package}/vibeface").mode & 0o111
+        (repo / "scripts/release-rustflags.py").write_text('raise RuntimeError("fixture failure")')
+        generated()
+        marker.unlink()
+        assert subprocess.run(["bash", str(repo / "scripts/package-node.sh"), "--target", "privacy-fixture"], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode != 0
+        assert not marker.exists(), "a failed privacy setup must stop the build"
+    print("Release privacy self-test passed: caller flags, source paths, archive owners and extended attributes")
 
 
 def expect_failure(check):
@@ -414,7 +491,6 @@ def main():
     plan.add_argument("--base")
     plan.add_argument("--head")
     plan.add_argument("--event", choices=("pull_request", "push", "schedule", "workflow_dispatch", "merge_group"))
-    plan.add_argument("--draft", action="store_true")
     plan.add_argument("--github-output")
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)

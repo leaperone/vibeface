@@ -1,21 +1,22 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Bot, ChevronDown, CircleX, Code, Copy, Globe, Info, Layers, ListChecks, MessagesSquare, MousePointerClick, RefreshCw, ScrollText, Search, Server, Terminal, TriangleAlert, X, type LucideIcon } from 'lucide-react'
-import { cn } from 'cn'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { EmptyState, InlineError, toast } from '@/components/app/kit'
-import { useDevice } from '@/features/identity/context'
-import { useWorkspace } from '@/features/workspace/context'
-import type { LogFilter, LogLevel, LogRecord, LogSource } from '@/lib/web-log'
+import { EmptyState, InlineError, Segmented, Skeleton, toast } from '@/components/app/kit'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import type { LogFilter, LogLevel, LogRecord, LogSource } from '@vibeface/client/lib/web-log.ts'
 
 export const Route = createFileRoute('/_app/settings_/logs')({ component: LogsPage })
 
-const levelChoices: Array<[LogLevel | undefined, string, LucideIcon]> = [
-  [undefined, '全部', Layers], ['info', '信息', Info], ['warn', '警告', TriangleAlert], ['error', '错误', CircleX],
+type LevelChoice = 'all' | Extract<LogLevel, 'info' | 'warn' | 'error'>
+const levelChoices: Array<{ value: LevelChoice; label: string; icon: LucideIcon }> = [
+  { value: 'all', label: '全部', icon: Layers }, { value: 'info', label: '信息', icon: Info }, { value: 'warn', label: '警告', icon: TriangleAlert }, { value: 'error', label: '错误', icon: CircleX },
 ]
 const sourceChoices: Array<[LogSource, string, LucideIcon]> = [
-  ['node', '设备', Server], ['web', '网页', Globe], ['agent', '助手', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['cursor', 'Cursor', MousePointerClick],
+  ['node', '设备', Server], ['web', '网页', Globe], ['agent', 'Bot', Bot], ['cli', '命令行', Terminal], ['codex', 'Codex', Code], ['cursor', 'Cursor', MousePointerClick],
 ]
 const sourceLabel = Object.fromEntries(sourceChoices.map(([value, label]) => [value, label])) as Record<LogSource, string>
 const levelLook: Record<LogLevel, { icon: LucideIcon; tone: string; label: string }> = {
@@ -57,39 +58,35 @@ function LogsPage() {
       toast(`已复制这个${what}的 ${all.length} 条记录`, { tone: 'success' })
     } catch (cause) { setError(cause) }
   }
-  if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机打开的页面可以查看日志。" />
-  return <div className="mx-auto grid w-full max-w-3xl gap-4">
-    <div className="flex items-center justify-end gap-2">
+  if (!allowed) return <EmptyState icon={ScrollText} title="看不了日志" description="只有管理设备或本机页面能看" />
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-4">
+    <div className="flex items-center gap-2">
+      <div className="relative min-w-0 flex-1">
+        <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input type="search" aria-label="搜索日志" placeholder="搜索内容或编号" className="h-10 ps-9 max-md:h-11" value={query} onChange={(event) => setQuery(event.target.value)} />
+      </div>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5" aria-label="刷新" title="刷新" disabled={busy} onClick={() => { void load() }}>
         <RefreshCw aria-hidden="true" className={cn(busy && 'animate-spin')} />
       </Button>
     </div>
-    <div className="relative">
-      <Search aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input type="search" aria-label="搜索日志" placeholder="搜索内容或编号" className="h-10 ps-9" value={query} onChange={(event) => setQuery(event.target.value)} />
-    </div>
-    <div role="radiogroup" aria-label="级别" className="flex w-full gap-1 rounded-lg bg-muted p-1 sm:w-fit">
-      {levelChoices.map(([value, label, Icon]) => <Button key={label} type="button" role="radio" aria-checked={level === value} variant={level === value ? 'outline' : 'ghost'} className="flex-1 sm:flex-none" onClick={() => setLevel(value)}>
-        <Icon aria-hidden="true" />{label}
-      </Button>)}
-    </div>
-    <div role="group" aria-label="来源" className="flex flex-wrap gap-2">
+    <Segmented label="级别" labels fill value={level ?? 'all'} options={levelChoices} onChange={(value) => setLevel(value === 'all' ? undefined : value)} />
+    <div role="group" aria-label="来源" className="flex flex-wrap gap-2 max-md:-m-1 max-md:-mx-4 max-md:flex-nowrap max-md:overflow-x-auto max-md:p-1 max-md:px-4 max-md:scroll-px-4 max-md:[scrollbar-width:none] max-md:[&::-webkit-scrollbar]:hidden">
       {sourceChoices.map(([value, label, Icon]) => {
         const on = sources.includes(value)
-        return <button key={value} type="button" aria-pressed={on} onClick={() => setSources(on ? sources.filter((item) => item !== value) : [...sources, value])}
-          className={cn('inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-10 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
+        return <button key={value} type="button" aria-pressed={on} onClick={(event) => { event.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' }); setSources(on ? sources.filter((item) => item !== value) : [...sources, value]) }}
+          className={cn('inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-11 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
             on ? 'border-primary bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-muted hover:text-foreground')}>
           <Icon aria-hidden="true" className="size-3.5" />{label}
         </button>
       })}
     </div>
     <InlineError error={error} />
-    {records === null ? null : records.length === 0
-      ? <EmptyState icon={ScrollText} title="没有符合条件的记录"
+    {records === null ? error ? null : <div className="grid gap-2" aria-busy="true"><Skeleton className="h-12" /><Skeleton className="h-12" /><Skeleton className="h-12" /></div> : records.length === 0
+      ? <EmptyState icon={ScrollText} title={level || sources.length || query ? "没有符合条件的记录" : "还没有日志"}
         action={level || sources.length || query ? <Button type="button" variant="outline" onClick={() => { setLevel(undefined); setSources([]); setQuery('') }}><X aria-hidden="true" />清除筛选</Button> : undefined} />
       : <>
         <p className="text-meta text-muted-foreground" aria-live="polite">{records.length >= SHOWN ? `最新 ${SHOWN} 条` : `共 ${records.length} 条`}</p>
-        <ul className="divide-y overflow-hidden rounded-xl border bg-card">
+        <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
           {records.map((record, index) => <LogRow key={`${record.ts_ms}-${index}`} record={record} chat={workspace.bots.find((bot) => bot.conversation_id === record.conversation_id)?.name} open={open === index} onToggle={() => setOpen(open === index ? null : index)} onCopyAll={copyAll} />)}
         </ul>
       </>}
@@ -102,12 +99,12 @@ function time(ms: number) {
   return today ? clock : `${date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })} ${clock}`
 }
 
-/** `chat`: the assistant whose chat the record belongs to, shown instead of its ID. */
+/** `chat`: the bot whose chat the record belongs to, shown instead of its ID. */
 function LogRow({ record, chat, open, onToggle, onCopyAll }: { record: LogRecord; chat?: string; open: boolean; onToggle(): void; onCopyAll(filter: LogFilter, what: string): Promise<void> }) {
   const look = levelLook[record.level]
   const ids: Array<[string, string | undefined]> = [['对话', chat ?? record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]
   return <li>
-    <button type="button" aria-expanded={open} onClick={onToggle} className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-muted/50 focus-visible:bg-muted/50 outline-none">
+    <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
       <look.icon aria-label={look.label} className={cn('mt-0.5 size-4 shrink-0', look.tone)} />
       <span className="grid min-w-0 flex-1 gap-1">
         <span className={cn('break-words', !open && 'line-clamp-2')}>{record.message || record.event}</span>

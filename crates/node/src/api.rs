@@ -105,7 +105,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        (
+            self.0,
+            Json(json!({"error": crate::logging::scrub(&self.1)})),
+        )
+            .into_response()
     }
 }
 
@@ -143,8 +147,24 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     node.local_access
         .publish_listener(local_url.clone(), node.identity.device_id()?)?;
     let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
-    let tools = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let tool_url = format!("http://{}", tools.local_addr()?);
+    // Codex threads keep the tool URL they were created with, so the port is reused across
+    // starts when free; a new port means new threads.
+    let port_file = node.data_dir.join("tool-port");
+    let previous = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|port| port.trim().parse::<u16>().ok());
+    let tools = match previous {
+        Some(port) => match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => listener,
+            Err(_) => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+        },
+        None => TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+    };
+    let tool_addr = tools.local_addr()?;
+    if previous != Some(tool_addr.port()) {
+        std::fs::write(&port_file, tool_addr.port().to_string())?;
+    }
+    let tool_url = format!("http://{tool_addr}");
     let internal = tool_router(node.clone(), Site::parse(&tool_url)?);
     node.tools_ready(tool_url)?;
     tokio::try_join!(
@@ -206,7 +226,6 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     let app = App::new(node, sites);
     let mut routes = Router::new()
-        .route("/transport.js", get(transport_javascript))
         .route("/generated/vibeface_secure.js", get(crypto_javascript))
         .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
         .route("/api/info", get(info))
@@ -435,7 +454,7 @@ async fn local_info(State(app): State<App>, headers: HeaderMap) -> ApiResult<Jso
         })
     });
     Ok(Json(
-        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"device_id":local_session.map(|session| session.device_id),"network_id":network_id,"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true}}),
+        json!({"enabled":app.node.local_access.enabled(),"has_session":local_session.is_some(),"device_id":local_session.map(|session| session.device_id),"entry":{"address":app.node.local_access.origin().map_err(ApiError::bad)?,"device_id":device_id,"local":true}}),
     ))
 }
 
@@ -542,12 +561,11 @@ struct LocalSetupRequest {}
 enum LocalSetup {
     Uninitialized {
         invitation: BootstrapInvitation,
-        /// What this computer was called before it was removed, the default when it joins again.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
     },
     Initialized {
         entry: LocalEntry,
+        /// Lets a browser that never joined show this computer as removed instead of not joined.
+        removed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         local_launch: Option<LocalLaunch>,
     },
@@ -587,20 +605,19 @@ async fn local_setup(
     let origin = one_header(&headers, header::ORIGIN.as_str()).ok_or_else(ApiError::forbidden)?;
     let device_id = app.node.identity.device_id().map_err(ApiError::bad)?;
     if app.node.has_membership().await.map_err(ApiError::bad)? {
+        let state = app.node.membership_state().await.map_err(ApiError::bad)?;
+        let removed = state
+            .project()
+            .map_err(ApiError::bad)?
+            .revocation(&device_id)
+            .is_some();
         let local_launch = if app.node.local_access.enabled() {
             match app.node.local_access.origin() {
                 Ok(url) => {
-                    let network_id = app
-                        .node
-                        .membership_state()
-                        .await
-                        .map_err(ApiError::bad)?
-                        .genesis
-                        .network_id;
                     let token = app
                         .node
                         .local_access
-                        .issue_from_local_setup(&device_id, &network_id)
+                        .issue_from_local_setup(&device_id, &state.genesis.network_id)
                         .map_err(ApiError::bad)?;
                     Some(LocalLaunch {
                         url,
@@ -618,6 +635,7 @@ async fn local_setup(
                 address: origin.into(),
                 device_id,
             },
+            removed,
             local_launch,
         }));
     }
@@ -652,9 +670,6 @@ async fn local_setup(
             device_id,
             capability: capability.capability,
         },
-        name: std::fs::read_to_string(app.node.data_dir.join(crate::config::FORMER_NAME_FILE))
-            .ok()
-            .filter(|name| !name.is_empty() && name.chars().count() <= 128),
     }))
 }
 
@@ -811,12 +826,6 @@ async fn frontend(method: Method, uri: axum::http::Uri) -> Response {
         .into_response()
 }
 
-async fn transport_javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/transport.js"),
-    )
-}
 async fn crypto_javascript() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
@@ -965,7 +974,7 @@ mod tests {
         use crate::{
             config::{self, Config},
             crypto::LocalIdentity,
-            identity::{Genesis, Member, NetworkState},
+            identity::{Genesis, GovernanceEvent, Member, NetworkState, Revocation},
         };
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1034,7 +1043,7 @@ mod tests {
             )?)?;
             node.store.lock().await.bootstrap_network(state, &capability.capability, &admin.device_id()?)?;
             let initialized: Value = request().send().await?.json().await?;
-            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?}}));
+            assert_eq!(initialized, json!({"kind":"initialized","entry":{"address":origin,"device_id":node.identity.device_id()?},"removed":false}));
             assert!(!initialized.to_string().contains(&capability.capability));
             assert!(node.store.lock().await.verify_bootstrap_capability(&capability.capability).is_err());
             let local_origin = "http://127.0.0.1:4791";
@@ -1053,6 +1062,12 @@ mod tests {
             node.local_access.set_enabled(false)?;
             assert_eq!(request().send().await?.json::<Value>().await?, initialized);
             assert!(node.local_access.session(&cookie, &node.identity.device_id()?, &network_id).is_err());
+            let mut removed = node.membership_state().await?;
+            removed.append(GovernanceEvent::revoke(&admin, &removed.project()?, Revocation::new(&node.identity.device_id()?, None)?)?)?;
+            node.install_membership(removed).await?;
+            let after_removal: Value = request().send().await?.json().await?;
+            assert_eq!(after_removal["kind"], "initialized");
+            assert_eq!(after_removal["removed"], true);
             Ok::<(), anyhow::Error>(())
         }.await;
         server.abort();
@@ -1108,7 +1123,6 @@ mod tests {
                     LOG => json!({"source":"node","records":[]}),
                     _ => event,
                 };
-                // Passes the boundary; this Node has no network yet.
                 assert_eq!(
                     status(client.post(&url).json(&body)).await?,
                     StatusCode::BAD_REQUEST

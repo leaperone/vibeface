@@ -15,7 +15,7 @@ fn bytes(input: &Value) -> Result<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
-    let mut identity = Identity::generate()?;
+    let identity = Identity::generate()?;
     let mut handshake = None::<Handshake>;
     let mut channel = None::<Channel>;
     for line in io::stdin().lock().lines() {
@@ -23,12 +23,7 @@ fn main() -> Result<()> {
             let input: Value = serde_json::from_str(&line.map_err(|_| "probe input failed")?)
                 .map_err(|_| "invalid probe JSON")?;
             Ok(match text(&input, "op")? {
-                "identity" => {
-                    if let Some(secret) = input.get("secret_hex").and_then(Value::as_str) {
-                        identity = Identity::from_secret_hex(secret)?;
-                    }
-                    json!({"device_id":identity.device_id()})
-                }
+                "identity" => json!({"device_id":identity.device_id()}),
                 "recovery_seal" => json!(hex::encode(vibeface_secure::recovery_seal(
                     &bytes(&input)?,
                     text(&input, "password")?

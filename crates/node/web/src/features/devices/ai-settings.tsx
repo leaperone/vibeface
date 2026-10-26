@@ -1,0 +1,407 @@
+import { useEffect, useRef, useState } from "react"
+import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { cn } from "@/lib/utils"
+import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
+import { terms } from "@/lib/glossary"
+import { rawError } from "@vibeface/client/lib/errors.ts"
+import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+
+export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
+export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
+  ready: { label: "可用", tone: "success", icon: CircleCheck },
+  needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
+  starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
+  off: { label: "未使用", tone: "neutral", icon: CircleDashed },
+}
+// Names come from runtime/settings.rs readiness.missing.
+const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> = {
+  codex: [
+    { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
+  ],
+  cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
+}
+
+function issueText(provider: ProviderId, issue: ProviderIssue): string {
+  const name = providerNames[provider]
+  switch (issue.code) {
+    case "bin_missing": return `找不到 ${name} 程序`
+    case "env_missing": return `缺少 ${issue.name}`
+    case "launch_failed": return `${name} 没能启动`
+    case "config_invalid": return `${name} 的配置文件读不了`
+    case "app_server_not_found": return "没找到这台电脑上运行的 Codex"
+    case "app_server_unreachable": return "连不上这台电脑上的 Codex"
+  }
+}
+
+const modes: { value: AppServerMode; label: string; icon: LucideIcon }[] = [{ value: "system", label: "用已在运行的", icon: Monitor }, { value: "spawn", label: "由 Vibeface 启动", icon: Play }]
+const spawnServer = { mode: "spawn", socket: null } as const
+
+/** One line for an App Server state, from the device or a fresh test. */
+function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string }) {
+  const [tone, Icon, label] = {
+    connected: ["text-success", CircleCheck, "已连接"],
+    starting: ["text-muted-foreground", LoaderCircle, "连接中"],
+    off: ["text-muted-foreground", Power, "未用于执行任务"],
+    not_found: ["text-warning", CircleAlert, "未找到"],
+    handshake_failed: ["text-warning", CircleAlert, "连不上"],
+    launch_failed: ["text-warning", CircleAlert, "没能启动"],
+  }[link.state] as [string, LucideIcon, string]
+  return <span role="status" className={cn("flex min-w-0 items-center gap-1.5 text-meta", tone)}>
+    <Icon aria-hidden="true" className={cn("size-4 shrink-0", link.state === "starting" && "animate-spin")} />
+    <span className="min-w-0 truncate">{prefix}{label}{link.state === "connected" && link.user_agent ? ` · ${link.user_agent}` : ""}</span>
+  </span>
+}
+
+/**
+ * Where Codex work runs: the App Server already running on this computer, or one the device starts.
+ * `compact`: setup only asks for the socket; how it connects and testing it stay on the device page.
+ */
+function AppServerSettings({ server, working, blocked, busy, pick, compact = false, save, test }: {
+  server: AppServer; working: boolean; blocked: boolean; busy: string; pick: boolean; compact?: boolean
+  save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
+}) {
+  const [socket, setSocket] = useState(server.socket ?? "")
+  const [tested, setTested] = useState<AppServerLink | null>(null)
+  const [testing, setTesting] = useState(false)
+  useEffect(() => setSocket(server.socket ?? ""), [server.socket])
+  useEffect(() => setTested(null), [server.mode, server.socket])
+  const link = server.link
+  const shown = tested ?? link
+  const inUse = shown.state === "connected" || shown.state === "handshake_failed" ? [shown.socket] : shown.state === "not_found" ? shown.candidates : []
+  const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
+  const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
+  const dirty = socket.trim() !== (server.socket ?? "")
+  const socketForm = <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
+    <Input aria-label="指定连接路径" className={cn("min-w-0 font-mono", compact && "placeholder:font-sans")} placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working}
+      data-fix={pick ? "" : undefined} onChange={(event) => setSocket(event.target.value)} />
+    {compact || dirty ? <Button type="submit" variant="outline" disabled={working || !dirty}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
+  </form>
+  if (compact) return socketForm
+
+  return <div className="grid gap-2">
+    <p className="text-meta font-medium text-muted-foreground">连接方式</p>
+    <div className="flex min-w-0 flex-wrap items-center gap-2">
+      <Segmented label="连接方式" labels fill value={server.mode} options={modes} disabled={working} onChange={setMode} />
+      <Button type="button" variant="ghost" disabled={working || testing || blocked || link.state === "off"} onClick={() => void runTest()}>
+        <BusyIcon busy={testing} icon={PlugZap} />测试连接
+      </Button>
+    </div>
+    {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
+    {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
+    {server.mode === "system" || pick ? <Details label="手动指定" open={pick || undefined}>
+      {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
+      {socketForm}
+    </Details> : null}
+  </div>
+}
+
+/** Opens a provider's settings on this page and moves focus into them; every fix action lands here. */
+function openProvider(provider: ProviderId) {
+  const card = document.getElementById(`provider-${provider}`)
+  if (!card) return
+  if (card instanceof HTMLDetailsElement) card.open = true
+  card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
+  card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
+}
+
+type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
+type Failure = { at: ProviderId | "roots" | null; cause: unknown }
+
+/**
+ * The AI on the device this browser is connected to: which provider runs the bot, whether
+ * Codex executes tasks, each provider's program and variables, and the folders it may use. Every
+ * change saves right away. Variable values are write-only; the device only says which are set.
+ */
+export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean; onBot?(on: boolean): void }) {
+  const { ready } = useDevice()
+  const workspace = useWorkspace()
+  const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
+  const [busy, setBusy] = useState("")
+  const [error, setError] = useState<Failure | null>(null)
+  const sequence = useRef(0)
+
+  async function call(key: string, at: Failure["at"], method: string, params?: Change | NodeSettings) {
+    if (!ready?.isCurrent()) return false
+    const connection = ready, owner = ++sequence.current
+    setBusy(key); setError(null)
+    try {
+      const parsed = parseNodeSettings(await connection.request(method, params))
+      if (owner !== sequence.current || !connection.isCurrent()) return false
+      setResponse(parsed)
+      return true
+    } catch (cause) {
+      if (owner === sequence.current && connection.isCurrent()) setError({ at, cause })
+      return false
+    } finally {
+      if (owner === sequence.current) setBusy("")
+    }
+  }
+  const load = () => call("load", null, "node_settings")
+  /** After a write that failed, possibly after the device applied it: read the state again instead of resending; the error stays shown. */
+  async function reconcile() {
+    if (!ready?.isCurrent()) return
+    const connection = ready, owner = sequence.current
+    try {
+      const parsed = parseNodeSettings(await connection.request("node_settings"))
+      if (owner === sequence.current && connection.isCurrent()) setResponse(parsed)
+    } catch { /* the shown error already says what failed */ }
+  }
+  useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
+  async function test(): Promise<AppServerLink | null> {
+    if (!ready?.isCurrent()) return null
+    try {
+      const link = parseAppServerLink(await ready.request("test_codex_app_server"))
+      void load()
+      return link
+    } catch (cause) {
+      setError({ at: "codex", cause })
+      return null
+    }
+  }
+  const starting = response?.providers.some((item) => item.state === "starting")
+  const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
+  useEffect(() => { onBot?.(botOn) }, [botOn])
+  // Nothing pushes a device's bot readiness; the device list, the inbox and onboarding read it from `nodes`, so read them again when it moves.
+  const botState = response?.providers.find((item) => item.roles.includes("agent"))?.state
+  useEffect(() => { if (botState && workspace.isCurrent()) void workspace.refresh().catch(() => {}) }, [botState])
+  useEffect(() => {
+    if (!starting) return
+    const timer = setTimeout(() => void load(), 2000)
+    return () => clearTimeout(timer)
+  }, [response])
+
+  if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
+  const { roots, manager } = response.settings
+  return <div className="grid gap-5">
+    <ul className="grid gap-3">
+      {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
+        error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
+        change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
+        saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
+    </ul>
+    {onboarding ? botOn ? null : <BotHint /> : <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
+  </div>
+}
+
+/**
+ * A chip that turns one use of a provider on or off. A small switch inside says it is a control, not a status; on, the chip is also tinted,
+ * so a phone without hover still reads it. Never solid, so the page's own next step stays the only filled button.
+ */
+function RoleToggle({ label, name, pressed, busy, disabled, onClick }: { label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
+  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
+    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/45")}>
+      <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
+    </span>}{label}
+  </Button>
+}
+
+function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test, reconcile }: {
+  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
+}) {
+  const name = providerNames[item.provider], Icon = providerIcons[item.provider]
+  const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
+  const manager = bot ? response.settings.manager : null
+  const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
+  const state = states[item.state === "ready" && missing.length ? "needs_setup" : item.state]
+  const [editing, setEditing] = useState<string | null>(null)
+  const [value, setValue] = useState("")
+  const [newName, setNewName] = useState("")
+  const [newValue, setNewValue] = useState("")
+  const [bin, setBin] = useState(item.bin ?? "")
+  useEffect(() => setBin(item.bin ?? ""), [item.bin])
+  const working = busy.startsWith(`${item.provider}:`)
+  const issue = item.state === "needs_setup" ? item.issues[0] : undefined
+  // The App Server already running needs its socket named first; until then the device refuses Codex work.
+  const server = item.app_server
+  const noSocket = server?.mode === "system" && !server.socket
+  const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
+  const [pick, setPick] = useState(0)
+  // The Codex folder a managed App Server needs before Codex work starts; null while not asked for.
+  const [home, setHome] = useState<string | null>(null)
+  useEffect(() => { setAsked(null); setHome(null); setPick(0) }, [server?.mode])
+  useEffect(() => { if (pick) openProvider(item.provider) }, [pick])
+  const refused = /explicit App Server socket/i.test(rawError(error))
+  const choosing = refused || (noSocket && asked !== null)
+  const turnOn = (role: "bot" | "execution") => noSocket ? setAsked(role) : void change(role, role === "bot" ? { bot: true } : { execution: true })
+  const serverSettings = server ? <AppServerSettings server={server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} pick={pick > 0} compact={onboarding} save={change} test={test} /> : null
+  const homeSet = item.env.some((row) => row.name === "CODEX_HOME" && row.set)
+  const homePath = home?.trim() ?? ""
+  const homeValid = /^(\/|[A-Za-z]:[\\/])/.test(homePath)
+  // One write: the folder, the managed App Server and the use asked for, so a failure leaves nothing half done.
+  const startOwn = (codexHome?: string) => change(asked ?? "app_server", {
+    app_server: { ...spawnServer, socket: server?.socket ?? null }, env: codexHome ? { CODEX_HOME: codexHome } : undefined,
+    bot: asked === "bot" || undefined, execution: asked === "execution" || undefined,
+  }).then((ok) => { if (!ok) void reconcile() })
+  const fix = () => {
+    if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
+    openProvider(item.provider)
+  }
+  const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
+    .then((ok) => { if (ok) toast(next === null ? `已删除「${name}」` : `已保存「${name}」`, { tone: "success" }); return ok })
+  const addName = newName.trim().toUpperCase()
+
+  return <li className="overflow-hidden rounded-xl border">
+    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
+      <div className="flex items-center gap-3">
+        <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+        <span className="font-medium whitespace-nowrap">{name}</span>
+        <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
+      </div>
+      <div className="ms-auto flex shrink-0 gap-2 max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2">
+        <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+          onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
+        {item.supports.includes("execution") && !onboarding ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
+          onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
+      </div>
+    </div>
+    {choosing ? <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2 text-meta">
+      <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />还没选怎么连 Codex</span>
+      <span className="flex flex-wrap gap-2">
+        {noSocket ? <Button type="button" size="sm" variant="outline" disabled={working} aria-expanded={asked && !homeSet ? home !== null : undefined}
+          onClick={() => asked && !homeSet ? setHome(home ?? "") : void startOwn()}><BusyIcon busy={working && home === null} icon={Play} />改由 Vibeface 启动</Button> : null}
+        <Button type="button" size="sm" variant="ghost" onClick={() => setPick(pick + 1)}><Monitor aria-hidden="true" />指定路径</Button>
+      </span>
+      {home !== null ? <form className="grid basis-full gap-1" onSubmit={(event) => { event.preventDefault(); if (homeValid) void startOwn(homePath) }}>
+        <label htmlFor={`${item.provider}-home`} className="font-medium text-muted-foreground">Codex 目录</label>
+        <div className="flex min-w-0 gap-2">
+          <Input id={`${item.provider}-home`} autoFocus className="min-w-0 font-mono placeholder:font-sans" placeholder="例如 /Users/你的用户名/.codex" spellCheck={false} maxLength={4096}
+            value={home} disabled={working} aria-invalid={homePath !== "" && !homeValid ? true : undefined} onChange={(event) => setHome(event.target.value)} />
+          <Button type="submit" variant="outline" disabled={working || !homeValid}><BusyIcon busy={working} icon={Check} />确认</Button>
+        </div>
+      </form> : null}
+    </div> : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
+      <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
+      <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
+      {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
+          onClick={() => void startOwn()}>改由 Vibeface 启动</button>
+        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
+        : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
+    </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
+      <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
+      <span className="min-w-0 truncate">{check.label}</span>
+      <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
+    </li>)}</ul> : null}
+    {onboarding ? pick && serverSettings ? <div id={`provider-${item.provider}`} className="border-t p-3">{serverSettings}</div> : null
+      : <details id={`provider-${item.provider}`} className="details border-t">
+      <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
+        <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
+      </summary>
+      <div className="grid gap-4 px-3 pb-3">
+        {serverSettings}
+
+        {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
+          <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
+          <div className="flex min-w-0 gap-2">
+            <Input id={`${item.provider}-bin`} className="min-w-0 font-mono" placeholder="codex" value={bin} disabled={working}
+              data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
+            {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
+          </div>
+        </form> : null}
+
+        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
+          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
+
+        <div className="grid gap-2">
+          <p className="text-meta font-medium text-muted-foreground">环境变量</p>
+          {item.env.length ? <ul className="grid gap-1">{item.env.map((row) => {
+            const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
+            return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
+              <div className="flex min-h-8 min-w-0 items-center gap-2">
+                <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
+                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
+                <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
+                  data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>
+                {row.set ? <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
+                  onClick={() => void setVariable(`env:${row.name}`, row.name, null)}><Trash2 aria-hidden="true" /></Button> : null}
+              </div>
+              {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
+                event.preventDefault()
+                void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
+              }}>
+                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
+                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
+                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
+              </form> : null}
+            </li>
+          })}</ul> : null}
+          <form className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)_auto]" onSubmit={(event) => {
+            event.preventDefault()
+            void setVariable("add", addName, newValue).then((ok) => { if (ok) { setNewName(""); setNewValue("") } })
+          }}>
+            <Input aria-label="变量名" className="min-w-0 font-mono" placeholder="变量名" autoCapitalize="characters" spellCheck={false} maxLength={256} value={newName} disabled={working} onChange={(event) => setNewName(event.target.value)} />
+            <div className="flex min-w-0 gap-2 sm:contents">
+              <Input type="password" autoComplete="off" aria-label="值" className="min-w-0" placeholder="值" maxLength={4096} value={newValue} disabled={working} onChange={(event) => setNewValue(event.target.value)} />
+              <Button type="submit" variant="outline" disabled={working || !addName || !newValue}><BusyIcon busy={busy === `${item.provider}:add`} icon={Plus} />添加</Button>
+            </div>
+          </form>
+          <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
+          {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
+        </div>
+        {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
+      </div>
+    </details>}
+    {error && !refused ? <InlineError error={error} className="px-3 pb-3" /> : null}
+  </li>
+}
+
+/** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
+function BotHint() {
+  return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开「运行 {terms.bot.label}」
+  </p>
+}
+
+const botFields = ["model", "workspace", "cursor_sdk_bin"] as const
+
+/** The bot's model, folder and programs, inside the settings of the provider it runs on. */
+function BotDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+  const [draft, setDraft] = useState(manager)
+  const cursor = manager.provider === "cursor_sdk"
+  const dirty = botFields.some((key) => draft[key] !== manager[key])
+  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) =>
+    <label className="grid gap-1 text-meta">{label}<Input name={key} className={cn(!extra.plain && "font-mono")} value={draft[key]} maxLength={key === "model" ? 256 : undefined} disabled={working}
+      placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
+  return <form className="grid gap-3" onSubmit={(event) => {
+    event.preventDefault()
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim() })
+  }}>
+    <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
+    {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
+    {field("workspace", "Bot 工作文件夹")}
+    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : null}
+    {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
+  </form>
+}
+
+function Folders({ roots, busy, save }: { roots: string[]; busy: boolean; save(roots: string[]): void }) {
+  const [folder, setFolder] = useState("")
+  const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
+  return <div className="grid gap-2">
+    <p className="text-meta font-medium text-muted-foreground">{terms.folders.label}</p>
+    {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
+      <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+      <FolderPath path={root} />
+      <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
+    </li>)}</ul> : null}
+    <div className="flex min-w-0 gap-2">
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/path/to/project" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
+    </div>
+  </div>
+}
+
+/** A long path gives up its parent folders first, so the folder's own name stays readable. */
+function FolderPath({ path }: { path: string }) {
+  const cut = path.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
+  return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
+    <span className="min-w-0 truncate text-muted-foreground">{path.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{path.slice(cut)}</span>
+  </span>
+}

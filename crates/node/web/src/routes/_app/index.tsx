@@ -1,7 +1,7 @@
 import { createFileRoute, Navigate } from '@tanstack/react-router'
 import { ConversationList } from '@/features/workspace/conversation-list'
-import { useWorkspace } from '@/features/workspace/context'
-import { homeBot } from '@/features/workspace/home'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { homeBot } from '@vibeface/client/workspace/home.ts'
 import { useIsMobile } from '@/lib/hooks/use-mobile'
 
 export const Route = createFileRoute('/_app/')({

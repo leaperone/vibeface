@@ -1,12 +1,12 @@
-//! The AI providers this Node runs locally, the roles each may serve, and the variables each
-//! provider's processes get. The switches live in `config.json`; the variables are model keys,
+//! The AI providers this Node runs locally and the variables each provider's processes get. The
+//! bot's provider and the execution switch live in `config.json`; the variables are model keys,
 //! so they stay in one private file of the data directory and never reach events, logs or the
 //! web, which only learns which names are set.
 use crate::manager::ManagerKind;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -21,7 +21,7 @@ pub enum Provider {
     Cursor,
 }
 
-/// The coordination Agent (the assistant) or the execution layer that runs dispatched work.
+/// The coordination Agent (the bot) or the execution layer that runs dispatched work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -33,7 +33,7 @@ impl Provider {
     pub const ALL: [Provider; 2] = [Provider::Codex, Provider::Cursor];
 
     /// What the runtime can run on each provider: dispatched work runs only on the Codex
-    /// App Server, so Cursor serves only as the assistant.
+    /// App Server, so Cursor serves only as the bot.
     pub fn supports(self) -> &'static [Role] {
         match self {
             Provider::Codex => &[Role::Agent, Role::Execution],
@@ -47,20 +47,12 @@ impl Provider {
             ManagerKind::CursorSdk => Provider::Cursor,
         }
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Switch {
-    pub enabled: bool,
-    pub roles: BTreeSet<Role>,
-}
-
-impl Switch {
-    fn all(provider: Provider) -> Self {
-        Self {
-            enabled: true,
-            roles: provider.supports().iter().copied().collect(),
+    /// The bot runtime that runs on this provider.
+    pub fn manager_kind(self) -> ManagerKind {
+        match self {
+            Provider::Codex => ManagerKind::CodexSdk,
+            Provider::Cursor => ManagerKind::CursorSdk,
         }
     }
 }
@@ -79,62 +71,35 @@ pub enum AppServerMode {
 #[serde(deny_unknown_fields)]
 pub struct AppServer {
     pub mode: AppServerMode,
-    /// The system App Server's socket when discovery should not choose it. Kept while the
+    /// The explicitly selected system App Server socket. Kept while the
     /// Node starts its own, so switching back restores it.
     pub socket: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+/// What the providers do besides the bot, which `Config.manager` chooses. A provider is in
+/// use while the bot runs on it or, for Codex, while it executes dispatched work.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
-    pub codex: Switch,
-    pub cursor: Switch,
+    /// Dispatched work runs on the Codex App Server.
+    pub execution: bool,
     #[serde(default)]
     pub codex_app_server: AppServer,
 }
 
-impl Default for Providers {
-    fn default() -> Self {
-        Self {
-            codex: Switch::all(Provider::Codex),
-            cursor: Switch::all(Provider::Cursor),
-            codex_app_server: AppServer::default(),
-        }
-    }
-}
-
 impl Providers {
-    pub fn get(&self, provider: Provider) -> &Switch {
-        match provider {
-            Provider::Codex => &self.codex,
-            Provider::Cursor => &self.cursor,
-        }
-    }
-    pub fn get_mut(&mut self, provider: Provider) -> &mut Switch {
-        match provider {
-            Provider::Codex => &mut self.codex,
-            Provider::Cursor => &mut self.cursor,
-        }
-    }
-    pub fn serves(&self, provider: Provider, role: Role) -> bool {
-        let switch = self.get(provider);
-        switch.enabled && switch.roles.contains(&role)
-    }
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self, codex_agent: bool) -> Result<()> {
+        ensure!(
+            !(self.execution || codex_agent)
+                || self.codex_app_server.mode != AppServerMode::System
+                || self.codex_app_server.socket.is_some(),
+            "set an explicit App Server socket before enabling system execution"
+        );
         if let Some(socket) = &self.codex_app_server.socket {
             let text = socket.to_string_lossy();
             ensure!(
                 socket.is_absolute() && text.len() <= 1024 && !text.contains('\0'),
                 "the App Server socket must be an absolute path"
-            );
-        }
-        for provider in Provider::ALL {
-            ensure!(
-                self.get(provider)
-                    .roles
-                    .iter()
-                    .all(|role| provider.supports().contains(role)),
-                "{provider:?} cannot serve that role"
             );
         }
         Ok(())
@@ -162,6 +127,7 @@ impl ProviderEnv {
         for provider in Provider::ALL {
             for (name, value) in env.get(provider) {
                 validate(provider, name, value)?;
+                crate::logging::add_private_path(std::path::Path::new(value));
             }
         }
         env.redact_in_logs();
@@ -228,7 +194,7 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     ensure!(
         !name.starts_with("VIBEFACE_")
             && !(provider == Provider::Cursor && name.starts_with("CURSOR_SDK_")),
-        "{name} is set by vibeface"
+        "{name} is set by Vibeface"
     );
     ensure!(
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
@@ -257,11 +223,26 @@ pub struct CodexLaunch {
 /// The App Server the Node talks to right now.
 #[derive(Clone, PartialEq)]
 pub enum CodexTarget {
-    /// Codex does not serve the execution layer.
+    /// Codex does not execute work.
     Off,
-    /// The App Server already running on this computer; `None` discovers its socket.
-    System(Option<PathBuf>),
+    /// The App Server at the explicitly configured socket.
+    System(PathBuf),
     Spawn(CodexLaunch),
+}
+
+impl CodexTarget {
+    /// Which App Server keeps the threads: the explicitly selected system server, or the
+    /// Node's own by the Codex home it stores them in. A thread or turn belongs to one of them.
+    pub fn server(&self) -> String {
+        match self {
+            CodexTarget::Off => "off".into(),
+            CodexTarget::System(_) => "system".into(),
+            CodexTarget::Spawn(launch) => format!(
+                "own:{}",
+                launch.env.get("CODEX_HOME").map_or("", String::as_str)
+            ),
+        }
+    }
 }
 
 /// Everything about the providers that only this machine knows.
@@ -273,20 +254,30 @@ pub struct Local {
 }
 
 impl Local {
-    pub fn serves(&self, provider: Provider, role: Role) -> bool {
-        self.switches.serves(provider, role)
+    pub fn validate(&self, codex_agent: bool) -> Result<()> {
+        self.switches.validate(codex_agent)?;
+        if (self.switches.execution || codex_agent)
+            && self.switches.codex_app_server.mode == AppServerMode::Spawn
+        {
+            ensure!(
+                self.env
+                    .codex
+                    .get("CODEX_HOME")
+                    .is_some_and(|home| std::path::Path::new(home).is_absolute()),
+                "set an explicit absolute CODEX_HOME before starting a managed App Server"
+            );
+        }
+        Ok(())
     }
-
-    /// The App Server is used only while Codex serves the execution layer. The variables reach
-    /// only an App Server the Node starts; the system one keeps its own.
-    pub fn codex_target(&self) -> CodexTarget {
+    /// The variables reach only an App Server the Node starts; the system one keeps its own.
+    pub fn codex_target(&self, codex_agent: bool) -> CodexTarget {
         let app_server = &self.switches.codex_app_server;
-        match (
-            self.serves(Provider::Codex, Role::Execution),
-            app_server.mode,
-        ) {
+        match (self.switches.execution || codex_agent, app_server.mode) {
             (false, _) => CodexTarget::Off,
-            (true, AppServerMode::System) => CodexTarget::System(app_server.socket.clone()),
+            (true, AppServerMode::System) => match &app_server.socket {
+                Some(socket) => CodexTarget::System(socket.clone()),
+                None => CodexTarget::Off,
+            },
             (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
                 bin: self.codex_bin.clone(),
                 env: self.env.codex.clone(),
@@ -298,6 +289,29 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn threads_belong_to_the_app_server_that_keeps_them() {
+        let own = |home: Option<&str>| {
+            CodexTarget::Spawn(CodexLaunch {
+                bin: "codex".into(),
+                env: home
+                    .map(|home| ("CODEX_HOME".to_owned(), home.to_owned()))
+                    .into_iter()
+                    .collect(),
+            })
+            .server()
+        };
+        assert_eq!(
+            CodexTarget::System("/tmp/first.sock".into()).server(),
+            CodexTarget::System("/tmp/a.sock".into()).server()
+        );
+        assert_ne!(
+            CodexTarget::System("/tmp/first.sock".into()).server(),
+            own(None)
+        );
+        assert_ne!(own(None), own(Some("/tmp/home")));
+    }
 
     #[test]
     fn variables_are_validated_and_stay_with_their_provider() -> Result<()> {
@@ -352,29 +366,36 @@ mod tests {
     }
 
     #[test]
-    fn roles_follow_what_each_provider_can_run() {
-        let mut providers = Providers::default();
-        assert!(providers.serves(Provider::Codex, Role::Execution));
-        assert!(providers.validate().is_ok());
-        providers.cursor.roles.insert(Role::Execution);
-        assert!(providers.validate().is_err());
-        providers.cursor.roles.remove(&Role::Execution);
-        providers.codex.enabled = false;
-        assert!(!providers.serves(Provider::Codex, Role::Agent));
-        let local = Local {
-            switches: providers,
+    fn the_execution_switch_decides_whether_codex_runs_work() {
+        let mut local = Local {
+            switches: Providers::default(),
             codex_bin: "codex".into(),
             env: ProviderEnv::default(),
         };
-        assert!(local.codex_target() == CodexTarget::Off);
+        assert!(!local.switches.execution && local.switches.validate(false).is_ok());
+        assert!(local.codex_target(false) == CodexTarget::Off);
+        assert!(local.validate(true).is_err());
+        local.switches.execution = true;
+        assert!(local.validate(false).is_err());
+        local.switches.codex_app_server.socket = Some("/configured/app-server.sock".into());
+        assert!(local.validate(false).is_ok());
+        assert!(matches!(local.codex_target(false), CodexTarget::System(_)));
+        local.switches.execution = false;
+        assert!(local.validate(true).is_ok());
+        assert!(matches!(local.codex_target(true), CodexTarget::System(_)));
+        assert!(local.codex_target(false) == CodexTarget::Off);
+        assert!(
+            serde_json::from_value::<Providers>(serde_json::json!({
+                "execution":true,"codex":{"enabled":true,"roles":["agent"]},
+            }))
+            .is_err(),
+            "per-provider switches are gone"
+        );
     }
 
     #[test]
-    fn codex_uses_the_system_app_server_unless_told_to_start_its_own() -> Result<()> {
-        let saved: Providers = serde_json::from_value(serde_json::json!({
-            "codex":{"enabled":true,"roles":["agent","execution"]},
-            "cursor":{"enabled":true,"roles":["agent"]},
-        }))?;
+    fn codex_execution_requires_an_explicit_socket_or_spawn_mode() -> Result<()> {
+        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":true}))?;
         let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
@@ -385,19 +406,20 @@ mod tests {
             codex_bin: "codex".into(),
             env,
         };
-        assert!(local.codex_target() == CodexTarget::System(None));
+        assert!(local.switches.validate(false).is_err());
+        assert!(local.codex_target(false) == CodexTarget::Off);
         local.switches.codex_app_server = AppServer {
             mode: AppServerMode::Spawn,
             socket: Some("/tmp/kept.sock".into()),
         };
-        let CodexTarget::Spawn(launch) = local.codex_target() else {
+        let CodexTarget::Spawn(launch) = local.codex_target(false) else {
             panic!("spawn mode starts the Node's own App Server");
         };
         assert_eq!(launch.env["CPA_API_KEY"], "fixture-value");
         local.switches.codex_app_server.mode = AppServerMode::System;
-        assert!(local.codex_target() == CodexTarget::System(Some("/tmp/kept.sock".into())));
+        assert!(local.codex_target(false) == CodexTarget::System("/tmp/kept.sock".into()));
         local.switches.codex_app_server.socket = Some("relative.sock".into());
-        assert!(local.switches.validate().is_err());
+        assert!(local.switches.validate(false).is_err());
         Ok(())
     }
 }

@@ -1,0 +1,127 @@
+import { TextClassContext } from '@/components/ui/text';
+import { cn } from '@/lib/utils';
+import { cva, type VariantProps } from 'class-variance-authority';
+import { Platform, Pressable } from 'react-native';
+import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import { withUniwind } from 'uniwind';
+
+const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
+// Critically damped and quick, so the press lands on touch-down and settles without a bounce.
+const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
+// Disabling eases; fills change at once so a theme switch never leaves a stale colour behind.
+const fade = { transitionProperty: 'opacity', transitionDuration: 150 } as const;
+
+const buttonVariants = cva(
+  cn(
+    'group shrink-0 flex-row items-center justify-center gap-2 rounded-md shadow-none',
+    Platform.select({
+      web: "focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive whitespace-nowrap outline-none transition-all focus-visible:ring-[3px] disabled:pointer-events-none [&_svg:not([class*='size-'])]:size-4 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+    })
+  ),
+  {
+    variants: {
+      variant: {
+        default: cn(
+          'bg-primary active:bg-primary/90 shadow-sm shadow-black/5',
+          Platform.select({ web: 'hover:bg-primary/90' })
+        ),
+        destructive: cn(
+          'bg-destructive active:bg-destructive/90 dark:bg-destructive/60 shadow-sm shadow-black/5',
+          Platform.select({
+            web: 'hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40',
+          })
+        ),
+        outline: cn(
+          'border-border bg-background active:bg-accent dark:bg-input/30 dark:border-input dark:active:bg-input/50 border shadow-sm shadow-black/5',
+          Platform.select({
+            web: 'hover:bg-accent dark:hover:bg-input/50',
+          })
+        ),
+        secondary: cn(
+          'bg-secondary active:bg-secondary/80 shadow-sm shadow-black/5',
+          Platform.select({ web: 'hover:bg-secondary/80' })
+        ),
+        ghost: cn(
+          'active:bg-accent dark:active:bg-accent/50',
+          Platform.select({ web: 'hover:bg-accent dark:hover:bg-accent/50' })
+        ),
+        link: '',
+      },
+      size: {
+        default: cn('min-h-10 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
+        sm: cn('min-h-9 gap-1.5 rounded-md px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
+        lg: cn('min-h-11 rounded-md px-6', Platform.select({ web: 'has-[>svg]:px-4' })),
+        // No sm: steps; on iPad widths they would override a caller's size-11.
+        icon: 'min-h-10 w-10',
+      },
+    },
+    defaultVariants: {
+      variant: 'default',
+      size: 'default',
+    },
+  }
+);
+
+const buttonTextVariants = cva(
+  cn(
+    'text-foreground text-body font-sans font-medium',
+    Platform.select({ web: 'pointer-events-none transition-colors' })
+  ),
+  {
+    variants: {
+      variant: {
+        default: 'text-primary-foreground',
+        destructive: 'text-white',
+        outline: cn(
+          'group-active:text-accent-foreground',
+          Platform.select({ web: 'group-hover:text-accent-foreground' })
+        ),
+        secondary: 'text-secondary-foreground',
+        ghost: 'group-active:text-accent-foreground',
+        // Underlined at rest so a link reads apart from body text; Android draws the line in the text colour, so the press dims the text instead.
+        link: cn(
+          'text-primary underline decoration-muted-foreground group-active:text-primary/70',
+          Platform.select({ web: 'underline-offset-4 hover:text-primary/70 group-hover:text-primary/70' })
+        ),
+      },
+      size: {
+        default: '',
+        sm: '',
+        lg: '',
+        icon: '',
+      },
+    },
+    defaultVariants: {
+      variant: 'default',
+      size: 'default',
+    },
+  }
+);
+
+type ButtonProps = React.ComponentProps<typeof Pressable> &
+  React.RefAttributes<typeof Pressable> &
+  VariantProps<typeof buttonVariants> & {
+    /** Change fill on the same frame as the content, for buttons whose icon colour swaps with the fill. */
+    instant?: boolean;
+  };
+
+function Button({ className, variant, size, instant, style, onPressIn, onPressOut, ...props }: ButtonProps) {
+  const scale = useSharedValue(1);
+  const pressed = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+  const muted = props.disabled && (variant ?? 'default') === 'default';
+  return (
+    <TextClassContext.Provider value={cn(buttonTextVariants({ variant, size }), muted && 'text-muted-foreground')}>
+      <AnimatedPressable
+        className={cn(props.disabled && !muted && 'opacity-50', buttonVariants({ variant, size }), muted && 'bg-muted shadow-none', className)}
+        role="button"
+        {...props}
+        style={[typeof style === 'function' ? undefined : style, pressed, !instant && fade]}
+        onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
+        onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
+      />
+    </TextClassContext.Provider>
+  );
+}
+
+export { Button };
+export type { ButtonProps };

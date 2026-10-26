@@ -1,0 +1,39 @@
+{
+  "name": "@vibeface/secure-native",
+  "version": "0.0.0",
+  "private": true,
+  "description": "vibeface-secure for React Native through uniffi",
+  "homepage": "https://github.com/leaperone/vibeface",
+  "license": "UNLICENSED",
+  "author": "LEAPERone",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leaperone/vibeface.git"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "react-native": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "codegenConfig": {
+    "name": "SecureNativeSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.vibeface.securenative"
+    }
+  },
+  "dependencies": {
+    "@ubjs/core": "0.31.0-6",
+    "uniffi-bindgen-react-native": "0.31.0-6"
+  },
+  "peerDependencies": {
+    "react-native": "*"
+  },
+  "devDependencies": {
+    "@vibeface/client": "workspace:*",
+    "react-native": "0.88.0",
+    "typescript": "^6.0.2"
+  }
+}

@@ -136,14 +136,6 @@ table "pending_events" {
     null = false
     type = text
   }
-  column "author" {
-    null = false
-    type = text
-  }
-  column "seq" {
-    null = false
-    type = integer
-  }
   column "envelope" {
     null = false
     type = text
@@ -249,8 +241,16 @@ table "messages" {
     null = true
     type = text
   }
-  column "blobs" {
+  column "attachments" {
     null = false
+    type = text
+  }
+  column "sender" {
+    null = true
+    type = text
+  }
+  column "steered_into" {
+    null = true
     type = text
   }
   primary_key {
@@ -297,11 +297,15 @@ table "bots" {
     null = false
     type = text
   }
+  column "cause" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_profiles" {
+table "bot_profiles" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -327,6 +331,46 @@ table "assistant_profiles" {
     columns = [column.network_id, column.conversation_id, column.field]
   }
 }
+table "bot_models" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "provider" {
+    null = false
+    type = text
+  }
+  column "model" {
+    null = false
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id, column.provider]
+  }
+}
+table "bot_deletions" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.network_id, column.conversation_id]
+  }
+}
 table "skills" {
   schema = schema.main
   column "network_id" {
@@ -349,13 +393,13 @@ table "skills" {
     columns = [column.network_id, column.skill_id]
   }
 }
-table "routines" {
+table "schedules" {
   schema = schema.main
   column "network_id" {
     null = false
     type = text
   }
-  column "routine_id" {
+  column "schedule_id" {
     null = false
     type = text
   }
@@ -363,7 +407,53 @@ table "routines" {
     null = false
     type = text
   }
-  column "routine" {
+  column "schedule" {
+    null = true
+    type = text
+  }
+  column "rank" {
+    null = false
+    type = text
+  }
+  column "changed_at_ms" {
+    null = false
+    type = integer
+  }
+  column "enabled" {
+    null = false
+    type = integer
+  }
+  column "enabled_rank" {
+    null = false
+    type = text
+  }
+  column "enabled_at_ms" {
+    null = false
+    type = integer
+  }
+  column "removed" {
+    null = false
+    type = integer
+  }
+  primary_key {
+    columns = [column.network_id, column.schedule_id]
+  }
+}
+table "memories" {
+  schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
+  column "memory_id" {
+    null = false
+    type = text
+  }
+  column "conversation_id" {
+    null = false
+    type = text
+  }
+  column "text" {
     null = true
     type = text
   }
@@ -376,13 +466,13 @@ table "routines" {
     type = integer
   }
   primary_key {
-    columns = [column.network_id, column.routine_id]
+    columns = [column.network_id, column.memory_id]
   }
-  index "routines_conversation" {
+  index "memories_conversation" {
     columns = [column.network_id, column.conversation_id]
   }
 }
-table "assistant_changes" {
+table "bot_changes" {
   schema = schema.main
   column "network_id" {
     null = false
@@ -405,7 +495,7 @@ table "assistant_changes" {
     type = text
   }
   column "cause" {
-    null = false
+    null = true
     type = text
   }
   column "change" {
@@ -419,7 +509,7 @@ table "assistant_changes" {
   primary_key {
     columns = [column.network_id, column.change_id]
   }
-  index "assistant_changes_order" {
+  index "bot_changes_order" {
     columns = [column.network_id, column.conversation_id, column.rank]
   }
 }
@@ -542,10 +632,6 @@ table "questions" {
     null = false
     type = text
   }
-  column "event_hash" {
-    null = false
-    type = text
-  }
   column "rank" {
     null = false
     type = text
@@ -609,6 +695,11 @@ table "session_owners" {
   column "attribution" {
     null = true
     type = text
+  }
+  column "muted" {
+    null    = false
+    type    = integer
+    default = 0
   }
   column "created_at_ms" {
     null = false
@@ -712,14 +803,6 @@ table "triage_outbox" {
     null = false
     type = integer
   }
-  column "created_ms" {
-    null = false
-    type = integer
-  }
-  column "last_error" {
-    null = true
-    type = text
-  }
   primary_key {
     columns = [column.event_id]
   }
@@ -736,6 +819,16 @@ table "triage_scans" {
   }
   primary_key {
     columns = [column.rollout]
+  }
+}
+table "coordination_threads" {
+  schema = schema.main
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  primary_key {
+    columns = [column.thread_id]
   }
 }
 table "addresses" {
@@ -868,6 +961,10 @@ table "scheduler_sessions" {
     null = true
     type = text
   }
+  column "native_token" {
+    null = true
+    type = text
+  }
   column "covers" {
     null = false
     type = text
@@ -883,6 +980,10 @@ table "scheduler_sessions" {
   column "permission_version" {
     null = false
     type = integer
+  }
+  column "shown" {
+    null = false
+    type = text
   }
   primary_key {
     columns = [column.conversation_id]
@@ -959,13 +1060,17 @@ table "scheduler_outbox" {
     columns = [column.conversation_id, column.trigger]
   }
 }
-table "routine_runs" {
+table "schedule_claims" {
   schema = schema.main
+  column "network_id" {
+    null = false
+    type = text
+  }
   column "conversation_id" {
     null = false
     type = text
   }
-  column "routine_id" {
+  column "schedule_id" {
     null = false
     type = text
   }
@@ -973,8 +1078,16 @@ table "routine_runs" {
     null = false
     type = integer
   }
+  column "owner_epoch" {
+    null = false
+    type = integer
+  }
+  column "author" {
+    null = false
+    type = text
+  }
   primary_key {
-    columns = [column.conversation_id, column.routine_id]
+    columns = [column.network_id, column.conversation_id, column.schedule_id, column.slot_ms]
   }
 }
 table "pending_checks" {
@@ -1015,6 +1128,28 @@ table "manager_processes" {
   }
   primary_key {
     columns = [column.attempt_id, column.process_group]
+  }
+}
+table "manager_turns" {
+  schema = schema.main
+  column "attempt_id" {
+    null = false
+    type = text
+  }
+  column "server" {
+    null = false
+    type = text
+  }
+  column "thread_id" {
+    null = false
+    type = text
+  }
+  column "turn_id" {
+    null = true
+    type = text
+  }
+  primary_key {
+    columns = [column.attempt_id]
   }
 }
 table "work_runs" {
@@ -1082,14 +1217,6 @@ table "work_runs" {
 table "work_dispatches" {
   schema = schema.main
   column "work_id" {
-    null = false
-    type = text
-  }
-  column "conversation_id" {
-    null = false
-    type = text
-  }
-  column "target_node" {
     null = false
     type = text
   }

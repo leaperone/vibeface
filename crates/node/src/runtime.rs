@@ -30,18 +30,18 @@ mod settings;
 mod triage;
 mod work;
 pub use manager_control::ManagerAccess;
-pub(crate) use observation::ObservationGuard;
+pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
 pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
-    for member in bundle
-        .genesis
-        .members()
-        .iter()
-        .chain(bundle.checkpoints.iter().flat_map(|c| &c.members))
-    {
+    for member in bundle.genesis.members().iter().chain(
+        bundle
+            .checkpoints
+            .iter()
+            .flat_map(|c| c.directory.iter().flat_map(|d| &d.members)),
+    ) {
         if member.kind == IdentityKind::Node {
             names.insert(member.device_id.clone(), member.name.clone());
         }
@@ -150,7 +150,7 @@ pub struct Runtime {
     /// Shared by every Cursor turn, so it only proves the bridge called; the agent picks the attempt.
     cursor_callback_token: String,
     /// Cursor agent id → token of the attempt running it.
-    pub(crate) cursor_agents: Mutex<HashMap<String, String>>,
+    pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
     codex_epoch: std::sync::atomic::AtomicU64,
@@ -233,9 +233,13 @@ impl Runtime {
             codex_bin: config.codex_bin.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
+        let codex_agent = config
+            .manager
+            .as_ref()
+            .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk);
+        providers.validate(codex_agent)?;
         let codex = Arc::new(codex_server::CodexServer::open(
-            providers.codex_target(),
-            codex_server::system_candidates(),
+            providers.codex_target(codex_agent),
             &identity,
             dir,
             tx,
@@ -274,7 +278,7 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             cursor: std::sync::OnceLock::new(),
             cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
-            cursor_agents: Mutex::new(HashMap::new()),
+            cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             codex_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -359,14 +363,11 @@ impl Runtime {
     pub async fn membership_state(&self) -> Result<NetworkState> {
         self.store.lock().await.public_state()
     }
-    /// The name this Node had in its network, kept after its removal.
-    pub async fn member_name(&self) -> Option<String> {
-        let device = self.identity.device_id().ok()?;
-        node_display_names(&self.membership_state().await.ok()?).remove(&device)
+    pub async fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
+        self.store.lock().await.recovery_since_ms(recovery_key)
     }
     pub fn info(&self) -> Value {
-        let manager_available = self.assistant().is_some();
-        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"manager_available":manager_available,"public_entry":self.config.public_entry})
+        json!({"device_id":self.identity.device_id().ok(),"version":env!("CARGO_PKG_VERSION"),"public_entry":self.config.public_entry})
     }
     pub async fn start(self: &Arc<Self>) -> Result<()> {
         let events = self
@@ -378,6 +379,7 @@ impl Runtime {
         if self.config.public_entry {
             return self.start_network().await;
         }
+        self.start_recovery_timer();
         if self.align_on_start().await? {
             self.start_writers(events);
         } else {
@@ -397,6 +399,51 @@ impl Runtime {
             });
         }
         self.start_network().await
+    }
+    /// A recovery takes effect with time alone and no new record, so this installs the history
+    /// again whenever another directory is in effect: at start, after each membership change, and
+    /// when a waiting recovery is due. It wakes at least every 15 minutes and checks the wall
+    /// clock again, since a monotonic sleep stops while the computer sleeps.
+    fn start_recovery_timer(self: &Arc<Self>) {
+        let node = Arc::downgrade(self);
+        let mut membership = self.membership.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let Some(runtime) = node.upgrade() else {
+                    return;
+                };
+                let due = runtime.settle_recovery().await.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "installing the directory in effect is pending");
+                    Some(now_ms() as u64 + 60_000)
+                });
+                drop(runtime);
+                let wait = async {
+                    match due {
+                        Some(due) => {
+                            let left = due.saturating_sub(now_ms() as u64).min(15 * 60_000);
+                            tokio::time::sleep(Duration::from_millis(left)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = wait => {}
+                    changed = membership.changed() => if changed.is_err() { return },
+                }
+            }
+        });
+    }
+    /// Returns when the waiting recovery is due.
+    async fn settle_recovery(&self) -> Result<Option<u64>> {
+        if !self.has_membership().await? {
+            return Ok(None);
+        }
+        let state = self.membership_state().await?;
+        let view = state.project()?;
+        if self.recovery_since_ms(&view.recovery_key).await?.is_none() {
+            self.install_membership(state).await?;
+        }
+        Ok(view.pending.map(|pending| pending.effective_at_ms))
     }
     /// Work, scheduling and observation append to the log, so they wait for `writable`.
     /// ponytail: a Node that forks later keeps these running and its appends fail; stop them
@@ -459,7 +506,10 @@ impl Runtime {
         match change {
             Changed::Event(hash) => payload["event_hash"] = json!(hash),
             Changed::Work(work_id) => payload["work_id"] = json!(work_id),
-            Changed::Job(trigger) => payload["trigger"] = json!(trigger),
+            Changed::Job(trigger) => {
+                payload["trigger"] = json!(trigger);
+                self.hint_job_changed(network, scope);
+            }
             Changed::Reload => {}
         }
         let _ = self.events.send(Update {
@@ -490,17 +540,15 @@ impl Runtime {
             hold_ms=held.elapsed().as_millis() as u64, "history store phase finished");
         Ok(())
     }
-    /// What this Node offers its peers right now; a provider that is off is not offered.
+    /// What this Node offers its peers right now; work it does not execute is not offered.
     async fn capabilities(&self) -> Value {
         let settings = self.settings_snapshot();
-        let manager = self.assistant().map(|m| m.provider);
+        let manager = self.manager().map(|m| m.provider);
         let mut codex = self.codex.capability().await;
-        codex["enabled"] = json!(self.providers().serves(
-            crate::providers::Provider::Codex,
-            crate::providers::Role::Execution
-        ));
+        codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
+            "manager_ready":self.manager_ready().await,
             "manager_capabilities":manager.map(|kind|kind.capabilities()),
             "codex":codex})
     }
@@ -632,8 +680,12 @@ impl Runtime {
             "questions" => self.questions(&access).await,
             "answer" => self.answer_question(&access, &input).await,
             "create_bot" => self.create_bot(&access, &input).await,
-            "set_primary_assistant" => self.set_primary_assistant(&access, &input).await,
+            "delete_bot" => self.delete_bot(&access, &input).await,
+            "set_primary_bot" => self.set_primary_bot(&access, &input).await,
+            "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
+            "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
+            "dismiss_unanswered" => self.settle_unanswered(&access, &input, true).await,
             "resolve" => self.resolve_check(&access, &input).await,
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),

@@ -1,9 +1,9 @@
 [workspace]
-members = ["crates/protocol", "crates/bridge", "crates/node", "crates/secure"]
+members = ["crates/protocol", "crates/bridge", "crates/node", "crates/secure", "crates/secure-ffi"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1-nightly.20261022.4"
+version = "0.0.1-nightly.20261026.1"
 edition = "2024"
 rust-version = "1.91"
 

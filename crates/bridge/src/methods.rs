@@ -313,7 +313,7 @@ pub fn fallback(method: &str) -> (Result<Value, Value>, &'static str) {
             "fail",
         ),
         Reply::Refuse => (
-            Err(json!({"code":-32601,"message":"vibeface does not answer this request"})),
+            Err(json!({"code":-32601,"message":"Vibeface does not answer this request"})),
             "refuse",
         ),
     }

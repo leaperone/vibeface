@@ -100,6 +100,15 @@ impl Runtime {
         if receipt.is_some() {
             self.wake_scheduler()?;
         }
+        if !quiet
+            && matches!(record.state, WorkState::Running { .. })
+            && self.waiting_stop(work_id).await?
+        {
+            match Box::pin(self.stop_bound_work(network, work_id)).await {
+                Ok(stopped) => return Ok(stopped),
+                Err(error) => tracing::warn!(%error, work_id, "stop of a just-bound work waits"),
+            }
+        }
         if matches!(record.state, WorkState::Interrupting { .. }) {
             let node = self.clone();
             let (network, work_id) = (network.to_owned(), work_id.to_owned());
@@ -181,18 +190,31 @@ impl Runtime {
                     "the result this work follows has not reached this device"
                 );
             }
-            Some(("routine", _)) => {
+            Some(("schedule", _)) => {
                 ensure!(
                     from_owner,
                     "only the conversation's scheduling device dispatches its work"
                 );
-                let (routine_id, _) = crate::scheduling::parse_routine_trigger(&spec.trigger)
+                let (schedule_id, _) = crate::scheduling::parse_schedule_trigger(&spec.trigger)
                     .context("invalid work trigger")?;
                 ensure!(
-                    store.routine(network, routine_id)?.is_some_and(|entry| {
-                        entry.conversation_id == spec.conversation && entry.routine.enabled
+                    store.schedule(network, schedule_id)?.is_some_and(|entry| {
+                        entry.conversation_id == spec.conversation && entry.schedule.enabled
                     }),
-                    "the routine this work runs for is paused, deleted or has not reached this device"
+                    "the schedule this work runs for is paused, deleted or has not reached this device"
+                );
+            }
+            Some(("bot_message", message_id)) => {
+                ensure!(
+                    from_owner,
+                    "only the conversation's scheduling device dispatches its work"
+                );
+                let message = store
+                    .message(network, &spec.conversation, message_id)?
+                    .context("the bot's message has not reached this device")?;
+                ensure!(
+                    message.role == Role::Bot,
+                    "work must follow a message in this conversation"
                 );
             }
             Some(("task", task)) => {
@@ -222,7 +244,7 @@ impl Runtime {
         }
         ensure!(
             spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
-            "another device takes work only as a task for its assistant"
+            "another device takes work only as a task for its bot"
         );
         if spec.kind == WorkKind::Task {
             ensure!(
@@ -230,15 +252,15 @@ impl Runtime {
                 "an agent task goes to another device"
             );
             ensure!(
-                self.assistant().is_some(),
-                "this device has no assistant to take the task"
+                self.manager().is_some(),
+                "this device has no bot to take the task"
             );
         }
         Ok(())
     }
 
     /// Records the dispatch. A Codex work is then started by the Agent that registered it; an
-    /// agent task is queued for this device's assistant. A retry of the same `work_id` returns the
+    /// agent task is queued for this device's bot. A retry of the same `work_id` returns the
     /// existing record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
@@ -430,7 +452,6 @@ impl Runtime {
         let mut record = record;
         if let Some(thread) = args["thread_id"].as_str() {
             vibeface_protocol::validate_id(thread).map_err(anyhow::Error::msg)?;
-            self.forget_ignored(thread);
             if matches!(record.state, WorkState::Accepted) {
                 ensure!(
                     now_ms() < record.send_by_ms,
@@ -573,6 +594,26 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether the user stopped this device's work before its turn was bound.
+    async fn waiting_stop(&self, work_id: &str) -> Result<bool> {
+        let local = self.identity.device_id()?;
+        Ok(self
+            .store
+            .lock()
+            .await
+            .stop_requests()?
+            .iter()
+            .any(|request| request.work_id == work_id && request.target == local))
+    }
+
+    /// Interrupts the turn a waiting stop was for, then drops the request.
+    async fn stop_bound_work(self: &Arc<Self>, network: &str, work_id: &str) -> Result<WorkRecord> {
+        self.interrupt_work(network, work_id).await?;
+        let mut store = self.store.lock().await;
+        store.forget_stop_request(work_id)?;
+        store.work_record(work_id)?.context("work not found")
+    }
+
     pub(super) async fn interrupt_work(
         self: &Arc<Self>,
         network: &str,
@@ -584,6 +625,7 @@ impl Runtime {
             .await
             .work_record(work_id)?
             .context("work not found")?;
+        let mut waiting_for_start = false;
         match &record.state {
             WorkState::Running { handle } => {
                 self.codex
@@ -593,7 +635,6 @@ impl Runtime {
                 self.signal_work(network, work_id, Signal::InterruptRequested)
                     .await?;
             }
-            // An agent task stops with its coordination turn.
             WorkState::Accepted if record.kind == WorkKind::Task => {
                 let job = self.store.lock().await.request_manager_cancel(
                     &self.identity,
@@ -608,9 +649,21 @@ impl Runtime {
                 }
                 self.publish_changed(network, &record.conversation, Changed::Work(work_id));
             }
+            WorkState::Accepted | WorkState::Starting { .. } if record.kind == WorkKind::Codex => {
+                let at = now_ms();
+                self.store.lock().await.save_stop_request(&StopRequest {
+                    work_id: work_id.into(),
+                    conversation: record.conversation.clone(),
+                    target: self.identity.device_id()?,
+                    requested_at_ms: at,
+                    deadline_ms: at,
+                    timed_out: false,
+                })?;
+                self.publish_changed(network, &record.conversation, Changed::Work(work_id));
+                waiting_for_start = true;
+            }
             _ => {}
         }
-        // Stopping a work stops what it delegated.
         let children = {
             let store = self.store.lock().await;
             let mut children = Vec::new();
@@ -628,7 +681,9 @@ impl Runtime {
         for child in children {
             Box::pin(self.interrupt_work(network, &child)).await?;
         }
-        Ok(json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false}))
+        Ok(
+            json!({"work_id":work_id,"interrupt_requested":true,"confirmed":false,"waiting_for_start":waiting_for_start}),
+        )
     }
 
     /// Stops a work wherever it runs. A target that cannot be reached keeps the request here,
@@ -692,6 +747,7 @@ impl Runtime {
             }
         }
         let requests = self.store.lock().await.stop_requests()?;
+        let local = self.identity.device_id()?;
         for mut request in requests {
             let ended = self
                 .store
@@ -707,10 +763,22 @@ impl Runtime {
                     .forget_stop_request(&request.work_id)?;
                 continue;
             }
+            // A local request waits for its work's turn, however long starting takes.
+            if request.target == local {
+                let bound = self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(&request.work_id)?
+                    .is_some_and(|record| matches!(record.state, WorkState::Running { .. }));
+                if bound && let Err(error) = self.stop_bound_work(network, &request.work_id).await {
+                    tracing::debug!(%error, work_id = request.work_id, "stop of a bound work waits");
+                }
+                continue;
+            }
             if request.timed_out {
                 continue;
             }
-            // Bounded like the first attempt, so an offline device cannot hold up the outbox.
             let attempt =
                 tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request));
             if matches!(attempt.await, Ok(Ok(_))) {

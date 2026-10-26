@@ -1,35 +1,16 @@
 "use client"
 
 import { useState, type ReactNode } from "react"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { InlineError } from "@/components/app/kit"
-import { stateLabel } from "./labels"
-import { useWorkspace } from "./context"
-
-export function StatusBadge({ value, label }: { value?: string; label?: string }) {
-  const text = stateLabel(value, label)
-  return <Badge variant={value === "failed" || value === "rejected" ? "destructive" : "secondary"}>{text}</Badge>
-}
-
-export function DetailList({ pairs }: { pairs: Array<[string, string | undefined]> }) {
-  return (
-    <dl className="grid gap-3">
-      {pairs.map(([key, value]) => (
-        <div key={key}>
-          <dt>{key}</dt>
-          <dd className="whitespace-pre-line">{value ?? "未提供"}</dd>
-        </div>
-      ))}
-    </dl>
-  )
-}
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 
 export function ActionButton({
   children,
   className,
   title,
+  label,
   variant = "secondary",
   disabled,
   action,
@@ -37,6 +18,8 @@ export function ActionButton({
   children: ReactNode
   className?: string
   title?: string
+  /** Makes it an icon button: `children` is the icon, `label` its accessible name and tooltip. */
+  label?: string
   variant?: "default" | "secondary" | "ghost" | "destructive"
   disabled?: boolean
   action: () => Promise<void>
@@ -51,7 +34,9 @@ export function ActionButton({
       type="button"
       variant={variant}
       className={className}
-      title={title}
+      size={label ? "icon" : undefined}
+      title={title ?? label}
+      aria-label={label}
       disabled={disabled || busy}
       aria-busy={busy}
       onClick={() => {
@@ -63,18 +48,9 @@ export function ActionButton({
       }}
     >
       {busy ? <Spinner /> : null}
-      {children}
+      {busy && label ? null : children}
     </Button>
     <InlineError error={failure} />
     </span>
-  )
-}
-
-export function SubmitButton({ children, busy, disabled, variant = "default" }: { children: ReactNode; busy: boolean; disabled?: boolean; variant?: "default" | "secondary" }) {
-  return (
-    <Button type="submit" variant={variant} disabled={disabled || busy} aria-busy={busy}>
-      {busy ? <Spinner /> : null}
-      {children}
-    </Button>
   )
 }

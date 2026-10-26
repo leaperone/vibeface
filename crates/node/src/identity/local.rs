@@ -111,12 +111,13 @@ impl Store {
         capability: &str,
         client: &str,
     ) -> Result<AuthorizationView> {
-        ensure!(
-            state.events.is_empty(),
-            "bootstrap accepts genesis or a checkpoint"
-        );
         let view = state.project()?;
-        view.manager(client)?;
+        // A recovery here waits like any other; its new manager is in the waiting directory.
+        let members = view.pending.as_ref().map_or(&view.members, |p| &p.members);
+        ensure!(
+            members.iter().any(|m| m.device_id == client && m.manage),
+            "management permission required"
+        );
         self.transaction(|tx| {
             verify_bootstrap_in(tx, capability)?;
             save_state(tx, &state)?;
@@ -145,22 +146,20 @@ impl Store {
         Ok(state)
     }
 
+    pub fn recovery_since_ms(&self, recovery_key: &str) -> Result<Option<i64>> {
+        crate::store::recovery_since_ms(&self.connection, recovery_key)
+    }
+
     pub fn has_network(&self) -> Result<bool> {
         has_network_in(&self.connection)
     }
 
-    /// Merges `incoming`; a higher recovery epoch voids every invite and join request. Also
-    /// returns whether the projections were rebuilt.
+    /// Merges `incoming`; also returns whether the projections were rebuilt.
     pub fn install_state(&mut self, incoming: NetworkState) -> Result<(AuthorizationView, bool)> {
         incoming.project()?;
         self.transaction(|tx| {
             let next = if has_network_in(tx)? {
-                let current = load_state(tx)?;
-                let merged = current.merge(&incoming)?;
-                if merged.epoch() > current.epoch() {
-                    tx.execute("DELETE FROM invites", [])?;
-                }
-                merged
+                load_state(tx)?.merge(&incoming)?
             } else {
                 incoming
             };

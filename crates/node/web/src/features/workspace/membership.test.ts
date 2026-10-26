@@ -9,23 +9,24 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 
 const network = 'b'.repeat(64), browser = 'c'.repeat(64), entry = 'a'.repeat(64)
 const conversationId = 'conversation-1'
-const bot = { bot_id: 'bot-1', conversation_id: conversationId, name: '助手一', instructions: '', event_hash: 'h' }
+const bot = { bot_id: 'bot-1', conversation_id: conversationId, name: 'Bot 一', instructions: '', models: {}, skills: null, event_hash: 'h' }
 const question = {
-  question_id: 'q-1', conversation_id: conversationId, assistant: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
+  question_id: 'q-1', conversation_id: conversationId, bot: null, severity: 'attention', text: '继续吗？', choices: [{ label: '继续' }],
   about: { node: entry, agent: 'codex', session_id: 's', cwd: '/p', summary: '' }, author: entry, created_at_ms: 1, answer: null,
 }
 const conversation = {
   conversation: { conversation_id: conversationId, title: '', owner: entry, owner_epoch: 1 }, messages: [], works: [], deliveries: [], scheduler: null,
-  checks: [], local_node: entry, changes: [], assistant: { skills: [], routines: [] }, questions: [question], sessions: [],
+  checks: [], local_node: entry, changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [question], sessions: [],
 }
 const notMember = 'device is not a member of this personal network'
 const settle = () => new Promise(setImmediate)
 const sourceRoot = fileURLToPath(new URL('../../', import.meta.url))
+const clientRoot = fileURLToPath(new URL('../../../../../../packages/client/src/', import.meta.url))
 const nodeRequire = createRequire(import.meta.url)
 
 /** Loads a TypeScript module the way the bundle sees it, with `stubs` for browser-only imports. */
 function loader(globals: Record<string, unknown>, stubs: (specifier: string) => unknown) {
-  const sandbox = createContext({ ...globals, URL, URLSearchParams, TextEncoder, Uint8Array, Error, JSON, Promise, crypto: globalThis.crypto })
+  const sandbox = createContext({ ...globals, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, Error, JSON, Promise, crypto: globalThis.crypto })
   const modules = new Map<string, { exports: Record<string, unknown> }>()
   return function load(filename: string): Record<string, unknown> {
     const cached = modules.get(filename)
@@ -35,6 +36,7 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
     const require = (specifier: string) => {
       const stub = stubs(specifier)
       if (stub) return stub
+      if (specifier.startsWith('@vibeface/client/')) return load(resolve(clientRoot, specifier.slice(17)))
       if (!specifier.startsWith('.') && !specifier.startsWith('@/')) return nodeRequire(specifier)
       const path = specifier.startsWith('@/') ? resolve(sourceRoot, specifier.slice(2)) : resolve(dirname(filename), specifier)
       const file = extname(path) ? path : [`${path}.ts`, `${path}.tsx`].find(candidate => { try { readFileSync(candidate); return true } catch { return false } })!
@@ -93,23 +95,24 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   }
   const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {} }
   const load = loader({
-    window: { ...timers, location: { href: `https://node.example/b/${bot.bot_id}` }, localStorage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) } },
-    document: { hidden: false, addEventListener() {}, removeEventListener() {} },
     location: { pathname: `/b/${bot.bot_id}`, search: '' },
     ...timers,
   }, (specifier) => {
     if (specifier === 'react') return react
     if (specifier === 'react/jsx-runtime') return { jsx: (_type: unknown, props: unknown) => props }
-    if (specifier.endsWith('/transport.js')) return { signClient: async () => 'signature', validTarget: (value: string) => value, validEndpoint: (value: string) => value }
-    if (specifier.endsWith('/vibeface_secure.js')) return { attestationPayload: () => new Uint8Array() }
-    if (specifier === '@/lib/outbox') return { ...load(resolve(sourceRoot, 'lib/outbox.ts')), indexedOutbox: () => outbox }
     return undefined
   })
-  const Provider = load(fileURLToPath(new URL('./context.tsx', import.meta.url))).WorkspaceProvider as (props: Record<string, unknown>) => { value: Record<string, any> }
+  const platform = {
+    secure: { attestationPayload: () => new Uint8Array() }, transport: { signClient: async () => 'signature' },
+    storage: { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => stored.set(key, value) }, outbox, self: '这个浏览器',
+    notifier: { name: '浏览器提醒', permission: async () => 'default', request: async () => 'default', show() {} },
+    onForeground: () => () => {}, foreground: () => true,
+  }
+  const Provider = load(resolve(clientRoot, 'workspace/context.tsx')).WorkspaceProvider as (props: Record<string, unknown>) => { value: Record<string, any> }
   const tabs = { leader: () => true, post() {}, listen: () => () => {} }
   const render = () => {
     cursor = 0
-    const { value } = Provider({ connection, tabs, openConversation() {}, children: null })
+    const { value } = Provider({ platform, connection, tabs, initialBot: bot.bot_id, openConversation() {}, children: null })
     afterRender.splice(0).forEach(run => run())
     return value
   }
@@ -124,21 +127,22 @@ async function open(source: 'membership' | 'local_session', readBefore: string[]
   return app
 }
 
-test('a browser in a local session sees the workspace read-only and is told to join', async () => {
+test('a browser in a local session is shown as 本机管理, sees the workspace read-only and is told to join', async () => {
   const app = await open('local_session')
   try {
     const view = app.render()
     assert.equal(view.bots.length, 1, 'the records still show')
     assert.equal(view.writable, false, 'every write control is off')
     assert.equal(view.joined, false)
-    await assert.rejects(view.answer(question, '继续'), /这个浏览器还没加入/)
+    await assert.rejects(view.answer(question, '继续'), /本机管理不能发送/)
     assert.equal(app.rpcs.includes('answer'), false, 'nothing is sent to be refused')
   } finally { app.close() }
   const load = loader({}, () => undefined)
-  const { NotJoined } = load(fileURLToPath(new URL('./not-joined.tsx', import.meta.url))) as { NotJoined: (props: { onJoin(): void }) => unknown }
+  const { LocalSession } = load(fileURLToPath(new URL('./local-session.tsx', import.meta.url))) as { LocalSession: (props: { onJoin(): void }) => unknown }
   const { createElement } = nodeRequire('react'), { renderToStaticMarkup } = nodeRequire('react-dom/server')
-  const html: string = renderToStaticMarkup(createElement(NotJoined, { onJoin() {} }))
-  assert.match(html, /这个浏览器还没加入/)
+  const html: string = renderToStaticMarkup(createElement(LocalSession, { onJoin() {} }))
+  assert.match(html, /本机管理/)
+  assert.doesNotMatch(html, /还没加入/)
   assert.match(html, /<button[^>]*>.*用加入链接加入<\/button>/)
 })
 

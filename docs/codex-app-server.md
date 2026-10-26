@@ -1,6 +1,6 @@
 # Codex App Server 方法覆盖表
 
-本表由 `crates/bridge/src/methods.rs` 维护。方法名单来自 `crates/bridge/schema/app-server-methods.json`，用 `scripts/codex-schema.py` 从已安装的 Codex 生成（当前 0.163.0）。`methods.rs` 的覆盖测试要求名单里每个方法都出现在方法表和本文件里。协调 Agent 用 `vibeface codex call` 可调用任何方法；网页不调用 App Server 方法；分类决定写方法结果不明时不重发。Codex 升级新增方法时 CI 会失败，直到补上分类。
+本表由 `crates/bridge/src/methods.rs` 维护。方法名单来自 `crates/bridge/schema/app-server-methods.json`，用 `scripts/codex-schema.py` 从已安装的 Codex 生成（当前 0.163.0）。`methods.rs` 的覆盖测试要求名单里每个方法都出现在方法表和本文件里。协调 Agent 用 `vibeface codex call` 可调用除开始、引导、停止回合以外的方法（下表标明拒绝的十个）；网页不调用 App Server 方法；分类决定写方法结果不明时不重发。Codex 升级新增方法时 CI 会失败，直到补上分类。
 
 执行的命令、命令输出、diff 和改动文件列表只进观察状态，送往网页前由 `sanitize` 去掉。服务端请求交给协调 Agent 处理，见下文。
 
@@ -9,9 +9,9 @@
 | 方法 | 分类 | 处理与展示 |
 |---|---|---|
 | `initialize` | 隐藏 | 连接建立时由客户端发送，不对外暴露 |
-| `thread/start` | 写 | `dispatch_work` 先登记再发；协调 Agent 也可用 `vibeface codex call` 自开线程 |
+| `thread/start` | 写 | `dispatch_work` 先登记再发；Bot 线程带 `developerInstructions`（工具说明、目录和固定规则），`thread/resume` 再带同一份，App Server 对已加载的线程忽略它；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/resume` | 写 | Node 订阅观察；`vibeface codex send`（带 `thread` 的工作）先 resume |
-| `thread/fork` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
+| `thread/fork` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/archive` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/delete` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/unsubscribe` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
@@ -26,10 +26,10 @@
 | `thread/attachment/remove` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/section/move` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `thread/unarchive` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `thread/compact/start` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `thread/shellCommand` | 隐藏 | 不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用 |
+| `thread/compact/start` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `thread/shellCommand` | 隐藏 | 不经 Node 暴露给网页；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/approveGuardianDeniedAction` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `thread/revert` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
+| `thread/revert` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `thread/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `threadSection/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `threadSection/create` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
@@ -39,7 +39,7 @@
 | `thread/read` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `thread/turns/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `thread/items/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
-| `thread/inject_items` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
+| `thread/inject_items` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `skills/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `skills/extraRoots/set` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `hooks/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
@@ -71,10 +71,10 @@
 | `skills/config/write` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/install` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
 | `plugin/uninstall` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
-| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id` |
-| `turn/steer` | 写 | `vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id` |
-| `turn/interrupt` | 写 | 停止按钮经 Node 发送；协调 Agent 也可直接调用 |
-| `review/start` | 写 | 协调 Agent 经 `vibeface codex call` 调用；结果不明时对账，不重发 |
+| `turn/start` | 写 | `dispatch_work` 与 `vibeface codex send` 先向 Node 登记工作再发，`clientUserMessageId` 为 `work_id`；Codex Bot 的回合也用它开始，`clientUserMessageId` 为 attempt ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `turn/steer` | 写 | `vibeface codex send` 在回合进行中时发送，同样是登记过的工作，`clientUserMessageId` 为 `work_id`；Bot 回复进行中收到的用户消息先记为 `steering` 再发，`clientUserMessageId` 为消息 ID；`vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
+| `turn/interrupt` | 写 | 停止按钮与 `interrupt_work` 经 Node 发送；工作还在开始阶段时停止请求留在本机，回合绑定后立即发送；`vibeface codex call` 拒绝 |
+| `review/start` | 写 | `vibeface codex call` 拒绝，它会开始、引导或停止 Node 不跟踪的回合 |
 | `model/list` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `account/gatewayOAuth/read` | 只读 | 协调 Agent 经 `vibeface codex call` 调用 |
 | `account/gatewayOAuth/login` | 隐藏 | 不经 Node 暴露给网页；协调 Agent 用 `vibeface codex call` 可调用 |

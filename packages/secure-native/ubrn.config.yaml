@@ -1,0 +1,23 @@
+rust:
+  directory: ../..
+  manifestPath: crates/secure-ffi/Cargo.toml
+bindings:
+  cpp: cpp/generated
+  ts: src/generated
+turboModule:
+  ts: src/generated
+  entrypoint: src/generated/index.ts
+ios:
+  frameworkName: build/VibefaceSecureFramework
+android:
+  targets:
+    - arm64-v8a
+    - x86_64
+  useSharedLibrary: false
+noOverwrite:
+  - android/CMakeLists.txt
+  - android/build.gradle
+  - android/src/main/AndroidManifest.xml
+  - ios/SecureNative.h
+  - ios/SecureNative.mm
+  - SecureNative.podspec

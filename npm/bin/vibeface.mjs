@@ -10,7 +10,7 @@ const targets = {
 };
 const target = targets[`${process.platform}-${process.arch}`];
 if (!target || (process.platform === 'linux' && !process.report.getReport().header.glibcVersionRuntime)) {
-  console.error('vibeface supports macOS Apple Silicon and Linux x64/ARM64 with glibc.');
+  console.error('Vibeface supports macOS Apple Silicon and Linux x64/ARM64 with glibc.');
   process.exit(1);
 }
 const binary = fileURLToPath(new URL(`../vendor/${target}/vibeface`, import.meta.url));

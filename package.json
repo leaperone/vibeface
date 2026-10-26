@@ -1,0 +1,15 @@
+{
+  "name": "vibeface-monorepo",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "devDependencies": {
+    "@e2e-dev/web": "^0.15.3",
+    "@types/node": "^24.19.2",
+    "e2e": "^0.21.3",
+    "typescript": "^6.0.3"
+  },
+  "scripts": {
+    "test:e2e": "e2e run",
+    "test:e2e:check": "tsc --noEmit -p tsconfig.e2e.json && node --check scripts/e2e-node.mjs"
+  }
+}

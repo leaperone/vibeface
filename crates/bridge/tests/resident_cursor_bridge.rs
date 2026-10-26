@@ -1,4 +1,3 @@
-//! The Node keeps one `cursor-sdk-bridge` for every Cursor turn, driven here by a controlled fixture.
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
