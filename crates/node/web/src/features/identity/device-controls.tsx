@@ -59,12 +59,14 @@ export function ConnectionSettings() {
           <Button type="submit" variant="outline" className="w-fit">保存</Button>
         </form>
       </Details>
+      {/* Dropping the address is upkeep, not a way out: 断开这个浏览器 stays the one red row on the page. */}
+      {ready ? removing ? <div className="grid gap-2 border-t pt-3">
+        <p className="text-meta text-foreground">会断开连接并回到登录页</p>
+        <div className="flex justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
+          <Button type="button" variant="destructive" onClick={() => { const entry = ready.entry; device.disconnect(); try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}>断开并移除</Button>
+        </div>
+      </div> : <Button type="button" variant="ghost" className="-ms-3 w-fit text-danger hover:text-danger" onClick={() => setRemoving(true)}><Unplug aria-hidden="true" />移除当前地址</Button> : null}
     </SettingsDisclosure>
-    {ready ? <SettingsRow icon={Unplug} tone="danger" label="移除当前地址" description={removing ? '会断开连接并回到登录页' : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
-      {removing ? <>
-        <Button type="button" variant="ghost" className="min-h-11" onClick={() => setRemoving(false)}>取消</Button>
-        <Button type="button" variant="destructive" className="min-h-11" onClick={() => { const entry = ready.entry; device.disconnect(); try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}>断开并移除</Button>
-      </> : null}
-    </SettingsRow> : null}
   </>
 }

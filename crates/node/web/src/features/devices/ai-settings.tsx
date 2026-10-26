@@ -302,7 +302,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <div className="flex items-center gap-3">
         <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
         <span className="font-medium whitespace-nowrap">{name}</span>
-        <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
+        {item.state === "off" ? null : <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>}
       </div>
       <div className="ms-auto flex shrink-0 gap-2 max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2">
         <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
@@ -456,7 +456,7 @@ function Folders({ roots, display, busy, save }: { roots: string[]; display: Dis
       <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
     <div className="flex min-w-0 gap-2">
-      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="例如 ~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
   </div>
