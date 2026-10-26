@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, Eye, EyeOff, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { AuthPage, Details, EmptyState, InlineError, Panel, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
+import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -318,7 +318,6 @@ type Run = (action: () => Promise<void>) => Promise<void>
 /** Step 2a: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
-  const [show, setShow] = useState(false)
   const [short, setShort] = useState(false)
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
@@ -334,10 +333,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
-          <span className="relative">
-            <Input type={show ? 'text' : 'password'} name="password" className="pe-9 max-md:pe-11" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-            <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={show ? '隐藏密码' : '显示密码'} aria-pressed={show} onClick={() => setShow(!show)}>{show ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
-          </span>
+          <PasswordInput name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
           <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
         </Field>
         <div className="flex justify-between gap-2">

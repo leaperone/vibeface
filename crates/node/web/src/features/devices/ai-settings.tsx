@@ -250,7 +250,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <span className="font-medium whitespace-nowrap">{name}</span>
         <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
       </div>
-      <div className="ms-auto flex shrink-0 gap-2">
+      <div className="ms-auto flex shrink-0 gap-2 max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2">
         <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
         {item.supports.includes("execution") && !onboarding ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}

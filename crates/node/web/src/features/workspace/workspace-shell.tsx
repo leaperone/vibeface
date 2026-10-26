@@ -56,7 +56,10 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
-  const botTitle = chatRoute && workspace.selectedBot
+  const routeBot = /^\/b\/([^/]+)/.exec(pathname)?.[1]
+  // A chat link to a bot this network does not have; the conversation open before must not stand in for it.
+  const missingBot = routeBot !== undefined && workspace.bots.length > 0 && !workspace.bots.some((bot) => bot.bot_id === decodeURIComponent(routeBot))
+  const botTitle = chatRoute && !missingBot && workspace.selectedBot
   const title = chatRoute ? "对话" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
   const navigate = useNavigate()
   const joins = useOpenJoins()
@@ -116,7 +119,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <SidebarGroupContent>
               <SidebarMenu>
                 {workspace.bots.map((bot) => {
-                  const active = chatRoute && bot.bot_id === workspace.selectedBot?.bot_id
+                  const active = chatRoute && !missingBot && bot.bot_id === workspace.selectedBot?.bot_id
                   const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id))
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
@@ -179,7 +182,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
-          <div className="conversation-view"><ConversationScreen /></div>
+          <div className="conversation-view"><ConversationScreen missing={missingBot} /></div>
           {chatRoute ? children : null}
         </div>
         {chatRoute ? null : <div className="workspace-screen">{children}</div>}

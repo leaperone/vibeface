@@ -38,7 +38,8 @@ function NoBot() {
     : <EmptyState icon={Bot} title="还没有 Bot" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 
-export function ConversationScreen() {
+/** `missing`: the route names a bot this network does not have. */
+export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
@@ -212,6 +213,7 @@ export function ConversationScreen() {
   }
   const setText = (value: string) => setDrafts((current) => new Map(current).set(conversationId, value))
 
+  if (missing) return <section className="conversation-screen" aria-label="对话"><Chat key="missing" entries={[]} empty={<NoBot />} /></section>
   if (bot && !data) return <section className="conversation-screen" aria-label="对话"><ChatSkeleton /></section>
 
   return (
