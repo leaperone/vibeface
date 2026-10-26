@@ -106,7 +106,7 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
       {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
       {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     </div>
-    <Details label="路径" open={pathsOpen || undefined}>
+    <Details label="路径" open={pathsOpen || needsPaths || undefined}>
       {server.mode === "system"
         ? <PathField id="codex-socket" label="连接路径" value={server.socket} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
             onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
@@ -139,7 +139,7 @@ function openProvider(provider: ProviderId) {
   if (!card) return
   if (card instanceof HTMLDetailsElement) card.open = true
   card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
-  const target = card.querySelector<HTMLElement>("[data-fix], input")
+  const target = card.querySelector<HTMLElement>("[data-fix]") ?? card.querySelector<HTMLElement>("input")
   for (let fold = target?.closest("details"); fold && fold !== card; fold = fold.parentElement?.closest("details")) fold.open = true
   target?.focus({ preventScroll: true })
 }
