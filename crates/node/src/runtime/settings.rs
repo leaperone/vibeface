@@ -713,7 +713,7 @@ impl Runtime {
     /// this computer; the card is a shared record.
     fn proposal_text(&self, paths: &Paths) -> String {
         let shown = |path: &PathBuf| self.host.display(path);
-        let mut lines = vec!["要把这台设备的 AI 设置改成这样吗？".to_owned()];
+        let mut lines = vec!["要把这台电脑的 AI 设置改成这样吗？".to_owned()];
         if let Some(on) = paths.execution {
             lines.push(
                 if on {
