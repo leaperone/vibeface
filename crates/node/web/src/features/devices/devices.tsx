@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -155,7 +155,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.entry ? <Section title={terms.address.label}>
       <p className="break-all font-mono text-meta">{address}</p>
       {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
-        <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
+        <span className="flex items-center gap-1.5 text-muted-foreground"><Monitor aria-hidden="true" className="size-4 shrink-0" />只能在本机打开</span>
         <a className="hit-area relative font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
       {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
@@ -180,7 +180,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
-      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? "移除后这台设备无法再连接，已有的对话记录会保留" : undefined} onClick={removing ? undefined : () => setRemoving(true)}>
+      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? "移除后它无法再连接，对话记录会保留" : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
           <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast(`已移除「${row.name}」`, { tone: "success" }); void navigate({ to: "/devices" }) })}>

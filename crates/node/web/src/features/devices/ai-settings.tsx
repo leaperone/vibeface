@@ -56,9 +56,12 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
   </span>
 }
 
-/** Where Codex work runs: the App Server already running on this computer, or one the device starts. */
-function AppServerSettings({ server, working, blocked, busy, pick, save, test }: {
-  server: AppServer; working: boolean; blocked: boolean; busy: string; pick: boolean
+/**
+ * Where Codex work runs: the App Server already running on this computer, or one the device starts.
+ * `compact`: setup only asks for the socket; how it connects and testing it stay on the device page.
+ */
+function AppServerSettings({ server, working, blocked, busy, pick, compact = false, save, test }: {
+  server: AppServer; working: boolean; blocked: boolean; busy: string; pick: boolean; compact?: boolean
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
   const [socket, setSocket] = useState(server.socket ?? "")
@@ -71,6 +74,13 @@ function AppServerSettings({ server, working, blocked, busy, pick, save, test }:
   const inUse = shown.state === "connected" || shown.state === "handshake_failed" ? [shown.socket] : shown.state === "not_found" ? shown.candidates : []
   const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
+  const dirty = socket.trim() !== (server.socket ?? "")
+  const socketForm = <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
+    <Input aria-label="指定连接路径" className={cn("min-w-0 font-mono", compact && "placeholder:font-sans")} placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working}
+      data-fix={pick ? "" : undefined} onChange={(event) => setSocket(event.target.value)} />
+    {compact || dirty ? <Button type="submit" variant="outline" disabled={working || !dirty}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
+  </form>
+  if (compact) return socketForm
 
   return <div className="grid gap-2">
     <p className="text-meta font-medium text-muted-foreground">连接方式</p>
@@ -84,11 +94,7 @@ function AppServerSettings({ server, working, blocked, busy, pick, save, test }:
     {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     {server.mode === "system" || pick ? <Details label="手动指定" open={pick || undefined}>
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
-      <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
-        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working}
-          data-fix={pick ? "" : undefined} onChange={(event) => setSocket(event.target.value)} />
-        {socket.trim() !== (server.socket ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
-      </form>
+      {socketForm}
     </Details> : null}
   </div>
 }
@@ -220,7 +226,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const refused = /explicit App Server socket/i.test(rawError(error))
   const choosing = refused || (noSocket && asked !== null)
   const turnOn = (role: "bot" | "execution") => noSocket ? setAsked(role) : void change(role, role === "bot" ? { bot: true } : { execution: true })
-  const serverSettings = server ? <AppServerSettings server={server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} pick={pick > 0} save={change} test={test} /> : null
+  const serverSettings = server ? <AppServerSettings server={server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} pick={pick > 0} compact={onboarding} save={change} test={test} /> : null
   const homeSet = item.env.some((row) => row.name === "CODEX_HOME" && row.set)
   const homePath = home?.trim() ?? ""
   const homeValid = /^(\/|[A-Za-z]:[\\/])/.test(homePath)
@@ -244,7 +250,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <span className="font-medium whitespace-nowrap">{name}</span>
         <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
       </div>
-      <div className="ms-auto flex shrink-0 gap-2">
+      <div className="ms-auto flex shrink-0 gap-2 max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2">
         <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
         {item.supports.includes("execution") && !onboarding ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
@@ -261,7 +267,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       {home !== null ? <form className="grid basis-full gap-1" onSubmit={(event) => { event.preventDefault(); if (homeValid) void startOwn(homePath) }}>
         <label htmlFor={`${item.provider}-home`} className="font-medium text-muted-foreground">Codex 目录</label>
         <div className="flex min-w-0 gap-2">
-          <Input id={`${item.provider}-home`} autoFocus className="min-w-0 font-mono" placeholder="/Users/你的用户名/.codex" spellCheck={false} maxLength={4096}
+          <Input id={`${item.provider}-home`} autoFocus className="min-w-0 font-mono placeholder:font-sans" placeholder="例如 /Users/你的用户名/.codex" spellCheck={false} maxLength={4096}
             value={home} disabled={working} aria-invalid={homePath !== "" && !homeValid ? true : undefined} onChange={(event) => setHome(event.target.value)} />
           <Button type="submit" variant="outline" disabled={working || !homeValid}><BusyIcon busy={working} icon={Check} />确认</Button>
         </div>

@@ -8,6 +8,9 @@ const codes: Record<string, string> = {
 }
 
 const malformed = /invalid|is required|must be|missing/i
+export const spentInviteText = '这条加入链接已用过或已过期。请在已有设备上点“添加设备”重新生成。'
+/** A join link the Node will not take again: already answered, or past its time, in the Node's words or ours. */
+export const spentInvite = new RegExp(`ticket has already been used|ticket is unknown or already expired|ticket has expired|^${spentInviteText}$`, 'i')
 const patterns: [RegExp, string][] = [
   [/artifact is not UTF-8 text/i, '这个文件不是文字，下载后再打开。'],
   [/log has forked/i, '这台设备的数据被复制过，已暂停发送。去待处理看看。'],
@@ -77,11 +80,13 @@ const patterns: [RegExp, string][] = [
   [/webhook must use HTTPS/i, 'Webhook 地址要以 https 开头。'],
   [/nothing to change|is unchanged/i, '内容没有变化。'],
   [/project root|execution path|workspace must be|workspace does not exist|manager workspace/i, '文件夹不存在，或不是这台设备上的绝对路径。'],
+  [/No such file or directory|ENOENT|command not found|Missing script|cannot find (the )?(file|path|module)/i, '找不到需要的文件、脚本或命令。确认它在这台设备上，再让 Bot 试。'],
+  [/permission denied|EACCES|operation not permitted/i, '这台设备上没有权限读写需要的文件。'],
   [/coordination Agent|manager provider|manager program/i, '这台设备上的 Bot 还没配置好。'],
   [/only the user|requires the user|agents cannot|Agent tokens/i, '只有你自己能做这个操作，Bot 不能代办。'],
   [/management client|management permission|management control/i, '只有管理设备能做这个操作。'],
   [/local browser (session|cookie|access)|local (cookie|token) missing|session cookie|local session identity/i, '本机会话已失效。请在这台电脑上重新打开。'],
-  [/ticket has already been used|ticket is unknown or already expired|ticket has expired/i, '这条加入链接已用过或已过期。请在已有设备上点“添加设备”重新生成。'],
+  [spentInvite, spentInviteText],
   [/invite link|ticket/i, '加入链接无效或不完整。请重新复制。'],
   [/already belongs to a personal network|already initialized/i, '这台设备已经加入了一组设备。'],
   [/revoked/i, '这台设备已被移除。'],
@@ -100,10 +105,16 @@ export function humanError(raw: string, code?: unknown, action = '这次操作')
   return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? `${action}没有成功，请再试一次。`
 }
 
-/** A task's own failure: its agent's words are not a page request, so advice to refresh the page would mislead. */
+/**
+ * A task's own failure: its agent's words are not a page request, so advice to refresh the page would mislead.
+ * Unknown text keeps its first line under the message, since trying again may not help and the cause is the clue.
+ */
 export function taskError(raw: string): string {
   if (chinese.test(raw)) return raw
-  return patterns.find(([pattern]) => pattern !== malformed && pattern.test(raw))?.[1] ?? '这个任务没有成功，请再试一次。'
+  const known = patterns.find(([pattern]) => pattern !== malformed && pattern.test(raw))?.[1]
+  if (known) return known
+  const line = raw.trim().split('\n')[0].trim()
+  return line ? `这个任务没有成功。\n${line.length > 80 ? `${line.slice(0, 80)}…` : line}` : '这个任务没有成功。'
 }
 
 /** The untranslated text, for 详细信息; empty when the shown message already is the original. */

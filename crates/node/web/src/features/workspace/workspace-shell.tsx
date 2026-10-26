@@ -56,7 +56,11 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
-  const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
+  const routeBot = /^\/b\/([^/]+)/.exec(pathname)?.[1]
+  // A chat link to a bot this network does not have; the conversation open before must not stand in for it.
+  const missingBot = routeBot !== undefined && workspace.bots.length > 0 && !workspace.bots.some((bot) => bot.bot_id === decodeURIComponent(routeBot))
+  const botTitle = chatRoute && !missingBot && workspace.selectedBot
+  const title = chatRoute ? "对话" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
@@ -115,7 +119,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <SidebarGroupContent>
               <SidebarMenu>
                 {workspace.bots.map((bot) => {
-                  const active = chatRoute && bot.bot_id === workspace.selectedBot?.bot_id
+                  const active = chatRoute && !missingBot && bot.bot_id === workspace.selectedBot?.bot_id
                   const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id))
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
@@ -153,7 +157,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
-              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", chatRoute ? "flex" : "truncate")} title={chatRoute ? undefined : title}>{chatRoute ? <BotPanelButton /> : title}</h1>
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
@@ -178,7 +182,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
-          <div className="conversation-view"><ConversationScreen /></div>
+          <div className="conversation-view"><ConversationScreen missing={missingBot} /></div>
           {chatRoute ? children : null}
         </div>
         {chatRoute ? null : <div className="workspace-screen">{children}</div>}
