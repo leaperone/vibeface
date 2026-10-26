@@ -275,7 +275,6 @@ export function DetailRow({ label, value, mono = false }: { label: string; value
   return <div className="grid gap-0.5"><span>{label}</span>{typeof value === "string" && /^[0-9a-f]{20,}$/.test(value) ? <LongId value={value} /> : <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>}</div>
 }
 
-/** File input with a Chinese button; the native control's label follows the browser language. */
 /** A password field with an eye button that shows what was typed. */
 export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeof Input>, "type">) {
   const [shown, setShown] = useState(false)
@@ -285,6 +284,7 @@ export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeo
   </span>
 }
 
+/** File input with a Chinese button; the native control's label follows the browser language. */
 export function FilePicker({ name, accept, required, disabled, label = "选择文件", onFile }: { name?: string; accept?: string; required?: boolean; disabled?: boolean; label?: string; onFile?(file: File): void }) {
   const [chosen, setChosen] = useState("")
   return <span className="flex min-w-0 items-center gap-3">
