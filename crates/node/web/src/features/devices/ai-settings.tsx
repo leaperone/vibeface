@@ -5,6 +5,7 @@ import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast,
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
 import { rawError } from "@vibeface/client/lib/errors.ts"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
@@ -118,6 +119,7 @@ type Failure = { at: ProviderId | "roots" | null; cause: unknown }
  */
 export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean; onBot?(on: boolean): void }) {
   const { ready } = useDevice()
+  const workspace = useWorkspace()
   const [response, setResponse] = useState<NodeSettingsResponse | null>(null)
   const [busy, setBusy] = useState("")
   const [error, setError] = useState<Failure | null>(null)
@@ -164,6 +166,9 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
+  // Nothing pushes a device's bot readiness; the device list, the inbox and onboarding read it from `nodes`, so read them again when it moves.
+  const botState = response?.providers.find((item) => item.roles.includes("agent"))?.state
+  useEffect(() => { if (botState && workspace.isCurrent()) void workspace.refresh().catch(() => {}) }, [botState])
   useEffect(() => {
     if (!starting) return
     const timer = setTimeout(() => void load(), 2000)
