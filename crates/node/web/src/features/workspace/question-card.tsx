@@ -34,7 +34,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const standing = answer ?? question.answer?.text
   const settled = settledAnswer(standing, workspace.answered[id])
   // The first line asks; lines after it list what the answer applies to.
-  const [ask, ...lines] = question.text.split("\n")
+  const [ask = question.text, ...lines] = question.text.split(/\r?\n/).filter((line) => line.trim())
   if (settled) return <p ref={answering.current ? claimFocus : undefined} tabIndex={-1} role={standing === undefined || settled.elsewhere ? "status" : undefined} className="-mx-2 outline-none flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 text-meta text-muted-foreground">
     {settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}
     <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">

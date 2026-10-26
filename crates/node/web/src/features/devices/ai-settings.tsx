@@ -67,7 +67,7 @@ function PathField({ id, label, value, placeholder, working, busy, onSave }: {
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); if (dirty) void onSave(draft.trim()) }}>
     <label htmlFor={id} className="text-meta font-medium text-muted-foreground">{label}</label>
     <div className="flex min-w-0 gap-2">
-      <Input id={id} className="min-w-0 font-mono placeholder:font-sans" placeholder={placeholder} spellCheck={false} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
+      <Input id={id} className="min-w-0 font-mono text-foreground placeholder:font-sans" placeholder={placeholder} spellCheck={false} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
       {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
     </div>
   </form>
@@ -88,7 +88,10 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
   const link = server.link
   const shown = tested ?? link
   const setMode = (mode: AppServerMode) => void save("app_server", { app_server: { mode, socket: server.socket } })
-  const pathsOpen = blocked || (server.mode === "system" ? !server.socket : !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
+  // Opens by itself when a path needs attention and stays open after it is fixed, so a saved field does not fold away under the cursor.
+  const needsPaths = blocked || (server.mode === "system" ? !server.socket : !home) || ["not_found", "handshake_failed", "launch_failed"].includes(link.state)
+  const [pathsOpen, setPathsOpen] = useState(needsPaths)
+  useEffect(() => { if (needsPaths) setPathsOpen(true) }, [needsPaths])
   const runTest = async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }
 
   return <div className="grid gap-3">
@@ -136,7 +139,9 @@ function openProvider(provider: ProviderId) {
   if (!card) return
   if (card instanceof HTMLDetailsElement) card.open = true
   card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
-  card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
+  const target = card.querySelector<HTMLElement>("[data-fix], input")
+  for (let fold = target?.closest("details"); fold && fold !== card; fold = fold.parentElement?.closest("details")) fold.open = true
+  target?.focus({ preventScroll: true })
 }
 
 type Change = { provider: ProviderId; bot?: boolean; execution?: boolean; bin?: string; env?: Record<string, string | null>; app_server?: { mode: AppServerMode; socket: string | null } }
@@ -259,7 +264,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const binForm = item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
       <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
       <div className="flex min-w-0 gap-2">
-        <Input id={`${item.provider}-bin`} className="min-w-0 font-mono" placeholder="codex" value={bin} disabled={working}
+        <Input id={`${item.provider}-bin`} className="min-w-0 font-mono text-foreground" placeholder="codex" value={bin} disabled={working}
           data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
         {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
