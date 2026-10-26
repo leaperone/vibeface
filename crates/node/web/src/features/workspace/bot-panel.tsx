@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, CirclePause, Cpu, Inbox, Laptop, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Inbox, Laptop, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BotAvatar, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
@@ -19,7 +19,7 @@ import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
 const GAP_MS = 4000
 
-/** Header button for the chat route; opens a view of the bot where schedules can be paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
+/** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where schedules can be paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
@@ -58,9 +58,11 @@ export function BotPanelButton() {
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   return <>
-    <Button type="button" variant="ghost" size="icon" className="-ms-1 shrink-0 rounded-lg hover:bg-transparent hover:brightness-95 dark:hover:brightness-110" aria-label="Bot 信息" title="Bot 信息" disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
+    <button type="button" className="-ms-1.5 flex min-h-11 min-w-0 items-center gap-2 rounded-lg ps-1 pe-1.5 outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 enabled:hover:bg-muted enabled:active:bg-muted md:min-h-10 dark:enabled:hover:bg-muted/50" aria-haspopup="dialog" title={bot.name} disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
       <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} />
-    </Button>
+      <span className="min-w-0 truncate">{bot.name}</span>
+      <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+    </button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
       <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md">
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">

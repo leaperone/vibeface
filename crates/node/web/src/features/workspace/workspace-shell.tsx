@@ -152,8 +152,8 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           </div>
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
-              {chatRoute ? <BotPanelButton /> : null}
-              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className="min-w-0 truncate text-heading font-semibold outline-none" title={title}>{title}</h1>
+              {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", chatRoute ? "flex" : "truncate")} title={chatRoute ? undefined : title}>{chatRoute ? <BotPanelButton /> : title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
