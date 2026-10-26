@@ -665,6 +665,26 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
+    async fn proof_request_closes_stdin_before_waiting_for_output() {
+        let mut command = tokio::process::Command::new("/usr/bin/python3");
+        command
+            .args(["-c", "import sys; data=sys.stdin.buffer.read(); assert data == b'x' * 131072; sys.stdout.buffer.write(b'complete')"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let output = bounded_run(
+            command,
+            &vec![b'x'; 131_072],
+            8,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, b"complete");
+    }
+    #[tokio::test]
     async fn excessive_output_fails_without_waiting_for_more() {
         let mut command = tokio::process::Command::new("/bin/sh");
         command
