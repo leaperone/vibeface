@@ -17,10 +17,11 @@ test('creates a network and a persistent Bot without a model', async ({ app, scr
   await expect(screen.getByRole('heading', '让这台电脑运行 Bot')).toBeVisible();
   await screen.getByRole('button', '稍后设置').click();
   await screen.getByLabel('名称', { exact: true }).fill('E2E Bot');
-  await screen.getByRole('button', '开始对话').click();
+  await screen.getByRole('button', '完成').click();
   await expect(browser).toHaveURL(/\/b\/[^/?#]+$/);
   const bot = screen.getByRole('region', '对话').getByRole('heading', 'E2E Bot');
   await expect(bot).toBeVisible();
+  await expect(screen.getByText('Bot 还不能回复')).toBeVisible();
   await browser.reload();
   await expect(bot).toBeVisible();
   await app.screenshot('onboarding-complete');

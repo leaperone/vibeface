@@ -1,6 +1,6 @@
 import {
   Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
-  Laptop, Link, ListChecks, Lock, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
+  Laptop, Link, ListChecks, Lock, MessageSquareShare, Monitor, MonitorSmartphone, QrCode, RefreshCw, Server, Settings, ShieldCheck,
   Smartphone, Sparkles, ArchiveRestore,
 } from "lucide-react"
 
@@ -28,6 +28,7 @@ export const terms = {
   approval: { label: "需要你同意", icon: Hand },
   confirm: { label: "待确认", icon: CircleQuestionMark },
   inbox: { label: "待处理", icon: Inbox },
+  externalChat: { label: "外部聊天", icon: MessageSquareShare },
   folders: { label: "可用文件夹", icon: FolderOpen },
   readOnly: { label: "只读", icon: Lock },
   paused: { label: "已暂停", icon: CirclePause },

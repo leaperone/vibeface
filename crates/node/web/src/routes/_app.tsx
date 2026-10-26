@@ -1,4 +1,4 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { Navigate, Outlet, createFileRoute, useNavigate, useRouterState } from '@tanstack/react-router'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -16,6 +16,8 @@ function AppLayout() {
   const { ready, phase, entries, initialInvitation, tabs, joining, link, disconnect, retryNow } = useDevice()
   const navigate = useNavigate()
   const onboarding = useOnboarding()
+  // Onboarding ends on a pressed button that leaves with it; the workspace that follows takes the focus on its title.
+  const [onboarded] = useState(onboarding !== null)
   // The page that asked, not the connect page this layout is already leaving for.
   const here = useRouterState({ select: (state) => (state.resolvedLocation ?? state.location).href })
   const home = useRouterState({ select: (state) => state.location.pathname === '/' })
@@ -26,6 +28,6 @@ function AppLayout() {
   if (!ready) return <ShellSkeleton home={home} />
   const key = `${ready.principal.network_id}:${ready.principal.device_id}`
   return <WorkspaceProvider key={key} platform={webPlatform} connection={ready} tabs={tabs} initialBot={routeBot && decodeURIComponent(routeBot)} openConversation={(id) => { void navigate({ to: '/', search: { conversation: id } }) }}>
-    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell><Outlet /></WorkspaceShell>}
+    {onboarding ? <Suspense fallback={<ShellSkeleton />}><Onboarding /></Suspense> : <WorkspaceShell landing={onboarded}><Outlet /></WorkspaceShell>}
   </WorkspaceProvider>
 }

@@ -44,10 +44,13 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
     return () => clearTimeout(timer)
   }, [copied])
   // A join request is the next thing to act on, so it takes the only solid button.
-  const requests = useOpenJoins().length > 0
-  // A link is single-use: once a device has answered it, it is spent.
+  const joins = useOpenJoins()
+  const requests = joins.length > 0
+  // A link is single-use: once a device has answered it, it is spent. Requests already open when it was made are not that answer.
   const [used, setUsed] = useState(false)
-  useEffect(() => { if (requests && result) setUsed(true) }, [requests, result])
+  const earlier = useRef<Set<string>>(new Set())
+  const answered = result !== null && joins.some((request) => !earlier.current.has(request.join_id))
+  useEffect(() => { if (answered) setUsed(true) }, [answered])
   useEffect(() => { setResult(null); setError(""); setStatus(""); setAdded(null) }, [ready])
   // While a link is out, look for the new device's request more often than the shell does.
   useEffect(() => {
@@ -66,7 +69,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
     catch (cause) { if (connection?.isCurrent()) setError(messageOf(cause)) }
     finally { if (pending.current === generation) pending.current = null; setBusyGeneration((owner) => owner === generation ? null : owner) }
   }
-  const generate = () => { setResult(null); setUsed(false); setAdded(null); void run(async () => {
+  const generate = () => { earlier.current = new Set(joins.map((request) => request.join_id)); setResult(null); setUsed(false); setAdded(null); void run(async () => {
     const connection = ready
     const invitation = await device.createInvitation()
     if (connection?.isCurrent()) setResult(share(invitation))
@@ -89,7 +92,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       {/* A waiting request leads the sheet; its first control is 设为管理员, which should not take focus on its own. */}
       <SheetContent ref={sheet} className="!w-full overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
-        <SheetHeader className="pr-14"><SheetTitle>添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
+        <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
           <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
