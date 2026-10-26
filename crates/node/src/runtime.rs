@@ -217,9 +217,11 @@ impl Runtime {
             crate::config::DATA_EPOCH
         );
         let config = Config::load(dir)?;
-        let entry_token = (config.public_entry || config.network.entry.is_some())
-            .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
-            .transpose()?;
+        let entry_token = ((config.public_entry
+            && config.network.relay_mode == crate::net::RelayServiceMode::Forward)
+            || config.network.entry.is_some())
+        .then(|| crate::net::read_token_file(&dir.join(crate::net::ENTRY_TOKEN_FILE)))
+        .transpose()?;
         let process_lock = Arc::new(config::lock_data_dir(dir)?);
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;

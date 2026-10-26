@@ -39,6 +39,7 @@ pub struct Config {
     /// Loopback-only local session listener; fixed so its origin and browser storage persist.
     pub local_listen: SocketAddr,
     pub public_url: String,
+    pub web_enabled: bool,
     pub allowed_origins: Vec<String>,
     pub allow_insecure_lan: bool,
     pub local_auto_access: bool,
@@ -71,6 +72,7 @@ impl Config {
             listen,
             local_listen: DEFAULT_LOCAL_LISTEN,
             public_url: format!("http://{listen}"),
+            web_enabled: true,
             allowed_origins: vec![],
             allow_insecure_lan,
             local_auto_access: true,
@@ -145,6 +147,11 @@ impl Config {
                 "project root must be an existing absolute directory"
             );
         }
+        ensure!(
+            self.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly
+                || self.public_entry,
+            "discovery-only runs as a public entry outside personal networks"
+        );
         if self.public_entry {
             ensure!(
                 self.network.relay_listen.is_some()

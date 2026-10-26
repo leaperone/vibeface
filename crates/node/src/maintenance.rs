@@ -164,6 +164,7 @@ impl Drop for MaintenanceGuard {
 pub struct Health {
     pub device_id: String,
     pub version: String,
+    pub web_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_state: Option<crate::store::WriteState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -173,6 +174,7 @@ pub struct Health {
 #[serde(deny_unknown_fields)]
 pub struct PeerHealth {
     pub device_id: String,
+    pub path: Option<crate::net::PathKind>,
     pub name: String,
     /// `None` until the first sync attempt with this peer finishes.
     pub reachable: Option<bool>,
@@ -377,6 +379,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
     let health = Health {
         device_id: runtime.identity.device_id()?,
         version: env!("CARGO_PKG_VERSION").into(),
+        web_enabled: runtime.config.web_enabled,
         write_state: (!runtime.config.public_entry).then(|| *runtime.write_state.borrow()),
         peers: runtime.peer_health().await,
     };
@@ -452,7 +455,7 @@ mod tests {
 
     #[test]
     fn device_id_health_uses_only_the_current_field() -> Result<()> {
-        let wire = r#"{"device_id":"device","version":"version"}"#;
+        let wire = r#"{"device_id":"device","version":"version","web_enabled":true}"#;
         let health: Health = serde_json::from_str(wire)?;
         assert_eq!(health.device_id, "device");
         assert_eq!(serde_json::to_string(&health)?, wire);

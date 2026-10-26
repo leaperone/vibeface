@@ -126,15 +126,22 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         site.secure || node.config.listen.ip().is_loopback() || node.config.allow_insecure_lan,
         "non-loopback HTTP requires allow_insecure_lan; use HTTPS for public access"
     );
-    let listener = TcpListener::bind(node.config.listen).await?;
+    let listener = if node.config.web_enabled {
+        Some(TcpListener::bind(node.config.listen).await?)
+    } else {
+        None
+    };
     if node.config.public_entry {
-        return axum::serve(
-            listener,
-            browser_router(node.clone(), sites, false)
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .map_err(Into::into);
+        return match listener {
+            Some(listener) => axum::serve(
+                listener,
+                browser_router(node.clone(), sites, false)
+                    .into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .map_err(Into::into),
+            None => std::future::pending().await,
+        };
     }
     let local_listen = node.config.local_listen;
     let local_listener = TcpListener::bind(local_listen).await.with_context(|| {
@@ -144,8 +151,10 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
         )
     })?;
     let local_url = format!("http://{local_listen}");
-    node.local_access
-        .publish_listener(local_url.clone(), node.identity.device_id()?)?;
+    if node.config.web_enabled {
+        node.local_access
+            .publish_listener(local_url.clone(), node.identity.device_id()?)?;
+    }
     let local = browser_router(node.clone(), vec![Site::parse(&local_url)?], true);
     // Codex threads keep the tool URL they were created with, so the port is reused across
     // starts when free; a new port means new threads.
@@ -169,12 +178,17 @@ pub async fn serve(node: Arc<Runtime>) -> Result<()> {
     node.tools_ready(tool_url)?;
     tokio::try_join!(
         async {
-            axum::serve(
-                listener,
-                browser_router(node.clone(), sites, false)
-                    .into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
+            match listener {
+                Some(listener) => {
+                    axum::serve(
+                        listener,
+                        browser_router(node.clone(), sites, false)
+                            .into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .await
+                }
+                None => std::future::pending().await,
+            }
         },
         async {
             axum::serve(
@@ -225,21 +239,30 @@ fn router_with_sites(node: Arc<Runtime>, sites: Vec<Site>) -> Router {
 
 fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     let app = App::new(node, sites);
-    let mut routes = Router::new()
-        .route("/generated/vibeface_secure.js", get(crypto_javascript))
-        .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
-        .route("/api/info", get(info))
-        .route("/api/local/setup", post(local_setup))
-        .route("/api/client", get(client_gateway))
-        .route("/api/decision", post(decision))
-        .fallback(frontend);
+    let mut routes = Router::new();
+    if app.node.config.web_enabled {
+        routes = routes
+            .route("/generated/vibeface_secure.js", get(crypto_javascript))
+            .route("/generated/vibeface_secure_bg.wasm", get(crypto_wasm))
+            .route("/api/info", get(info))
+            .fallback(frontend);
+        if app.node.config.network.relay_mode != crate::net::RelayServiceMode::DiscoveryOnly {
+            routes = routes
+                .route("/api/local/setup", post(local_setup))
+                .route("/api/client", get(client_gateway))
+                .route("/api/decision", post(decision));
+        }
+        if local {
+            routes = routes
+                .route("/api/local/info", get(local_info))
+                .route("/api/local/launch", post(local_launch))
+                .route("/api/local/exchange", post(local_exchange))
+                .route("/api/local/ws", get(local_websocket));
+        }
+    }
     if local {
         routes = routes
-            .route("/api/local/info", get(local_info))
-            .route("/api/local/launch", post(local_launch))
-            .route("/api/local/exchange", post(local_exchange))
-            .route("/api/local/ws", get(local_websocket))
-            .route("/api/hooks", post(hooks))
+            .route(HOOKS, post(hooks))
             .route(TRIAGE, post(triage))
             .route(LOG, post(log));
     }
@@ -1080,98 +1103,121 @@ mod tests {
     #[tokio::test]
     async fn hook_routes_take_only_local_processes_on_the_local_listener() -> Result<()> {
         use crate::config::{self, Config};
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.artifacts")
-            .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
-        config::private_dir(&dir)?;
-        Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
-        config::private_write(
-            &dir.join("data-epoch.json"),
-            &crate::config::data_epoch_marker(),
-        )?;
-        config::private_write(
-            &dir.join("identity.json"),
-            &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
-        )?;
-        let node = Arc::new(Runtime::open(&dir).await?);
-        let mut origins = vec![];
-        let mut servers = vec![];
-        for local in [true, false] {
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let origin = format!("http://{}", listener.local_addr()?);
-            let app = browser_router(node.clone(), vec![Site::parse(&origin)?], local);
-            origins.push(origin);
-            servers.push(tokio::spawn(async move {
-                axum::serve(
-                    listener,
-                    app.into_make_service_with_connect_info::<SocketAddr>(),
-                )
-                .await
-                .unwrap();
-            }));
-        }
-        let client = reqwest::Client::builder().no_proxy().build()?;
-        let result = async {
-            for path in ["/api/hooks", "/api/triage", LOG] {
-                let url = format!("{}{path}", origins[0]);
-                let event = json!({"session_id":"s","turn_id":"t","action":"events"});
-                let status = |request: reqwest::RequestBuilder| async {
-                    Ok::<_, anyhow::Error>(request.send().await?.status())
-                };
-                let body = match path {
-                    "/api/hooks" => json!({"session_id":"s","turn_id":"t"}),
-                    LOG => json!({"source":"node","records":[]}),
-                    _ => event,
-                };
-                assert_eq!(
-                    status(client.post(&url).json(&body)).await?,
-                    StatusCode::BAD_REQUEST
-                );
-                assert_eq!(
-                    status(
-                        client
-                            .post(&url)
-                            .header(header::ORIGIN, &origins[0])
-                            .json(&body)
+        for web_enabled in [true, false] {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.artifacts")
+                .join(format!("hook-boundary-{}", uuid::Uuid::new_v4()));
+            config::private_dir(&dir)?;
+            Config::local("127.0.0.1:0".parse()?, vec![], false).save(&dir)?;
+            config::private_write(
+                &dir.join("data-epoch.json"),
+                &crate::config::data_epoch_marker(),
+            )?;
+            config::private_write(
+                &dir.join("identity.json"),
+                &serde_json::to_vec(&crate::crypto::LocalIdentity::generate())?,
+            )?;
+            let mut runtime = Runtime::open(&dir).await?;
+            runtime.config.web_enabled = web_enabled;
+            let node = Arc::new(runtime);
+            assert_eq!(node.gateway_url().is_some(), web_enabled);
+            let mut origins = vec![];
+            let mut servers = vec![];
+            for local in [true, false] {
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let origin = format!("http://{}", listener.local_addr()?);
+                let app = browser_router(node.clone(), vec![Site::parse(&origin)?], local);
+                origins.push(origin);
+                servers.push(tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
                     )
-                    .await?,
-                    StatusCode::FORBIDDEN
-                );
-                assert_eq!(
-                    status(
-                        client
-                            .post(&url)
-                            .header("x-forwarded-for", "203.0.113.1")
-                            .json(&body)
-                    )
-                    .await?,
-                    StatusCode::FORBIDDEN
-                );
-                assert_eq!(
-                    status(
-                        client
-                            .post(&url)
-                            .header(header::CONTENT_TYPE, "text/plain")
-                            .body(body.to_string())
-                    )
-                    .await?,
-                    StatusCode::UNSUPPORTED_MEDIA_TYPE
-                );
-                assert_eq!(
-                    status(client.post(format!("{}{path}", origins[1])).json(&body)).await?,
-                    StatusCode::NOT_FOUND
-                );
+                    .await
+                    .unwrap();
+                }));
             }
-            assert!(check_hook(&HeaderMap::new(), "192.168.1.2".parse()?).is_err());
-            Ok::<_, anyhow::Error>(())
+            let client = reqwest::Client::builder().no_proxy().build()?;
+            let result = async {
+                if !web_enabled {
+                    for origin in &origins {
+                        for path in [
+                            "/",
+                            "/api/info",
+                            "/api/client",
+                            "/api/local/info",
+                            "/generated/vibeface_secure.js",
+                            "/generated/vibeface_secure_bg.wasm",
+                        ] {
+                            assert_eq!(
+                                client.get(format!("{origin}{path}")).send().await?.status(),
+                                StatusCode::NOT_FOUND
+                            );
+                        }
+                    }
+                }
+                for path in ["/api/hooks", "/api/triage", LOG] {
+                    let url = format!("{}{path}", origins[0]);
+                    let event = json!({"session_id":"s","turn_id":"t","action":"events"});
+                    let status = |request: reqwest::RequestBuilder| async {
+                        Ok::<_, anyhow::Error>(request.send().await?.status())
+                    };
+                    let body = match path {
+                        "/api/hooks" => json!({"session_id":"s","turn_id":"t"}),
+                        LOG => json!({"source":"node","records":[]}),
+                        _ => event,
+                    };
+                    assert_eq!(
+                        status(client.post(&url).json(&body)).await?,
+                        StatusCode::BAD_REQUEST
+                    );
+                    assert_eq!(
+                        status(
+                            client
+                                .post(&url)
+                                .header(header::ORIGIN, &origins[0])
+                                .json(&body)
+                        )
+                        .await?,
+                        StatusCode::FORBIDDEN
+                    );
+                    assert_eq!(
+                        status(
+                            client
+                                .post(&url)
+                                .header("x-forwarded-for", "203.0.113.1")
+                                .json(&body)
+                        )
+                        .await?,
+                        StatusCode::FORBIDDEN
+                    );
+                    assert_eq!(
+                        status(
+                            client
+                                .post(&url)
+                                .header(header::CONTENT_TYPE, "text/plain")
+                                .body(body.to_string())
+                        )
+                        .await?,
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE
+                    );
+                    assert_eq!(
+                        status(client.post(format!("{}{path}", origins[1])).json(&body)).await?,
+                        StatusCode::NOT_FOUND
+                    );
+                }
+                assert!(check_hook(&HeaderMap::new(), "192.168.1.2".parse()?).is_err());
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            for server in servers {
+                server.abort();
+            }
+            drop(node);
+            std::fs::remove_dir_all(dir)?;
+            result?;
         }
-        .await;
-        for server in servers {
-            server.abort();
-        }
-        drop(node);
-        std::fs::remove_dir_all(dir)?;
-        result
+        Ok(())
     }
 
     #[test]
