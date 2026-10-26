@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, KeyRound, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -18,19 +18,22 @@ const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon:
   starting: { label: "启动中", tone: "neutral", icon: LoaderCircle },
   off: { label: "未使用", tone: "neutral", icon: CircleDashed },
 }
+/** Where each provider's program comes from, and how the device uses it. */
+const install: Record<ProviderId, string> = { codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-sdk" }
+const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk" }
 // Names come from runtime/settings.rs readiness.missing.
-const checks: Record<ProviderId, { key: string; label: string; doc: string }[]> = {
-  codex: [
-    { key: "Codex CLI", label: "缺少 Codex 命令行", doc: "node.md#使用-codex-sdk" },
-  ],
-  cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件", doc: "node.md#使用-cursor-sdk" }],
+const checks: Record<ProviderId, { key: string; label: string }[]> = {
+  codex: [{ key: "Codex CLI", label: "缺少 Codex 命令行" }],
+  cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件" }],
 }
+/** A variable the provider needs, named as its service names it where there is such a name. */
+const keyName = (name: string) => name === "CURSOR_API_KEY" ? "Cursor API Key" : name
 
 function issueText(provider: ProviderId, issue: ProviderIssue): string {
   const name = providerNames[provider]
   switch (issue.code) {
     case "bin_missing": return `找不到 ${name} 程序`
-    case "env_missing": return `缺少 ${issue.name}`
+    case "env_missing": return `缺少 ${keyName(issue.name)}`
     case "launch_failed": return `${name} 没能启动`
     case "config_invalid": return `${name} 的配置文件读不了`
     case "app_server_not_found": return "没找到这台电脑上运行的 Codex"
@@ -57,9 +60,20 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
   </span>
 }
 
+/** How Settings shows paths under the home folder, from `display_paths`. */
+type Display = Record<string, string>
+
+/** A path input that reads `~/…` while it rests on the saved path and shows the full path to edit. */
+function PathInput({ saved, display, value, className, ...props }: ComponentProps<"input"> & { saved: string; display: Display; value: string }) {
+  const [editing, setEditing] = useState(false)
+  const short = !editing && value === saved ? display[saved] : undefined
+  return <Input {...props} className={cn("min-w-0 font-mono text-foreground placeholder:font-sans", className)} spellCheck={false} title={short ? saved : undefined} value={short ?? value}
+    onFocus={() => setEditing(true)} onBlur={() => setEditing(false)} />
+}
+
 /** A path the device uses, shown as it is saved; editing it shows 保存. An empty path lets the device look again. */
-function PathField({ id, label, value, placeholder, working, busy, onSave }: {
-  id: string; label: string; value: string | null; placeholder: string; working: boolean; busy: boolean; onSave(path: string): unknown
+function PathField({ id, label, value, display, placeholder, working, busy, onSave }: {
+  id: string; label: string; value: string | null; display: Display; placeholder: string; working: boolean; busy: boolean; onSave(path: string): unknown
 }) {
   const [draft, setDraft] = useState(value ?? "")
   useEffect(() => setDraft(value ?? ""), [value])
@@ -67,19 +81,21 @@ function PathField({ id, label, value, placeholder, working, busy, onSave }: {
   return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); if (dirty) void onSave(draft.trim()) }}>
     <label htmlFor={id} className="text-meta font-medium text-muted-foreground">{label}</label>
     <div className="flex min-w-0 gap-2">
-      <Input id={id} className="min-w-0 font-mono text-foreground placeholder:font-sans" placeholder={placeholder} spellCheck={false} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
+      <PathInput id={id} saved={value ?? ""} display={display} placeholder={placeholder} maxLength={4096} value={draft} disabled={working} onChange={(event) => setDraft(event.target.value)} />
       {dirty ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
     </div>
   </form>
 }
+
+const placeholders = { home: "例如 ~/.codex", socket: "例如 ~/.codex/app-server-control/app-server-control.sock" }
 
 /**
  * Where Codex work runs: the App Server already running on this computer, at its socket, or one the device starts with the
  * Codex folder. The device fills both in from this computer when they are missing; the paths stay folded until one is missing or broken.
  * `children`: other paths the provider uses, folded with these.
  */
-function AppServerSettings({ server, home, sessions, working, blocked, busy, save, test, children }: {
-  server: AppServer; home: string | null; sessions: string | null; working: boolean; blocked: boolean; busy: string
+function AppServerSettings({ server, home, sessions, display, working, blocked, busy, save, test, children }: {
+  server: AppServer; home: string | null; sessions: string | null; display: Display; working: boolean; blocked: boolean; busy: string
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>; children?: ReactNode
 }) {
   const [tested, setTested] = useState<AppServerLink | null>(null)
@@ -108,11 +124,11 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
     </div>
     <Details label="路径" open={pathsOpen || needsPaths || undefined}>
       {server.mode === "system"
-        ? <PathField id="codex-socket" label="连接路径" value={server.socket} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
+        ? <PathField id="codex-socket" label="连接路径" value={server.socket} display={display} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
             onSave={(path) => save("socket", { app_server: { mode: "system", socket: path || null } })} />
-        : <PathField id="codex-home" label="Codex 目录" value={home} placeholder="例如 /Users/你的用户名/.codex" working={working} busy={busy.endsWith(":home")}
+        : <PathField id="codex-home" label="Codex 目录" value={home} display={display} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
             onSave={(path) => save("home", { env: { CODEX_HOME: path || null } })} />}
-      {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} /></span></p> : null}
+      {sessions ? <p className="grid gap-1"><span className="font-medium">会话目录</span><span className="flex min-w-0 text-foreground"><FolderPath path={sessions} shown={display[sessions]} /></span></p> : null}
       {children}
     </Details>
   </div>
@@ -125,9 +141,9 @@ function AppServerSettings({ server, home, sessions, working, blocked, busy, sav
 function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
-      <PathField id="manual-codex-home" label="Codex 目录" value={null} placeholder="例如 /Users/你的用户名/.codex" working={working} busy={busy.endsWith(":home")}
+      <PathField id="manual-codex-home" label="Codex 目录" value={null} display={{}} placeholder={placeholders.home} working={working} busy={busy.endsWith(":home")}
         onSave={(path) => save("home", { app_server: { mode: "spawn", socket: null }, env: { CODEX_HOME: path } })} />
-      {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} placeholder="App Server socket 的绝对路径" working={working} busy={busy.endsWith(":socket")}
+      {onboarding ? null : <PathField id="manual-codex-socket" label="连接路径" value={null} display={{}} placeholder={placeholders.socket} working={working} busy={busy.endsWith(":socket")}
         onSave={(path) => save("socket", { app_server: { mode: "system", socket: path } })} />}
     </div>
   </Details>
@@ -219,7 +235,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
-    {onboarding ? botOn ? null : <BotHint /> : <Folders roots={roots} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding ? botOn ? null : <BotHint /> : <Folders roots={roots} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -242,6 +258,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
+  const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const manager = bot ? response.settings.manager : null
   const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
@@ -259,21 +276,19 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
   const notFound = /no Codex folder found/i.test(rawError(error))
   const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, { [role]: true }).then((ok) => { if (!ok) void reconcile() }) }
+  const saveKey = (name: string, value: string) => change(`env:${name}`, { env: { [name]: value } })
+    .then((ok) => { if (ok) toast(`${keyName(name)} 已保存`, { tone: "success" }); return ok })
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
     .then((ok) => { if (!ok) void reconcile(); return ok })
   const binForm = item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
       <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
       <div className="flex min-w-0 gap-2">
-        <Input id={`${item.provider}-bin`} className="min-w-0 font-mono text-foreground" placeholder="codex" value={bin} disabled={working}
+        <PathInput id={`${item.provider}-bin`} saved={item.bin ?? ""} display={display} placeholder="codex" value={bin} disabled={working}
           data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
         {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
     </form> : null
-  const serverSettings = server ? <AppServerSettings server={server} home={item.home} sessions={item.sessions} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
-  const fix = () => {
-    if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
-    openProvider(item.provider)
-  }
+  const serverSettings = server ? <AppServerSettings server={server} home={item.home} sessions={item.sessions} display={display} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
   const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
     .then((ok) => { if (ok) toast(next === null ? `已删除「${name}」` : `已保存「${name}」`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()
@@ -296,18 +311,23 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     </div>
     {notFound ? <div className="grid gap-2 px-3 pb-2 text-meta">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button asChild variant="outline" size="sm"><a href={install.codex} target="_blank" rel="noopener noreferrer"><Download aria-hidden="true" />怎么装</a></Button>
+        {asked ? <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => turnOn(asked)}><BusyIcon busy={busy === `${item.provider}:${asked}`} icon={RotateCw} />再找一次</Button> : null}
+      </div>
       <ManualCodex onboarding={onboarding} working={working} busy={busy} save={manual} />
-    </div> : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
+    </div> : issue?.code === "env_missing" ? <KeyField key={issue.name} name={issue.name} working={working} busy={busy === `${item.provider}:env:${issue.name}`} more={item.issues.length - 1} save={saveKey} />
+    : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
           onClick={() => void change("app_server", { app_server: spawnServer })}>改由 Vibeface 启动</button>
-        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
-        : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
+        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
+        : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
       <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
       <span className="min-w-0 truncate">{check.label}</span>
-      <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
+      <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={install[item.provider]} target="_blank" rel="noopener noreferrer">怎么装</a>
     </li>)}</ul> : null}
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details border-t">
       <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
@@ -316,7 +336,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <div className="grid gap-4 px-3 pb-3">
         {serverSettings}
 
-        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} fixBin={issue?.code === "bin_missing"} working={working}
+        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} fixBin={issue?.code === "bin_missing"} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
@@ -362,6 +382,31 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   </li>
 }
 
+/**
+ * The key a provider still needs, pasted in where it is asked for. It goes only to this device's own variables file,
+ * like 环境变量 in Settings; the field is cleared once saved and the value never comes back.
+ */
+function KeyField({ name, working, busy, more, save }: { name: string; working: boolean; busy: boolean; more: number; save(name: string, value: string): Promise<boolean> }) {
+  const [value, setValue] = useState("")
+  const label = keyName(name)
+  return <form className="grid gap-2 px-3 pb-3" onSubmit={(event) => {
+    event.preventDefault()
+    if (value) void save(name, value).then((ok) => { if (ok) setValue("") })
+  }}>
+    <label htmlFor={`key-${name}`} className="flex min-w-0 items-center gap-1.5 text-meta text-warning">
+      <KeyRound aria-hidden="true" className="size-4 shrink-0" />缺少 {label}{more > 0 ? `，还有 ${more} 项` : ""}
+    </label>
+    <div className="flex min-w-0 gap-2">
+      <Input id={`key-${name}`} type="password" autoComplete="new-password" data-1p-ignore="" spellCheck={false} className="min-w-0" placeholder={`粘贴 ${label}`} maxLength={4096}
+        value={value} disabled={working} onChange={(event) => setValue(event.target.value)} />
+      <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy} />保存</Button>
+    </div>
+    {name === "CURSOR_API_KEY" ? <a className="hit-area relative inline-flex w-fit items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline" href="https://cursor.com/dashboard" target="_blank" rel="noopener noreferrer">
+      获取 Key<ExternalLink aria-hidden="true" className="size-3.5" />
+    </a> : null}
+  </form>
+}
+
 /** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
 function BotHint() {
   return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
@@ -372,13 +417,15 @@ function BotHint() {
 const botFields = ["model", "workspace", "cursor_sdk_bin"] as const
 
 /** The bot's model, folder and programs, inside the settings of the provider it runs on. */
-function BotDetails({ manager, fixBin, working, busy, save }: { manager: ManagerSettings; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+function BotDetails({ manager, display, fixBin, working, busy, save }: { manager: ManagerSettings; display: Display; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const cursor = manager.provider === "cursor_sdk"
   const dirty = botFields.some((key) => draft[key] !== manager[key])
-  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) =>
-    <label className="grid gap-1 text-meta">{label}<Input name={key} className={cn(!extra.plain && "font-mono")} value={draft[key]} maxLength={key === "model" ? 256 : undefined} disabled={working}
-      placeholder={extra.placeholder} required={extra.required} data-fix={extra.fix ? "" : undefined} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /></label>
+  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) => {
+    const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required, "data-fix": extra.fix ? "" : undefined,
+      onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
+    return <label className="grid gap-1 text-meta">{label}{extra.plain ? <Input {...props} maxLength={256} /> : <PathInput {...props} saved={manager[key]} display={display} />}</label>
+  }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
     void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim() })
@@ -391,27 +438,27 @@ function BotDetails({ manager, fixBin, working, busy, save }: { manager: Manager
   </form>
 }
 
-function Folders({ roots, busy, save }: { roots: string[]; busy: boolean; save(roots: string[]): void }) {
+function Folders({ roots, display, busy, save }: { roots: string[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <div className="grid gap-2">
     <p className="text-meta font-medium text-muted-foreground">{terms.folders.label}</p>
     {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-      <FolderPath path={root} />
+      <FolderPath path={root} shown={display[root]} />
       <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
     <div className="flex min-w-0 gap-2">
-      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="/path/to/project" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="例如 ~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
   </div>
 }
 
-/** A long path gives up its parent folders first, so the folder's own name stays readable. */
-function FolderPath({ path }: { path: string }) {
-  const cut = path.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
+/** A long path gives up its parent folders first, so the folder's own name stays readable. `shown`: its `~/…` form. */
+function FolderPath({ path, shown = path }: { path: string; shown?: string }) {
+  const cut = shown.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
   return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
-    <span className="min-w-0 truncate text-muted-foreground">{path.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{path.slice(cut)}</span>
+    <span className="min-w-0 truncate text-muted-foreground">{shown.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{shown.slice(cut)}</span>
   </span>
 }

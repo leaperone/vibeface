@@ -60,6 +60,8 @@ export type NodeSettingsResponse = {
   defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin'>
   readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
   providers: ProviderStatus[]
+  /** How Settings shows each path under the home folder (`~/…`); edits still use the full path. */
+  display_paths: Record<string, string>
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -169,6 +171,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin) },
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
     providers: array(v.providers).map(parseProvider),
+    display_paths: Object.fromEntries(Object.entries(record(v.display_paths)).map(([path, shown]) => [path, text(shown)])),
   }
 }
 const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']

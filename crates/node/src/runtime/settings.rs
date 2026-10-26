@@ -36,6 +36,22 @@ pub struct ProviderChange {
 }
 
 impl ProviderChange {
+    /// Reads a leading `~` in the paths the owner typed as this computer's home folder.
+    fn expand(mut self, host: &discovery::Host) -> Self {
+        self.bin = self.bin.map(|bin| host.expand(&bin));
+        if let Some(socket) = self
+            .app_server
+            .as_mut()
+            .and_then(|server| server.socket.as_mut())
+        {
+            *socket = host.expand(socket);
+        }
+        if let Some(Some(home)) = self.env.get_mut(discovery::CODEX_HOME) {
+            *home = host.expand(Path::new(home)).to_string_lossy().into_owned();
+        }
+        self
+    }
+
     /// `default` is the bot a provider starts when none runs yet.
     fn apply(self, target: Target, default: Option<ManagerSettings>) -> Result<()> {
         let kind = self.provider.manager_kind();
@@ -319,10 +335,10 @@ impl Runtime {
         for provider in Provider::ALL {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
-        Ok(
-            json!({"settings":settings,"defaults":defaults,"readiness":{"manager":readiness,"missing":missing},
-                "providers":providers}),
-        )
+        let mut response = json!({"settings":settings,"defaults":defaults,
+            "readiness":{"manager":readiness,"missing":missing},"providers":providers});
+        response["display_paths"] = json!(self.host.display_paths(&response));
+        Ok(response)
     }
 
     /// Only the owner changes this Node's settings: a management device, or a browser on this
@@ -367,6 +383,7 @@ impl Runtime {
             Some(true) if self.manager().is_none() => Some(self.default_manager(kind)?),
             _ => None,
         };
+        let change = change.expand(&self.host);
         self.write_providers(|target| change.apply(target, default))
             .await?;
         self.node_settings().await
@@ -473,6 +490,7 @@ impl Runtime {
             "at most 128 project roots are allowed"
         );
         for root in &mut settings.roots {
+            *root = self.host.expand(root);
             ensure!(
                 root.is_absolute(),
                 "project root must be an existing absolute directory"
@@ -483,6 +501,8 @@ impl Runtime {
         settings.roots.sort();
         settings.roots.dedup();
         if let Some(manager) = &mut settings.manager {
+            manager.workspace = self.host.expand(&manager.workspace);
+            manager.cursor_sdk_bin = self.host.expand(&manager.cursor_sdk_bin);
             ensure!(
                 manager.workspace.is_absolute(),
                 "manager workspace must be an existing absolute directory"
@@ -522,6 +542,9 @@ impl Runtime {
     }
 }
 
+/// The agent a settings card is about: the user's answer goes to `apply_provider_config`, not
+/// to a session.
+pub(crate) const SETTINGS_AGENT: &str = "vibeface";
 /// The answer that lets a proposal be written; any other answer writes nothing.
 pub(crate) const ALLOW: &str = "允许";
 const DENY: &str = "不允许";
@@ -656,7 +679,7 @@ impl Runtime {
                 .into(),
             about: crate::model::Subject {
                 node: device,
-                agent: "vibeface".into(),
+                agent: SETTINGS_AGENT.into(),
                 session_id: format!("provider-setup-{}", &question_id[2..18]),
                 cwd: String::new(),
                 summary: "AI 设置".into(),

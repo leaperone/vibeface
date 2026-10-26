@@ -133,9 +133,9 @@
 | `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
 | `log` | `records`：1 到 20 条 `{level, event, message, conversation_id?, work_id?, fields?}` | 浏览器写日志，来源记为 `web`，每条 JSON 不超过 8 KiB，每台设备每分钟 120 条 |
 | `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
-| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}` 和 `providers`。`providers` 每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置 |
-| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型、工作目录和程序路径；不能开关 Bot 或更换它的服务 |
-| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`execution` 只用于 Codex。`bin` 和 `app_server` 只用于 Codex。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
+| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}` 和 `providers`。`providers` 每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
+| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型、工作目录和程序路径，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
+| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`execution` 只用于 Codex。`bin` 和 `app_server` 只用于 Codex。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |

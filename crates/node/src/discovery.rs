@@ -84,16 +84,49 @@ impl Host {
     /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
     /// only its last two parts, so the full path stays on this computer.
     pub fn display(&self, path: &Path) -> String {
-        if let Some(rest) = self
-            .home
-            .as_ref()
-            .and_then(|home| path.strip_prefix(home).ok())
-        {
-            return format!("~/{}", rest.display());
+        self.tilde(path).unwrap_or_else(|| {
+            let parts: Vec<_> = path.components().rev().take(2).collect();
+            let tail: PathBuf = parts.into_iter().rev().collect();
+            format!("…/{}", tail.display())
+        })
+    }
+
+    /// `path` under the home folder, written from `~`.
+    pub fn tilde(&self, path: &Path) -> Option<String> {
+        let rest = path.strip_prefix(self.home.as_ref()?).ok()?;
+        Some(match rest.as_os_str().is_empty() {
+            true => "~".into(),
+            false => format!("~/{}", rest.display()),
+        })
+    }
+
+    /// A path the owner typed, with a leading `~` read as the home folder.
+    pub fn expand(&self, path: &Path) -> PathBuf {
+        match (path.strip_prefix("~"), &self.home) {
+            (Ok(rest), Some(home)) if rest.as_os_str().is_empty() => home.clone(),
+            (Ok(rest), Some(home)) => home.join(rest),
+            _ => path.to_path_buf(),
         }
-        let parts: Vec<_> = path.components().rev().take(2).collect();
-        let tail: PathBuf = parts.into_iter().rev().collect();
-        format!("…/{}", tail.display())
+    }
+
+    /// Every absolute path string in `value` that lies under the home folder, with how
+    /// Settings shows it.
+    pub fn display_paths(&self, value: &serde_json::Value) -> BTreeMap<String, String> {
+        let mut shown = BTreeMap::new();
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                serde_json::Value::String(text) if text.starts_with('/') => {
+                    if let Some(short) = self.tilde(Path::new(text)) {
+                        shown.insert(text.clone(), short);
+                    }
+                }
+                serde_json::Value::Array(items) => pending.extend(items),
+                serde_json::Value::Object(fields) => pending.extend(fields.values()),
+                _ => {}
+            }
+        }
+        shown
     }
 }
 
@@ -387,6 +420,43 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn settings_show_home_paths_from_tilde_and_read_typed_tilde_as_home() {
+        let host = Host {
+            codex_home: None,
+            home: Some("/Users/a".into()),
+            path: None,
+        };
+        let response = serde_json::json!({
+            "roots": ["/Users/a/src", "/srv/shared"],
+            "providers": [{"home": "/Users/a/.codex", "bin": "codex", "socket": null,
+                "issues": [{"path": "/Users/ab/codex"}]}],
+            "workspace": "/Users/a",
+        });
+        assert_eq!(
+            host.display_paths(&response),
+            BTreeMap::from([
+                ("/Users/a".into(), "~".into()),
+                ("/Users/a/.codex".into(), "~/.codex".into()),
+                ("/Users/a/src".into(), "~/src".into()),
+            ]),
+            "only paths under the home folder get a short form; a sibling folder is not under it"
+        );
+        assert_eq!(
+            host.expand(Path::new("~/.codex/app.sock")),
+            PathBuf::from("/Users/a/.codex/app.sock")
+        );
+        assert_eq!(host.expand(Path::new("~")), PathBuf::from("/Users/a"));
+        for kept in ["/opt/codex", "~other/x", "codex"] {
+            assert_eq!(host.expand(Path::new(kept)), PathBuf::from(kept));
+        }
+        assert_eq!(
+            Host::default().expand(Path::new("~/x")),
+            PathBuf::from("~/x"),
+            "without a home folder the path stays as typed and fails as not absolute"
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ const patterns: [RegExp, string][] = [
   [/usage limit|rate limit|quota|too many requests/i, 'AI 服务的用量到上限了。等额度恢复后让 Bot 再试。'],
   [/no rollout found/i, 'Codex 新对话还没准备好，任务没有开始。请再派一次。'],
   [/no Codex folder found/i, '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。'],
-  [/has no sessions folder/i, '这台电脑的 Codex 目录里还没有会话目录。先用 Codex 跑一次，或关掉会话扫描。'],
+  [/has no sessions folder/i, '这台电脑的 Codex 还没有会话记录。先用 Codex 跑一次对话，再回来重试。'],
   [/explicit App Server socket/i, '还没填 Codex 的连接路径。'],
   [/App Server socket must be an absolute path/i, '连接路径要是绝对路径。'],
   [/explicit absolute CODEX_HOME/i, '由 Vibeface 启动前，先填 Codex 目录。'],
