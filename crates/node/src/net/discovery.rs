@@ -672,10 +672,29 @@ mod tests {
             .await?;
         send.finish()?;
         tokio::time::timeout(CONTROL_TIMEOUT, raw.closed()).await?;
+        drop((send, _recv, raw));
         service_router.shutdown().await?;
         drop(service_router);
         drop(service);
-        let restarted = net(&identity, &config).await?;
+        // Closing QUIC does not await pending stream destructors that still own its UDP socket.
+        let restarted = tokio::time::timeout(CONTROL_TIMEOUT, async {
+            loop {
+                match net(&identity, &config).await {
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                        }) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    result => return result,
+                }
+            }
+        })
+        .await
+        .context("closed discovery UDP socket was not released before restart")??;
         let restarted_router = restarted.discovery_router();
         registered(&restarted, 2).await?;
         assert_eq!(
