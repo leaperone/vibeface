@@ -644,6 +644,9 @@ struct Session {
     /// Threads another process writes: they cannot be resumed here, so their turns are read.
     polled: HashSet<String>,
     retry_observation_at: HashMap<String, Instant>,
+    /// Every observed thread was read once on this connection, so any request the App Server
+    /// asks again on them has arrived.
+    observed_once: bool,
 }
 
 impl Session {
@@ -974,6 +977,10 @@ async fn run_session(
             }
             _ = ticker.tick() => {
                 if let Err(reason) = state.observe_threads(&writer, &observed.borrow()) { break reason; }
+                if state.ready && !state.observed_once && state.resuming.is_empty() {
+                    state.observed_once = true;
+                    let _ = events.send(json!({"method":"bridge.codex_observed","params":{"at_ms":now_ms()}}));
+                }
                 let expired: Vec<_> = state.pending.iter().filter(|(_, pending)| pending.deadline <= Instant::now()).map(|(id, _)| id.clone()).collect();
                 let mut initialize_expired = false;
                 for id in expired {
@@ -1390,6 +1397,7 @@ mod tests {
             let initialized: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(initialized, json!({"method":"initialized"}));
             assert_eq!(received_events.recv().await.unwrap()["method"], "bridge.codex_connected");
+            assert_eq!(received_events.recv().await.unwrap()["method"], "bridge.codex_observed", "with no thread to observe, observation ends at once");
 
             let querying = client.clone();
             let response = tokio::spawn(async move {
@@ -1482,7 +1490,11 @@ mod tests {
                 }
                 let turns: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(turns["method"], "thread/turns/list");
+                while let Ok(event) = received_events.try_recv() {
+                    assert_ne!(event["method"], "bridge.codex_observed", "observation ends only once every thread was read");
+                }
                 server.send(Message::Text(json!({"id":turns["id"],"result":{"data":[{"id":"previous-turn","status":"completed","items":[]}]}}).to_string().into())).await.unwrap();
+                while received_events.recv().await.unwrap()["method"] != "bridge.codex_observed" {}
                 if connection == 0 {
                     let sender = client.clone();
                     let sending = tokio::spawn(async move {

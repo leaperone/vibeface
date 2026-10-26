@@ -831,6 +831,15 @@ def fixture_codex(arguments):
     socket_path = Path(address.removeprefix("unix://"))
     state_path = run / "fixture-codex-state.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"threads": {}}
+    # The Node starts this App Server after killing the previous one, as with real Codex: a turn
+    # that process left in progress was interrupted with it, and its request is never asked again.
+    for thread in state["threads"].values():
+        if thread["turns"] and thread["turns"][-1]["status"] == "inProgress":
+            thread["turns"][-1]["status"] = "interrupted"
+            thread["status"] = {"type": "idle"}
+            if "answer" not in (thread.get("request") or {"answer": None}):
+                del thread["request"]
+            private_json(state_path, state)
     state_lock = threading.Lock()
     slow_start = run / "fixture-codex-slow-start"
     if slow_start.exists():

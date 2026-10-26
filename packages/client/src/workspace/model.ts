@@ -1,7 +1,7 @@
 import type { Attachment, TranscriptMessage } from "../chat/types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
-  AnswerResult, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
+  AnswerResult, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome,
 } from "./types.ts"
@@ -367,6 +367,10 @@ function subject(value: unknown): QuestionSubject {
   const data = record(value)
   return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
 }
+function closeReason(value: unknown): CloseReason {
+  if (value !== "request_lost") throw new Error("问题关闭的原因无法识别。")
+  return value
+}
 function question(value: unknown): Question {
   const data = record(value)
   const bot = data.bot == null ? null : record(data.bot), answer = data.answer == null ? null : record(data.answer)
@@ -377,6 +381,7 @@ function question(value: unknown): Question {
     choices: list(data.choices ?? []).map((item) => ({ label: text(record(item).label) })),
     about: subject(data.about), author: text(data.author), created_at_ms: number(data.created_at_ms),
     answer: answer && { message_id: text(answer.message_id), text: text(answer.text), author: text(answer.author), created_at_ms: number(answer.created_at_ms) },
+    closed: data.closed == null ? null : closeReason(data.closed),
   }
 }
 function sentBotMessage(value: unknown): SentBotMessage {

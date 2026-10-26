@@ -170,6 +170,8 @@ export type Severity = "info" | "attention" | "urgent"
 export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
 type QuestionChoice = { label: string }
 type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
+/** Why the device that asked closed a question unanswered: the App Server request it held is gone. */
+export type CloseReason = "request_lost"
 /** Something only the person can settle, asked in a bot's chat. Text answers are always allowed; a choice answers with its label. */
 export type Question = {
   question_id: string
@@ -182,6 +184,8 @@ export type Question = {
   author: string
   created_at_ms: number
   answer: QuestionAnswer | null
+  /** Set only while unanswered: an answer that stands wins over a close. */
+  closed: CloseReason | null
 }
 /** `already_answered`: another answer stood first; `text` is the one that stands. */
 export type AnswerResult = { status: "answered" | "already_answered"; text: string }

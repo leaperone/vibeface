@@ -660,6 +660,10 @@ table "questions" {
     null = false
     type = text
   }
+  column "closed" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.question_id]
   }
