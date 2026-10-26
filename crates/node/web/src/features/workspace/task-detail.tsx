@@ -80,7 +80,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
     return () => window.removeEventListener("keydown", onKey)
   }, [botId, from])
   // The last progress line is stale once a task ends, so it never stands in for a result.
-  const result = work?.result_text || (work?.failure_reason ? taskError(work.failure_reason) : state === "completed" ? "没有返回文字" : "")
+  // A task settled by hand carries no text either, so an empty result shows no section rather than an odd placeholder.
+  const result = work?.result_text || (work?.failure_reason ? taskError(work.failure_reason) : "")
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
@@ -131,7 +132,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       </div> : null}
       <Details>
         {work.prompt ? <DetailRow label="交代的事" value={<span className="whitespace-pre-wrap break-words">{work.prompt}</span>} /> : null}
-        {work.failure_reason && (check || rawError(work.failure_reason)) ? <DetailRow label="原始错误" value={<span className="break-words">{work.failure_reason}</span>} /> : null}
+        {work.failure_reason && (check || rawError(work.failure_reason)) ? <DetailRow label={check ? "说明" : "原始错误"} value={<span className="break-words">{work.failure_reason}</span>} /> : null}
         <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
         {device ? <DetailRow label="设备编号" value={device} mono /> : null}

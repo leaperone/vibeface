@@ -124,7 +124,9 @@ export function RotateHintCard() {
   return <ActionCard icon={KeyRound} title="恢复文件可能泄露了" actions={<>
     <Button type="button" variant="ghost" onClick={() => setRotateHint(network, false)}>不用</Button>
     <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>换恢复密码</Button>
-  </>} />
+  </>}>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />有人用它发起了找回，被你拦下了。</p>
+  </ActionCard>
 }
 
 /** Shared by creating and recovering: the sealed file, then the promise it is kept apart from its password. */

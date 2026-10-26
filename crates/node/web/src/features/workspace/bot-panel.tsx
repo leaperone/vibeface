@@ -121,7 +121,7 @@ export function BotPanelButton() {
           {view.memory.length ? <SettingsGroup title={`笔记 · ${view.memory.length}`}>
             {view.memory.map((note) => <p key={note.memory_id} className="line-clamp-3 px-4 py-3 [overflow-wrap:anywhere]" title={note.text}>{note.text}</p>)}
           </SettingsGroup> : null}
-          {view.skills.length ? <SettingsGroup title={bot.skills === null ? "skill · 全部可用" : `skill · ${view.skills.length}`}>
+          {view.skills.length ? <SettingsGroup title={bot.skills === null ? "Skill · 全部可用" : `Skill · ${view.skills.length}`}>
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}
           <SettingsGroup>
