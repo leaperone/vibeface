@@ -62,10 +62,6 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
-function Hint({ icon: Icon, label, warning = false }: { icon: LucideIcon; label: string; warning?: boolean }) {
-  return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className={cn("size-4", warning ? "text-warning" : "text-muted-foreground")} /><span className="sr-only">{label}</span></span>
-}
-
 export function DevicesPage() {
   const device = useDevice()
   const rows = useDeviceRows()
@@ -82,9 +78,13 @@ export function DevicesPage() {
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="interactive-row flex min-h-14 items-center gap-3 px-4 py-2">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           {/* On a phone the tag drops under the name, so the name keeps the width. */}
-          <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
-          {row.bot ? <Hint icon={terms.canRunBot.icon} label={row.bot === "ready" ? terms.canRunBot.label : "Bot 需设置"} warning={row.bot === "needs_setup"} /> : null}
-          {row.admin ? <Hint icon={terms.admin.icon} label={terms.admin.label} /> : null}
+          <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
+            <span className="flex flex-wrap gap-1 empty:hidden">
+              {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
+              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : "Bot 需设置"}</Tag> : null}
+              {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+            </span>
+          </span>
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>

@@ -1,6 +1,7 @@
+import { useLayoutEffect, useRef } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
 import { ChevronRight, Inbox } from 'lucide-react'
-import { EmptyState } from '@/components/app/kit'
+import { claimFocus, EmptyState } from '@/components/app/kit'
 import { useInbox } from '@/features/workspace/inbox'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { JoinCard } from '@/features/devices/join'
@@ -12,9 +13,24 @@ export const Route = createFileRoute('/_app/inbox')({ component: InboxPage })
 
 function InboxPage() {
   const items = useInbox()
+  // A handled card leaves with the button just pressed; the card now in its place, or the page title, takes the focus.
+  const list = useRef<HTMLUListElement>(null)
+  const held = useRef<{ key: string; index: number } | null>(null)
+  const keys = items.map((item) => item.key).join('\n')
+  useLayoutEffect(() => {
+    const last = held.current
+    if (!last || items.some((item) => item.key === last.key)) return
+    held.current = null
+    const cards = list.current?.children
+    const next = cards?.length ? cards[Math.min(last.index, cards.length - 1)] : document.getElementById('main')?.querySelector('h1')
+    if (next instanceof HTMLElement) claimFocus(next)
+  }, [keys])
   if (!items.length) return <EmptyState icon={Inbox} title="没有待处理" />
-  return <ul className="mx-auto grid w-full max-w-(--page-width) gap-3">
-    {items.map((item) => <li key={item.key} className="min-w-0 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
+  return <ul ref={list} className="mx-auto grid w-full max-w-(--page-width) gap-3" onFocus={(event) => {
+    const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))
+    if (items[index]) held.current = { key: items[index].key, index }
+  }}>
+    {items.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
       {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.write ? <WriteCard kind={item.write} /> : item.join ? <JoinCard request={item.join} /> : item.question ? <QuestionCard question={item.question} inbox /> : item.check ? <ConfirmCard check={item.check} inbox /> : <Link to={item.to} className="flex min-h-14 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-3">
         <item.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
         <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
