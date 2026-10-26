@@ -543,10 +543,6 @@ mod tests {
         ))
     }
 
-    fn available_udp_port() -> Result<u16> {
-        Ok(std::net::UdpSocket::bind("0.0.0.0:0")?.local_addr()?.port())
-    }
-
     async fn registered(service: &Net, count: usize) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -636,7 +632,7 @@ mod tests {
         let identity = LocalIdentity::generate();
         let mut config = NetworkConfig {
             relay_mode: RelayServiceMode::DiscoveryOnly,
-            relay_listen: Some(SocketAddr::from(([127, 0, 0, 1], available_udp_port()?))),
+            relay_listen: Some("127.0.0.1:0".parse()?),
             ..Default::default()
         };
         let service = net(&identity, &config).await?;
@@ -699,29 +695,40 @@ mod tests {
             &LocalIdentity::generate(),
             &NetworkConfig {
                 relay_mode: RelayServiceMode::DiscoveryOnly,
-                relay_listen: Some(SocketAddr::from(([0, 0, 0, 0], available_udp_port()?))),
+                relay_listen: Some("0.0.0.0:0".parse()?),
                 ..Default::default()
             },
         )
         .await?;
         let service_router = service.discovery_router();
-        let port = service
-            .addr()
-            .ip_addrs()
+        let ipv4_port = service
+            .endpoint
+            .bound_sockets()
+            .into_iter()
             .find(|address| address.is_ipv4())
             .context("service IPv4 missing")?
             .port();
-        let discovery = format!("vibeface://{}@localhost:{port}", service.endpoint.id());
+        let ipv6_port = service
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(|address| address.is_ipv6())
+            .context("service IPv6 missing")?
+            .port();
+        let discovery = vec![
+            format!("vibeface://{}@127.0.0.1:{ipv4_port}", service.endpoint.id()),
+            format!("vibeface://{}@[::1]:{ipv6_port}", service.endpoint.id()),
+        ];
         let a_id = LocalIdentity::generate();
         let b_id = LocalIdentity::generate();
         let mut a_config = NetworkConfig {
             bind: Some("127.0.0.1:0".parse()?),
-            discovery: vec![discovery.clone()],
+            discovery: discovery.clone(),
             ..Default::default()
         };
         let mut b_config = NetworkConfig {
             bind: Some("[::1]:0".parse()?),
-            discovery: vec![discovery],
+            discovery,
             ..Default::default()
         };
         let a = net(&a_id, &a_config).await?;
