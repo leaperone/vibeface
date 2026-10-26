@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { ActionCard, BusyIcon, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
+import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
@@ -134,6 +134,11 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   code: string; saved: boolean; onSaved(saved: boolean): void; download?: { done: boolean; run(): void }; busy?: boolean
 }) {
   const downloaded = !download || download.done
+  // The download button gives way to the file once it is down, and is disabled while it works; ticking the box is next.
+  const box = useRef<HTMLInputElement>(null)
+  const settled = downloaded && !busy
+  const wasSettled = useRef(settled)
+  useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
     <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />没有恢复密码，这个文件打不开</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
@@ -144,20 +149,21 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
       </span>
       {download ? <Button type="button" variant="ghost" disabled={busy} onClick={download.run}>重新下载</Button> : null}
     </p> : <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button>}
-    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />已把文件和密码分开保存</label>
+    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input ref={box} type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />已把文件和密码分开保存</label>
   </>
 }
 
 /**
  * A new recovery file this page made and still holds: downloaded once on its own, offered again from a tap until the
  * person confirms it is kept apart from its password, which drops the copy.
+ * `landing`: where the focus goes once confirming takes the file, and the box ticked, off the page.
  */
-export function UnsavedRecoveryFile() {
+export function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null | undefined }) {
   const { unsavedRecovery: file, downloadUnsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const [error, setError] = useState('')
   if (!file) return null
   return <>
-    <SaveRecoveryFile code={file.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }}
+    <SaveRecoveryFile code={file.code} saved={false} onSaved={(saved) => { if (saved) { landing()?.focus({ preventScroll: true }); forgetUnsavedRecovery() } }}
       download={{ done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } }} />
     <InlineError error={error || null} />
   </>
@@ -166,6 +172,7 @@ export function UnsavedRecoveryFile() {
 /** This browser's recovery while it waits on the Node, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
   const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
+  const saving = useRef<HTMLElement>(null)
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
     <p className="text-muted-foreground">刚下载的新文件用不了</p>
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
@@ -178,9 +185,9 @@ export function RecoveryWaiting() {
     </>}
     <p className="flex items-center gap-2 text-muted-foreground"><ShieldAlert aria-hidden="true" className="size-4 shrink-0" />期间你的其他设备可以拦下</p>
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
-    {unsavedRecovery ? <section className="grid gap-3 border-t pt-4">
+    {unsavedRecovery ? <section ref={saving} className="grid gap-3 border-t pt-4">
       <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />保存新的恢复文件</h3>
-      <UnsavedRecoveryFile />
+      <UnsavedRecoveryFile landing={() => saving.current?.parentElement?.querySelector('h2')} />
     </section> : null}
   </Panel>
 }
@@ -245,9 +252,18 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
   // Opened from the reminder: the form may sit below the fold on a phone.
   useEffect(() => { if (open === 'passphrase' && !only) document.getElementById(PASSWORD_HASH)?.scrollIntoView({ block: 'center' }) }, [])
+  const rows = { restore: useRef<HTMLButtonElement>(null), passphrase: useRef<HTMLButtonElement>(null) }
+  const fold = useRef<HTMLElement>(null)
+  // Folding a form away takes the focused control with it; its row takes the focus back.
+  function close() {
+    const mode = open
+    setOpen(undefined)
+    const active = document.activeElement
+    if (mode && (!active || active === document.body || fold.current?.contains(active))) rows[mode].current?.focus({ preventScroll: true })
+  }
   if (device.review?.kind === 'recovery') return <RecoveryReview />
   // In settings each action is a row that folds its form out below itself; alone, the form stands as a card.
-  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
+  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
   const toggle = (mode: 'restore' | 'passphrase') => setOpen(open === mode ? undefined : mode)
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
       <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
@@ -271,7 +287,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
         <InlineError error={error || null} />
-        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
+        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
       </fieldset></form>
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
@@ -284,23 +300,23 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           finally { clearPasswords(form) }
           await work
           if (device.ready) setRotateHint(device.ready.principal.network_id, false)
-          if (!only) setOpen(undefined)
+          if (!only) close()
         }, '已换密码，旧恢复文件已失效')
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><Input type="password" name="old_password" autoComplete="off" required /></Label>
         <Label label="新密码（至少 8 个字符）"><Input type="password" name="password" minLength={8} autoComplete="new-password" required /></Label>
         <InlineError error={error || null} />
-        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={() => setOpen(undefined)}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />下载新文件</Button></div>
+        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />下载新文件</Button></div>
       </fieldset></form>
     </>, PASSWORD_HASH) : null
   const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null
-  const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile /></section> : null
+  const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile landing={() => rows.passphrase.current} /></section> : null
   if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
   return <>
-    <SettingsRow icon={ArchiveRestore} label="用恢复文件找回" expanded={open === 'restore'} className={open === 'restore' ? 'border-b-0' : undefined} onClick={() => toggle('restore')} />
+    <SettingsRow ref={rows.restore} icon={ArchiveRestore} label="用恢复文件找回" expanded={open === 'restore'} className={open === 'restore' ? 'border-b-0' : undefined} onClick={() => toggle('restore')} />
     {restoreForm}
-    <SettingsRow icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => toggle('passphrase')} />
+    <SettingsRow ref={rows.passphrase} icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => toggle('passphrase')} />
     {passphraseForm}
     {done}
     {unsaved}
