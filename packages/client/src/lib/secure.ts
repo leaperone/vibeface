@@ -28,7 +28,7 @@ export function secureKit(secure: SecureApi) {
     const principal = parsePrincipal(auth.principal)
     const state = record(auth.state)
     if (principal.device_id !== own.deviceId || expected && principal.network_id !== expected.networkId) throw new Error('电脑返回的身份和这台设备对不上。')
-    if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !array(state.checkpoints).some(item => same(item, expected.checkpoint)))) throw new Error('认证返回的根授权与本地确认的记录不一致。')
+    if (expected?.kind === 'root' && (!same(state.genesis, expected.genesis) || expected.checkpoint !== undefined && !array(state.checkpoints).some(item => same(item, expected.checkpoint)))) throw new Error('电脑返回的设备记录和这里保存的对不上。')
     const view = verifiedView(state, principal.network_id, nodeNow(auth))
     if (principal.epoch !== view.epoch || !same(auth.view, view)) throw new Error('设备列表没通过校验。')
     const revoked = (id: string) => view.revoked.some(item => item.device_id === id)

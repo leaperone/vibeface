@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -93,7 +93,7 @@ export function RecoveryPendingCard() {
     ...current.filter((member) => !kept.has(member.device_id)).map((member) => ({ member, added: false })),
   ]
   return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms - device.nodeClockOffset)} 小时后生效`} actions={<>
-    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我</Button>
+    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我在找回</Button>
     {/* Solid here, unlike the soft global destructive: the time-limited step must outrank every other button on the page. */}
     <Button type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
       await device.vetoRecovery(pending.checkpoint)
@@ -101,6 +101,7 @@ export function RecoveryPendingCard() {
       toast('已拦下', { tone: 'success' })
     })}><BusyIcon busy={busy} icon={Hand} />拦下</Button>
   </>}>
+    {changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">不拦下，到时划掉的设备会被移出</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
       const Change = added ? CirclePlus : CircleMinus
@@ -122,10 +123,10 @@ export function RotateHintCard() {
   const network = device.ready?.principal.network_id
   if (!network) return null
   return <ActionCard icon={ShieldAlert} title="恢复文件可能泄露了" actions={<>
-    <Button type="button" variant="ghost" onClick={() => setRotateHint(network, false)}>不用</Button>
+    <Button type="button" variant="ghost" onClick={() => setRotateHint(network, false)}>以后再说</Button>
     <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>换恢复密码</Button>
   </>}>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />有人用它发起了找回，被你拦下了。</p>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />对方还能再试，换密码让旧文件作废</p>
   </ActionCard>
 }
 
@@ -175,7 +176,7 @@ export function RecoveryWaiting() {
   const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const saving = useRef<HTMLElement>(null)
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
-    <p className="text-muted-foreground">刚下载的新文件用不了</p>
+    <p className="text-muted-foreground">刚下载的新文件用不了，旧恢复文件仍然有效</p>
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
@@ -184,7 +185,7 @@ export function RecoveryWaiting() {
       <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{at > Date.now() ? `剩余 ${hoursUntil(at)} 小时` : '马上生效'}</p>
       <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>生效后自动进入</p>
     </>}
-    <p className="flex items-center gap-2 text-muted-foreground"><ShieldAlert aria-hidden="true" className="size-4 shrink-0" />期间你的其他设备可以拦下</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><BellRing aria-hidden="true" className="size-4 shrink-0" />你的管理设备会看到提醒</p>
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     {unsavedRecovery ? <section ref={saving} className="grid gap-3 border-t pt-4">
       <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />保存新的恢复文件</h3>
@@ -271,7 +272,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try {
-            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error('请在“连接到哪台电脑”里填好要连的电脑。')
+            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`请在“${target ? '连接到哪台电脑' : '手动填写'}”里填好要连的电脑。`)
             work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
           }
           finally { clearPasswords(form) }
@@ -281,7 +282,9 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="恢复密码"><PasswordInput name="password" autoComplete="off" required /></Label>
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
-        <Details label="连接到哪台电脑" open={!target}>
+        {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
+        {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />在要连的电脑上打开本机页面再找回</p>}
+        <Details label={target ? '连接到哪台电脑' : '手动填写'}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
@@ -290,7 +293,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       </fieldset></form>
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
-      <p className="text-meta text-muted-foreground">换完后旧文件失效</p>
+      <p className="text-meta text-muted-foreground">需要现在的恢复文件和旧密码，旧文件会作废</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
@@ -306,7 +309,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <Label label="旧密码"><PasswordInput name="old_password" autoComplete="off" required /></Label>
         <Label label="新密码（至少 8 个字符）"><PasswordInput name="password" minLength={8} autoComplete="new-password" required /></Label>
         <InlineError error={error || null} />
-        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />下载新文件</Button></div>
+        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />换密码并下载新文件</Button></div>
       </fieldset></form>
     </>, PASSWORD_HASH) : null
   const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null

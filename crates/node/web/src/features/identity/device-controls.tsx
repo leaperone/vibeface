@@ -42,7 +42,7 @@ export function ConnectionSettings() {
     </SettingsRow> : null}
     {others.map((entry) => <SettingsRow key={keyOf(entry)} icon={Server} label={<span title={entry.address}>{device.entryName(entry) || addressName(entry.address)}</span>} description={hostOf(entry.address)}>
       <Button type="button" size="sm" variant="outline" onClick={() => { setError(null); void device.connect(entry).catch(setError) }}>切换</Button>
-      <Button type="button" variant="ghost" size="icon" aria-label="移除" title="移除" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
+      <Button type="button" variant="ghost" size="icon" aria-label="从列表删掉这个地址" title="从列表删掉这个地址" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
     </SettingsRow>)}
     {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
     <SettingsDisclosure icon={Info} label="详细信息">
