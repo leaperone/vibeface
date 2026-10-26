@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, Eye, EyeOff, FileKey, FileWarning, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -17,7 +17,7 @@ const PASSWORD_HASH = 'recovery-password'
 
 function field(form: HTMLFormElement, name: string) { const element = form.elements.namedItem(name); return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement ? element.value : '' }
 /** A failed try keeps the chosen file and name; only typed passwords leave the page. */
-function clearPasswords(form: HTMLFormElement) { for (const input of form.querySelectorAll<HTMLInputElement>('input[type=password]')) input.value = '' }
+function clearPasswords(form: HTMLFormElement) { for (const input of form.querySelectorAll<HTMLInputElement>('input[name$=password]')) input.value = '' }
 function fileOf(form: HTMLFormElement) { const element = form.elements.namedItem('bundle'); const file = element instanceof HTMLInputElement ? element.files?.[0] : null; if (!file) throw new Error('请选择恢复文件。'); return file }
 const Label = ({ label, children }: { label: string; children: ReactNode }) => <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 
@@ -250,6 +250,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const localEntry = device.localSetup?.entry
   const target = device.ready?.entry || device.entry || localEntry
   const { busy, error, status, run } = useGenerationRun()
+  const [showPassword, setShowPassword] = useState(false)
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
   // Opened from the reminder: the form may sit below the fold on a phone.
   useEffect(() => { if (open === 'passphrase' && !only) document.getElementById(PASSWORD_HASH)?.scrollIntoView({ block: 'center' }) }, [])
@@ -279,7 +280,10 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         })
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
-        <Label label="恢复密码"><Input type="password" name="password" autoComplete="off" required /></Label>
+        <Label label="恢复密码"><span className="relative">
+          <Input type={showPassword ? 'text' : 'password'} name="password" className="pe-9 max-md:pe-11" autoComplete="off" required />
+          <Button type="button" variant="ghost" size="icon" className="absolute inset-y-0 end-0 text-muted-foreground hover:bg-transparent hover:text-foreground" aria-label={showPassword ? '隐藏密码' : '显示密码'} aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)}>{showPassword ? <EyeOff aria-hidden="true" /> : <Eye aria-hidden="true" />}</Button>
+        </span></Label>
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName(device.identity?.deviceId)} /></Label>
         <Details label="连接到哪台电脑" open={!target}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>

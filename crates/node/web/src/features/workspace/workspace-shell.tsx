@@ -56,7 +56,8 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)
-  const title = chatRoute ? workspace.selectedBot?.name ?? "" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
+  const botTitle = chatRoute && workspace.selectedBot
+  const title = chatRoute ? "对话" : titles[pathname] ?? (pathname.startsWith("/devices") ? terms.myDevices.label : "")
   const navigate = useNavigate()
   const joins = useOpenJoins()
   const [actionsSlot, setActionsSlot] = useState<HTMLElement | null>(null)
@@ -153,7 +154,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
-              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", chatRoute ? "flex" : "truncate")} title={chatRoute ? undefined : title}>{chatRoute ? <BotPanelButton /> : title}</h1>
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
