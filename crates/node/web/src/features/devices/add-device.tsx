@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { Link } from "@tanstack/react-router"
-import { CircleCheck, Clock, Copy, Link2, Plus, ShieldCheck, Smartphone } from "lucide-react"
+import { CircleCheck, Clock, Copy, Link2, Plus, ScanEye, Smartphone } from "lucide-react"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -104,7 +104,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
             {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用手机相机扫码打开" /> : null}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? "已复制" : "复制链接"}</Button>
             <ul className="grid gap-1.5 text-meta text-muted-foreground">
-              <li className="flex items-center gap-1.5"><ShieldCheck aria-hidden="true" className="size-4 shrink-0" />新设备打开后，回这里比对安全码</li>
+              <li className="flex items-center gap-1.5"><ScanEye aria-hidden="true" className="size-4 shrink-0" />新设备打开后，回这里比对安全码</li>
               <li className="flex items-center gap-1.5"><Clock aria-hidden="true" className="size-4 shrink-0" />只发给自己的设备，10 分钟内有效</li>
             </ul>
             {result.qr ? null : <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">

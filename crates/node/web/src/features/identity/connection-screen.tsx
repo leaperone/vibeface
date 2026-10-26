@@ -74,7 +74,7 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
   const canRejoin = device.removedLocally || Boolean(setup?.local_launch)
-  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '这台设备已被移出'}>
+  return <Panel icon={MonitorX} title={here || device.removedLocally ? '这台电脑已被移出' : '所连的电脑已被移出'}>
     {canRejoin ? <>
       <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
       <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>

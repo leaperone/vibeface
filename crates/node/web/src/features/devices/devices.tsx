@@ -44,8 +44,8 @@ export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): Luc
   return /iphone|android|ipad|phone|手机/i.test(row.name) ? Smartphone : Monitor
 }
 
-function Tag({ children }: { children: ReactNode }) {
-  return <span className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
+function Tag({ children, title }: { children: ReactNode; title?: string }) {
+  return <span title={title} className="inline-flex shrink-0 items-center gap-1 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{children}</span>
 }
 
 /** `compact`: the list names only the exception, so an online row shows the dot alone. */
@@ -81,7 +81,7 @@ export function DevicesPage() {
             <span className="flex flex-wrap gap-1 empty:hidden">
               {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
               {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : "Bot 需设置"}</Tag> : null}
-              {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+              {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
             </span>
           </span>
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
@@ -109,11 +109,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const action = useAction()
   const [removing, setRemoving] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
+  const entryName = rows.find((item) => item.entry)?.name
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
   const RemoveIcon = terms.remove.icon
   const canManage = ready?.principal.can_manage === true
   const localSession = ready?.principal.source === "local_session"
-  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这台设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
+  if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
   const address = row.entry ? ready?.entry.address ?? "" : ""
   const saved = device.entries.find((item) => item.device_id === row.id)
@@ -126,9 +127,9 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-          {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+          {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
         </div>
-        {row.online === false ? <p className="text-meta text-muted-foreground">确认它开着，并且和这台设备网络互通</p> : null}
+        {row.online === false ? <p className="text-meta text-muted-foreground">{entryName && !row.entry ? `确认它开着，并且能连到「${entryName}」` : "确认它开着，并且已联网"}</p> : null}
       </div>
     </header>
 
@@ -140,7 +141,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
       {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
         <p>{row.bot === "ready" ? terms.canRunBot.label : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
-        <p className="text-meta text-muted-foreground">{canManage ? "连到这台设备后才能修改" : `只有${terms.admin.label}能修改`}</p>
+        <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>}
     </Section> : null}

@@ -121,7 +121,7 @@ export function RotateHintCard() {
   const navigate = useNavigate()
   const network = device.ready?.principal.network_id
   if (!network) return null
-  return <ActionCard icon={KeyRound} title="恢复文件可能泄露了" actions={<>
+  return <ActionCard icon={ShieldAlert} title="恢复文件可能泄露了" actions={<>
     <Button type="button" variant="ghost" onClick={() => setRotateHint(network, false)}>不用</Button>
     <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>换恢复密码</Button>
   </>}>

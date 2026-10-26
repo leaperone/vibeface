@@ -116,7 +116,7 @@ test('after a reload an older address record never replaces a newer one, withdra
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
-  assert.equal(humanError('unknown member', 'target_not_member'), '这台设备不在我的设备里，访问地址不会转发给它。')
+  assert.equal(humanError('unknown member', 'target_not_member'), '那台电脑不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
   assert.match(humanError('Codex SDK failed: Missing environment variable: `CPA_API_KEY`.'), /缺少密钥/)
   assert.match(humanError('CURSOR_API_KEY is required for the Cursor SDK manager'), /缺少密钥/)

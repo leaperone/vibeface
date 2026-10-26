@@ -308,7 +308,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         : expected
       verified = verifyAuthentication(authValue, own(), trust)
       const pinnedNetwork = load(`network-for.${active.entry.device_id}`)
-      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这台设备属于另一组设备。请先确认连接的是自己的设备。')
+      if (pinnedNetwork && pinnedNetwork !== verified.principal.network_id) throw new Error('这台电脑属于另一组设备。请先确认连接的是自己的设备。')
     } catch (cause) { throw new AuthenticationError(messageOf(cause)) }
     if (session.current !== active) throw changed()
     const { principal, view } = verified
@@ -394,7 +394,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       let active: Session | null = null
       try {
         active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
-        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台设备已属于另一组设备。')
+        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台电脑已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
         if (candidate === target.entry && removed(auth, active, target.networkId)) return true
         if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
@@ -634,7 +634,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   async function revoke(deviceId: string) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId)
-    if (!member) throw new Error('找不到这台设备，请刷新后再试。')
+    if (!member) throw new Error('找不到这个设备，请刷新后再试。')
     if (deviceId === own().deviceId || deviceId === connection.entry.device_id) throw new Error(`不能移除${self}或当前连接的电脑。`)
     // A Node's log counts up to the head this entry holds, along that branch if it forked.
     let cutoff = 0, cutoffHash: string | null = null
@@ -699,7 +699,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
         if (active) break
       }
-      if (!active) throw new Error('连不上这台设备。')
+      if (!active) throw new Error('连不上这台电脑。')
       // A browser removed from this network joins again as a new device; its old key stays revoked.
       if (record(await scoped(active)('authenticate')).revoked === true) {
         const fresh = publicIdentity(await replaceClient())

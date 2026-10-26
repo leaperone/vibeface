@@ -2,9 +2,9 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, NotebookPen, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { BotAvatar, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
+import { BotAvatar, EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
@@ -32,6 +32,8 @@ export function BotPanelButton() {
   const [gaps, setGaps] = useState<Gap[]>([])
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
+  // 去聊天里说 closes the panel onto the composer instead of the title button that opened it.
+  const toComposer = useRef(false)
   const navigate = useNavigate()
   const bot = workspace.selectedBot
   const view = workspace.data?.bot_settings
@@ -64,7 +66,12 @@ export function BotPanelButton() {
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
-      <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md">
+      <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => {
+        if (!toComposer.current) return
+        toComposer.current = false
+        const composer = document.getElementById("message-text")
+        if (composer) { event.preventDefault(); composer.focus() }
+      }}>
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
           <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
           <span className="grid min-w-0 gap-0.5">
@@ -86,7 +93,8 @@ export function BotPanelButton() {
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
             </SettingsRow>
           </SettingsGroup>
-          {empty ? <p className="flex items-center justify-center gap-2 py-2 text-meta text-muted-foreground"><NotebookPen aria-hidden="true" className="size-4 shrink-0" />还没有说明、定时任务和笔记</p> : null}
+          {empty ? <EmptyState icon={NotebookPen} className="py-4" title="还没有说明、定时任务和笔记"
+            action={<Button type="button" size="sm" variant="outline" onClick={() => { toComposer.current = true; setOpen(false) }}><MessageCircle aria-hidden="true" />去聊天里说</Button>} /> : null}
           {bot.instructions.trim() ? <SettingsGroup title="说明">
             <p className="px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
           </SettingsGroup> : null}

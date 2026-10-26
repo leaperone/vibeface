@@ -23,8 +23,8 @@ import type {
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
   aligning: "正在和你的其他设备同步，稍后就能发送。",
-  read_only: "这台设备暂时只读。去待处理确认一下就能发送。",
-  forked: "这台设备的数据被复制过，已暂停发送。去待处理看看。",
+  read_only: "这台电脑暂时只读。去待处理确认一下就能发送。",
+  forked: "这台电脑的数据被复制过，已暂停发送。去待处理看看。",
 }
 
 type InterruptedReply = { trigger: string; conversation_id: string; after?: string; text: string }
@@ -115,7 +115,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     requireCurrent()
     if (!joined) throw new Error("本机管理不能发送。用加入链接加入后再操作。")
     if (!booted) throw new Error("本地记录还没读完，先暂停发送。")
-    if (readConnection.current !== connection) throw new Error("正在补读当前设备的记录，已暂停写入。")
+    if (readConnection.current !== connection) throw new Error("正在补读这台电脑的记录，已暂停写入。")
     if (writeState.state !== "writable") throw new Error(writeNotices[writeState.state])
   }
   const scoped = (key: string) => networkKey(`${key}.${clientId}`, networkId)
@@ -518,12 +518,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
-    writeNotice: readConnection.current !== connection ? "正在补读当前设备的记录，已暂停写入。" : "",
+    writeNotice: readConnection.current !== connection ? "正在补读这台电脑的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],
     diagnostics: (sinceMs: number) => { requireCurrent(); return connection.request("diagnostics", { since_ms: sinceMs }) },
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
-    syncText: !data ? "发一条消息开始对话。" : "已加载这台设备上的记录。",
+    syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
     refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
@@ -618,13 +618,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     }),
     takeOver: () => withMutation(`owner:${activeId.current}`, async () => {
       const id = activeId.current, context = requireBotContext(id)
-      if (!context.conversation) throw new Error("这台设备上还没有这个对话，可能还在同步。")
+      if (!context.conversation) throw new Error("这台电脑上还没有这个对话，可能还在同步。")
       const scheduler = context.local_node, epoch = context.conversation.owner_epoch + 1
       const attestation = await attest(id, { type: "conversation_owner", scheduler_node: scheduler, epoch })
       try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "这台设备"}`)
+      setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一台电脑"}`)
       if (activeId.current === id) await refreshRef.current()
     }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {

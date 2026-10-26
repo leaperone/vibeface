@@ -46,7 +46,7 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
-    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="恢复" footer="恢复文件只有一份有效，丢了不能补">
+    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer="恢复文件只有一份有效，丢了不能补">
       <CurrentRecoveryFile />
       <RecoveryControls />
     </SettingsGroup> : null}
