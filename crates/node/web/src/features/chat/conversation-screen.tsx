@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, EmptyState, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -188,6 +188,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // A device that only needs setup is fixable now, so it comes before one that is offline.
   const away = managerOffline && !unready
   const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
+  const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
   useEffect(() => {
     if (messagePending) sentDrafts.current.set(messagePending.conversation_id, messagePending)
@@ -226,7 +227,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
           <h2 className="text-heading font-semibold">{bot.name}</h2>
           {needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
-            <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+              : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}

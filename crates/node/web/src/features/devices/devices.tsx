@@ -180,7 +180,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
-      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? "移除后这台设备无法再连接，已有的对话记录会保留" : undefined} onClick={removing ? undefined : () => setRemoving(true)}>
+      {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? "移除后它无法再连接，对话记录会保留" : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>
         {removing ? <>
           <Button type="button" size="sm" variant="ghost" onClick={() => setRemoving(false)}>取消</Button>
           <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "remove" || undefined} onClick={() => void action.run("remove", async () => { await device.revoke(row.id); toast(`已移除「${row.name}」`, { tone: "success" }); void navigate({ to: "/devices" }) })}>

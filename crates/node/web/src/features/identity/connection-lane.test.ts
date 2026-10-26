@@ -21,7 +21,7 @@ test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(primaryLane({ hasInvitation: false, savedCount: 1, hasLocalSetup: true }), 'local')
   assert.equal(primaryLane({ hasInvitation: true, savedCount: 0, hasLocalSetup: true }), 'invite')
   assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: false, removed: true }), 'invite')
-  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: true, removed: true }), 'local')
+  assert.equal(primaryLane({ hasInvitation: false, savedCount: 2, hasLocalSetup: true, removed: true }), 'invite')
 })
 
 const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64)

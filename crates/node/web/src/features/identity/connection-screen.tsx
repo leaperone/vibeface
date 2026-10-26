@@ -151,7 +151,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const scannable = canScan()
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
   const computerName = savedName || '这台电脑'
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed: device.error === BROWSER_REMOVED })
+  const removed = device.error === BROWSER_REMOVED
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -212,7 +213,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
-      {active !== 'saved' && device.entries.length > 0 ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
+      {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />用加入链接</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
     </div>
@@ -251,9 +252,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'recovery') body = usable ? <RecoveryControls only="restore" /> : null
   else {
     alertInBody = true
-    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : '加入我的设备'}>
-      {/* A failure already says where to go next. */}
-      {failed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
+    body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : removed ? '重新加入' : '加入我的设备'}>
+      {/* A failure or the removal notice already says where to go next. */}
+      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">

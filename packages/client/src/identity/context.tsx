@@ -5,6 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
+import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
 import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
@@ -725,7 +726,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
       if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error('这条加入链接已失效。请在已有设备上重新添加。')
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error(spentInviteText)
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
     } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
