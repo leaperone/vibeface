@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, Laptop, Link2, ListChecks, RotateCw, Server, Square, X } from "lucide-react"
+import { ChevronLeft, CircleStop, Laptop, Link2, ListChecks, RotateCw, Server, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
@@ -105,10 +105,10 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {asking ? <QuestionCard question={asking} inTask /> : null}
       {stop ? <div className="grid gap-2">
         {confirming || action.busy === "stop" ? <div className="flex flex-wrap items-center gap-2">
-          <Button type="button" variant="destructive" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><Square aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>
+          <Button type="button" variant="destructive" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("stop", stop).finally(() => setConfirming(false))}><CircleStop aria-hidden="true" />{action.busy === "stop" ? "正在请求停止…" : "确认停止"}</Button>
           <Button type="button" variant="ghost" disabled={action.busy !== null} onClick={() => setConfirming(false)}>取消</Button>
           <span className="text-meta text-muted-foreground">停下后不会自动接着做</span>
-        </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><Square aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
+        </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
       {["failed", "interrupted", "rejected"].includes(state) ? <div className="grid gap-2">

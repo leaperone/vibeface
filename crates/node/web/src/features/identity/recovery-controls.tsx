@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, LockKeyhole, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -141,6 +141,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
     <p className="flex items-center gap-2 text-muted-foreground"><LockKeyhole aria-hidden="true" className="size-4 shrink-0" />没有恢复密码，这个文件打不开</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />只有这一份，丢了不能补</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
@@ -243,7 +244,7 @@ export function RecoveryReview() {
   </Panel>
 }
 
-/** Find devices again with the recovery file, or re-seal that file with a new password. */
+/** Find devices again with the recovery file (connection page only), or re-seal that file with a new password. */
 export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) {
   const device = useDevice()
   const localEntry = device.localSetup?.entry
@@ -252,19 +253,17 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
   // Opened from the reminder: the form may sit below the fold on a phone.
   useEffect(() => { if (open === 'passphrase' && !only) document.getElementById(PASSWORD_HASH)?.scrollIntoView({ block: 'center' }) }, [])
-  const rows = { restore: useRef<HTMLButtonElement>(null), passphrase: useRef<HTMLButtonElement>(null) }
+  const row = useRef<HTMLButtonElement>(null)
   const fold = useRef<HTMLElement>(null)
-  // Folding a form away takes the focused control with it; its row takes the focus back.
+  // Folding the form away takes the focused control with it; its row takes the focus back.
   function close() {
-    const mode = open
     setOpen(undefined)
     const active = document.activeElement
-    if (mode && (!active || active === document.body || fold.current?.contains(active))) rows[mode].current?.focus({ preventScroll: true })
+    if (!active || active === document.body || fold.current?.contains(active)) row.current?.focus({ preventScroll: true })
   }
   if (device.review?.kind === 'recovery') return <RecoveryReview />
-  // In settings each action is a row that folds its form out below itself; alone, the form stands as a card.
+  // In settings the password is a row that folds its form out below itself; alone, a form stands as a card.
   const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
-  const toggle = (mode: 'restore' | 'passphrase') => setOpen(open === mode ? undefined : mode)
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
       <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {
@@ -287,7 +286,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
         <InlineError error={error || null} />
-        <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
+        <div className="flex flex-wrap justify-end gap-2"><Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} />下一步</Button></div>
       </fieldset></form>
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
@@ -311,12 +310,11 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       </fieldset></form>
     </>, PASSWORD_HASH) : null
   const done = status ? <p role="status" className={only ? 'text-meta text-success' : 'px-4 py-3 text-meta text-success'}>{status}</p> : null
-  const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile landing={() => rows.passphrase.current} /></section> : null
+  const unsaved = device.unsavedRecovery && !device.recovered ? <section className="grid gap-3 px-4 pt-1 pb-4 sm:ps-15"><UnsavedRecoveryFile landing={() => row.current} /></section> : null
   if (only) return <div className="grid gap-4">{restoreForm}{passphraseForm}{done}</div>
+  // Finding devices again lives on the connection page: here it would start a real two-day recovery against this person's own devices.
   return <>
-    <SettingsRow ref={rows.restore} icon={ArchiveRestore} label="用恢复文件找回" expanded={open === 'restore'} className={open === 'restore' ? 'border-b-0' : undefined} onClick={() => toggle('restore')} />
-    {restoreForm}
-    <SettingsRow ref={rows.passphrase} icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => toggle('passphrase')} />
+    <SettingsRow ref={row} icon={KeyRound} label="换恢复密码" expanded={open === 'passphrase'} className={open === 'passphrase' ? 'border-b-0' : undefined} onClick={() => setOpen(open === 'passphrase' ? undefined : 'passphrase')} />
     {passphraseForm}
     {done}
     {unsaved}
