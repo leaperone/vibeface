@@ -323,7 +323,7 @@ function NamesStep({ computer, initial, onNext }: { computer?: string; initial: 
 
 type Run = (action: () => Promise<void>) => Promise<void>
 
-/** Step 2a: the recovery password; the file is sealed with it right away. */
+/** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
   const [short, setShort] = useState(false)
@@ -353,7 +353,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   </Panel>
 }
 
-/** Step 2b: download the sealed file, confirm it is stored apart from the password, then create. */
+/** Step 3: download the sealed file, confirm it is stored apart from the password, then create. */
 function RecoveryStep({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
   const [downloaded, setDownloaded] = useState(false)
