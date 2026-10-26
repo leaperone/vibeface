@@ -646,7 +646,7 @@ def progress_observer(expected):
             if seen.get(actor) != stage:
                 seen[actor] = stage
                 try:
-                    print("STAGE delivery-live " + actor + " " + stage, flush=True)
+                    print("::notice title=Live delivery progress::" + actor + " " + stage, flush=True)
                 except OSError:
                     pass
         return dict(verified)
@@ -1489,7 +1489,7 @@ def self_test_ui(directory):
                 assert str(error) == "pending command exceeded its explicit runtime limit"
             else:
                 raise AssertionError("Progress must not accept an unfinished command")
-        assert output.call_args_list[-1].args == ("STAGE delivery-live inside probe-build",)
+        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside probe-build",)
         expected["inside"] = "probe-build"
         original = RuntimeError("private-business-error")
         with patch("time.monotonic", return_value=0):
@@ -1500,7 +1500,7 @@ def self_test_ui(directory):
         enter("paid-acceptance")
         with patch("time.monotonic", side_effect=[0, 2]), patch("time.sleep"):
             rejected(lambda: join_owned(running, ready, running, 1, observe=observe))
-        assert output.call_args_list[-1].args == ("STAGE delivery-live inside paid-acceptance",)
+        assert output.call_args_list[-1].args == ("::notice title=Live delivery progress::inside paid-acceptance",)
         expected["inside"] = "paid-acceptance"
         snapshot = progress_ui / "paid-progress.json"
         valid = json.loads(snapshot.read_bytes())
