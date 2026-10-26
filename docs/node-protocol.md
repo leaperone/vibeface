@@ -383,7 +383,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 `relay_mode=discovery-only` 的公共入口只注册 `vibeface/discovery/1`，不启动 `iroh-relay`，不提供 HTTP 浏览器转发，也不接受 `SYNC`、`BLOB`、`RPC`、`CLIENT`、`JOIN` 或 `DECISION` 业务 ALPN。网页开启时只提供静态资源和服务信息。
 
-发现协议使用长度前缀 JSON，单帧最多 512 字节，未知字段被拒绝。请求只有 `register`、`lookup {device_id}` 和空的 `probe`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住，观察记录不落入持久签名地址簿。
+发现协议使用长度前缀 JSON，单帧最多 512 字节，未知字段被拒绝。请求只有 `register`、`lookup {device_id}` 和空的 `probe`。服务端用连接的 TLS 身份和已选中的实际 IP 路径构造 `registered {address}`、`peer {device_id,address}` 和 `notice {device_id,address}`；不接受客户端提交地址或任意转发载荷。对端据通知发起固定空探测，再通过原有业务 ALPN 通信。发现服务的身份由客户端配置钉住。对端查询和通知提供的地址只作临时提示；本机观察地址会随自身签名地址记录在个人网络内传播。
 
 总控制连接上限为 512，同来源 IP 上限 8。租约覆盖整条控制会话和读写，最长 60 秒，每连接最多 60 个请求。每个登记最多暂存 8 条连接通知，同一目标的通知间隔至少 250 毫秒；客户端最多同时进行 8 个探测。一个设备可有并发登记，结束时只清理该连接的登记；临时加入连接退出后，已有主连接仍可被找到。
 
