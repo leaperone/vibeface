@@ -370,7 +370,7 @@ jobs:
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
       - name: Cache Chromium binaries
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: .artifacts/e2e/browsers
           key: ${{ matrix.runner }}-${{ runner.arch }}-chromium-${{ hashFiles('pnpm-lock.yaml') }}
