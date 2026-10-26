@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react"
-import { ActionCard, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
+import { ActionCard, claimFocus, Details, DetailRow, InlineError, SafetyCode, Skeleton, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
@@ -26,9 +26,28 @@ export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean
     const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 2000)
     return () => clearInterval(timer)
   }, [waiting, device.ready])
+  // A handled card leaves with the button just pressed; the card now in its place, or the sheet or page title, takes the focus.
+  const list = useRef<HTMLElement>(null)
+  const held = useRef<{ id: string; index: number; title: HTMLElement | null } | null>(null)
+  const ids = joins.map((request) => request.join_id).join("\n")
+  useLayoutEffect(() => {
+    const last = held.current
+    if (!last || joins.some((request) => request.join_id === last.id)) return
+    held.current = null
+    const cards = list.current?.children
+    const next = cards?.length ? cards[Math.min(last.index, cards.length - 1)] : last.title
+    if (next instanceof HTMLElement && next.isConnected) claimFocus(next)
+  }, [ids])
   if (!joins.length) return null
-  return <section className="grid gap-3" aria-label="等待加入">
-    {joins.map((request) => <JoinCard key={request.join_id} request={request} auto={issuing} onAllowed={onAllowed} />)}
+  return <section ref={list} className="grid gap-3" aria-label="等待加入" onFocus={(event) => {
+    const index = [...event.currentTarget.children].findIndex((card) => card.contains(event.target))
+    const scope = event.currentTarget.closest<HTMLElement>("[role=dialog]") ?? document.getElementById("main")
+    if (joins[index]) held.current = { id: joins[index].join_id, index, title: scope?.querySelector<HTMLElement>("h1, h2") ?? null }
+  }} onBlur={(event) => {
+    // Focus moved on to something else (say the sheet over this page), so a card leaving later is not this list's to answer.
+    if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) held.current = null
+  }}>
+    {joins.map((request) => <div key={request.join_id} tabIndex={-1} className="min-w-0 outline-none"><JoinCard request={request} auto={issuing} onAllowed={onAllowed} /></div>)}
   </section>
 }
 

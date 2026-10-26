@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowDownToLine, ArrowRightLeft, Ban, BellOff, Bot, ChevronRight, CircleCheck, CircleStop, CircleX, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, BotAvatar, Details, InlineError } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -214,7 +214,10 @@ export function ConversationScreen() {
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
           <h2 className="text-heading font-semibold">{bot.name}</h2>
-          {needsSetup ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+          {needsSetup ? <>
+            <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
+            <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+          </>
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
