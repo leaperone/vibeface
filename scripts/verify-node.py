@@ -1133,7 +1133,7 @@ def fixture_codex(arguments):
 
 
 READ_TOOLS = {"nodes", "context", "work_status", "call_lookup", "read_skill", "recall", "fetch_url", "list_bots", "read_bot"}
-WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session"}
+WORK_TOOLS = {"dispatch_work", "interrupt_work", "hand_over_session", "propose_provider_config", "apply_provider_config"}
 WAKE_TOOLS = {"remind", "message_bot"}
 SETTINGS_TOOLS = {"update_profile", "save_skill", "remove_skill", "save_schedule", "remove_schedule", "remember", "forget",
                   "create_bot", "configure_bot", "delete_bot"}

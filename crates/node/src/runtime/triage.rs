@@ -2918,42 +2918,84 @@ mod tests {
             let saved = || Config::load(&dir).map(|config| config.triage.codex_sessions);
 
             let asked = node
-                .propose_provider_config(&network, "c", "m-1", json!({"codex_sessions": codex.join("sessions")}))
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "m-1",
+                    json!({"codex_sessions": codex.join("sessions")}),
+                )
                 .await?;
             assert_eq!(asked["status"], "asked");
             let question = asked["question_id"].as_str().unwrap().to_owned();
             let card = unanswered(&node).await?;
             assert_eq!(card.len(), 1);
-            assert!(!card[0].to_string().contains(&*dir.to_string_lossy()), "the card names no full local path");
-            assert!(node.apply_provider_config(&network, "c", &question).await.is_err(), "nothing is written before an answer");
+            assert!(
+                !card[0].to_string().contains(&*dir.to_string_lossy()),
+                "the card names no full local path"
+            );
+            assert!(
+                node.apply_provider_config(&network, "c", &question)
+                    .await
+                    .is_err(),
+                "nothing is written before an answer"
+            );
             assert_eq!(saved()?, None);
 
             answer(&node, &question, "不允许").await?;
-            assert_eq!(node.apply_provider_config(&network, "c", &question).await?["status"], "declined");
+            assert_eq!(
+                node.apply_provider_config(&network, "c", &question).await?["status"],
+                "declined"
+            );
             assert_eq!(saved()?, None, "a declined proposal writes nothing");
             assert_eq!(node.triage.config().codex_sessions, None);
 
             let asked = node
-                .propose_provider_config(&network, "c", "m-2", json!({"codex_sessions": codex.join("archived")}))
+                .propose_provider_config(
+                    &network,
+                    "c",
+                    "m-2",
+                    json!({"codex_sessions": codex.join("archived")}),
+                )
                 .await?;
             let question = asked["question_id"].as_str().unwrap().to_owned();
-            assert!(node.apply_provider_config(&network, "other", &question).await.is_err(), "another chat cannot apply it");
+            assert!(
+                node.apply_provider_config(&network, "other", &question)
+                    .await
+                    .is_err(),
+                "another chat cannot apply it"
+            );
             answer(&node, &question, "允许").await?;
             let applied = node.apply_provider_config(&network, "c", &question).await?;
             assert_eq!(applied["status"], "applied");
             assert_eq!(saved()?, Some(codex.join("archived")));
-            assert_eq!(node.triage.config().codex_sessions, Some(codex.join("archived")));
+            assert_eq!(
+                node.triage.config().codex_sessions,
+                Some(codex.join("archived"))
+            );
             assert_eq!(
                 node.apply_provider_config(&network, "c", &question).await?,
                 applied,
                 "a retry reads the first outcome back"
             );
             assert_eq!(
-                node.propose_provider_config(&network, "c", "m-3", json!({"codex_sessions": codex.join("archived")})).await?["status"],
+                node.propose_provider_config(
+                    &network,
+                    "c",
+                    "m-3",
+                    json!({"codex_sessions": codex.join("archived")})
+                )
+                .await?["status"],
                 "unchanged"
             );
             assert!(
-                node.propose_provider_config(&network, "c", "m-4", json!({"codex_sessions": "relative"})).await.is_err(),
+                node.propose_provider_config(
+                    &network,
+                    "c",
+                    "m-4",
+                    json!({"codex_sessions": "relative"})
+                )
+                .await
+                .is_err(),
                 "only absolute paths that exist are proposed"
             );
             Ok::<_, anyhow::Error>(())

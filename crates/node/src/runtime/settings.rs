@@ -386,13 +386,25 @@ impl Runtime {
         let mut manager = previous_manager.clone();
         let previous_triage = self.triage.config();
         let mut triage = previous_triage.clone();
-        edit(Target { local: &mut next, manager: &mut manager, triage: &mut triage })?;
+        edit(Target {
+            local: &mut next,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
         let filled = discovery::missing(
-            &Target { local: &mut next, manager: &mut manager, triage: &mut triage },
+            &Target {
+                local: &mut next,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
             false,
             &self.host,
         )?;
-        filled.apply(Target { local: &mut next, manager: &mut manager, triage: &mut triage })?;
+        filled.apply(Target {
+            local: &mut next,
+            manager: &mut manager,
+            triage: &mut triage,
+        })?;
         if let Some(chosen) = &manager {
             self.ensure_default_workspace(&chosen.workspace)?;
         }
@@ -623,7 +635,14 @@ impl Runtime {
         let question_id = format!(
             "q-{}",
             &crate::crypto::digest(
-                [device.as_str(), scope, trigger, &serde_json::to_string(&paths)?].join("\0").as_bytes()
+                [
+                    device.as_str(),
+                    scope,
+                    trigger,
+                    &serde_json::to_string(&paths)?
+                ]
+                .join("\0")
+                .as_bytes()
             )[..32]
         );
         let body = crate::model::EventBody::QuestionAsked {
@@ -673,7 +692,14 @@ impl Runtime {
         let shown = |path: &PathBuf| self.host.display(path);
         let mut lines = vec!["要把这台设备的 AI 设置改成这样吗？".to_owned()];
         if let Some(on) = paths.execution {
-            lines.push(if on { "用 Codex 执行任务" } else { "不再用 Codex 执行任务" }.into());
+            lines.push(
+                if on {
+                    "用 Codex 执行任务"
+                } else {
+                    "不再用 Codex 执行任务"
+                }
+                .into(),
+            );
         }
         if let Some(server) = &paths.app_server {
             lines.push(match (&server.mode, &server.socket) {

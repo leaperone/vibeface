@@ -109,7 +109,9 @@ pub fn runnable(program: &Path, path: Option<&OsString>) -> bool {
     if program.components().count() != 1 || program.is_absolute() {
         return executable_file(program);
     }
-    path.is_some_and(|paths| std::env::split_paths(paths).any(|dir| executable_file(&dir.join(program))))
+    path.is_some_and(|paths| {
+        std::env::split_paths(paths).any(|dir| executable_file(&dir.join(program)))
+    })
 }
 
 /// Where Codex's running App Server listens: the desktop app and `codex app-server proxy` keep
@@ -307,12 +309,20 @@ pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Resu
         env: std::mem::take(env),
     };
     let filled = missing(
-        &Target { local: &mut local, manager: &mut config.manager, triage: &mut config.triage },
+        &Target {
+            local: &mut local,
+            manager: &mut config.manager,
+            triage: &mut config.triage,
+        },
         false,
         host,
     );
     if let Ok(filled) = &filled {
-        filled.apply(Target { local: &mut local, manager: &mut config.manager, triage: &mut config.triage })?;
+        filled.apply(Target {
+            local: &mut local,
+            manager: &mut config.manager,
+            triage: &mut config.triage,
+        })?;
     }
     config.providers = local.switches;
     config.codex_bin = local.codex_bin;
@@ -356,7 +366,10 @@ mod tests {
     use crate::providers::Providers;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vibeface-discovery-{name}-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "vibeface-discovery-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
     }
@@ -416,10 +429,17 @@ mod tests {
             path: None,
         };
         let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
-        let target = Target { local: &mut local, manager: &mut manager, triage: &mut triage };
+        let target = Target {
+            local: &mut local,
+            manager: &mut manager,
+            triage: &mut triage,
+        };
         let error = missing(&target, true, &host).unwrap_err().to_string();
         assert!(error.contains("no Codex folder found"), "{error}");
-        assert!(!error.contains(&root.to_string_lossy().into_owned()), "the error names no local path");
+        assert!(
+            !error.contains(&root.to_string_lossy().into_owned()),
+            "the error names no local path"
+        );
         assert!(
             missing(&target, false, &host)?.is_empty(),
             "nothing is looked up while Codex is not in use"
@@ -441,13 +461,20 @@ mod tests {
         };
         let (mut local, mut manager, mut triage) = (local(), None, TriageConfig::default());
         let found = missing(
-            &Target { local: &mut local, manager: &mut manager, triage: &mut triage },
+            &Target {
+                local: &mut local,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
             true,
             &host,
         )?;
         assert_eq!(
             found.app_server,
-            Some(AppServer { mode: AppServerMode::Spawn, socket: None })
+            Some(AppServer {
+                mode: AppServerMode::Spawn,
+                socket: None
+            })
         );
         assert_eq!(found.codex_home.as_ref(), Some(&codex));
         assert_eq!(found.codex_sessions, Some(codex.join("sessions")));
@@ -456,15 +483,25 @@ mod tests {
         let socket = codex.join("app-server-control/app-server-control.sock");
         std::os::unix::fs::symlink(root.join("gone.sock"), &socket)?;
         let found = missing(
-            &Target { local: &mut local, manager: &mut manager, triage: &mut triage },
+            &Target {
+                local: &mut local,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
             true,
             &host,
         )?;
         assert_eq!(
             found.app_server,
-            Some(AppServer { mode: AppServerMode::System, socket: Some(socket) })
+            Some(AppServer {
+                mode: AppServerMode::System,
+                socket: Some(socket)
+            })
         );
-        assert_eq!(found.codex_home, None, "the system App Server keeps its own folder");
+        assert_eq!(
+            found.codex_home, None,
+            "the system App Server keeps its own folder"
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -477,21 +514,33 @@ mod tests {
         let dir = root.join("node");
         crate::config::private_dir(&dir)?;
         // Saved by a Node before discovery: execution on, nothing to run it with.
-        let mut config = serde_json::to_value(Config::local("127.0.0.1:0".parse()?, vec![], false))?;
+        let mut config =
+            serde_json::to_value(Config::local("127.0.0.1:0".parse()?, vec![], false))?;
         config["providers"]["execution"] = true.into();
         std::fs::write(dir.join("config.json"), serde_json::to_vec(&config)?)?;
-        let host = Host { codex_home: None, home: Some(root.clone()), path: None };
+        let host = Host {
+            codex_home: None,
+            home: Some(root.clone()),
+            path: None,
+        };
         complete_saved(&dir, &host)?;
         let saved = Config::load(&dir)?;
         assert_eq!(saved.providers.codex_app_server.mode, AppServerMode::Spawn);
         assert_eq!(saved.triage.codex_sessions, Some(codex.join("sessions")));
         assert_eq!(
-            ProviderEnv::load(&dir)?.get(crate::providers::Provider::Codex).get(CODEX_HOME).map(PathBuf::from),
+            ProviderEnv::load(&dir)?
+                .get(crate::providers::Provider::Codex)
+                .get(CODEX_HOME)
+                .map(PathBuf::from),
             Some(codex.clone())
         );
         let before = std::fs::read(dir.join("config.json"))?;
         complete_saved(&dir, &host)?;
-        assert_eq!(std::fs::read(dir.join("config.json"))?, before, "a saved path is not looked up again");
+        assert_eq!(
+            std::fs::read(dir.join("config.json"))?,
+            before,
+            "a saved path is not looked up again"
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -514,7 +563,11 @@ mod tests {
         });
         let (mut local, mut triage) = (local(), TriageConfig::default());
         let found = missing(
-            &Target { local: &mut local, manager: &mut manager, triage: &mut triage },
+            &Target {
+                local: &mut local,
+                manager: &mut manager,
+                triage: &mut triage,
+            },
             false,
             &host,
         )?;
@@ -522,7 +575,11 @@ mod tests {
         manager.as_mut().unwrap().cursor_sdk_bin = root.join("chosen/cursor-sdk-bridge");
         assert!(
             missing(
-                &Target { local: &mut local, manager: &mut manager, triage: &mut triage },
+                &Target {
+                    local: &mut local,
+                    manager: &mut manager,
+                    triage: &mut triage
+                },
                 false,
                 &host,
             )?
@@ -530,7 +587,10 @@ mod tests {
             "a path the owner chose stays, even when it is gone"
         );
         assert_eq!(host.display(&root.join(".codex")), "~/.codex");
-        assert_eq!(host.display(Path::new("/opt/tools/bin/codex")), "…/bin/codex");
+        assert_eq!(
+            host.display(Path::new("/opt/tools/bin/codex")),
+            "…/bin/codex"
+        );
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
