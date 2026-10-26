@@ -38,13 +38,13 @@ function SettingsPage() {
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
         <NotificationValue />
       </SettingsRow>
-      {operator ? <TriageSettings /> : null}
     </SettingsGroup>
     <SettingsGroup title="外观">
       <SettingsRow icon={Palette} label="主题" description={<SegmentedValue value={theme} options={themes} />}>
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
+    {operator ? <SettingsGroup><TriageSettings /></SettingsGroup> : null}
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
     <SettingsGroup title="文件传输">
       <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="公益转发与实验付费交付"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>

@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Check, Copy, Globe, Info, Server, Wifi, WifiOff, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { terms } from '@/lib/glossary'
 import { Details, InlineError, SettingsDisclosure, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -34,7 +35,8 @@ export function ConnectionSettings() {
   const current = ready ? keyOf(ready.entry) : ''
   const others = entries.filter((entry) => keyOf(entry) !== current)
   return <>
-    {ready ? <SettingsRow icon={Globe} label={<span title={ready.entry.address}>{device.entryName(ready.entry) || addressName(ready.entry.address)}</span>} description={hostOf(ready.entry.address)}>
+    {ready ? <SettingsRow icon={Globe} label={<span title={ready.entry.address}>{device.entryName(ready.entry) || addressName(ready.entry.address)}</span>}
+      description={connectionOnline ? <span className="inline-flex items-center gap-1"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />{terms.encrypted.label}</span> : undefined}>
       <span className={cn('flex items-center gap-1.5', connectionOnline ? 'text-success' : 'text-muted-foreground')}>{connectionOnline ? <Wifi aria-hidden="true" className="size-4" /> : <WifiOff aria-hidden="true" className="size-4" />}{connectionOnline ? '在线' : '离线'}</span>
     </SettingsRow> : null}
     {others.map((entry) => <SettingsRow key={keyOf(entry)} icon={Server} label={<span title={entry.address}>{device.entryName(entry) || addressName(entry.address)}</span>} description={hostOf(entry.address)}>
@@ -43,6 +45,7 @@ export function ConnectionSettings() {
     </SettingsRow>)}
     {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
     <SettingsDisclosure icon={Info} label="详细信息">
+      {ready ? <p className="flex min-w-0 items-center justify-between gap-3 text-meta"><span className="shrink-0 text-muted-foreground">{terms.address.label}</span><span className="truncate" title={ready.entry.address}>{hostOf(ready.entry.address) || ready.entry.address}</span></p> : null}
       <CopyDiagnostics lines={[['个人网络', directory?.network_id || ready?.principal.network_id], ['授权版本', directory?.epoch], ['这个浏览器', identity?.deviceId], ['当前连接', ready?.entry.device_id]]} />
       <Details label="手动添加地址">
         <form className="grid gap-2" noValidate onSubmit={(event) => {

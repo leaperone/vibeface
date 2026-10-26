@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react"
-import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, X, type LucideIcon } from "lucide-react"
+import { Check, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, FolderOpen, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { terms } from "@/lib/glossary"
+import { rawError } from "@vibeface/client/lib/errors.ts"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
@@ -56,8 +57,8 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
 }
 
 /** Where Codex work runs: the App Server already running on this computer, or one the device starts. */
-function AppServerSettings({ server, working, blocked, busy, save, test }: {
-  server: AppServer; working: boolean; blocked: boolean; busy: string
+function AppServerSettings({ server, working, blocked, busy, pick, save, test }: {
+  server: AppServer; working: boolean; blocked: boolean; busy: string; pick: boolean
   save(key: string, change: Omit<Change, "provider">): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
   const [socket, setSocket] = useState(server.socket ?? "")
@@ -81,10 +82,11 @@ function AppServerSettings({ server, working, blocked, busy, save, test }: {
     </div>
     {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
     {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
-    {server.mode === "system" ? <Details label="手动指定">
+    {server.mode === "system" || pick ? <Details label="手动指定" open={pick || undefined}>
       {inUse.map((path) => <code key={path} className="font-mono text-foreground">{path}</code>)}
       <form className="flex min-w-0 gap-2" onSubmit={(event) => { event.preventDefault(); void save("socket", { app_server: { mode: "system", socket: socket.trim() || null } }) }}>
-        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working} onChange={(event) => setSocket(event.target.value)} />
+        <Input aria-label="指定连接路径" className="min-w-0 font-mono" placeholder="App Server socket 的绝对路径" spellCheck={false} value={socket} disabled={working}
+          data-fix={pick ? "" : undefined} onChange={(event) => setSocket(event.target.value)} />
         {socket.trim() !== (server.socket ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy.endsWith(":socket")} />保存</Button> : null}
       </form>
     </Details> : null}
@@ -94,8 +96,8 @@ function AppServerSettings({ server, working, blocked, busy, save, test }: {
 /** Opens a provider's settings on this page and moves focus into them; every fix action lands here. */
 function openProvider(provider: ProviderId) {
   const card = document.getElementById(`provider-${provider}`)
-  if (!(card instanceof HTMLDetailsElement)) return
-  card.open = true
+  if (!card) return
+  if (card instanceof HTMLDetailsElement) card.open = true
   card.scrollIntoView({ block: "center", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" })
   card.querySelector<HTMLElement>("[data-fix], input")?.focus({ preventScroll: true })
 }
@@ -132,6 +134,15 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     }
   }
   const load = () => call("load", null, "node_settings")
+  /** After a write that failed, possibly after the device applied it: read the state again instead of resending; the error stays shown. */
+  async function reconcile() {
+    if (!ready?.isCurrent()) return
+    const connection = ready, owner = sequence.current
+    try {
+      const parsed = parseNodeSettings(await connection.request("node_settings"))
+      if (owner === sequence.current && connection.isCurrent()) setResponse(parsed)
+    } catch { /* the shown error already says what failed */ }
+  }
   useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
@@ -158,7 +169,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   return <div className="grid gap-5">
     <ul className="grid gap-3">
       {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
-        error={error?.at === item.provider ? error.cause : null} test={test}
+        error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
@@ -168,19 +179,21 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
 }
 
 /**
- * A chip that turns one use of a provider on or off. On, it is tinted with a check, so a phone without hover still reads it;
- * never solid, so the page's own next step stays the only filled button.
+ * A chip that turns one use of a provider on or off. A small switch inside says it is a control, not a status; on, the chip is also tinted,
+ * so a phone without hover still reads it. Never solid, so the page's own next step stays the only filled button.
  */
-function RoleToggle({ icon: Icon, label, name, pressed, busy, disabled, onClick }: { icon: LucideIcon; label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
+function RoleToggle({ label, name, pressed, busy, disabled, onClick }: { label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
     className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
-    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : pressed ? <Check aria-hidden="true" className="text-brand" /> : <Icon aria-hidden="true" />}{label}
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/45")}>
+      <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
+    </span>}{label}
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test }: {
+function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test, reconcile }: {
   item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
-  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
+  change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
@@ -195,6 +208,27 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   useEffect(() => setBin(item.bin ?? ""), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
   const issue = item.state === "needs_setup" ? item.issues[0] : undefined
+  // The App Server already running needs its socket named first; until then the device refuses Codex work.
+  const server = item.app_server
+  const noSocket = server?.mode === "system" && !server.socket
+  const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
+  const [pick, setPick] = useState(0)
+  // The Codex folder a managed App Server needs before Codex work starts; null while not asked for.
+  const [home, setHome] = useState<string | null>(null)
+  useEffect(() => { setAsked(null); setHome(null); setPick(0) }, [server?.mode])
+  useEffect(() => { if (pick) openProvider(item.provider) }, [pick])
+  const refused = /explicit App Server socket/i.test(rawError(error))
+  const choosing = refused || (noSocket && asked !== null)
+  const turnOn = (role: "bot" | "execution") => noSocket ? setAsked(role) : void change(role, role === "bot" ? { bot: true } : { execution: true })
+  const serverSettings = server ? <AppServerSettings server={server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} pick={pick > 0} save={change} test={test} /> : null
+  const homeSet = item.env.some((row) => row.name === "CODEX_HOME" && row.set)
+  const homePath = home?.trim() ?? ""
+  const homeValid = /^(\/|[A-Za-z]:[\\/])/.test(homePath)
+  // One write: the folder, the managed App Server and the use asked for, so a failure leaves nothing half done.
+  const startOwn = (codexHome?: string) => change(asked ?? "app_server", {
+    app_server: { ...spawnServer, socket: server?.socket ?? null }, env: codexHome ? { CODEX_HOME: codexHome } : undefined,
+    bot: asked === "bot" || undefined, execution: asked === "execution" || undefined,
+  }).then((ok) => { if (!ok) void reconcile() })
   const fix = () => {
     if (issue?.code === "env_missing") { setEditing(issue.name); setValue("") }
     openProvider(item.provider)
@@ -211,17 +245,32 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>
       </div>
       <div className="ms-auto flex shrink-0 gap-2">
-        <RoleToggle icon={terms.bot.icon} label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
-          onClick={() => void change("bot", { bot: !bot })} />
-        {item.supports.includes("execution") && !onboarding ? <RoleToggle icon={terms.task.icon} label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
-          onClick={() => void change("execution", { execution: !execution })} /> : null}
+        <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+          onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
+        {item.supports.includes("execution") && !onboarding ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
+          onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
     </div>
-    {issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
+    {choosing ? <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2 text-meta">
+      <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />还没选怎么连 Codex</span>
+      <span className="flex flex-wrap gap-2">
+        {noSocket ? <Button type="button" size="sm" variant="outline" disabled={working} aria-expanded={asked && !homeSet ? home !== null : undefined}
+          onClick={() => asked && !homeSet ? setHome(home ?? "") : void startOwn()}><BusyIcon busy={working && home === null} icon={Play} />改由 Vibeface 启动</Button> : null}
+        <Button type="button" size="sm" variant="ghost" onClick={() => setPick(pick + 1)}><Monitor aria-hidden="true" />指定路径</Button>
+      </span>
+      {home !== null ? <form className="grid basis-full gap-1" onSubmit={(event) => { event.preventDefault(); if (homeValid) void startOwn(homePath) }}>
+        <label htmlFor={`${item.provider}-home`} className="font-medium text-muted-foreground">Codex 目录</label>
+        <div className="flex min-w-0 gap-2">
+          <Input id={`${item.provider}-home`} autoFocus className="min-w-0 font-mono" placeholder="/Users/你的用户名/.codex" spellCheck={false} maxLength={4096}
+            value={home} disabled={working} aria-invalid={homePath !== "" && !homeValid ? true : undefined} onChange={(event) => setHome(event.target.value)} />
+          <Button type="submit" variant="outline" disabled={working || !homeValid}><BusyIcon busy={working} icon={Check} />确认</Button>
+        </div>
+      </form> : null}
+    </div> : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
-      {issue.code === "app_server_not_found" && item.app_server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
-          onClick={() => void change("app_server", { app_server: { ...spawnServer, socket: item.app_server?.socket ?? null } })}>改由 Vibeface 启动</button>
+      {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
+          onClick={() => void startOwn()}>改由 Vibeface 启动</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={docs + checks[item.provider][0].doc} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={fix}>去设置</button>}
     </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
@@ -229,12 +278,13 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <span className="min-w-0 truncate">{check.label}</span>
       <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={docs + check.doc} target="_blank" rel="noopener noreferrer">怎么装</a>
     </li>)}</ul> : null}
-    {onboarding ? null : <details id={`provider-${item.provider}`} className="details border-t">
+    {onboarding ? pick && serverSettings ? <div id={`provider-${item.provider}`} className="border-t p-3">{serverSettings}</div> : null
+      : <details id={`provider-${item.provider}`} className="details border-t">
       <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
       <div className="grid gap-4 px-3 pb-3">
-        {item.app_server ? <AppServerSettings server={item.app_server} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test} /> : null}
+        {serverSettings}
 
         {item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
           <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
@@ -287,7 +337,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>
     </details>}
-    {error ? <InlineError error={error} className="px-3 pb-3" /> : null}
+    {error && !refused ? <InlineError error={error} className="px-3 pb-3" /> : null}
   </li>
 }
 

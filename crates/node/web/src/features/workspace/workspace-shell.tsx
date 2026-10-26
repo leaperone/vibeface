@@ -2,11 +2,11 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldCheck, Star, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldCheck, Star, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
-import { BotAvatar, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { BotAvatar, claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -24,7 +24,8 @@ import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { LocalSession } from "./local-session"
 
-export function WorkspaceShell({ children }: { children: ReactNode }) {
+/** `landing`: the title takes the focus when the shell replaces the page the person was on. */
+export function WorkspaceShell({ children, landing = false }: { children: ReactNode; landing?: boolean }) {
   const [sidebarOpen, setSidebarOpen] = useState(() => typeof window === "undefined" || window.matchMedia("(min-width: 1024px)").matches)
   useEffect(() => {
     const wide = window.matchMedia("(min-width: 1024px)")
@@ -32,7 +33,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     wide.addEventListener("change", follow)
     return () => wide.removeEventListener("change", follow)
   }, [])
-  return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout>{children}</WorkspaceLayout></SidebarProvider>
+  return <SidebarProvider className="workspace-shell" open={sidebarOpen} onOpenChange={setSidebarOpen}><WorkspaceLayout landing={landing}>{children}</WorkspaceLayout></SidebarProvider>
 }
 
 const CreateBot = createContext<() => void>(() => {})
@@ -42,7 +43,7 @@ export const useCreateBot = () => useContext(CreateBot)
 const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/transfers": "文件传输" }
 
-function WorkspaceLayout({ children }: { children: ReactNode }) {
+function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
   const device = useDevice()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
@@ -151,8 +152,8 @@ function WorkspaceLayout({ children }: { children: ReactNode }) {
           </div>
           <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
-              {chatRoute ? <BotPanelButton /> : null}
-              <h1 className="min-w-0 truncate text-heading font-semibold" title={title}>{title}</h1>
+              {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", chatRoute ? "flex" : "truncate")} title={chatRoute ? undefined : title}>{chatRoute ? <BotPanelButton /> : title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
@@ -211,10 +212,10 @@ export function ConnectionCapsule() {
   const address = device.ready?.entry.address ?? ""
   const entryId = device.ready?.entry.device_id
   const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
-  const name = entryName ? `经 ${entryName}` : addressName(address)
+  const name = entryName || addressName(address)
   // Devices of another network this browser opened before; the current network fails over by itself.
   const others = device.entries.filter((item) => !item.local && !device.directory?.members.some((member) => member.device_id === item.device_id))
-  const state: { label: string; icon: LucideIcon; tone: string } = link.kind === "connecting"
+  const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
       ? { label: "离线", icon: WifiOff, tone: "text-muted-foreground" }
@@ -224,10 +225,10 @@ export function ConnectionCapsule() {
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
-        : { label: "在线", icon: Wifi, tone: "text-success" }
+        : { label: "在线", icon: terms.encrypted.icon, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
-      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.label}`}>
+      <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
         <state.icon aria-hidden="true" className={cn("size-4 shrink-0", state.tone)} />
         <span className="min-w-0 flex-1 truncate">{name}</span>
         <span className={cn("shrink-0", state.tone)}>{state.label}</span>

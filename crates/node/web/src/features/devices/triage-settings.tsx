@@ -5,15 +5,17 @@ import { BusyIcon, Details, InlineError, Segmented, SettingsDisclosure, Settings
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
+import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
 import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
-const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", "也发给机器人", Layers]]
+const chat = terms.externalChat.label
+const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", `也发给${chat}`, Layers]]
 const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions" | "codex_sessions">
 
-/** Where this device sends sessions that need the person, plus the chat bot (Grok Bot) channel both ways. Saves on each change. */
+/** One folded row: where this device sends sessions that need the person, plus the external chat (Grok Bot) channel both ways. Saves on each change. */
 export function TriageSettings() {
   const { ready } = useDevice()
   const [settings, setSettings] = useState<Settings | null>(null)
@@ -25,6 +27,7 @@ export function TriageSettings() {
   const [label, setLabel] = useState("")
   const [token, setToken] = useState("")
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
+  const [open, setOpen] = useState(false)
   const sequence = useRef(0)
 
   async function call(key: string, method: string, params?: Record<string, unknown>) {
@@ -47,7 +50,9 @@ export function TriageSettings() {
   }
   useEffect(() => { setSettings(null); void call("load", "triage_settings"); return () => { sequence.current += 1 } }, [ready])
 
-  if (!settings) return <div className="px-4 py-3">{error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-8" />}</div>
+  const header = <SettingsRow icon={terms.externalChat.icon} label={`转发到${chat}`} expanded={open} onClick={() => setOpen(!open)}>{settings && !open ? settings.webhook_url ? "已连接" : "未连接" : null}</SettingsRow>
+  if (!open) return header
+  if (!settings) return <>{header}<div className="px-4 py-3">{error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-8" />}</div></>
   const config: Config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
   const save = (key: string, patch: Partial<Config>, extra: Record<string, unknown> = {}) => {
     const next = { ...config, ...patch }
@@ -62,6 +67,7 @@ export function TriageSettings() {
   const { pending, delivered, dead } = settings.outbox
 
   return <>
+    {header}
     <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时" stacked>
       <Segmented label="会话等你时" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
@@ -81,12 +87,12 @@ export function TriageSettings() {
       </div>
     </SettingsDisclosure>
 
-    <SettingsDisclosure icon={Webhook} label="聊天机器人" value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
+    <SettingsDisclosure icon={Webhook} label={chat} value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
-        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给机器人</p>
-        <Input aria-label="机器人地址" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
+        <Input aria-label={`${chat}地址`} type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
         <div className="flex min-w-0 gap-2">
-          <Input aria-label="机器人密钥" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : "机器人密钥"} value={secret} onChange={(event) => setSecret(event.target.value)} />
+          <Input aria-label={`${chat}密钥`} type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : `${chat}密钥`} value={secret} onChange={(event) => setSecret(event.target.value)} />
           {settings.webhook_secret_set ? <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => void save("webhook", {}, { webhook_secret: null })}><Trash2 aria-hidden="true" /></Button> : null}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -106,8 +112,8 @@ export function TriageSettings() {
         </div>
       </form>
 
-      <Details label="让机器人代你回答">
-        <p className="flex items-center gap-2 text-meta text-foreground"><KeyRound aria-hidden="true" className="size-4" />机器人用这个地址和授权码回话</p>
+      <Details label={`让${chat}代你回答`}>
+        <p className="flex items-center gap-2 text-meta text-foreground"><KeyRound aria-hidden="true" className="size-4" />{chat}用这个地址和授权码回话</p>
         <code className="truncate rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta" title={settings.decision_url}>{settings.decision_url}</code>
         {token ? <div role="status" className="flex min-w-0 items-center gap-2 rounded-lg border border-warning-border bg-warning-soft px-3 py-2">
           <code className="min-w-0 flex-1 break-all font-mono text-meta">{token}</code>
@@ -120,8 +126,8 @@ export function TriageSettings() {
           <Button type="button" variant="ghost" size="icon" aria-label={`撤销 ${item.label || "授权码"}`} title="撤销" disabled={Boolean(busy)} onClick={() => void call("revoke", "revoke_decision_token", { token_id: item.token_id })}><Trash2 aria-hidden="true" /></Button>
         </li>)}</ul> : null}
         <div className="flex min-w-0 gap-2">
-          <Input aria-label="授权码名称" className="min-w-0" placeholder="聊天机器人" maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />
-          <Button type="button" variant="outline" disabled={Boolean(busy)} onClick={() => void call("token", "create_decision_token", { label: label.trim() || "聊天机器人" }).then((result) => {
+          <Input aria-label="授权码名称" className="min-w-0" placeholder={chat} maxLength={64} value={label} disabled={Boolean(busy)} onChange={(event) => setLabel(event.target.value)} />
+          <Button type="button" variant="outline" disabled={Boolean(busy)} onClick={() => void call("token", "create_decision_token", { label: label.trim() || chat }).then((result) => {
             const value = (result as { token?: unknown } | null)?.token
             if (typeof value === "string") { setToken(value); setLabel("") }
           })}><BusyIcon busy={busy === "token"} icon={Plus} />生成授权码</Button>

@@ -70,11 +70,11 @@ function LogsPage() {
       </Button>
     </div>
     <Segmented label="级别" labels fill value={level ?? 'all'} options={levelChoices} onChange={(value) => setLevel(value === 'all' ? undefined : value)} />
-    <div role="group" aria-label="来源" className="flex flex-wrap gap-2">
+    <div role="group" aria-label="来源" className="flex flex-wrap gap-2 max-md:-m-1 max-md:-mx-4 max-md:flex-nowrap max-md:overflow-x-auto max-md:p-1 max-md:px-4 max-md:[scrollbar-width:none] max-md:[&::-webkit-scrollbar]:hidden">
       {sourceChoices.map(([value, label, Icon]) => {
         const on = sources.includes(value)
         return <button key={value} type="button" aria-pressed={on} onClick={() => setSources(on ? sources.filter((item) => item !== value) : [...sources, value])}
-          className={cn('inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-11 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
+          className={cn('inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-3 text-meta font-medium transition-colors max-md:h-11 focus-visible:ring-3 focus-visible:ring-ring/50 outline-none',
             on ? 'border-primary bg-primary text-primary-foreground' : 'bg-background text-muted-foreground hover:bg-muted hover:text-foreground')}>
           <Icon aria-hidden="true" className="size-3.5" />{label}
         </button>

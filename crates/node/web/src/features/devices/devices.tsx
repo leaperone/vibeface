@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, TriangleAlert, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -62,10 +62,6 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
-function Hint({ icon: Icon, label, warning = false }: { icon: LucideIcon; label: string; warning?: boolean }) {
-  return <span title={label} className="flex shrink-0"><Icon aria-hidden="true" className={cn("size-4", warning ? "text-warning" : "text-muted-foreground")} /><span className="sr-only">{label}</span></span>
-}
-
 export function DevicesPage() {
   const device = useDevice()
   const rows = useDeviceRows()
@@ -82,9 +78,13 @@ export function DevicesPage() {
         return <li key={row.id}><Link to="/devices/$deviceId" params={{ deviceId: row.id }} className="interactive-row flex min-h-14 items-center gap-3 px-4 py-2">
           <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
           {/* On a phone the tag drops under the name, so the name keeps the width. */}
-          <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>{row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}</span>
-          {row.bot ? <Hint icon={terms.canRunBot.icon} label={row.bot === "ready" ? terms.canRunBot.label : "Bot 需设置"} warning={row.bot === "needs_setup"} /> : null}
-          {row.admin ? <Hint icon={terms.admin.icon} label={terms.admin.label} /> : null}
+          <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
+            <span className="flex flex-wrap gap-1 empty:hidden">
+              {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
+              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : "Bot 需设置"}</Tag> : null}
+              {row.admin ? <Tag><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.label}</Tag> : null}
+            </span>
+          </span>
           {row.online !== undefined ? <Online online={row.online} compact /> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
@@ -158,12 +158,18 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         <span className="flex items-center gap-1.5 text-warning"><TriangleAlert aria-hidden="true" className="size-4" />只能本机打开，手机和其他电脑连不上</span>
         <a className="hit-area relative font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
       </p> : null}
-      {canManage || localSession ? <label className="flex min-h-11 items-center justify-between gap-3 border-t pt-3">
-        <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上直接打开" : "在那台电脑上直接打开"}</span><span className="text-meta text-muted-foreground">不用加入链接</span></span>
-        <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true}
-          disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess}
-          onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />
-      </label> : null}
+      {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
+        <label className="flex min-h-11 items-center justify-between gap-3">
+          <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上直接打开" : "在那台电脑上直接打开"}</span><span className="text-meta text-muted-foreground">不用加入链接</span></span>
+          <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true} aria-describedby={device.localAutoAccess ? "local-access-risk" : undefined}
+            disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess}
+            onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />
+        </label>
+        {/* Once on, nobody on that computer is asked before opening the network. */}
+        {device.localAutoAccess ? <p id="local-access-risk" className="flex items-center gap-1.5 text-meta text-warning">
+          <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这台电脑上的人都能直接打开" : "那台电脑上的人都能直接打开"}
+        </p> : null}
+      </div> : null}
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}
     </Section> : null}
 
