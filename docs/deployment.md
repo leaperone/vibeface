@@ -28,7 +28,16 @@ vibeface join '<加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFA
 
 先安装所选 Provider，再配置程序路径、工作目录和认证环境。修改已有 `config.json` 时保留未列出的字段。
 
-使用已经运行的 Codex App Server 时，明确给出它的 socket：
+用到 Codex 或 Cursor 而路径缺失时，Node 在 `init`、启动和网页打开开关时从本机找出并写进配置，之后照写下的用，不再每次猜：
+
+- Codex 目录：Node 进程的 `CODEX_HOME`，没有时用 `$HOME/.codex`，目录必须存在。
+- App Server：`<Codex 目录>/app-server-control/app-server-control.sock` 存在时用它（`system`）；不存在时改为 `spawn`，并把 Codex 目录写进 `provider-env.json` 的 `CODEX_HOME`。
+- 会话目录：`<Codex 目录>/sessions`。
+- 只写了名字的程序（`codex`、`cursor-sdk-bridge`）在 PATH 里找不到时，再找 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`，Codex 还找 `/Applications/Codex.app/Contents/Resources`。服务进程的 PATH 很短，这一步让它们也能找到。
+
+已写下的路径不被替换。找不到 Codex 目录时打开开关会报错，在网页里手动填写，或按下面写进配置。密钥不在查找范围内。
+
+使用已经运行的 Codex App Server 时，也可以直接给出它的 socket：
 
 ```json
 {

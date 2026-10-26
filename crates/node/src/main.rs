@@ -172,7 +172,7 @@ struct Init {
     model: Option<String>,
     #[arg(long, default_value = "cursor-sdk-bridge")]
     cursor_sdk_bin: PathBuf,
-    /// Explicit socket of the existing Codex App Server to use.
+    /// Socket of the running Codex App Server; found under the Codex folder when omitted.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     #[arg(long, default_value = "codex")]
@@ -858,7 +858,17 @@ fn init(options: Init) -> Result<()> {
             cursor_sdk_bin: options.cursor_sdk_bin,
         });
     }
-    initialize_announced(dir, configuration, entry_token)
+    let mut env = vibeface::providers::ProviderEnv::default();
+    vibeface::discovery::complete(
+        &mut configuration,
+        &mut env,
+        &vibeface::discovery::Host::current(),
+    )?;
+    initialize_announced(dir, configuration, entry_token)?;
+    if env != vibeface::providers::ProviderEnv::default() {
+        env.save(dir)?;
+    }
+    Ok(())
 }
 
 fn initialize_announced(
