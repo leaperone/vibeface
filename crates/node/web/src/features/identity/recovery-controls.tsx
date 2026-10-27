@@ -6,10 +6,10 @@ import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Pan
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { passphrase, recoveryCode, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
+import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
+import { hoursUntil, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { deviceIcon } from '@/features/devices/devices'
 import { setRotateHint } from '@/lib/rotate-hint'
 
@@ -46,18 +46,6 @@ function useGenerationRun() {
   return { busy: busyGeneration === generation, error, status, run }
 }
 
-/** The code in the name of the file that opens with `key`, once worked out. */
-function useRecoveryCode(key: string | undefined) {
-  const [code, setCode] = useState<{ key: string; value: string } | null>(null)
-  useEffect(() => {
-    if (!key) return
-    let live = true
-    void recoveryCode(key).then((value) => { if (live) setCode({ key, value }) })
-    return () => { live = false }
-  }, [key])
-  return key && code?.key === key ? code.value : null
-}
-
 /** The file that still works: the code its name carries, and the day it was made. */
 export function CurrentRecoveryFile() {
   const { directory, recoverySince } = useDevice()
@@ -67,17 +55,6 @@ export function CurrentRecoveryFile() {
     {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN')}</time> : null}
   </SettingsRow>
 }
-
-/** A time within the next days as people say it: 今天、明天、后天 and the clock, later ones with their date. */
-export function whenText(at: number, now = Date.now()) {
-  const day = (time: number) => { const date = new Date(time); return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / 86_400_000 }
-  const clock = new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
-  const ahead = day(at) - day(now)
-  return ahead >= 0 && ahead <= 2 ? `${['今天', '明天', '后天'][ahead]} ${clock}` : `${new Date(at).toLocaleDateString('zh-CN', { month: 'long', day: 'numeric' })} ${clock}`
-}
-
-/** Hours until `at` on this browser's clock, at least one while it has not passed. */
-export const hoursUntil = (at: number) => Math.max(1, Math.ceil((at - Date.now()) / 3_600_000))
 
 /** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
 export function RecoveryPendingCard() {
@@ -142,8 +119,8 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   const wasSettled = useRef(settled)
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
-    <p className="flex items-center gap-2 text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />没有恢复密码，这个文件打不开</p>
-    <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />只有这一份，丢了不能补</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.needsPassword}</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
       {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
@@ -152,7 +129,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
       </span>
       {download ? <Button type="button" variant="ghost" disabled={busy} onClick={download.run}>重新下载</Button> : null}
     </p> : <Button type="button" className="w-fit" disabled={busy} onClick={download.run}><Download aria-hidden="true" />下载恢复文件</Button>}
-    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input ref={box} type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />已把文件和密码分开保存</label>
+    <label className={cn('flex min-h-11 items-center gap-2', !downloaded && 'text-muted-foreground')}><input ref={box} type="checkbox" className="size-4" disabled={!downloaded || busy} checked={saved} onChange={(event) => onSaved(event.target.checked)} />{recoveryCopy.keptApart}</label>
   </>
 }
 
@@ -176,20 +153,20 @@ export function UnsavedRecoveryFile({ landing }: { landing(): HTMLElement | null
 export function RecoveryWaiting() {
   const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
   const saving = useRef<HTMLElement>(null)
-  if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title="这次找回被拦下了">
-    <p className="text-muted-foreground">刚下载的新文件用不了，旧恢复文件仍然有效</p>
+  if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
+    <p className="text-muted-foreground">{recoveryCopy.stoppedNote}</p>
     <Button type="button" className="w-fit justify-self-end" onClick={() => { forgetUnsavedRecovery(); dismissRecovery() }}>知道了</Button>
   </Panel>
   const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
-  return <Panel icon={Hourglass} title="找回等待生效">
+  return <Panel icon={Hourglass} title={recoveryCopy.waiting}>
     {at === null ? null : <>
-      <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{at > Date.now() ? `剩余 ${hoursUntil(at)} 小时` : '马上生效'}</p>
-      <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>生效后自动进入</p>
+      <p role="status" className="flex items-center gap-2 text-heading font-semibold tabular-nums"><WaitingDot />{recoveryCopy.left(at)}</p>
+      <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>{recoveryCopy.autoEnter}</p>
     </>}
-    <p className="flex items-center gap-2 text-muted-foreground"><BellRing aria-hidden="true" className="size-4 shrink-0" />你的管理设备会看到提醒</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><BellRing aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.managersSee}</p>
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     {unsavedRecovery ? <section ref={saving} className="grid gap-3 border-t pt-4">
-      <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />保存新的恢复文件</h3>
+      <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.saveNew}</h3>
       <UnsavedRecoveryFile landing={() => saving.current?.parentElement?.querySelector('h2')} />
     </section> : null}
   </Panel>
@@ -202,8 +179,8 @@ export function RecoveredStep() {
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
   // Ticking 已分开保存 drops the copy this page held for another download.
-  return <Panel icon={FileKey} title="保存新的恢复文件">
-    <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />已找回，旧文件已作废</p>
+  return <Panel icon={FileKey} title={recoveryCopy.saveNew}>
+    <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.recovered}</p>
     <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={(value) => { setSaved(value); if (value) forgetUnsavedRecovery() }}
       download={file ? { done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } } : undefined} />
     <InlineError error={error || null} />

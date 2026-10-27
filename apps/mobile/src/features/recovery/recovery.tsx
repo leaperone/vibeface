@@ -1,13 +1,13 @@
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, FileCheck, FileKey, Hourglass, Laptop, Smartphone, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, Download, FileCheck, FileKey, FileWarning, Hourglass, KeyRound, Laptop, ShieldX, Smartphone, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Switch, View } from 'react-native'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
-import { parseEntry, type Member } from '@vibeface/client/lib/node.ts'
-import { passphrase, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
-import { Details } from '@/components/kit'
+import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
+import { recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { passphrase, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
+import { Details, Panel } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -31,7 +31,7 @@ function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onP
 
 const passwordProps = { secureTextEntry: true, autoCapitalize: 'none', autoCorrect: false, className: 'h-11' } as const
 const errorText = (error: string) => error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null
-const hint = (icon: LucideIcon, text: string) => <View className="flex-row items-center gap-2"><Icon as={icon} className="size-4 text-muted-foreground" /><Text className="min-w-0 flex-1 text-meta text-muted-foreground">{text}</Text></View>
+const hint = (icon: LucideIcon, text: string, tone = 'text-muted-foreground') => <View className="flex-row items-center gap-2"><Icon as={icon} className={`size-4 ${tone}`} /><Text className={`min-w-0 flex-1 text-meta ${tone}`}>{text}</Text></View>
 
 /** Find devices again with the recovery file: open it, connect to one of the devices, then pick what was lost. */
 export function RecoveryRestore() {
@@ -73,35 +73,24 @@ export function RecoveryReview() {
   const review = device.review
   const { busy, error, run } = useRun()
   const [lost, setLost] = useState<string[]>([])
-  const [admins, setAdmins] = useState<string[] | null>(null)
   if (review?.kind !== 'recovery') return null
-  const managers = admins ?? review.members.filter((member) => member.manage).map((member) => member.device_id)
-  const toggle = (list: string[], id: string, on: boolean) => on ? [...list, id] : list.filter((item) => item !== id)
-  const recover = () => void run('recover', () => device.confirmRecovery(review.members
-    .filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))
-    .map((member): Member => ({ ...member, manage: member.kind === 'client' && managers.includes(member.device_id) }))))
-  return <View className="gap-4">
-    <View className="flex-row items-center gap-2">
-      <Icon as={ArchiveRestore} className="text-muted-foreground" />
-      <Text role="heading" className="text-heading font-semibold">{recoveryCopy.whichLost}</Text>
-    </View>
+  // As on the web: the kept devices go as the file listed them, with no choice of who manages.
+  const recover = () => void run('recover', () => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))
+  return <Panel icon={ArchiveRestore} title={recoveryCopy.whichLost}>
     <View className="gap-2">
-      {review.members.map((member) => {
+      {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
         const gone = lost.includes(member.device_id)
-        return <View key={member.device_id} className="gap-1 rounded-lg bg-muted/60 px-3 py-2">
-          <View className="min-h-11 flex-row items-center gap-2">
-            <Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-4 text-muted-foreground" />
-            <Text numberOfLines={1} className="min-w-0 flex-1">{member.name}</Text>
-            {required ? <Text className="text-meta text-muted-foreground">当前连接</Text> : <>
-              <Text className="text-meta">丢了</Text>
-              <Switch accessibilityLabel={`${member.name} 丢了`} value={gone} disabled={busy !== null} onValueChange={(on) => setLost(toggle(lost, member.device_id, on))} />
-            </>}
+        return <View key={member.device_id} className="min-h-12 flex-row items-center gap-2 rounded-lg bg-muted/60 px-3">
+          <Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-4 text-muted-foreground" />
+          <View className="min-w-0 flex-1 py-1.5">
+            <Text numberOfLines={1} className={gone ? 'text-muted-foreground line-through' : undefined}>{member.name}</Text>
+            {gone ? <Text className="text-meta text-danger">生效后移出</Text> : null}
           </View>
-          {member.kind === 'client' && !gone ? <View className="min-h-11 flex-row items-center justify-end gap-2">
-            <Text className="text-meta text-muted-foreground">管理设备</Text>
-            <Switch accessibilityLabel={`${member.name} 管理设备`} value={managers.includes(member.device_id)} disabled={busy !== null} onValueChange={(on) => setAdmins(toggle(managers, member.device_id, on))} />
-          </View> : null}
+          {required ? <Text className="text-meta text-muted-foreground">当前连接</Text> : <>
+            <Text className="text-meta">丢了</Text>
+            <Switch accessibilityLabel={`${member.name} 丢了`} value={gone} disabled={busy !== null} onValueChange={(on) => setLost(on ? [...lost, member.device_id] : lost.filter((id) => id !== member.device_id))} />
+          </>}
         </View>
       })}
     </View>
@@ -113,7 +102,74 @@ export function RecoveryReview() {
       <Button className="min-h-11" disabled={busy !== null} onPress={recover}><Text>{busy ? '找回中' : '找回'}</Text></Button>
     </View>
     {busy ? <Text className="text-meta text-muted-foreground">{recoveryCopy.cancelLate}</Text> : null}
-  </View>
+  </Panel>
+}
+
+/** Shared by waiting and recovered: the new file, saved through the share sheet, then the promise it is kept apart from its password. */
+function SaveRecoveryFile({ code, saved, onSaved, save }: { code: string; saved: boolean; onSaved(saved: boolean): void; save?: { done: boolean; run(): void } }) {
+  const done = !save || save.done
+  return <>
+    {hint(KeyRound, recoveryCopy.needsPassword)}
+    {hint(FileWarning, recoveryCopy.onlyCopy)}
+    {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+      <Icon as={CircleCheck} className="size-4 text-success" />
+      {/* The code is what tells files apart; on a narrow screen the shared prefix gives way first. */}
+      <Text accessibilityLabel={`已保存 ${recoveryFileStem(code)}`} numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 py-2 font-mono text-meta">
+        <Text className="font-mono text-meta text-muted-foreground">{recoveryFileStem('')}</Text><Text className="font-mono text-meta font-medium tracking-wide">{code}</Text>
+      </Text>
+      {save ? <Button variant="ghost" className="min-h-11" onPress={save.run}><Text>重新保存</Text></Button> : null}
+    </View> : <Button className="min-h-11 self-start" onPress={save.run}><Icon as={Download} /><Text>保存恢复文件</Text></Button>}
+    <View className="min-h-11 flex-row items-center justify-between gap-3">
+      <Text className={`min-w-0 flex-1 ${done ? '' : 'text-muted-foreground'}`}>{recoveryCopy.keptApart}</Text>
+      <Switch accessibilityLabel={recoveryCopy.keptApart} value={saved} disabled={!done} onValueChange={onSaved} />
+    </View>
+  </>
+}
+
+/** Hands the kept file to the share sheet again; a failure stays next to the button. */
+function useSaveAgain() {
+  const { unsavedRecovery: file, downloadUnsavedRecovery } = useDevice()
+  const [error, setError] = useState('')
+  const save = file ? { done: file.attempted, run: () => { setError(''); downloadUnsavedRecovery().catch((cause) => setError(messageOf(cause))) } } : undefined
+  return { save, error }
+}
+
+/** This phone's recovery while it waits on the device it went through, or once one of the devices it would replace stopped it. */
+export function RecoveryWaiting() {
+  const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
+  const { save, error } = useSaveAgain()
+  if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
+    <Text className="text-muted-foreground">{recoveryCopy.stoppedNote}</Text>
+    <Button className="min-h-11 self-end" onPress={() => { forgetUnsavedRecovery(); dismissRecovery() }}><Text>知道了</Text></Button>
+  </Panel>
+  const at = recovery?.status === 'waiting' ? recovery.effectiveAt : null
+  return <Panel icon={Hourglass} title={recoveryCopy.waiting}>
+    {at === null ? null : <>
+      <Text role="status" className="text-heading font-semibold" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.left(at)}</Text>
+      {hint(CalendarClock, `${whenText(at)} ${recoveryCopy.autoEnter}`)}
+    </>}
+    {hint(BellRing, recoveryCopy.managersSee)}
+    {/* Saving the new file is a separate thing to do now, not part of the wait. */}
+    {unsavedRecovery && save ? <View className="gap-3 border-t border-border pt-4">
+      <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
+      <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
+      {errorText(error)}
+    </View> : null}
+  </Panel>
+}
+
+/** After a recovery took effect, before anything else: its new file gets confirmed as kept apart from its password. */
+export function RecoveredStep() {
+  const { directory, finishRecovered, forgetUnsavedRecovery } = useDevice()
+  const code = useRecoveryCode(directory?.recovery_key)
+  const { save, error } = useSaveAgain()
+  const [saved, setSaved] = useState(false)
+  return <Panel icon={FileKey} title={recoveryCopy.saveNew}>
+    {hint(CircleCheck, recoveryCopy.recovered, 'text-success')}
+    <SaveRecoveryFile code={code ?? ''} saved={saved} onSaved={(value) => { setSaved(value); if (value) forgetUnsavedRecovery() }} save={save} />
+    {errorText(error)}
+    <Button className="min-h-11 self-end" disabled={!saved} onPress={() => { forgetUnsavedRecovery(); finishRecovered() }}><Text>完成</Text></Button>
+  </Panel>
 }
 
 /** A new recovery file under a new password; every older file stops working. */

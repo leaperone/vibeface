@@ -1,23 +1,23 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
-import { SafetyCode } from '@/components/kit'
+import { Panel, SafetyCode } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
-import { RecoveryRestore, RecoveryReview } from '@/features/recovery/recovery'
+import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
 import { useRun } from '@/lib/use-run'
 
 export default function JoinScreen() {
@@ -25,7 +25,8 @@ export default function JoinScreen() {
   const device = useDevice()
   const session = workspace.session
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
-  const choosing = device.phase !== 'key_lost' && !device.review && session.phase !== 'joining'
+  const recovering = Boolean(device.recovery || device.ready && device.recovered)
+  const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
     <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
@@ -36,6 +37,8 @@ export default function JoinScreen() {
         </Animated.View>
       </View>
       {device.phase === 'key_lost' ? <LostKey />
+        : device.ready && device.recovered ? <RecoveredStep />
+        : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
         : session.phase === 'joining' ? <Waiting code={session.code} onCancel={workspace.actions.cancelJoin} />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore /></Panel>
@@ -125,14 +128,4 @@ function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void
     {code ? <SafetyCode code={code} /> : <View className="h-8 w-40 rounded-md bg-muted" />}
     <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={onCancel}><Text>取消</Text></Button>
   </Panel>
-}
-
-function Panel({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <View className="gap-4">
-    <View className="flex-row items-center gap-2">
-      <Icon as={icon} className="text-muted-foreground" />
-      <Text role="heading" className="text-heading font-semibold">{title}</Text>
-    </View>
-    {children}
-  </View>
 }

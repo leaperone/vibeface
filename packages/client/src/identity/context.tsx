@@ -1152,3 +1152,14 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   return <DeviceContext.Provider value={value}>{children}</DeviceContext.Provider>
 }
 export function useDevice() { const value = useContext(DeviceContext); if (!value) throw new Error('useDevice must be used inside DeviceProvider'); return value }
+/** The code in the name of the recovery file that opens with `key`, once worked out. */
+export function useRecoveryCode(key: string | undefined) {
+  const [code, setCode] = useState<{ key: string; value: string } | null>(null)
+  useEffect(() => {
+    if (!key) return
+    let live = true
+    void recoveryCode(key).then((value) => { if (live) setCode({ key, value }) })
+    return () => { live = false }
+  }, [key])
+  return key && code?.key === key ? code.value : null
+}
