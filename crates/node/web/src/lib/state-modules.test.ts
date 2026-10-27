@@ -4,7 +4,7 @@ import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
 import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
-import { humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
+import { failureKinds, failureText, humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }
@@ -118,10 +118,12 @@ test('after a reload an older address record never replaces a newer one, withdra
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {
   assert.equal(humanError('unknown member', 'target_not_member'), '那台电脑不在我的设备里，访问地址不会转发给它。')
   assert.match(humanError('conversation not found'), /还没有这个对话/)
-  assert.match(humanError('Codex SDK failed: Missing environment variable: `CPA_API_KEY`.'), /缺少密钥/)
-  assert.match(humanError('CURSOR_API_KEY is required for the Cursor SDK manager'), /缺少密钥/)
+  assert.match(failureText('missing_key'), /缺少密钥.*设备 → Bot 与任务/)
+  assert.match(failureText('execution_disabled'), /没开执行任务.*设备 → Bot 与任务/)
+  assert.match(failureText('quota'), /用量到上限/)
+  assert.equal(failureText('unknown'), '', 'an unknown kind is worded by its caller')
+  for (const kind of failureKinds) if (kind !== 'unknown') assert.match(failureText(kind), /[一-鿿]/, kind)
   assert.match(humanError('client response timed out; outcome may be unknown'), /结果未知/)
-  assert.match(humanError("You've hit your usage limit. Try again at 4:12 PM.", undefined, '这个任务'), /用量到上限/)
   assert.equal(humanError('已断开设备连接。'), '已断开设备连接。')
   assert.match(humanError('peer did not answer in time'), /另一台设备没有回应/)
   assert.match(humanError('Codex rejected request: {"code":-32600,"message":"no rollout found for thread id 01a15c84"}'), /新对话还没准备好/)

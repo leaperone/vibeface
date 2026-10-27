@@ -1820,6 +1820,7 @@ mod tests {
                     status: None,
                     answers: None,
                     attestation: None,
+                    failure: None,
                 },
             )?
             .attestation()
@@ -1850,6 +1851,7 @@ mod tests {
                 status: None,
                 answers: None,
                 attestation: Some(user(&ia, &network, id)?),
+                failure: None,
             })
         };
         let (mut p, mut q) = (replica()?, replica()?);
@@ -2276,6 +2278,7 @@ mod tests {
                         status: None,
                         answers: None,
                         attestation: None,
+                        failure: None,
                     },
                 )?;
                 let signature = posted.attestation().cloned().context("signed message")?;

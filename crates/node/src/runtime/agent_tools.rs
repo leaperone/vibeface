@@ -513,10 +513,13 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
-        ensure!(
-            self.providers().switches.execution,
-            "Codex execution is turned off on this device"
-        );
+        if !self.providers().switches.execution {
+            return Err(vibeface_bridge::failure::ExecFailure::new(
+                vibeface_bridge::failure::FailureKind::ExecutionDisabled,
+                "Codex execution is turned off on this device",
+            )
+            .into());
+        }
         let cwd = spec.cwd.clone();
         let continues = spec.continues.clone();
         let (record, created) = self.accept_dispatch(network, spec).await?;

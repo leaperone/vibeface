@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=4`，数据库 `user_version=4`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=5`，数据库 `user_version=5`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -73,8 +73,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":4}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=4` |
+| `data-epoch.json` | `{"data_epoch":5}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=5` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -192,7 +192,7 @@
 
 `changes` 按 rank 列出本会话的 bot 修改，每项为 `{ change_id, conversation_id, cause, event_hash, created_at_ms, change }`，`conversation_id` 是被修改的 bot 的会话，`cause` 为 `{ conversation_id, message_id }` 或 `null`（bot 自己定的提醒），`change` 即 `BotChanged.change`。`bot_settings` 为 `{ skills: [{ skill_id, name, description }], schedules: [{ schedule_id, name, prompt, first_run_at_ms, every_minutes?, enabled, depth?, next_run_at_ms }], memory: [{ memory_id, text }] }`，skill 是全网共用的库，schedules 只列本会话还会运行或已暂停的 schedule，暂停时 `next_run_at_ms` 为 `null`，没有 `every_minutes` 的是一次性提醒，`depth` 省略即 0。`messages` 中 `role=bot` 的是另一个 bot 发来的消息，带 `sender { conversation_id, name }`。
 
-`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason` 和本机状态 `state`。网页以 `title` 为任务名，`prompt` 放在详细信息里。
+`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure` 和本机状态 `state`。网页以 `title` 为任务名，`prompt` 放在详细信息里。
 
 ## 可靠调度回执
 
@@ -219,7 +219,9 @@
 
 `bot_message:<message_id>` 由写入 `BotMessaged` 的发送方负责人接纳（对方会话也归它调度时），否则进 outbox，经 `deliver` 交给对方负责人。同步只存消息，不排 job。每个轮次有深度：本人消息和回答为 0，schedule 轮取其 `depth`，bot 消息轮取 `hops`，工作结果和 Agent 任务沿派发链继承；提醒和 bot 消息的深度为当前加一，超过 4 时拒绝。
 
-job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。Codex 回复进行中时，同一会话排队的用户消息（无附件、需要回复）先在本机记为 `steering`，再以消息 ID 为 `clientUserMessageId` 发 `turn/steer` 并入当前回合，发送前核对目标是本进程启动的回复且未被停止或移走；App Server 明确拒绝时回到 `queued`，其余（含超时）保持 `steering`。目标回复结束后才按线程回读结算：消息所在回合 `completed` 即 `steered`（`outcome=answered`），在其他终态回合即 `steered`（`outcome=unfinished`，随宿主回复的终态），线程里没有它且目标回合已结束即回到 `queued`，绝不重发；消息只出现在其他回合也算 `unfinished`。只有回读成功且读到目标回合才结算，读取失败或读不到目标回合保持 `steering`，连续 10 分钟读不到（中间读到一次即重新计时）则记为 `steered`（`outcome=unknown`，网页显示“不确定 Bot 看到了没有”）。未定期间本机仍拥有的会话不领取后续消息，会话已移走时排队消息照常交给新所有者；停止 `steering` 消息即停止它并入的回复。steer 记在本机调度状态，同步和恢复不会重放；结算为 `answered` 时在同一事务写一条 `message_steered`，让以后的负责人不把这条消息算作未回复。Cursor 始终排队。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。Bot 回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。
+job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`completed`、`failed`、`cancelled`、`interrupted` 或 `steered`，后五种是终态。Codex 回复进行中时，同一会话排队的用户消息（无附件、需要回复）先在本机记为 `steering`，再以消息 ID 为 `clientUserMessageId` 发 `turn/steer` 并入当前回合，发送前核对目标是本进程启动的回复且未被停止或移走；App Server 明确拒绝时回到 `queued`，其余（含超时）保持 `steering`。目标回复结束后才按线程回读结算：消息所在回合 `completed` 即 `steered`（`outcome=answered`），在其他终态回合即 `steered`（`outcome=unfinished`，随宿主回复的终态），线程里没有它且目标回合已结束即回到 `queued`，绝不重发；消息只出现在其他回合也算 `unfinished`。只有回读成功且读到目标回合才结算，读取失败或读不到目标回合保持 `steering`，连续 10 分钟读不到（中间读到一次即重新计时）则记为 `steered`（`outcome=unknown`，网页显示“不确定 Bot 看到了没有”）。未定期间本机仍拥有的会话不领取后续消息，会话已移走时排队消息照常交给新所有者；停止 `steering` 消息即停止它并入的回复。steer 记在本机调度状态，同步和恢复不会重放；结算为 `answered` 时在同一事务写一条 `message_steered`，让以后的负责人不把这条消息算作未回复。Cursor 始终排队。跨重启的 `running` 与 `cancelling` 进入 `interrupted` 并登记待核对，不自动重新调用 SDK。Bot 回答 `MessagePosted(assistant)` 与 job 终态在同一事务提交，`status` 为 `completed`、`failed`、`stopped` 或 `interrupted`，停止或中断时保留已输出的部分文字。`failed` 与 `interrupted` 带 `failure`（失败类别，见下），原始错误只留在本机 job 与 `node.log`，客户端按类别给出说明。
+
+失败类别 `failure` 取 `missing_key`、`auth_failed`、`quota`、`missing_binary`、`execution_disabled`、`no_model`、`writer_busy`、`rejected`、`transport`、`timed_out`、`restarted`、`lost` 或 `unknown`。本仓库自己的错误在产生处直接给出类别；Cursor SDK 与 Codex App Server 的上游错误只在 `crates/bridge/src/failure.rs` 一处识别，Codex 回合错误先看 `codexErrorInfo`。回复、工作结果（`WorkFinished.failure`）、本机 job（`failure {kind, detail}`）和被拒的派发都带同一类别。
 
 ```text
 queued → claimed → running ─→ completed | failed
@@ -275,10 +277,10 @@ Event {
 | `bot_messaged` | `message_id`、`from { conversation_id, name }`、`text`、`hops` | 发送方会话的负责人，写在对方会话 |
 | `schedule_controlled` | `schedule_id`、`action`、`attestation` | 入口 Node |
 | `message_steered` | `message_id`、`reply` | steer 这条本人消息的 Node，在宿主回复 `reply` 完成且消息并入其中时写 |
-| `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`answers?`、`attestation?` | 本人消息由入口写，回答由负责人写；`answers` 只在本人消息上，`message_id` 为 `a-<question_id>` |
+| `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`failure?`、`answers?`、`attestation?` | 本人消息由入口写，回答由负责人写；`answers` 只在本人消息上，`message_id` 为 `a-<question_id>` |
 | `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（`codex` 或 `task`）、`cwd`、`title`、`prompt`、`continues?`、`parent?`、`thread?` | 目标 Node |
 | `work_progress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node |
-| `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`attestation?` | 目标 Node，本人结清时由入口写 |
+| `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`failure?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
 | `question_asked` | `question_id`、`severity`、`text`、`choices: [{label}]`、`about {node, agent, session_id, cwd, summary, request_id?}` | 提问的 Node；写在拥有该会话的 Bot 会话 |
 | `question_closed` | `question_id`、`reason`（`request_lost`） | 提问且挂着该请求的 Node，写在提问所在会话；其他作者的关闭不计入。已有回答时回答为准，与到达顺序无关；关闭后回答被拒绝 |

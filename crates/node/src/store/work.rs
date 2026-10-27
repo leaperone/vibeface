@@ -266,6 +266,7 @@ impl Store {
                     outcome: WorkOutcome::Interrupted,
                     text: String::new(),
                     reason: Some("这台电脑在这个对话里还有没做完的任务".into()),
+                    failure: None,
                 },
                 at,
             )?
@@ -340,6 +341,7 @@ impl Store {
                 result_text: note.into(),
                 failure_reason: None,
                 attestation: Some(attestation),
+                failure: None,
             },
             vec![],
             at,
@@ -397,6 +399,7 @@ impl Store {
                         result_text: String::new(),
                         failure_reason: Some(REMOVED.into()),
                         attestation: None,
+                        failure: None,
                     },
                     vec![],
                     at,
@@ -441,7 +444,7 @@ fn query_dispatches(
     params: impl rusqlite::Params,
 ) -> Result<Vec<Dispatch>> {
     let mut statement = connection.prepare(&format!(
-        "SELECT spec,state,reason FROM work_dispatches WHERE {filter} ORDER BY work_id"
+        "SELECT spec,state,reason,failure FROM work_dispatches WHERE {filter} ORDER BY work_id"
     ))?;
     let rows = statement
         .query_map(params, |r| {
@@ -449,16 +452,18 @@ fn query_dispatches(
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     rows.into_iter()
-        .map(|(spec, state, reason)| {
+        .map(|(spec, state, reason, failure)| {
             let state = match state.as_str() {
                 "pending" => DispatchState::Pending,
                 "accepted" => DispatchState::Accepted,
                 "rejected" => DispatchState::Rejected {
                     reason: reason.unwrap_or_default(),
+                    failure: failure.as_deref().map(super::enum_from).transpose()?,
                 },
                 "unverified" => DispatchState::Unverified {
                     reason: reason.unwrap_or_default(),
@@ -474,19 +479,20 @@ fn query_dispatches(
 }
 
 fn save_dispatch_row(connection: &Connection, dispatch: &Dispatch) -> Result<()> {
-    let (state, reason) = match &dispatch.state {
-        DispatchState::Pending => ("pending", None),
-        DispatchState::Accepted => ("accepted", None),
-        DispatchState::Rejected { reason } => ("rejected", Some(reason)),
-        DispatchState::Unverified { reason } => ("unverified", Some(reason)),
+    let (state, reason, failure) = match &dispatch.state {
+        DispatchState::Pending => ("pending", None, None),
+        DispatchState::Accepted => ("accepted", None, None),
+        DispatchState::Rejected { reason, failure } => ("rejected", Some(reason), *failure),
+        DispatchState::Unverified { reason } => ("unverified", Some(reason), None),
     };
     connection.execute(
-        "INSERT OR REPLACE INTO work_dispatches(work_id,spec,state,reason) VALUES(?,?,?,?)",
+        "INSERT OR REPLACE INTO work_dispatches(work_id,spec,state,reason,failure) VALUES(?,?,?,?,?)",
         params![
             dispatch.spec.work_id,
             serde_json::to_string(&dispatch.spec)?,
             state,
             reason,
+            failure.as_ref().map(super::enum_text),
         ],
     )?;
     Ok(())

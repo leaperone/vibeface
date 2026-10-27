@@ -1,6 +1,7 @@
 use crate::providers::Provider;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+pub use vibeface_bridge::failure::FailureKind;
 
 pub type NetworkId = String;
 pub type DeviceId = String;
@@ -97,9 +98,6 @@ pub enum WorkOutcome {
     Rejected,
     /// The real result cannot be proven; only the user or a later probe settles it.
     Unverified,
-    /// No longer written: a removed target's open work is recorded `Unverified`. Removing the
-    /// variant changes the stored event format, so it goes with the next `DATA_EPOCH` bump.
-    Abandoned,
 }
 
 /// How soon the user should look at a triaged session.
@@ -581,6 +579,9 @@ pub enum EventBody {
         in_reply_to: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ReplyStatus>,
+        /// Why a failed or interrupted reply ended; clients word it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureKind>,
         /// A user message answering this question; its `message_id` is `a-<question_id>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         answers: Option<String>,
@@ -623,6 +624,9 @@ pub enum EventBody {
         result_text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure_reason: Option<String>,
+        /// The kind of execution failure that ended it, when one did; clients word it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
@@ -897,6 +901,7 @@ pub struct Message {
     pub created_at_ms: i64,
     pub in_reply_to: Option<String>,
     pub status: Option<ReplyStatus>,
+    pub failure: Option<FailureKind>,
     pub report_results: Option<bool>,
     /// The question this user message answers.
     pub answers: Option<String>,
@@ -938,6 +943,7 @@ pub struct WorkProjection {
     pub outcome: Option<WorkOutcome>,
     pub result_text: String,
     pub failure_reason: Option<String>,
+    pub failure: Option<FailureKind>,
     pub state: WorkStatus,
 }
 

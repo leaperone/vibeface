@@ -643,20 +643,21 @@ impl Runtime {
                 entry.1 = params["item"]["text"].as_str().unwrap_or_default().into();
             }
             "turn/completed" => {
-                let status = params["turn"]["status"].as_str().unwrap_or("completed");
+                let ended = vibeface_bridge::turn::turn_snapshot(&params["turn"]);
+                let status = ended
+                    .status
+                    .as_ref()
+                    .map_or("completed", |status| status.as_str());
                 let event = AgentEvent {
                     source: triage::Source::AppServer,
                     agent: triage::Agent::Codex,
                     event: triage::Kind::TurnEnd,
                     status: Some(status.into()),
                     session_id: thread,
-                    turn_id: params["turn"]["id"].as_str().unwrap_or_default().into(),
+                    turn_id: ended.id.unwrap_or_default(),
                     cwd: entry.0.clone(),
                     last_message: std::mem::take(&mut entry.1),
-                    detail: params["turn"]["error"]["message"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .into(),
+                    detail: ended.error.map(|error| error.detail).unwrap_or_default(),
                     ..Default::default()
                 };
                 let node = self.clone();
@@ -2004,7 +2005,7 @@ mod tests {
             ));
             let done = crate::work::Signal::TurnCompleted {
                 turn_id: "u-1".into(),
-                status: "completed".into(),
+                status: vibeface_bridge::turn::TurnStatus::Completed,
                 text: "done".into(),
                 error: None,
             };
@@ -2102,7 +2103,7 @@ mod tests {
 
             let ended = crate::work::Signal::TurnCompleted {
                 turn_id: "u-1".into(),
-                status: "interrupted".into(),
+                status: vibeface_bridge::turn::TurnStatus::Interrupted,
                 text: String::new(),
                 error: None,
             };
@@ -2195,7 +2196,7 @@ mod tests {
 
             let ended = crate::work::Signal::TurnCompleted {
                 turn_id: "u-1".into(),
-                status: "interrupted".into(),
+                status: vibeface_bridge::turn::TurnStatus::Interrupted,
                 text: String::new(),
                 error: None,
             };
@@ -2922,6 +2923,7 @@ mod tests {
                 status: None,
                 answers: None,
                 attestation: None,
+                failure: None,
             },
         )?;
         let signed = posted.attestation().cloned().context("signed")?;
@@ -2969,7 +2971,10 @@ mod tests {
                     &Default::default(),
                 )?;
                 let interrupted = crate::scheduling::JobOutcome::Interrupted {
-                    detail: "lost".into(),
+                    failure: vibeface_bridge::failure::ExecFailure::new(
+                        vibeface_bridge::failure::FailureKind::Lost,
+                        "lost",
+                    ),
                     process_unconfirmed: true,
                 };
                 store.finish_job(

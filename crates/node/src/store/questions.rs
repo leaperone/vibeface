@@ -504,6 +504,7 @@ impl Store {
                 status: None,
                 answers: Some(question.into()),
                 attestation,
+                failure: None,
             },
             vec![],
             created_at_ms,

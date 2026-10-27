@@ -5,6 +5,10 @@ use crate::scheduling::task_trigger;
 use crate::work::{
     Dispatch, DispatchState, Handle, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
 };
+use vibeface_bridge::{
+    failure::{ExecFailure, FailureKind},
+    turn::{TurnStatus, turn_snapshot},
+};
 
 /// An interrupt the App Server took is checked against the turn once this passes without its end.
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -323,7 +327,8 @@ impl Runtime {
             Ok(record) => {
                 json!({"work_id":record.work_id,"state":record.state.name()})
             }
-            Err(error) => json!({"rejected":error.to_string()}),
+            Err(error) => json!({"rejected":error.to_string(),
+                "failure":error.downcast_ref::<ExecFailure>().map(|failure| failure.kind)}),
         })
     }
 
@@ -356,6 +361,7 @@ impl Runtime {
                     .as_str()
                     .unwrap_or("the device refused the work")
                     .into(),
+                failure: serde_json::from_value(reply["failure"].clone()).unwrap_or_default(),
             },
             Err(error) => {
                 tracing::debug!(%error, "dispatch waits for its target");
@@ -364,7 +370,7 @@ impl Runtime {
         };
         let spec = &dispatch.spec;
         match &state {
-            DispatchState::Rejected { reason } => tracing::warn!(
+            DispatchState::Rejected { reason, .. } => tracing::warn!(
                 event = "work.dispatch_rejected",
                 conversation_id = spec.conversation,
                 work_id = spec.work_id,
@@ -416,11 +422,12 @@ impl Runtime {
                 turn_id,
                 "Codex turn started"
             );
-        } else if let Some(reason) = args["failed"].as_str() {
+        } else if let Some(reason) = args["failed"]["detail"].as_str() {
             tracing::warn!(
                 event = "work.start_failed",
                 conversation_id = scope,
                 work_id,
+                kind = %args["failed"]["kind"],
                 reason,
                 "Codex did not start the work"
             );
@@ -504,13 +511,12 @@ impl Runtime {
                     .signal_work(network, work_id, Signal::Probed(probe))
                     .await?;
             }
-        } else if let Some(reason) = args["failed"].as_str() {
+        } else if !args["failed"].is_null() {
+            let mut failure: ExecFailure = serde_json::from_value(args["failed"].clone())
+                .context("failed must be {kind, detail}")?;
+            failure.detail = failure.detail.chars().take(2_000).collect();
             record = self
-                .signal_work(
-                    network,
-                    work_id,
-                    Signal::StartRejected(reason.chars().take(2_000).collect()),
-                )
+                .signal_work(network, work_id, Signal::StartRejected(failure))
                 .await?;
         } else if args["unknown"].is_string() {
             if let Err(error) = self.probe_work(network, work_id, true).await {
@@ -560,7 +566,10 @@ impl Runtime {
                     self.signal_work(
                         network,
                         work_id,
-                        Signal::StartRejected("协调 Agent 没有在时限内开始这项工作".into()),
+                        Signal::StartRejected(ExecFailure::new(
+                            FailureKind::TimedOut,
+                            "the coordination Agent did not start this work in time",
+                        )),
                     )
                     .await?;
                 }
@@ -1061,17 +1070,17 @@ impl Runtime {
                 summary: plan_summary(params),
                 at_ms: now_ms(),
             }),
-            "turn/completed" => Some(Signal::TurnCompleted {
-                turn_id: turn.unwrap_or_default().into(),
-                status: params["turn"]["status"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .into(),
-                text: String::new(),
-                error: params["turn"]["error"]["message"]
-                    .as_str()
-                    .map(str::to_owned),
-            }),
+            "turn/completed" => {
+                let ended = turn_snapshot(&params["turn"]);
+                Some(Signal::TurnCompleted {
+                    turn_id: turn.unwrap_or_default().into(),
+                    status: ended
+                        .status
+                        .unwrap_or_else(|| TurnStatus::Other("unknown".into())),
+                    text: String::new(),
+                    error: ended.error,
+                })
+            }
             _ => None,
         };
         let target_node = self.identity.device_id()?;

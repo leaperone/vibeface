@@ -9,6 +9,7 @@ use crate::{
     work::{Signal, WorkSpec},
 };
 use serde_json::json;
+use vibeface_bridge::failure::ExecFailure;
 
 struct Net {
     network: String,
@@ -51,6 +52,7 @@ fn user(net: &Net, id: &str, text: &str) -> EventBody {
                 status: None,
                 answers: None,
                 attestation: None,
+                failure: None,
             },
         )
         .expect("fixture client signs")
@@ -596,6 +598,7 @@ fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<(
             status: None,
             answers: None,
             attestation: None,
+            failure: None,
         },
     )?;
     store.accept_message(
@@ -848,7 +851,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         &id,
         Signal::TurnCompleted {
             turn_id: "u".into(),
-            status: "completed".into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
             text: "done".into(),
             error: None,
         },
@@ -940,6 +943,7 @@ fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
 
     let no = DispatchState::Rejected {
         reason: "no bot".into(),
+        failure: None,
     };
     let woke = |store: &mut Store, state: &DispatchState| {
         store
@@ -1070,6 +1074,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         outcome,
         text: "late".into(),
         reason: Some("lost".into()),
+        failure: None,
     };
     store.apply_work_signal(
         &net.b,
@@ -1100,6 +1105,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         result_text: String::new(),
         failure_reason: None,
         attestation: None,
+        failure: None,
     };
     store.append_event(&net.b, &net.network, "c", unsigned, vec![], 9)?;
     assert_eq!(
@@ -1119,6 +1125,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             result_text: "checked".into(),
             failure_reason: None,
             attestation: None,
+            failure: None,
         },
     )?
     else {
@@ -1187,6 +1194,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             result_text: String::new(),
             failure_reason: None,
             attestation: None,
+            failure: None,
         },
     )?
     else {
@@ -1216,7 +1224,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
         &running.work_id,
         Signal::TurnCompleted {
             turn_id: "tu".into(),
-            status: "completed".into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
             text: "late".into(),
             error: None,
         },
@@ -1566,6 +1574,7 @@ fn bot_reply(id: &str, to: &str) -> EventBody {
         status: Some(ReplyStatus::Completed),
         answers: None,
         attestation: None,
+        failure: None,
     }
 }
 
@@ -3560,6 +3569,7 @@ fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Resul
                 status: None,
                 answers: Some(question.into()),
                 attestation: None,
+                failure: None,
             },
         )?
         .attestation()
@@ -4069,19 +4079,25 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
 }
 
 #[test]
-fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Result<()> {
+fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
     let raw = "CURSOR_API_KEY is required for the Cursor SDK manager";
-    for (id, outcome) in [
-        ("m1", JobOutcome::Failed(raw.into())),
+    let failure = ExecFailure::new(FailureKind::MissingKey, raw);
+    for (id, outcome, status) in [
+        (
+            "m1",
+            JobOutcome::Failed(failure.clone()),
+            ReplyStatus::Failed,
+        ),
         (
             "m2",
             JobOutcome::Interrupted {
-                detail: raw.into(),
+                failure: failure.clone(),
                 process_unconfirmed: true,
             },
+            ReplyStatus::Interrupted,
         ),
     ] {
         store.accept_message(
@@ -4113,10 +4129,13 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
         let reply = store
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
-        assert!(!reply.text.contains("CURSOR_API_KEY"), "{}", reply.text);
-        assert!(reply.text.contains("设备 → Bot 与任务"), "{}", reply.text);
+        assert_eq!(
+            (reply.status, reply.failure, reply.text.as_str()),
+            (Some(status), Some(FailureKind::MissingKey), ""),
+            "the shared reply names the kind, never the raw cause"
+        );
         assert!(
-            matches!(&job.state, JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } if detail == raw),
+            matches!(&job.state, JobState::Failed { failure: kept, .. } | JobState::Interrupted { failure: kept, .. } if *kept == failure),
             "the raw cause stays on the local job"
         );
     }
@@ -4503,7 +4522,10 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
                 )?;
                 JobOutcome::Completed
             } else {
-                JobOutcome::Failed("the model is unknown".into())
+                JobOutcome::Failed(ExecFailure::new(
+                    FailureKind::NoModel,
+                    "the model is unknown",
+                ))
             };
             store.finish_job(
                 &net.a,

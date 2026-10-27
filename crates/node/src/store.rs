@@ -701,7 +701,7 @@ pub(crate) fn conversation_from(
         .optional()?)
 }
 
-const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender";
+const MESSAGE_COLUMNS: &str = "message_id,role,text,event_hash,author,created_at_ms,in_reply_to,status,report_results,attachments,answers,rank,sender,failure";
 
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let role: String = r.get(1)?;
@@ -717,6 +717,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
     let answers: Option<String> = r.get(10)?;
     let rank: String = r.get(11)?;
     let sender: Option<String> = r.get(12)?;
+    let failure: Option<String> = r.get(13)?;
     Ok((|| {
         Ok(Message {
             message_id,
@@ -728,6 +729,9 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Message>> {
             in_reply_to,
             status: status
                 .map(|status| serde_json::from_value(Value::String(status)))
+                .transpose()?,
+            failure: failure
+                .map(|failure| serde_json::from_value(Value::String(failure)))
                 .transpose()?,
             report_results,
             answers,

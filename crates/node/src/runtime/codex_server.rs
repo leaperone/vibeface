@@ -5,7 +5,10 @@ use super::*;
 use crate::providers::{CodexLaunch, CodexTarget};
 use crate::work::Probe;
 use std::os::unix::process::CommandExt as _;
-use vibeface_bridge::codex::{CodexClient, CodexError};
+use vibeface_bridge::{
+    codex::{CodexClient, CodexError},
+    turn::{TurnStatus, turn_snapshot},
+};
 
 fn last_answer(turn: &Value) -> String {
     turn["items"]
@@ -85,14 +88,15 @@ impl CodexServer {
         let Some(found) = found else {
             return Ok(Probe::Missing);
         };
-        let turn_id = found["id"].as_str().unwrap_or_default().to_owned();
-        Ok(match found["status"].as_str() {
-            Some("inProgress") => Probe::Running { turn_id, epoch },
+        let snapshot = turn_snapshot(found);
+        let turn_id = snapshot.id.unwrap_or_default();
+        Ok(match snapshot.status {
+            Some(TurnStatus::InProgress) => Probe::Running { turn_id, epoch },
             Some(status) => Probe::Terminal {
                 turn_id,
-                status: status.into(),
+                status,
                 text: last_answer(found),
-                error: found["error"]["message"].as_str().map(str::to_owned),
+                error: snapshot.error,
             },
             None => Probe::Missing,
         })

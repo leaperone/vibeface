@@ -1,3 +1,4 @@
+use crate::failure::{ExecFailure, FailureKind};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -73,6 +74,7 @@ pub struct AgentResult {
     pub usage: Option<Value>,
 }
 
+/// How certain the end of a failed turn is; `ExecFailure` says why it failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentFailure {
     Failed,
@@ -82,14 +84,14 @@ pub enum AgentFailure {
 
 #[derive(Debug)]
 pub struct AgentRunError {
-    pub kind: AgentFailure,
+    pub outcome: AgentFailure,
     pub session_id: Option<String>,
-    message: String,
+    pub failure: ExecFailure,
 }
 
 impl std::fmt::Display for AgentRunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
+        self.failure.fmt(formatter)
     }
 }
 
@@ -422,26 +424,32 @@ impl SdkBridge {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
-        let not_sent = |kind, message: String| AgentRunError {
-            kind,
+        let not_sent = |outcome, failure: ExecFailure| AgentRunError {
+            outcome,
             session_id: previous_session_id.map(str::to_owned),
-            message: redact_text(message, &self.secrets(&turn.api_key, &turn.env, "")),
+            failure: ExecFailure {
+                detail: redact_text(failure.detail, &self.secrets(&turn.api_key, &turn.env, "")),
+                ..failure
+            },
         };
         let cancelled_before_send = || {
             not_sent(
                 AgentFailure::Cancelled,
-                "Cursor SDK management cancelled before Send".into(),
+                ExecFailure::new(
+                    FailureKind::Unknown,
+                    "Cursor SDK management cancelled before Send",
+                ),
             )
         };
-        if let Err(error) = validate_turn(turn, prompt, previous_session_id) {
-            return Err(not_sent(AgentFailure::Failed, format!("{error:#}")));
+        if let Err(failure) = validate_turn(turn, prompt, previous_session_id) {
+            return Err(not_sent(AgentFailure::Failed, failure));
         }
         if *cancel.borrow() {
             return Err(cancelled_before_send());
         }
         let admission = tokio::select! {
             admitted = self.admit(&turn.executable, &turn.workspace, &turn.api_key, &turn.env) => {
-                admitted.map_err(|error| not_sent(AgentFailure::Failed, format!("{error:#}")))?
+                admitted.map_err(|error| not_sent(AgentFailure::Failed, start_failure(&error)))?
             }
             _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
         };
@@ -458,7 +466,10 @@ impl SdkBridge {
         {
             return Err(not_sent(
                 AgentFailure::Failed,
-                format!("record Cursor SDK process group before sending: {error:#}"),
+                ExecFailure::new(
+                    FailureKind::Unknown,
+                    format!("record Cursor SDK process group before sending: {error:#}"),
+                ),
             ));
         }
         let rpc = &live.rpc;
@@ -505,15 +516,16 @@ impl SdkBridge {
         let mut exited = live.exited.clone();
         let outcome = tokio::select! {
             biased;
-            result = tokio::time::timeout(Duration::from_secs(turn.timeout_secs), operation) => {
-                result.unwrap_or_else(|_| Err(anyhow!("Cursor SDK manager timed out; completion is unknown")))
-            }
+            result = tokio::time::timeout(Duration::from_secs(turn.timeout_secs), operation) => match result {
+                Ok(result) => result.map_err(|error| ExecFailure::upstream(format!("{error:#}"), FailureKind::Unknown)),
+                Err(_) => Err(ExecFailure::new(FailureKind::TimedOut, "Cursor SDK manager timed out; completion is unknown")),
+            },
             _ = exited.wait_for(|exited| *exited) => {
-                Err(anyhow!("Cursor SDK bridge exited unexpectedly; completion is unknown"))
+                Err(ExecFailure::new(FailureKind::Lost, "Cursor SDK bridge exited unexpectedly; completion is unknown"))
             }
             _ = wait_for_cancel(&mut cancel) => {
                 cancellation_requested = true;
-                Err(anyhow!("Cursor SDK management cancellation requested"))
+                Err(ExecFailure::new(FailureKind::Unknown, "Cursor SDK management cancellation requested"))
             }
         };
         let mut native_terminal = None;
@@ -567,8 +579,8 @@ impl SdkBridge {
             )
             .await;
         }
-        outcome.map_err(|error| {
-            let kind = if cancellation_requested {
+        outcome.map_err(|failure| {
+            let outcome = if cancellation_requested {
                 provider_cancel_failure(native_terminal)
             } else if send_started {
                 AgentFailure::Unknown
@@ -576,13 +588,16 @@ impl SdkBridge {
                 AgentFailure::Failed
             };
             // The agent may still act; its pending check closes only once the bridge group ends.
-            if kind == AgentFailure::Unknown && !live.exited() {
+            if outcome == AgentFailure::Unknown && !live.exited() {
                 live.retire();
             }
             AgentRunError {
-                kind,
+                outcome,
                 session_id: agent_id,
-                message: redact_text(format!("{error:#}"), &secrets),
+                failure: ExecFailure {
+                    detail: redact_text(failure.detail, &secrets),
+                    ..failure
+                },
             }
         })
     }
@@ -674,9 +689,14 @@ impl SdkBridge {
             .envs(&self.env)
             .env("CURSOR_API_KEY", api_key)
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
-        let mut child = command
-            .spawn()
-            .context("could not start cursor-sdk-bridge")?;
+        let mut child = command.spawn().map_err(|error| {
+            let kind = if error.kind() == std::io::ErrorKind::NotFound {
+                FailureKind::MissingBinary
+            } else {
+                FailureKind::Unknown
+            };
+            ExecFailure::new(kind, format!("could not start cursor-sdk-bridge: {error}"))
+        })?;
         let group = child.id().context("Cursor SDK process has no group")?;
         let stdout = child
             .stdout
@@ -714,9 +734,12 @@ impl SdkBridge {
         let mut died = exited.clone();
         let (rpc, agents) = tokio::select! {
             ready = tokio::time::timeout(STARTUP_TIMEOUT, self.connect(ready_rx)) => ready.map_err(|_| {
-                anyhow!(
-                    "Cursor SDK bridge did not start within {}s; the reply did not start",
-                    STARTUP_TIMEOUT.as_secs()
+                ExecFailure::new(
+                    FailureKind::TimedOut,
+                    format!(
+                        "Cursor SDK bridge did not start within {}s; the reply did not start",
+                        STARTUP_TIMEOUT.as_secs()
+                    ),
                 )
             })??,
             _ = died.wait_for(|exited| *exited) => bail!("Cursor SDK bridge exited during startup"),
@@ -843,23 +866,41 @@ async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_turn(turn: &SdkTurn, prompt: &str, previous_session_id: Option<&str>) -> Result<()> {
-    ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
-    ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
-        "invalid management prompt"
-    );
-    ensure!(
-        !turn.model.trim().is_empty(),
-        "Cursor SDK requires an explicit model"
-    );
-    validate_api_key(&turn.api_key)?;
-    validate_launch_env(&turn.env)?;
-    validate_tools(&turn.custom_tools)?;
-    if let Some(id) = previous_session_id {
-        validate_sdk_id(id)?;
+fn validate_turn(
+    turn: &SdkTurn,
+    prompt: &str,
+    previous_session_id: Option<&str>,
+) -> Result<(), ExecFailure> {
+    if turn.model.trim().is_empty() {
+        return Err(ExecFailure::new(
+            FailureKind::NoModel,
+            "Cursor SDK requires an explicit model",
+        ));
     }
-    Ok(())
+    validate_api_key(&turn.api_key)
+        .map_err(|error| ExecFailure::new(FailureKind::MissingKey, error.to_string()))?;
+    (|| {
+        ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
+        ensure!(
+            !prompt.trim().is_empty() && prompt.len() <= MAX_PROMPT_BYTES,
+            "invalid management prompt"
+        );
+        validate_launch_env(&turn.env)?;
+        validate_tools(&turn.custom_tools)?;
+        if let Some(id) = previous_session_id {
+            validate_sdk_id(id)?;
+        }
+        Ok(())
+    })()
+    .map_err(|error: anyhow::Error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))
+}
+
+/// A bridge that did not start: its own kind when it named one, else by the SDK's words.
+fn start_failure(error: &anyhow::Error) -> ExecFailure {
+    match error.downcast_ref::<ExecFailure>() {
+        Some(failure) => failure.clone(),
+        None => ExecFailure::upstream(format!("{error:#}"), FailureKind::Unknown),
+    }
 }
 
 fn validate_api_key(api_key: &str) -> Result<()> {

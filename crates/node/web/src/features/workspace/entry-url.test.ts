@@ -62,9 +62,13 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(parsed.messages[1].attachments, [{ hash: "file", size: 20, name: "报告.pdf" }])
   assert.throws(() => parseConversation({ ...context, messages: [{ ...sent, attachments: [{ hash: "file", size: 20 }] }] }), "an attachment without a name fails closed")
   assert.equal(parseConversation(context).scheduler, null)
-  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
+  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
   }
+  assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "finished", outcome: "abandoned" }] }))
+  assert.equal(parseConversation({ ...context, messages: [{ ...message, status: "failed", failure: "quota" }] }).messages[0].failure, "quota")
+  assert.equal(parseConversation({ ...context, works: [{ ...work, failure: "execution_disabled" }] }).works[0].failure, "execution_disabled")
+  assert.throws(() => parseConversation({ ...context, messages: [{ ...message, failure: "usage limit" }] }), "an unknown failure kind fails closed")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: undefined }] }), "a DAG work always has a state")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting" }] }))
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device" }] }), "undelivered dispatches arrive as deliveries")

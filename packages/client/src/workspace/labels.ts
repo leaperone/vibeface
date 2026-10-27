@@ -72,7 +72,7 @@ const taskStates: Record<string, string> = {
   pending_delivery: "等待中", queued: "等待中", claimed: "准备中", accepted: "准备中", running: "运行中", waiting: "需要你同意",
   cancelling: "停止中", interrupting: "停止中", completed: "已完成", failed: "失败", cancelled: "已停止", interrupted: "已中断",
   pending_check: "待确认", unknown: "待确认", starting: "准备中", finished: "已完成", unverified: "待确认", awaiting_confirmation: "待确认",
-  abandoned: "已放弃、未执行", dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", dispatch_unverified: "结果未知", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
+  dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", dispatch_unverified: "结果未知", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
 
