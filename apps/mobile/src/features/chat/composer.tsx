@@ -21,7 +21,7 @@ type Props = {
   onChange: (value: string) => void
   files: Attachment[]
   onFiles: (files: Attachment[]) => void
-  /** Why sending is off, shown under the box; null when it is allowed. */
+  /** Why sending is off, in place of the placeholder, or under the box while it holds a draft; null when it is allowed. */
   blocked: string | null
   /** A message is on its way: the button rests, and nothing below the box appears and shifts it. */
   sending: boolean
@@ -53,7 +53,7 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
           </Pressable>
         </View>)}
       </ScrollView> : null}
-      <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder="发消息" placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
+      <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="给 Bot 发消息" placeholder={blocked ?? '发消息'} placeholderTextColorClassName="accent-muted-foreground" multiline maxLength={100000}
         className="max-h-40 min-h-11 px-4 pt-3 pb-1 font-sans text-body text-foreground" value={value} onChangeText={onChange} />
       <View className="flex-row items-center justify-between ps-0.5 pe-1.5 pb-1.5">
         <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} onPress={pick}>
@@ -68,8 +68,8 @@ export function Composer({ value, onChange, files, onFiles, blocked, sending, on
         </Animated.View>
       </View>
     </View>
-    {blocked || children ? <View className="w-full max-w-[640px] self-center">
-      {blocked ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
+    {blocked && value || children ? <View className="w-full max-w-[640px] self-center">
+      {blocked && value ? <Text className="px-2 text-meta text-muted-foreground">{blocked}</Text> : null}
       {children}
     </View> : null}
   </View>

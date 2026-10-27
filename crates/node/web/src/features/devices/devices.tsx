@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { isLoopback, phoneName } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
@@ -42,7 +42,7 @@ export function useDeviceRows(): DeviceRow[] {
 
 export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): LucideIcon {
   if (row.kind === "node") return row.entry ? Laptop : Server
-  return /iphone|android|ipad|phone|手机/i.test(row.name) ? Smartphone : Monitor
+  return phoneName(row.name) ? Smartphone : Monitor
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
