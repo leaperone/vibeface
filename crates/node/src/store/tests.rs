@@ -918,18 +918,17 @@ fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
     store.save_dispatch(&lost)?;
     let render = |store: &Store, trigger: &str| -> Result<Value> {
         let job = store.scheduler_job("c", trigger)?.context("job")?;
-        let context = store.context(&net.network, "c", None)?;
+        let history = store.turn_history(&net.network, "c", &job, None)?;
         let works = store.works(&net.network, "c")?;
         let dispatches = store.undelivered_dispatches(&net.network, "c")?;
         let (prompt, _) = crate::scheduler::materialize(
-            &context,
+            &history,
             &job,
             &works,
             &dispatches,
             json!({}),
             None,
             &[],
-            None,
             None,
         )?;
         prompt_data(&prompt)
@@ -3721,19 +3720,10 @@ fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()
             .into_iter()
             .find(|job| job.trigger == trigger)
             .context("answer job")?;
-        let context = store.context(&net.network, "c", None)?;
+        let history = store.turn_history(&net.network, "c", &job, None)?;
         let works = store.works(&net.network, "c")?;
-        let (prompt, _) = crate::scheduler::materialize(
-            &context,
-            &job,
-            &works,
-            &[],
-            json!({}),
-            None,
-            &[],
-            None,
-            None,
-        )?;
+        let (prompt, _) =
+            crate::scheduler::materialize(&history, &job, &works, &[], json!({}), None, &[], None)?;
         roles.insert(id, prompt.lines().next().unwrap_or_default().to_owned());
     }
     assert!(
@@ -4288,15 +4278,22 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         message_id: "reply".into(),
         state: JobState::Queued,
     };
+    let history = store.turn_history(&net.network, "c", &job, None)?;
     let materialize = |bot: Value| {
-        crate::scheduler::materialize(&context, &job, &works, &[], bot, None, &[], None, None)
+        crate::scheduler::materialize(&history, &job, &works, &[], bot, None, &[], None)
             .map(|(prompt, _)| prompt)
     };
     let newest = json!(
-        context
-            .events
-            .iter()
-            .rposition(|event| matches!(event.event.body, EventBody::MessagePosted { .. }))
+        super::event_about_from(
+            &store.connection,
+            &net.network,
+            "c",
+            "message_posted",
+            "m48"
+        )?
+        .context("m48")?
+        .event
+        .seq
     );
 
     let roomy = prompt_data(&materialize(json!({}))?)?;
@@ -4318,8 +4315,9 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
     );
     assert!(roomy["conversation"]["checkpoint"].is_object());
     assert_eq!(
-        listed(&roomy, "/conversation/messages", "offset").last(),
-        Some(&newest)
+        listed(&roomy, "/conversation/messages", "seq").last(),
+        Some(&newest),
+        "the newest message before the trigger closes the history"
     );
 
     let notes = (0..8)
@@ -4330,11 +4328,10 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
     let prompt = materialize(full_bot)?;
     assert!(prompt.len() <= crate::scheduler::PROMPT_LIMIT);
     let tight = prompt_data(&prompt)?;
-    let offsets = listed(&tight, "/conversation/messages", "offset");
-    assert_eq!(offsets.last(), Some(&newest), "the trigger message stays");
+    let seqs = listed(&tight, "/conversation/messages", "seq");
+    assert_eq!(seqs.last(), Some(&newest), "the newest messages stay");
     assert!(
-        offsets
-            .windows(2)
+        seqs.windows(2)
             .all(|pair| pair[0].as_u64() < pair[1].as_u64())
     );
     assert!(
@@ -4852,32 +4849,29 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     for i in 0..3 {
         store.accept_work(&net.a, &net.network, work(i)?, 10 + i as i64)?;
     }
-    let render = |store: &Store, trigger: &str, resumed, thread| {
-        let context = store.context(&net.network, "c", None)?;
+    let local = net.a.device_id()?;
+    let render = |store: &Store, trigger: &str, resumed: Option<&VersionVector>, thread| {
         let job = SchedulerJob {
             conversation_id: "c".into(),
             trigger: message_trigger(trigger),
             kind: TriggerKind::Human,
             sequence: 0,
-            basis: context.basis.clone(),
+            basis: store.version_vector(&net.network)?,
             reply_to: trigger.into(),
             message_id: "reply".into(),
             state: JobState::Queued,
         };
+        let history = store.turn_history(
+            &net.network,
+            "c",
+            &job,
+            resumed.map(|covers| (covers, local.as_str())),
+        )?;
         let works = store.works(&net.network, "c")?;
         let bot = crate::scheduler::bot_value(store, &net.network, "c", 100)?;
-        let rendered = crate::scheduler::materialize(
-            &context,
-            &job,
-            &works,
-            &[],
-            bot,
-            None,
-            &[],
-            resumed,
-            thread,
-        )?;
-        Ok::<_, anyhow::Error>((rendered, context.basis))
+        let rendered =
+            crate::scheduler::materialize(&history, &job, &works, &[], bot, None, &[], thread)?;
+        Ok::<_, anyhow::Error>((rendered, job.basis))
     };
     let rule = "Operate only inside this personal network";
 
@@ -4908,9 +4902,11 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
     assert_eq!(data["bot"], json!({"unchanged":true,"now_ms":100}));
     assert_eq!(listed(&data, "/works", "work_id"), [json!("w3")]);
     assert_eq!(data["works_unchanged"], 3);
+    assert_eq!(data["trigger"]["event"]["body"]["text"], "next");
     assert_eq!(
-        listed(&data, "/conversation/messages", "text"),
-        [json!("next")]
+        data["conversation"]["messages"],
+        json!([]),
+        "the trigger is not repeated among the messages"
     );
 
     store.change_bot(
@@ -4979,5 +4975,495 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
     let fresh = turn("m3", "cfg-new-instructions")?;
     assert_eq!(fresh.previous_native_id, None);
     assert_eq!(fresh.shown, Shown::default());
+    Ok(())
+}
+
+fn job_at(store: &Store, net: &Net, trigger: &str) -> Result<SchedulerJob> {
+    Ok(SchedulerJob {
+        conversation_id: "c".into(),
+        trigger: message_trigger(trigger),
+        kind: TriggerKind::Human,
+        sequence: 0,
+        basis: store.version_vector(&net.network)?,
+        reply_to: trigger.into(),
+        message_id: "reply".into(),
+        state: JobState::Queued,
+    })
+}
+
+fn message_seq(store: &Store, net: &Net, message: &str) -> Result<u64> {
+    Ok(super::event_about_from(
+        &store.connection,
+        &net.network,
+        "c",
+        "message_posted",
+        message,
+    )?
+    .context("message")?
+    .event
+    .seq)
+}
+
+#[test]
+fn history_pages_read_at_the_turn_basis_by_position_and_type() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for i in 1..=5 {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            user(&net, &format!("m{i}"), &format!("t{i}")),
+            vec![],
+            10 + i,
+        )?;
+    }
+    let basis = store.version_vector(&net.network)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m6", "t6"),
+        vec![],
+        20,
+    )?;
+    let author = net.a.device_id()?;
+    let messages = ["message_posted".to_owned()];
+    let ids = |events: Vec<HashedEvent>| -> Vec<String> {
+        events
+            .into_iter()
+            .filter_map(|event| match event.event.body {
+                EventBody::MessagePosted { message_id, .. } => Some(message_id),
+                _ => None,
+            })
+            .collect()
+    };
+    let (newest, more) = store.history_page(&net.network, "c", &basis, None, &messages, 2)?;
+    assert_eq!(
+        ids(newest),
+        ["m5", "m4"],
+        "the newest within the basis, not m6 that came after"
+    );
+    assert!(more);
+    let m3 = message_seq(&store, &net, "m3")?;
+    let (older, more) = store.history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&author, m3, false)),
+        &messages,
+        10,
+    )?;
+    assert_eq!(ids(older), ["m2", "m1"]);
+    assert!(!more);
+    let (newer, more) = store.history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&author, m3, true)),
+        &messages,
+        10,
+    )?;
+    assert_eq!(
+        ids(newer),
+        ["m4", "m5"],
+        "a position stays put while new events arrive"
+    );
+    assert!(!more);
+    let (all, _) = store.history_page(
+        &net.network,
+        "c",
+        &basis,
+        Some((&author, m3, false)),
+        &[],
+        10,
+    )?;
+    assert!(
+        all.iter()
+            .any(|event| !matches!(event.event.body, EventBody::MessagePosted { .. })),
+        "without types every event reads"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_turn_reads_only_past_the_checkpoint_yet_finds_an_older_trigger() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let text = "x".repeat(2_000);
+    for i in 0..20 {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            user(&net, &format!("m{i}"), &text),
+            vec![],
+            10 + i,
+        )?;
+    }
+    let context = store.context(&net.network, "c", None)?;
+    let checkpoint = crate::scheduler::checkpoint(&context, &[]).context("over budget")?;
+    store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 50)?;
+    let job = job_at(&store, &net, "m0")?;
+    let history = store.turn_history(&net.network, "c", &job, None)?;
+    assert!(history.checkpoint.is_some());
+    let m0 = message_seq(&store, &net, "m0")?;
+    assert!(
+        history
+            .recent
+            .events
+            .iter()
+            .all(|event| event.event.seq > m0),
+        "covered events are not loaded"
+    );
+    assert_eq!(
+        history.trigger.as_ref().map(|event| event.event.seq),
+        Some(m0),
+        "the trigger is found by its index however old"
+    );
+    let (prompt, _) =
+        crate::scheduler::materialize(&history, &job, &[], &[], json!({}), None, &[], None)?;
+    let data = prompt_data(&prompt)?;
+    assert_eq!(data["trigger"]["event"]["seq"], json!(m0));
+    Ok(())
+}
+
+#[test]
+fn a_resumed_session_is_not_shown_its_own_replies_or_the_trigger_twice() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m1", "first"),
+        vec![],
+        10,
+    )?;
+    let covers = store.version_vector(&net.network)?;
+    let reply = |id: &str, status| EventBody::MessagePosted {
+        message_id: id.into(),
+        role: Role::Assistant,
+        text: format!("reply {id}"),
+        attachments: vec![],
+        report_results: None,
+        in_reply_to: Some("m1".into()),
+        status: Some(status),
+        failure: None,
+        answers: None,
+        attestation: None,
+    };
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        reply("r1", ReplyStatus::Completed),
+        vec![],
+        11,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        reply("r2", ReplyStatus::Failed),
+        vec![],
+        12,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        reply("r3", ReplyStatus::Stopped),
+        vec![],
+        12,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", "second"),
+        vec![],
+        13,
+    )?;
+    let job = job_at(&store, &net, "m2")?;
+    let local = net.a.device_id()?;
+    let texts = |resumed: Option<(&VersionVector, &str)>| -> Result<Vec<Value>> {
+        let history = store.turn_history(&net.network, "c", &job, resumed)?;
+        let (prompt, _) =
+            crate::scheduler::materialize(&history, &job, &[], &[], json!({}), None, &[], None)?;
+        Ok(listed(
+            &prompt_data(&prompt)?,
+            "/conversation/messages",
+            "text",
+        ))
+    };
+    assert_eq!(
+        texts(Some((&covers, &local)))?,
+        [json!("reply r2"), json!("reply r3")],
+        "the session holds the reply it completed; a failed or stopped one may never have run there"
+    );
+    assert_eq!(
+        texts(None)?,
+        [
+            json!("first"),
+            json!("reply r1"),
+            json!("reply r2"),
+            json!("reply r3")
+        ],
+        "a fresh session reads every reply, and the trigger only as the trigger"
+    );
+    Ok(())
+}
+
+#[test]
+fn answers_become_checkpoint_decisions_that_later_checkpoints_keep() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.ask(&net.a, &net.network, "c", question(&net, "q-1", "t1")?, 2)?;
+    let signed = Some(answer_signature(&net, "c", "q-1", "用方案 B")?);
+    store.accept_answer(&net.a, &net.network, "q-1", "用方案 B", signed, 3)?;
+    let text = "x".repeat(2_000);
+    let mut decisions = Vec::new();
+    for round in 0..2 {
+        for i in 0..20 {
+            let id = format!("m{round}-{i}");
+            store.append_event(
+                &net.a,
+                &net.network,
+                "c",
+                user(&net, &id, &text),
+                vec![],
+                10 + 100 * round + i,
+            )?;
+        }
+        let context = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+        let checkpoint = crate::scheduler::checkpoint(&context, &[]).context("over budget")?;
+        let EventBody::ContextCheckpoint {
+            decisions: found, ..
+        } = &checkpoint
+        else {
+            unreachable!()
+        };
+        decisions = found.clone();
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            checkpoint,
+            vec![],
+            90 + 100 * round,
+        )?;
+    }
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.contains("q-1") && decision.contains("用方案 B")),
+        "the answer survives the rolling summary: {decisions:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_turn_marks_attachments_not_on_this_device_pending() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let content = b"hello".to_vec();
+    let file = Attachment {
+        hash: crate::crypto::digest(&content),
+        size: content.len() as u64,
+        name: "a.txt".into(),
+    };
+    let message = net.a.fixture_admin().attest(
+        &net.network,
+        "c",
+        EventBody::MessagePosted {
+            message_id: "m1".into(),
+            role: Role::User,
+            text: "看附件".into(),
+            attachments: vec![file.clone()],
+            report_results: Some(true),
+            in_reply_to: None,
+            status: None,
+            answers: None,
+            attestation: None,
+            failure: None,
+        },
+    )?;
+    store.put_blob(&file.blob(), &content)?;
+    store.append_event(&net.a, &net.network, "c", message, vec![file.blob()], 10)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", "再看"),
+        vec![],
+        11,
+    )?;
+    let job = job_at(&store, &net, "m2")?;
+    let mut history = store.turn_history(&net.network, "c", &job, None)?;
+    assert_eq!(
+        history
+            .shown_events()
+            .flat_map(|event| &event.event.blobs)
+            .count(),
+        1,
+        "the attachment the prompt shows is the one a turn fetches"
+    );
+    history.pending_blobs.insert(file.hash.clone());
+    let (prompt, _) =
+        crate::scheduler::materialize(&history, &job, &[], &[], json!({}), None, &[], None)?;
+    let data = prompt_data(&prompt)?;
+    assert_eq!(
+        data.pointer("/conversation/messages/0/attachments/0/pending_download"),
+        Some(&json!(true))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (i, thread) in ["t-a", "t-b"].into_iter().enumerate() {
+        let spec = WorkSpec {
+            work_id: format!("w{i}"),
+            conversation: "c".into(),
+            trigger: message_trigger("m"),
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: format!("call-{i}"),
+            kind: WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".into(),
+            continues: None,
+            parent: None,
+            thread: Some(thread.into()),
+        };
+        store.accept_work(&net.a, &net.network, spec, 10 + i as i64)?;
+    }
+    let on = |thread| -> Result<Vec<String>> {
+        Ok(store
+            .work_records_on_thread(thread)?
+            .into_iter()
+            .map(|record| record.work_id)
+            .collect())
+    };
+    assert_eq!(on("t-a")?, ["w0"]);
+    assert_eq!(on("t-b")?, ["w1"]);
+    Ok(())
+}
+
+#[test]
+fn an_attachment_page_reads_text_as_text_and_splits_on_characters() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let attach = |store: &mut Store, id: &str, content: &[u8], time| -> Result<String> {
+        let file = Attachment {
+            hash: crate::crypto::digest(content),
+            size: content.len() as u64,
+            name: format!("{id}.bin"),
+        };
+        let message = net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: id.into(),
+                attachments: vec![file.clone()],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+                failure: None,
+            },
+        )?;
+        store.put_blob(&file.blob(), content)?;
+        store.append_event(&net.a, &net.network, "c", message, vec![file.blob()], time)?;
+        Ok(file.hash)
+    };
+    let text = "好".repeat(1_000);
+    let hash = attach(&mut store, "m1", text.as_bytes(), 10)?;
+    let binary = attach(&mut store, "m2", &[0xff, 0x00, 0xfe], 11)?;
+    let page = |hash: &str, offset: u64| {
+        crate::runtime::agent_tools::blob_page(
+            &store,
+            &net.network,
+            "c",
+            hash,
+            &json!({"offset":offset,"limit":1}),
+        )
+    };
+    let mut read = String::new();
+    let mut offset = Some(0);
+    while let Some(at) = offset {
+        let chunk = page(&hash, at)?;
+        read.push_str(chunk["text"].as_str().context("UTF-8 comes back as text")?);
+        offset = chunk["next_offset"].as_u64();
+    }
+    assert_eq!(
+        read, text,
+        "pages split between characters, never inside one"
+    );
+    assert_eq!(page(&binary, 0)?["data_base64"], "/wD+");
+    std::fs::remove_file(store.blob_file(&binary)?)?;
+    assert_eq!(page(&binary, 0)?["pending_download"], true);
+    Ok(())
+}
+
+#[test]
+fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for i in 0..30 {
+        let spec = WorkSpec {
+            work_id: format!("w{i:02}"),
+            conversation: "c".into(),
+            trigger: message_trigger("m"),
+            target: net.a.device_id()?,
+            dispatcher: net.a.device_id()?,
+            call_ref: format!("call-{i}"),
+            kind: WorkKind::Codex,
+            cwd: "/tmp".into(),
+            title: "t".into(),
+            prompt: "p".repeat(2_000),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        store.accept_work(&net.a, &net.network, spec, 10 + i)?;
+    }
+    let works = store.works(&net.network, "c")?;
+    let mut seen = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let page = crate::runtime::agent_tools::work_status(
+            &works,
+            &[],
+            &json!({"before":before,"limit":50}),
+        )?;
+        assert!(
+            page.to_string().len() <= 33_000,
+            "a page stays within the cap"
+        );
+        let ids = listed(&page, "/works", "work_id");
+        before = ids.last().and_then(|id| id.as_str()).map(str::to_owned);
+        seen.extend(ids);
+        if page["more"] != true {
+            break;
+        }
+    }
+    let expected: Vec<Value> = (0..30).rev().map(|i| json!(format!("w{i:02}"))).collect();
+    assert_eq!(seen, expected, "every work once, newest first");
     Ok(())
 }

@@ -8,6 +8,22 @@ use crate::{
 };
 use serde_json::{Value, json};
 
+/// Event types `context` filters by; see `EventBody::kind`.
+const EVENT_TYPES: [&str; 12] = [
+    "message_posted",
+    "bot_messaged",
+    "question_asked",
+    "question_closed",
+    "work_dispatched",
+    "work_progress",
+    "work_finished",
+    "context_checkpoint",
+    "bot_created",
+    "bot_changed",
+    "schedule_controlled",
+    "session_attributed",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Nodes,
@@ -172,6 +188,10 @@ impl Tool {
     /// `wait_codex` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
         let string = || json!({"type":"string","minLength":1});
+        let position = || {
+            json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1}},
+            "required":["author","seq"],"additionalProperties":false})
+        };
         Some(match self {
             Tool::Nodes => (
                 "List personal Nodes, device names and allowed roots.",
@@ -179,8 +199,11 @@ impl Tool {
                 &[],
             ),
             Tool::Context => (
-                "Read conversation events in their shared order, or an attachment. offset counts events, or bytes for blobs; blob limit counts KiB.",
-                json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100},"blob_hash":string()}),
+                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types keeps only those event types. more says further events lie that way. A long event is cut short; limit 1 reads more of it. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
+                json!({"before":position(),"after":position(),
+                "types":{"type":"array","items":{"type":"string","enum":EVENT_TYPES},"uniqueItems":true},
+                "limit":{"type":"integer","minimum":1,"maximum":100},
+                "blob_hash":string(),"offset":{"type":"integer","minimum":0}}),
                 &[],
             ),
             Tool::DispatchWork => (
@@ -196,8 +219,8 @@ impl Tool {
                 &["title", "prompt", "cwd", "call_ref"],
             ),
             Tool::WorkStatus => (
-                "Read the state and result of this conversation's works, or of one work_id.",
-                json!({"work_id":string()}),
+                "Read one work_id's state and result, or this conversation's works newest first. before continues after the last work_id of the previous page; more says older ones remain.",
+                json!({"work_id":string(),"before":string(),"limit":{"type":"integer","minimum":1,"maximum":50}}),
                 &[],
             ),
             Tool::InterruptWork => (

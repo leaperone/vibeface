@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=5`，数据库 `user_version=5`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=6`，数据库 `user_version=6`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -74,8 +74,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":5}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=5` |
+| `data-epoch.json` | `{"data_epoch":6}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=6` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -219,7 +219,7 @@
 
 新负责人从共享记录推导旧负责人留下的未回复消息，列在 `conversation` 调度队列的 `unanswered` 里，按会话顺序给出。未回复指本会话的本人消息没有 `status = completed` 的回复，没有 `message_steered` 记录，本机也没有它的 job 或 outbox 条目。只有本机是负责人且 bot 未删除时才列出。网页显示“N 条消息没等到回复”，本人选择回复后经 `reply_unanswered` 在本机排队，不会自动重放；选择“不回复”则经 `dismiss_unanswered` 在本机把它们记为开始前已取消，不执行任何操作。这条记录和队列一样只在本机：会话再换到第三台设备时，那里会重新列出，仍需本人决定。排队按 trigger 去重，重试不会再排，结果未知时重读会话即可对账。回复 ID 由 `(会话, trigger, owner_epoch)` 派生，所以新负责人的回复不会和旧负责人已写的停止或中断回复冲突。
 
-每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果、schedule 和 bot 消息。每轮按领取时固定的版本向量 `basis` 准备上下文。排在后面的消息因此能读到前一条的回复。提示总长不超过 50000 字节，bot 指令和 schedule prompt 各以 8 KB 封顶并计入总长。Codex 线程在 `thread/start` 和 `thread/resume` 的 `developerInstructions` 里收到 CLI 说明、全部工具目录和固定规则，回合消息只带本轮角色和数据：续接的线程只收到新消息、变化过的工作（`works_unchanged` 计其余条数）和变化过的 bot（未变时为 `{"unchanged":true}`），`trigger.unavailable_tools` 列出本轮不提供的工具。线程看过的 bot 和工作摘要随 `covers` 存在本机会话里。会话键含线程指令的摘要，指令变化就开新线程；模型不在 Codex 会话键里，按回合经 `turn/start` 传。Cursor 每轮提示仍带全部规则和上下文，模型变化开新会话。超出时依次收缩工作列表、检查点和较早的消息，不让这一轮失败。工作列表、记忆和消息都从新到旧取到各自预算为止，再按时间顺序给出，并附省略条数。
+每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果、schedule 和 bot 消息。每轮按领取时固定的版本向量 `basis` 准备上下文。排在后面的消息因此能读到前一条的回复。提示总长不超过 50000 字节，bot 指令和 schedule prompt 各以 8 KB 封顶并计入总长。Codex 线程在 `thread/start` 和 `thread/resume` 的 `developerInstructions` 里收到 CLI 说明、全部工具目录和固定规则，回合消息只带本轮角色和数据：续接的线程只收到新消息、变化过的工作（`works_unchanged` 计其余条数）和变化过的 bot（未变时为 `{"unchanged":true}`），`trigger.unavailable_tools` 列出本轮不提供的工具。线程看过的 bot 和工作摘要随 `covers` 存在本机会话里。会话键含线程指令的摘要，指令变化就开新线程；模型不在 Codex 会话键里，按回合经 `turn/start` 传。Cursor 每轮提示仍带全部规则和上下文，模型变化开新会话。超出时依次收缩工作列表、检查点和较早的消息，不让这一轮失败。工作列表、记忆和消息都从新到旧取到各自预算为止，再按时间顺序给出，并附省略条数。提示只读最新检查点之后（续接的会话则是它看过的 `covers` 之后）的事件；触发事件和它回答的问题按事件的 `kind` 与 `subject` 索引直接取，不随历史变长而多读。每条消息带 `author` 和 `seq`，触发事件只出现在 `trigger.event`，不在 `messages` 里重复；续接的会话不再收到本节点在该会话里正常完成的回复，停止、中断或失败的回复照常给出。回合开始前，提示要展示的附件不在本机时，向写这条消息的设备拉取，合计最多等 15 秒；仍没拉到的附件带 `pending_download: true`，触发事件另列 `pending_download` 哈希。
 
 负责人每 30 秒检查本机负责的会话中已启用的 schedule，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。运行前负责人写一条 `schedule_run_claimed` 领取这个时刻；时刻已过去超过 10 分钟（设备关机或休眠）时同样写领取，但不运行，只记一条 `schedule.skipped_late` 日志。任何 Node 已领取的时刻都不再排队，所以重启、同步和换负责人都不会重跑或补跑，一次性提醒也只运行一次。同一 schedule 仍在排队时不领取下一个时刻。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。新负责人不领取、不运行早于或等于换到它的 `conversation_owner` 记录时间的时刻：旧负责人可能已在断开期间运行过它，领取还没传过来。schedule 轮可以派发工作和设提醒，不提供修改 bot 的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前 schedule 已暂停或删除，或这个时刻的领取胜者不是本机时，job 取消。换负责人时未开始的 schedule job 直接丢弃，由新负责人按自己的检查运行。
 
@@ -238,13 +238,13 @@ queued → claimed → running ─→ completed | failed
 
 Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合则按记下的线程和回合 ID 复查 App Server，仍在运行就中断。都已结束时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
 
-负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。`recent_user_requests` 是被覆盖的最近 20 条本人消息摘录，只是历史，不代表需要长期遵守的指令。
+负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。`decisions` 是不截断区，记本人对提问的回答和本人确认的工作结果，后续检查点原样继承，只在超过 200 条时为限制事件大小丢最早的；`summary` 是滚动区，只保留最新的 6000 字节。`recent_user_requests` 是被覆盖的最近 20 条本人消息摘录，只是历史，不代表需要长期遵守的指令。提示放不下时检查点依次让出滚动摘要、较早的本人消息摘录和未完成工作，`decisions` 最后才省略，并给出 `decisions_omitted`。
 
 本机调度 job、outbox、工作状态日志和原生 SDK 会话不进入事件日志。
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。`propose_provider_config { execution?, codex_home?, app_server_socket?, codex_sessions?, cursor_sdk_bin? }` 提议本设备的路径：给出的必须是存在的绝对路径，其余由 Node 补齐，只留与现有设置不同的项；都相同时返回 `{status: "unchanged"}`。否则在本聊天写一张「允许 / 不允许」提问卡片，卡片里的路径缩写成 `~/…`，返回 `{status: "asked", question_id, proposed}`，此时什么都不写。本人回答后的那一轮，Bot 用 `apply_provider_config { question_id }`：回答为「允许」时经 `configure_provider` 的同一写入路径写入，返回 `{status: "applied", applied, also_filled}`；其他回答返回 `{status: "declined"}`，不写。同一提问重复调用只读回第一次的结果。提议只存在内存，Node 重启后要重新提议。密钥和其他变量不经这两个工具。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。`propose_provider_config { execution?, codex_home?, app_server_socket?, codex_sessions?, cursor_sdk_bin? }` 提议本设备的路径：给出的必须是存在的绝对路径，其余由 Node 补齐，只留与现有设置不同的项；都相同时返回 `{status: "unchanged"}`。否则在本聊天写一张「允许 / 不允许」提问卡片，卡片里的路径缩写成 `~/…`，返回 `{status: "asked", question_id, proposed}`，此时什么都不写。本人回答后的那一轮，Bot 用 `apply_provider_config { question_id }`：回答为「允许」时经 `configure_provider` 的同一写入路径写入，返回 `{status: "applied", applied, also_filled}`；其他回答返回 `{status: "declined"}`，不写。同一提问重复调用只读回第一次的结果。提议只存在内存，Node 重启后要重新提议。密钥和其他变量不经这两个工具。`context { before? | after?: {author, seq}, types?, limit?, blob_hash?, offset? }` 按本轮领取时的 `basis` 读历史，位置不随新事件移动：不给位置读最新的，`before` 或 `after` 读某条事件之前或之后的，`types` 按事件类型过滤，`more` 表示该方向还有；一页最多 32000 字节，单个事件最多 8000 字节，`limit: 1` 时单个事件可到 32000 字节；位置超出本轮 `basis` 时报错。带 `blob_hash` 时读附件，`limit` 以 KiB 计、最多 32，UTF-8 文本以 `text` 返回并在字符边界分页，其他内容为 `data_base64`，附件还没到本机时返回 `pending_download: true`。`work_status { work_id? | before?, limit? }` 给出单个工作的完整记录（结果超过 32000 字节时截断并标 `result_truncated`），或从新到旧分页列出本会话的工作，`before` 接上一页最后一个 `work_id`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 
@@ -302,7 +302,7 @@ Event {
 
 通知由 `work_finished` 和会话里的 `question_asked` 派生，通知 ID 即该事件 hash。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`：工作记录 rank 最小者胜，`session_attributed` rank 最大者胜并覆盖工作记录，`session_muted` 置 `muted`；所属 Bot 已删除的行读取时视为无主。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
-入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
+入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；缺少 `deps` 的事件进入 `pending_events`，依赖到齐后自动入库。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。每行另存事件类型 `kind` 和它所指的消息、工作或提问 `subject`，按类型的读取（检查点、负责人记录、触发事件、`context` 的类型过滤）走索引。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
 
 `effective` 标记事件是否计入投影，只由签名证据决定：作者从分叉序号起两支都不计入；当前成员 Node 计入此前的主分支事件；被撤销设备计入不超过上限的事件，分叉后沿 `cutoff_hash` 往回的那一支也计入。依赖只决定顺序，不传递是否计入。成员目录变化或分叉证据到达时，同一事务内重新计算 `effective`，有变化时清空并按顺序重放 reducer 写的投影表，本机账本不变，不重放副作用，然后推送一条不带会话的 `changed`。
 

@@ -749,6 +749,41 @@ impl EventBody {
             _ => None,
         }
     }
+    /// The event's type tag, stored beside it so reads by type use an index.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ConversationCreated { .. } => "conversation_created",
+            Self::ConversationOwner { .. } => "conversation_owner",
+            Self::BotCreated { .. } => "bot_created",
+            Self::MessagePosted { .. } => "message_posted",
+            Self::WorkDispatched { .. } => "work_dispatched",
+            Self::WorkProgress { .. } => "work_progress",
+            Self::WorkFinished { .. } => "work_finished",
+            Self::NotificationAcked { .. } => "notification_acked",
+            Self::QuestionAsked { .. } => "question_asked",
+            Self::QuestionClosed { .. } => "question_closed",
+            Self::SessionAttributed { .. } => "session_attributed",
+            Self::SessionMuted { .. } => "session_muted",
+            Self::PrimaryBotSet { .. } => "primary_bot_set",
+            Self::BotChanged { .. } => "bot_changed",
+            Self::BotDeleted { .. } => "bot_deleted",
+            Self::ScheduleControlled { .. } => "schedule_controlled",
+            Self::ScheduleRunClaimed { .. } => "schedule_run_claimed",
+            Self::MessageSteered { .. } => "message_steered",
+            Self::BotMessaged { .. } => "bot_messaged",
+            Self::ContextCheckpoint { .. } => "context_checkpoint",
+        }
+    }
+    /// The message, work or question the event is about; a turn finds its trigger by it.
+    pub fn subject(&self) -> Option<&str> {
+        match self {
+            Self::MessagePosted { message_id, .. } | Self::BotMessaged { message_id, .. } => {
+                Some(message_id)
+            }
+            Self::QuestionAsked { question_id, .. } => Some(question_id),
+            body => body.work_id(),
+        }
+    }
     pub fn work_id(&self) -> Option<&str> {
         match self {
             Self::WorkDispatched { work_id, .. }

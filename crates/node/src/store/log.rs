@@ -348,7 +348,7 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
         *known = (*known).max(seq);
     }
     let mut statement = connection.prepare(
-        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='conversation_owner'",
     )?;
     let mut rows = statement.query(params![network, scope])?;
     let mut newest: Option<(u64, bool)> = None;
@@ -425,9 +425,16 @@ fn insert_event(
         lamport = lamport.max(parent.unwrap_or(0));
     }
     lamport += 1;
+    debug_assert_eq!(
+        serde_json::to_value(&event.body)
+            .ok()
+            .map(|body| body["type"].clone()),
+        Some(serde_json::json!(event.body.kind())),
+        "an event's stored kind is its type tag"
+    );
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective,kind,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject()],
     )?;
     for blob in &event.blobs {
         connection.execute(

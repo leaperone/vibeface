@@ -755,7 +755,7 @@ fn taken_over_at(
         return Ok(None);
     }
     let mut statement = connection.prepare(
-        "SELECT created_at_ms,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+        "SELECT created_at_ms,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='conversation_owner'",
     )?;
     let mut rows = statement.query(params![network, conversation])?;
     let mut since: Option<i64> = None;

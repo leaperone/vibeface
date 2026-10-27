@@ -1,9 +1,10 @@
 CREATE TABLE `networks` (`network_id` text NULL, `bundle` text NOT NULL, PRIMARY KEY (`network_id`));
-CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
+CREATE TABLE `events` (`network_id` text NOT NULL, `author` text NOT NULL, `seq` integer NOT NULL, `hash` text NOT NULL, `scope_id` text NOT NULL, `lamport` integer NOT NULL, `created_at_ms` integer NOT NULL, `envelope` text NOT NULL, `main` integer NOT NULL, `effective` integer NOT NULL, `kind` text NOT NULL, `subject` text NULL, PRIMARY KEY (`network_id`, `hash`), CONSTRAINT `0` FOREIGN KEY (`network_id`) REFERENCES `networks` (`network_id`) ON UPDATE NO ACTION ON DELETE NO ACTION);
 CREATE UNIQUE INDEX `events_main` ON `events` (`network_id`, `author`, `seq`) WHERE main = 1;
 CREATE INDEX `events_forks` ON `events` (`network_id`, `author`, `seq`) WHERE main = 0;
 CREATE INDEX `events_order` ON `events` (`network_id`, `scope_id`, `lamport`, `created_at_ms`, `hash`);
 CREATE INDEX `events_scope_author` ON `events` (`network_id`, `scope_id`, `author`, `seq`);
+CREATE INDEX `events_kind` ON `events` (`network_id`, `scope_id`, `kind`, `subject`);
 CREATE TABLE `event_blobs` (`network_id` text NOT NULL, `hash` text NOT NULL, `blob` text NOT NULL, `size` integer NOT NULL, PRIMARY KEY (`network_id`, `hash`, `blob`));
 CREATE INDEX `event_blobs_blob` ON `event_blobs` (`network_id`, `blob`);
 CREATE TABLE `log_heads` (`network_id` text NOT NULL, `author` text NOT NULL, `max_seq` integer NOT NULL, `head_hash` text NOT NULL, PRIMARY KEY (`network_id`, `author`));
@@ -52,5 +53,6 @@ CREATE TABLE `pending_checks` (`attempt_id` text NOT NULL, `conversation_id` tex
 CREATE TABLE `manager_processes` (`attempt_id` text NOT NULL, `process_group` integer NOT NULL, PRIMARY KEY (`attempt_id`, `process_group`));
 CREATE TABLE `manager_turns` (`attempt_id` text NOT NULL, `server` text NOT NULL, `thread_id` text NOT NULL, `turn_id` text NULL, PRIMARY KEY (`attempt_id`));
 CREATE TABLE `work_runs` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `kind` text NOT NULL, `state` text NOT NULL, `thread_id` text NULL, `turn_id` text NULL, `codex_epoch` integer NULL, `outcome` text NULL, `evidence` text NULL, `probe` integer NULL, `result_text` text NOT NULL, `send_by_ms` integer NOT NULL, `progress` text NOT NULL, `progress_at_ms` integer NOT NULL, PRIMARY KEY (`work_id`));
+CREATE INDEX `work_runs_thread` ON `work_runs` (`thread_id`);
 CREATE TABLE `work_dispatches` (`work_id` text NOT NULL, `spec` text NOT NULL, `state` text NOT NULL, `reason` text NULL, `failure` text NULL, PRIMARY KEY (`work_id`));
 CREATE TABLE `work_stops` (`work_id` text NOT NULL, `conversation_id` text NOT NULL, `target_node` text NOT NULL, `requested_at_ms` integer NOT NULL, `deadline_ms` integer NOT NULL, `timed_out` integer NOT NULL, PRIMARY KEY (`work_id`));

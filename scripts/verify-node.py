@@ -1255,6 +1255,7 @@ def fixture_manager(run, initial, bot):
               "resumed_session": context["conversation"]["resumed_session"],
               "checkpoint": context["conversation"]["checkpoint"] is not None,
               "messages": [row["text"][:200] for row in context["conversation"]["messages"]],
+              "trigger_text": str(((context["trigger"].get("event") or {}).get("body") or {}).get("text", ""))[:200],
               "works": [row["work_id"] for row in context["works"]] if isinstance(context["works"], list) else None,
               "bot": context["bot"].get("configured_bot"),
               "sessions": [row["session_id"] for row in context["bot"].get("sessions") or []],
@@ -3289,7 +3290,8 @@ def phase4_acceptance(options):
                 "the follow-up starts no second thread")
         require(t2["resumed"] and t2["native_session_id"] == t1["native_session_id"],
                 "a message through entrance B continues the owner's native Agent session")
-        require(any("p4-m2" in text for text in t2["messages"]), "the turn reads the message sent through B")
+        require("p4-m2" in t2["trigger_text"] and not any("p4-m2" in text for text in t2["messages"]),
+                "the turn reads the message sent through B once, as its trigger")
         wait_for("all entrances converge", lambda: converged(members, network), timeout=60)
 
         def same_views():
@@ -3432,7 +3434,7 @@ def phase4_acceptance(options):
             for client in (a.client, at_p)), timeout=60)
         r7 = send(a.client, "p4-m7", {"label": "p4-m7"})
         t7 = turn(b, r7["trigger"])
-        require(not t7["resumed"] and t7["checkpoint"] and any("p4-m7" in text for text in t7["messages"]),
+        require(not t7["resumed"] and t7["checkpoint"] and "p4-m7" in t7["trigger_text"],
                 "the new owner starts fresh from the checkpoint and the newer messages")
         require_quiet("the switch replays nothing", lambda: side_effect.read_text() == "once"
                       and len(records(a)) == a_calls

@@ -418,6 +418,10 @@ impl Store {
     pub fn work_records(&self) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "1", [])
     }
+    /// The runs on one App Server thread, by index: a streamed event reads only these.
+    pub fn work_records_on_thread(&self, thread: &str) -> Result<Vec<WorkRecord>> {
+        query_runs(&self.connection, "thread_id=?", [thread])
+    }
 }
 
 /// A run that has not started stays unstarted once the user settled it; a running one keeps
