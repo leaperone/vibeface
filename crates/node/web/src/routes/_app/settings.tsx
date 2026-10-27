@@ -47,7 +47,7 @@ function SettingsPage() {
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
     <SettingsGroup title="文件传输">
-      <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="公益转发与实验付费交付"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
+      <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="发送和接收文件"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
     </SettingsGroup>
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer="恢复文件只有一份有效，丢了不能补">
       <CurrentRecoveryFile />

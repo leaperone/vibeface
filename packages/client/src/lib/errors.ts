@@ -20,6 +20,7 @@ const patterns: [RegExp, string][] = [
   [/is set by Vibeface/i, '这个变量由 Vibeface 自己设置，换个名字。'],
   [/variable names use/i, '变量名只能用字母、数字和下划线，且不能以数字开头。'],
   [/variable value must be|variables per provider/i, '变量值不能为空，也不能太长。'],
+  [/delivery service is disabled|service outcome is unknown/i, '对方或中转设备没有回应，可能还没打开文件传输。确认后再试，不会重复发送。'],
   [/outcome may be unknown|timed out/i, '设备没有及时回复，结果未知。请先确认结果，不要重复提交。'],
   [/no configured management SDK/i, '这台电脑没开 Bot。去设备页的「Bot 与任务」里选一个。'],
   [/question was closed/i, '这个请求已失效，不能再回答。'],

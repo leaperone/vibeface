@@ -20,30 +20,31 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await expect(screen.getByLabel(`安全码 ${joined.code.split('').join(' ')}`, { exact: true })).toBeVisible();
     await request('/approve', { role: 'web', peer: joined.peer, code: joined.code });
     await browser.goto(`${environment.nodes.web.url}/transfers`);
-    await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible({ timeout: 30000 });
+    await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
     await expect(screen.getByRole('switch', '付费交付（本地测试）')).toBeChecked();
     await event('observer-ready', { role: 'web' });
     for (const kind of ['source-partial', 'source-unknown'] as const) {
       const inspection = await nextInspection(kind);
       assert(inspection.role === 'web' && inspection.nodePeer === environment.nodes.web.peer && inspection.orderId && inspection.intentId);
       await browser.reload();
-      await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible({ timeout: 30000 });
+      await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
       const orders = browser.locator('button[aria-pressed]');
       await expect.poll(() => orders.count(), { timeout: 30000, message: 'The real original source has exactly one strict order' }).toBe(1);
       await orders.click();
-      const actual = screen.getByRole('region', '订单详情', { exact: true });
+      const actual = screen.getByRole('region', '传输详情', { exact: true });
+      await actual.getByText('详细信息', { exact: true }).click();
       await expect(actual.getByText(inspection.orderId, { exact: true })).toBeVisible();
       await expect(actual.getByText(inspection.intentId, { exact: true })).toBeVisible();
       await expect(actual.getByText('12 / 12 / 17', { exact: true })).toBeVisible();
-      await expect(actual.getByText('尚无交付确认。交付确认不表示真人已阅读。', { exact: true })).toBeVisible();
+      await expect(actual.getByText('还没送达。交付确认不表示真人已阅读。', { exact: true })).toBeVisible();
       if (kind === 'source-partial') {
-        await expect(actual.getByText('部分交付 · 服务商已提款', { exact: true })).toBeVisible();
+        await expect(actual.getByText('部分完成 · 服务费已提取', { exact: true })).toBeVisible();
         await expect(actual.getByText('已赚取 / 已提款 / 已退款', { exact: true })).toBeVisible();
         await expect(actual.getByText(/^窗口 1 .*已证明解密$/)).toBeVisible();
       } else {
-        await expect(actual.getByText('正在查询原交易 · 交易结果未知，需对账', { exact: true })).toBeVisible();
+        await expect(actual.getByText('正在确认付款结果 · 付款结果未知', { exact: true })).toBeVisible();
         await expect(actual.getByText('上次记录（赚取 / 提款 / 退款，到账待确认）', { exact: true })).toBeVisible();
-        await expect(actual.getByText('原交易结果尚未确认。继续与对账会查询原意图，不会创建另一笔付款。', { exact: true })).toBeVisible();
+        await expect(actual.getByText('付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。', { exact: true })).toBeVisible();
         expect(await actual.getByText(/已证明解密/).count()).toBe(0);
       }
       await browser.setViewport({ width: 1440, height: 2200 });
@@ -53,12 +54,12 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     }
     await ordinaryReady();
     await browser.reload();
-    await expect(screen.getByRole('heading', '此设备的传输设置')).toBeVisible({ timeout: 30000 });
+    await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
     await expect.poll(async () => (await facts()).paired.android, { timeout: 180000, message: 'The Android receiver joins through its actual invitation' }).toBe(true);
-    await screen.getByLabel('接收设备的连接 ID').fill(environment.nodes.android.peer);
-    await screen.getByLabel('服务设备的连接 ID').fill(environment.nodes.provider.peer);
+    await screen.getByLabel('接收方的连接 ID').fill(environment.nodes.android.peer);
+    await screen.getByLabel('中转设备的连接 ID').fill(environment.nodes.provider.peer);
     await screen.getByRole('radio', '付费交付', { exact: true }).click();
-    await expect(screen.getByRole('radio', '确认可恢复后结算')).toBeChecked();
+    await expect(screen.getByRole('radio', '对方能取回后付款')).toBeChecked();
     await screen.getByLabel('服务费上限（测试代币最小单位）').fill(environment.serviceCap);
     await screen.getByLabel('链费上限（测试链原生币最小单位）').fill(environment.gasCap);
     const input = insideArtifacts(resolve(root, environment.sourceFile));
@@ -77,10 +78,11 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     });
     await screen.getByRole('button', '选择文件').click();
     await browser.locator('body > input[type="file"]').setInputFiles(input);
-    await expect(screen.getByText(`${environment.name} · 4096 字节。当前最多`, { exact: false })).toBeVisible();
-    await screen.getByRole('button', '准备订单并查看费用').click();
-    const details = screen.getByRole('region', '确认这笔订单', { exact: true });
+    await expect(screen.getByText(environment.name, { exact: true })).toBeVisible();
+    await screen.getByRole('button', '查看费用').click();
+    const details = screen.getByRole('region', '确认发送', { exact: true });
     await expect(details).toBeVisible({ timeout: 45000 });
+    await details.getByText('详细信息', { exact: true }).click();
     const prepared = (await facts()).source;
     assert(prepared && prepared.mode === 'paid' && prepared.acceptance === 'recoverable');
     expect(prepared.payment.total).toBe('17');
@@ -98,13 +100,16 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     const quotationScreenshot = await preserveScreenshot('web.png', await app.screenshot('ordinary-paid-quotation'));
     const recording = await webRecording();
     try {
-      await screen.getByRole('button', '确认费用并提交原订单').click();
+      await screen.getByRole('button', '确认并付款').click();
       await expect.poll(async () => (await facts()).source?.phase !== 'prepared', {
         timeout: 30000, message: 'The actual Web member authorizes the original paid intent',
       }).toBe(true);
       await event('confirmed');
       await browser.reload();
-      await expect(screen.getByText(prepared.order_id, { exact: true })).toBeVisible({ timeout: 30000 });
+      const reloaded = screen.getByRole('region', '传输详情', { exact: true });
+      await expect(reloaded).toBeVisible({ timeout: 30000 });
+      await reloaded.getByText('详细信息', { exact: true }).click();
+      await expect(screen.getByText(prepared.order_id, { exact: true })).toBeVisible();
       await expect(screen.getByText(prepared.intent_id, { exact: true })).toBeVisible();
       await videoEvidence('web', prepared.order_id, prepared.intent_id, [await recording.stop()]);
     } finally { await recording.cancel(); }
@@ -122,11 +127,11 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     expect(settled.provider.payment.refunded).toBe('0');
     assert(settled.source?.order_id === prepared.order_id && settled.source.intent_id === prepared.intent_id
       && settled.source.evidence === 'decryption_proven');
-    const completed = screen.getByRole('region', '订单详情', { exact: true });
+    const completed = screen.getByRole('region', '传输详情', { exact: true });
     await expect(completed.getByText(prepared.order_id, { exact: true })).toBeVisible({ timeout: 30000 });
     await expect(completed.getByText(prepared.intent_id, { exact: true })).toBeVisible();
-    await expect(completed.getByText('交付条件已结算 · 服务商已提款', { exact: true })).toBeVisible();
-    await expect(completed.getByText('已证明实际解密。交付确认不表示真人已阅读。', { exact: true })).toBeVisible();
+    await expect(completed.getByText('已完成 · 服务费已提取', { exact: true })).toBeVisible();
+    await expect(completed.getByText('对方已打开。交付确认不表示真人已阅读。', { exact: true })).toBeVisible();
     await expect(completed.getByText('17 / 17 / 0', { exact: true })).toBeVisible();
     await expect(completed.getByText(/^窗口 1 .*已证明解密$/)).toBeVisible();
     await browser.setViewport({ width: 1440, height: 2200 });

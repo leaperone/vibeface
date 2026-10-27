@@ -1,127 +1,190 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowDownToLine, ArrowRightLeft, File, RefreshCw } from 'lucide-react'
+import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, RefreshCw } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
 import { canRead, canRestart, changeMode, deadlineRows, evidenceLabels, paymentLabels, phaseLabels, settlementAmountsLabel, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { Acceptance, DeliveryDraft, DeliveryMode, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { BusyIcon, EmptyState, Segmented, useAction } from '@/components/app/kit'
+import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 
 const modes: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '公益转发' }, { value: 'paid', label: '付费交付' }]
-const acceptances: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '确认可恢复后结算' }, { value: 'strict', label: '证明实际解密后结算' }]
+const acceptances: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
+const roleIcons = { sender: ArrowUpRight, receiver: ArrowDownLeft, provider: ArrowRightLeft } as const
+
+/** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
+export function sizeLabel(bytes: number, floor = false): string {
+  if (bytes < 1024) return `${bytes} 字节`
+  const [value, unit] = bytes < 1024 * 1024 ? [bytes / 1024, 'KB'] : [bytes / 1024 / 1024, 'MB']
+  const digits = value < 10 ? 1 : 0
+  const scale = 10 ** digits
+  return `${(floor ? Math.floor(value * scale) / scale : value).toFixed(digits)} ${unit}`
+}
 
 export function Transfers() {
   const { ready } = useDevice()
-  return ready ? <TransferPage key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title="设备暂时离线" description="重新连接后可查询原订单，不会自动重新付款。" />
+  return ready ? <TransferPage key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title="设备暂时离线" description="重新连接后可查看传输记录，不会重复付款。" />
 }
 
 function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
   const delivery = useDelivery(connection, webPlatform)
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
   const [file, setFile] = useState<TransferFile | null>(null)
+  // Feedback shows next to the control that caused it, not at the top of a long page.
+  const [origin, setOrigin] = useState<'page' | 'form' | 'order'>('page')
   const picker = useAction()
   const status = delivery.status
   const selected = delivery.selected
   const working = delivery.busy !== null || picker.busy !== null
   const change = (patch: Partial<DeliverySettings>) => {
+    setOrigin('page')
     if (status) void delivery.configure({ enabled: status.enabled, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled, ...patch })
   }
+  const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
+  const unusable = working || !file || status?.max_file_bytes === 0 || draft.mode === 'charity' && !status?.charity_enabled || draft.mode === 'paid' && !status?.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
-    <div className="flex flex-wrap items-start justify-between gap-3">
-      <p className="max-w-lg text-meta text-muted-foreground">查找设备和公益转发免费，付费交付仅供本地测试。</p>
-      <Button type="button" variant="outline" size="sm" disabled={working} onClick={() => void delivery.refresh()}><BusyIcon busy={delivery.busy === 'refresh'} icon={RefreshCw} />刷新</Button>
-    </div>
-    {delivery.error ? <p role="alert" className="text-meta text-danger">{delivery.error}</p> : null}
-    {delivery.notice ? <p role="status" className="text-meta text-success">{delivery.notice}</p> : null}
-    {!status ? <p role="status" className="text-meta text-muted-foreground">正在读取传输状态。</p> : <>
+    {feedback('page')}
+    {!status ? <p role="status" className="text-meta text-muted-foreground">正在读取传输设置。</p> : <>
       <section aria-labelledby="transfer-settings" className="grid gap-4 rounded-xl border bg-card p-4">
-        <h2 id="transfer-settings" className="text-heading font-semibold">此设备的传输设置</h2>
-        <Info label="发送设备" value={status.node_peer} />
-        <div className="flex flex-wrap gap-x-6 gap-y-3">
+        <h2 id="transfer-settings" className="text-heading font-semibold">传输设置</h2>
+        <div className="flex flex-wrap gap-x-6 gap-y-1">
           <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
-          <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-          <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} />
+          {status.enabled ? <>
+            <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
+            <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} />
+          </> : null}
         </div>
-        <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}{!delivery.canManage ? ' 只有已加入的管理员能更改设置或确认订单。' : ''}</p>
+        {status.enabled ? <ConnectionId value={status.node_peer} /> : <p className="text-meta text-muted-foreground">打开后可以加密收发文件</p>}
+        {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />只有{terms.admin.label}能更改设置和发送</p> : null}
+        {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
         {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
-        {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
-        {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
-        <p className="text-meta text-muted-foreground">钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。</p>
+        <Details>
+          {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
+          {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
+          <p>钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。</p>
+        </Details>
       </section>
-      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) void delivery.prepare(draft, file) }}>
+      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) { setOrigin('form'); void delivery.prepare(draft, file) } }}>
         <h2 className="text-heading font-semibold">发送文件</h2>
-        <Field><FieldLabel htmlFor="transfer-receiver">接收设备的连接 ID</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
-        <Field><FieldLabel htmlFor="transfer-provider">服务设备的连接 ID</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>付款不会让服务设备加入你的设备列表。</FieldDescription></Field>
+        <Field><FieldLabel htmlFor="transfer-receiver">接收方的连接 ID</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
+        <Field><FieldLabel htmlFor="transfer-provider">中转设备的连接 ID</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>只经手加密后的文件，不会加入你的设备</FieldDescription></Field>
         <Segmented label="传输方式" value={draft.mode} options={modes} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
         {draft.mode === 'paid' ? <>
-          <Segmented label="结算条件" value={draft.acceptance} options={acceptances} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
+          <Segmented label="什么时候付款" value={draft.acceptance} options={acceptances} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
           <Field><FieldLabel htmlFor="transfer-service-cap">服务费上限（测试代币最小单位）</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
           <Field><FieldLabel htmlFor="transfer-gas-cap">链费上限（测试链原生币最小单位）</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
-        </> : <p className="text-meta text-muted-foreground">文件全程加密，公益收据仅确认接收，不产生链上证明或付款。</p>}
-        <div className="grid justify-items-start gap-2">
+        </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />全程加密 · 免费</p>}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const picked = await webPlatform.files?.pick(); if (picked) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
-          <p className="text-meta text-muted-foreground">{file ? `${file.name} · ${file.size} 字节` : '尚未选择文件'}。当前最多 {status.max_file_bytes} 字节。</p>
-          {picker.error ? <p role="alert" className="text-meta text-danger">{messageOf(picker.error)}</p> : null}
+          <span className="min-w-0 break-all text-meta text-muted-foreground">{file ? <><span className="text-foreground">{file.name}</span> · {sizeLabel(file.size)}</> : `最大 ${sizeLabel(status.max_file_bytes, true)}`}</span>
         </div>
-        <Button type="submit" className="justify-self-start" disabled={working || !file || status.max_file_bytes === 0 || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled}><BusyIcon busy={delivery.busy === 'prepare'} />准备订单并查看费用</Button>
-        {selected && canRestart(selected) ? <Button type="button" variant="outline" className="justify-self-start" disabled={working || !file || status.max_file_bytes === 0 || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled} onClick={() => { if (file) void delivery.prepare(draft, file, selected.intent_id) }}>作为新订单再次发送</Button> : null}
-        <p className="text-meta text-muted-foreground">准备订单会把文件交给当前连接的可信设备加密，尚不付款。同一文件和条款复用原意图。原订单确认结束后，选择相同文件和条款，点击“作为新订单再次发送”才能创建另一笔订单。</p>
-      </form> : !status.enabled ? <p className="text-meta text-muted-foreground">文件传输默认关闭。关闭时仍可免费查找设备，并查询已有订单。</p> : null}
+        {picker.error ? <p role="alert" className="text-meta text-danger">{messageOf(picker.error)}</p> : null}
+        {file && file.size > status.max_file_bytes ? <p role="alert" className="text-meta text-danger">文件超过 {sizeLabel(status.max_file_bytes, true)}，换一个小点的</p> : null}
+        {feedback('form')}
+        <div className="flex flex-wrap gap-2">
+          <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{draft.mode === 'paid' ? '查看费用' : '下一步'}</Button>
+          {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(draft, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
+        </div>
+        <Details><p>准备订单会把文件交给当前连接的可信设备加密，尚不付款。同一文件和条款复用原意图。原订单确认结束后，选择相同文件和条款，点击“作为新订单再次发送”才能创建另一笔订单。</p></Details>
+      </form> : null}
     </>}
     <section aria-labelledby="transfer-orders" className="grid gap-3">
-      <h2 id="transfer-orders" className="text-heading font-semibold">订单</h2>
-      {delivery.orders.length ? <ul className="divide-y overflow-hidden rounded-xl border bg-card">{delivery.orders.map(order => <li key={order.order_id}><button type="button" className="interactive-row grid w-full gap-1 px-4 py-3 text-left" aria-pressed={delivery.selected?.order_id === order.order_id} onClick={() => delivery.select(order.order_id)}>
-        <span className="break-all font-medium">{order.name ?? `密文订单 ${order.order_id.slice(0, 12)}`}</span>
-        <span className="text-meta text-muted-foreground">{order.mode === 'charity' ? '公益' : '付费'} · {order.bytes} 字节 · {phaseLabels[order.phase]}</span>
-        <span className="text-meta text-muted-foreground">{evidenceLabels[order.evidence]} · {paymentLabels[order.payment.state]}</span>
-      </button></li>)}</ul> : <p className="text-meta text-muted-foreground">还没有传输订单。</p>}
+      <div className="flex items-center justify-between gap-3">
+        <h2 id="transfer-orders" className="text-heading font-semibold">传输记录</h2>
+        <Button type="button" variant="ghost" size="sm" disabled={working} onClick={() => { setOrigin('page'); void delivery.refresh() }}><BusyIcon busy={delivery.busy === 'refresh'} icon={RefreshCw} />刷新</Button>
+      </div>
+      {delivery.orders.length ? <ul className="divide-y overflow-hidden rounded-xl border bg-card">{delivery.orders.map(order => {
+        const Icon = roleIcons[order.role]
+        return <li key={order.order_id}><button type="button" className="interactive-row flex w-full items-center gap-3 px-4 py-3 text-left" aria-pressed={delivery.selected?.order_id === order.order_id} onClick={() => delivery.select(order.order_id)}>
+          <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+          <span className="grid min-w-0 gap-0.5">
+            <span className="truncate font-medium">{orderTitle(order)}</span>
+            <span className="text-meta text-muted-foreground">{order.mode === 'charity' ? '免费' : '付费'} · {sizeLabel(order.bytes)} · {phaseLabels[order.phase]}</span>
+          </span>
+        </button></li>
+      })}</ul> : <p className="text-meta text-muted-foreground">还没有传输记录</p>}
     </section>
-    {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} walletReady={status?.wallet.state === 'unlocked'} confirm={() => void delivery.confirm(selected)} accept={() => void delivery.accept(selected)} reconcile={() => void delivery.reconcile(selected)} save={() => void delivery.save(selected)} /> : null}
+    {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} walletReady={status?.wallet.state === 'unlocked'} feedback={feedback('order')}
+      confirm={() => { setOrigin('order'); void delivery.confirm(selected) }} accept={() => { setOrigin('order'); void delivery.accept(selected) }}
+      reconcile={() => { setOrigin('order'); void delivery.reconcile(selected) }} save={() => { setOrigin('order'); void delivery.save(selected) }} /> : null}
   </div>
 }
 
-function OrderDetails({ order, busy, canManage, walletReady, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; walletReady: boolean; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
+function orderTitle(order: DeliveryOrder) {
+  if (order.name) return order.name
+  return order.role === 'provider' ? '代为转发的文件' : '待接收的文件'
+}
+
+function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; walletReady: boolean; feedback: ReactNode; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
   const heading = useRef<HTMLHeadingElement>(null)
   useEffect(() => { heading.current?.focus() }, [])
   const paid = order.mode === 'paid'
   return <section className="grid gap-4 rounded-xl border bg-card p-4" aria-labelledby="transfer-detail">
-    <h2 ref={heading} id="transfer-detail" tabIndex={-1} className="text-heading font-semibold outline-none">{order.phase === 'prepared' ? '确认这笔订单' : '订单详情'}</h2>
-    <p>{phaseLabels[order.phase]} · {paymentLabels[order.payment.state]}</p>
-    <p className="text-meta text-muted-foreground">{evidenceLabels[order.evidence]}。交付确认不表示真人已阅读。</p>
-    <Info label="订单" value={order.order_id} /><Info label="付款意图" value={order.intent_id} />
-    {order.name ? <Info label="文件" value={`${order.name} · ${order.bytes} 字节`} /> : null}
-    <Info label="发送设备" value={order.source_peer} /><Info label="接收设备" value={order.receiver_peer} /><Info label="服务设备" value={order.provider_peer} />
-    <Info label="验收条件" value={paid ? order.acceptance === 'strict' ? '接收设备 证明实际解密后结算' : '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
+    <h2 ref={heading} id="transfer-detail" tabIndex={-1} className="text-heading font-semibold outline-none">{order.role === 'sender' && order.phase === 'prepared' ? '确认发送' : '传输详情'}</h2>
+    <p>{phaseLabels[order.phase]}{paid ? ` · ${paymentLabels[order.payment.state]}` : ''}</p>
+    {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
+    <Info label="传输方式" value={paid ? '付费交付' : <span className="inline-flex items-center gap-1.5"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />公益转发 · 免费</span>} />
     {paid ? <>
-      <Info label="测试链 ID" value={order.payment.chain_id ?? ''} /><Info label="测试资产合约" value={order.payment.asset ?? ''} /><Info label="付款钱包" value={order.payment.payer ?? ''} /><Info label="固定收款钱包" value={order.payment.provider_wallet ?? ''} />
-      <div className="grid gap-2 border-y py-3 text-meta">
-        <Info label="传输费" value={order.payment.delivery_fee} /><Info label="暂存预留费" value={order.payment.reservation_fee} /><Info label="时效优先费" value={order.payment.priority_fee} /><Info label="服务费合计（最小单位）" value={order.payment.total} /><Info label="链费上限（原生币最小单位）" value={order.payment.gas_cap} />
-        <Info label={settlementAmountsLabel(order)} value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
-      </div>
-      {deadlineRows(order).map(([label, value]) => <Info key={label} label={label} value={value} />)}
-      <p className="text-meta text-muted-foreground">时效优先费只有在其截止前完成整单才赚取。过了时效截止，仍可在结算硬截止前完成交付。暂存费支付容量预留，不代表持续存储证明。</p>
-      {order.payment.tx_hash ? <Info label="原交易" value={order.payment.tx_hash} /> : null}
-      {order.acceptance === 'strict' ? <p className="text-meta text-warning">严格验收需要接收设备 提交解密证明。对方离线或未提交时，服务商可能收不到费用。</p> : null}
-    </> : <p className="text-meta text-muted-foreground">本订单免费，不调用钱包或链上付款。</p>}
-    {order.windows.length ? <ul className="grid gap-1 text-meta text-muted-foreground">{order.windows.map(window => <li key={window.index}>窗口 {window.index + 1} · 密文已落盘 {window.committed_bytes} / {window.bytes + 68} 字节{window.decryption_proven ? ' · 已证明解密' : ''}</li>)}</ul> : null}
-    {order.sha256 ? <Info label="原文件 SHA-256" value={order.sha256} /> : null}
+      <Info label="服务费合计（最小单位）" value={order.payment.total} />
+      <Info label="链费上限（原生币最小单位）" value={order.payment.gas_cap} />
+      {order.acceptance === 'strict' ? <p className="text-meta text-warning">对方确认打开后才付款。对方离线或没确认时，中转设备可能收不到费用。</p> : null}
+    </> : null}
     {order.error ? <p role="alert" className="text-meta text-danger">{order.error}</p> : null}
+    {feedback}
     <div className="flex flex-wrap gap-2">
-      {order.role === 'sender' && order.phase === 'prepared' ? <Button type="button" disabled={busy || !canManage || paid && !walletReady} onClick={confirm}>{paid ? '确认费用并提交原订单' : '确认公益传输'}</Button> : null}
-      {order.role === 'receiver' && !canRead(order) && order.phase !== 'refunded' && order.phase !== 'failed' ? <Button type="button" disabled={busy || !canManage} onClick={accept}>接受此订单</Button> : null}
-      <Button type="button" variant="outline" disabled={busy || !canManage} onClick={reconcile}>继续与对账</Button>
-      {canRead(order) ? <Button type="button" variant="outline" disabled={busy} onClick={save}><ArrowDownToLine aria-hidden="true" />取回文件</Button> : null}
+      {order.role === 'sender' && order.phase === 'prepared' ? <Button type="button" disabled={busy || !canManage || paid && !walletReady} onClick={confirm}>{paid ? '确认并付款' : '确认发送'}</Button> : null}
+      {order.role === 'receiver' && !canRead(order) && order.phase !== 'refunded' && order.phase !== 'failed' ? <Button type="button" disabled={busy || !canManage} onClick={accept}>接收文件</Button> : null}
+      {canRead(order) && order.phase !== 'prepared' ? <Button type="button" variant={order.role === 'receiver' ? 'default' : 'outline'} disabled={busy} onClick={save}><ArrowDownToLine aria-hidden="true" />保存文件</Button> : null}
+      <Button type="button" variant="outline" disabled={busy || !canManage} onClick={reconcile}>检查进度</Button>
     </div>
-    {paid && order.phase === 'prepared' && !walletReady ? <p className="text-meta text-warning">请先在发送设备 本机创建或解锁钱包，再刷新此订单。</p> : null}
-    {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <p className="text-meta text-warning">原交易结果尚未确认。继续与对账会查询原意图，不会创建另一笔付款。</p> : null}
+    {paid && order.phase === 'prepared' && !walletReady ? <p className="text-meta text-warning">先在发送设备本机创建或解锁钱包，再刷新。</p> : null}
+    {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <p className="text-meta text-warning">付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。</p> : null}
+    <Details>
+      <p>{evidenceLabels[order.evidence]}。交付确认不表示真人已阅读。</p>
+      <Info label="订单" value={order.order_id} /><Info label="付款意图" value={order.intent_id} />
+      <Info label="发送设备" value={order.source_peer} /><Info label="接收设备" value={order.receiver_peer} /><Info label="中转设备" value={order.provider_peer} />
+      <Info label="验收条件" value={paid ? order.acceptance === 'strict' ? '接收设备证明实际解密后结算' : '完整密文持有证明与正确密钥包可取后结算' : '公益收据'} />
+      {paid ? <>
+        <Info label="测试链 ID" value={order.payment.chain_id ?? ''} /><Info label="测试资产合约" value={order.payment.asset ?? ''} /><Info label="付款钱包" value={order.payment.payer ?? ''} /><Info label="固定收款钱包" value={order.payment.provider_wallet ?? ''} />
+        <Info label="传输费" value={order.payment.delivery_fee} /><Info label="暂存预留费" value={order.payment.reservation_fee} /><Info label="时效优先费" value={order.payment.priority_fee} />
+        <Info label={settlementAmountsLabel(order)} value={`${order.payment.earned} / ${order.payment.withdrawn} / ${order.payment.refunded}`} />
+        {deadlineRows(order).map(([label, value]) => <Info key={label} label={label} value={value} />)}
+        <p>时效优先费只有在其截止前完成整单才赚取。过了时效截止，仍可在结算硬截止前完成交付。暂存费支付容量预留，不代表持续存储证明。</p>
+        {order.payment.tx_hash ? <Info label="原交易" value={order.payment.tx_hash} /> : null}
+      </> : <p>本订单免费，不调用钱包或链上付款。</p>}
+      {order.windows.length ? <ul className="grid gap-1">{order.windows.map(window => <li key={window.index}>窗口 {window.index + 1} · 密文已落盘 {window.committed_bytes} / {window.bytes + 68} 字节{window.decryption_proven ? ' · 已证明解密' : ''}</li>)}</ul> : null}
+      {order.sha256 ? <Info label="原文件 SHA-256" value={order.sha256} /> : null}
+    </Details>
   </section>
 }
 
-function Info({ label, value }: { label: string; value: ReactNode }) { return <div className="grid gap-1 text-meta sm:grid-cols-[10rem_minmax(0,1fr)]"><span className="text-muted-foreground">{label}</span><span className="break-all">{value}</span></div> }
+function Feedback({ error, notice }: { error: string; notice: string }) {
+  if (error) return <InlineError error={error} />
+  if (notice) return <p role="status" className="flex items-center gap-1.5 text-meta text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />{notice}</p>
+  return null
+}
+
+function ConnectionId({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
+  return <div className="grid gap-1 text-meta">
+    <span className="text-muted-foreground">连接 ID · 收文件时发给对方</span>
+    <span className="flex min-w-0 items-center gap-2">
+      <code className="min-w-0 truncate" title={value}>{value}</code>
+      <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => { void navigator.clipboard.writeText(value).then(() => setCopied(true), () => {}) }}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制'}</Button>
+    </span>
+  </div>
+}
+
+function Info({ label, value }: { label: string; value: ReactNode }) { return <div className="grid gap-1 text-meta sm:grid-cols-[10rem_minmax(0,1fr)]"><span className="text-muted-foreground">{label}</span><span className="break-all text-foreground">{value}</span></div> }
 function Toggle({ label, checked, disabled, change }: { label: string; checked: boolean; disabled: boolean; change(value: boolean): void }) {
   return <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" role="switch" checked={checked} disabled={disabled} onChange={event => change(event.target.checked)} />{label}</label>
 }

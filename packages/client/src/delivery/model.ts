@@ -31,7 +31,7 @@ export function fileName(value: unknown): string {
   return name
 }
 export function intentId(value: unknown): string {
-  if (typeof value !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)) throw new Error('付款意图编号无效。')
+  if (typeof value !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)) throw new Error('付款编号无效。')
   return value
 }
 export function parseStatus(value: unknown): DeliveryStatus {
@@ -55,7 +55,7 @@ function payment(value: unknown): DeliveryPayment {
     earned: amount(v.earned), withdrawn: amount(v.withdrawn), refunded: amount(v.refunded),
     tx_hash: nullable(v.tx_hash, value => {
       const hash = text(value)
-      if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) throw new Error('链上交易摘要无效。')
+      if (!/^0x[a-fA-F0-9]{64}$/.test(hash)) throw new Error('交易摘要无效。')
       return hash
     }),
   }
@@ -71,7 +71,7 @@ function deadlines(value: unknown): DeliveryDeadlines | null {
 export function parseOrder(value: unknown): DeliveryOrder {
   const v = record(value)
   const windows = array(v.windows)
-  if (windows.length > 16) throw new Error('订单窗口数超过协议上限。')
+  if (windows.length > 16) throw new Error('订单分段数超过上限。')
   const order: DeliveryOrder = {
     order_id: peer(v.order_id), intent_id: intentId(v.intent_id), role: member(v.role, ['sender', 'receiver', 'provider']), mode: member(v.mode, ['charity', 'paid']), acceptance: member(v.acceptance, ['recoverable', 'strict']),
     source_peer: peer(v.source_peer), receiver_peer: peer(v.receiver_peer), provider_peer: peer(v.provider_peer), name: nullable(v.name, fileName), bytes: integer(v.bytes, protocolMaxBytes), sha256: nullable(v.sha256, peer),
@@ -79,7 +79,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
     evidence: member(v.evidence, ['none', 'charity_receipt', 'ciphertext_held', 'recoverable', 'decryption_proven']), payment: payment(v.payment), deadlines: deadlines(v.deadlines),
     windows: windows.map((item, index) => {
       const w = record(item), bytes = integer(w.bytes, 65_536)
-      if (integer(w.index, 15) !== index) throw new Error('订单窗口不连续。')
+      if (integer(w.index, 15) !== index) throw new Error('订单分段不连续。')
       return { index, bytes, committed_bytes: integer(w.committed_bytes, bytes + 68), state: member(w.state, ['pending', 'stored', 'held', 'key_published', 'earned', 'refunded']), decryption_proven: boolean(w.decryption_proven) }
     }),
     created_at_ms: integer(v.created_at_ms), updated_at_ms: integer(v.updated_at_ms), error: nullable(v.error, text),
@@ -88,7 +88,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
     const p = order.payment
     if (order.acceptance !== 'recoverable' || p.state !== 'free' || [p.delivery_fee, p.reservation_fee, p.priority_fee, p.total, p.gas_cap, p.earned, p.withdrawn, p.refunded].some(value => value !== '0')
       || [p.chain_id, p.asset, p.payer, p.provider_wallet, p.tx_hash].some(value => value !== null)
-      || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('公益订单只能使用免费收据，不能带付款或强证明条件。')
+      || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('公益订单只能免费，不能带付款或付款条件。')
   } else if (order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null) throw new Error('付费订单缺少固定付款信息。')
   if (order.mode === 'paid') {
     const d = order.deadlines
@@ -139,6 +139,7 @@ export function changeMode(draft: DeliveryDraft, mode: DeliveryMode): DeliveryDr
   return { ...draft, mode, acceptance: mode === 'charity' ? 'recoverable' : draft.acceptance }
 }
 export function canRestart(order: DeliveryOrder): boolean {
+  if (order.role !== 'sender') return false
   if (order.mode === 'charity') return order.phase === 'recoverable' && order.evidence === 'charity_receipt' && order.windows.length > 0
     && order.windows.every(window => ['held', 'key_published', 'earned'].includes(window.state))
   return order.phase === 'paid' && ['earned', 'withdrawn', 'confirmed'].includes(order.payment.state) && order.windows.length > 0 && order.windows.every(window => window.state === 'earned')
@@ -154,12 +155,12 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
 }
 
 export const phaseLabels: Record<DeliveryPhase, string> = {
-  prepared: '待确认', funding_pending: '已授权，等待处理', proving: '正在生成交付证明', funded: '资金已托管', transferring: '传输中', cipher_held: '对方已持有密文', key_published: '密钥包已发布',
-  recoverable: '文件可恢复', paid: '交付条件已结算', partial: '部分交付', refundable: '可申请退款', refunded: '已退款', reconciling: '正在查询原交易', key_unavailable: '解密密钥暂不可用', failed: '未完成',
+  prepared: '待确认', funding_pending: '正在付款', proving: '正在确认付款条件', funded: '已付款', transferring: '传输中', cipher_held: '对方已收到，等待解锁', key_published: '正在解锁',
+  recoverable: '已送达', paid: '已完成', partial: '部分完成', refundable: '可以退款', refunded: '已退款', reconciling: '正在确认付款结果', key_unavailable: '暂时打不开', failed: '未完成',
 }
-export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '尚无交付确认', charity_receipt: '公益收据', ciphertext_held: '密文持有证明', recoverable: '链上已确认可恢复', decryption_proven: '已证明实际解密' }
+export const evidenceLabels: Record<DeliveryEvidence, string> = { none: '还没送达', charity_receipt: '对方已收到', ciphertext_held: '对方已收到，还没解锁', recoverable: '对方可以打开', decryption_proven: '对方已打开' }
 export const paymentLabels: Record<PaymentState, string> = {
-  free: '免费', prepared: '未付款', submitted: '交易已提交', included: '已打包，等待确认', confirmed: '链上已确认', earned: '服务商已取得债权', withdrawn: '服务商已提款', refunded: '已退还', unknown: '交易结果未知，需对账', failed: '付款失败',
+  free: '免费', prepared: '未付款', submitted: '付款已提交', included: '付款处理中', confirmed: '已付款', earned: '服务费已结算', withdrawn: '服务费已提取', refunded: '款已退回', unknown: '付款结果未知', failed: '付款失败',
 }
 export function settlementAmountsLabel(order: DeliveryOrder): string {
   return order.payment.state === 'unknown' || order.payment.state === 'failed' || order.phase === 'reconciling' || order.phase === 'failed'
@@ -179,7 +180,7 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
   const rows: Array<[string, number]> = [
     ['报价确认截止', d.quote_expires_at], ['时效优先费截止', d.priority_deadline],
     ['交付结算硬截止', order.acceptance === 'strict' ? d.open_deadline : d.key_deadline],
-    ['密文持有截止', d.hold_deadline], ['密钥包发布截止', d.key_deadline], ['保留义务截止', d.retain_until],
+    ['对方收到文件截止', d.hold_deadline], ['密钥包发布截止', d.key_deadline], ['保留义务截止', d.retain_until],
   ]
   return rows.map(([label, seconds]) => [label, new Date(seconds * 1000).toLocaleString(undefined, { timeZoneName: 'short' })])
 }
