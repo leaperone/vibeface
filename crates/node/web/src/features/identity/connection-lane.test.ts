@@ -717,7 +717,8 @@ test('a signed management browser keeps its permissions through the local cookie
       assert.equal(app.render().ready?.entry.local, false)
       assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').entry.local, false)
       app.sockets[0]?.drop()
-      const [id, retry] = [...app.timers.entries()][0]
+      // The newest timer is the reconnect; a manager's directory poll was set before it.
+      const [id, retry] = [...app.timers.entries()].at(-1)!
       app.timers.delete(id); retry(); await settle()
       assert.equal(app.sockets[1]?.entry.local, undefined)
       assert.equal(app.render().ready?.principal.source, 'membership')

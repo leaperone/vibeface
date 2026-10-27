@@ -1144,12 +1144,16 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   useEffect(() => {
     if (!ready?.principal.can_manage) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
+    // Join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    const refresh = () => { void refreshDirectory().catch(() => {}) }
+    refresh()
+    const poll = setInterval(refresh, 30_000)
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
-      clearTimeout(timer); timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, 300)
+      clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
-    return () => { clearTimeout(timer); stop() }
+    return () => { clearTimeout(timer); clearInterval(poll); stop() }
   }, [ready])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
   function setRotateHint(network: string, on: boolean) { try { store(`rotate-hint.${network}`, on || null) } catch {} setDismissals(count => count + 1) }
