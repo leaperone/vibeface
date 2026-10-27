@@ -262,7 +262,7 @@ jobs:
           workspaces: |
             . -> .artifacts/vdp/domain-target
             proofs/delivery -> ../../.artifacts/vdp/proof-target
-      - name: Require current public delivery fixtures
+      - name: Check public delivery fixtures when present
         run: python3 scripts/check-delivery.py --check-fixtures
       - name: Install checksum-pinned guest compiler in artifacts
         run: python3 scripts/install-delivery-toolchain.py

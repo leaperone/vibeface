@@ -116,6 +116,13 @@ def load_fixtures():
     return manifest, proofs
 
 
+def optional_fixtures():
+    if not FIXTURES.exists() and not FIXTURES.is_symlink():
+        print("skipped: no public proof fixture; receipt verification needs fixtures generated on an x86_64 machine with enough memory", flush=True)
+        return None
+    return load_fixtures()
+
+
 def run(command, **kwargs):
     return subprocess.run(command, cwd=ROOT, check=True, **kwargs)
 
@@ -137,7 +144,7 @@ def sandbox_commands(context):
 
 
 def sandbox():
-    load_fixtures()
+    optional_fixtures()
     for name in ("cargo", "risc0", "canonical"):
         (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
@@ -159,7 +166,8 @@ def check():
         raise ValueError("Delivery verification forbids dev mode and skipped guest builds")
     if (platform.system(), platform.machine(), str(ROOT)) != ("Linux", "x86_64", "/work") or os.environ.get("CARGO_HOME") != "/cargo" or os.environ.get("RISC0_HOME") != "/risc0":
         raise ValueError("Run full delivery verification in the canonical Linux sandbox at /work with CARGO_HOME=/cargo and RISC0_HOME=/risc0")
-    manifest, proofs = load_fixtures()
+    fixtures = optional_fixtures()
+    manifest, proofs = fixtures or (None, [])
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     environment = {**os.environ, "RISC0_BUILD_LOCKED": "1"}
     target = Path("/artifacts/proof-target")
@@ -168,7 +176,8 @@ def check():
     run(["bash", "proofs/delivery/build.sh"], env=environment)
     prover = target / "release/vibeface-delivery-prover"
     compiled = json.loads(run([str(prover), "info"], capture_output=True, text=True, env=environment).stdout)
-    checked_metadata(manifest, proofs, compiled)
+    if fixtures:
+        checked_metadata(manifest, proofs, compiled)
     (ARTIFACTS / "host-info.json").write_text(json.dumps(compiled, indent=2) + "\n")
     profile = load_profile(compiled)
     vectors = ARTIFACTS / "public-vectors.json"
@@ -188,10 +197,13 @@ def check():
             raise ValueError("A receipt accepted a journal with another guest image")
         verified.append({"relation": relation, "journalHash": proof["journalHash"], "verified": True, "wrongJournalRejected": True})
         print(f"PASS current guest relation {relation} public receipt and wrong-journal rejection", flush=True)
-    for script, arguments in (("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("exercise-settlement.mjs", ["--self-test"]), ("run.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)]), ("verify-delivery.mjs", [str(FIXTURES)])):
+    scripts = [("install.mjs", []), ("compile.mjs", ["--check-trust"]), ("exercise-settlement.mjs", ["--self-test"]), ("run.mjs", []), ("verify-risc0.mjs", []), ("compare-vectors.mjs", [str(vectors)])]
+    if fixtures:
+        scripts.append(("verify-delivery.mjs", [str(FIXTURES)]))
+    for script, arguments in scripts:
         run(["node", f"contracts/delivery/{script}", *arguments])
     (ARTIFACTS / "proof-results.json").write_text(json.dumps({"imageId": compiled["imageId"], "schemaHash": compiled["schemaHash"], "receipts": verified}, indent=2) + "\n")
-    print("Delivery receipts, cross-language bytes and production EVM adapter checks passed")
+    print("Delivery receipts, cross-language bytes and production EVM adapter checks passed" if fixtures else "Guest rebuild, cross-language bytes and production EVM adapter checks passed; skipped: no public proof fixture")
 
 
 def self_test():
@@ -285,13 +297,16 @@ def self_test():
     assert build[-2] == container[-4]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
     assert not {"--env", "--env-file", "-e", "--privileged"}.intersection(container)
-    with patch(f"{__name__}.load_fixtures", side_effect=ValueError("missing fixture")), patch(f"{__name__}.run") as operation:
+    with patch(f"{__name__}.FIXTURES", ROOT / ".artifacts/no-public-proof-fixture"), patch(f"{__name__}.load_fixtures") as loader:
+        assert optional_fixtures() is None
+        loader.assert_not_called()
+    with patch(f"{__name__}.FIXTURES", ROOT), patch(f"{__name__}.load_fixtures", side_effect=ValueError("missing fixture")), patch(f"{__name__}.run") as operation:
         try:
             sandbox()
         except ValueError:
             pass
         else:
-            raise AssertionError("A missing fixture must stop sandbox dispatch")
+            raise AssertionError("A broken fixture must stop sandbox dispatch")
         operation.assert_not_called()
     print("Delivery fixture, product profile, receipt export and sandbox command self-tests passed; no Docker job or cryptographic proof ran")
 
@@ -306,8 +321,8 @@ if __name__ == "__main__":
     if args.self_test:
         self_test()
     elif args.check_fixtures:
-        load_fixtures()
-        print("Public fixture structure and schema checked; proof verification has not run")
+        if optional_fixtures():
+            print("Public fixture structure and schema checked; proof verification has not run")
     elif args.sandbox:
         sandbox()
     else:
