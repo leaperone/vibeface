@@ -742,11 +742,47 @@ fn schedule_claim(
         .optional()?)
 }
 
+/// When the user handed this Node the conversation at `epoch`: the earliest record naming it.
+/// None for the conversation's first owner, which took nothing over.
+fn taken_over_at(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    local: &str,
+    epoch: u64,
+) -> Result<Option<i64>> {
+    if epoch <= 1 {
+        return Ok(None);
+    }
+    let mut statement = connection.prepare(
+        "SELECT created_at_ms,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+    )?;
+    let mut rows = statement.query(params![network, conversation])?;
+    let mut since: Option<i64> = None;
+    while let Some(row) = rows.next()? {
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        if let EventBody::ConversationOwner {
+            scheduler_node,
+            epoch: named,
+            ..
+        } = serde_json::from_str::<Event>(&envelope.canonical_body)?.body
+            && named == epoch
+            && scheduler_node == local
+        {
+            let at: i64 = row.get(0)?;
+            since = Some(since.map_or(at, |since| since.min(at)));
+        }
+    }
+    Ok(since)
+}
+
 /// Queues the latest due time of each schedule in conversations this Node schedules. Earlier
 /// missed times are never run, and a time any Node already claimed is left to it. This Node
 /// claims a time in the network's log before it runs or, found more than `MAX_LATE_MS` late,
-/// skips it, so no other owner takes it again. A schedule waits while its previous run is still
-/// queued. Returns `(conversation, trigger)` per job.
+/// skips it, so no other owner takes it again. A time due before the user handed this Node the
+/// conversation is the former owner's: its claim may still be on the way, so it is left alone.
+/// A schedule waits while its previous run is still queued. Returns `(conversation, trigger)`
+/// per job.
 fn admit_due_schedules_from(
     connection: &Connection,
     blob_dir: &Path,
@@ -768,7 +804,16 @@ fn admit_due_schedules_from(
         else {
             continue;
         };
-        if schedule_claim(connection, network, conversation, &entry.schedule_id, slot)?.is_some() {
+        if schedule_claim(connection, network, conversation, &entry.schedule_id, slot)?.is_some()
+            || taken_over_at(
+                connection,
+                network,
+                conversation,
+                &local,
+                current.owner_epoch,
+            )?
+            .is_some_and(|since| slot <= since)
+        {
             continue;
         }
         let late = now - slot > MAX_LATE_MS;

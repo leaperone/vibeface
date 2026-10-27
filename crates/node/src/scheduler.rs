@@ -174,6 +174,10 @@ pub async fn run(
 
 async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Result<Option<Value>> {
     let _work = node.maintenance.enter()?;
+    // A turn whose reply could not be recorded must not start; queued jobs wait.
+    if !node.writable() {
+        return Ok(None);
+    }
     ensure!(
         access
             .conversation_id

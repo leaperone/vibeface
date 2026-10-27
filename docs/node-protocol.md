@@ -221,7 +221,7 @@
 
 每个会话的本机管理队列最多 256 个待处理触发，本人消息优先于工作结果、schedule 和 bot 消息。每轮按领取时固定的版本向量 `basis` 准备上下文。排在后面的消息因此能读到前一条的回复。提示总长不超过 50000 字节，bot 指令和 schedule prompt 各以 8 KB 封顶并计入总长。Codex 线程在 `thread/start` 和 `thread/resume` 的 `developerInstructions` 里收到 CLI 说明、全部工具目录和固定规则，回合消息只带本轮角色和数据：续接的线程只收到新消息、变化过的工作（`works_unchanged` 计其余条数）和变化过的 bot（未变时为 `{"unchanged":true}`），`trigger.unavailable_tools` 列出本轮不提供的工具。线程看过的 bot 和工作摘要随 `covers` 存在本机会话里。会话键含线程指令的摘要，指令变化就开新线程；模型不在 Codex 会话键里，按回合经 `turn/start` 传。Cursor 每轮提示仍带全部规则和上下文，模型变化开新会话。超出时依次收缩工作列表、检查点和较早的消息，不让这一轮失败。工作列表、记忆和消息都从新到旧取到各自预算为止，再按时间顺序给出，并附省略条数。
 
-负责人每 30 秒检查本机负责的会话中已启用的 schedule，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。运行前负责人写一条 `schedule_run_claimed` 领取这个时刻；时刻已过去超过 10 分钟（设备关机或休眠）时同样写领取，但不运行，只记一条 `schedule.skipped_late` 日志。任何 Node 已领取的时刻都不再排队，所以重启、同步和换负责人都不会重跑或补跑，一次性提醒也只运行一次。同一 schedule 仍在排队时不领取下一个时刻。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。schedule 轮可以派发工作和设提醒，不提供修改 bot 的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前 schedule 已暂停或删除，或这个时刻的领取胜者不是本机时，job 取消。换负责人时未开始的 schedule job 直接丢弃，由新负责人按自己的检查运行。
+负责人每 30 秒检查本机负责的会话中已启用的 schedule，只取不晚于当前时间的最近一个时刻 `slot_ms`，错过的不补跑。运行前负责人写一条 `schedule_run_claimed` 领取这个时刻；时刻已过去超过 10 分钟（设备关机或休眠）时同样写领取，但不运行，只记一条 `schedule.skipped_late` 日志。任何 Node 已领取的时刻都不再排队，所以重启、同步和换负责人都不会重跑或补跑，一次性提醒也只运行一次。同一 schedule 仍在排队时不领取下一个时刻。早于最近一次修改 5 分钟以上的时刻不运行，所以暂停后恢复不会补跑。新负责人不领取、不运行早于或等于换到它的 `conversation_owner` 记录时间的时刻：旧负责人可能已在断开期间运行过它，领取还没传过来。schedule 轮可以派发工作和设提醒，不提供修改 bot 的工具，回复的 `in_reply_to` 为该 trigger，由它派发的工作结果也回复这个 trigger。领取前 schedule 已暂停或删除，或这个时刻的领取胜者不是本机时，job 取消。换负责人时未开始的 schedule job 直接丢弃，由新负责人按自己的检查运行。
 
 `bot_message:<message_id>` 由写入 `BotMessaged` 的发送方负责人接纳（对方会话也归它调度时），否则进 outbox，经 `deliver` 交给对方负责人。同步只存消息，不排 job。每个轮次有深度：本人消息和回答为 0，schedule 轮取其 `depth`，bot 消息轮取 `hops`，工作结果和 Agent 任务沿派发链继承；提醒和 bot 消息的深度为当前加一，超过 4 时拒绝。
 
@@ -256,7 +256,7 @@ Codex 默认 bypass。Node 订阅的线程上的服务端请求和不属于线�
 
 工作状态为 `accepted`、`starting`、`running`、`interrupting`、`finished` 和 `unverified`。每次转换在同一事务更新本机日志并追加对应事件。`WorkFinished.outcome` 为 `completed`、`failed`、`interrupted`、`rejected`（从未启动）或 `unverified`；只有 `unverified` 可以被本人签名的 `WorkFinished` 取代。工作结束时若原消息的 `report_results` 不为 `false`，负责人把 `work:<work_id>` 入队，下一轮向本人汇报。
 
-`providers.codex_app_server.mode` 为 `spawn` 时 Node 托管 App Server：执行 `codex app-server --listen unix://<socket>`，socket 位于 0700 的 `/tmp/vibeface-<identity>/` 目录，App Server 放入独立进程组，进程组号写入 `codex-app-server.pid`。启动时先结束上次遗留且命令相符的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。App Server 每次重连 epoch 加一。重连后对未结束的工作调用 `thread/read` 只读复查，读不到原 turn 时进入 `unverified`。同一用户的本机进程可以连接这个 socket，协调 Agent 经 `VIBEFACE_CODEX_SOCKET` 得到它。
+`providers.codex_app_server.mode` 为 `spawn` 时 Node 托管 App Server：执行 `codex app-server --listen unix://<socket>`，socket 位于 0700 的 `/tmp/vibeface-<identity>/` 目录，App Server 放入独立进程组，进程组号写入 `codex-app-server.pid`。启动时先结束上次遗留且命令相符的进程组，退出时 SIGTERM，3 秒后 SIGKILL，异常退出按 1 至 30 秒退避重启。App Server 每次重连 epoch 加一。重连后对未结束的工作调用 `thread/read` 只读复查，读不到原 turn 时进入 `unverified`。运行中和可复查的 `unverified` 工作每分钟也这样复查一次，补上漏掉的结束事件；复查只读，不重发。同一用户的本机进程可以连接这个 socket，协调 Agent 经 `VIBEFACE_CODEX_SOCKET` 得到它。
 
 ## 事件 DAG
 
@@ -312,13 +312,15 @@ Event {
 
 ## 写入保护
 
-Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只有 `writable` 时 Node 追加自己的事件，其他状态下所有本地写入在追加时被拒绝，调度和执行在进入 `writable` 前不启动。读取、同步和入库其他设备的事件不受影响。
+Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只有 `writable` 时 Node 追加自己的事件，其他状态下所有本地写入在追加时被拒绝，调度和执行在进入 `writable` 前不启动，进入 `forked` 后不再开始新的回合和定时时刻。读取、同步和入库其他设备的事件不受影响。
+
+每次进入 `writable`，Node 在本机 `identity_meta.write-file` 记下数据库文件的 inode 和创建时间。启动时文件仍是这一个，说明它就是上次写入用的数据，直接可写，不等其他 Node。复制数据目录或从备份恢复都会产生新文件，对不上，才走下表的对齐。
 
 | 状态 | 进入条件 | 离开条件 |
 |---|---|---|
-| `aligning` | 启动时成员目录中还有其他 Node | 本次启动以来每台其他当前成员 Node 都确认过：一次同步结束时它记录的本机 `max_seq` 不大于本机，本机在该序号上的事件就是它的头，本机日志也没有分叉；对端更多时先拉回本机自己的日志。成员目录变化时重新判断，被撤销的 Node 不再需要确认 |
+| `aligning` | 启动时数据库文件不是上次写入用的那个，且成员目录中还有其他 Node | 本次启动以来每台其他当前成员 Node 都确认过：一次同步结束时它记录的本机 `max_seq` 不大于本机，本机在该序号上的事件就是它的头，本机日志也没有分叉；对端更多时先拉回本机自己的日志。成员目录变化时重新判断，被撤销的 Node 不再需要确认 |
 | `read_only` | 对齐中且还没确认的 Node 都同步失败 | 这些 Node 恢复后补齐确认，或本人调用 `confirm_writable` |
-| `writable` | 没有其他 Node、对齐完成或本人确认 | 发现分叉 |
+| `writable` | 启动时文件对得上、没有其他 Node、对齐完成或本人确认 | 发现分叉 |
 | `forked` | 本机存有自己日志的另一支 | 不离开；撤销这台设备后用新数据目录重新加入 |
 
 拒绝写入时的错误为 `this Node is aligning with other Nodes; try again shortly`、`this Node is read-only until you confirm it was not restored from a backup` 和 `this Node's log has forked and it no longer writes`，网页翻译成中文。`confirm_writable` 只记录在本机，不进入 DAG，对 `forked` 无效。
