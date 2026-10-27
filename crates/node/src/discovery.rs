@@ -4,7 +4,6 @@
 //! The paths stay in `config.json` and `provider-env.json`; they never reach shared records.
 use crate::{
     config::{Config, ManagerSettings},
-    manager::ManagerKind,
     providers::{AppServer, AppServerMode, Local, Provider, ProviderEnv},
     triage::TriageConfig,
 };
@@ -262,7 +261,7 @@ impl Paths {
         }
         if let Some(bin) = &self.cursor_sdk_bin {
             match target.manager {
-                Some(manager) if manager.provider == ManagerKind::CursorSdk => {
+                Some(manager) if manager.provider == Provider::Cursor => {
                     manager.cursor_sdk_bin = bin.clone()
                 }
                 _ => bail!("the Cursor program is set while Cursor runs the bot"),
@@ -281,7 +280,7 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
         || target
             .manager
             .as_ref()
-            .is_some_and(|m| m.provider == ManagerKind::CodexSdk);
+            .is_some_and(|m| m.provider.on_app_server());
     let home_set = local.env.get(Provider::Codex).contains_key(CODEX_HOME);
     let mut paths = Paths::default();
     let server = &local.switches.codex_app_server;
@@ -325,7 +324,7 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
         }
     }
     if let Some(manager) = target.manager.as_ref()
-        && manager.provider == ManagerKind::CursorSdk
+        && manager.provider == Provider::Cursor
         && !runnable(&manager.cursor_sdk_bin, host.path.as_ref())
     {
         paths.cursor_sdk_bin = bare(&manager.cursor_sdk_bin).and_then(|name| host.program(name));
@@ -626,7 +625,7 @@ mod tests {
             path: Some("/usr/bin:/bin".into()),
         };
         let mut manager = Some(ManagerSettings {
-            provider: ManagerKind::CursorSdk,
+            provider: Provider::Cursor,
             workspace: root.clone(),
             model: "auto".into(),
             cursor_sdk_bin: "cursor-sdk-bridge".into(),

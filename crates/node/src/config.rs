@@ -61,7 +61,8 @@ pub struct Config {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
-    pub provider: crate::manager::ManagerKind,
+    #[serde(with = "crate::providers::sdk_name")]
+    pub provider: crate::providers::Provider,
     pub workspace: PathBuf,
     pub model: String,
     pub cursor_sdk_bin: PathBuf,
@@ -165,7 +166,7 @@ impl Config {
         self.providers.validate(
             self.manager
                 .as_ref()
-                .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk),
+                .is_some_and(|manager| manager.provider.on_app_server()),
         )?;
         ensure!(
             !self.codex_bin.as_os_str().is_empty(),

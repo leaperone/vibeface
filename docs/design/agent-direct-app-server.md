@@ -88,9 +88,9 @@ sequenceDiagram
 	A->>N: track_work（title、prompt、cwd、call_ref…）
 	N-->>A: work_id、may_send、send_by_ms、cwd、thread_id?
 	A->>X: initialize、thread/start（never、danger-full-access）
-	A->>N: bind_work（thread_id）
+	A->>N: bind_work（report: thread）
 	A->>X: turn/start（clientUserMessageId=work_id）
-	A->>N: bind_work（turn_id | unknown | failed）
+	A->>N: bind_work（report: turn | rejected | unknown）
 	N->>X: thread/resume 订阅，观察进展
 ```
 

@@ -1976,7 +1976,7 @@ mod tests {
         let settings = crate::runtime::NodeSettings {
             roots: vec![project.clone(), project.join(".")],
             manager: Some(ManagerSettings {
-                provider: crate::manager::ManagerKind::CursorSdk,
+                provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
                 cursor_sdk_bin: dir.join("missing-cursor-sdk"),
@@ -2085,7 +2085,7 @@ mod tests {
             saved["settings"]
         );
         let mut codex_settings = settings.clone();
-        codex_settings.manager.as_mut().unwrap().provider = crate::manager::ManagerKind::CodexSdk;
+        codex_settings.manager.as_mut().unwrap().provider = crate::providers::Provider::Codex;
         assert!(
             dispatch(
                 &node,
@@ -2138,7 +2138,7 @@ mod tests {
     async fn provider_keys_stay_in_the_private_file_and_one_call_chooses_what_providers_run()
     -> Result<()> {
         use crate::config::{self, Config};
-        use crate::manager::ManagerKind;
+        use crate::providers::Provider;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../.artifacts")
             .join(format!("provider-keys-{}", uuid::Uuid::new_v4()));
@@ -2265,8 +2265,8 @@ mod tests {
                 .is_err()
         );
 
-        let codex_env = node.provider_env(ManagerKind::CodexSdk);
-        let cursor_env = node.provider_env(ManagerKind::CursorSdk);
+        let codex_env = node.provider_env(Provider::Codex);
+        let cursor_env = node.provider_env(Provider::Cursor);
         assert_eq!(codex_env["FIXTURE_CODEX_KEY"], codex_key);
         assert!(!codex_env.contains_key("CURSOR_API_KEY"));
         assert_eq!(cursor_env["CURSOR_API_KEY"], cursor_key);
@@ -2404,7 +2404,7 @@ mod tests {
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(
-            reopened.provider_env(ManagerKind::CursorSdk)["CURSOR_API_KEY"],
+            reopened.provider_env(Provider::Cursor)["CURSOR_API_KEY"],
             cursor_key
         );
         drop(reopened);
