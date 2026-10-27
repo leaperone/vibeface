@@ -1,8 +1,8 @@
 "use client"
 
 import { useEffect, useRef, useState, type FormEvent } from "react"
-import { useNavigate } from "@tanstack/react-router"
-import { Plus } from "lucide-react"
+import { Link, useNavigate } from "@tanstack/react-router"
+import { ChevronRight, Plus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BusyIcon, InlineError } from "@/components/app/kit"
 import { Field, FieldDescription, FieldLabel } from "@/components/ui/field"
@@ -28,7 +28,7 @@ const projectKey = (project: BotProject) => JSON.stringify([project.target_node,
 export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const workspace = useWorkspace()
   const navigate = useNavigate()
-  const { directory } = useDevice()
+  const { directory, ready } = useDevice()
   const pending = workspace.pendingBot
   const rejected = pending?.submission?.state === "rejected"
   const [name, setName] = useState("")
@@ -40,7 +40,9 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const wasOpen = useRef(false)
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
   // Folders come only from devices that run a bot, so with none of those the hint points at setting one up.
-  const botDevice = workspace.nodes.some((node) => !node.revoked && node.online && node.capabilities?.manager)
+  const botDevice = workspace.nodes.find((node) => !node.revoked && node.online && node.capabilities?.manager)
+  // Only an admin, or this computer's own page, can add a folder or set up a device; elsewhere the link would lead nowhere.
+  const setupDevice = ready?.principal.can_manage || ready?.principal.source === "local_session" ? botDevice?.device_id ?? ready.entry.device_id : undefined
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.capabilities?.manager) return []
     const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
@@ -111,7 +113,12 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
                 {projects.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
               </NativeSelect>
             )}
-            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help">{botDevice ? "还没有可用的文件夹，可在「设备」里添加" : "设备能运行 Bot 后就能选"}</FieldDescription>}
+            {projects.length || pending?.project ? null : <FieldDescription id="bot-project-help" className="flex flex-wrap items-center gap-x-2">
+              {botDevice ? "还没有可用的文件夹" : "设备能运行 Bot 后就能选"}
+              {setupDevice ? <Link to="/devices/$deviceId" params={{ deviceId: setupDevice }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11" onClick={() => onOpenChange(false)}>
+                {botDevice ? "去添加" : "去设置"}<ChevronRight aria-hidden="true" className="size-3.5" />
+              </Link> : null}
+            </FieldDescription>}
           </Field>
           <InlineError error={error} />
           <div className="flex flex-wrap justify-end gap-2">
