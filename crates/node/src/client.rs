@@ -6,7 +6,7 @@
 use crate::{
     crypto::LocalIdentity,
     identity::{
-        AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, Member,
+        AuthorizationView, GovernanceAction, GovernanceEvent, IdentityKind, LAST_MANAGER, Member,
         NO_RECOVERY_WAITING, NetworkState, RECOVERY_SKEW_MS, RootCheckpoint,
         local::{Join, JoinRequest, JoinStatus},
     },
@@ -208,7 +208,8 @@ struct Session {
     device_id: String,
     /// Present only on `/api/local/ws`; it lets a non-member browser use this Node.
     cookie: Option<String>,
-    subscribed: bool,
+    /// Set by `subscribe` to the management permission the device had then.
+    subscribed: Option<bool>,
     observation: Option<crate::runtime::ObservationGuard>,
 }
 
@@ -403,7 +404,7 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
             let mut session = Session {
                 device_id: remote,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             };
             let result = dispatch(&node, &mut session, method, request["params"].clone()).await?;
@@ -455,7 +456,7 @@ async fn serve_session(
     let mut session = Session {
         device_id,
         cookie,
-        subscribed: false,
+        subscribed: None,
         observation: None,
     };
     let opened = Instant::now();
@@ -504,7 +505,7 @@ async fn serve_session(
                     _ => bail!("client channel accepts only encrypted binary frames"),
                 }
             }
-            event = events.recv(), if session.subscribed => {
+            event = events.recv(), if session.subscribed.is_some() => {
                 let principal = principal(&node, &session).await?;
                 match event {
                     Ok(event) if event.network_id == principal.network_id => {
@@ -525,7 +526,7 @@ async fn serve_session(
             _ = heartbeat.tick() => {
                 ensure!(received.elapsed() < IDLE_TIMEOUT, "client channel idle");
                 ensure!(partial_started.is_none_or(|at| at.elapsed() < IDLE_TIMEOUT), "client fragmented message timed out");
-                if session.subscribed || session.observation.is_some() { principal(&node, &session).await?; }
+                if session.subscribed.is_some() || session.observation.is_some() { principal(&node, &session).await?; }
                 if guest.is_some() {
                     if principal(&node, &session).await.is_ok() { guest = None; }
                     else { ensure!(opened.elapsed() < GUEST_LIFETIME, "a device that is not a member may stay connected for 15 minutes"); }
@@ -535,8 +536,12 @@ async fn serve_session(
             }
             changed = membership.changed() => {
                 changed.context("membership state closed")?;
-                // A removed device loses its subscription at once, not at the next heartbeat.
-                if session.subscribed || session.observation.is_some() { principal(&node, &session).await?; }
+                // A removed device loses its subscription at once, not at the next heartbeat; one
+                // whose management permission changed reconnects to pick up the new principal.
+                if session.subscribed.is_some() || session.observation.is_some() {
+                    let now = principal(&node, &session).await?.can_manage;
+                    ensure!(session.subscribed.is_none_or(|was| was == now), "this device's management permission changed");
+                }
             }
             changed = local_changes.changed(), if session.cookie.is_some() => {
                 changed.context("local access state closed")?;
@@ -743,7 +748,7 @@ async fn dispatch(
         "subscribe" => {
             // The browser sends the vector it has already shown; a lagging entry asks its peers now.
             let principal = principal(node, session).await?;
-            session.subscribed = true;
+            session.subscribed = Some(principal.can_manage);
             let vector: std::collections::BTreeMap<String, u64> = node
                 .store
                 .lock()
@@ -908,6 +913,30 @@ async fn dispatch(
             let mut state = node.membership_state().await?;
             state.append(event)?;
             node.install_membership(state.clone()).await?;
+            authentication(node, session).await
+        }
+        "grant" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Grant { member } = &event.action else {
+                bail!("invalid grant signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id && event.epoch == view.epoch,
+                "invalid grant signer or action"
+            );
+            // New devices join through `approve`; this only changes a current client's permission.
+            ensure!(
+                view.client(&member.device_id).is_ok(),
+                "device is not a member of this personal network"
+            );
+            let mut state = node.membership_state().await?;
+            state.append(event)?;
+            ensure!(
+                state.project()?.members.iter().any(|m| m.manage),
+                LAST_MANAGER
+            );
+            node.install_membership(state).await?;
             authentication(node, session).await
         }
         "veto" => {
@@ -1860,7 +1889,7 @@ mod tests {
             Ok(Session {
                 device_id: identity.device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             })
         };
@@ -1993,7 +2022,7 @@ mod tests {
             Ok(Session {
                 device_id: identity.device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             })
         };
@@ -2078,7 +2107,7 @@ mod tests {
             Ok(Session {
                 device_id: identity.device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             })
         };
@@ -2337,7 +2366,7 @@ mod tests {
             Ok(Session {
                 device_id: identity.device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             })
         };
@@ -2614,13 +2643,13 @@ mod tests {
             let mut local = Session {
                 device_id: browser.device_id()?,
                 cookie: Some(cookie),
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             };
             let mut remote_manager = Session {
                 device_id: admin.device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             };
             assert!(
@@ -2683,7 +2712,7 @@ mod tests {
             let mut page = Session {
                 device_id: LocalIdentity::generate().device_id()?,
                 cookie: None,
-                subscribed: false,
+                subscribed: None,
                 observation: None,
             };
             let status = |value: Value| value["status"].as_str().unwrap_or_default().to_owned();
@@ -2923,7 +2952,7 @@ mod tests {
             let browser_id = browser.device_id()?;
             let mut local_session = Session {
                 device_id: browser_id.clone(), cookie: Some(cookie.into()),
-                subscribed: false, observation: None,
+                subscribed: None, observation: None,
             };
             let save = node.config_save.lock().await;
             let mut queued_disable = Box::pin(dispatch(&node, &mut local_session, "local_access", json!({"enabled":false})));
@@ -2945,7 +2974,7 @@ mod tests {
             node.local_access.set_enabled(false)?;
             let mut manager_session = Session {
                 device_id: manager.device_id()?, cookie: None,
-                subscribed: false, observation: None,
+                subscribed: None, observation: None,
             };
             let save = node.config_save.lock().await;
             let mut queued_enable = Box::pin(dispatch(&node, &mut manager_session, "local_access", json!({"enabled":true})));
@@ -3119,6 +3148,31 @@ mod tests {
             connect(refused.clone()).await?.call("join", join(&refused, [3; 32], &nonce)?).await?;
             assert_eq!(manager.call("approve", json!({"join_id":refused_id,"reject":true})).await?["status"], "rejected");
             assert!(manager.call("approve", json!({"join_id":refused_id,"admin_nonce":"66".repeat(32)})).await.is_err());
+
+            let set_manage = |issuer: &LocalIdentity, view: &AuthorizationView, device: &LocalIdentity, name: &str, manage: bool| -> Result<GovernanceEvent> {
+                GovernanceEvent::unsigned(view, &issuer.device_id()?, GovernanceAction::Grant { member: Member::client(device, name, manage)? })?.sign(issuer)
+            };
+            let mut listening = connect(phone.clone()).await?;
+            listening.call("subscribe", json!({})).await?;
+            let view = node.membership_state().await?.project()?;
+            let demote = set_manage(&admin, &view, &phone, "phone", false)?;
+            assert!(joiner.call("grant", json!({"event":demote})).await.is_err(), "issuer must be the session");
+            manager.call("grant", json!({"event":demote})).await?;
+            manager.call("grant", json!({"event":demote})).await?;
+            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            assert!(listening.call("info", json!({})).await.is_err(), "a subscription reconnects to pick up the new permission");
+            let view = node.membership_state().await?.project()?;
+            let mut own = set_manage(&admin, &view, &phone, "phone", true)?;
+            own.issuer = phone.device_id()?;
+            assert!(joiner.call("grant", json!({"event":own.sign(&phone)?})).await.is_err(), "a demoted device cannot promote itself");
+            let stranger = set_manage(&admin, &view, &LocalIdentity::generate(), "stranger", true)?;
+            assert!(manager.call("grant", json!({"event":stranger})).await.is_err(), "new devices join through approve");
+            let mut alone = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Grant { member: Member::client(&phone, "phone", false)? })?;
+            alone.action = GovernanceAction::Grant { member: Member::client(&admin, "admin", false)? };
+            let error = manager.call("grant", json!({"event":alone.sign(&admin)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
+            manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
+            assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
 
             let mut watching = connect(phone.clone()).await?;
             watching.call("subscribe", json!({})).await?;

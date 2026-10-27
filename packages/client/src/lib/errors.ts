@@ -47,6 +47,7 @@ const patterns: [RegExp, string][] = [
   [/conflicting recovery checkpoint|recovery epoch rollback/i, '这组设备已经用另一份恢复文件找回过。请用最近一次下载的恢复文件。'],
   [/another recovery is waiting/i, '已有一次找回在等待生效。'],
   [/stopped this recovery/i, '这次找回已被拦下。'],
+  [/needs at least one management device/i, '至少要留一台管理设备。'],
   [/no recovery is waiting/i, '没有正在等待的找回，可能已生效或已被拦下。'],
   [/signed too long ago/i, '这次找回太旧了，请重新发起。'],
   [/can no longer be stopped/i, '这次找回马上就要生效，来不及拦下了。'],

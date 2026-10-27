@@ -78,7 +78,7 @@ type DeviceContextValue = {
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
-  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>
+  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>
   beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
   replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
@@ -653,6 +653,19 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     await request('revoke', { event }); await refreshDirectory()
     for (const entry of savedEntries().filter(item => item.device_id === deviceId)) removeEntry(entry)
   }
+  async function setManage(deviceId: string, manage: boolean) {
+    const connection = managing(), request = scoped()
+    const member = directory?.members.find(item => item.device_id === deviceId && item.kind === 'client')
+    if (!member) throw new Error('找不到这个设备，请刷新后再试。')
+    if (deviceId === own().deviceId) throw new Error(`不能修改${self}自己的管理权限。`)
+    const response = record(await request('directory'))
+    const verified = verifyState(response.state, connection.principal.network_id, nodeNow(response))
+    let event: Record<string, unknown>
+    try { event = JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'grant', member: { ...member, manage } }))) }
+    finally { verified.free() }
+    event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+    await request('grant', { event }); await refreshDirectory()
+  }
   /**
    * Stops the recovery `checkpoint` names. The directory is read first, and again when the answer is lost, so a veto
    * that landed is not signed again and a recovery that got stopped is told apart from one that took effect.
@@ -1138,7 +1151,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
-    startApproval, approveJoin, rejectJoin, revoke, beginRecovery, replaceRecoveryFile,
+    startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
