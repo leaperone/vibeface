@@ -1,9 +1,9 @@
 import { stat } from 'node:fs/promises';
-import { test } from '@e2e-dev/web';
+import { test } from './fixtures';
 import { expect, secrets } from 'e2e';
 
-test('creates a network and a persistent Bot without a model', async ({ app, screen, browser }) => {
-  await app.open('/');
+test('creates a network and a persistent Bot without a model', async ({ app, node, screen, browser }) => {
+  await app.open(node.url);
   await screen.getByLabel('这台电脑叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();
   await expect(screen.getByRole('heading', '设置恢复密码')).toBeVisible();

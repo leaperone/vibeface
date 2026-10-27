@@ -2,6 +2,7 @@ import type { SecureApi } from '../secure-api.ts'
 import type { ConnectionEntry, LocalSetup, PublicIdentity } from './node.ts'
 import type { OutboxStore } from './outbox.ts'
 import type { Transport } from './transport.ts'
+import type { TransferFile } from '../delivery/types.ts'
 
 /** Synchronous string storage that survives restarts, like the browser's `localStorage`. */
 export type KeyValue = { getItem(key: string): string | null; setItem(key: string, value: string): void }
@@ -45,6 +46,10 @@ export type Platform = {
   foreground(): boolean
   /** Hands a sealed recovery file to the person to keep, under `name`. */
   saveRecovery(bytes: Uint8Array, name: string): void | Promise<void>
+  files?: {
+    pick(): Promise<TransferFile | null>
+    save(bytes: Uint8Array, name: string): Promise<'saved' | 'handed_off'>
+  }
   /** How messages name this device: 这个浏览器, 这台手机. */
   self: string
   page?: LocalPage

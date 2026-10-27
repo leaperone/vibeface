@@ -11,6 +11,11 @@ on:
   schedule:
     - cron: '23 3 * * *'
   workflow_dispatch:
+    inputs:
+      delivery_live:
+        description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -27,6 +32,7 @@ jobs:
       web: ${{ steps.select.outputs.web }}
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
+      delivery: ${{ steps.select.outputs.delivery }}
       package: ${{ steps.select.outputs.package }}
       package_matrix: ${{ steps.select.outputs.package_matrix }}
       package_mode: ${{ steps.select.outputs.package_mode }}
@@ -69,7 +75,10 @@ jobs:
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           python3 scripts/ci.py --self-test
-          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py")]'
+          python3 scripts/check-delivery.py --self-test
+          python3 scripts/install-delivery-toolchain.py --self-test
+          python3 scripts/run-delivery-live.py --self-test
+          python3 -c 'import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("scripts/ci.py", "scripts/verify-node.py", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")]'
           bash -n install.sh
           bash -n scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
           shellcheck install.sh scripts/package-node.sh scripts/install-node-service.sh scripts/build-web-crypto.sh scripts/build-web.sh
@@ -230,6 +239,58 @@ jobs:
           CI_PLAN: ${{ needs.plan.outputs.plan }}
         run: python3 scripts/ci.py test --tier slow --plan-env CI_PLAN
 
+  delivery:
+    needs: plan
+    if: needs.plan.outputs.delivery == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      RISC0_HOME: /risc0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: delivery
+          workspaces: |
+            . -> .artifacts/vdp/domain-target
+            proofs/delivery -> ../../.artifacts/vdp/proof-target
+      - name: Check public delivery fixtures when present
+        run: python3 scripts/check-delivery.py --check-fixtures
+      - name: Install checksum-pinned guest compiler in artifacts
+        run: python3 scripts/install-delivery-toolchain.py
+      - name: Bind canonical Linux build paths
+        run: |
+          mkdir -p .artifacts/vdp "${CARGO_HOME:-$HOME/.cargo}"
+          sudo mkdir -p /work /cargo /risc0 /artifacts
+          sudo mount --bind "$PWD" /work
+          sudo mount --bind "${CARGO_HOME:-$HOME/.cargo}" /cargo
+          sudo mount --bind "$PWD/.artifacts/vdp/risc0" /risc0
+          sudo mount --bind "$PWD/.artifacts/vdp" /artifacts
+      - name: Rebuild guest and verify real delivery receipts on host and EVM
+        working-directory: /work
+        env:
+          CARGO_HOME: /cargo
+        run: python3 scripts/check-delivery.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: delivery-${{ github.sha }}
+          path: |
+            .artifacts/vdp/host-info.json
+            .artifacts/vdp/proof-results.json
+            .artifacts/vdp/public-vectors.json
+            .artifacts/vdp/contracts/*-results.json
+          if-no-files-found: warn
+          retention-days: 7
+
   package:
     needs: [plan, crypto-web, web]
     if: needs.plan.outputs.package == 'true'
@@ -253,6 +314,8 @@ jobs:
           name: web-${{ github.sha }}
           path: crates/node/web/dist/client
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: package-${{ matrix.target }}
@@ -362,12 +425,47 @@ jobs:
           grep -qx 'Identifier=cn.leaperone.vibeface' <<< "$details"
           grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
           grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
-          spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" 2>&1 | tee "$RUNNER_TEMP/gatekeeper-assessment.txt"
-          grep -qx 'source=Notarized Developer ID' "$RUNNER_TEMP/gatekeeper-assessment.txt"
+          binary_sha="$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)"
+          for attempt in 1 2 3 4; do
+            assessment="$RUNNER_TEMP/gatekeeper-assessment-$attempt.txt"
+            if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" >"$assessment" 2>&1; then
+              assessment_status=0
+            else
+              assessment_status=$?
+            fi
+            cat "$assessment"
+            printf 'Gatekeeper assessment %s exited %s\n' "$attempt" "$assessment_status"
+            test "$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)" = "$binary_sha"
+            if test "$assessment_status" -eq 0; then
+              grep -qx 'source=Notarized Developer ID' "$assessment"
+              break
+            fi
+            if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq 4; then
+              exit "$assessment_status"
+            fi
+            sleep 15
+          done
       - name: Verify packaged Web assets and process
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: python3 scripts/verify-node.py --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts .artifacts/ci-web --web-only
+      - name: Verify packaged free discovery and charity delivery over real Node processes
+        if: needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          PACKAGE: ${{ steps.unpack.outputs.package }}
+          VIBEFACE_PROBE_SOURCE_ROOT: ${{ github.workspace }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.artifacts/delivery-probe/target
+        run: |
+          cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check
+          cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked
+          python3 scripts/verify-node.py --delivery-charity --binary "$PACKAGE/vibeface" --crypto-module "$PACKAGE/web/vibeface_secure.js" --artifacts "$PWD/.artifacts/ci-delivery" --delivery-probe "$CARGO_TARGET_DIR/debug/vibeface-delivery-probe" --delivery-source-root "$PWD" --delivery-profile "$PWD/proofs/delivery/profile.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() && needs.plan.outputs.delivery == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
+        with:
+          name: delivery-charity-${{ github.sha }}
+          path: .artifacts/ci-delivery/delivery-charity-*/report.json
+          if-no-files-found: warn
+          retention-days: 7
       - name: Use official Ubuntu package mirror
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: printf 'https://archive.ubuntu.com/ubuntu/\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
@@ -474,6 +572,142 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
+  delivery-android:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    uses: ./.github/workflows/mobile.yml
+    with:
+      android_only: true
+
+  delivery-live:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    needs: [plan, package, crypto-web, web, delivery-android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: node-package-x86_64-unknown-linux-gnu-${{ github.sha }}
+          path: .artifacts/vdp/live-package
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: crypto-web-${{ github.sha }}
+          path: crates/node/web/generated
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-${{ github.sha }}
+          path: crates/node/web/dist/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: vibeface-android-${{ github.sha }}
+          path: .artifacts/vdp/live-android
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install recording and KVM access tools
+        run: |
+          printf 'https://archive.ubuntu.com/ubuntu\n' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg acl
+      - name: Prepare host Web and Android drivers without model calls
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.artifacts/vdp/live-ui/browsers
+        run: |
+          pnpm install --frozen-lockfile --filter .
+          pnpm test:e2e:check
+          pnpm exec e2e-web install chromium --with-deps
+          command -v Xvfb
+          command -v xvfb-run
+          command -v xauth
+          command -v ffmpeg
+          command -v ffprobe
+          test -c /dev/kvm
+          sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+      - name: Generate genuine local proofs and verify actual Web and Android delivery
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/run-delivery-live.py --package .artifacts/vdp/live-package --android .artifacts/vdp/live-android --source-commit "$SOURCE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ !cancelled() }}
+        with:
+          name: delivery-live-public-${{ github.sha }}
+          path: |
+            .artifacts/vdp/live-public/key-binding.receipt
+            .artifacts/vdp/live-public/key-binding.json
+            .artifacts/vdp/live-public/relation-*-window-*.receipt
+            .artifacts/vdp/live-public/relation-*-window-*.json
+            .artifacts/vdp/live-public/settlement.json
+            .artifacts/vdp/live-public/settlement-observation.json
+            .artifacts/vdp/live-public/key-lifecycle/rotate.receipt
+            .artifacts/vdp/live-public/key-lifecycle/rotate.json
+            .artifacts/vdp/live-public/key-lifecycle/revoke.receipt
+            .artifacts/vdp/live-public/key-lifecycle/revoke.json
+            .artifacts/vdp/live-public/key-lifecycle/register.receipt
+            .artifacts/vdp/live-public/key-lifecycle/register.json
+            .artifacts/vdp/live-public/key-lifecycle/summary.json
+            .artifacts/vdp/live-public/key-lifecycle/mixed-held.json
+            .artifacts/vdp/live-public/ordinary-settlement/key-binding.receipt
+            .artifacts/vdp/live-public/ordinary-settlement/key-binding.json
+            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.receipt
+            .artifacts/vdp/live-public/ordinary-settlement/relation-*-window-0.json
+            .artifacts/vdp/live-public/ordinary-settlement/settlement.json
+            .artifacts/vdp/live-public/ordinary-settlement/settlement-observation.json
+            .artifacts/vdp/live-public/branches/index.json
+            .artifacts/vdp/live-public/branches/core-restored.json
+            .artifacts/vdp/live-public/branches/key-rotate.json
+            .artifacts/vdp/live-public/branches/key-revoke.json
+            .artifacts/vdp/live-public/branches/key-register.json
+            .artifacts/vdp/live-public/branches/branch-offline-refund.json
+            .artifacts/vdp/live-public/branches/branch-partial-refund.json
+            .artifacts/vdp/live-public/branches/branch-held-timeout.json
+            .artifacts/vdp/live-public/branches/branch-strict-late-open.json
+            .artifacts/vdp/live-public/branches/branch-late-priority.json
+            .artifacts/vdp/live-public/branches/branch-hold-reorg.json
+            .artifacts/vdp/live-public/branches/branch-capsule-reorg.json
+            .artifacts/vdp/live-public/branches/branch-keeper.json
+            .artifacts/vdp/live-public/branches/branch-token-false.json
+            .artifacts/vdp/live-public/branches/branch-token-frozen.json
+            .artifacts/vdp/live-public/branches/branch-token-fee.json
+            .artifacts/vdp/live-public/branches/branch-token-sender-tax.json
+            .artifacts/vdp/live-public/branches/branch-token-precision.json
+            .artifacts/vdp/live-public/branches/branch-token-nonreturn.json
+            .artifacts/vdp/live-public/branches/branch-token-reentrancy.json
+            .artifacts/vdp/live-public/branches/branch-node-refund-hook.json
+            .artifacts/vdp/live-public/branches/branch-incoming-false.json
+            .artifacts/vdp/live-public/branches/branch-incoming-frozen.json
+            .artifacts/vdp/live-public/branches/branch-incoming-fee.json
+            .artifacts/vdp/live-public/branches/branch-incoming-sender-tax.json
+            .artifacts/vdp/live-public/branches/branch-incoming-precision.json
+            .artifacts/vdp/live-public/branches/branch-incoming-reentrancy.json
+            .artifacts/vdp/live-public/branches/branch-incoming-nonreturn.json
+            .artifacts/vdp/live-public/branches/branch-mixed-held-rotate.json
+            .artifacts/vdp/live-public/ui/web.json
+            .artifacts/vdp/live-public/ui/android.json
+            .artifacts/vdp/live-public/ui/web.png
+            .artifacts/vdp/live-public/ui/android-offline.png
+            .artifacts/vdp/live-public/ui/android.png
+            .artifacts/vdp/live-public/ui/ui-inspections.json
+            .artifacts/vdp/live-public/ui/web-partial-refund.png
+            .artifacts/vdp/live-public/ui/web-unknown-transaction.png
+            .artifacts/vdp/live-public/ui/android-key-before.png
+            .artifacts/vdp/live-public/ui/android-key-rotated.png
+            .artifacts/vdp/live-public/ui/web-settled.png
+            .artifacts/vdp/live-public/ui/video-metadata.json
+            .artifacts/vdp/live-public/ui/web-confirm.mp4
+            .artifacts/vdp/live-public/ui/android-accept-offline.mp4
+            .artifacts/vdp/live-public/ui/android-resume-save.mp4
+            .artifacts/vdp/live-public/summary.json
+            .artifacts/vdp/live-public/resources.json
+          if-no-files-found: warn
+          retention-days: 14
+
   npm-package:
     needs: [plan, package]
     if: needs.plan.outputs.npm == 'true'
@@ -540,7 +774,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: always()
-    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, package, npm-package, npm-smoke]
+    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -549,7 +783,7 @@ jobs:
       - name: Require every check selected for this commit and scenario
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
-        run: python3 scripts/ci.py gate --needs-env CI_NEEDS
+        run: python3 scripts/ci.py gate --needs-env CI_NEEDS ${{ github.event_name == 'workflow_dispatch' && inputs.delivery_live && '--delivery-live' || '' }}
 
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

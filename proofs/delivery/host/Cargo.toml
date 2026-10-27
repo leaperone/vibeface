@@ -1,0 +1,16 @@
+[package]
+name = "vibeface-delivery-prover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+bincode = "1.3"
+hex = "0.4"
+libc = "0.2"
+risc0-zkvm = { version = "=3.0.6", default-features = false, features = ["client", "disable-dev-mode"] }
+serde_json = "1"
+vibeface-delivery = { path = "../../../crates/delivery" }
+vibeface-delivery-methods = { path = "../methods" }
+zeroize = "1"

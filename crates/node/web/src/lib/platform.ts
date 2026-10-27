@@ -100,6 +100,26 @@ export const webPlatform: Platform = {
     link.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   },
+  files: {
+    pick: () => new Promise((resolve, reject) => {
+      const input = document.createElement('input')
+      input.type = 'file'
+      input.hidden = true
+      const finish = () => { const file = input.files?.[0] ?? null; input.remove(); resolve(file) }
+      input.addEventListener('change', finish, { once: true })
+      input.addEventListener('cancel', finish, { once: true })
+      document.body.append(input)
+      try { input.click() } catch (cause) { input.remove(); reject(cause) }
+    }),
+    async save(bytes, name) {
+      const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' }))
+      const link = document.createElement('a')
+      link.href = url; link.download = name
+      document.body.append(link); link.click(); link.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      return 'handed_off'
+    },
+  },
   self: '这个浏览器',
   page: localPage,
   get joinTabs() { return typeof BroadcastChannel !== 'undefined' && globalThis.navigator?.locks ? joinTabs : undefined },

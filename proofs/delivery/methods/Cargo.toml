@@ -1,0 +1,11 @@
+[package]
+name = "vibeface-delivery-methods"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+risc0-build = "=3.0.6"
+
+[package.metadata.risc0]
+methods = ["../guest"]

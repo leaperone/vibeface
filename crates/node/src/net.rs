@@ -20,6 +20,7 @@ use std::{
 };
 
 mod discovery;
+pub mod pkarr;
 
 pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
 pub const SYNC: &[u8] = b"vibeface/sync/1";
@@ -29,7 +30,8 @@ pub const CLIENT: &[u8] = b"vibeface/client/1";
 pub const JOIN: &[u8] = b"vibeface/join/1";
 /// A decision sent to a session through another device; the target checks its token.
 pub const DECISION: &[u8] = b"vibeface/decision/1";
-pub const ALPNS: [&[u8]; 6] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION];
+pub const SERVICE: &[u8] = b"vibeface/service/1";
+pub const ALPNS: [&[u8]; 7] = [SYNC, BLOB, RPC, CLIENT, JOIN, DECISION, SERVICE];
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
@@ -38,6 +40,8 @@ const RELAY_TOKEN_DOMAIN: &[u8] = b"vibeface:relay:v1";
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
+    #[serde(default)]
+    pub pkarr: pkarr::PkarrConfig,
     /// UDP address of the iroh endpoint; defaults to all interfaces on the `listen` port.
     #[serde(default)]
     pub bind: Option<SocketAddr>,
@@ -123,6 +127,7 @@ pub fn same_token(a: &str, b: &str) -> bool {
 }
 impl NetworkConfig {
     pub fn validate(&self) -> Result<()> {
+        self.pkarr.validate()?;
         ensure!(self.relays.len() <= MAX_RELAYS, "too many relays");
         ensure!(self.discovery.len() <= 4, "too many discovery servers");
         for server in &self.discovery {
@@ -331,6 +336,21 @@ impl Net {
             )
             .relay_mode(RelayMode::Custom(map))
             .address_lookup(lookup.clone());
+        for url in &config.pkarr.urls {
+            let url = reqwest::Url::parse(url)?;
+            if config.pkarr.publish {
+                let publisher = iroh::address_lookup::PkarrPublisher::builder(url.clone());
+                let publisher = if config.pkarr.publish_direct {
+                    publisher.addr_filter(iroh::address_lookup::AddrFilter::unfiltered())
+                } else {
+                    publisher
+                };
+                builder = builder.address_lookup(publisher);
+            }
+            if config.pkarr.resolve {
+                builder = builder.address_lookup(pkarr::FreshResolver::new(url)?);
+            }
+        }
         // iroh starts with wildcard sockets on random ports; replace them so a configured
         // address is the only one, and the default uses the listen port.
         builder = builder.clear_ip_transports();

@@ -41,7 +41,7 @@ const CreateBot = createContext<() => void>(() => {})
 export const useCreateBot = () => useContext(CreateBot)
 
 const JOINS_SEEN = "vibeface.joins-seen"
-const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志" }
+const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/transfers": "文件传输" }
 
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()

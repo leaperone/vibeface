@@ -8,13 +8,13 @@
 
 个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。每个 `RootCheckpoint` 带下一把恢复密钥 `recovery_key`，由上一把签名，第一把是根密钥。恢复私钥只在加密恢复文件里，Node 不持有。
 
-`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 在 `forward` 模式决定是否运行 relay；`public_entry` 是不入网的公共入口，也可选择只发现而不转发业务的模式。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 在 `forward` 模式决定是否运行 relay；`public_entry` 是不入网的公共入口，也可选择只发现而不转发业务的模式。两者都可显式启用独立的文件交付服务，服务权限不改变成员关系。
 
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由当前恢复密钥签名、epoch 加一的 checkpoint 建立新授权并换恢复密钥；`directory` 为空的 checkpoint 只换恢复密钥，目录沿用上一 epoch，立即生效；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。
 
 换目录的 checkpoint 带签名时间 `issued_at_ms` 和 `heads`（签名时恢复密钥所在 epoch 的管理事件 heads，rotation 为空），从这时起等 48 小时（`RECOVERY_DELAY_MS`）才生效，之前视图仍是原目录，`pending` 给出它的哈希、`effective_at_ms` 和待生效成员。等待期内，原目录里的管理设备可以在原 epoch 签 `veto`：`{"type":"veto","checkpoint":<checkpoint 哈希>,"at_ms":<签名时间>}`。否决算不算数只看它自己和它的因果祖先，之后到达的事件改变不了：因果祖先须包含该 checkpoint 的全部 `heads`，签发者在这些祖先里是管理设备且未被撤销（否则整份状态无效），`at_ms` 早于生效时刻；目标不符或祖先不全的否决不起作用。所以改写 `parents` 绕不过找回前的撤销，而先否决、后被撤销的设备，否决仍然有效。`heads` 含本机没有的事件的 checkpoint 不生效，`recover` 直接拒绝（`this recovery rests on device changes this Node has not received; sync it first`），同步合并时它保持等待，补齐事件后再按签名时间判定。同一把恢复密钥在找回生效前签出的 rotation（`issued_at_ms` 早于该找回的生效时刻）也会让它作废，换恢复密码不受等待中的找回阻塞。被否决或被 rotation 取代的 checkpoint 及建在它上面的 checkpoint 作废，哈希列入视图的 `stopped`，原目录继续有效。同一把恢复密钥只能出现一次；一把密钥再签时，此前签的每个找回要么有合法否决，要么被这次 rotation 取代，否则整份状态无效。最多 64 个未被否决的 checkpoint。生效不是终局：生效目录是签名记录和墙钟的纯函数，Node 不拒绝任何合法历史。窗口内签的否决（或倒签到窗口内的 rotation）晚到时，已按墙钟翻转的 Node 回到旧目录，与其他 Node 收敛；回滚前，它可能短暂按新目录放行。所以翻转时不往共享日志写不可撤回的记录：找回移出的 Node 上未完成的工作不记为待确认，它超出上限的写入只是在投影里不计入，回滚后重新计入；只有管理设备签名的 `revoke` 才把被移除设备的工作记为待确认（`unverified`）。作废邀请、`identity_meta.recovery_since`（首次见到某把密钥生效的时间，只用于展示）和地址簿清理都是本机可重做的。认为对方已被移除的 Node 仍接受对方推来的成员状态，所以被找回移出、又因否决回到目录的 Node 也能收敛。未被移除的被偷管理设备可以随时拦下找回（含补签迟到否决），这个限制早已存在，补救是先移除它再找回。曾考虑过的方案：生效即终局会让休眠错过窗口的 Node 拒绝否决、永久分叉；成员时钟会让丢失的 Node 永远拦住找回，且两台都过期的 Node 互相交换后仍会分叉；否决按 epoch 最终投影计数会让事后撤销否决人立即复活找回。视图的 `epoch` 是生效的 epoch。`attestation` 的签名设备须在任一 epoch 做过客户端。
 
-一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。地址默认只在个人网络内传播；`network.discovery` 是明确选择公开临时传输地址的配置。
+一个数据目录只属于一个个人网络，一个 Node 进程只服务一个网络。成员关系、项目和会话不发布到公共目录。地址默认只在个人网络内传播；`network.discovery` 是明确选择公开临时传输地址的配置，显式启用 `network.pkarr.publish` 才向指定 pkarr 目录发布地址。
 
 ## 本机配置
 
@@ -29,7 +29,7 @@
 | `allow_insecure_lan` | 明确允许可信 LAN 上的明文 HTTP |
 | `local_auto_access` | 默认 `true`，通过独立回环入口和本机凭据建立受限本机会话 |
 | `web_enabled` | 是否提供网页和浏览器访问，默认 `true`。启动时 `--no-web` 只关闭本次进程的浏览器访问 |
-| `public_entry` | `true` 表示不加入个人网络。默认提供网页、relay 和密文转发；`discovery-only` 时仅提供发现服务和可选静态网页 |
+| `public_entry` | `true` 表示不加入个人网络。默认提供网页、relay 和密文转发；`discovery-only` 时仅提供发现服务和可选静态网页；两种模式都可另行启用独立文件交付服务 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
@@ -51,6 +51,7 @@
 | `discovery` | `--discovery URL` | 最多 4 个 `vibeface://<device-id>@<host>:<UDP-port>`，显式钉住发现服务身份 |
 | `relay_url` | `--relay-url URL` | 其他 Node 访问本 relay 的 URL，明确提供其他 Node 可访问的 URL |
 | `entry` | `--entry URL`、`--entry-relay URL` | 公共入口 `{ url, relay }`；`relay` 默认等于 `url`，即反向代理把 `/relay` 转给入口的 relay |
+| `pkarr` | 无 | 默认全部关闭的免费 pkarr 发现配置，见[免费节点发现](#免费节点发现) |
 
 配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。`discovery-only` 还要求非零 UDP 端口，不能配置 `bind`、`relays`、`n0_relays`、`relay_url` 或其他发现服务。
 
@@ -79,6 +80,10 @@
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
 | `local-sessions.json` | 本机会话的 cookie 摘要 |
+| `delivery-settings.json` | 可选文件交付设置，与 `config.json` 分开 |
+| `delivery-wallet.json` | 独立加密 EVM 钱包，0600，不包含接收密钥 |
+| `delivery/service.sqlite3` | 订单、接收密钥、证明任务、续传偏移、nonce 和签名交易账本；不进入共享 DAG |
+| `delivery/objects/`、`delivery/private/` | 交付对象与本机私密材料，目录 0700、文件 0600；完整恢复需保留整个 `delivery/` |
 | `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
@@ -128,6 +133,7 @@
 | `entrances` | `{}` | 地址簿中的签名地址记录，浏览器自行验签 |
 | `subscribe` | 可选 `vector` | 订阅 `changed` 推送；浏览器带已见的版本向量，入口落后时回 `behind: true` 并立即同步 |
 | `rpc` | 下节业务对象 | 业务读写 |
+| `delivery` | `{op, ...}` | 独立文件交付通道，见[可选文件交付](#可选文件交付)；不经业务 RPC 或 Agent 工具 |
 | `write_state` | `{}` | 写入状态和本机记下的冲突，见 [写入保护](#写入保护) |
 | `confirm_writable` | `{}` | 本人确认数据目录不是从备份恢复的，只读或对齐中的 Node 进入可写 |
 | `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
@@ -323,9 +329,9 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### iroh Endpoint
 
-每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。Node 不向 n0 DNS、pkarr 或局域网发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS、pkarr 或局域网发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
 
-`Router` 按 ALPN 分发连接。每个请求占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。
+`Router` 按 ALPN 分发连接。私人 Node 请求每次占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。`service` 的独立 Noise 帧和容量见[服务传输](#服务传输)。
 
 | ALPN | 用途 | 接受的对端 |
 |---|---|---|
@@ -335,8 +341,9 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
 | `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
 | `vibeface/join/1` | 只开放 `join` 和 `join_status` | 任意设备 |
+| `vibeface/service/1` | 可选的公益和付费文件对象交付 | 已认证 PeerID，另验服务开关、条款、证明及对象授权，不要求成为私人成员 |
 
-`sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。连接接受时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共入口不接受任何入站 iroh 连接。
+`sync`、`blob` 和 `rpc` 的每个请求带 `network_id`，与本机不一致时关闭连接。这些私人通道接受连接时按 `remote_id()` 核对成员资格，非成员 Node 被拒绝；成员目录变化时已接受的连接重新核对，对端不再是成员就关闭。撤销还会关闭到被撤销 Node 的出站连接并删除它的地址。公共入口默认不接受入站 iroh 连接；显式启用文件交付时，只在独立 `vibeface/service/1` 上按服务规则接收，不开放私人 `sync`、`blob` 或 `rpc`。
 
 ### 同步
 
@@ -380,7 +387,53 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 启用 `relay_listen` 的 Node 运行 `iroh-relay` 服务。个人网络里的 relay 只接纳当前成员 Node，以及带有效邀请令牌 `SHA256("vibeface:relay:v1" ‖ invite_hash)` 的加入者，所以只能经 relay 连通的新 Node 要用运行 relay 的 Node 发出的邀请。relay 看不到内容，但能看到哪些设备连接它、彼此何时通信和流量大小。
 
-公共入口（`init --public-entry`）不加入个人网络。它的 relay 只接纳持有 `entry-token` 的设备，它不运行调度、执行和同步，不保存业务数据，本机设置路径回 404。成员 Node 用 `--entry URL --relay-token-file PATH` 指向它：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
+公共入口（`init --public-entry`）不加入个人网络。它的 relay 只接纳持有 `entry-token` 的设备，它不运行调度、执行和同步，不保存个人网络的事件或附件，本机设置路径回 404。显式启用文件交付后，独立 `delivery/` 可以暂存交付密文及服务账本，不授予私人网络权限。成员 Node 用 `--entry URL --relay-token-file PATH` 指向它：把入口的 relay 加为自己的 relay 并带上令牌，地址记录的 `gateway_url` 写入口 URL，于是邀请链接和二维码打开的是入口的 origin。浏览器经入口的 `/api/client` 连到成员 Node，入口只搬运 Noise 密文。部署步骤见 [配置公共入口](node.md#配置公共入口)。
+
+## 免费节点发现
+
+`network.pkarr` 的字段为 `publish`、`resolve`、`urls`、`publish_direct`。布尔值默认均为 `false`，`urls` 默认空，最多 4 个。发布或解析必须指定非空目录列表。URL 只接受无凭证、查询参数和 fragment 的 HTTPS，或字面回环地址的 HTTP。
+
+发现只搬运签名地址包，不调用钱包、合约或付费服务。`publish=true` 发布本 Node 的 PeerID 和可达地址，默认过滤直连 IP；只有 `publish_direct=true` 才请求发布直连地址。成员关系、会话和项目不进入记录。目录不提供成员授权，也不证明节点在线或愿意接单。
+
+解析器核对 pkarr 签名、目标 PeerID、包大小和签名时间。超过 900 秒的旧包或领先本机时间超过 120 秒的包被拒绝。每个解析器最多 16 个并发请求，不跟随 HTTP 重定向。已有的成员、签名地址簿和目标 Noise 身份核验仍独立执行。
+
+## 可选文件交付
+
+VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。公益没有钱包和链调用。付费只接受字面回环 HTTP RPC 的 `chain_id=31337`，部署和 proof profile 必须与程序固定值一致。它不接入主网或真实稳定币。配置字段、资金状态和结算规则见[文件交付实验参考](paid-delivery.md)。
+
+### 客户端授权
+
+加密客户端方法 `delivery` 使用 `op` 区分请求。`status`、`list`、`get`、`find_intent` 和 `read` 要求已验证的个人网络主体。写操作另要求来自当前成员目录、且 `manage=true` 的客户端，受限本机会话和 Agent token 不能代替它。除 `configure` 外，写操作还要求 Node 处于 `writable`。
+
+| op | 主要参数和行为 |
+| --- | --- |
+| `status` | 服务开关、PeerID、钱包和接收 key 的公开状态、文件容量上限。 |
+| `configure` | `enabled`、`charity_enabled`、`paid_enabled` 三个布尔值，不接收钱包口令、链或 prover 路径。 |
+| `list`、`get` | 当前个人网络的订单列表，或精确 `order_id` 的详情。 |
+| `find_intent` | 当前网络下精确 `intent_id` 的订单，返回 `{order: ...}` 或 `{order: null}`。 |
+| `prepare` | UUID `intent_id`、双方及服务 PeerID、模式、验收条件、文件名、base64 内容、服务费和链费上限。固定订单与报价，尚未付款。 |
+| `confirm` | 原 `intent_id`，先持久化授权并返回，后台继续证明、付款和传输。 |
+| `accept` | 原 `order_id`，仅接收端接受，后台按已授权条款继续。 |
+| `reconcile` | 原 `order_id`，核对原意图和原交易，不创建替代付款。 |
+| `read` | 已接受订单的完整文件，返回 `name`、`content_base64`、`sha256` 和 `bytes`，不是新的接收授权。 |
+
+订单按当前网络隔离。接收端和发送端的写授权在后台副作用前再次核对。撤销管理成员或配置变化会停止当前执行步骤；锁定钱包只能观察原交易。公共入口的 P 没有私人网络，后台仅按已接受的服务订单和本机预算发布 E、提款或对账。
+
+### 服务传输
+
+`vibeface/service/1` 在 QUIC 上使用独立 Noise 上下文 `vibeface:service:v1`，把会话 PeerID 绑定到对端。每条流处理一个请求，4 字节大端长度前缀，控制 JSON 最多 16384 字节。每个连接最多 64 条请求，服务同时最多 16 个连接，每个 PeerID 最多 2 个。默认关闭时拒绝服务连接。
+
+服务操作包含公告、接收 key、报价、订单投递、对象授权与偏移、分块上传及读取、hold、open 和订单查询。付费对象 grant 绑定 P、调用 PeerID、订单、窗口、对象哈希、操作、最大字节数和截止。它不能复用为另一个对象或私人 RPC。分块大小为 8192 字节，持久偏移与对象账本共同提交；完整长度和 SHA-256 通过后才算完成。公益使用独立签名条款和对象授权，不构造虚假付费订单。
+
+### 证明和恢复
+
+规范 `DeliveryStatement` 为 47 个 ABI word，共 1504 字节，唯一声明为 `crates/delivery/abi/Statement.sol`。四种关系为 key binding、source、hold 和 open。profile 固定 guest image、schema、密码套件及窗口和资源上限。Native 测试、guest 执行和已验 Groth16 收据各自有不同的证据强度。
+
+每窗口使用 ChaCha20-Poly1305 和 RFC 9180 HPKE。C 长度为窗口明文加 68 字节，E 长度为 80 字节。Source 校验全部签名和加密对应关系，hold 证明完整 C、接收私钥及同意，open 实际执行解封和解密。合约独立重建公开 statement，检查当前 registry、阶段、期限和固定结算地址。proof 不能替代链的当前状态或付款事实。
+
+证明收据以 statement digest 固定本机任务路径，私密输入不进入 argv、日志、公共 fixtures 或 DAG。收据完成验证后原子发布，重启先验真并恢复原 seal。签名前在事务中固定 nonce、calldata 和 gas 预算，raw transaction 持久化后广播。结果未知只对账或在授权仍有效时重播同一字节。
+
+接收 key 的注册、轮换和撤销只通过同用户维护 socket。注册、轮换和撤销均使用显式稳定 UUID，重试不能更换 action、gas、部署、profile 或 serial。状态读取不自动续期或重新启用 key，registry 确认前不宣称生效。旧 KeyId 私密材料保留，已 Held 窗口继续使用原 key，未 Held 的旧 serial 窗口按合约终止或退款。个人恢复文件和独立钱包备份都不包含这些订单解密材料，恢复必须保留完整 Node 数据目录。
 
 ### 仅发现协议
 
