@@ -1,7 +1,7 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router'
 import { Crown, Laptop, MonitorSmartphone, Smartphone, Trash2 } from 'lucide-react-native'
 import { useState } from 'react'
-import { ScrollView, View } from 'react-native'
+import { ScrollView, Switch, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { CopyableId, Details, EmptyState } from '@/components/kit'
@@ -15,10 +15,12 @@ import { useRun } from '@/lib/use-run'
 export default function DeviceDetail() {
   const { deviceId } = useLocalSearchParams<{ deviceId: string }>()
   const device = useDevice()
-  const member = useWorkspace().members.find((item) => item.device_id === deviceId)
+  const { members } = useWorkspace()
+  const member = members.find((item) => item.device_id === deviceId)
   const { busy, error, run } = useRun()
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" />
+  const manageable = device.ready?.principal.can_manage === true && member.kind === 'client' && !member.current
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
@@ -41,6 +43,14 @@ export default function DeviceDetail() {
       <Text className="text-meta text-muted-foreground">设备编号</Text>
       <CopyableId value={member.device_id} label="设备编号" />
     </Details>
+    {manageable ? <View className="gap-2">
+      <View className="min-h-11 flex-row items-center justify-between gap-3">
+        <View className="min-w-0 flex-1 flex-row items-center gap-2"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text>管理设备</Text></View>
+        <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
+          onValueChange={(manage) => void run('manage', () => device.setManage(member.device_id, manage))} />
+      </View>
+      {error && busy === null && !removing ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+    </View> : null}
     {removable ? <View className="gap-3 rounded-xl border border-danger-border p-4">
       {removing ? <>
         <Text>{deviceCopy.removeNotice(false)}</Text>

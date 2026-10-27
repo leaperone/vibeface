@@ -26,6 +26,7 @@ pub const RECOVERY_WAITING: &str = "another recovery is waiting to take effect";
 /// A recovery file whose recovery a device stopped, or one built on it.
 pub const RECOVERY_STOPPED: &str = "one of your devices stopped this recovery";
 pub const NO_RECOVERY_WAITING: &str = "no recovery is waiting";
+pub const LAST_MANAGER: &str = "the network needs at least one management device";
 /// A recovery resting on management changes this replica does not hold yet.
 pub const RECOVERY_INCOMPLETE: &str =
     "this recovery rests on device changes this Node has not received; sync it first";
@@ -524,7 +525,13 @@ impl GovernanceEvent {
             "management permission required"
         );
         match &action {
-            GovernanceAction::Grant { member } => member.validate()?,
+            GovernanceAction::Grant { member } => {
+                member.validate()?;
+                ensure!(
+                    member.manage || view.keeps_manager_without(&member.device_id),
+                    LAST_MANAGER
+                );
+            }
             GovernanceAction::Revoke(revocation) => revocation.validate()?,
             GovernanceAction::Veto { checkpoint, .. } => ensure!(
                 view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
@@ -635,6 +642,13 @@ pub struct PendingRecovery {
 }
 
 impl AuthorizationView {
+    /// Whether a manager other than `device` remains.
+    pub fn keeps_manager_without(&self, device: &str) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.device_id != device && member.is_manager())
+    }
+
     pub fn member(&self, device: &str) -> Result<Member> {
         ensure!(self.cutoff(device).is_none(), "device has been revoked");
         self.members
@@ -1567,6 +1581,45 @@ mod tests {
             Member::client(&ordinary, "promoted", true)?,
         )?)?;
         assert!(state.project()?.manager(&id(&ordinary)).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn a_manager_can_be_demoted_while_another_remains() -> Result<()> {
+        let (_, a, _, mut state) = setup()?;
+        let b = identity();
+        let last = |result: Result<GovernanceEvent>| {
+            assert!(format!("{:#}", result.unwrap_err()).contains(LAST_MANAGER));
+        };
+        last(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::client(&a, "a", false)?,
+        ));
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::client(&b, "b", true)?,
+        )?)?;
+        state.append(GovernanceEvent::grant(
+            &b,
+            &state.project()?,
+            Member::client(&a, "a", false)?,
+        )?)?;
+        let view = state.project()?;
+        assert!(view.manager(&id(&a)).is_err() && view.client(&id(&a)).is_ok());
+        assert!(GovernanceEvent::grant(&a, &view, Member::client(&a, "a", true)?).is_err());
+        last(GovernanceEvent::grant(
+            &b,
+            &view,
+            Member::client(&b, "b", false)?,
+        ));
+        state.append(GovernanceEvent::grant(
+            &b,
+            &view,
+            Member::client(&a, "a", true)?,
+        )?)?;
+        assert!(state.project()?.manager(&id(&a)).is_ok());
         Ok(())
     }
 
