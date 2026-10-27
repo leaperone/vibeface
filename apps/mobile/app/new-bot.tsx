@@ -47,7 +47,7 @@ export default function NewBot() {
     {pending ? <Text role="status" className="rounded-lg bg-muted p-3 text-meta">{pending.submission?.state === 'rejected' ? '上次没建成，确认后可以修改。' : '上次没确认是否建好，内容保持不变。'}</Text> : null}
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">名称</Text>
-      <Input accessibilityLabel="名称" placeholder="例如：项目 bot" className="min-h-11" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
+      <Input accessibilityLabel="名称" placeholder="例如：项目 Bot" className="min-h-11" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">它负责什么 <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
@@ -67,7 +67,7 @@ export default function NewBot() {
           </Pressable>
         })}
       </View>
-      {projects.length || pending?.project ? null : <Text className="text-meta text-muted-foreground">还没有可用的文件夹，可在 AI 设置里添加</Text>}
+      {projects.length || pending?.project ? null : <Text className="text-meta text-muted-foreground">还没有可用的文件夹，可在「Bot 与任务」里添加</Text>}
     </View>
     <ErrorText error={error} />
     {!shared.writable ? <Text role="status" className="text-meta text-muted-foreground">{shared.writeNotice || '连上后就能创建。'}</Text> : null}

@@ -37,19 +37,19 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
     </View> : null}
     <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : '没有要你决定的事'} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
-      <Text role="heading" className="text-meta font-medium text-muted-foreground">bot</Text>
+      <Text role="heading" className="text-meta font-medium text-muted-foreground">Bot</Text>
       <Link href="/new-bot" asChild>
-        <Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="新建 bot" disabled={!canCreate}><Icon as={Plus} /></Button>
+        <Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button>
       </Link>
     </View>
     {bots.length ? bots.map((bot) => {
       const last = bot.last_message
       return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name}
-        mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+        mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
         unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
         preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
-    }) : <EmptyState icon={Bot} title="还没有 bot" action={canCreate ? <Link href="/new-bot" asChild>
-      <Button className="min-h-11"><Icon as={Plus} /><Text>新建 bot</Text></Button>
+    }) : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
+      <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} />}
     <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView>

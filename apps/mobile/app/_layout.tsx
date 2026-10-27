@@ -58,8 +58,8 @@ function Screens() {
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
-            <Stack.Screen name="new-bot" options={{ title: '新建 bot', presentation: 'modal' }} />
-            <Stack.Screen name="ai" options={{ title: 'AI' }} />
+            <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal' }} />
+            <Stack.Screen name="ai" options={{ title: 'Bot 与任务' }} />
             <Stack.Screen name="inbox" options={{ title: '待处理', ...root }} />
             <Stack.Screen name="settings" options={{ title: '设置', ...root }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />

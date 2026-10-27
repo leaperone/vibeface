@@ -1,13 +1,13 @@
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, Ban, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { humanError } from '@vibeface/client/lib/errors.ts'
+import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
-import type { BotChange, BotChangeRecord, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { ActionButton } from '@/components/action'
 import { ActionCard } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -18,12 +18,17 @@ import { cn } from '@/lib/utils'
 
 export type Row = { key: string; node: ReactNode }
 
+/** Why a reply or task failed: its kind's words, else the first line of its original text. */
+const cause = (kind: FailureKind | undefined, raw: string | null | undefined) => failureText(kind) || (raw ? taskError(raw).split('\n').at(-1) ?? '' : '')
+const workCause = (work: WorkRecord) => cause(work.failure, work.failure_reason)
+
 /** Plain-language reason a work needs the person; the device's own words stay out of the card. */
 export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
   if (check.reason === 'offline') return `${device} 离线了，报不回这个任务的结果。`
   if (check.reason === 'disconnected') return `${device} 上的 Codex 断开了，报不回这个任务的结果。`
-  if (/restart/i.test(check.detail)) return '设备在 bot 工作时重启了，系统不会自动重做。'
-  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return '和 bot 的连接断了，系统不会自动重做。'
+  if (check.detail.startsWith('设备已移除')) return `${device} 已移除，报不回这个任务的结果。`
+  if (/restart/i.test(check.detail)) return '设备在 Bot 工作时重启了，系统不会自动重做。'
+  if (/stream closed|frame limit|disconnect|connection/i.test(check.detail)) return '和 Bot 的连接断了，系统不会自动重做。'
   return '这次的结果没法自动确认，系统不会自动重做。'
 }
 
@@ -55,6 +60,9 @@ export function useChatExtras(conversationId: string, botId: string) {
     const cause = scheduledReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
     add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} /> })
   })
+  for (const job of jobs) {
+    if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(job.message_id, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
+  }
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
   for (const [at, records] of changes.after) add(at, { key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
@@ -63,8 +71,8 @@ export function useChatExtras(conversationId: string, botId: string) {
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
   if (owner && here?.online && here.capabilities?.manager && owner !== here.device_id && !shared.nodes.some((node) => node.device_id === owner && node.online && !node.revoked)) {
-    cards.push(<ActionCard key="owner" icon={ArrowRightLeft} title={`${nodeName(owner, lookup)} 离线了，这个对话在等它`}
-      actions={<ActionButton disabled={!shared.writable} action={() => shared.takeOver()}>交给这台设备处理</ActionButton>} />)
+    cards.push(<ActionCard key="owner" icon={WifiOff} title={`${nodeName(owner, lookup)} 离线，对话在等它`}
+      actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(here.device_id, lookup)}</ActionButton>} />)
   }
   for (const check of pendingChecks(data, shared.nodes, conversationId)) cards.push(<ConfirmCard key={check.check_id} check={check} />)
   return { after, rest, cards }
@@ -83,8 +91,8 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
     <Text className="text-meta text-muted-foreground">· {taskLabel(state)}</Text>
   </View>
   if (!open) {
-    const result = (work.result_text || (work.failure_reason ? humanError(work.failure_reason, undefined, '这个任务') : '')).split('\n')[0]
-    const icon = state === 'abandoned' ? Ban : state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
+    const result = work.result_text ? work.result_text.split('\n')[0] : workCause(work)
+    const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
       <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
         <Icon as={icon} className={cn('mt-0.5 size-4', failed ? 'text-danger' : icon === CircleCheck ? 'text-success' : 'text-muted-foreground')} />
@@ -103,12 +111,20 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}
-        {joined ? <View className="flex-row items-center gap-1"><Icon as={Link2} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">并入「{joined}」</Text></View>
+        {joined ? <View className="flex-row items-center gap-1"><Icon as={Link2} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">补充到「{joined}」</Text></View>
           : active && work.summary ? <Text numberOfLines={1} className="text-meta text-muted-foreground">{work.summary}</Text> : null}
       </View>
       <Icon as={ChevronRight} accessibilityLabel="详情" className="size-4 text-muted-foreground" />
     </Pressable>
   </Link>
+}
+
+function JobLine({ job }: { job: ManagerJob }) {
+  const reason = job.failure ? cause(job.failure.kind, job.failure.detail) : ''
+  return <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
+    <View className="flex-row items-center gap-1"><Icon as={CircleX} className="size-4 text-danger" /><Text className="text-meta text-danger">Bot 没能回复</Text></View>
+    {reason ? <Text className="shrink text-meta text-muted-foreground">{reason}</Text> : null}
+  </View>
 }
 
 const confirmIcons: Record<WorkCheck['reason'], LucideIcon> = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
@@ -149,7 +165,7 @@ function ConfirmCard({ check }: { check: PendingCheck }) {
 function changeTitle(changes: BotChange[]) {
   const kind = changes[0]?.kind
   if (changes.some((change) => change.kind !== kind)) return '已更新'
-  if (kind === 'profile') return '已更新 bot'
+  if (kind === 'profile') return '已更新 Bot'
   const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
   const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
   if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'

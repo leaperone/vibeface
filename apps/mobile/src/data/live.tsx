@@ -102,10 +102,10 @@ function Live({ children }: { children: ReactNode }) {
       replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
         || job.reply_message_id && job.message_id
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
-      status: shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
+      status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
       blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '')
-        || (!agentReady ? (nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? '能运行 bot 的设备离线了' : '暂时没有能运行 bot 的设备') : '') || null,
+        || (!agentReady ? (nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? '能运行 Bot 的设备离线了' : '还没设置运行 Bot 的设备') : '') || null,
       sending: shared.messageBusy,
     }
   }
@@ -124,7 +124,7 @@ function Live({ children }: { children: ReactNode }) {
     const select = async (id: string) => {
       const workspace = latest.current
       const bot = workspace.bots.find((item) => item.conversation_id === id)
-      if (!bot) throw new Error('没有这个 bot')
+      if (!bot) throw new Error('没有这个 Bot')
       if (workspace.conversationId !== id) await workspace.selectBot(bot)
     }
     return {

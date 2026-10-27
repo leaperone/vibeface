@@ -23,7 +23,7 @@ import { cn } from '@/lib/utils'
 export default function AiScreen() {
   const { ready } = useDevice()
   if (!ready) return null
-  if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理员能修改" />
+  if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理设备能修改" />
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
     <Section icon={Bell} title="会话等你时"><Triage /></Section>
@@ -71,11 +71,14 @@ const checks: Record<ProviderId, { key: string; label: string }[]> = {
   cursor: [{ key: 'Cursor SDK Bridge', label: '缺少 Cursor 组件' }],
 }
 
+const services: Record<string, string> = { CURSOR_API_KEY: 'Cursor', OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
+const keyName = (name: string) => services[name] ? `${services[name]} 密钥` : name
+
 function issueText(provider: ProviderId, issue: ProviderIssue): string {
   const name = providerNames[provider]
   switch (issue.code) {
     case 'bin_missing': return `找不到 ${name} 程序`
-    case 'env_missing': return `缺少 ${issue.name}`
+    case 'env_missing': return `缺少 ${keyName(issue.name)}`
     case 'launch_failed': return `${name} 没能启动`
     case 'config_invalid': return `${name} 的配置文件读不了`
     case 'app_server_not_found': return '没找到这台电脑上运行的 Codex'
@@ -133,7 +136,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle icon={Bot} label={`${name} 运行 bot`} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
+      <Toggle icon={Bot} label={`${name} 运行 Bot`} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
       {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
       {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
@@ -220,9 +223,9 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
       value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
   </Field>
   return <View className="gap-3">
-    <Text className="text-meta font-medium text-muted-foreground">bot</Text>
+    <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
-    {field('workspace', 'bot 工作文件夹')}
+    {field('workspace', 'Bot 工作文件夹')}
     {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : null}
     {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
@@ -261,12 +264,12 @@ function Variables({ item, working, change }: { item: ProviderStatus; working: b
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
-    <Text className="text-meta text-muted-foreground">只存在那台电脑上，保存后看不到原值</Text>
+    <Text className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</Text>
     {item.app_server?.mode === 'system' ? <Text className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</Text> : null}
   </Field>
 }
 
-const outlets: [Outlet, string, LucideIcon][] = [['record', '只在待处理', Inbox], ['both', '也发到聊天机器人', Layers]]
+const outlets: [Outlet, string, LucideIcon][] = [['record', '只在待处理', Inbox], ['both', '也发给外部聊天', Layers]]
 
 /** Where that device sends sessions that need the person, plus the chat bot channel both ways. Saves on each change. */
 function Triage() {
@@ -298,10 +301,10 @@ function Triage() {
         }}
         onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
     </Field>
-    <Field label="把提醒发给机器人">
-      <Input accessibilityLabel="机器人地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
+    <Field label="转发到外部聊天">
+      <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
       <View className="flex-row gap-2">
-        <Input secureTextEntry accessibilityLabel="机器人密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '机器人密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+        <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
         {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
       </View>
       <View className="flex-row flex-wrap items-center gap-2">
@@ -323,7 +326,7 @@ function Triage() {
           count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
       </View> : null}
     </Field>
-    <Field label="让机器人代你回答">
+    <Field label="让外部聊天代你回答">
       <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
       {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
         <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
@@ -336,8 +339,8 @@ function Triage() {
         <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
       </View>)}
       <View className="flex-row gap-2">
-        <Input accessibilityLabel="授权码名称" placeholder="聊天机器人" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-        <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '聊天机器人' }).then((result) => {
+        <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
+        <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
           const value = (result as { token?: unknown } | null)?.token
           if (typeof value === 'string') { setToken(value); setLabel('') }
         })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>

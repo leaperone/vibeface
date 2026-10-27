@@ -97,17 +97,17 @@ export function RecoveryReview() {
             </>}
           </View>
           {member.kind === 'client' && !gone ? <View className="min-h-11 flex-row items-center justify-end gap-2">
-            <Text className="text-meta text-muted-foreground">管理员</Text>
-            <Switch accessibilityLabel={`${member.name} 管理员`} value={managers.includes(member.device_id)} disabled={busy !== null} onValueChange={(on) => setAdmins(toggle(managers, member.device_id, on))} />
+            <Text className="text-meta text-muted-foreground">管理设备</Text>
+            <Switch accessibilityLabel={`${member.name} 管理设备`} value={managers.includes(member.device_id)} disabled={busy !== null} onValueChange={(on) => setAdmins(toggle(managers, member.device_id, on))} />
           </View> : null}
         </View>
       })}
     </View>
-    <Text className="text-meta text-muted-foreground">这台手机会成为管理员，并保存新的恢复文件</Text>
+    <Text className="text-meta text-muted-foreground">这台手机会成为管理设备，并保存新的恢复文件</Text>
     {errorText(error)}
     <View className="flex-row justify-between gap-2">
       <Button variant="ghost" className="-ms-3 min-h-11" onPress={device.cancelSensitive}><Text>取消</Text></Button>
-      <Button className="min-h-11" disabled={busy !== null} onPress={recover}><Text>{busy ? '恢复中' : '恢复'}</Text></Button>
+      <Button className="min-h-11" disabled={busy !== null} onPress={recover}><Text>{busy ? '找回中' : '找回'}</Text></Button>
     </View>
     {busy ? <Text className="text-meta text-muted-foreground">如果已经提交，取消不会撤回；重新连接后看一下设备列表。</Text> : null}
   </View>
