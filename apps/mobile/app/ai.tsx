@@ -103,7 +103,7 @@ function AiSettings() {
   const live = useLive()
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
-  useEffect(() => { if (folders !== undefined) live?.refresh().catch((cause) => setError({ at: '', text: messageOf(cause, '读取最新内容') })) }, [botState, folders])
+  useEffect(() => { if (folders !== undefined) live?.refresh().catch((cause) => { if (ready?.isCurrent()) setError({ at: '', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
   if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-28 rounded-xl bg-muted" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
