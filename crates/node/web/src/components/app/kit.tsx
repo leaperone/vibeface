@@ -4,6 +4,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, us
 import { createPortal } from "react-dom"
 import { Bot, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { messageOf } from "@vibeface/client/lib/node.ts"
@@ -48,6 +49,14 @@ export function BotAvatar({ name, primary = false, size = "md", className }: { n
   const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
   return <span aria-hidden="true" className={cn("grid shrink-0 place-items-center font-semibold ring-1 select-none ring-inset", primary ? "bg-brand-soft text-brand ring-brand/20" : "bg-muted text-muted-foreground ring-border",
     size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
+}
+
+/** The primary bot's star. Alone, its name shows on hover and to screen readers; `labeled` writes it out. */
+export function PrimaryMark({ labeled = false }: { labeled?: boolean }) {
+  const { label, icon: Icon } = terms.primaryBot
+  return labeled
+    ? <span className="inline-flex shrink-0 items-center gap-1 text-meta text-muted-foreground"><Icon aria-hidden="true" className="size-3.5 fill-current" />{label}</span>
+    : <span role="img" aria-label={label} title={label} className="inline-flex shrink-0 text-muted-foreground"><Icon aria-hidden="true" className="size-3.5 fill-current" /></span>
 }
 
 /** Unread or waiting count, in the brand violet. */

@@ -13,6 +13,7 @@ import type { Outlet, TriageSettings as Settings } from "@vibeface/client/worksp
 const chat = terms.externalChat.label
 const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", `也发给${chat}`, Layers]]
 const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
+const fieldLabel = "-mb-1 text-meta font-medium text-muted-foreground"
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions" | "codex_sessions">
 
 /** One folded row: where this device sends sessions that need the person, plus the external chat (Grok Bot) channel both ways. Saves on each change. */
@@ -91,10 +92,12 @@ export function TriageSettings() {
     <SettingsDisclosure icon={terms.externalChat.icon} label={chat} value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
       <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
         <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
-        <Input aria-label={`${chat}地址`} type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+        <label htmlFor="webhook-url" className={fieldLabel}>地址</label>
+        <Input id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+        <label htmlFor="webhook-secret" className={fieldLabel}>密钥</label>
         {confirming === "secret" ? <p className="text-meta text-foreground">清除后提醒发不出去</p> : null}
         <div className="flex min-w-0 gap-2">
-          <Input aria-label={`${chat}密钥`} type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "密钥已设置" : `${chat}密钥`} value={secret} onChange={(event) => setSecret(event.target.value)} />
+          <Input id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />
           {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
             <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
             <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
@@ -119,7 +122,11 @@ export function TriageSettings() {
 
       <Details label={`让${chat}代你回答`}>
         <p className="flex items-center gap-2 text-meta text-foreground"><terms.secret.icon aria-hidden="true" className="size-4" />{chat}用这个地址和授权码回话</p>
-        <code className="truncate rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta" title={settings.decision_url}>{settings.decision_url}</code>
+        <span className={fieldLabel}>地址</span>
+        <div className="flex min-w-0 items-center gap-1 rounded-lg bg-muted/60 ps-3">
+          <code className="min-w-0 flex-1 truncate font-mono text-meta" title={settings.decision_url}>{settings.decision_url}</code>
+          <Button type="button" variant="ghost" size="icon" aria-label="复制地址" title="复制地址" onClick={() => void navigator.clipboard?.writeText(settings.decision_url).then(() => toast("已复制", { tone: "success" }))}><Copy aria-hidden="true" /></Button>
+        </div>
         {token ? <div role="status" className="flex min-w-0 items-center gap-2 rounded-lg border border-warning-border bg-warning-soft px-3 py-2">
           <code className="min-w-0 flex-1 break-all font-mono text-meta">{token}</code>
           <Button type="button" variant="ghost" size="icon" aria-label="复制授权码" title="只显示这一次" onClick={() => void navigator.clipboard?.writeText(token).then(() => toast("已复制", { tone: "success" }))}><Copy aria-hidden="true" /></Button>

@@ -193,6 +193,8 @@ struct Response {
     result: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 /// First text frame on `/api/client`.
@@ -491,7 +493,10 @@ async fn serve_session(
                             } else {
                                 dispatch(&node, &mut session, &request.method, request.params).await
                             };
-                            let response = match result { Ok(result) => Response { id: request.id, result, error: None }, Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())) } };
+                            let response = match result {
+                                Ok(result) => Response { id: request.id, result, error: None, code: None },
+                                Err(error) => Response { id: request.id, result: Value::Null, error: Some(crate::logging::scrub(&error.to_string())), code: error.downcast_ref::<crate::discovery::CodexMissing>().map(|_| crate::discovery::CodexMissing::CODE) },
+                            };
                             send_value(&mut socket, &mut channel, &response).await?;
                         } else { partial_started.get_or_insert_with(Instant::now); }
                     }

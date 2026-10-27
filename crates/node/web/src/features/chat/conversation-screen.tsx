@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowDownToLine, ArrowRightLeft, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, EmptyState, InlineError } from '@/components/app/kit'
+import { ActionCard, BotAvatar, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -232,7 +232,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
           <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
-          <h2 className="text-heading font-semibold">{bot.name}</h2>
+          <div className="grid justify-items-center gap-1">
+            <h2 className="text-heading font-semibold">{bot.name}</h2>
+            {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
+          </div>
           {needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
             {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>

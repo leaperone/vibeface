@@ -66,6 +66,7 @@ const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
   'codex.call': '调用 Codex',
   'codex.call_failed': '调用 Codex 失败',
   'web.rpc_failed': '网页请求失败',
+  'web.codex_missing': '没找到 Codex',
   'web.action_failed': (f) => `${str(f.action) ?? '操作'}失败`,
   'web.uncaught': '网页出错',
   'web.unhandled_rejection': '网页出错',

@@ -288,7 +288,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     if (session.current !== active || active.generation !== generation.current) throw changed()
     let result: unknown
     try { result = await active.channel.request(method, params) } catch (cause) {
-      if (method !== 'log') reportLog({ level: 'warn', event: 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self } })
+      // Codex not installed yet is a setup step for the owner, not a failed request.
+      const missing = (cause as { code?: unknown } | null)?.code === 'codex_missing'
+      if (method !== 'log') reportLog({ level: missing ? 'info' : 'warn', event: missing ? 'web.codex_missing' : 'web.rpc_failed', message: messageOf(cause), fields: { method: method === 'rpc' ? `rpc.${String(params.method)}` : method, origin: page?.origin ?? self } })
       throw cause
     }
     if (session.current !== active || active.generation !== generation.current) throw changed()

@@ -2,11 +2,11 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, Star, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
-import { BotAvatar, claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { BotAvatar, claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -126,7 +126,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
                         <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}</span>
-                        {workspace.primary === bot.conversation_id ? <span title="主 Bot" className="inline-flex shrink-0"><Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /></span> : null}
+                        {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
                         {marked ? <Dot label="有新进展" /> : null}
                       </Link>
                     </SidebarMenuButton>

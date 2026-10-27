@@ -16,7 +16,20 @@ use std::{
 };
 
 pub const CODEX_HOME: &str = "CODEX_HOME";
-const NOT_FOUND: &str = "no Codex folder found on this computer: install Codex so $HOME/.codex exists, set CODEX_HOME for the Node, or enter the Codex folder";
+
+/// Codex is not on this computer: something the owner sets up, not a failure, so the client
+/// channel tags it with [`CodexMissing::CODE`].
+#[derive(Debug)]
+pub struct CodexMissing;
+impl CodexMissing {
+    pub const CODE: &str = "codex_missing";
+}
+impl std::fmt::Display for CodexMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no Codex folder found on this computer: install Codex so $HOME/.codex exists, set CODEX_HOME for the Node, or enter the Codex folder")
+    }
+}
+impl std::error::Error for CodexMissing {}
 
 /// What the Node's own environment says about where things are on this computer.
 #[derive(Clone, Debug, Default)]
@@ -51,13 +64,13 @@ impl Host {
             Some(home) => home.clone(),
             None => match &self.home {
                 Some(home) => home.join(".codex"),
-                None => bail!(NOT_FOUND),
+                None => bail!(CodexMissing),
             },
         };
         if home.is_absolute() && home.is_dir() {
             Ok(home)
         } else {
-            bail!(NOT_FOUND)
+            bail!(CodexMissing)
         }
     }
 
@@ -503,7 +516,12 @@ mod tests {
             manager: &mut manager,
             triage: &mut triage,
         };
-        let error = missing(&target, true, &host).unwrap_err().to_string();
+        let error = missing(&target, true, &host).unwrap_err();
+        assert!(
+            error.downcast_ref::<CodexMissing>().is_some(),
+            "the client channel can tag it"
+        );
+        let error = error.to_string();
         assert!(error.contains("no Codex folder found"), "{error}");
         assert!(
             !error.contains(&root.to_string_lossy().into_owned()),

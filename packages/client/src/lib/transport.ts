@@ -217,7 +217,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys) {
           const item = message.id === undefined ? undefined : pending.get(message.id)
           if (item) {
             pending.delete(message.id); clearTimeout(item.timer)
-            if (message.error !== undefined && message.error !== null) item.reject(Object.assign(new Error(message.error), { responded: true }))
+            if (message.error !== undefined && message.error !== null) item.reject(Object.assign(new Error(message.error), { responded: true, code: typeof message.code === 'string' ? message.code : undefined }))
             else item.resolve(message.result)
           } else onEvent?.(message)
         }

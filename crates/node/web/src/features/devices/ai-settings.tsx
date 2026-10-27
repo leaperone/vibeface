@@ -7,7 +7,6 @@ import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { rawError } from "@vibeface/client/lib/errors.ts"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
@@ -276,7 +275,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const server = item.app_server
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
-  const notFound = /no Codex folder found/i.test(rawError(error))
+  const notFound = (error as { code?: unknown } | null)?.code === "codex_missing"
   const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, { [role]: true }).then((ok) => { if (!ok) void reconcile() }) }
   const saveKey = (name: string, value: string) => change(`env:${name}`, { env: { [name]: value } })
     .then((ok) => { if (ok) toast(`${keyName(name)} 已保存`, { tone: "success" }); return ok })
