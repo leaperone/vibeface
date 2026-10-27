@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
+import { deviceIcon } from '@/features/devices/device-icon'
 import { useRun } from '@/lib/use-run'
 
 type PickedFile = { name: string; file: RecoveryFile }
@@ -164,12 +165,15 @@ export function RecoveryPendingCard() {
   </>}>
     {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}
     {changes.some(({ added }) => !added) ? <Text className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</Text> : null}
-    {changes.map(({ member, added }) => <View key={member.device_id} className="min-w-0 flex-row items-center gap-2">
-      <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
-      <Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-4 text-muted-foreground" />
-      <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
-      {member.device_id === device.identity?.deviceId ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这台手机</Text> : null}
-    </View>)}
+    {changes.map(({ member, added }) => {
+      const current = member.device_id === device.identity?.deviceId
+      return <View key={member.device_id} className="min-w-0 flex-row items-center gap-2">
+        <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
+        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current, entry: false })} className="size-4 text-muted-foreground" />
+        <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
+        {current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这台手机</Text> : null}
+      </View>
+    })}
     {errorText(error)}
   </ActionCard>
 }
