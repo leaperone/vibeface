@@ -6,8 +6,8 @@ use crate::work::{
     Dispatch, DispatchState, Handle, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
 };
 use vibeface_bridge::{
+    codex::{ExecEvent, StartReport},
     failure::{ExecFailure, FailureKind},
-    turn::{TurnStatus, turn_snapshot},
 };
 
 /// An interrupt the App Server took is checked against the turn once this passes without its end.
@@ -20,24 +20,6 @@ const STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_RETRY_MS: i64 = 3_000;
 const STOP_RETRY_MAX_MS: i64 = 60_000;
 
-/// A plan as one line per step, the current step marked, for the persisted progress.
-fn plan_summary(params: &Value) -> String {
-    params["plan"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|step| {
-            let mark = match step["status"].as_str() {
-                Some("completed") => "✓",
-                Some("inProgress") => "→",
-                _ => "·",
-            };
-            format!("{mark} {}", step["step"].as_str().unwrap_or_default())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn live(record: &WorkRecord) -> bool {
     !matches!(
         record.state,
@@ -46,10 +28,6 @@ fn live(record: &WorkRecord) -> bool {
 }
 
 impl Runtime {
-    fn codex_epoch(&self) -> u64 {
-        self.codex_epoch.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
     pub(super) async fn signal_work(
         self: &Arc<Self>,
         network: &str,
@@ -410,44 +388,9 @@ impl Runtime {
         self: &Arc<Self>,
         network: &str,
         scope: &str,
-        args: &Value,
+        work_id: &str,
+        report: StartReport,
     ) -> Result<Value> {
-        let work_id = field(args, "work_id")?;
-        let thread_id = args["thread_id"].as_str();
-        if let Some(turn_id) = args["turn_id"].as_str() {
-            tracing::info!(
-                event = "work.turn_started",
-                conversation_id = scope,
-                work_id,
-                turn_id,
-                "Codex turn started"
-            );
-        } else if let Some(reason) = args["failed"]["detail"].as_str() {
-            tracing::warn!(
-                event = "work.start_failed",
-                conversation_id = scope,
-                work_id,
-                kind = %args["failed"]["kind"],
-                reason,
-                "Codex did not start the work"
-            );
-        } else if let Some(reason) = args["unknown"].as_str() {
-            tracing::warn!(
-                event = "work.start_unknown",
-                conversation_id = scope,
-                work_id,
-                reason,
-                "unknown whether Codex started the work"
-            );
-        } else if thread_id.is_some() {
-            tracing::info!(
-                event = "work.thread_bound",
-                conversation_id = scope,
-                work_id,
-                thread_id,
-                "Codex thread bound to the work"
-            );
-        }
         let record = self
             .store
             .lock()
@@ -459,75 +402,101 @@ impl Runtime {
             "work belongs to another conversation"
         );
         let mut record = record;
-        if let Some(thread) = args["thread_id"].as_str() {
-            vibeface_protocol::validate_id(thread).map_err(anyhow::Error::msg)?;
-            if matches!(record.state, WorkState::Accepted) {
-                ensure!(
-                    now_ms() < record.send_by_ms,
-                    "the send window for this work is over; it will not start"
-                );
-                record = self
-                    .signal_work(network, work_id, Signal::ThreadCreated(thread.into()))
-                    .await?;
-            }
-            ensure!(
-                matches!(&record.state, WorkState::Starting { thread: Some(known) } if known == thread),
-                "this work is already bound to another thread or past starting"
-            );
-        }
-        if let Some(turn) = args["turn_id"].as_str() {
-            let signal = Signal::TurnStarted {
-                turn_id: turn.into(),
-                epoch: self.codex_epoch(),
-            };
-            record = self.signal_work(network, work_id, signal).await?;
-            if record
-                .state
-                .handle()
-                .is_none_or(|handle| handle.turn_id != turn)
-            {
-                tracing::warn!(
-                    event = "work.turn_untracked",
+        match report {
+            StartReport::Thread { thread_id } => {
+                tracing::info!(
+                    event = "work.thread_bound",
                     conversation_id = scope,
                     work_id,
-                    turn_id = turn,
-                    state = record.state.name(),
-                    "a turn started after its work had ended; the Node does not follow it"
+                    thread_id,
+                    "Codex thread bound to the work"
+                );
+                vibeface_protocol::validate_id(&thread_id).map_err(anyhow::Error::msg)?;
+                if matches!(record.state, WorkState::Accepted) {
+                    ensure!(
+                        now_ms() < record.send_by_ms,
+                        "the send window for this work is over; it will not start"
+                    );
+                    record = self
+                        .signal_work(network, work_id, Signal::ThreadCreated(thread_id.clone()))
+                        .await?;
+                }
+                ensure!(
+                    matches!(&record.state, WorkState::Starting { thread: Some(known) } if *known == thread_id),
+                    "this work is already bound to another thread or past starting"
                 );
             }
-            // The turn may have ended before it was bound.
-            if let Some(handle) = record.state.handle().cloned()
-                && let Ok(probe @ Probe::Terminal { .. }) = self
-                    .codex
-                    .probe(
-                        &handle.thread_id,
-                        Some(&handle.turn_id),
+            StartReport::Turn { turn_id } => {
+                tracing::info!(
+                    event = "work.turn_started",
+                    conversation_id = scope,
+                    work_id,
+                    turn_id,
+                    "Codex turn started"
+                );
+                let signal = Signal::TurnStarted {
+                    turn_id: turn_id.clone(),
+                    epoch: self.codex.epoch(),
+                };
+                record = self.signal_work(network, work_id, signal).await?;
+                if record
+                    .state
+                    .handle()
+                    .is_none_or(|handle| handle.turn_id != turn_id)
+                {
+                    tracing::warn!(
+                        event = "work.turn_untracked",
+                        conversation_id = scope,
                         work_id,
-                        handle.epoch,
-                    )
-                    .await
-            {
+                        turn_id,
+                        state = record.state.name(),
+                        "a turn started after its work had ended; the Node does not follow it"
+                    );
+                }
+                // The turn may have ended before it was bound.
+                if let Some(handle) = record.state.handle().cloned()
+                    && let Ok(probe @ Probe::Terminal { .. }) = self
+                        .codex
+                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id)
+                        .await
+                {
+                    record = self
+                        .signal_work(network, work_id, Signal::Probed(probe))
+                        .await?;
+                }
+            }
+            StartReport::Rejected(mut failure) => {
+                tracing::warn!(
+                    event = "work.start_failed",
+                    conversation_id = scope,
+                    work_id,
+                    kind = ?failure.kind,
+                    reason = failure.detail,
+                    "Codex did not start the work"
+                );
+                failure.detail = failure.detail.chars().take(2_000).collect();
                 record = self
-                    .signal_work(network, work_id, Signal::Probed(probe))
+                    .signal_work(network, work_id, Signal::StartRejected(failure))
                     .await?;
             }
-        } else if !args["failed"].is_null() {
-            let mut failure: ExecFailure = serde_json::from_value(args["failed"].clone())
-                .context("failed must be {kind, detail}")?;
-            failure.detail = failure.detail.chars().take(2_000).collect();
-            record = self
-                .signal_work(network, work_id, Signal::StartRejected(failure))
-                .await?;
-        } else if args["unknown"].is_string() {
-            if let Err(error) = self.probe_work(network, work_id, true).await {
-                tracing::debug!(%error, work_id, "unknown start waits for the next probe");
+            StartReport::Unknown { reason } => {
+                tracing::warn!(
+                    event = "work.start_unknown",
+                    conversation_id = scope,
+                    work_id,
+                    reason,
+                    "unknown whether Codex started the work"
+                );
+                if let Err(error) = self.probe_work(network, work_id, true).await {
+                    tracing::debug!(%error, work_id, "unknown start waits for the next probe");
+                }
+                record = self
+                    .store
+                    .lock()
+                    .await
+                    .work_record(work_id)?
+                    .context("work not found on this device")?;
             }
-            record = self
-                .store
-                .lock()
-                .await
-                .work_record(work_id)?
-                .context("work not found on this device")?;
         }
         Ok(json!({"work_id":work_id,"state":record.state}))
     }
@@ -558,7 +527,6 @@ impl Runtime {
         if !now && !over && unsent {
             return Ok(());
         }
-        let epoch = self.codex_epoch();
         let codex = &self.codex;
         let probe = match &record.state {
             WorkState::Accepted | WorkState::Starting { thread: None } => {
@@ -578,11 +546,11 @@ impl Runtime {
             state => match (state.handle(), state.thread()) {
                 (Some(handle), _) => {
                     codex
-                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id, epoch)
+                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id)
                         .await
                 }
                 // A send not seen in time is looked for by its work ID.
-                (None, Some(thread)) => codex.probe(thread, None, work_id, epoch).await,
+                (None, Some(thread)) => codex.probe(thread, None, work_id).await,
                 (None, None) => return Ok(()),
             },
         };
@@ -743,12 +711,9 @@ impl Runtime {
         if (interrupting && at < request.deadline_ms) || !self.stop_attempt_due(&work_id) {
             return Ok(());
         }
-        let probe = self.codex.probe(
-            &handle.thread_id,
-            Some(&handle.turn_id),
-            &work_id,
-            self.codex_epoch(),
-        );
+        let probe = self
+            .codex
+            .probe(&handle.thread_id, Some(&handle.turn_id), &work_id);
         match tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, probe).await {
             Ok(Ok(Probe::Running { turn_id, epoch })) => {
                 if matches!(record.state, WorkState::Unverified { .. }) {
@@ -972,53 +937,41 @@ impl Runtime {
         Ok(())
     }
 
-    /// Maps App Server notifications and requests onto the work that owns their thread and turn.
-    pub(super) async fn route_codex_event(
-        self: &Arc<Self>,
-        network: &str,
-        event: Value,
-    ) -> Result<()> {
-        let method = event["method"].as_str().unwrap_or_default();
-        let records = self.store.lock().await.work_records()?;
-        match method {
-            "bridge.codex_connected" => {
-                let epoch = self.store.lock().await.next_codex_epoch()?;
-                self.codex_epoch
-                    .store(epoch, std::sync::atomic::Ordering::SeqCst);
-                for record in records.into_iter().filter(live) {
-                    if let Err(error) = self.probe_work(network, &record.work_id, false).await {
-                        tracing::debug!(%error, "work probe after reconnect failed");
-                    }
-                }
-                return Ok(());
-            }
-            "bridge.codex_disconnected" => {
-                for record in records
-                    .into_iter()
-                    .filter(|r| r.state.handle().is_some() && live(r))
-                {
-                    self.signal_work(network, &record.work_id, Signal::Disconnected)
-                        .await?;
-                }
-                return Ok(());
-            }
-            _ => {}
+    /// A new connection gets the next epoch and has every live work read again; a lost one
+    /// leaves the running works waiting for that read.
+    async fn on_connection(self: &Arc<Self>, connected: bool) -> Result<()> {
+        if connected {
+            let epoch = self.store.lock().await.next_codex_epoch();
+            self.codex
+                .connected(*epoch.as_ref().unwrap_or(&self.codex.epoch()));
+            epoch?;
+        } else {
+            self.drop_codex_requests();
         }
-        drop(records);
-        self.route_turn_event(network, event).await
+        let Some(network) = self.store.lock().await.network()? else {
+            return Ok(());
+        };
+        let records = self.store.lock().await.work_records()?;
+        for record in records.into_iter().filter(live) {
+            if connected {
+                if let Err(error) = self.probe_work(&network, &record.work_id, false).await {
+                    tracing::debug!(%error, "work probe after reconnect failed");
+                }
+            } else if record.state.handle().is_some() {
+                self.signal_work(&network, &record.work_id, Signal::Disconnected)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
+    /// Applies an App Server notification to the works whose turn it is about.
     async fn route_turn_event(self: &Arc<Self>, network: &str, event: Value) -> Result<()> {
-        let method = event["method"].as_str().unwrap_or_default();
-        let params = &event["params"];
+        let turn = codex_server::turn_event(&event);
         let records = self.store.lock().await.work_records()?;
-        let thread = params["threadId"].as_str();
-        let turn = params["turnId"]
-            .as_str()
-            .or_else(|| params["turn"]["id"].as_str());
         // A turn on the thread of a send not seen in time may be that send; reading the thread
         // tells, and settles the work if so.
-        if matches!(method, "turn/started" | "turn/completed") {
+        if turn.boundary {
             let unseen: Vec<_> = records
                 .iter()
                 .filter(|record| {
@@ -1029,7 +982,7 @@ impl Runtime {
                             probe: true,
                             ..
                         }
-                    ) && record.state.thread() == thread
+                    ) && record.state.thread() == turn.thread
                 })
                 .map(|record| record.work_id.clone())
                 .collect();
@@ -1043,46 +996,11 @@ impl Runtime {
             .into_iter()
             .filter(|record| {
                 record.state.handle().is_some_and(|h| {
-                    Some(h.thread_id.as_str()) == thread && Some(h.turn_id.as_str()) == turn
+                    Some(h.thread_id.as_str()) == turn.thread
+                        && Some(h.turn_id.as_str()) == turn.turn
                 })
             })
             .collect();
-        if works.is_empty() {
-            return Ok(());
-        }
-        let item = &params["item"];
-        let signal = match method {
-            "item/completed" if item["type"] == "agentMessage" && item["phase"] == "commentary" => {
-                Some(Signal::Progress {
-                    summary: item["text"].as_str().unwrap_or_default().into(),
-                    at_ms: now_ms(),
-                })
-            }
-            "item/completed"
-                if item["type"] == "agentMessage"
-                    && (item["phase"].is_null() || item["phase"] == "final_answer") =>
-            {
-                Some(Signal::Text(
-                    item["text"].as_str().unwrap_or_default().into(),
-                ))
-            }
-            "turn/plan/updated" => Some(Signal::Progress {
-                summary: plan_summary(params),
-                at_ms: now_ms(),
-            }),
-            "turn/completed" => {
-                let ended = turn_snapshot(&params["turn"]);
-                Some(Signal::TurnCompleted {
-                    turn_id: turn.unwrap_or_default().into(),
-                    status: ended
-                        .status
-                        .unwrap_or_else(|| TurnStatus::Other("unknown".into())),
-                    text: String::new(),
-                    error: ended.error,
-                })
-            }
-            _ => None,
-        };
         let target_node = self.identity.device_id()?;
         // A send steered into a running turn shares it with the work that started it.
         for record in works {
@@ -1092,14 +1010,14 @@ impl Runtime {
                     "target_node":target_node,"sequence":self.progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                     "progress":observation::native_progress(&event)}),
             );
-            if let Some(signal) = signal.clone() {
+            if let Some(signal) = turn.signal.clone() {
                 self.signal_work(network, &record.work_id, signal).await?;
             }
         }
         Ok(())
     }
 
-    pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<Value>) {
+    pub(super) fn start_codex(self: &Arc<Self>, mut events: mpsc::UnboundedReceiver<ExecEvent>) {
         let node = self.clone();
         tokio::spawn(async move {
             // Known before the first connect, so requests on these threads come back to the Node
@@ -1107,26 +1025,24 @@ impl Runtime {
             node.observe_live_threads().await;
             node.codex.start();
             while let Some(event) = events.recv().await {
-                match event["method"].as_str() {
-                    Some("bridge.codex_request") => {
-                        node.on_codex_request(&event["params"]).await;
-                        continue;
+                let applied = match event {
+                    ExecEvent::Request(request) => {
+                        node.on_codex_request(&request).await;
+                        Ok(())
                     }
-                    Some("bridge.codex_observed") => {
-                        if let Err(error) = node.close_lost_questions().await {
-                            tracing::warn!(%error, "could not close questions about lost requests");
+                    ExecEvent::Observed => node.close_lost_questions().await,
+                    ExecEvent::Connected => node.on_connection(true).await,
+                    ExecEvent::Disconnected => node.on_connection(false).await,
+                    ExecEvent::Message(message) => {
+                        node.triage_app_server(&message);
+                        let network = node.store.lock().await.network();
+                        match network {
+                            Ok(Some(network)) => node.route_turn_event(&network, message).await,
+                            other => other.map(|_| ()),
                         }
-                        continue;
                     }
-                    Some("bridge.codex_connected") => node.codex.connected(),
-                    Some("bridge.codex_disconnected") => node.drop_codex_requests(),
-                    _ => {}
-                }
-                node.triage_app_server(&event);
-                let network = node.store.lock().await.network().ok().flatten();
-                if let Some(network) = network
-                    && let Err(error) = node.route_codex_event(&network, event).await
-                {
+                };
+                if let Err(error) = applied {
                     tracing::warn!(%error, "could not apply an App Server event");
                 }
             }

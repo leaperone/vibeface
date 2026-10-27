@@ -89,6 +89,31 @@ fn answered(message: impl Into<String>) -> CodexError {
     }
 }
 
+/// What the connection to the App Server reports to the Node, in the order it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExecEvent {
+    /// A connection completed its handshake.
+    Connected,
+    /// The connection ended, or the next one did not come up; its requests are gone.
+    Disconnected,
+    /// Every observed thread was read once on this connection, so any request the App Server
+    /// asks again on them has arrived.
+    Observed,
+    /// A server request on one of the Node's threads, or on none: the Node answers it. The same
+    /// message also follows as `Message`.
+    Request(ServerRequest),
+    /// A notification or server request as the App Server sent it.
+    Message(Value),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerRequest {
+    pub id: RpcId,
+    pub method: String,
+    pub thread_id: Option<String>,
+    pub params: Value,
+}
+
 #[derive(Clone)]
 pub struct CodexClient {
     commands: mpsc::UnboundedSender<Command>,
@@ -101,7 +126,7 @@ impl CodexClient {
     /// disconnected. Setting the same path again cuts a reconnect backoff short.
     pub fn start(
         endpoint: watch::Receiver<Option<PathBuf>>,
-        events: mpsc::UnboundedSender<Value>,
+        events: mpsc::UnboundedSender<ExecEvent>,
     ) -> Self {
         let (commands, receiver) = mpsc::unbounded_channel();
         let cache = Arc::new(RwLock::new(Cache::default()));
@@ -781,7 +806,7 @@ async fn connection_loop(
     mut commands: mpsc::UnboundedReceiver<Command>,
     observed: watch::Receiver<BTreeSet<String>>,
     cache: Arc<RwLock<Cache>>,
-    events: mpsc::UnboundedSender<Value>,
+    events: mpsc::UnboundedSender<ExecEvent>,
 ) {
     let mut backoff = 1;
     loop {
@@ -824,7 +849,7 @@ async fn connection_loop(
             Err(reason) => reason,
         };
         cache.write().await.disconnect(&reason);
-        let _ = events.send(json!({"method":"bridge.codex_disconnected","params":{"reason":reason,"at_ms":now_ms()}}));
+        let _ = events.send(ExecEvent::Disconnected);
         let delay = tokio::time::sleep(Duration::from_secs(backoff));
         tokio::pin!(delay);
         loop {
@@ -849,7 +874,7 @@ async fn run_session(
     commands: &mut mpsc::UnboundedReceiver<Command>,
     observed: &watch::Receiver<BTreeSet<String>>,
     cache: &Arc<RwLock<Cache>>,
-    events: &mpsc::UnboundedSender<Value>,
+    events: &mpsc::UnboundedSender<ExecEvent>,
 ) -> String {
     let (mut sink, mut reader) = stream.split();
     let (writer, mut writes) = mpsc::unbounded_channel();
@@ -930,12 +955,12 @@ async fn run_session(
                     if let Some(id) = request_id(&message)
                         && thread.is_none_or(|thread| observed.borrow().contains(thread))
                     {
-                        let _ = events.send(json!({"method":"bridge.codex_request","params":{"id":id,"method":method,"threadId":thread,"params":message["params"]}}));
+                        let _ = events.send(ExecEvent::Request(ServerRequest { id, method: method.into(), thread_id: thread.map(str::to_owned), params: message["params"].clone() }));
                     }
                     drop(observed_cache);
                     if (message["method"] == "thread/closed" || message["method"] == "thread/unsubscribed")
                         && let Some(id) = message["params"]["threadId"].as_str() { state.subscribed.remove(id); }
-                    let _ = events.send(message);
+                    let _ = events.send(ExecEvent::Message(message));
                     continue;
                 }
                 let Some(id) = message.get("id").and_then(|id| serde_json::from_value::<RpcId>(id.clone()).ok()) else { continue };
@@ -955,7 +980,7 @@ async fn run_session(
                         if writer.send(Write::Message(Message::Text(json!({"method":"initialized"}).to_string().into()))).is_err() { break "Codex writer stopped".into(); }
                         state.ready = true;
                         cache.write().await.connection = json!({"state":"connected","user_agent":result["userAgent"],"at_ms":now_ms()});
-                        let _ = events.send(json!({"method":"bridge.codex_connected","params":{"userAgent":result["userAgent"],"at_ms":now_ms()}}));
+                        let _ = events.send(ExecEvent::Connected);
                     }
                     PendingKind::ObserveThread(thread_id) => {
                         cache.write().await.observe_thread(&result["thread"]);
@@ -993,7 +1018,7 @@ async fn run_session(
                 if let Err(reason) = state.observe_threads(&writer, &observed.borrow()) { break reason; }
                 if state.ready && !state.observed_once && state.resuming.is_empty() {
                     state.observed_once = true;
-                    let _ = events.send(json!({"method":"bridge.codex_observed","params":{"at_ms":now_ms()}}));
+                    let _ = events.send(ExecEvent::Observed);
                 }
                 let expired: Vec<_> = state.pending.iter().filter(|(_, pending)| pending.deadline <= Instant::now()).map(|(id, _)| id.clone()).collect();
                 let mut initialize_expired = false;
@@ -1212,21 +1237,19 @@ pub struct Outgoing {
     pub full_access: bool,
 }
 
+/// What starting a work came to, as its sender reports it to the Node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum Delivery {
-    Delivered {
-        mode: String,
-        turn_id: String,
-    },
-    /// The send may or may not have happened; sending again with the same `client_id` only reads back.
-    Unknown {
-        reason: String,
-    },
+pub enum StartReport {
+    /// The work's thread exists; nothing is sent into it yet.
+    Thread { thread_id: String },
+    /// The turn that carries the work's message.
+    Turn { turn_id: String },
     /// Nothing was sent.
-    Rejected {
-        failure: ExecFailure,
-    },
+    Rejected(ExecFailure),
+    /// The send may or may not have happened; sending again with the same `client_id` only
+    /// reads back, and the Node reads the thread to tell.
+    Unknown { reason: String },
 }
 
 fn input(outgoing: &Outgoing) -> Value {
@@ -1275,10 +1298,9 @@ impl DirectSession {
 
     /// Resume, then steer the active turn or start one, then read back by `client_id`. A message
     /// already in the thread is reported, not sent again; an unknown result is never resent.
-    pub async fn send(&mut self, outgoing: &Outgoing) -> Delivery {
-        let rejected = |error: CodexError| Delivery::Rejected {
-            failure: error.failure(),
-        };
+    /// Never `StartReport::Thread`: the thread exists already.
+    pub async fn send(&mut self, outgoing: &Outgoing) -> StartReport {
+        let rejected = |error: CodexError| StartReport::Rejected(error.failure());
         // A thread without a rollout has no turns: nothing to find or steer.
         let resumed = if self.started.contains(&outgoing.thread_id) {
             json!({})
@@ -1294,10 +1316,7 @@ impl DirectSession {
             }
         };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
-            return Delivery::Delivered {
-                mode: "existing".into(),
-                turn_id,
-            };
+            return StartReport::Turn { turn_id };
         }
         let active = (!outgoing.start_only && resumed["thread"]["status"]["type"] == "active")
             .then(|| {
@@ -1325,8 +1344,8 @@ impl DirectSession {
                 result => steered = Some(result),
             }
         }
-        let (mode, result) = match steered {
-            Some(result) => ("steer", result),
+        let result = match steered {
+            Some(result) => result,
             None => {
                 let mut params = json!({"threadId":outgoing.thread_id,"input":input(outgoing),
                     "clientUserMessageId":outgoing.client_id});
@@ -1340,7 +1359,7 @@ impl DirectSession {
                     params["approvalPolicy"] = json!("never");
                     params["sandboxPolicy"] = json!({"type":"dangerFullAccess"});
                 }
-                ("start", self.request("turn/start", params).await)
+                self.request("turn/start", params).await
             }
         };
         let sent = match result {
@@ -1355,23 +1374,16 @@ impl DirectSession {
             .read_back(&outgoing.thread_id, &outgoing.client_id)
             .await
         {
-            Ok(Some(turn_id)) => Delivery::Delivered {
-                mode: mode.into(),
-                turn_id,
-            },
-            Ok(None) if sent.is_some() => Delivery::Delivered {
-                mode: mode.into(),
-                turn_id: sent.expect("checked"),
-            },
-            Ok(None) => Delivery::Unknown {
-                reason: "the message is not in the thread yet".into(),
+            Ok(Some(turn_id)) => StartReport::Turn { turn_id },
+            Ok(None) => match sent {
+                Some(turn_id) => StartReport::Turn { turn_id },
+                None => StartReport::Unknown {
+                    reason: "the message is not in the thread yet".into(),
+                },
             },
             Err(error) => match sent {
-                Some(turn_id) => Delivery::Delivered {
-                    mode: mode.into(),
-                    turn_id,
-                },
-                None => Delivery::Unknown {
+                Some(turn_id) => StartReport::Turn { turn_id },
+                None => StartReport::Unknown {
                     reason: error.message,
                 },
             },
@@ -1408,8 +1420,8 @@ mod tests {
             server.send(Message::Text(json!({"id":initialize["id"],"result":{"userAgent":"codex/0.163.0"}}).to_string().into())).await.unwrap();
             let initialized: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(initialized, json!({"method":"initialized"}));
-            assert_eq!(received_events.recv().await.unwrap()["method"], "bridge.codex_connected");
-            assert_eq!(received_events.recv().await.unwrap()["method"], "bridge.codex_observed", "with no thread to observe, observation ends at once");
+            assert_eq!(received_events.recv().await.unwrap(), ExecEvent::Connected);
+            assert_eq!(received_events.recv().await.unwrap(), ExecEvent::Observed, "with no thread to observe, observation ends at once");
 
             let querying = client.clone();
             let response = tokio::spawn(async move {
@@ -1419,17 +1431,16 @@ mod tests {
             assert_eq!(request["method"], "thread/read");
             let approval = json!({"id":27,"method":"item/commandExecution/requestApproval","params":{"threadId":"t"}});
             server.send(Message::Text(approval.to_string().into())).await.unwrap();
-            assert_eq!(received_events.recv().await.unwrap(), approval);
+            assert_eq!(received_events.recv().await.unwrap(), ExecEvent::Message(approval));
             assert_eq!(client.snapshot().await["pending_requests"][0]["id"], 27);
             server.send(Message::Text(json!({"id":request["id"],"result":{"thread":{"id":"t","status":{"type":"idle"}}}}).to_string().into())).await.unwrap();
             assert_eq!(response.await.unwrap().unwrap()["thread"]["id"], "t");
 
             let refresh = json!({"id":28,"method":"account/chatgptAuthTokens/refresh","params":{"reason":"unauthorized"}});
             server.send(Message::Text(refresh.to_string().into())).await.unwrap();
-            let handed = received_events.recv().await.unwrap();
-            assert_eq!(handed["method"], "bridge.codex_request", "a request without a thread goes to the Node");
-            assert_eq!(handed["params"]["id"], 28);
-            assert_eq!(received_events.recv().await.unwrap(), refresh);
+            let ExecEvent::Request(handed) = received_events.recv().await.unwrap() else { panic!("a request without a thread goes to the Node") };
+            assert_eq!(handed.id, RpcId::Number(28));
+            assert_eq!(received_events.recv().await.unwrap(), ExecEvent::Message(refresh));
             client.respond(&json!(28), Err(json!({"code":-32601,"message":"no credentials"})), "refuse").await.unwrap();
             let sent: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(sent["id"], 28);
@@ -1503,10 +1514,10 @@ mod tests {
                 let turns: Value = serde_json::from_str(server.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
                 assert_eq!(turns["method"], "thread/turns/list");
                 while let Ok(event) = received_events.try_recv() {
-                    assert_ne!(event["method"], "bridge.codex_observed", "observation ends only once every thread was read");
+                    assert_ne!(event, ExecEvent::Observed, "observation ends only once every thread was read");
                 }
                 server.send(Message::Text(json!({"id":turns["id"],"result":{"data":[{"id":"previous-turn","status":"completed","items":[]}]}}).to_string().into())).await.unwrap();
-                while received_events.recv().await.unwrap()["method"] != "bridge.codex_observed" {}
+                while received_events.recv().await.unwrap() != ExecEvent::Observed {}
                 if connection == 0 {
                     let sender = client.clone();
                     let sending = tokio::spawn(async move {
@@ -1524,8 +1535,9 @@ mod tests {
                     server.send(Message::Text(completed.to_string().into())).await.unwrap();
                     let mut recovered = Vec::new();
                     while recovered.len() < 2 {
-                        let event = received_events.recv().await.unwrap();
-                        if event == approval || event == completed {
+                        if let ExecEvent::Message(event) = received_events.recv().await.unwrap()
+                            && (event == approval || event == completed)
+                        {
                             recovered.push(event);
                         }
                     }
@@ -1843,9 +1855,9 @@ mod tests {
                 sent
             });
             let outgoing = Outgoing { thread_id: "t".into(), text: "use plan B".into(), client_id: "d1".into(), ..Default::default() };
-            for expected in ["steer", "existing"] {
+            for _ in 0..2 {
                 let mut session = DirectSession::connect(&socket).await.unwrap();
-                assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: expected.into(), turn_id: "r1".into() });
+                assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "r1".into() });
                 session.close().await;
             }
             assert_eq!(server.await.unwrap(), 1, "a repeated send only reads back");
@@ -1896,7 +1908,7 @@ mod tests {
             let started = session.request("thread/start", json!({"cwd":"/project","approvalPolicy":"never","sandbox":"danger-full-access"})).await.unwrap();
             let thread = started["thread"]["id"].as_str().unwrap().to_owned();
             let outgoing = Outgoing { thread_id: thread, text: "do the work".into(), client_id: "w1".into(), start_only: true, full_access: true, ..Default::default() };
-            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-0".into() },
+            assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "turn-fresh-0".into() },
                 "the thread this session started gets its first turn");
             session.close().await;
 
@@ -1905,7 +1917,7 @@ mod tests {
             session.close().await;
             let mut session = DirectSession::connect(&socket).await.unwrap();
             let outgoing = Outgoing { thread_id: "fresh-1".into(), text: "hello".into(), client_id: "m1".into(), ..Default::default() };
-            assert_eq!(session.send(&outgoing).await, Delivery::Delivered { mode: "start".into(), turn_id: "turn-fresh-1".into() },
+            assert_eq!(session.send(&outgoing).await, StartReport::Turn { turn_id: "turn-fresh-1".into() },
                 "a thread started elsewhere without a rollout yet still gets its first turn");
             session.close().await;
             server.abort();

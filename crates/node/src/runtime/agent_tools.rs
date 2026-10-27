@@ -332,12 +332,11 @@ impl Runtime {
                 let request: ChangeRequest = serde_json::from_value(request).map_err(|error| {
                     anyhow::anyhow!("{error}. Provider and folders change only in Settings")
                 })?;
-                let provider = crate::providers::Provider::of(
-                    self.settings_snapshot()
-                        .manager
-                        .context("this Node has no configured management SDK")?
-                        .provider,
-                );
+                let provider = self
+                    .settings_snapshot()
+                    .manager
+                    .context("this Node has no configured management SDK")?
+                    .provider;
                 let (record, written) = self.store.lock().await.change_bot(
                     &self.identity,
                     network,
@@ -358,7 +357,12 @@ impl Runtime {
                 Ok(json!(record))
             }
             Tool::TrackWork => self.track_work(&access, &scope, &args).await,
-            Tool::BindWork => self.bind_work(network, &scope, &args).await,
+            Tool::BindWork => {
+                let report = serde_json::from_value(args["report"].clone())
+                    .context("report must be a start report")?;
+                self.bind_work(network, &scope, field(&args, "work_id")?, report)
+                    .await
+            }
             Tool::WaitCodex => {
                 drop((_lease, _work));
                 Ok(json!({"connected": self.codex.ready().await}))
@@ -370,7 +374,9 @@ impl Runtime {
                 crate::agent_cli::dispatch(
                     &args,
                     |args| async move { self.track_work(access, scope, &args).await },
-                    |args| async move { self.bind_work(network, scope, &args).await },
+                    |work_id, report| async move {
+                        self.bind_work(network, scope, &work_id, report).await
+                    },
                     || async {
                         self.codex.ready().await;
                     },

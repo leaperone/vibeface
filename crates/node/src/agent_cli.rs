@@ -4,13 +4,13 @@ use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 use std::{future::Future, path::Path};
 use vibeface_bridge::{
-    codex::{Delivery, DirectSession, Outgoing},
+    codex::{DirectSession, Outgoing, StartReport},
     failure::{ExecFailure, FailureKind},
 };
 use vibeface_protocol::now_ms;
 
-/// Registers the work with the Node (`track`), binds its thread before the send, sends the prompt
-/// with `clientUserMessageId` = work ID and binds the result. Without `thread` the work starts a
+/// Registers the work with the Node (`track`), reports its thread before the send, sends the
+/// prompt with `clientUserMessageId` = work ID and reports how the send ended (`bind`). Without `thread` the work starts a
 /// turn in a new thread (or the one it continues); with `thread` it goes into that existing
 /// thread, steering its running turn or starting one, and the thread's directory is read first.
 /// Only the registration that created the work sends, and only inside its window. Each connect
@@ -26,7 +26,7 @@ pub async fn dispatch<T, TF, B, BF, R, RF>(
 where
     T: FnOnce(Value) -> TF,
     TF: Future<Output = Result<Value>>,
-    B: Fn(Value) -> BF,
+    B: Fn(String, StartReport) -> BF,
     BF: Future<Output = Result<Value>>,
     R: Fn() -> RF,
     RF: Future<Output = ()>,
@@ -66,7 +66,8 @@ where
         .as_str()
         .context("the Node returned no work ID")?
         .to_owned();
-    let fail = |failure: ExecFailure| bind(json!({"work_id":work_id,"failed":failure}));
+    let report = |report| bind(work_id.clone(), report);
+    let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
     ready().await;
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
@@ -92,7 +93,10 @@ where
             }
         }
     };
-    bind(json!({"work_id":work_id,"thread_id":thread})).await?;
+    report(StartReport::Thread {
+        thread_id: thread.clone(),
+    })
+    .await?;
     if now_ms() >= tracked["send_by_ms"].as_u64().unwrap_or(0) {
         let failure = ExecFailure::new(
             FailureKind::TimedOut,
@@ -110,14 +114,9 @@ where
         start_only: existing.is_none(),
         full_access: true,
     };
-    let delivery = session.send(&outgoing).await;
+    let sent = session.send(&outgoing).await;
     session.close().await;
-    let report = match delivery {
-        Delivery::Delivered { turn_id, .. } => json!({"work_id":work_id,"turn_id":turn_id}),
-        Delivery::Unknown { reason } => json!({"work_id":work_id,"unknown":reason}),
-        Delivery::Rejected { failure } => json!({"work_id":work_id,"failed":failure}),
-    };
-    bind(report).await
+    report(sent).await
 }
 
 /// App Server methods that start, steer or stop a turn. A turn the Node did not register is

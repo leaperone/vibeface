@@ -18,7 +18,6 @@ use vibeface::{
     identity::local::BootstrapCapability,
     local_access::Launcher,
     maintenance,
-    manager::ManagerKind,
     net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
     runtime::Runtime,
     store::Store,
@@ -230,7 +229,7 @@ struct Init {
     #[arg(long)]
     allow_insecure_lan: bool,
     #[arg(long, value_enum, requires = "workspace")]
-    manager: Option<ManagerKind>,
+    manager: Option<vibeface::providers::Provider>,
     #[arg(long, requires = "manager")]
     workspace: Option<PathBuf>,
     #[arg(long, requires = "manager")]
@@ -1131,13 +1130,7 @@ fn init(options: Init) -> Result<()> {
             workspace: workspace
                 .canonicalize()
                 .context("resolve manager workspace")?,
-            model: options.model.unwrap_or_else(|| {
-                if manager == ManagerKind::CursorSdk {
-                    "auto".into()
-                } else {
-                    String::new()
-                }
-            }),
+            model: manager.model(options.model.as_deref().unwrap_or_default()),
             cursor_sdk_bin: options.cursor_sdk_bin,
         });
     }
@@ -1561,7 +1554,13 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
     vibeface::agent_cli::dispatch(
         arguments,
         |args| post_tool("track_work", args, call_id),
-        |args| post_tool("bind_work", args, call_id),
+        |work_id, report| {
+            post_tool(
+                "bind_work",
+                json!({"work_id":work_id,"report":report}),
+                call_id,
+            )
+        },
         || async {
             let _ = post_tool("wait_codex", json!({}), call_id).await;
         },

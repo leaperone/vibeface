@@ -81,8 +81,7 @@ pub(crate) fn bot_model(
     device: &crate::config::ManagerSettings,
     bot: Option<&Bot>,
 ) -> Option<String> {
-    bot?.model(crate::providers::Provider::of(device.provider))
-        .map(str::to_owned)
+    bot?.model(device.provider).map(str::to_owned)
 }
 
 pub(crate) fn boot_id() -> &'static str {
@@ -199,7 +198,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     if let Some(model) = &bot_model {
         settings.model = model.clone();
     }
-    let kind = settings.provider;
+    let provider = settings.provider;
+    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
     // Claiming before the tool listener exists would turn a startup race into a failed job.
     let tool_url = node
         .tool_url
@@ -210,16 +210,15 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     // App Server; another one starts a new thread too, and so do new thread instructions.
     let server = node.codex.server();
     let tool_cli = std::env::current_exe()?;
-    let codex = kind == manager::ManagerKind::CodexSdk;
-    // A user's own turn is offered every tool; a Codex thread lists them all once.
+    // A thread lists the tools once, with the guidance that holds for all its turns.
     let guide = manager::codex_instructions(
         Some(&tool_cli),
-        &tools(TriggerKind::Human),
+        &provider.tools_for(TriggerKind::Human),
         &thread_instructions(),
     );
     let sdk_config = session_key(
         &settings,
-        codex.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
+        thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
     )?;
     let claimed = {
         let mut store = node.store.lock().await;
@@ -248,7 +247,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     {
         tracing::Span::current().record("work_id", work_id);
     }
-    tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?kind, "agent turn started");
+    tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
     let token = claimed
@@ -276,9 +275,9 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 _ => None,
             };
             let render = |resumed, thread| materialize(&context, &job, &works, &dispatches, bot.clone(), schedule.as_ref(), &local_settings.roots, resumed, thread);
-            let turn = render(claimed.covers.as_ref(), codex.then_some(&claimed.shown))?;
-            // A resumed thread Codex no longer has is replaced by a new one, which needs it all.
-            let fresh = match (codex, &claimed.previous_native_id) {
+            let turn = render(claimed.covers.as_ref(), thread.then_some(&claimed.shown))?;
+            // A resumed thread the backend no longer has is replaced by a new one, which needs it all.
+            let fresh = match (thread, &claimed.previous_native_id) {
                 (true, Some(_)) => Some(render(None, Some(&Shown::default()))?),
                 _ => None,
             };
@@ -287,14 +286,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let (fresh_prompt, fresh_shown) = fresh.unzip();
         let shown = Arc::new(Mutex::new(shown_now));
         let local_url = node.tool_url.get().context("local tool listener is not ready")?.clone();
-        if kind == manager::ManagerKind::CodexSdk {
-            // The turn runs on the App Server, which may still be starting with the Node.
-            node.codex.ready().await;
-        }
+        // The backend may still be starting with the Node.
+        node.manager_backend_ready(provider).await;
         let mut config = ManagerConfig {
-            custom_tools: tools(if codex { TriggerKind::Human } else { job.kind }),
+            custom_tools: provider.tools_for(job.kind),
             tool_cli: Some(tool_cli),
-            instructions: if codex { thread_instructions() } else { String::new() },
+            instructions: if thread { thread_instructions() } else { String::new() },
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
             codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
@@ -346,9 +343,9 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     &persist_attempt,
                     &id,
                     &persist_token,
-                    // Cursor sends the prompt right after this; a Codex thread has seen it only
-                    // once its turn starts, which the turn recorder marks.
-                    kind == manager::ManagerKind::CursorSdk,
+                    // A turn sends the prompt right after this; a thread has seen it only once
+                    // its turn starts, which the turn recorder marks.
+                    !thread,
                 )
             },
             cancel,
@@ -1075,13 +1072,14 @@ mod tests {
         };
         let codex = |model, guide| {
             session_key(
-                &settings(model, manager::ManagerKind::CodexSdk),
+                &settings(model, crate::providers::Provider::Codex),
                 Some(("http://127.0.0.1:1", "system", guide)),
             )
         };
         assert_eq!(codex("gpt-a", "guide")?, codex("gpt-b", "guide")?);
         assert_ne!(codex("gpt-a", "guide")?, codex("gpt-a", "new guide")?);
-        let cursor = |model| session_key(&settings(model, manager::ManagerKind::CursorSdk), None);
+        let cursor =
+            |model| session_key(&settings(model, crate::providers::Provider::Cursor), None);
         assert_ne!(cursor("a")?, cursor("b")?);
         Ok(())
     }
