@@ -28,7 +28,7 @@ export function useInbox(): InboxItem[] {
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
   if (device.pendingRecovery) items.push({ key: "recovery", icon: ShieldAlert, title: recoveryCopy.pending, to: "/inbox", kind: "recovery" })
-  if (device.rotateHint) items.push({ key: "rotate", icon: KeyRound, title: recoveryCopy.rotate, to: "/inbox", kind: "rotate" })
+  if (device.rotateHint) items.push({ key: "rotate", icon: KeyRound, title: "换个恢复密码", to: "/inbox", kind: "rotate" })
   if (write.state === "read_only") items.push({ key: "write:read_only", icon: terms.readOnly.icon, title: "这台电脑暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台电脑的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
