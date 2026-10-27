@@ -1269,16 +1269,16 @@ impl Runtime {
             }
             let _ = self.store.lock().await.forget_address(&revoked.device_id);
         }
-        self.abandon_revoked_works(&view.network_id).await;
+        self.unverify_revoked_works(&view.network_id).await;
     }
 
-    /// Work on devices a manager removed that never reported is recorded as abandoned by the
-    /// owner, and requests still waiting for those devices are dropped.
+    /// Work on devices a manager removed that never reported is recorded as unverified by the
+    /// owner, for the user to settle; requests still waiting for those devices end unknown.
     ///
     /// Only a signed removal counts. A Node a recovery left out is out only until a late veto
-    /// puts the earlier directory back, and an `Abandoned` record in the shared log cannot be
-    /// taken back; its writes past the bound simply stop counting (`log::recompute`) until then.
-    pub(super) async fn abandon_revoked_works(&self, network: &str) {
+    /// puts the earlier directory back, and a record in the shared log cannot be taken back;
+    /// its writes past the bound simply stop counting (`log::recompute`) until then.
+    pub(super) async fn unverify_revoked_works(&self, network: &str) {
         let Ok(state) = self.membership_state().await else {
             return;
         };
@@ -1289,25 +1289,35 @@ impl Runtime {
         if removed.is_empty() {
             return;
         }
-        let result =
-            self.store
-                .lock()
-                .await
-                .abandon_works(&self.identity, network, &removed, now_ms());
+        let result = self.store.lock().await.unverify_removed_works(
+            &self.identity,
+            network,
+            &removed,
+            now_ms(),
+        );
         match result {
-            Ok(abandoned) => {
-                for (scope, work_id) in &abandoned {
+            Ok(unverified) => {
+                for (scope, work_id) in &unverified {
                     self.publish_changed(network, scope, Changed::Work(work_id));
                 }
-                if !abandoned.is_empty() {
-                    self.schedule_wakeup.notify_one();
+                if !unverified.is_empty() {
                     self.outbox_wakeup.notify_one();
                 }
             }
-            Err(error) => tracing::warn!(%error, "abandoning work on removed devices is pending"),
+            Err(error) => tracing::warn!(%error, "recording work on removed devices is pending"),
         }
-        if let Err(error) = self.store.lock().await.drop_requests_to(&removed) {
-            tracing::warn!(%error, "dropping requests to removed devices is pending");
+        let Ok(local) = self.identity.device_id() else {
+            return;
+        };
+        match self
+            .store
+            .lock()
+            .await
+            .drop_requests_to(network, &local, &removed)
+        {
+            Ok(0) => {}
+            Ok(_) => self.schedule_wakeup.notify_one(),
+            Err(error) => tracing::warn!(%error, "dropping requests to removed devices is pending"),
         }
     }
 
@@ -2217,9 +2227,9 @@ mod tests {
         result
     }
 
-    /// A recovery leaving out a Node abandons none of its work: a late veto can put the Node
-    /// back, and an `Abandoned` record in the shared log could not be taken back. A manager's
-    /// signed removal still abandons it.
+    /// A recovery leaving out a Node records nothing about its work: a late veto can put the
+    /// Node back, and a record in the shared log could not be taken back. A manager's signed
+    /// removal leaves its work unverified.
     #[tokio::test]
     async fn a_recovery_undone_by_a_late_veto_adds_nothing_to_the_shared_log() -> Result<()> {
         use crate::{
@@ -2302,8 +2312,8 @@ mod tests {
             let (waiting, checkpoint, _) = recovery_on(&ia, &state, kept, retired, issued)?;
             let flipped = a.install_membership(waiting.clone()).await?;
             assert!(flipped.revocation(&work.target).is_some());
-            a.abandon_revoked_works(&network).await;
-            assert_eq!(shared().await?, before, "a recovery abandons nothing");
+            a.unverify_revoked_works(&network).await;
+            assert_eq!(shared().await?, before, "a recovery records nothing");
 
             let back = a
                 .install_membership(vetoed(&ia, &waiting, &checkpoint, issued + 1)?)
@@ -2322,7 +2332,7 @@ mod tests {
             let mut removed = a.membership_state().await?;
             removed.append(removal)?;
             a.install_membership(removed).await?;
-            assert_eq!(shared().await?.1, Some(WorkOutcome::Abandoned));
+            assert_eq!(shared().await?.1, Some(WorkOutcome::Unverified));
             anyhow::Ok(())
         }
         .await;

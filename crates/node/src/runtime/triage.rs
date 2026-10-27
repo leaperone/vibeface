@@ -1915,6 +1915,120 @@ mod tests {
             .find(|request| request.work_id == work_id))
     }
 
+    /// A `turn/start` stuck past the send window is not written off as never run: the work is
+    /// unverified, and the turn that shows up late is followed to its result.
+    #[tokio::test]
+    async fn a_send_stuck_past_its_window_is_unverified_then_followed() -> Result<()> {
+        use crate::model::{WorkOutcome, WorkStatus};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let started = Arc::new(AtomicBool::new(false));
+            let seen = started.clone();
+            let _requests =
+                scripted_app_server(&node, move |request| match request["method"].as_str() {
+                    Some("thread/read") if seen.load(Ordering::SeqCst) => {
+                        json!({"result":{"thread":{"turns":[{"id":"u-1","status":"inProgress",
+                            "items":[{"type":"userMessage","clientId":"w-late"}]}]}}})
+                    }
+                    Some("thread/read") => json!({"result":{"thread":{"turns":[]}}}),
+                    _ => json!({"result":{}}),
+                })?;
+            connected(&node).await;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let spec = crate::work::WorkSpec {
+                work_id: "w-late".into(),
+                conversation: "c".into(),
+                trigger: "message:m1".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "late".into(),
+                kind: crate::model::WorkKind::Codex,
+                cwd: "/tmp".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            let window = crate::work::SEND_WINDOW_MS + crate::work::RECONCILE_GRACE_MS;
+            node.store.lock().await.accept_work(
+                &node.identity,
+                &network,
+                spec,
+                now_ms() - window,
+            )?;
+            let bound = json!({"work_id":"w-late","thread_id":"t-late"});
+            node.store.lock().await.apply_work_signal(
+                &node.identity,
+                &network,
+                "w-late",
+                crate::work::Signal::ThreadCreated("t-late".into()),
+                now_ms(),
+            )?;
+            node.reconcile_works(&network).await?;
+            let outcome = async || -> Result<(Option<WorkOutcome>, WorkStatus)> {
+                let work = node
+                    .store
+                    .lock()
+                    .await
+                    .works(&network, "c")?
+                    .into_iter()
+                    .find(|work| work.work_id == "w-late")
+                    .context("work")?;
+                Ok((work.outcome, work.state))
+            };
+            assert_eq!(
+                outcome().await?,
+                (Some(WorkOutcome::Unverified), WorkStatus::Unverified),
+                "an unseen send is not recorded as refused"
+            );
+            assert!(matches!(
+                state(&node, "w-late").await?,
+                crate::work::WorkState::Unverified { handle: None, thread: Some(ref thread), .. }
+                    if thread == "t-late"
+            ));
+            assert!(
+                node.bind_work(&network, "c", &bound).await.is_err(),
+                "past its window the work takes no new thread"
+            );
+
+            started.store(true, Ordering::SeqCst);
+            let late = json!({"work_id":"w-late","turn_id":"u-1"});
+            node.bind_work(&network, "c", &late).await?;
+            assert!(matches!(
+                state(&node, "w-late").await?,
+                crate::work::WorkState::Running { ref handle } if handle.turn_id == "u-1"
+            ));
+            let done = crate::work::Signal::TurnCompleted {
+                turn_id: "u-1".into(),
+                status: "completed".into(),
+                text: "done".into(),
+                error: None,
+            };
+            node.signal_work(&network, "w-late", done).await?;
+            assert_eq!(
+                outcome().await?,
+                (Some(WorkOutcome::Completed), WorkStatus::Finished),
+                "the late turn's real result replaces the unknown one"
+            );
+            assert!(
+                node.store
+                    .lock()
+                    .await
+                    .scheduler_job("c", &crate::scheduling::work_trigger("w-late"))?
+                    .is_some(),
+                "and reports back"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
     #[tokio::test]
     async fn a_held_stop_outlives_a_failed_interrupt_and_ends_with_its_work() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2881,6 +2995,55 @@ mod tests {
                 ["own:"],
                 "only the turn on this App Server was found gone"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn work_status_lists_dispatches_the_dag_does_not_name_yet() -> Result<()> {
+        use crate::work::{Dispatch, DispatchState, WorkSpec};
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let trigger = crate::scheduling::message_trigger("m1");
+            let spec = WorkSpec {
+                work_id: WorkSpec::id("c", &trigger, "r"),
+                conversation: "c".into(),
+                trigger,
+                target: LocalIdentity::generate().device_id()?,
+                dispatcher: node.identity.device_id()?,
+                call_ref: "r".into(),
+                kind: crate::model::WorkKind::Task,
+                cwd: "/w".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            };
+            node.store.lock().await.save_dispatch(&Dispatch {
+                spec: spec.clone(),
+                state: DispatchState::Pending,
+            })?;
+            let access = Access {
+                network_id: network,
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            let all = node.tool(access.clone(), "work_status", json!({})).await?;
+            assert_eq!(
+                (&all["works"][0]["work_id"], &all["works"][0]["state"]),
+                (&json!(spec.work_id), &json!("dispatch_waiting"))
+            );
+            let one = node
+                .tool(access, "work_status", json!({"work_id": spec.work_id}))
+                .await?;
+            assert_eq!(one["state"], "dispatch_waiting");
             Ok::<_, anyhow::Error>(())
         }
         .await;

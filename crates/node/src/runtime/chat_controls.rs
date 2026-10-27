@@ -149,7 +149,7 @@ impl Runtime {
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
         let checks = without_work_checks(checks, &works);
-        let deliveries = deliveries(&store, scope, &works)?;
+        let deliveries = deliveries(&store, network, scope)?;
         let conversation = store.conversation(network, scope)?;
         // Devices whose live progress this conversation shows: its owner and those running its open works.
         let mut targets = Vec::new();
@@ -284,7 +284,7 @@ impl Runtime {
             "questions":store.conversation_questions(network, scope)?,
             "sent":store.sent_bot_messages(network, scope)?,
             "notifications":notifications,
-            "deliveries":deliveries(&store, scope, &works)?,
+            "deliveries":deliveries(&store, network, scope)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
@@ -307,25 +307,16 @@ fn without_work_checks(checks: Vec<PendingCheck>, works: &[WorkProjection]) -> V
 
 /// Requests this device still carries: dispatches the DAG learns of only once the target
 /// answers, and stops not yet confirmed.
-fn deliveries(store: &Store, scope: &str, works: &[WorkProjection]) -> Result<Vec<Value>> {
+fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
     let mut deliveries = Vec::new();
-    for dispatch in store.dispatches()? {
-        let spec = &dispatch.spec;
-        let state = match &dispatch.state {
-            DispatchState::Accepted => continue,
-            DispatchState::Pending => "dispatch_waiting",
-            DispatchState::Rejected { .. } => "dispatch_rejected",
-        };
-        if spec.conversation != scope || works.iter().any(|w| w.work_id == spec.work_id) {
+    for dispatch in store.undelivered_dispatches(network, scope)? {
+        if dispatch.state == DispatchState::Accepted {
             continue;
         }
-        let reason = match &dispatch.state {
-            DispatchState::Rejected { reason } => Some(reason),
-            _ => None,
-        };
+        let spec = &dispatch.spec;
         deliveries.push(
-            json!({"work_id":spec.work_id,"target_node":spec.target,"state":state,
-            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":reason}),
+            json!({"work_id":spec.work_id,"target_node":spec.target,"state":dispatch.state.name(),
+            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason()}),
         );
     }
     for stop in store.stop_requests()? {

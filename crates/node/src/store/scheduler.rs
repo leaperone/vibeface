@@ -689,9 +689,8 @@ pub(crate) fn chain_depth(
                 return Ok(hops);
             }
             Some(("work" | "task", work_id)) => {
-                let work = super::reduce::work_from(connection, network, work_id)?
+                (conversation, trigger) = cause_from(connection, network, work_id)?
                     .context("the work is not stored here")?;
-                (conversation, trigger) = (work.conversation_id, work.trigger);
             }
             _ => bail!("unknown trigger {trigger}"),
         }
@@ -838,44 +837,48 @@ pub(crate) fn queue_delivery_from(
     .receipt(network))
 }
 
-/// The user message a work ultimately answers, followed through the DAG's dispatch chain, so
-/// any owner can report a result whose turn ran on another Node.
-fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Result<Option<String>> {
-    let mut work_id = work_id.to_owned();
+/// The conversation and trigger of the turn that dispatched a work: from the DAG, else from this
+/// Node's own dispatch the target never took, which only this Node can follow.
+fn cause_from(
+    connection: &Connection,
+    network: &str,
+    work_id: &str,
+) -> Result<Option<(String, String)>> {
+    if let Some(work) = super::reduce::work_from(connection, network, work_id)? {
+        return Ok(Some((work.conversation_id, work.trigger)));
+    }
+    Ok(super::work::dispatch_from(connection, work_id)?
+        .map(|dispatch| (dispatch.spec.conversation, dispatch.spec.trigger)))
+}
+
+/// The user message a trigger ultimately answers, followed through the dispatch chain, so any
+/// owner can report a result whose turn ran on another Node.
+fn origin_message(connection: &Connection, network: &str, trigger: &str) -> Result<Option<String>> {
+    let mut trigger = trigger.to_owned();
     for _ in 0..64 {
-        let Some(work) = super::reduce::work_from(connection, network, &work_id)? else {
-            return Ok(None);
-        };
-        match work.trigger.split_once(':') {
+        match trigger.split_once(':') {
             Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
-            Some(("work" | "task", parent)) => work_id = parent.into(),
-            Some(("schedule", _)) => return Ok(Some(work.trigger)),
+            Some(("work" | "task", work_id)) => match cause_from(connection, network, work_id)? {
+                Some((_, cause)) => trigger = cause,
+                None => return Ok(None),
+            },
+            Some(("schedule", _)) => return Ok(Some(trigger)),
             _ => return Ok(None),
         }
     }
     Ok(None)
 }
 
-/// A finished work reports back to the owner through its own trigger, unless the user opted out
-/// on the message that started the chain. Unverified results wait for the user or a probe.
-/// Another Node's result waits in the outbox for the owner.
-pub(crate) fn admit_work_result_from(
+/// Admits the work's report turn for the message the chain started from, unless the user
+/// opted out there.
+fn admit_report_from(
     connection: &Connection,
     network: &str,
-    local: &str,
     conversation: &str,
     work_id: &str,
-    outcome: WorkOutcome,
 ) -> Result<Option<AdmissionReceipt>> {
-    if outcome == WorkOutcome::Unverified {
-        return Ok(None);
-    }
     let trigger = work_trigger(work_id);
-    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
-    if owner.as_deref() != Some(local) {
-        return queue_delivery_from(connection, network, conversation, &trigger).map(Some);
-    }
-    let Some(reply_to) = origin_message(connection, network, work_id)? else {
+    let Some(reply_to) = origin_message(connection, network, &trigger)? else {
         return Ok(None);
     };
     let report = message_from(connection, network, conversation, &reply_to)?
@@ -893,6 +896,47 @@ pub(crate) fn admit_work_result_from(
         &reply_to,
     )
     .map(Some)
+}
+
+/// A dispatch refused, or left unknown by a removed device, has no result in the DAG; the
+/// dispatching owner wakes its bot through the work's trigger instead, once per work.
+pub(crate) fn admit_dispatch_result_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    dispatch: &crate::work::Dispatch,
+) -> Result<Option<AdmissionReceipt>> {
+    let spec = &dispatch.spec;
+    let owner = conversation_from(connection, network, &spec.conversation)?.and_then(|c| c.owner);
+    if !dispatch.state.ended()
+        || owner.as_deref() != Some(local)
+        || super::reduce::work_from(connection, network, &spec.work_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    admit_report_from(connection, network, &spec.conversation, &spec.work_id)
+}
+
+/// A finished work reports back to the owner through its own trigger, unless the user opted out
+/// on the message that started the chain. Unverified results wait for the user or a probe.
+/// Another Node's result waits in the outbox for the owner.
+pub(crate) fn admit_work_result_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    conversation: &str,
+    work_id: &str,
+    outcome: WorkOutcome,
+) -> Result<Option<AdmissionReceipt>> {
+    if outcome == WorkOutcome::Unverified {
+        return Ok(None);
+    }
+    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
+    if owner.as_deref() != Some(local) {
+        let trigger = work_trigger(work_id);
+        return queue_delivery_from(connection, network, conversation, &trigger).map(Some);
+    }
+    admit_report_from(connection, network, conversation, work_id)
 }
 
 /// Provider errors as the person reads them in the chat, each with where to go next. The raw

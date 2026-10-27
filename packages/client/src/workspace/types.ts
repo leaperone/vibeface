@@ -12,11 +12,11 @@ export type NodeInfo = {
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
-/** A dispatch this device still carries: the target has not taken it, or refused it. Not in the DAG yet. */
-type DispatchState = "dispatch_waiting" | "dispatch_rejected"
+/** A dispatch this device still carries: the target has not taken it, refused it, or was removed before saying. Not in the DAG yet. */
+type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch_unverified"
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
 type StopState = "stop_waiting" | "stop_timed_out"
-/** `abandoned`: the device was removed before it reported; the work did not run. */
+/** `abandoned` is no longer written; a removed device's open work is `unverified`. */
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
 export type WorkRecord = {
   work_id: string

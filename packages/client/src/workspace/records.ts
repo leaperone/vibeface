@@ -2,7 +2,7 @@ import { withDeliveries } from "./model.ts"
 import { questionOpen } from "./questions.ts"
 import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
 
-const delivery = (item: WorkRecord) => item.state === "dispatch_waiting" || item.state === "dispatch_rejected"
+const delivery = (item: WorkRecord) => item.state.startsWith("dispatch_")
 const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {

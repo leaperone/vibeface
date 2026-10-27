@@ -61,10 +61,7 @@ impl Runtime {
             now_ms(),
         )?;
         if !quiet {
-            let thread_id = match &record.state {
-                WorkState::Starting { thread } => thread.as_deref(),
-                state => state.handle().map(|handle| handle.thread_id.as_str()),
-            };
+            let thread_id = record.state.thread();
             let (conversation_id, state) = (record.conversation.as_str(), record.state.name());
             match &record.state {
                 WorkState::Finished {
@@ -132,12 +129,7 @@ impl Runtime {
             .unwrap_or_default()
             .into_iter()
             .filter(live)
-            .filter_map(|record| match &record.state {
-                WorkState::Starting {
-                    thread: Some(thread),
-                } => Some(thread.clone()),
-                state => state.handle().map(|handle| handle.thread_id.clone()),
-            })
+            .filter_map(|record| record.state.thread().map(str::to_owned))
             .collect();
         let _ = self.codex.observe(threads);
     }
@@ -174,11 +166,19 @@ impl Runtime {
                     from_owner,
                     "only the conversation's scheduling device dispatches its work"
                 );
+                // A refused or unknown dispatch of this Node has no result in the DAG; only this
+                // Node, which holds it, can follow it up.
+                let ended = store
+                    .works(network, &spec.conversation)?
+                    .iter()
+                    .any(|work| work.work_id == previous && work.outcome.is_some())
+                    || spec.dispatcher == self.identity.device_id()?
+                        && store.dispatch(previous)?.is_some_and(|dispatch| {
+                            dispatch.spec.conversation == spec.conversation
+                                && dispatch.state.ended()
+                        });
                 ensure!(
-                    store
-                        .works(network, &spec.conversation)?
-                        .iter()
-                        .any(|work| work.work_id == previous && work.outcome.is_some()),
+                    ended,
                     "the result this work follows has not reached this device"
                 );
             }
@@ -329,10 +329,12 @@ impl Runtime {
 
     /// A dispatch to another Node waits in this Node's journal until the target answers; an
     /// unknown answer is retried with the same `work_id`, which the target accepts at most once.
+    /// `notify` is set for a retry outside the dispatching turn: a refusal then wakes the bot.
     pub(super) async fn send_dispatch(
         self: &Arc<Self>,
         network: &str,
         spec: WorkSpec,
+        notify: bool,
     ) -> Result<Dispatch> {
         let dispatch = self.store.lock().await.save_dispatch(&Dispatch {
             spec,
@@ -378,13 +380,21 @@ impl Runtime {
                 "another device accepted the work"
             ),
         }
-        let dispatch = Dispatch { state, ..dispatch };
-        self.store.lock().await.save_dispatch(&dispatch)?;
+        let (dispatch, receipt) = self.store.lock().await.answer_dispatch(
+            network,
+            &self.identity.device_id()?,
+            &spec.work_id,
+            state,
+            notify,
+        )?;
         self.publish_changed(
             network,
             &dispatch.spec.conversation,
             Changed::Work(&dispatch.spec.work_id),
         );
+        if receipt.is_some() {
+            self.wake_scheduler()?;
+        }
         Ok(dispatch)
     }
 
@@ -464,6 +474,20 @@ impl Runtime {
                 epoch: self.codex_epoch(),
             };
             record = self.signal_work(network, work_id, signal).await?;
+            if record
+                .state
+                .handle()
+                .is_none_or(|handle| handle.turn_id != turn)
+            {
+                tracing::warn!(
+                    event = "work.turn_untracked",
+                    conversation_id = scope,
+                    work_id,
+                    turn_id = turn,
+                    state = record.state.name(),
+                    "a turn started after its work had ended; the Node does not follow it"
+                );
+            }
             // The turn may have ended before it was bound.
             if let Some(handle) = record.state.handle().cloned()
                 && let Ok(probe @ Probe::Terminal { .. }) = self
@@ -542,16 +566,15 @@ impl Runtime {
                 }
                 return Ok(());
             }
-            WorkState::Starting {
-                thread: Some(thread),
-            } => codex.probe(thread, None, work_id, epoch).await,
-            state => match state.handle() {
-                Some(handle) => {
+            state => match (state.handle(), state.thread()) {
+                (Some(handle), _) => {
                     codex
                         .probe(&handle.thread_id, Some(&handle.turn_id), work_id, epoch)
                         .await
                 }
-                None => return Ok(()),
+                // A send not seen in time is looked for by its work ID.
+                (None, Some(thread)) => codex.probe(thread, None, work_id, epoch).await,
+                (None, None) => return Ok(()),
             },
         };
         match probe {
@@ -774,11 +797,9 @@ impl Runtime {
             WorkState::Accepted
             | WorkState::Starting { .. }
             | WorkState::Running { .. }
-            | WorkState::Unverified {
-                handle: Some(_),
-                probe: true,
-                ..
-            } if record.kind == WorkKind::Codex => {
+            | WorkState::Unverified { probe: true, .. }
+                if record.kind == WorkKind::Codex =>
+            {
                 let at = now_ms();
                 let held = self
                     .hold_stop(&StopRequest {
@@ -801,7 +822,9 @@ impl Runtime {
                                 })
                                 .is_ok());
                     }
-                    WorkState::Unverified { .. } => retrying = true,
+                    WorkState::Unverified {
+                        handle: Some(_), ..
+                    } => retrying = true,
                     _ => waiting_for_start = true,
                 }
                 self.publish_changed(network, &record.conversation, Changed::Work(work_id));
@@ -892,7 +915,7 @@ impl Runtime {
         let dispatches = self.store.lock().await.dispatches()?;
         for dispatch in dispatches {
             if dispatch.state == DispatchState::Pending {
-                self.send_dispatch(network, dispatch.spec).await?;
+                self.send_dispatch(network, dispatch.spec, true).await?;
             }
         }
         let local = self.identity.device_id()?;
@@ -984,6 +1007,29 @@ impl Runtime {
         let turn = params["turnId"]
             .as_str()
             .or_else(|| params["turn"]["id"].as_str());
+        // A turn on the thread of a send not seen in time may be that send; reading the thread
+        // tells, and settles the work if so.
+        if matches!(method, "turn/started" | "turn/completed") {
+            let unseen: Vec<_> = records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        &record.state,
+                        WorkState::Unverified {
+                            handle: None,
+                            probe: true,
+                            ..
+                        }
+                    ) && record.state.thread() == thread
+                })
+                .map(|record| record.work_id.clone())
+                .collect();
+            for work_id in unseen {
+                if let Err(error) = Box::pin(self.probe_work(network, &work_id, true)).await {
+                    tracing::debug!(%error, work_id, "an unseen send waits for the next probe");
+                }
+            }
+        }
         let works: Vec<_> = records
             .into_iter()
             .filter(|record| {

@@ -120,7 +120,7 @@ export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[
   const rows = [...works]
   for (const item of list(value)) {
     const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
-    if (state === "dispatch_waiting" || state === "dispatch_rejected") {
+    if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") {
       rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason) })
     } else if (state === "stop_waiting" || state === "stop_timed_out") {
       const index = rows.findIndex((row) => row.work_id === work_id)
@@ -140,7 +140,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
  */
 export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
-  if (item.outcome || item.state === "finished" || item.state === "dispatch_waiting" || item.state === "dispatch_rejected") return null
+  if (item.outcome || item.state === "finished" || item.state.startsWith("dispatch_")) return null
   const node = nodes.find((candidate) => candidate.device_id === item.target_node)
   if (!node || node.revoked) return null
   if (!node.online) return "offline"
