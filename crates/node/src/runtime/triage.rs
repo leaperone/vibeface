@@ -2169,9 +2169,17 @@ mod tests {
 
             b.start_network().await?;
             a.net()?.learn(&b.net()?.addr()).await;
+            // Retry by hand: the backoff from the offline attempts must not outlast the timeout.
             let interrupt = tokio::time::timeout(Duration::from_secs(30), async {
                 loop {
-                    let request = requests.recv().await.context("the App Server closed")?;
+                    a.stop_retries.lock().unwrap().clear();
+                    a.deliver_work_requests(&network).await?;
+                    let Ok(request) =
+                        tokio::time::timeout(Duration::from_millis(500), requests.recv()).await
+                    else {
+                        continue;
+                    };
+                    let request = request.context("the App Server closed")?;
                     if request["method"] == "turn/interrupt" {
                         return Ok::<_, anyhow::Error>(request);
                     }
