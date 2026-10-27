@@ -1,5 +1,16 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotChangeRecord, BotSchedule, BotSettings, ScheduleView } from "./types.ts"
+import type { BotChangeRecord, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+
+/**
+ * Where a new bot's folder gets set up when none is offered. Folders come only from devices that run a bot (`add`), and a
+ * device's AI settings are editable only through the connected device `here`, by an admin or on that computer itself.
+ */
+export function folderSetup(nodes: readonly NodeInfo[], principal: { can_manage: boolean; source: string }, here: string): { add: boolean; device?: string } {
+  const bots = nodes.filter((node) => !node.revoked && node.online && node.capabilities?.manager).map((node) => node.device_id)
+  const add = bots.length > 0
+  if (principal.can_manage) return { add, device: bots.includes(here) ? here : bots[0] ?? here }
+  return { add, device: principal.source === "local_session" && (!add || bots.includes(here)) ? here : undefined }
+}
 
 const weekdays = "日一二三四五六"
 const pad = (value: number) => String(value).padStart(2, "0")

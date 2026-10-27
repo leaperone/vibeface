@@ -1,9 +1,10 @@
-import { Stack, useRouter } from 'expo-router'
-import { Check, FolderOpen, LoaderCircle } from 'lucide-react-native'
+import { Link, Stack, useRouter } from 'expo-router'
+import { Check, ChevronRight, FolderOpen, LoaderCircle } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { folderSetup } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { projectName } from '@vibeface/client/workspace/questions.ts'
 import type { BotProject } from '@vibeface/client/workspace/types.ts'
@@ -19,7 +20,7 @@ import { cn } from '@/lib/utils'
 /** A new bot, as the web form: a name, what it does and a folder it works in; an unconfirmed one is retried unchanged. */
 export default function NewBot() {
   const shared = useLive()
-  const { directory } = useDevice()
+  const { directory, ready } = useDevice()
   const router = useRouter()
   const pending = shared?.pendingBot ?? null
   const [name, setName] = useState(pending?.name ?? '')
@@ -37,6 +38,8 @@ export default function NewBot() {
     const bot = await shared.createBot(pending ? { name: pending.name, instructions: pending.instructions, project: pending.project } : { name, instructions, project })
     if (bot) router.replace(`/b/${bot.bot_id}`)
   })
+  const here = ready?.entry.device_id
+  const setup = ready && here ? folderSetup(shared.nodes, ready.principal, here) : undefined
   const locked = Boolean(pending) || busy !== null
   const disabled = busy !== null || !shared.writable || !(pending?.name ?? name).trim()
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-6 p-4 pb-10">
@@ -67,7 +70,13 @@ export default function NewBot() {
           </Pressable>
         })}
       </View>
-      {projects.length || pending?.project ? null : <Text className="text-meta text-muted-foreground">还没有可用的文件夹，可在「Bot 与任务」里添加</Text>}
+      {projects.length || pending?.project ? null : <View className="flex-row flex-wrap items-center gap-x-2">
+        <Text className="text-meta text-muted-foreground">{setup?.add ? '还没有可用的文件夹' : '设备能运行 Bot 后就能选'}</Text>
+        {/* This phone edits only the AI settings of the device it connects through. */}
+        {pending || !setup ? null : setup.device === here ? <Link href="/ai" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-0.5">
+          <Text className="text-meta font-medium">{setup.add ? '去添加' : '去设置'}</Text><Icon as={ChevronRight} className="size-3.5" />
+        </Pressable></Link> : setup.device ? null : <Text className="text-meta text-muted-foreground">在管理设备上设置</Text>}
+      </View>}
     </View>
     <ErrorText error={error} />
     {!shared.writable ? <Text role="status" className="text-meta text-muted-foreground">{shared.writeNotice || '连上后就能创建。'}</Text> : null}
