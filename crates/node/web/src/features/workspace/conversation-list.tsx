@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router"
-import { Bot, Plus, Star, WifiOff, type LucideIcon } from "lucide-react"
+import { Bot, Plus, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
-import { BotAvatar, CountBadge, EmptyState, Skeleton } from "@/components/app/kit"
+import { BotAvatar, CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -27,7 +27,7 @@ export function ConversationList() {
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
       <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" className="size-11 rounded-xl" />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
-        name={bot.name} mark={workspace.primary === bot.conversation_id ? <Star aria-label="主 Bot" className="size-3.5 shrink-0 fill-current text-muted-foreground" /> : null} />
+        name={bot.name} mark={workspace.primary === bot.conversation_id ? <PrimaryMark /> : null} />
     </li>
   })}</ul>
   else if (!workspace.joined) list = <EmptyState icon={Bot} title="还没有 Bot" />

@@ -5,6 +5,7 @@
 const codes: Record<string, string> = {
   target_not_member: '那台电脑不在我的设备里，访问地址不会转发给它。',
   target_unreachable: '访问地址连不上那台电脑。它可能关机或断网了，稍后会自动重试。',
+  codex_missing: '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。',
 }
 
 const malformed = /invalid|is required|must be|missing/i
@@ -24,7 +25,6 @@ const patterns: [RegExp, string][] = [
   [/question was closed/i, '这个请求已失效，不能再回答。'],
   [/answered meanwhile|no App Server request is waiting/i, '这个请求已经回答过或已过期。'],
   [/no rollout found/i, 'Codex 新对话还没准备好，任务没有开始。请再派一次。'],
-  [/no Codex folder found/i, '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。'],
   [/has no sessions folder/i, '这台电脑的 Codex 还没有会话记录。先用 Codex 跑一次对话，再回来重试。'],
   [/explicit App Server socket/i, '还没填 Codex 的连接路径。'],
   [/App Server socket must be an absolute path/i, '连接路径要是绝对路径。'],

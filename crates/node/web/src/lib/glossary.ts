@@ -1,7 +1,7 @@
 import {
   Ban, Bot, CircleAlert, CirclePause, CircleQuestionMark, Clock, Crown, FileKey, FolderOpen, Globe, Hand, Inbox,
   Key, KeyRound, Laptop, Link, ListChecks, Lock, MessageSquareShare, Monitor, MonitorSmartphone, QrCode, RefreshCw, ScanEye, Server, Settings, ShieldCheck,
-  Smartphone, Sparkles, ArchiveRestore,
+  Smartphone, Sparkles, Star, ArchiveRestore,
 } from "lucide-react"
 
 /** One icon and one word per concept, see docs/design/web-ux.md. */
@@ -24,6 +24,7 @@ export const terms = {
   secret: { label: "密钥", icon: Key },
   restore: { label: "用恢复文件找回", icon: ArchiveRestore },
   bot: { label: "Bot", icon: Bot },
+  primaryBot: { label: "主 Bot", icon: Star },
   ai: { label: "Bot 与任务", icon: Sparkles },
   task: { label: "任务", icon: ListChecks },
   approval: { label: "需要你同意", icon: Hand },

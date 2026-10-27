@@ -2,9 +2,10 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Star, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { BotAvatar, EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
+import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
 import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
@@ -88,7 +89,7 @@ export function BotPanelButton() {
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
               <span className="max-w-48 truncate font-mono" title={model}>{model}</span>
             </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><span>设备默认</span></SettingsRow>}
-            <SettingsRow icon={Star} label="主 Bot" description={primaryHint}>
+            <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
             </SettingsRow>
