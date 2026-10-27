@@ -576,15 +576,14 @@ impl Runtime {
     /// the turns of running and unverified works about once a minute, and carries out the stops
     /// this device holds for its own works. A probe only reads; it never starts or resends.
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let at = now_ms();
-        let read_live = self
-            .live_probe_at
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |last| (at - last >= LIVE_PROBE_MS).then_some(at),
-            )
-            .is_ok();
+        let last = self.live_probe_at.load(Relaxed);
+        let read_live = at - last >= LIVE_PROBE_MS
+            && self
+                .live_probe_at
+                .compare_exchange(last, at, Relaxed, Relaxed)
+                .is_ok();
         let records = self.store.lock().await.work_records()?;
         for record in records {
             if record.kind != WorkKind::Codex {
