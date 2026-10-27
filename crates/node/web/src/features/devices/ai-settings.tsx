@@ -56,7 +56,7 @@ function LinkLine({ link, prefix = "" }: { link: AppServerLink; prefix?: string 
   }[link.state] as [string, LucideIcon, string]
   return <span role="status" className={cn("flex min-w-0 items-center gap-1.5 text-meta", tone)}>
     <Icon aria-hidden="true" className={cn("size-4 shrink-0", link.state === "starting" && "animate-spin")} />
-    <span className="min-w-0 truncate">{prefix}{label}{link.state === "connected" && link.user_agent ? ` · ${link.user_agent}` : ""}</span>
+    <span className="min-w-0 truncate" title={link.state === "connected" ? link.user_agent || undefined : undefined}>{prefix}{label}</span>
   </span>
 }
 

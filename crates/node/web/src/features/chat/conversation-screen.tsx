@@ -24,7 +24,9 @@ import { PromptInput } from './elements/prompt-input'
 import { canSend, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import './chat.css'
 
-const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
+/** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
+const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
+
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
@@ -242,7 +244,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
-              {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : workspace.synced ? <NoBot /> : null}
       />

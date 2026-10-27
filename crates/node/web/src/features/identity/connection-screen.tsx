@@ -323,7 +323,8 @@ function NamesStep({ computer, initial, onNext }: { computer?: string; initial: 
       {renaming
         ? <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" autoFocus value={browser} onChange={(event) => setBrowser(event.target.value)} /></Field>
         : <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
-          <Monitor aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">这个浏览器：</span>
+          <Monitor aria-hidden="true" className="size-4 shrink-0" />
+          <span className="shrink-0 rounded-md bg-muted px-1.5">这个浏览器</span>
           <span className="min-w-0 truncate" title={browser}>{browser}</span>
           <Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="改浏览器名称" title="改浏览器名称" onClick={() => setRenaming(true)}><Pencil aria-hidden="true" /></Button>
         </p>}
