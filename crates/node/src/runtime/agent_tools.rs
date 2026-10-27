@@ -442,6 +442,12 @@ impl Runtime {
                 ))
             })
             .transpose()?;
+        if let Some((author, seq, _)) = at {
+            ensure!(
+                seq <= basis.get(author).copied().unwrap_or(0),
+                "that position is after this turn's history"
+            );
+        }
         let kinds: Vec<String> = match &args["types"] {
             Value::Null => vec![],
             types => serde_json::from_value(types.clone()).context("types lists event types")?,
@@ -449,13 +455,14 @@ impl Runtime {
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
         let (events, more) = store.history_page(network, scope, &basis, at, &kinds, limit)?;
         drop(store);
+        let event_bytes = if limit == 1 { PAGE_BYTES } else { EVENT_BYTES };
         let after = at.is_some_and(|(_, _, after)| after);
         let mut rows = Vec::new();
         let mut used = 0;
         let mut cut = false;
         for event in &events {
             let row = json!({"author":event.event.author,"seq":event.event.seq,"created_at_ms":event.event.created_at_ms,
-                "body":crate::scheduler::bounded(&crate::scheduler::agent_event_body(&event.event.body), EVENT_BYTES),
+                "body":crate::scheduler::bounded(&crate::scheduler::agent_event_body(&event.event.body), event_bytes),
                 "blobs":event.event.blobs});
             used += row.to_string().len();
             if !rows.is_empty() && used > PAGE_BYTES {

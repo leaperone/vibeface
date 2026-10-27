@@ -5176,6 +5176,14 @@ fn a_resumed_session_is_not_shown_its_own_replies_or_the_trigger_twice() -> Resu
         &net.a,
         &net.network,
         "c",
+        reply("r3", ReplyStatus::Stopped),
+        vec![],
+        12,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
         user(&net, "m2", "second"),
         vec![],
         13,
@@ -5194,12 +5202,17 @@ fn a_resumed_session_is_not_shown_its_own_replies_or_the_trigger_twice() -> Resu
     };
     assert_eq!(
         texts(Some((&covers, &local)))?,
-        [json!("reply r2")],
-        "the session holds the reply it wrote; a failed one may never have reached it"
+        [json!("reply r2"), json!("reply r3")],
+        "the session holds the reply it completed; a failed or stopped one may never have run there"
     );
     assert_eq!(
         texts(None)?,
-        [json!("first"), json!("reply r1"), json!("reply r2")],
+        [
+            json!("first"),
+            json!("reply r1"),
+            json!("reply r2"),
+            json!("reply r3")
+        ],
         "a fresh session reads every reply, and the trigger only as the trigger"
     );
     Ok(())

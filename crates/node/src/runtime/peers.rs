@@ -1677,6 +1677,7 @@ impl Runtime {
             let _download = self.blob_fetch.lock().await;
             for (author, blob) in &wanted {
                 if local.as_ref() == Some(author)
+                    || self.sync_failing(author)
                     || self.store.lock().await.has_blob(blob).unwrap_or(false)
                 {
                     continue;

@@ -934,7 +934,7 @@ impl TurnHistory {
             .filter(|event| !covered(&event.event, &self.since))
             .chain(&self.trigger)
     }
-    /// A reply the resumed session wrote itself; a failed one may never have reached it.
+    /// A reply the resumed session completed itself; a stopped or failed one may never have run there.
     fn seen_by_session(&self, event: &Event) -> bool {
         self.resumed_by.as_deref() == Some(event.author.as_str())
             && matches!(
@@ -943,7 +943,7 @@ impl TurnHistory {
                     role: Role::Assistant,
                     ref status,
                     ..
-                } if *status != Some(crate::model::ReplyStatus::Failed)
+                } if matches!(status, None | Some(crate::model::ReplyStatus::Completed))
             )
     }
 }

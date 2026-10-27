@@ -348,7 +348,7 @@ fn authorize_owner(connection: &Connection, network: &str, event: &Event) -> Res
         *known = (*known).max(seq);
     }
     let mut statement = connection.prepare(
-        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND instr(envelope,'conversation_owner')>0",
+        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='conversation_owner'",
     )?;
     let mut rows = statement.query(params![network, scope])?;
     let mut newest: Option<(u64, bool)> = None;

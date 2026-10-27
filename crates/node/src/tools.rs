@@ -199,7 +199,7 @@ impl Tool {
                 &[],
             ),
             Tool::Context => (
-                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types keeps only those event types. more says further events lie that way. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
+                "Read this conversation's events as of this turn, in shared order: the newest, or those before or after the event an author and seq name (a message in your prompt gives both). types keeps only those event types. more says further events lie that way. A long event is cut short; limit 1 reads more of it. With blob_hash, read an attachment instead: offset counts bytes, limit KiB; text comes back as text, other files as data_base64, and one not on this device yet as pending_download.",
                 json!({"before":position(),"after":position(),
                 "types":{"type":"array","items":{"type":"string","enum":EVENT_TYPES},"uniqueItems":true},
                 "limit":{"type":"integer","minimum":1,"maximum":100},
