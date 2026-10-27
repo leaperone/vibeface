@@ -89,7 +89,7 @@ test('receives a charity file through a real native pairing and verifies the sav
   await device.clearKeychain();
   await app.open();
   await screen.getByRole('textbox', /^加入链接/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
-  await screen.getByRole('textbox', /^设备名称/).fill('VDP native receiver');
+  await screen.getByRole('textbox', /^这台手机叫什么/).fill('VDP native receiver');
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' });

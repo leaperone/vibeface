@@ -3,7 +3,8 @@ import { Crown, Laptop, MonitorSmartphone, Smartphone, Trash2 } from 'lucide-rea
 import { useState } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { CopyableId, EmptyState } from '@/components/kit'
+import { deviceCopy } from '@vibeface/client/identity/copy.ts'
+import { CopyableId, Details, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -17,7 +18,7 @@ export default function DeviceDetail() {
   const member = useWorkspace().members.find((item) => item.device_id === deviceId)
   const { busy, error, run } = useRun()
   const [removing, setRemoving] = useState(false)
-  if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这台设备" />
+  if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" />
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
@@ -31,17 +32,18 @@ export default function DeviceDetail() {
             <Text className={cn('text-meta', member.online ? 'text-success' : 'text-muted-foreground')}>{member.online ? '在线' : '离线'}</Text>
           </View>
           {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
-          {member.admin ? <View className="flex-row items-center gap-1"><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理设备</Text></View> : null}
+          {member.admin ? <View className="flex-row items-center gap-1"><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理</Text></View> : null}
         </View>
+        {member.kind === 'node' && !member.online ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
-    <View className="gap-1">
+    <Details>
       <Text className="text-meta text-muted-foreground">设备编号</Text>
       <CopyableId value={member.device_id} label="设备编号" />
-    </View>
+    </Details>
     {removable ? <View className="gap-3 rounded-xl border border-danger-border p-4">
       {removing ? <>
-        <Text>移除后这台设备无法再连接，已有的对话记录会保留。</Text>
+        <Text>{deviceCopy.removeNotice(false)}</Text>
         <View className="flex-row flex-wrap justify-end gap-2">
           <Button variant="ghost" className="min-h-11" onPress={() => setRemoving(false)}><Text>取消</Text></Button>
           <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>

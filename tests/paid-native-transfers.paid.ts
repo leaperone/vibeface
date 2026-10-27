@@ -33,7 +33,7 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await device.installApp(undefined, { reinstall: true });
       await app.open();
       await screen.getByRole('textbox', /^加入链接/).fill(secrets.get('paidAndroidInvitation'), { timeout: 30000 });
-      await screen.getByRole('textbox', /^设备名称/).fill('VDP paid native receiver');
+      await screen.getByRole('textbox', /^这台手机叫什么/).fill('VDP paid native receiver');
       await device.dismissKeyboard();
       await screen.getByRole('button', '加入', { exact: true }).click();
       await expect.poll(async () => (await pairing('android')) !== null, { timeout: 45000, message: 'The real Android member reveals its pairing nonce' }).toBe(true);
