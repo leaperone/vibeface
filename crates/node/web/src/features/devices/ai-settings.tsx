@@ -230,7 +230,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
   return <div className="grid gap-6">
-    <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
+    <ul className={cn("divide-y overflow-hidden rounded-xl border", !onboarding && "bg-card shadow-xs")}>
       {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
         error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
@@ -341,7 +341,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={install[item.provider]} target="_blank" rel="noopener noreferrer">怎么装</a>
     </li>)}</ul> : null}
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
-      <summary className="-mt-2 flex min-h-10 w-fit items-center gap-1 px-4 sm:ps-12 pe-4 text-meta text-muted-foreground hover:text-foreground">
+      <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
       <div className="grid gap-5 px-4 sm:ps-12 pt-1 pb-4">
@@ -426,7 +426,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
 /** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
 function BotHint() {
   return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
-    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开「{deviceCopy.roles.bot.label}」
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开<terms.bot.icon aria-hidden="true" className="size-4 shrink-0" />{deviceCopy.roles.bot.label}
   </p>
 }
 
