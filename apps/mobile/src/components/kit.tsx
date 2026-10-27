@@ -32,6 +32,17 @@ export function ActionCard({ icon, tone = 'warning', title, children, actions }:
   </View>
 }
 
+/** A titled step on a full screen, as the web's <Panel>. */
+export function Panel({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+  return <View className="gap-4">
+    <View className="flex-row items-center gap-2">
+      <Icon as={icon} className="text-muted-foreground" />
+      <Text role="heading" className="text-heading font-semibold">{title}</Text>
+    </View>
+    {children}
+  </View>
+}
+
 export function EmptyState({ icon, title, action }: { icon: LucideIcon; title: string; action?: ReactNode }) {
   return <View className="items-center gap-3 px-4 py-12">
     <Icon as={icon} className="size-8 text-muted-foreground" />
