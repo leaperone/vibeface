@@ -1,5 +1,5 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router'
-import { Crown, Laptop, MonitorSmartphone, Smartphone, Trash2 } from 'lucide-react-native'
+import { Crown, MonitorSmartphone, Trash2 } from 'lucide-react-native'
 import { useState } from 'react'
 import { ScrollView, Switch, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
+import { deviceIcon } from '@/features/devices/device-icon'
 import { cn } from '@/lib/utils'
 import { useRun } from '@/lib/use-run'
 
@@ -25,7 +26,7 @@ export default function DeviceDetail() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
     <View className="flex-row items-center gap-4">
-      <View className="size-12 items-center justify-center rounded-xl bg-muted"><Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-6" /></View>
+      <View className="size-12 items-center justify-center rounded-xl bg-muted"><Icon as={deviceIcon(member)} className="size-6" /></View>
       <View className="min-w-0 flex-1 gap-1">
         <Text className="text-title font-semibold">{member.name}</Text>
         <View className="flex-row flex-wrap items-center gap-3">

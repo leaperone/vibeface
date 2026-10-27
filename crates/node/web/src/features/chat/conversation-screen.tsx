@@ -208,6 +208,16 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     })
   }, [conversationId, data, messagePending])
   useEffect(() => { setSendError(null) }, [conversationId])
+  // Nothing pushes a device's bot readiness, so while no device can reply to an open bot, read it again every 10s.
+  const latest = useRef(workspace)
+  latest.current = workspace
+  useEffect(() => {
+    if (!bot || agentReady) return
+    const read = () => { if (latest.current.isCurrent()) void latest.current.refresh().catch(() => {}) }
+    read()
+    const timer = setInterval(read, 10000)
+    return () => clearInterval(timer)
+  }, [Boolean(bot), agentReady])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {

@@ -1,13 +1,14 @@
-import { Link, Stack, useLocalSearchParams } from 'expo-router'
+import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
 import { Bot, LoaderCircle } from 'lucide-react-native'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { starters } from '@vibeface/client/chat/protocol.ts'
+import { botReadiness } from '@vibeface/client/workspace/model.ts'
 import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -86,6 +87,17 @@ export default function ChatScreen() {
   const live = useLive()
   // No device can run a bot at all: the entry device's AI settings set one up; an offline one only needs to come back.
   const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
+  // Nothing pushes a device's bot readiness, so while no device can reply and this chat is on screen, read it again every 10s.
+  const latestLive = useRef(live)
+  latestLive.current = live
+  const replyReady = live?.nodes.some((node) => botReadiness(node) === 'ready') ?? true
+  useFocusEffect(useCallback(() => {
+    if (replyReady) return
+    const read = () => void latestLive.current?.refresh().catch(() => {})
+    read()
+    const timer = setInterval(read, 10000)
+    return () => clearInterval(timer)
+  }, [replyReady]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is

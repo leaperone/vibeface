@@ -1,6 +1,6 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { ArrowRightLeft, Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
@@ -13,6 +13,7 @@ import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
+import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { useWide } from '@/lib/layout'
 import { cn } from '@/lib/utils'
@@ -104,8 +105,6 @@ function Section({ icon, title, children }: { icon: LucideIcon; title: string; c
   </View>
 }
 
-const kindIcon = (member: Member) => member.kind === 'client' ? Smartphone : Laptop
-
 function MemberRow({ member, first }: { member: Member; first: boolean }) {
   // iOS sits inline views on the line box, not the glyph baseline, so they sink as the line height grows with Dynamic Type.
   // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
@@ -113,7 +112,7 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
   const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 1
   return <Link href={`/device/${member.device_id}`} asChild>
     <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
-      <Icon as={kindIcon(member)} className="text-muted-foreground" />
+      <Icon as={deviceIcon(member)} className="text-muted-foreground" />
       {/* Title and subtitle, as a system cell. The name wraps in full so the inline crown is never cut off with it. */}
       <View className="min-w-0 flex-1">
         <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
