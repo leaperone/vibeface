@@ -34,7 +34,8 @@ pub const SCHEMA_VERSION: u32 = crate::config::DATA_EPOCH;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteState {
-    /// Started with other member Nodes; waits for one to confirm it holds nothing newer of ours.
+    /// Started from a database file it never wrote from, with other member Nodes; waits for
+    /// them to confirm it holds nothing newer of ours.
     Aligning,
     /// No other member Node answered; writable once the user confirms no backup was restored.
     ReadOnly,
@@ -539,6 +540,45 @@ impl Store {
             );
         }
         Ok(open)
+    }
+    /// This database file as the filesystem knows it: inode and creation time. Copying the data
+    /// directory or restoring it from a backup writes a new file, so the values change.
+    fn file_identity(&self) -> Option<String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata =
+            std::fs::metadata(self.connection.path().filter(|path| !path.is_empty())?).ok()?;
+        let born = metadata
+            .created()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |at| at.as_nanos());
+        Some(format!("{}:{born}", metadata.ino()))
+    }
+    /// Whether this Node last wrote from this very file, so it holds everything it wrote.
+    pub fn wrote_from_this_file(&self) -> Result<bool> {
+        let Some(identity) = self.file_identity() else {
+            return Ok(false);
+        };
+        let recorded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key='write-file'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(recorded == Some(identity))
+    }
+    /// Notes that this Node writes from this file; a later start from the same file needs no
+    /// alignment.
+    pub fn record_write_file(&self) -> Result<()> {
+        if let Some(identity) = self.file_identity() {
+            self.connection.execute(
+                "INSERT INTO identity_meta(key,value) VALUES('write-file',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [identity],
+            )?;
+        }
+        Ok(())
     }
     /// Every local append checks this gate; it lives only as long as this connection.
     pub fn set_write_state(&mut self, state: WriteState) -> Result<()> {

@@ -163,6 +163,8 @@ pub struct Runtime {
     /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
     /// stop and its deadline are stored, so a restart retries at once.
     stop_retries: std::sync::Mutex<HashMap<String, (u32, i64)>>,
+    /// When reconciliation last read every running or unverified work's turn.
+    live_probe_at: std::sync::atomic::AtomicI64,
     pub local_access: Arc<crate::local_access::LocalAccess>,
     /// Operator token of the public entry's relay: this entry's own, or the one it serves.
     pub(crate) entry_token: Option<String>,
@@ -297,6 +299,7 @@ impl Runtime {
             codex,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
+            live_probe_at: std::sync::atomic::AtomicI64::new(now_ms()),
             local_access,
             entry_token,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
@@ -484,6 +487,9 @@ impl Runtime {
         if let Some(bridge) = self.cursor.get() {
             bridge.stop().await;
         }
+    }
+    pub(crate) fn writable(&self) -> bool {
+        *self.write_state.borrow() == WriteState::Writable
     }
     pub async fn append(&self, network: &str, scope: &str, body: EventBody) -> Result<SignedEvent> {
         self.append_blobs(network, scope, body, vec![]).await

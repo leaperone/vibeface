@@ -2050,6 +2050,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_reads_a_running_turn_whose_end_was_missed() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let mut requests =
+                scripted_app_server(&node, move |request| match request["method"].as_str() {
+                    Some("thread/read") => json!({"result":{"thread":{"turns":[
+                        {"id":"u-1","status":"completed","items":[]}]}}}),
+                    _ => json!({"result":{}}),
+                })?;
+            connected(&node).await;
+            let network = node.network_id().await?;
+            running_work(&node, "w-missed").await?;
+            node.reconcile_works(&network).await?;
+            assert_eq!(methods(&mut requests), [] as [&str; 0], "not due yet");
+
+            node.live_probe_at
+                .store(now_ms() - 60_000, std::sync::atomic::Ordering::Relaxed);
+            node.reconcile_works(&network).await?;
+            assert_eq!(
+                methods(&mut requests),
+                ["thread/read"],
+                "read, never resent"
+            );
+            assert!(matches!(
+                state(&node, "w-missed").await?,
+                crate::work::WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Completed
+                }
+            ));
+            node.reconcile_works(&network).await?;
+            assert_eq!(methods(&mut requests), [] as [&str; 0]);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn a_held_stop_outlives_a_failed_interrupt_and_ends_with_its_work() -> Result<()> {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (node, admin, dir) = node().await?;

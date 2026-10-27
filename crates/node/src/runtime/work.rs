@@ -14,6 +14,9 @@ use vibeface_bridge::{
 const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A stop not confirmed by then shows as still trying; it is retried until its work ends.
 const STOP_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Reconciliation reads the turn of each running or unverified work this often, so an end the
+/// event stream missed is still recorded.
+const LIVE_PROBE_MS: i64 = 60_000;
 /// The user waits this long for the first stop attempt; a stop is idempotent, so retries are safe.
 const STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Retries of a held stop start this far apart and double up to `STOP_RETRY_MAX_MS`.
@@ -569,18 +572,30 @@ impl Runtime {
         }
     }
 
-    /// Settles works the Agent registered but did not finish starting within its window, and
-    /// carries out the stops this device holds for its own works.
+    /// Settles works the Agent registered but did not finish starting within its window, reads
+    /// the turns of running and unverified works about once a minute, and carries out the stops
+    /// this device holds for its own works. A probe only reads; it never starts or resends.
     pub(super) async fn reconcile_works(self: &Arc<Self>, network: &str) -> Result<()> {
+        let at = now_ms();
+        let read_live = self
+            .live_probe_at
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |last| (at - last >= LIVE_PROBE_MS).then_some(at),
+            )
+            .is_ok();
         let records = self.store.lock().await.work_records()?;
         for record in records {
-            if matches!(
-                record.state,
-                WorkState::Accepted | WorkState::Starting { .. }
-            ) && record.kind == WorkKind::Codex
-                && record.send_window_over(now_ms())
-                && let Err(error) = self.probe_work(network, &record.work_id, false).await
-            {
+            if record.kind != WorkKind::Codex {
+                continue;
+            }
+            let due = match record.state {
+                WorkState::Accepted | WorkState::Starting { .. } => record.send_window_over(at),
+                WorkState::Running { .. } | WorkState::Unverified { probe: true, .. } => read_live,
+                _ => false,
+            };
+            if due && let Err(error) = self.probe_work(network, &record.work_id, false).await {
                 tracing::debug!(%error, "work probe waits for the App Server");
             }
         }

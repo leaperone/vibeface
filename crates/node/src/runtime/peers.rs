@@ -883,25 +883,36 @@ impl Runtime {
         }
     }
 
-    /// Starting up with other member Nodes, this one waits to learn it holds every event it
-    /// wrote before (a restored backup may not); with none, it writes right away.
+    /// Started from the database file it last wrote from, this Node holds every event it wrote
+    /// and writes right away, as it does with no other member Node. A new file (a copy, or a
+    /// restored backup) waits to learn from the others that it holds every event it wrote.
     pub(super) async fn align_on_start(&self) -> Result<bool> {
         if !self.has_membership().await? {
+            self.store.lock().await.record_write_file()?;
             return Ok(true);
         }
         let (network, peers) = self.member_peers().await?;
-        let forked = self
-            .store
-            .lock()
-            .await
-            .has_conflicts_by(&network, &self.identity.device_id()?)?;
-        let state = match (forked, peers.is_empty()) {
+        let (forked, same_file) = {
+            let store = self.store.lock().await;
+            (
+                store.has_conflicts_by(&network, &self.identity.device_id()?)?,
+                store.wrote_from_this_file()?,
+            )
+        };
+        let state = match (forked, same_file || peers.is_empty()) {
             (true, _) => WriteState::Forked,
             (false, true) => WriteState::Writable,
             (false, false) => WriteState::Aligning,
         };
-        self.set_write_state(&network, &[WriteState::Writable], state)
-            .await;
+        if state == WriteState::Writable {
+            self.store.lock().await.record_write_file()?;
+        }
+        let from = [
+            WriteState::Writable,
+            WriteState::Aligning,
+            WriteState::ReadOnly,
+        ];
+        self.set_write_state(&network, &from, state).await;
         Ok(state == WriteState::Writable)
     }
 
@@ -965,7 +976,11 @@ impl Runtime {
         if current == to || !from.contains(&current) {
             return false;
         }
-        if let Err(error) = store.set_write_state(to) {
+        let recorded = match to {
+            WriteState::Writable => store.record_write_file(),
+            _ => Ok(()),
+        };
+        if let Err(error) = recorded.and_then(|()| store.set_write_state(to)) {
             tracing::warn!(%error, "write state change pending");
             return false;
         }
@@ -2384,6 +2399,54 @@ mod tests {
         .await;
         drop(a);
         std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_restart_from_the_same_file_writes_alone_and_a_copy_waits() -> Result<()> {
+        let ia = LocalIdentity::generate();
+        let others = [LocalIdentity::generate(), LocalIdentity::generate()];
+        let state = ia.sign_network_fixture(
+            1,
+            vec![
+                ia.device_id()?,
+                others[0].device_id()?,
+                others[1].device_id()?,
+            ],
+        )?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir) = node(&ia).await?;
+        let result = async {
+            a.install_membership(state).await?;
+            assert!(
+                !a.align_on_start().await?,
+                "no record of writing from this file yet"
+            );
+            a.confirm_writable(&network, "test").await?;
+
+            a.set_write_state(&network, &[WriteState::Writable], WriteState::Aligning)
+                .await;
+            assert!(
+                a.align_on_start().await?,
+                "the file it last wrote from holds all it wrote; no other Node needs to answer"
+            );
+            assert_eq!(*a.write_state.borrow(), WriteState::Writable);
+
+            let copy = dir.canonicalize()?.join("copy.sqlite3");
+            a.store
+                .lock()
+                .await
+                .connection
+                .execute("VACUUM INTO ?", [copy.to_str().context("path")?])?;
+            assert!(
+                !Store::open(&copy)?.wrote_from_this_file()?,
+                "a copied or restored database waits for the other Nodes or the user"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(a);
+        let _ = std::fs::remove_dir_all(dir);
         result
     }
 

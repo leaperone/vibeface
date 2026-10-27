@@ -3611,12 +3611,11 @@ def discovery_acceptance(options):
     def peer(node, target):
         return next((row for row in node_status(node).get("peers", []) if row["device_id"] == target.device_id), {})
 
-    def reconnect(node, network, *, writable=True):
+    def reconnect(node, network):
         node.client.close()
         node.client.connect(node.device_id)
         node.client.authenticate(network)
-        if writable:
-            wait_for("the management Node is aligned and writable", lambda: node_status(node).get("write_state") == "writable", timeout=60)
+        wait_for("the management Node is aligned and writable", lambda: node_status(node).get("write_state") == "writable", timeout=60)
 
     def stopped_browser(node):
         try:
@@ -3688,8 +3687,7 @@ def discovery_acceptance(options):
         a.start()
         b.start()
         wait_for("disjoint IP families cannot complete business through discovery", lambda: peer(a, b).get("reachable") is False, timeout=45)
-        reconnect(a, network, writable=False)
-        require(a.client.call("confirm_writable")["state"] == "writable", "the test manager explicitly permits an isolated write")
+        reconnect(a, network)
         a.client.rpc("create_conversation", conversation_id="discovery-blocked", title="Direct path blocked")
         require_quiet("discovery never forwards the blocked event", lambda: heads(b, network) != heads(a, network))
         require(peer(a, b).get("path") is None, "no data path is hidden behind discovery")
@@ -3868,14 +3866,11 @@ def phase5_acceptance(options):
         b.stop()
         a.stop()
         reopen(a)
-        until(a, "read_only")
-        refused = write(a.client, status=400)["error"]
-        require("read-only" in refused, "alone, A refuses writes until the user confirms")
-        alone = node_status(a)
-        require(alone["write_state"] == "read_only" and alone["peers"][0]["reachable"] is False, "status shows read-only and the unreachable peer")
-        require(a.client.call("confirm_writable")["state"] == "writable", "the user's confirmation makes A writable")
+        require(state(a.client)["state"] == "writable", "restarted from the file it last wrote from, A writes alone")
         write(a.client)
-        passed("offline-node-stays-read-only-until-confirmed", refused=refused[:120])
+        alone = node_status(a)
+        require(alone["write_state"] == "writable" and alone["peers"][0]["reachable"] is not True, "status shows writes and the absent peer")
+        passed("restart-from-the-same-data-writes-while-peers-are-offline")
 
         a.stop()
         copied = run / "A-copy"
@@ -3893,7 +3888,9 @@ def phase5_acceptance(options):
         nodes.append(twin)
         reopen(twin)
         until(twin, "read_only")
-        twin.client.call("confirm_writable")
+        refused = write(twin.client, status=400)["error"]
+        require("read-only" in refused, "alone, the copy refuses writes until the user confirms")
+        require(twin.client.call("confirm_writable")["state"] == "writable", "the user's confirmation makes the copy writable")
         write(twin.client)
         b.start()
         until(twin, "forked")

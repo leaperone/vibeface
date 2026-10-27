@@ -2160,6 +2160,43 @@ fn a_schedule_time_runs_once_across_owners() -> Result<()> {
 }
 
 #[test]
+fn a_new_owner_leaves_times_due_before_the_handover_to_the_former_owner() -> Result<()> {
+    let net = net()?;
+    let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 5)?;
+    let every = 5 * 60_000;
+    let slot = 1_000 + 3 * every;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        slot + 30,
+    )?;
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, slot + 40)?
+            .is_empty(),
+        "the time A may have run while cut off is not run again"
+    );
+    assert!(b_side.scheduler_jobs("c")?.is_empty());
+    let next = slot + every;
+    assert_eq!(
+        b_side.admit_due_schedules(&net.b, &net.network, next + 10)?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, next))]
+    );
+
+    sync(&b_side, &mut a_side, &net)?;
+    assert!(
+        a_side
+            .admit_due_schedules(&net.a, &net.network, next + 20)?
+            .is_empty(),
+        "the former owner stops once it sees the newer epoch"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_skipped_late_time_is_not_run_by_the_next_owner() -> Result<()> {
     let net = net()?;
     let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 60)?;

@@ -31,7 +31,7 @@ export function WriteCard({ kind }: { kind: WriteCardKind }) {
   const here = entry ? nodeName(entry, lookup) : "这台电脑"
   const canManage = device.ready?.principal.can_manage === true
   const away = workspace.nodes.filter((node) => !node.revoked && !node.online && node.device_id !== entry).map((node) => nodeName(node.device_id, lookup)).join("、")
-  const unreached = `${away ? `${away} ` : "其他设备都"}连不上，没法确认数据是最新的。`
+  const unreached = `这份数据像是复制或恢复来的，${away ? `${away} ` : "其他设备都"}连不上，没法确认是最新的。`
   if (kind === "read_only") return <ActionCard icon={Lock} title={`${here} 暂时只读`} actions={!canManage ? undefined : waiting
     ? <Button type="button" variant="ghost" onClick={() => setWaiting(false)}>返回</Button>
     : <>

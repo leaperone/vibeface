@@ -59,7 +59,7 @@ impl Runtime {
 
     /// Queues the schedules that are due in conversations this Node schedules.
     async fn fire_schedules(self: &Arc<Self>) -> Result<()> {
-        if self.manager().is_none() {
+        if self.manager().is_none() || !self.writable() {
             return Ok(());
         }
         let Some(network) = self.store.lock().await.network()? else {
@@ -77,7 +77,11 @@ impl Runtime {
         Ok(())
     }
 
+    /// Stops for good once this Node's log forks: a turn would act without a record.
     async fn schedule_tick(self: &Arc<Self>) -> Result<()> {
+        if !self.writable() {
+            return Ok(());
+        }
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
