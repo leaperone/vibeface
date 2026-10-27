@@ -14,6 +14,7 @@ import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
+import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 
 /**
@@ -97,6 +98,11 @@ function AiSettings() {
     const timer = setTimeout(() => void load(), 2000)
     return () => clearTimeout(timer)
   }, [response])
+  // Nothing pushes a device's bot readiness or folders; the new bot form and the chats read them from `nodes`, so read them again when they move.
+  const live = useLive()
+  const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
+  const folders = response?.settings.roots.join('\n')
+  useEffect(() => { if (folders !== undefined) void live?.refresh().catch(() => {}) }, [botState, folders])
   if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-28 rounded-xl bg-muted" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
