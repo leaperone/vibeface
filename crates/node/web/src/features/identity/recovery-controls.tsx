@@ -9,6 +9,7 @@ import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryCode, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
 import { deviceIcon } from '@/features/devices/devices'
 import { setRotateHint } from '@/lib/rotate-hint'
 
@@ -217,7 +218,7 @@ export function RecoveryReview() {
   const { busy, error, run } = useGenerationRun()
   const [lost, setLost] = useState<string[]>([])
   if (review?.kind !== 'recovery') return null
-  return <Panel icon={ArchiveRestore} title="哪台设备丢了？">
+  return <Panel icon={ArchiveRestore} title={recoveryCopy.whichLost}>
     <fieldset disabled={busy} className="grid gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
@@ -234,14 +235,14 @@ export function RecoveryReview() {
         </div>
       })}
     </fieldset>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />2 天后生效，期间你的其他设备可以拦下</p>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hourglass aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.delay}</p>
     <p className="flex items-center gap-2 text-meta text-muted-foreground"><Download aria-hidden="true" className="size-4 shrink-0" />会下载新的恢复文件，生效后旧文件作废</p>
     <InlineError error={error || null} />
     <div className="flex flex-wrap justify-between gap-2">
       <Button type="button" variant="ghost" className="-ms-3" onClick={device.cancelSensitive}>取消</Button>
       <Button type="button" disabled={busy} onClick={() => void run(() => device.confirmRecovery(review.members.filter((member) => member.device_id === review.requiredNode || !lost.includes(member.device_id))))}><BusyIcon busy={busy} />找回</Button>
     </div>
-    {busy ? <p className="text-meta text-muted-foreground">如果已经提交，取消不会撤回。</p> : null}
+    {busy ? <p className="text-meta text-muted-foreground">{recoveryCopy.cancelLate}</p> : null}
   </Panel>
 }
 
@@ -266,13 +267,13 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   // In settings the password is a row that folds its form out below itself; alone, a form stands as a card.
   const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
-      <p className="text-meta text-muted-foreground">只找回设备和管理权限，不含对话</p>
+      <p className="text-meta text-muted-foreground">{recoveryCopy.scope}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           let work: Promise<void>
           try {
-            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`请在“${target ? '连接到哪台电脑' : '手动填写'}”里填好要连的电脑。`)
+            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`请在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好要连的电脑。`)
             work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
           }
           finally { clearPasswords(form) }
@@ -284,7 +285,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         <Label label="这个浏览器叫什么？"><Input name="name" required maxLength={128} defaultValue={defaultBrowserName()} /></Label>
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
         {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />在要连的电脑上打开本机页面再找回</p>}
-        <Details label={target ? '连接到哪台电脑' : '手动填写'}>
+        <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
           <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
@@ -293,7 +294,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
       </fieldset></form>
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
-      <p className="text-meta text-muted-foreground">需要现在的恢复文件和旧密码，旧文件会作废</p>
+      <p className="text-meta text-muted-foreground">{recoveryCopy.replaceHint}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
@@ -303,7 +304,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           await work
           if (device.ready) setRotateHint(device.ready.principal.network_id, false)
           if (!only) close()
-        }, '已换密码，旧恢复文件已失效')
+        }, recoveryCopy.replaced)
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><PasswordInput name="old_password" autoComplete="off" required /></Label>

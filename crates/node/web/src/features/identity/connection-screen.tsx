@@ -13,6 +13,7 @@ import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrows
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
+import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
@@ -89,9 +90,9 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
 
 /** The code appears once the device that sent the link shows its own, so until then the next step is over there. */
 function JoinCode({ code }: { code?: string }) {
-  if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />在发链接的设备上点“显示安全码”</p>
+  if (!code) return <p role="status" className="flex items-center gap-2 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />{joinCopy.showCode}</p>
   return <>
-    <p role="status" className="flex items-center gap-2 text-muted-foreground"><WaitingDot />两边的安全码一致，就在那边点允许</p>
+    <p role="status" className="flex items-center gap-2 text-muted-foreground"><WaitingDot />{joinCopy.compareCode}</p>
     <SafetyCode code={code} />
   </>
 }
@@ -101,7 +102,7 @@ function NodeJoin() {
   const device = useDevice()
   const joining = device.nodeJoining!
   const [cancelling, setCancelling] = useState(false)
-  return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : '等待批准'}>
+  return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : joinCopy.waiting}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
       <JoinCode code={joining.code} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
@@ -214,7 +215,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
-      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />用加入链接</Button> : null}
+      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
     </div>
   </div> : null
@@ -264,7 +265,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     alertInBody = true
     body = <Panel icon={publicEntry ? QrCode : Link2} title={publicEntry ? '扫码加入' : thisComputer ? '把这台电脑加入我的设备' : removed ? '重新加入' : '加入我的设备'}>
       {/* A failure or the removal notice already says where to go next. */}
-      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">链接来自{publicEntry && !thisComputer ? '你的电脑' : '已有设备'}上的“添加设备”</p>}
+      {failed || removed ? null : <p className="-mt-2 text-meta text-muted-foreground">{joinCopy.linkSource(publicEntry && !thisComputer ? '你的电脑' : undefined)}</p>}
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">

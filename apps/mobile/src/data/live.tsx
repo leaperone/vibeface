@@ -28,7 +28,7 @@ function useConnection(): { session: Session; connection: Connection } {
   const device = useDevice()
   const access = accessOf({ ready: Boolean(device.ready), phase: device.phase, joining: Boolean(device.joining), savedEntries: device.entries.length, invitation: false, offlineRetryMs: null })
   const session: Session = access.kind === 'member' || access.kind === 'resuming' || access.kind === 'loading' && device.entries.length ? { phase: 'ready' }
-    : device.joining ? { phase: 'joining', deviceName: device.joining.name, code: device.joining.code ?? null }
+    : device.joining ? { phase: 'joining', code: device.joining.code ?? null }
     : { phase: 'unjoined' }
   const { link } = device
   const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
