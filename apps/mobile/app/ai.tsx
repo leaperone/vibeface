@@ -103,7 +103,7 @@ function AiSettings() {
   const live = useLive()
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
-  useEffect(() => { if (folders !== undefined) live?.refresh().catch((cause) => { if (ready?.isCurrent()) setError({ at: '', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
+  useEffect(() => { if (folders !== undefined) live?.refresh().then(() => setError((shown) => shown?.at === 'refresh' ? null : shown), (cause) => { if (ready?.isCurrent()) setError({ at: 'refresh', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
   if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-28 rounded-xl bg-muted" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
@@ -117,7 +117,7 @@ function AiSettings() {
       change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
       saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
     <PathList label="可用文件夹" items={roots} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
-    {error && (error.at === 'roots' || error.at === '') ? <ErrorText error={error.text} /> : null}
+    {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
 }
 
