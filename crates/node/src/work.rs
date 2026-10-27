@@ -3,6 +3,7 @@
 //! the pending-check list and the Web state all derive from it.
 use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
+use vibeface_bridge::{failure::ExecFailure, turn::TurnStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkSpec {
@@ -50,6 +51,8 @@ pub enum DispatchState {
     Accepted,
     Rejected {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureKind>,
     },
     /// The target can no longer answer (it was removed); whether it took the work is unknown.
     Unverified {
@@ -73,7 +76,7 @@ impl DispatchState {
     }
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Self::Rejected { reason } | Self::Unverified { reason } => Some(reason),
+            Self::Rejected { reason, .. } | Self::Unverified { reason } => Some(reason),
             Self::Pending | Self::Accepted => None,
         }
     }
@@ -197,9 +200,9 @@ pub enum Probe {
     Running { turn_id: String, epoch: u64 },
     Terminal {
         turn_id: String,
-        status: String,
+        status: TurnStatus,
         text: String,
-        error: Option<String>,
+        error: Option<ExecFailure>,
     },
     /// The thread has no turn: nothing started.
     NotStarted,
@@ -222,7 +225,7 @@ pub enum Signal {
         epoch: u64,
     },
     /// Nothing started: the Agent reported a refusal, or the window passed before it bound a thread.
-    StartRejected(String),
+    StartRejected(ExecFailure),
     Text(String),
     /// A plan or commentary update; persisted at most every `PROGRESS_INTERVAL_MS`.
     Progress {
@@ -232,9 +235,9 @@ pub enum Signal {
     InterruptRequested,
     TurnCompleted {
         turn_id: String,
-        status: String,
+        status: TurnStatus,
         text: String,
-        error: Option<String>,
+        error: Option<ExecFailure>,
     },
     /// The App Server restarted; live requests from the old epoch are gone.
     Disconnected,
@@ -244,11 +247,13 @@ pub enum Signal {
     Settled(WorkOutcome),
     /// The coordination process of an unverified agent task is gone; its turn did not finish.
     ProcessExited,
-    /// An agent task's coordination turn ended; its reply is the result.
+    /// An agent task's coordination turn ended; its reply is the result. `failure` names the
+    /// execution failure that ended it, if one did.
     Concluded {
         outcome: WorkOutcome,
         text: String,
         reason: Option<String>,
+        failure: Option<FailureKind>,
     },
 }
 
@@ -295,6 +300,7 @@ fn finish(
     record: &mut WorkRecord,
     outcome: WorkOutcome,
     reason: Option<String>,
+    failure: Option<FailureKind>,
 ) -> Option<EventBody> {
     record.state = WorkState::Finished { outcome };
     Some(EventBody::WorkFinished {
@@ -302,8 +308,19 @@ fn finish(
         outcome,
         result_text: bounded(&record.text),
         failure_reason: reason.map(|reason| bounded(&reason)),
+        failure,
         attestation: None,
     })
+}
+
+/// Ends the work with an execution failure, its detail as the reason.
+fn finish_failed(
+    record: &mut WorkRecord,
+    outcome: WorkOutcome,
+    failure: Option<ExecFailure>,
+) -> Option<EventBody> {
+    let (reason, kind) = failure.map(|f| (f.detail, f.kind)).unzip();
+    finish(record, outcome, reason, kind)
 }
 
 const DISCONNECTED: &str = "执行器连接已断开，等待重新核对";
@@ -332,6 +349,7 @@ fn unverified(
         outcome: WorkOutcome::Unverified,
         result_text: bounded(&record.text),
         failure_reason: Some(bounded(evidence)),
+        failure: None,
         attestation: None,
     })
 }
@@ -347,12 +365,12 @@ fn progress(record: &WorkRecord, phase: WorkPhase, summary: &str) -> Option<Even
     })
 }
 
-fn turn_outcome(status: &str) -> Option<WorkOutcome> {
+fn turn_outcome(status: &TurnStatus) -> Option<WorkOutcome> {
     match status {
-        "completed" => Some(WorkOutcome::Completed),
-        "failed" => Some(WorkOutcome::Failed),
-        "interrupted" => Some(WorkOutcome::Interrupted),
-        _ => None,
+        TurnStatus::Completed => Some(WorkOutcome::Completed),
+        TurnStatus::Failed => Some(WorkOutcome::Failed),
+        TurnStatus::Interrupted => Some(WorkOutcome::Interrupted),
+        TurnStatus::InProgress | TurnStatus::Other(_) => None,
     }
 }
 
@@ -391,8 +409,8 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 probe: true,
                 ..
             },
-            Signal::StartRejected(reason),
-        ) => finish(record, WorkOutcome::Rejected, Some(reason)),
+            Signal::StartRejected(failure),
+        ) => finish_failed(record, WorkOutcome::Rejected, Some(failure)),
         (Running { .. } | Interrupting { .. }, Signal::Text(text)) => {
             record.text = bounded(&text);
             None
@@ -426,11 +444,11 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 record.text = bounded(&text);
             }
             match turn_outcome(&status) {
-                Some(outcome) => finish(record, outcome, error),
+                Some(outcome) => finish_failed(record, outcome, error),
                 None => unverified(
                     record,
                     Some(handle),
-                    &format!("执行器返回未知状态：{status}"),
+                    &format!("执行器返回未知状态：{}", status.as_str()),
                     true,
                 ),
             }
@@ -575,6 +593,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             record,
             WorkOutcome::Interrupted,
             Some("Bot 进程已退出，任务没有做完".into()),
+            Some(FailureKind::Lost),
         ),
         (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
@@ -586,6 +605,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 outcome,
                 text,
                 reason,
+                failure,
             },
         ) => {
             record.text = bounded(&text);
@@ -596,7 +616,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                     reason.as_deref().unwrap_or("Bot 进程没有确认退出"),
                     false,
                 ),
-                outcome => finish(record, outcome, reason),
+                outcome => finish(record, outcome, reason, failure),
             }
         }
         _ => None,
@@ -688,7 +708,7 @@ mod tests {
         transition(&mut work, Signal::InterruptRequested);
         let completed = |status: &str| Signal::TurnCompleted {
             turn_id: "tu".into(),
-            status: status.into(),
+            status: TurnStatus::of(status),
             text: String::new(),
             error: None,
         };
@@ -697,6 +717,23 @@ mod tests {
             transition(&mut timed_out, Signal::InterruptTimedOut),
             Some(EventBody::WorkFinished {
                 outcome: WorkOutcome::Unverified,
+                ..
+            })
+        ));
+        let mut failed = work.clone();
+        assert!(matches!(
+            transition(
+                &mut failed,
+                Signal::TurnCompleted {
+                    turn_id: "tu".into(),
+                    status: TurnStatus::Failed,
+                    text: String::new(),
+                    error: Some(ExecFailure::new(FailureKind::Quota, "429")),
+                }
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Failed,
+                failure: Some(FailureKind::Quota),
                 ..
             })
         ));
@@ -721,7 +758,7 @@ mod tests {
                 &mut work,
                 Signal::Probed(Probe::Terminal {
                     turn_id: "tu".into(),
-                    status: "completed".into(),
+                    status: TurnStatus::Completed,
                     text: "done".into(),
                     error: None,
                 })
@@ -795,7 +832,7 @@ mod tests {
                 &mut late,
                 Signal::TurnCompleted {
                     turn_id: "tu".into(),
-                    status: "completed".into(),
+                    status: TurnStatus::Completed,
                     text: "done".into(),
                     error: None,
                 }
@@ -825,16 +862,24 @@ mod tests {
             probe: true,
         };
         assert!(matches!(
-            transition(&mut refused, Signal::StartRejected("refused".into())),
+            transition(
+                &mut refused,
+                Signal::StartRejected(ExecFailure::new(FailureKind::Rejected, "refused"))
+            ),
             Some(EventBody::WorkFinished {
                 outcome: WorkOutcome::Rejected,
+                failure: Some(FailureKind::Rejected),
+                failure_reason: Some(ref reason),
                 ..
-            })
+            }) if reason == "refused"
         ));
 
         let mut unbound = record();
         assert!(matches!(
-            transition(&mut unbound, Signal::StartRejected("window over".into())),
+            transition(
+                &mut unbound,
+                Signal::StartRejected(ExecFailure::new(FailureKind::TimedOut, "window over"))
+            ),
             Some(EventBody::WorkFinished {
                 outcome: WorkOutcome::Rejected,
                 ..

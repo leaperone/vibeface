@@ -35,7 +35,7 @@ type Fields = Record<string, unknown>
 const str = (value: unknown) => typeof value === 'string' && value ? value : undefined
 const turnEnded: Record<string, string> = { completed: 'Bot 回复完成', failed: 'Bot 回复失败', interrupted: 'Bot 回复中断', cancelled: 'Bot 回复已取消' }
 const workStates: Record<string, string> = { accepted: '任务已接下', starting: '任务准备开始', running: '任务进行中', interrupting: '任务正在停止', unverified: '任务结果待确认' }
-const workOutcomes: Record<string, string> = { completed: '任务完成', failed: '任务失败', interrupted: '任务已中断', rejected: '任务被拒绝', unverified: '任务结果待确认', abandoned: '任务已放弃' }
+const workOutcomes: Record<string, string> = { completed: '任务完成', failed: '任务失败', interrupted: '任务已中断', rejected: '任务被拒绝', unverified: '任务结果待确认' }
 /** Plain titles for the stable event names the device and this page write; others show their own message. */
 const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
   'agent.turn.started': 'Bot 开始回复',

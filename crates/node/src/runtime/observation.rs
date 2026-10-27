@@ -200,11 +200,9 @@ pub(crate) fn native_progress(event: &Value) -> Value {
         return json!({"type":"text_snapshot","item_id":bounded_text(item_id,128),"text":bounded_text(text,8000)});
     }
     if method == "turn/completed" {
-        let status = match params["turn"]["status"].as_str() {
-            Some("completed") => "completed",
-            Some("interrupted") => "interrupted",
-            Some("failed") => "failed",
-            _ => "unknown",
+        let status = match vibeface_bridge::turn::turn_snapshot(&params["turn"]).status {
+            Some(status) if status.ended() => status.as_str().to_owned(),
+            _ => "unknown".into(),
         };
         return json!({"type":"status","status":status});
     }

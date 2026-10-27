@@ -1,3 +1,5 @@
+import type { FailureKind } from "../lib/errors.ts"
+
 export type ReplyStatus = "completed" | "stopped" | "interrupted" | "failed"
 /** A file on a user's message: hex SHA-256, byte size and its cleaned file name. */
 export type Attachment = { hash: string; size: number; name: string }
@@ -9,6 +11,8 @@ export type TranscriptMessage = {
   created_at_ms: number
   in_reply_to?: string
   status?: ReplyStatus
+  /** On a failed or interrupted reply: why, as a kind; the original text stays on its device. */
+  failure?: FailureKind
   attachments?: Attachment[]
   /** On a user message: the question it answers. */
   answers?: string

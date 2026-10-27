@@ -16,21 +16,13 @@ const patterns: [RegExp, string][] = [
   [/log has forked/i, '这台电脑的数据被复制过，已暂停发送。去待处理看看。'],
   [/read-only until you confirm/i, '这台电脑暂时只读。去待处理确认一下就能发送。'],
   [/aligning with other Nodes/i, '正在和你的其他设备同步，稍后就能发送。'],
-  [/Missing environment variable|CURSOR_API_KEY is (required|missing)/i, 'AI 服务缺少密钥。去设备页的「Bot 与任务」里填上。'],
-  [/Codex execution is turned off/i, '这台电脑的 Codex 没开执行任务。去设备页的「Bot 与任务」里打开。'],
   [/is set by Vibeface/i, '这个变量由 Vibeface 自己设置，换个名字。'],
   [/variable names use/i, '变量名只能用字母、数字和下划线，且不能以数字开头。'],
   [/variable value must be|variables per provider/i, '变量值不能为空，也不能太长。'],
-  [/Cursor SDK bridge did not start within/i, 'Cursor 组件启动超时，这次回复没有开始。请稍后再发一次。'],
-  [/completion is unknown|reconcile its outcome/i, 'Bot 中途断开，结果未知。先看看有没有回复，再决定要不要重发。'],
   [/outcome may be unknown|timed out/i, '设备没有及时回复，结果未知。请先确认结果，不要重复提交。'],
-  [/Cursor SDK requires (an explicit )?model/i, 'Cursor 还没选模型。去设备页的「Bot 与任务」里选一个。'],
   [/no configured management SDK/i, '这台电脑没开 Bot。去设备页的「Bot 与任务」里选一个。'],
-  [/configured executable was not found/i, '这台电脑上的 Bot 程序找不到了。去设备页检查「Bot 与任务」。'],
-  [/Cursor SDK|cursor-sdk-bridge/i, 'Cursor 没能完成这次回复。请再发一次；一直不行就去设备页检查 Cursor。'],
   [/question was closed/i, '这个请求已失效，不能再回答。'],
   [/answered meanwhile|no App Server request is waiting/i, '这个请求已经回答过或已过期。'],
-  [/usage limit|rate limit|quota|too many requests/i, 'AI 服务的用量到上限了。等额度恢复后让 Bot 再试。'],
   [/no rollout found/i, 'Codex 新对话还没准备好，任务没有开始。请再派一次。'],
   [/no Codex folder found/i, '没找到这台电脑上的 Codex 目录。装好 Codex，或手动填写 Codex 目录。'],
   [/has no sessions folder/i, '这台电脑的 Codex 还没有会话记录。先用 Codex 跑一次对话，再回来重试。'],
@@ -118,6 +110,31 @@ export function taskError(raw: string): string {
   if (known) return known
   const line = raw.trim().split('\n')[0].trim()
   return line ? `这个任务没有成功。\n${line.length > 80 ? `${line.slice(0, 80)}…` : line}` : '这个任务没有成功。'
+}
+
+/** Why an execution failed, as the Node names it; its original text stays in 技术详情. */
+export type FailureKind = 'missing_key' | 'auth_failed' | 'quota' | 'missing_binary' | 'execution_disabled' | 'no_model' | 'writer_busy'
+  | 'rejected' | 'transport' | 'timed_out' | 'restarted' | 'lost' | 'unknown'
+const settings = '去「设备 → Bot 与任务」'
+const failures: Record<FailureKind, string> = {
+  missing_key: `AI 服务缺少密钥。${settings}填好后再试。`,
+  auth_failed: `AI 服务登录没通过。${settings}检查密钥后再试。`,
+  quota: 'AI 服务的用量到上限了。等额度恢复后再试。',
+  missing_binary: `这台电脑上找不到 AI 服务的程序。${settings}检查。`,
+  execution_disabled: `这台电脑的 Codex 没开执行任务。${settings}打开。`,
+  no_model: `没选模型，或 AI 服务不认识这个模型。${settings}选一个。`,
+  writer_busy: '另一个 Codex 正在写这个会话。等它结束后再试。',
+  rejected: 'AI 服务拒绝了这次请求，没有执行。',
+  transport: '连不上 AI 服务，或连接中途断了。稍后再试。',
+  timed_out: 'AI 服务没有及时响应。',
+  restarted: '设备在中途重启了，这次没有重做。',
+  lost: '执行的进程意外结束，不确定做完了没有。先看看有没有改动，再决定要不要重发。',
+  unknown: '',
+}
+export const failureKinds = Object.keys(failures) as FailureKind[]
+/** The words for a failure kind; empty for `unknown`, whose caller words it from what it knows. */
+export function failureText(kind: FailureKind | null | undefined): string {
+  return kind ? failures[kind] : ''
 }
 
 /** The untranslated text, for 详细信息; empty when the shown message already is the original. */

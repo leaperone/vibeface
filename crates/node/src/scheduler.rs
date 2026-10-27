@@ -12,7 +12,7 @@ use crate::{
     scheduling::{JobOutcome, JobState, SchedulerJob, Shown, TriggerKind},
     store::Store,
     tools::Tool,
-    work::Dispatch,
+    work::{Dispatch, DispatchState},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use futures_util::FutureExt;
@@ -21,7 +21,10 @@ use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, OnceLock},
 };
-use vibeface_bridge::agent::CustomToolConfig;
+use vibeface_bridge::{
+    agent::CustomToolConfig,
+    failure::{ExecFailure, FailureKind},
+};
 
 /// The whole turn prompt; Codex accepts 65536 bytes per message and Cursor more. A Codex thread
 /// holds the tool catalog and `thread_instructions` itself, so they stay out of this.
@@ -91,7 +94,9 @@ fn invocation_value(job: &SchedulerJob, network: &str) -> Value {
     let mut value = serde_json::to_value(job).expect("scheduler job serializes");
     value["network_id"] = json!(network);
     value["error"] = match &job.state {
-        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => json!(detail),
+        JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } => {
+            json!(failure.detail)
+        }
         _ => Value::Null,
     };
     value
@@ -385,6 +390,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let cancellation = error
             .downcast_ref::<ManagerError>()
             .is_some_and(|e| e.cancelled());
+        // Errors of this Node's own steps carry no failure kind.
+        let failure = error.downcast_ref::<ManagerError>().map_or_else(
+            || ExecFailure::new(FailureKind::Unknown, error.to_string()),
+            |e| e.failure.clone(),
+        );
         let uncertain = sdk_live
             && error
                 .downcast_ref::<ManagerError>()
@@ -420,13 +430,16 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             )
         } else if uncertain || !tools_fenced {
             JobOutcome::Interrupted {
-                detail: error.to_string(),
+                failure,
                 process_unconfirmed: true,
             }
         } else {
             JobOutcome::Failed(match &bot_model {
-                Some(model) => format!("{error}（这个 bot 设定的模型是 {model}）"),
-                None => error.to_string(),
+                Some(model) => ExecFailure {
+                    detail: format!("{}（这个 bot 设定的模型是 {model}）", failure.detail),
+                    ..failure
+                },
+                None => failure,
             })
         };
         let text = partial.lock().expect("partial text").text();
@@ -448,12 +461,13 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         (Err(error), _) => {
             tracing::error!(event = "agent.turn.finished", trigger, error = %format!("{error:#}"), "agent turn could not be recorded")
         }
-        (Ok(_), JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. }) => {
+        (Ok(_), JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. }) => {
             tracing::warn!(
                 event = "agent.turn.finished",
                 trigger,
                 state = job.state.name(),
-                detail,
+                failure = ?failure.kind,
+                detail = failure.detail,
                 "agent turn ended without a reply"
             )
         }
@@ -679,11 +693,12 @@ fn message_row(offset: usize, event: &Event) -> Option<Value> {
             text,
             attachments,
             status,
+            failure,
             answers,
             ..
         } => Some(
             json!({"offset":offset,"role":role,"author":event.author,"created_at_ms":event.created_at_ms,
-            "text":prefix(text,4_000),"status":status,"attachments":attachments,"answers":answers}),
+            "text":prefix(text,4_000),"status":status,"failure":failure,"attachments":attachments,"answers":answers}),
         ),
         EventBody::QuestionAsked {
             question_id,
@@ -824,15 +839,18 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
 pub(crate) fn dispatch_row(dispatch: &Dispatch) -> Value {
     let spec = &dispatch.spec;
     json!({"work_id":spec.work_id,"call_ref":spec.call_ref,"target_node":spec.target,"kind":spec.kind,
-        "cwd":spec.cwd,"prompt":prefix(&spec.prompt,500),"state":dispatch.state.name(),
-        "reason":dispatch.state.reason()})
+    "cwd":spec.cwd,"prompt":prefix(&spec.prompt,500),"state":dispatch.state.name(),
+    "reason":dispatch.state.reason(),"failure":match &dispatch.state {
+        DispatchState::Rejected { failure, .. } => *failure,
+        _ => None,
+    }})
 }
 
 fn work_row(work: &WorkProjection) -> Value {
     json!({"work_id":work.work_id,"target_node":work.target_node,"kind":work.kind,"cwd":work.cwd,
         "prompt":prefix(&work.prompt,500),"phase":work.phase,"progress":prefix(&work.summary,500),
         "outcome":work.outcome,"result":prefix(&work.result_text,1_000),
-        "failure_reason":work.failure_reason})
+        "failure_reason":work.failure_reason,"failure":work.failure})
 }
 
 /// The layered prompt: the bot's configuration, the conversation since the last
@@ -1094,6 +1112,7 @@ mod tests {
                 status: None,
                 answers: None,
                 attestation: None,
+                failure: None,
             },
             blobs: vec![file.blob()],
         };

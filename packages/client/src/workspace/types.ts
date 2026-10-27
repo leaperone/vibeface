@@ -1,5 +1,6 @@
 import type { ProviderId } from "../lib/node.ts"
 import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
+import type { FailureKind } from "../lib/errors.ts"
 
 export type NodeInfo = {
   device_id: string
@@ -16,8 +17,7 @@ export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "
 type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch_unverified"
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
 type StopState = "stop_waiting" | "stop_timed_out"
-/** `abandoned` is no longer written; a removed device's open work is `unverified`. */
-export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified" | "abandoned"
+export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
 export type WorkRecord = {
   work_id: string
   trigger: string
@@ -32,6 +32,8 @@ export type WorkRecord = {
   outcome: WorkOutcome | null
   result_text: string
   failure_reason: string | null
+  /** Why it failed, as a kind; `failure_reason` keeps the original text. */
+  failure?: FailureKind
   /** `codex`: a Codex turn its device watches; `task`: a task run by its device's coordination Agent. */
   kind?: "codex" | "task"
   /** The Codex thread and turn running it; works steered into one turn share both. */
@@ -45,7 +47,8 @@ export type ManagerJob = {
   state: string
   message_id?: string
   reply_message_id?: string
-  error?: string
+  /** A failed or interrupted reply's cause; `detail` is the original text, for 技术详情. */
+  failure?: { kind: FailureKind; detail: string }
   pending_check?: boolean
   /** How the reply a steered message joined ended. */
   outcome?: SteerOutcome

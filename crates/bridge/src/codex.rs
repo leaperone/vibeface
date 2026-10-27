@@ -1,4 +1,8 @@
-use crate::methods::{self, Category};
+use crate::{
+    failure::{self, ExecFailure, FailureKind},
+    methods::{self, Category},
+    turn::{TurnStatus, turn_snapshot},
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,14 +40,24 @@ impl fmt::Display for CodexError {
 
 impl std::error::Error for CodexError {}
 
-/// Codex keeps one writer per thread across processes; another App Server (a terminal `codex`,
-/// say) holding the thread rejects every write here until it lets go.
-const WRITER_BUSY: &str = "already has an active writer";
+impl CodexError {
+    /// Why it failed: Codex's answer by its wording, else a refusal; no answer is a transport
+    /// failure.
+    pub fn failure(&self) -> ExecFailure {
+        let otherwise = if self.answered {
+            FailureKind::Rejected
+        } else {
+            FailureKind::Transport
+        };
+        ExecFailure::upstream(self.message.clone(), otherwise)
+    }
+}
 
-/// Whether Codex refused because another process is writing the thread. Nothing was sent, and
-/// retrying does not help until that process lets go.
-pub fn writer_busy(message: &str) -> bool {
-    message.contains(WRITER_BUSY)
+/// Whether Codex refused because another process is writing the thread (Codex keeps one
+/// writer per thread across processes). Nothing was sent, and retrying does not help until that
+/// process lets go.
+fn writer_busy(message: &str) -> bool {
+    ExecFailure::upstream(message, FailureKind::Unknown).kind == FailureKind::WriterBusy
 }
 
 fn server_error(error: &Value) -> String {
@@ -504,10 +518,10 @@ impl Cache {
             "turn/completed" => {
                 observe_turn(state, &params["turn"]);
                 state.active_turn = None;
-                state.status = json!({"type": match params["turn"]["status"].as_str() {
-                    Some("completed" | "interrupted" | "failed") => "idle",
-                    _ => "unknown",
-                }});
+                let ended = turn_snapshot(&params["turn"])
+                    .status
+                    .is_some_and(|status| status.ended());
+                state.status = json!({"type": if ended { "idle" } else { "unknown" }});
             }
             "error" => state.last_error = bounded(params),
             "turn/plan/updated" => {
@@ -560,10 +574,9 @@ impl Cache {
                 if let Some(turn) = params["turnId"].as_str() {
                     let terminal = state.last_turn.as_ref().is_some_and(|known| {
                         known["id"] == turn
-                            && matches!(
-                                known["status"].as_str(),
-                                Some("completed" | "failed" | "interrupted")
-                            )
+                            && turn_snapshot(known)
+                                .status
+                                .is_some_and(|status| status.ended())
                     });
                     if !terminal {
                         if state
@@ -574,8 +587,9 @@ impl Cache {
                             state.last_assistant = None;
                         }
                         state.status = json!({"type":"active","activeFlags":[]});
-                        state.last_turn =
-                            Some(json!({"id":turn,"status":"inProgress","error":null}));
+                        state.last_turn = Some(
+                            json!({"id":turn,"status":TurnStatus::InProgress.as_str(),"error":null}),
+                        );
                     }
                 }
             }
@@ -1075,7 +1089,7 @@ impl DirectSession {
                 .request("thread/resume", json!({"threadId":thread}))
                 .await
             {
-                Err(error) if no_rollout(&error) => {
+                Err(error) if failure::no_rollout(&error.message) => {
                     tokio::time::sleep(Duration::from_secs(1)).await
                 }
                 result => return result,
@@ -1211,7 +1225,7 @@ pub enum Delivery {
     },
     /// Nothing was sent.
     Rejected {
-        reason: String,
+        failure: ExecFailure,
     },
 }
 
@@ -1230,11 +1244,6 @@ fn input(outgoing: &Outgoing) -> Value {
         );
     }
     json!(input)
-}
-
-/// Codex writes a thread's rollout when its first turn starts; resuming a thread before that fails.
-fn no_rollout(error: &CodexError) -> bool {
-    error.message.contains("no rollout found")
 }
 
 /// The turn holding the user message sent with `client_id`, if any.
@@ -1267,7 +1276,9 @@ impl DirectSession {
     /// Resume, then steer the active turn or start one, then read back by `client_id`. A message
     /// already in the thread is reported, not sent again; an unknown result is never resent.
     pub async fn send(&mut self, outgoing: &Outgoing) -> Delivery {
-        let rejected = |reason: String| Delivery::Rejected { reason };
+        let rejected = |error: CodexError| Delivery::Rejected {
+            failure: error.failure(),
+        };
         // A thread without a rollout has no turns: nothing to find or steer.
         let resumed = if self.started.contains(&outgoing.thread_id) {
             json!({})
@@ -1277,8 +1288,9 @@ impl DirectSession {
                 .await
             {
                 Ok(resumed) => resumed,
-                Err(error) if no_rollout(&error) => json!({}),
-                Err(error) => return rejected(error.message),
+                // Codex writes a thread's rollout when its first turn starts.
+                Err(error) if failure::no_rollout(&error.message) => json!({}),
+                Err(error) => return rejected(error),
             }
         };
         if let Some(turn_id) = delivered(&resumed["thread"], &outgoing.client_id) {
@@ -1293,7 +1305,7 @@ impl DirectSession {
                     turns
                         .iter()
                         .rev()
-                        .find(|turn| turn["status"] == "inProgress")
+                        .find(|turn| turn_snapshot(turn).status == Some(TurnStatus::InProgress))
                         .and_then(|turn| turn["id"].as_str().map(str::to_owned))
                 })
             })
@@ -1336,7 +1348,7 @@ impl DirectSession {
                 .as_str()
                 .or(reply["turnId"].as_str())
                 .map(str::to_owned),
-            Err(error) if !error.uncertain => return rejected(error.message),
+            Err(error) if !error.uncertain => return rejected(error),
             Err(_) => None,
         };
         match self

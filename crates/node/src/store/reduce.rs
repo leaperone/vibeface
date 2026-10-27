@@ -145,12 +145,13 @@ pub(crate) fn apply(
             report_results,
             in_reply_to,
             status,
+            failure,
             answers,
             attachments,
             ..
         } => {
             connection.execute(
-                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
+                "INSERT INTO messages(network_id,conversation_id,message_id,event_hash,rank,author,role,text,created_at_ms,in_reply_to,status,failure,report_results,answers,attachments) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,conversation_id,message_id) DO UPDATE SET event_hash=excluded.event_hash,rank=excluded.rank,author=excluded.author,role=excluded.role,text=excluded.text,created_at_ms=excluded.created_at_ms,in_reply_to=excluded.in_reply_to,status=excluded.status,failure=excluded.failure,report_results=excluded.report_results,answers=excluded.answers,attachments=excluded.attachments WHERE excluded.rank<rank",
                 params![
                     network,
                     scope,
@@ -163,6 +164,7 @@ pub(crate) fn apply(
                     event.created_at_ms,
                     in_reply_to,
                     status.map(text).transpose()?,
+                    failure.map(text).transpose()?,
                     report_results,
                     answers,
                     serde_json::to_string(attachments)?
@@ -230,13 +232,12 @@ pub(crate) fn apply(
                 .flatten();
             if target.as_deref() != Some(event.author.as_str())
                 && attestation.is_none()
-                && !matches!(outcome, WorkOutcome::Abandoned | WorkOutcome::Unverified)
+                && *outcome != WorkOutcome::Unverified
             {
                 return Ok(());
             }
             let precedence = match outcome {
                 WorkOutcome::Unverified => 1,
-                WorkOutcome::Abandoned => 2,
                 _ => 0,
             };
             let finish_rank = format!("{precedence}:{rank}");
@@ -546,15 +547,16 @@ pub(crate) fn works_from(
             Some(EventBody::WorkProgress { phase, summary, .. }) => (Some(phase), summary),
             _ => (None, String::new()),
         };
-        let (outcome, result_text, failure_reason) =
+        let (outcome, result_text, failure_reason, failure) =
             match finish.map(|f| serde_json::from_str(&f)).transpose()? {
                 Some(EventBody::WorkFinished {
                     outcome,
                     result_text,
                     failure_reason,
+                    failure,
                     ..
-                }) => (Some(outcome), result_text, failure_reason),
-                _ => (None, String::new(), None),
+                }) => (Some(outcome), result_text, failure_reason, failure),
+                _ => (None, String::new(), None, None),
             };
         works.push(WorkProjection {
             work_id,
@@ -577,6 +579,7 @@ pub(crate) fn works_from(
             outcome,
             result_text,
             failure_reason,
+            failure,
             state: WorkStatus::of(kind, phase, outcome),
         });
     }

@@ -6,6 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use vibeface_bridge::failure::ExecFailure;
 
 pub const MAX_PENDING_JOBS: usize = 256;
 
@@ -56,14 +57,18 @@ pub(crate) fn task_work_signal<'a>(
     let work_id = trigger.strip_prefix("task:")?;
     let signal = match change {
         TaskJobChange::Ended { outcome, text } => {
-            let (outcome, reason) = match outcome {
-                JobOutcome::Completed => (WorkOutcome::Completed, None),
-                JobOutcome::Failed(detail) => (WorkOutcome::Failed, Some(detail.clone())),
+            let (outcome, reason, failure) = match outcome {
+                JobOutcome::Completed => (WorkOutcome::Completed, None, None),
+                JobOutcome::Failed(failure) => (
+                    WorkOutcome::Failed,
+                    Some(failure.detail.clone()),
+                    Some(failure.kind),
+                ),
                 JobOutcome::Cancelled(evidence) => {
-                    (WorkOutcome::Interrupted, Some(evidence.clone()))
+                    (WorkOutcome::Interrupted, Some(evidence.clone()), None)
                 }
                 JobOutcome::Interrupted {
-                    detail,
+                    failure,
                     process_unconfirmed,
                 } => (
                     if *process_unconfirmed {
@@ -71,13 +76,15 @@ pub(crate) fn task_work_signal<'a>(
                     } else {
                         WorkOutcome::Interrupted
                     },
-                    Some(detail.clone()),
+                    Some(failure.detail.clone()),
+                    Some(failure.kind),
                 ),
             };
             Signal::Concluded {
                 outcome,
                 text: text.into(),
                 reason,
+                failure,
             }
         }
         TaskJobChange::ProcessExited => Signal::ProcessExited,
@@ -200,7 +207,7 @@ pub enum JobState {
     },
     Failed {
         attempt: ManagerAttempt,
-        detail: String,
+        failure: ExecFailure,
     },
     Cancelled {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,7 +216,7 @@ pub enum JobState {
     },
     Interrupted {
         attempt: ManagerAttempt,
-        detail: String,
+        failure: ExecFailure,
     },
 }
 
@@ -345,11 +352,11 @@ pub struct Shown {
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum JobOutcome {
     Completed,
-    Failed(String),
+    Failed(ExecFailure),
     Cancelled(String),
     /// `process_unconfirmed` records a pending check for the SDK process in the same transaction.
     Interrupted {
-        detail: String,
+        failure: ExecFailure,
         process_unconfirmed: bool,
     },
 }
