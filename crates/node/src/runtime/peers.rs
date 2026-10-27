@@ -1695,12 +1695,20 @@ impl Runtime {
             .collect()
     }
 
+    /// Downloads from `peer` every attachment stored events reference that is not here yet. Each
+    /// sync round runs it, so one a turn left pending arrives once a member holding it is reached.
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
         let _download = self.blob_fetch.lock().await;
         let missing = self.store.lock().await.missing_blobs(network)?;
-        for blob in missing {
-            self.fetch_blob(network, peer, &blob).await?;
+        let mut failed = 0;
+        for blob in &missing {
+            // One attachment the peer cannot serve must not hold back the rest.
+            if let Err(error) = self.fetch_blob(network, peer, blob).await {
+                tracing::debug!(%peer, %error, blob = blob.hash, "attachment download pending");
+                failed += 1;
+            }
         }
+        ensure!(failed == 0, "{failed} attachments still pending");
         Ok(())
     }
 
@@ -2680,6 +2688,88 @@ mod tests {
                 b.fetch_turn_attachments(&network, events.iter()).await,
                 [blob.hash.clone()].into(),
                 "an author out of reach leaves it pending"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        drop((a, b));
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_fetches_attachments_past_one_the_peer_lacks_and_catches_up_later() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            let mut files: Vec<(Vec<u8>, BlobRef)> = ["first notes", "second notes"]
+                .map(|text| {
+                    let content = text.as_bytes().to_vec();
+                    let blob = BlobRef {
+                        hash: crate::crypto::digest(&content),
+                        size: content.len() as u64,
+                    };
+                    (content, blob)
+                })
+                .into();
+            files.sort_by(|x, y| x.1.hash.cmp(&y.1.hash));
+            let attached: Vec<Attachment> = files
+                .iter()
+                .map(|(_, blob)| Attachment {
+                    hash: blob.hash.clone(),
+                    size: blob.size,
+                    name: "notes.txt".into(),
+                })
+                .collect();
+            let (lacked, held) = (&files[0], &files[1]);
+            {
+                let mut store = a.store.lock().await;
+                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
+                for (content, blob) in &files {
+                    store.put_blob(blob, content)?;
+                }
+                store.accept_message(
+                    &ia,
+                    &network,
+                    "c",
+                    "m1",
+                    "m1",
+                    attached.clone(),
+                    true,
+                    user_with(&ia, &network, "m1", attached)?,
+                    now_ms(),
+                )?;
+                std::fs::remove_file(store.blob_file(&lacked.1.hash)?)?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            b.refresh_own_address(&network).await?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            assert!(
+                b.store.lock().await.has_blob(&held.1)?,
+                "an attachment the peer lacks does not hold back the next"
+            );
+            assert_eq!(
+                b.store.lock().await.missing_blobs(&network)?,
+                std::slice::from_ref(&lacked.1)
+            );
+            a.store.lock().await.put_blob(&lacked.1, &lacked.0)?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            assert!(
+                b.store.lock().await.missing_blobs(&network)?.is_empty(),
+                "the next sync round fetches what was pending"
             );
             Ok::<_, anyhow::Error>(())
         }

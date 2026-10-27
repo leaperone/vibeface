@@ -427,6 +427,11 @@ impl Runtime {
             }
             None => store.version_vector(network)?,
         };
+        if !args["at"].is_null() {
+            let (author, seq) = position(&args["at"], &basis)?;
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            return event_page(&store, network, scope, author, seq, offset);
+        }
         let at = match (&args["before"], &args["after"]) {
             (Value::Null, Value::Null) => None,
             (at, Value::Null) => Some((at, false)),
@@ -434,20 +439,8 @@ impl Runtime {
             _ => bail!("give before or after, not both"),
         };
         let at = at
-            .map(|(at, after)| {
-                Ok::<_, anyhow::Error>((
-                    at["author"].as_str().context("author is required")?,
-                    at["seq"].as_u64().context("seq is required")?,
-                    after,
-                ))
-            })
+            .map(|(at, after)| position(at, &basis).map(|(author, seq)| (author, seq, after)))
             .transpose()?;
-        if let Some((author, seq, _)) = at {
-            ensure!(
-                seq <= basis.get(author).copied().unwrap_or(0),
-                "that position is after this turn's history"
-            );
-        }
         let kinds: Vec<String> = match &args["types"] {
             Value::Null => vec![],
             types => serde_json::from_value(types.clone()).context("types lists event types")?,
@@ -455,14 +448,13 @@ impl Runtime {
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
         let (events, more) = store.history_page(network, scope, &basis, at, &kinds, limit)?;
         drop(store);
-        let event_bytes = if limit == 1 { PAGE_BYTES } else { EVENT_BYTES };
         let after = at.is_some_and(|(_, _, after)| after);
         let mut rows = Vec::new();
         let mut used = 0;
         let mut cut = false;
         for event in &events {
             let row = json!({"author":event.event.author,"seq":event.event.seq,"created_at_ms":event.event.created_at_ms,
-                "body":crate::scheduler::bounded(&crate::scheduler::agent_event_body(&event.event.body), event_bytes),
+                "body":crate::scheduler::bounded(&crate::scheduler::agent_event_body(&event.event.body), EVENT_BYTES),
                 "blobs":event.event.blobs});
             used += row.to_string().len();
             if !rows.is_empty() && used > PAGE_BYTES {
@@ -577,6 +569,57 @@ impl Runtime {
 /// Bytes one tool result carries, and one event within it; the rest is read page by page.
 const PAGE_BYTES: usize = 32_000;
 const EVENT_BYTES: usize = 8_000;
+
+/// An `{author, seq}` position within the turn's history.
+fn position<'a>(at: &'a Value, basis: &crate::model::VersionVector) -> Result<(&'a str, u64)> {
+    let author = at["author"].as_str().context("author is required")?;
+    let seq = at["seq"].as_u64().context("seq is required")?;
+    ensure!(
+        seq <= basis.get(author).copied().unwrap_or(0),
+        "that position is after this turn's history"
+    );
+    Ok((author, seq))
+}
+
+/// One event with its body as JSON text from byte `offset`, as much as fits in `PAGE_BYTES`;
+/// the pages joined are the whole body.
+pub(crate) fn event_page(
+    store: &crate::store::Store,
+    network: &str,
+    scope: &str,
+    author: &str,
+    seq: u64,
+    offset: usize,
+) -> Result<Value> {
+    let event = store
+        .scope_event(network, scope, author, seq)?
+        .context("no event with this author and seq in this conversation")?
+        .event;
+    let text = crate::scheduler::agent_event_body(&event.body).to_string();
+    ensure!(
+        offset <= text.len() && text.is_char_boundary(offset),
+        "invalid body offset"
+    );
+    let mut page = json!({"author":event.author,"seq":event.seq,"created_at_ms":event.created_at_ms,
+        "blobs":event.blobs,"offset":offset,"size":text.len(),"next_offset":u64::MAX,"body_json":""});
+    let mut room = PAGE_BYTES.saturating_sub(page.to_string().len());
+    let mut end = offset;
+    for c in text[offset..].chars() {
+        let escaped = match c {
+            '"' | '\\' | '\u{08}' | '\u{0c}' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if escaped > room {
+            break;
+        }
+        room -= escaped;
+        end += c.len_utf8();
+    }
+    page["body_json"] = json!(text[offset..end]);
+    page["next_offset"] = json!((end < text.len()).then_some(end));
+    Ok(page)
+}
 
 /// Up to `limit` KiB of an attachment from `offset`: text as UTF-8, other content as base64.
 /// An attachment not on this device yet says `pending_download`.
