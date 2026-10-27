@@ -21,10 +21,12 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const workspace = useWorkspace()
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
+  const shared = useLive()
+  // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
+  const loading = !shared?.synced
   const waiting = workspace.questions.filter((question) => question.answer === null).length
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
-  const shared = useLive()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
@@ -35,7 +37,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
       <Text role="heading" className="text-3xl font-bold">消息</Text>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
     </View> : null}
-    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : '没有要你决定的事'} />
+    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">Bot</Text>
       <Link href="/new-bot" asChild>
@@ -48,7 +50,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
         mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
         unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
         preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
-    }) : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
+    }) : loading ? <View accessibilityLabel="正在读取 Bot" className="gap-2">{[0, 1, 2].map((item) => <View key={item} className="h-16 rounded-xl bg-muted/60" />)}</View> : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} />}
     <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>

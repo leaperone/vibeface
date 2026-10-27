@@ -43,9 +43,9 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await request('/approve', { role: 'android', peer: joined.peer, code: joined.code });
       await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
       await screen.getByRole('link', '设置', { exact: true }).click();
-      await screen.scrollUntilVisible(screen.getByRole('link', '公益转发与实验付费交付', { exact: true }), { direction: 'down' });
-      await screen.getByRole('link', '公益转发与实验付费交付', { exact: true }).click();
-      await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible();
+      await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'down' });
+      await screen.getByRole('link', '发送和接收文件', { exact: true }).click();
+      await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible();
       await event('observer-ready', { role: 'android' });
       for (const kind of ['receiver-key-before', 'receiver-key-after'] as const) {
         const inspection = await nextInspection(kind);
@@ -56,9 +56,12 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
           await device.openApp(appId);
           await device.openLink('vibeface://transfers', { app: appId });
         }
-        const refresh = screen.getByRole('button', '刷新订单', { exact: true });
+        const refresh = screen.getByRole('button', '刷新', { exact: true });
         await screen.scrollUntilVisible(refresh, { direction: 'up', timeout: 30000 });
         await refresh.click();
+        const settingsDetails = screen.getByRole('button', '详细信息', { exact: true }).first();
+        await screen.scrollUntilVisible(settingsDetails, { direction: 'up', timeout: 30000 });
+        await settingsDetails.click();
         const key = screen.getByText(inspection.keyId, { exact: true }).first();
         await screen.scrollUntilVisible(key, { direction: 'down', timeout: 30000 });
         await expect(screen.getByText('当前接收密钥 ID', { exact: true }).first()).toBeVisible();
@@ -71,16 +74,16 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await device.closeApp();
       await device.openApp(appId);
       await device.openLink('vibeface://transfers', { app: appId });
-      await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible({ timeout: 45000 });
+      await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible({ timeout: 45000 });
       await expect.poll(async () => (await facts()).receiver !== null, {
         timeout: ordinaryDeadline(), interval: 1000, message: 'The original ordinary order reaches the real receiver after its genuine source proof',
       }).toBe(true);
       const offered = (await facts()).receiver;
       assert(offered && offered.acceptance === 'recoverable' && offered.mode === 'paid');
-      const incoming = screen.getByRole('button', new RegExp(`^密文订单 ${offered.order_id.slice(0, 12)}`));
+      const incoming = screen.getByRole('button', /^待接收的文件/).first();
       await screen.scrollUntilVisible(incoming, { direction: 'down', timeout: 30000 });
       await incoming.click();
-      const accept = screen.getByRole('button', '接受此订单', { exact: true });
+      const accept = screen.getByRole('button', '接收文件', { exact: true });
       await screen.scrollUntilVisible(accept, { direction: 'down' });
       const videos: Video[] = [];
       const acceptanceRecording = await androidRecording('android-accept-offline', serial);
@@ -117,15 +120,18 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
         assert(await reversePresent());
         await device.openApp(appId);
         await device.openLink('vibeface://transfers', { app: appId });
-        await expect(screen.getByText('此设备的传输设置', { exact: true }).first()).toBeVisible({ timeout: 45000 });
+        await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible({ timeout: 45000 });
         const recovered = screen.getByRole('button', new RegExp(`^${environment.name.replaceAll('.', '\\.')}`));
         await screen.scrollUntilVisible(recovered, { direction: 'down', timeout: 30000 });
         await recovered.click();
+        const orderDetails = screen.getByRole('button', '详细信息', { exact: true }).last();
+        await screen.scrollUntilVisible(orderDetails, { direction: 'down' });
+        await orderDetails.click();
         await screen.scrollUntilVisible(screen.getByText(offered.order_id, { exact: true }).first(), { direction: 'down' });
         await expect(screen.getByText(offered.order_id, { exact: true }).first()).toBeVisible();
         await screen.scrollUntilVisible(screen.getByText(offered.intent_id, { exact: true }).first(), { direction: 'down' });
         await expect(screen.getByText(offered.intent_id, { exact: true }).first()).toBeVisible();
-        const download = screen.getByRole('button', '取回文件', { exact: true });
+        const download = screen.getByRole('button', '保存文件', { exact: true });
         await screen.scrollUntilVisible(download, { direction: 'down' });
         await download.click();
         const directory = `/data/user/0/${appId}/files/transfers`;

@@ -49,7 +49,7 @@ export default function Settings() {
     </Section>
     {device.ready ? <Notifications /> : null}
     <Section icon={ArrowRightLeft} title="文件传输">
-      <LinkRow href="/transfers" icon={ArrowRightLeft} label="公益转发与实验付费交付" />
+      <LinkRow href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
     </Section>
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
       <LinkRow href="/ai" icon={SlidersHorizontal} label="Bot 与任务" />

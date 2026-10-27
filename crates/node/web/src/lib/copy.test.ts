@@ -58,11 +58,13 @@ test("copy check flags jargon outside Details only", () => {
   assert.equal(violations(`rpc("node_settings")`).length, 0)
 })
 
-const pending = new Set<string>([])
+// Mobile screens not yet reworded; remove an entry once its copy is plain.
+const pending = new Set<string>(["join.tsx", "device/[deviceId].tsx", "features/recovery/recovery.tsx"])
 
 test("user-facing copy avoids jargon outside Details", () => {
-  // The shared client package carries the same copy, so it is checked here too.
-  const found = [new URL("..", import.meta.url), new URL("../../../../../packages/client/src/", import.meta.url)].flatMap((url) => {
+  // The shared client package and the phone app carry the same copy, so they are checked here too.
+  const roots = ["..", "../../../../../packages/client/src/", "../../../../../apps/mobile/app/", "../../../../../apps/mobile/src/"]
+  const found = roots.map((path) => new URL(path, import.meta.url)).flatMap((url) => {
     const root = fileURLToPath(url)
     return sources(root).filter((file) => !pending.has(file.slice(root.length))).flatMap((file) => violations(readFileSync(file, "utf8"), file.slice(root.length)))
   })

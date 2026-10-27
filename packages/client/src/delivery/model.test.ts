@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -213,4 +213,24 @@ test('an unavailable wallet retains its distinct failure state and asks for its 
   assert.equal(unavailable.wallet.state, 'unavailable')
   assert.match(walletNotice(unavailable.wallet), /独立钱包备份/)
   assert.throws(() => parseStatus({ ...status, wallet: { state: 'unavailable', address: `0x${'66'.repeat(20)}`, reason: 'bad' } }))
+})
+
+test('sizes read as bytes, KB or MB and a limit never rounds up past what fits', () => {
+  assert.equal(sizeLabel(512), '512 字节')
+  assert.equal(sizeLabel(48 * 1024), '48 KB')
+  assert.equal(sizeLabel(1536), '1.5 KB')
+  assert.equal(sizeLabel(130_816, true), '127 KB')
+  assert.equal(sizeLabel(1024 * 1024 - 1, true), '1023 KB')
+  assert.equal(sizeLabel(5 * 1024 * 1024), '5.0 MB')
+})
+
+test('a record reads as file name and one plain line, and offers only what this side can do', () => {
+  const sent = { ...order(), name: 'a.txt', bytes: 48 * 1024, phase: 'recoverable', evidence: 'charity_receipt' } as DeliveryOrder
+  assert.equal(orderTitle(sent), 'a.txt')
+  assert.equal(orderSummary(sent), '免费 · 48 KB · 已送达')
+  assert.deepEqual(orderActions({ ...sent, phase: 'prepared', evidence: 'none' }), { confirm: true, accept: false, save: false }, 'nothing is saved before the send is confirmed')
+  const received = { ...sent, role: 'receiver', name: null, evidence: 'none', phase: 'transferring' } as DeliveryOrder
+  assert.equal(orderTitle(received), '待接收的文件')
+  assert.deepEqual(orderActions(received), { confirm: false, accept: true, save: false })
+  assert.equal(canRestart({ ...received, phase: 'recoverable', evidence: 'charity_receipt' }), false, 'a receiver never sends again')
 })

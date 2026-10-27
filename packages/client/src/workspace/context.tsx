@@ -509,6 +509,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     try { return await submitMessage(text, files) } finally { if (current()) setMessageBusy(false) }
   })
   const incomplete = !data
+  // The lists hold this connection's first full read and the Node is not aligning with other devices; until then an empty list means not yet known.
+  const synced = readConnection.current === connection && writeState.state !== "aligning"
   const messagePending = pendingMessages.find((item) => item.conversation_id === conversationId) ?? null
   const chatSlot = { conversationId: conversationId || null }
 
@@ -516,7 +518,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
     error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, openWorks, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
-    joined,
+    joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
     writeNotice: readConnection.current !== connection ? "正在补读这台电脑的记录，已暂停写入。" : "",
     writeState, readOnlyNotice: writeState.state === "writable" ? "" : writeNotices[writeState.state],

@@ -2,8 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, RefreshCw } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { canRead, canRestart, changeMode, deadlineRows, evidenceLabels, paymentLabels, phaseLabels, settlementAmountsLabel, walletNotice } from '@vibeface/client/delivery/model.ts'
-import type { Acceptance, DeliveryDraft, DeliveryMode, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
+import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -12,22 +12,11 @@ import { Input } from '@/components/ui/input'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 
-const modes: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '公益转发' }, { value: 'paid', label: '付费交付' }]
-const acceptances: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
 const roleIcons = { sender: ArrowUpRight, receiver: ArrowDownLeft, provider: ArrowRightLeft } as const
-
-/** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
-export function sizeLabel(bytes: number, floor = false): string {
-  if (bytes < 1024) return `${bytes} 字节`
-  const [value, unit] = bytes < 1024 * 1024 ? [bytes / 1024, 'KB'] : [bytes / 1024 / 1024, 'MB']
-  const digits = value < 10 ? 1 : 0
-  const scale = 10 ** digits
-  return `${(floor ? Math.floor(value * scale) / scale : value).toFixed(digits)} ${unit}`
-}
 
 export function Transfers() {
   const { ready } = useDevice()
-  return ready ? <TransferPage key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title="设备暂时离线" description="重新连接后可查看传输记录，不会重复付款。" />
+  return ready ? <TransferPage key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title="设备暂时离线" description={transferCopy.offline} />
 }
 
 function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
@@ -48,7 +37,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const unusable = working || !file || status?.max_file_bytes === 0 || draft.mode === 'charity' && !status?.charity_enabled || draft.mode === 'paid' && !status?.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
     {feedback('page')}
-    {!status ? <p role="status" className="text-meta text-muted-foreground">正在读取传输设置。</p> : <>
+    {!status ? <p role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</p> : <>
       <section aria-labelledby="transfer-settings" className="grid gap-4 rounded-xl border bg-card p-4">
         <h2 id="transfer-settings" className="text-heading font-semibold">传输设置</h2>
         <div className="flex flex-wrap gap-x-6 gap-y-1">
@@ -58,38 +47,38 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
             <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} />
           </> : null}
         </div>
-        {status.enabled ? <ConnectionId value={status.node_peer} /> : <p className="text-meta text-muted-foreground">打开后可以加密收发文件</p>}
-        {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />只有{terms.admin.label}能更改设置和发送</p> : null}
+        {status.enabled ? <ConnectionId value={status.node_peer} /> : <p className="text-meta text-muted-foreground">{transferCopy.off}</p>}
+        {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />{transferCopy.adminOnly}</p> : null}
         {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
         {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
         <Details>
           {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
           {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
-          <p>钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。</p>
+          <p>{transferCopy.walletDetails}</p>
         </Details>
       </section>
       {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) { setOrigin('form'); void delivery.prepare(draft, file) } }}>
         <h2 className="text-heading font-semibold">发送文件</h2>
-        <Field><FieldLabel htmlFor="transfer-receiver">接收方的连接 ID</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
-        <Field><FieldLabel htmlFor="transfer-provider">中转设备的连接 ID</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>只经手加密后的文件，不会加入你的设备</FieldDescription></Field>
-        <Segmented label="传输方式" value={draft.mode} options={modes} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
+        <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
+        <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
+        <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
         {draft.mode === 'paid' ? <>
-          <Segmented label="什么时候付款" value={draft.acceptance} options={acceptances} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
+          <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
           <Field><FieldLabel htmlFor="transfer-service-cap">服务费上限（测试代币最小单位）</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
           <Field><FieldLabel htmlFor="transfer-gas-cap">链费上限（测试链原生币最小单位）</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
-        </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />全程加密 · 免费</p>}
+        </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />{transferCopy.free}</p>}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const picked = await webPlatform.files?.pick(); if (picked) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
-          <span className="min-w-0 break-all text-meta text-muted-foreground">{file ? <><span className="text-foreground">{file.name}</span> · {sizeLabel(file.size)}</> : `最大 ${sizeLabel(status.max_file_bytes, true)}`}</span>
+          <span className="min-w-0 break-all text-meta text-muted-foreground">{file ? <><span className="text-foreground">{file.name}</span> · {sizeLabel(file.size)}</> : transferCopy.maxSize(status.max_file_bytes)}</span>
         </div>
         {picker.error ? <p role="alert" className="text-meta text-danger">{messageOf(picker.error)}</p> : null}
-        {file && file.size > status.max_file_bytes ? <p role="alert" className="text-meta text-danger">文件超过 {sizeLabel(status.max_file_bytes, true)}，换一个小点的</p> : null}
+        {file && file.size > status.max_file_bytes ? <p role="alert" className="text-meta text-danger">{transferCopy.tooLarge(status.max_file_bytes)}</p> : null}
         {feedback('form')}
         <div className="flex flex-wrap gap-2">
-          <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{draft.mode === 'paid' ? '查看费用' : '下一步'}</Button>
+          <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(draft.mode)}</Button>
           {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(draft, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
         </div>
-        <Details><p>准备订单会把文件交给当前连接的可信设备加密，尚不付款。同一文件和条款复用原意图。原订单确认结束后，选择相同文件和条款，点击“作为新订单再次发送”才能创建另一笔订单。</p></Details>
+        <Details><p>{transferCopy.prepareDetails}</p></Details>
       </form> : null}
     </>}
     <section aria-labelledby="transfer-orders" className="grid gap-3">
@@ -103,10 +92,10 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
           <span className="grid min-w-0 gap-0.5">
             <span className="truncate font-medium">{orderTitle(order)}</span>
-            <span className="text-meta text-muted-foreground">{order.mode === 'charity' ? '免费' : '付费'} · {sizeLabel(order.bytes)} · {phaseLabels[order.phase]}</span>
+            <span className="text-meta text-muted-foreground">{orderSummary(order)}</span>
           </span>
         </button></li>
-      })}</ul> : <p className="text-meta text-muted-foreground">还没有传输记录</p>}
+      })}</ul> : <p className="text-meta text-muted-foreground">{transferCopy.noRecords}</p>}
     </section>
     {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} walletReady={status?.wallet.state === 'unlocked'} feedback={feedback('order')}
       confirm={() => { setOrigin('order'); void delivery.confirm(selected) }} accept={() => { setOrigin('order'); void delivery.accept(selected) }}
@@ -114,35 +103,31 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   </div>
 }
 
-function orderTitle(order: DeliveryOrder) {
-  if (order.name) return order.name
-  return order.role === 'provider' ? '代为转发的文件' : '待接收的文件'
-}
-
 function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; walletReady: boolean; feedback: ReactNode; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
   const heading = useRef<HTMLHeadingElement>(null)
   useEffect(() => { heading.current?.focus() }, [])
   const paid = order.mode === 'paid'
+  const can = orderActions(order)
   return <section className="grid gap-4 rounded-xl border bg-card p-4" aria-labelledby="transfer-detail">
-    <h2 ref={heading} id="transfer-detail" tabIndex={-1} className="text-heading font-semibold outline-none">{order.role === 'sender' && order.phase === 'prepared' ? '确认发送' : '传输详情'}</h2>
-    <p>{phaseLabels[order.phase]}{paid ? ` · ${paymentLabels[order.payment.state]}` : ''}</p>
+    <h2 ref={heading} id="transfer-detail" tabIndex={-1} className="text-heading font-semibold outline-none">{orderHeading(order)}</h2>
+    <p>{orderStatus(order)}</p>
     {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
     <Info label="传输方式" value={paid ? '付费交付' : <span className="inline-flex items-center gap-1.5"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />公益转发 · 免费</span>} />
     {paid ? <>
       <Info label="服务费合计（最小单位）" value={order.payment.total} />
       <Info label="链费上限（原生币最小单位）" value={order.payment.gas_cap} />
-      {order.acceptance === 'strict' ? <p className="text-meta text-warning">对方确认打开后才付款。对方离线或没确认时，中转设备可能收不到费用。</p> : null}
+      {order.acceptance === 'strict' ? <p className="text-meta text-warning">{transferCopy.strict}</p> : null}
     </> : null}
     {order.error ? <p role="alert" className="text-meta text-danger">{order.error}</p> : null}
     {feedback}
     <div className="flex flex-wrap gap-2">
-      {order.role === 'sender' && order.phase === 'prepared' ? <Button type="button" disabled={busy || !canManage || paid && !walletReady} onClick={confirm}>{paid ? '确认并付款' : '确认发送'}</Button> : null}
-      {order.role === 'receiver' && !canRead(order) && order.phase !== 'refunded' && order.phase !== 'failed' ? <Button type="button" disabled={busy || !canManage} onClick={accept}>接收文件</Button> : null}
-      {canRead(order) && order.phase !== 'prepared' ? <Button type="button" variant={order.role === 'receiver' ? 'default' : 'outline'} disabled={busy} onClick={save}><ArrowDownToLine aria-hidden="true" />保存文件</Button> : null}
+      {can.confirm ? <Button type="button" disabled={busy || !canManage || paid && !walletReady} onClick={confirm}>{transferCopy.confirm(order.mode)}</Button> : null}
+      {can.accept ? <Button type="button" disabled={busy || !canManage} onClick={accept}>接收文件</Button> : null}
+      {can.save ? <Button type="button" variant={order.role === 'receiver' ? 'default' : 'outline'} disabled={busy} onClick={save}><ArrowDownToLine aria-hidden="true" />保存文件</Button> : null}
       <Button type="button" variant="outline" disabled={busy || !canManage} onClick={reconcile}>检查进度</Button>
     </div>
-    {paid && order.phase === 'prepared' && !walletReady ? <p className="text-meta text-warning">先在发送设备本机创建或解锁钱包，再刷新。</p> : null}
-    {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <p className="text-meta text-warning">付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。</p> : null}
+    {paid && order.phase === 'prepared' && !walletReady ? <p className="text-meta text-warning">{transferCopy.walletFirst}</p> : null}
+    {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <p className="text-meta text-warning">{transferCopy.unknownPayment}</p> : null}
     <Details>
       <p>{evidenceLabels[order.evidence]}。交付确认不表示真人已阅读。</p>
       <Info label="订单" value={order.order_id} /><Info label="付款意图" value={order.intent_id} />
@@ -176,7 +161,7 @@ function ConnectionId({ value }: { value: string }) {
     return () => clearTimeout(timer)
   }, [copied])
   return <div className="grid gap-1 text-meta">
-    <span className="text-muted-foreground">连接 ID · 收文件时发给对方</span>
+    <span className="text-muted-foreground">{transferCopy.connectionId}</span>
     <span className="flex min-w-0 items-center gap-2">
       <code className="min-w-0 truncate" title={value}>{value}</code>
       <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => { void navigator.clipboard.writeText(value).then(() => setCopied(true), () => {}) }}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制'}</Button>
