@@ -89,7 +89,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="!w-full overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
+      <SheetContent className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-lg" onCloseAutoFocus={(event) => { event.preventDefault(); restoreFocus() }}>
         <SheetHeader className="pr-14">
           <SheetTitle>{pending ? "再试一次" : "新 Bot"}</SheetTitle>
           <SheetDescription className={pending ? undefined : "sr-only"}>{pending ? "上次没确认是否建好，内容保持不变。" : "起个名字，就能开始聊。"}</SheetDescription>

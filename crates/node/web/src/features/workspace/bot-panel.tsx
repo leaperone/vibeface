@@ -67,7 +67,7 @@ export function BotPanelButton() {
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
     <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
-      <SheetContent className="!w-full gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => {
+      <SheetContent className="!w-full max-sm:!border-l-0 gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => {
         if (!toComposer.current) return
         toComposer.current = false
         const composer = document.getElementById("message-text")

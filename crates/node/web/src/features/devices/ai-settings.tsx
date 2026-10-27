@@ -247,7 +247,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
 function RoleToggle({ label, name, pressed, busy, disabled, onClick }: { label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
     className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
-    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/45")}>
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
     </span>}{label}
   </Button>
@@ -260,6 +260,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
+  const executable = item.supports.includes("execution") && !onboarding
   const manager = bot ? response.settings.manager : null
   const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
   const state = states[item.state === "ready" && missing.length ? "needs_setup" : item.state]
@@ -303,10 +304,11 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <span className="font-medium whitespace-nowrap">{name}</span>
         {item.state === "off" ? null : <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>}
       </div>
-      <div className="ms-auto flex shrink-0 gap-2 max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2">
+      {/* Two toggles share a row of their own on a phone; one stays beside the name. */}
+      <div className={cn("ms-auto flex shrink-0 gap-2", executable && "max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2")}>
         <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
-        {item.supports.includes("execution") && !onboarding ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
+        {executable ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
     </div>
