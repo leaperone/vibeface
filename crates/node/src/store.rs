@@ -453,6 +453,31 @@ impl Store {
         })
     }
 
+    /// The effective event at `author`/`seq` in this conversation.
+    pub(crate) fn scope_event(
+        &self,
+        network_id: &str,
+        scope_id: &str,
+        author: &str,
+        seq: u64,
+    ) -> Result<Option<HashedEvent>> {
+        self.connection
+            .query_row(
+                "SELECT hash,envelope FROM events WHERE network_id=? AND scope_id=? AND author=? AND seq=? AND effective=1 LIMIT 1",
+                params![network_id, scope_id, author, seq],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(hash, envelope)| {
+                let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+                Ok(HashedEvent {
+                    hash,
+                    event: serde_json::from_str(&envelope.canonical_body)?,
+                })
+            })
+            .transpose()
+    }
+
     /// Up to `limit` effective events of the conversation within `basis`, of `kinds` when any are
     /// given, next to the event `at` names by author and seq: before it newest first, or after it
     /// oldest first. Without `at`, the newest. The flag says more follow in that direction.
