@@ -20,6 +20,8 @@ const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
 const MAX_FORK_PAGES: usize = 64;
+/// How long a turn waits for the attachments it shows before it marks them pending.
+const ATTACHMENT_WAIT: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 pub(super) struct PeerSync {
@@ -1646,6 +1648,53 @@ impl Runtime {
         }
     }
 
+    /// Fetches the attachments of `events` that are not on this device from the device that
+    /// wrote each event, all within `ATTACHMENT_WAIT`. Returns the hashes still missing, which
+    /// the prompt marks `pending_download`; a cut-short download resumes from its last offset.
+    pub(crate) async fn fetch_turn_attachments<'a>(
+        &self,
+        network: &str,
+        events: impl Iterator<Item = &'a HashedEvent>,
+    ) -> std::collections::BTreeSet<String> {
+        let local = self.identity.device_id().ok();
+        let mut wanted: Vec<(String, BlobRef)> = Vec::new();
+        {
+            let store = self.store.lock().await;
+            for event in events {
+                for blob in &event.event.blobs {
+                    if !wanted.iter().any(|(_, seen)| seen.hash == blob.hash)
+                        && !store.has_blob(blob).unwrap_or(false)
+                    {
+                        wanted.push((event.event.author.clone(), blob.clone()));
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return Default::default();
+        }
+        let fetch = async {
+            let _download = self.blob_fetch.lock().await;
+            for (author, blob) in &wanted {
+                if local.as_ref() == Some(author)
+                    || self.store.lock().await.has_blob(blob).unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Err(error) = self.fetch_blob(network, author, blob).await {
+                    tracing::debug!(%error, blob = blob.hash, "attachment for a turn is still pending");
+                }
+            }
+        };
+        let _ = tokio::time::timeout(ATTACHMENT_WAIT, fetch).await;
+        let store = self.store.lock().await;
+        wanted
+            .into_iter()
+            .filter(|(_, blob)| !store.has_blob(blob).unwrap_or(false))
+            .map(|(_, blob)| blob.hash)
+            .collect()
+    }
+
     async fn fetch_blobs(&self, network: &str, peer: &str) -> Result<()> {
         let _download = self.blob_fetch.lock().await;
         let missing = self.store.lock().await.missing_blobs(network)?;
@@ -2557,6 +2606,81 @@ mod tests {
             b.sync_peer(&network, &member).await?;
             let held = b.membership_state().await?.project()?;
             assert_eq!(held.revocation(&removed), Some(&revocation));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        for node in [&a, &b] {
+            node.stop_network().await;
+        }
+        drop((a, b));
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_fetches_a_missing_attachment_from_its_author_or_marks_it_pending() -> Result<()>
+    {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            let content = b"meeting notes".to_vec();
+            let blob = BlobRef {
+                hash: crate::crypto::digest(&content),
+                size: content.len() as u64,
+            };
+            let attached = Attachment {
+                hash: blob.hash.clone(),
+                size: blob.size,
+                name: "notes.txt".into(),
+            };
+            {
+                let mut store = a.store.lock().await;
+                let owner = ia.owner_fixture(&network, "c", &ia.device_id()?)?;
+                store.create_conversation(&ia, &network, "c", "Files", owner, now_ms())?;
+                store.put_blob(&blob, &content)?;
+                store.accept_message(
+                    &ia,
+                    &network,
+                    "c",
+                    "m1",
+                    "m1",
+                    vec![attached.clone()],
+                    true,
+                    user_with(&ia, &network, "m1", vec![attached])?,
+                    now_ms(),
+                )?;
+            }
+            b.net()?.learn(&a.net()?.addr()).await;
+            b.refresh_own_address(&network).await?;
+            b.sync_peer(&network, &ia.device_id()?).await?;
+            let events = b.store.lock().await.context(&network, "c", None)?.events;
+            let file = b.store.lock().await.blob_file(&blob.hash)?;
+            std::fs::remove_file(&file)?;
+            assert!(
+                b.fetch_turn_attachments(&network, events.iter())
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                b.store.lock().await.has_blob(&blob)?,
+                "fetched from the message's author"
+            );
+            a.stop_network().await;
+            std::fs::remove_file(&file)?;
+            assert_eq!(
+                b.fetch_turn_attachments(&network, events.iter()).await,
+                [blob.hash.clone()].into(),
+                "an author out of reach leaves it pending"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

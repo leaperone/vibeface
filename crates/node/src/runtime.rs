@@ -17,7 +17,7 @@ use std::{
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 
-mod agent_tools;
+pub(crate) mod agent_tools;
 mod bots;
 mod chat_controls;
 mod codex_server;

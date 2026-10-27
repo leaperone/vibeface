@@ -400,6 +400,129 @@ impl Store {
         context_from(&self.connection, network_id, scope_id, basis)
     }
 
+    /// What a turn's prompt reads at the job's basis: the events after the newest checkpoint, or
+    /// after what the resumed session `resumed` has seen, plus the trigger and the question it
+    /// answers wherever they sit. Covered history stays on disk.
+    pub(crate) fn turn_history(
+        &self,
+        network_id: &str,
+        scope_id: &str,
+        job: &crate::scheduling::SchedulerJob,
+        resumed: Option<(&VersionVector, &str)>,
+    ) -> Result<crate::scheduler::TurnHistory> {
+        let basis = Some(&job.basis);
+        let connection = &self.connection;
+        let (checkpoint, since) = match resumed {
+            Some((covers, _)) => (None, covers.clone()),
+            None => match latest_checkpoint_from(connection, network_id, scope_id, basis)? {
+                Some((covers, body)) => (Some(body), covers),
+                None => (None, VersionVector::new()),
+            },
+        };
+        let recent = context_after(connection, network_id, scope_id, basis, &since)?;
+        let trigger = match crate::scheduler::trigger_event_key(&job.trigger) {
+            Some((kind, subject)) => {
+                event_about_from(connection, network_id, scope_id, kind, subject)?.filter(|event| {
+                    !matches!(
+                        event.event.body,
+                        EventBody::MessagePosted {
+                            role: Role::Assistant,
+                            ..
+                        }
+                    )
+                })
+            }
+            None => None,
+        };
+        let question = match trigger.as_ref().map(|event| &event.event.body) {
+            Some(EventBody::MessagePosted {
+                answers: Some(question),
+                ..
+            }) => event_about_from(connection, network_id, scope_id, "question_asked", question)?
+                .map(|event| event.event.body),
+            _ => None,
+        };
+        Ok(crate::scheduler::TurnHistory {
+            recent,
+            since,
+            checkpoint,
+            trigger,
+            question,
+            resumed_by: resumed.map(|(_, node)| node.to_owned()),
+            pending_blobs: Default::default(),
+        })
+    }
+
+    /// Up to `limit` effective events of the conversation within `basis`, of `kinds` when any are
+    /// given, next to the event `at` names by author and seq: before it newest first, or after it
+    /// oldest first. Without `at`, the newest. The flag says more follow in that direction.
+    pub(crate) fn history_page(
+        &self,
+        network_id: &str,
+        scope_id: &str,
+        basis: &VersionVector,
+        at: Option<(&str, u64, bool)>,
+        kinds: &[String],
+        limit: usize,
+    ) -> Result<(Vec<HashedEvent>, bool)> {
+        use rusqlite::types::Value as Sql;
+        let mut sql = String::from(
+            "SELECT author,seq,hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1",
+        );
+        let mut values = vec![
+            Sql::from(network_id.to_owned()),
+            Sql::from(scope_id.to_owned()),
+        ];
+        let after = at.is_some_and(|(_, _, after)| after);
+        if let Some((author, seq, _)) = at {
+            let (lamport, created, hash): (i64, i64, String) = self
+                .connection
+                .query_row(
+                    "SELECT lamport,created_at_ms,hash FROM events WHERE network_id=? AND scope_id=? AND author=? AND seq=? AND effective=1 LIMIT 1",
+                    params![network_id, scope_id, author, seq],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?
+                .context("no event with this author and seq in this conversation")?;
+            sql.push_str(if after {
+                " AND (lamport,created_at_ms,hash)>(?,?,?)"
+            } else {
+                " AND (lamport,created_at_ms,hash)<(?,?,?)"
+            });
+            values.extend([Sql::from(lamport), Sql::from(created), Sql::from(hash)]);
+        }
+        if !kinds.is_empty() {
+            sql.push_str(&format!(
+                " AND kind IN ({})",
+                vec!["?"; kinds.len()].join(",")
+            ));
+            values.extend(kinds.iter().cloned().map(Sql::from));
+        }
+        sql.push_str(if after {
+            " ORDER BY lamport,created_at_ms,hash"
+        } else {
+            " ORDER BY lamport DESC,created_at_ms DESC,hash DESC"
+        });
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+        let mut events = Vec::new();
+        while let Some(row) = rows.next()? {
+            let (author, seq): (String, u64) = (row.get(0)?, row.get(1)?);
+            if seq > basis.get(&author).copied().unwrap_or(0) {
+                continue;
+            }
+            if events.len() == limit {
+                return Ok((events, true));
+            }
+            let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(3)?)?;
+            events.push(HashedEvent {
+                hash: row.get(2)?,
+                event: serde_json::from_str(&envelope.canonical_body)?,
+            });
+        }
+        Ok((events, false))
+    }
+
     fn blob_path(&self, hash: &str) -> Result<PathBuf> {
         ensure!(
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -441,7 +564,7 @@ impl Store {
     }
 
     /// Reads an attachment referenced by a stored event of this conversation.
-    fn referenced_size(&self, network: &str, scope: &str, hash: &str) -> Result<u64> {
+    pub(crate) fn referenced_size(&self, network: &str, scope: &str, hash: &str) -> Result<u64> {
         self.connection
             .query_row(
                 "SELECT b.size FROM event_blobs b JOIN events e ON e.network_id=b.network_id AND e.hash=b.hash WHERE b.network_id=? AND b.blob=? AND e.scope_id=? LIMIT 1",
@@ -857,6 +980,32 @@ pub(crate) fn context_from(
     )
 }
 
+/// The newest effective checkpoint of the conversation within `basis` (default: all), and the
+/// vector it covers. Read through the kind index, so its cost does not grow with the history.
+pub(crate) fn latest_checkpoint_from(
+    connection: &Connection,
+    network_id: &str,
+    scope_id: &str,
+    basis: Option<&VersionVector>,
+) -> Result<Option<(VersionVector, EventBody)>> {
+    let mut statement = connection.prepare(
+        "SELECT author,seq,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='context_checkpoint' AND effective=1 ORDER BY lamport DESC,created_at_ms DESC,hash DESC",
+    )?;
+    let mut rows = statement.query(params![network_id, scope_id])?;
+    while let Some(row) = rows.next()? {
+        let (author, seq): (String, u64) = (row.get(0)?, row.get(1)?);
+        if basis.is_some_and(|basis| seq > basis.get(&author).copied().unwrap_or(0)) {
+            continue;
+        }
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        if let EventBody::ContextCheckpoint { covers, .. } = &event.body {
+            return Ok(Some((covers.clone(), event.body)));
+        }
+    }
+    Ok(None)
+}
+
 /// The newest checkpoint and the events it does not cover, in shared order. The next checkpoint
 /// needs only these, so a long conversation does not reload its whole history every turn.
 pub(crate) fn since_checkpoint_from(
@@ -864,20 +1013,37 @@ pub(crate) fn since_checkpoint_from(
     network_id: &str,
     scope_id: &str,
 ) -> Result<Context> {
-    let mut newest = connection.prepare(
-        "SELECT envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1 ORDER BY lamport DESC,created_at_ms DESC,hash DESC",
-    )?;
-    let mut rows = newest.query(params![network_id, scope_id])?;
-    let mut covers = VersionVector::new();
-    while let Some(row) = rows.next()? {
-        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(0)?)?;
-        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
-        if let EventBody::ContextCheckpoint { covers: found, .. } = event.body {
-            covers = found;
-            break;
-        }
-    }
+    let covers = latest_checkpoint_from(connection, network_id, scope_id, None)?
+        .map(|(covers, _)| covers)
+        .unwrap_or_default();
     context_after(connection, network_id, scope_id, None, &covers)
+}
+
+/// The first effective event in shared order of `kind` about `subject`, wherever it sits in the
+/// conversation's history.
+pub(crate) fn event_about_from(
+    connection: &Connection,
+    network_id: &str,
+    scope_id: &str,
+    kind: &str,
+    subject: &str,
+) -> Result<Option<HashedEvent>> {
+    let found: Option<(String, String)> = connection
+        .query_row(
+            "SELECT hash,envelope FROM events WHERE network_id=? AND scope_id=? AND kind=? AND subject=? AND effective=1 ORDER BY lamport,created_at_ms,hash LIMIT 1",
+            params![network_id, scope_id, kind, subject],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    found
+        .map(|(hash, envelope)| {
+            let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+            Ok(HashedEvent {
+                hash,
+                event: serde_json::from_str(&envelope.canonical_body)?,
+            })
+        })
+        .transpose()
 }
 
 fn context_after(

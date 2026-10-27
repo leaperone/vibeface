@@ -72,29 +72,14 @@ impl Runtime {
                 self.rpc_inner(access.clone(), json!({"method":"nodes"}))
                     .await
             }
-            Tool::Context => self.agent_context(network, &scope, &args).await,
+            Tool::Context => self.agent_context(&access, &scope, &args).await,
             // Dispatches the DAG does not name yet are listed too, so none is sent twice.
             Tool::WorkStatus => {
                 let store = self.store.lock().await;
                 let works = store.works(network, &scope)?;
                 let dispatches = store.undelivered_dispatches(network, &scope)?;
                 drop(store);
-                Ok(match args["work_id"].as_str() {
-                    Some(id) => match works.into_iter().find(|work| work.work_id == id) {
-                        Some(work) => json!(work),
-                        None => dispatch_row(
-                            dispatches
-                                .iter()
-                                .find(|dispatch| dispatch.spec.work_id == id)
-                                .context("work not found in this conversation")?,
-                        ),
-                    },
-                    None => {
-                        let mut rows: Vec<Value> = works.iter().map(|work| json!(work)).collect();
-                        rows.extend(dispatches.iter().map(dispatch_row));
-                        json!({ "works": rows })
-                    }
-                })
+                work_status(&works, &dispatches, &args)
             }
             Tool::CallLookup => {
                 let manager = access
@@ -425,29 +410,64 @@ impl Runtime {
         }
     }
 
-    async fn agent_context(&self, network: &str, scope: &str, args: &Value) -> Result<Value> {
-        let offset = args["offset"].as_u64().unwrap_or(0).min(usize::MAX as u64) as usize;
-        let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    /// Reads history as of the turn's basis, the same history its prompt was built from, so a
+    /// position the prompt names still points at the same event while new ones arrive.
+    async fn agent_context(&self, access: &Access, scope: &str, args: &Value) -> Result<Value> {
+        let network = access.network_id.as_str();
         let store = self.store.lock().await;
         if let Some(hash) = args["blob_hash"].as_str() {
-            // ponytail: each page re-reads the whole file; blobs are capped at MAX_BLOB_BYTES.
-            let (blob, bytes) = store.read_blob(network, scope, hash)?;
-            ensure!(offset <= bytes.len(), "invalid blob offset");
-            let end = offset.saturating_add(limit * 1024).min(bytes.len());
-            return Ok(json!({"hash":blob.hash,"size":blob.size,"offset":offset,
-                "data_hex":hex::encode(&bytes[offset..end]),"next_offset":(end<bytes.len()).then_some(end)}));
+            return blob_page(&store, network, scope, hash, args);
         }
-        let events = store.context(network, scope, None)?.events;
-        let end = offset.saturating_add(limit).min(events.len());
-        ensure!(offset <= end, "invalid event offset");
-        let page = events[offset..end]
-            .iter()
-            .map(|event| {
-                json!({"author":event.event.author,"created_at_ms":event.event.created_at_ms,
-                    "body":crate::scheduler::agent_event_body(&event.event.body),"blobs":event.event.blobs})
+        let basis = match &access.manager {
+            Some(manager) => {
+                store
+                    .scheduler_job(scope, &manager.trigger)?
+                    .context("this turn is not running here")?
+                    .basis
+            }
+            None => store.version_vector(network)?,
+        };
+        let at = match (&args["before"], &args["after"]) {
+            (Value::Null, Value::Null) => None,
+            (at, Value::Null) => Some((at, false)),
+            (Value::Null, at) => Some((at, true)),
+            _ => bail!("give before or after, not both"),
+        };
+        let at = at
+            .map(|(at, after)| {
+                Ok::<_, anyhow::Error>((
+                    at["author"].as_str().context("author is required")?,
+                    at["seq"].as_u64().context("seq is required")?,
+                    after,
+                ))
             })
-            .collect::<Vec<_>>();
-        Ok(json!({"events":page,"next_offset":(end<events.len()).then_some(end)}))
+            .transpose()?;
+        let kinds: Vec<String> = match &args["types"] {
+            Value::Null => vec![],
+            types => serde_json::from_value(types.clone()).context("types lists event types")?,
+        };
+        let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+        let (events, more) = store.history_page(network, scope, &basis, at, &kinds, limit)?;
+        drop(store);
+        let after = at.is_some_and(|(_, _, after)| after);
+        let mut rows = Vec::new();
+        let mut used = 0;
+        let mut cut = false;
+        for event in &events {
+            let row = json!({"author":event.event.author,"seq":event.event.seq,"created_at_ms":event.event.created_at_ms,
+                "body":crate::scheduler::bounded(&crate::scheduler::agent_event_body(&event.event.body), EVENT_BYTES),
+                "blobs":event.event.blobs});
+            used += row.to_string().len();
+            if !rows.is_empty() && used > PAGE_BYTES {
+                cut = true;
+                break;
+            }
+            rows.push(row);
+        }
+        if !after {
+            rows.reverse();
+        }
+        Ok(json!({"events":rows,"more":more || cut}))
     }
 
     /// Registers a dispatch before anything is sent. On this device it returns `may_send` only to
@@ -545,4 +565,106 @@ impl Runtime {
             "may_send":created,"send_by_ms":record.send_by_ms,"cwd":cwd,"thread_id":thread}),
         )
     }
+}
+
+/// Bytes one tool result carries, and one event within it; the rest is read page by page.
+const PAGE_BYTES: usize = 32_000;
+const EVENT_BYTES: usize = 8_000;
+
+/// Up to `limit` KiB of an attachment from `offset`: text as UTF-8, other content as base64.
+/// An attachment not on this device yet says `pending_download`.
+pub(crate) fn blob_page(
+    store: &crate::store::Store,
+    network: &str,
+    scope: &str,
+    hash: &str,
+    args: &Value,
+) -> Result<Value> {
+    use base64::Engine as _;
+    let size = store.referenced_size(network, scope, hash)?;
+    let blob = BlobRef {
+        hash: hash.into(),
+        size,
+    };
+    if !store.has_blob(&blob)? {
+        return Ok(json!({"hash":hash,"size":size,"pending_download":true}));
+    }
+    let offset = args["offset"].as_u64().unwrap_or(0);
+    ensure!(offset <= size, "invalid blob offset");
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 32) as usize * 1024;
+    let (_, mut bytes) = store.read_blob_range(network, scope, hash, offset, limit)?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(_) => true,
+        // A character split by the page end continues on the next page.
+        Err(error)
+            if error.error_len().is_none()
+                && error.valid_up_to() > 0
+                && offset + (bytes.len() as u64) < size =>
+        {
+            bytes.truncate(error.valid_up_to());
+            true
+        }
+        Err(_) => false,
+    };
+    let end = offset + bytes.len() as u64;
+    let mut page =
+        json!({"hash":hash,"size":size,"offset":offset,"next_offset":(end < size).then_some(end)});
+    if text {
+        page["text"] = json!(String::from_utf8(bytes)?);
+    } else {
+        page["data_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+    }
+    Ok(page)
+}
+
+/// `work_status`: one work by `work_id` in full, or a page of this conversation's works newest
+/// first, after the work `before` names, within `PAGE_BYTES`.
+pub(crate) fn work_status(
+    works: &[crate::model::WorkProjection],
+    dispatches: &[crate::work::Dispatch],
+    args: &Value,
+) -> Result<Value> {
+    if let Some(id) = args["work_id"].as_str() {
+        if let Some(work) = works.iter().find(|work| work.work_id == id) {
+            let mut row = json!(work);
+            if work.result_text.len() > PAGE_BYTES {
+                row["result_text"] = json!(crate::scheduler::prefix(&work.result_text, PAGE_BYTES));
+                row["result_truncated"] = json!(true);
+            }
+            return Ok(row);
+        }
+        return Ok(dispatch_row(
+            dispatches
+                .iter()
+                .find(|dispatch| dispatch.spec.work_id == id)
+                .context("work not found in this conversation")?,
+        ));
+    }
+    let rows: Vec<Value> = dispatches
+        .iter()
+        .rev()
+        .map(dispatch_row)
+        .chain(works.iter().rev().map(crate::scheduler::work_row))
+        .collect();
+    let start = match args["before"].as_str() {
+        Some(before) => {
+            rows.iter()
+                .position(|row| row["work_id"] == before)
+                .context("before names no work of this conversation")?
+                + 1
+        }
+        None => 0,
+    };
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+    let mut page = Vec::new();
+    let mut used = 0;
+    for row in rows.iter().skip(start).take(limit) {
+        used += row.to_string().len();
+        if !page.is_empty() && used > PAGE_BYTES {
+            break;
+        }
+        page.push(row.clone());
+    }
+    let more = start + page.len() < rows.len();
+    Ok(json!({"works":page,"more":more}))
 }

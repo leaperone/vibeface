@@ -100,7 +100,10 @@ impl Runtime {
                 Err(error) => tracing::warn!(%error, work_id, "stop waits for the next reconcile"),
             }
         }
-        self.observe_live_threads().await;
+        // Only a state change can change which threads stay subscribed.
+        if !quiet {
+            self.observe_live_threads().await;
+        }
         Ok(record)
     }
 
@@ -982,7 +985,10 @@ impl Runtime {
     /// Applies an App Server notification to the works whose turn it is about.
     async fn route_turn_event(self: &Arc<Self>, network: &str, event: Value) -> Result<()> {
         let turn = codex_server::turn_event(&event);
-        let records = self.store.lock().await.work_records()?;
+        let Some(thread) = turn.thread else {
+            return Ok(());
+        };
+        let records = self.store.lock().await.work_records_on_thread(thread)?;
         // A turn on the thread of a send not seen in time may be that send; reading the thread
         // tells, and settles the work if so.
         if turn.boundary {
@@ -996,7 +1002,7 @@ impl Runtime {
                             probe: true,
                             ..
                         }
-                    ) && record.state.thread() == turn.thread
+                    ) && record.state.thread() == Some(thread)
                 })
                 .map(|record| record.work_id.clone())
                 .collect();
@@ -1009,10 +1015,10 @@ impl Runtime {
         let works: Vec<_> = records
             .into_iter()
             .filter(|record| {
-                record.state.handle().is_some_and(|h| {
-                    Some(h.thread_id.as_str()) == turn.thread
-                        && Some(h.turn_id.as_str()) == turn.turn
-                })
+                record
+                    .state
+                    .handle()
+                    .is_some_and(|h| h.thread_id == thread && Some(h.turn_id.as_str()) == turn.turn)
             })
             .collect();
         let target_node = self.identity.device_id()?;

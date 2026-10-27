@@ -54,6 +54,14 @@ table "events" {
     null = false
     type = integer
   }
+  column "kind" {
+    null = false
+    type = text
+  }
+  column "subject" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.hash]
   }
@@ -77,6 +85,9 @@ table "events" {
   }
   index "events_scope_author" {
     columns = [column.network_id, column.scope_id, column.author, column.seq]
+  }
+  index "events_kind" {
+    columns = [column.network_id, column.scope_id, column.kind, column.subject]
   }
 }
 table "event_blobs" {
@@ -1224,6 +1235,9 @@ table "work_runs" {
   }
   primary_key {
     columns = [column.work_id]
+  }
+  index "work_runs_thread" {
+    columns = [column.thread_id]
   }
 }
 table "work_dispatches" {
