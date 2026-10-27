@@ -5005,6 +5005,47 @@ fn message_seq(store: &Store, net: &Net, message: &str) -> Result<u64> {
 }
 
 #[test]
+fn a_long_event_reads_whole_page_by_page_within_the_cap() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let text = "好\"\\\n\u{1}a".repeat(20_000);
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m1", &text),
+        vec![],
+        10,
+    )?;
+    let seq = message_seq(&store, &net, "m1")?;
+    let author = net.a.device_id()?;
+    let event = store
+        .scope_event(&net.network, "c", &author, seq)?
+        .context("m1")?;
+    let whole = crate::scheduler::agent_event_body(&event.event.body).to_string();
+    let mut read = String::new();
+    let mut pages = 0;
+    let mut offset = Some(0);
+    while let Some(at) = offset {
+        let page =
+            crate::runtime::agent_tools::event_page(&store, &net.network, "c", &author, seq, at)?;
+        assert!(
+            page.to_string().len() <= 32_000,
+            "one result stays within the cap"
+        );
+        read.push_str(page["body_json"].as_str().context("body_json")?);
+        offset = page["next_offset"].as_u64().map(|next| next as usize);
+        pages += 1;
+    }
+    assert!(pages > 4);
+    assert_eq!(read, whole, "the pages joined are the whole body");
+    let body: Value = serde_json::from_str(&read)?;
+    assert_eq!(body["text"], text);
+    Ok(())
+}
+
+#[test]
 fn history_pages_read_at_the_turn_basis_by_position_and_type() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
