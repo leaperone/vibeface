@@ -134,10 +134,21 @@ function useSaveAgain() {
   return { save, error }
 }
 
+/** A new file this phone made and still holds, offered again until it is confirmed kept apart from its password. */
+function UnsavedRecoveryFile() {
+  const { unsavedRecovery, forgetUnsavedRecovery } = useDevice()
+  const { save, error } = useSaveAgain()
+  if (!unsavedRecovery || !save) return null
+  return <View className="gap-3 border-t border-border pt-4">
+    <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
+    <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
+    {errorText(error)}
+  </View>
+}
+
 /** This phone's recovery while it waits on the device it went through, or once one of the devices it would replace stopped it. */
 export function RecoveryWaiting() {
-  const { recovery, dismissRecovery, unsavedRecovery, forgetUnsavedRecovery } = useDevice()
-  const { save, error } = useSaveAgain()
+  const { recovery, dismissRecovery, forgetUnsavedRecovery } = useDevice()
   if (recovery?.status === 'stopped') return <Panel icon={ShieldX} title={recoveryCopy.stopped}>
     <Text className="text-muted-foreground">{recoveryCopy.stoppedNote}</Text>
     <Button className="min-h-11 self-end" onPress={() => { forgetUnsavedRecovery(); dismissRecovery() }}><Text>知道了</Text></Button>
@@ -150,11 +161,7 @@ export function RecoveryWaiting() {
     </>}
     {hint(BellRing, recoveryCopy.managersSee)}
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
-    {unsavedRecovery && save ? <View className="gap-3 border-t border-border pt-4">
-      <View className="flex-row items-center gap-2"><Icon as={FileKey} className="size-4 text-muted-foreground" /><Text role="heading" className="font-medium">{recoveryCopy.saveNew}</Text></View>
-      <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
-      {errorText(error)}
-    </View> : null}
+    <UnsavedRecoveryFile />
   </Panel>
 }
 
@@ -196,5 +203,6 @@ export function ReplaceRecovery() {
     <Button className="min-h-11" disabled={locked || !picked || !oldPassword || !password} onPress={submit}>
       <Text>{busy ? '处理中' : '换密码并保存新文件'}</Text>
     </Button>
+    {device.recovered ? null : <UnsavedRecoveryFile />}
   </View>
 }
