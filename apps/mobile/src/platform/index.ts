@@ -15,7 +15,7 @@ const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
 const createdKey = 'vibeface.device-created'
 const outboxPrefix = 'outbox:'
-const lostKeyMessage = '这台手机的设备密钥不见了。请在管理设备上重新邀请这台手机，或导入恢复文件。原任务不会因此重新执行。'
+const lostKeyMessage = '这台手机的设备密钥不见了。请用管理设备生成的加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。'
 
 let identity: NativeIdentity | undefined
 /** The device secret lives in the Keychain / Keystore, readable only by this app on this phone. */

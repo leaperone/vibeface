@@ -253,6 +253,10 @@ table "messages" {
     null = true
     type = text
   }
+  column "failure" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.conversation_id, column.message_id]
   }
@@ -1043,6 +1047,10 @@ table "scheduler_jobs" {
     null = true
     type = text
   }
+  column "failure" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.conversation_id, column.trigger]
   }
@@ -1233,6 +1241,10 @@ table "work_dispatches" {
     type = text
   }
   column "reason" {
+    null = true
+    type = text
+  }
+  column "failure" {
     null = true
     type = text
   }

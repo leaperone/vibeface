@@ -5,8 +5,9 @@ use crate::{crypto::LocalIdentity, model::*, scheduling::*};
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
+use vibeface_bridge::failure::ExecFailure;
 
-const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail";
+const JOB_COLUMNS: &str = "conversation_id,trigger,kind,sequence,basis,reply_to,message_id,state,attempt_id,attempt_boot,attempt_permission,detail,failure";
 
 type JobRow = (
     String,
@@ -20,6 +21,7 @@ type JobRow = (
     Option<String>,
     Option<String>,
     Option<u64>,
+    Option<String>,
     Option<String>,
 );
 
@@ -37,6 +39,7 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         boot,
         permission,
         detail,
+        failure,
     ) = row;
     let attempt = match (id, boot, permission) {
         (Some(id), Some(boot), Some(permission_version)) => Some(ManagerAttempt {
@@ -48,6 +51,16 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
     };
     let attempt_or = || attempt.clone().context("scheduler job attempt missing");
     let detail = detail.unwrap_or_default();
+    let failure = || -> Result<ExecFailure> {
+        Ok(ExecFailure {
+            kind: super::enum_from(
+                failure
+                    .as_deref()
+                    .context("scheduler job failure missing")?,
+            )?,
+            detail: detail.clone(),
+        })
+    };
     let state = match state.as_str() {
         "queued" => JobState::Queued,
         "claimed" => JobState::Claimed {
@@ -64,7 +77,7 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         },
         "failed" => JobState::Failed {
             attempt: attempt_or()?,
-            detail,
+            failure: failure()?,
         },
         "cancelled" => JobState::Cancelled {
             attempt,
@@ -72,7 +85,7 @@ fn job_from_row(row: JobRow) -> Result<SchedulerJob> {
         },
         "interrupted" => JobState::Interrupted {
             attempt: attempt_or()?,
-            detail,
+            failure: failure()?,
         },
         "steering" | "steered" => {
             let steer: JobState = serde_json::from_str(&detail)?;
@@ -116,6 +129,7 @@ fn query_jobs(
                 r.get(9)?,
                 r.get(10)?,
                 r.get(11)?,
+                r.get(12)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<JobRow>>>()?;
@@ -145,9 +159,13 @@ fn queued_jobs(connection: &Connection, conversation: &str) -> Result<Vec<Schedu
 
 fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     let attempt = job.state.attempt();
+    let failure = match &job.state {
+        JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } => Some(failure),
+        _ => None,
+    };
     let detail = match &job.state {
-        JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } => {
-            Some(detail.clone())
+        JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } => {
+            Some(failure.detail.clone())
         }
         JobState::Cancelled { evidence, .. } => Some(evidence.clone()),
         JobState::Steering { .. } | JobState::Steered { .. } => {
@@ -157,7 +175,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
     };
     connection.execute(
         &format!(
-            "INSERT OR REPLACE INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO scheduler_jobs({JOB_COLUMNS}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"
         ),
         params![
             job.conversation_id,
@@ -172,6 +190,7 @@ fn save_job(connection: &Connection, job: &SchedulerJob) -> Result<()> {
             attempt.map(|a| &a.boot),
             attempt.map(|a| a.permission_version),
             detail,
+            failure.map(|f| super::enum_text(&f.kind)),
         ],
     )?;
     Ok(())
@@ -689,9 +708,8 @@ pub(crate) fn chain_depth(
                 return Ok(hops);
             }
             Some(("work" | "task", work_id)) => {
-                let work = super::reduce::work_from(connection, network, work_id)?
+                (conversation, trigger) = cause_from(connection, network, work_id)?
                     .context("the work is not stored here")?;
-                (conversation, trigger) = (work.conversation_id, work.trigger);
             }
             _ => bail!("unknown trigger {trigger}"),
         }
@@ -838,44 +856,48 @@ pub(crate) fn queue_delivery_from(
     .receipt(network))
 }
 
-/// The user message a work ultimately answers, followed through the DAG's dispatch chain, so
-/// any owner can report a result whose turn ran on another Node.
-fn origin_message(connection: &Connection, network: &str, work_id: &str) -> Result<Option<String>> {
-    let mut work_id = work_id.to_owned();
+/// The conversation and trigger of the turn that dispatched a work: from the DAG, else from this
+/// Node's own dispatch the target never took, which only this Node can follow.
+fn cause_from(
+    connection: &Connection,
+    network: &str,
+    work_id: &str,
+) -> Result<Option<(String, String)>> {
+    if let Some(work) = super::reduce::work_from(connection, network, work_id)? {
+        return Ok(Some((work.conversation_id, work.trigger)));
+    }
+    Ok(super::work::dispatch_from(connection, work_id)?
+        .map(|dispatch| (dispatch.spec.conversation, dispatch.spec.trigger)))
+}
+
+/// The user message a trigger ultimately answers, followed through the dispatch chain, so any
+/// owner can report a result whose turn ran on another Node.
+fn origin_message(connection: &Connection, network: &str, trigger: &str) -> Result<Option<String>> {
+    let mut trigger = trigger.to_owned();
     for _ in 0..64 {
-        let Some(work) = super::reduce::work_from(connection, network, &work_id)? else {
-            return Ok(None);
-        };
-        match work.trigger.split_once(':') {
+        match trigger.split_once(':') {
             Some(("message" | "bot_message", message)) => return Ok(Some(message.into())),
-            Some(("work" | "task", parent)) => work_id = parent.into(),
-            Some(("schedule", _)) => return Ok(Some(work.trigger)),
+            Some(("work" | "task", work_id)) => match cause_from(connection, network, work_id)? {
+                Some((_, cause)) => trigger = cause,
+                None => return Ok(None),
+            },
+            Some(("schedule", _)) => return Ok(Some(trigger)),
             _ => return Ok(None),
         }
     }
     Ok(None)
 }
 
-/// A finished work reports back to the owner through its own trigger, unless the user opted out
-/// on the message that started the chain. Unverified results wait for the user or a probe.
-/// Another Node's result waits in the outbox for the owner.
-pub(crate) fn admit_work_result_from(
+/// Admits the work's report turn for the message the chain started from, unless the user
+/// opted out there.
+fn admit_report_from(
     connection: &Connection,
     network: &str,
-    local: &str,
     conversation: &str,
     work_id: &str,
-    outcome: WorkOutcome,
 ) -> Result<Option<AdmissionReceipt>> {
-    if outcome == WorkOutcome::Unverified {
-        return Ok(None);
-    }
     let trigger = work_trigger(work_id);
-    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
-    if owner.as_deref() != Some(local) {
-        return queue_delivery_from(connection, network, conversation, &trigger).map(Some);
-    }
-    let Some(reply_to) = origin_message(connection, network, work_id)? else {
+    let Some(reply_to) = origin_message(connection, network, &trigger)? else {
         return Ok(None);
     };
     let report = message_from(connection, network, conversation, &reply_to)?
@@ -895,78 +917,57 @@ pub(crate) fn admit_work_result_from(
     .map(Some)
 }
 
-/// Provider errors as the person reads them in the chat, each with where to go next. The raw
-/// English cause stays on the local job and in node.log; the reply is synced to every device.
-const PROVIDER_FAILURES: &[(&[&str], &str)] = &[
-    (
-        &[
-            "api_key is required",
-            "api_key is missing",
-            "missing environment variable",
-        ],
-        "AI 服务缺少密钥或密钥无效。去「设备 → Bot 与任务」填好后再发一次。",
-    ),
-    (
-        &["execution is turned off"],
-        "这台电脑的 Codex 没开执行任务。去「设备 → Bot 与任务」打开后再发一次。",
-    ),
-    (
-        &[
-            "executable was not found",
-            "command not found",
-            "no cursor sdk bridge",
-            "enoent",
-        ],
-        "这台电脑上找不到 AI 服务的程序。去「设备 → Bot 与任务」检查后再发一次。",
-    ),
-    (
-        &["usage limit", "rate limit", "quota", "too many requests"],
-        "AI 服务的用量到上限了。等额度恢复后再发一次。",
-    ),
-    (
-        &[
-            "unauthorized",
-            "authentication failed",
-            "not logged in",
-            "invalid api key",
-        ],
-        "AI 服务登录没通过。去「设备 → Bot 与任务」检查密钥后再发一次。",
-    ),
-];
-
-fn plain_failure(detail: &str) -> Option<&'static str> {
-    let detail = detail.to_lowercase();
-    PROVIDER_FAILURES
-        .iter()
-        .find(|(needles, _)| needles.iter().any(|needle| detail.contains(needle)))
-        .map(|(_, text)| *text)
+/// A dispatch refused, or left unknown by a removed device, has no result in the DAG; the
+/// dispatching owner wakes its bot through the work's trigger instead, once per work.
+pub(crate) fn admit_dispatch_result_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    dispatch: &crate::work::Dispatch,
+) -> Result<Option<AdmissionReceipt>> {
+    let spec = &dispatch.spec;
+    let owner = conversation_from(connection, network, &spec.conversation)?.and_then(|c| c.owner);
+    if !dispatch.state.ended()
+        || owner.as_deref() != Some(local)
+        || super::reduce::work_from(connection, network, &spec.work_id)?.is_some()
+    {
+        return Ok(None);
+    }
+    admit_report_from(connection, network, &spec.conversation, &spec.work_id)
 }
 
-fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, String) {
-    let chinese = |detail: &str| {
-        detail
-            .chars()
-            .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
-    };
+/// A finished work reports back to the owner through its own trigger, unless the user opted out
+/// on the message that started the chain. Unverified results wait for the user or a probe.
+/// Another Node's result waits in the outbox for the owner.
+pub(crate) fn admit_work_result_from(
+    connection: &Connection,
+    network: &str,
+    local: &str,
+    conversation: &str,
+    work_id: &str,
+    outcome: WorkOutcome,
+) -> Result<Option<AdmissionReceipt>> {
+    if outcome == WorkOutcome::Unverified {
+        return Ok(None);
+    }
+    let owner = conversation_from(connection, network, conversation)?.and_then(|c| c.owner);
+    if owner.as_deref() != Some(local) {
+        let trigger = work_trigger(work_id);
+        return queue_delivery_from(connection, network, conversation, &trigger).map(Some);
+    }
+    admit_report_from(connection, network, conversation, work_id)
+}
+
+/// The reply's status, the failure it shows, and its text when the turn said nothing. The
+/// failure's detail stays on the local job and in node.log; clients word its kind.
+fn reply_status(outcome: &JobOutcome) -> (ReplyStatus, Option<FailureKind>, &'static str) {
     match outcome {
-        JobOutcome::Completed => (ReplyStatus::Completed, "（没有回复内容）".into()),
-        JobOutcome::Failed(detail) => (
-            ReplyStatus::Failed,
-            match plain_failure(detail) {
-                Some(text) => text.into(),
-                None if chinese(detail) => format!("这次没能回复：{detail}"),
-                None => "这次没能回复。再发一次试试。".into(),
-            },
-        ),
-        JobOutcome::Cancelled(_) => (ReplyStatus::Stopped, "已停止回复。".into()),
-        JobOutcome::Interrupted { detail, .. } => (
-            ReplyStatus::Interrupted,
-            match plain_failure(detail) {
-                Some(text) => text.into(),
-                None if chinese(detail) => format!("回复被中断：{detail}"),
-                None => "回复中途断开，结果未知。先看看有没有改动，再决定要不要重发。".into(),
-            },
-        ),
+        JobOutcome::Completed => (ReplyStatus::Completed, None, "（没有回复内容）"),
+        JobOutcome::Failed(failure) => (ReplyStatus::Failed, Some(failure.kind), ""),
+        JobOutcome::Cancelled(_) => (ReplyStatus::Stopped, None, "已停止回复。"),
+        JobOutcome::Interrupted { failure, .. } => {
+            (ReplyStatus::Interrupted, Some(failure.kind), "")
+        }
     }
 }
 
@@ -981,7 +982,7 @@ fn post_reply_from(
     identity: &LocalIdentity,
     network: &str,
     job: &SchedulerJob,
-    status: ReplyStatus,
+    (status, failure): (ReplyStatus, Option<FailureKind>),
     text: String,
     at: i64,
 ) -> Result<bool> {
@@ -1002,6 +1003,7 @@ fn post_reply_from(
             report_results: None,
             in_reply_to: Some(job.reply_to.clone()),
             status: Some(status),
+            failure,
             answers: None,
             attestation: None,
         },
@@ -1034,9 +1036,9 @@ fn end_job_from(
         .context("scheduler attempt missing")?
         .clone();
     let attempt_id = attempt.id.clone();
-    let (status, fallback) = reply_status(&outcome);
+    let (status, failure, fallback) = reply_status(&outcome);
     let text = if text.trim().is_empty() {
-        fallback
+        fallback.to_owned()
     } else {
         text.to_owned()
     };
@@ -1049,7 +1051,14 @@ fn end_job_from(
             connection, blob_dir, identity, network, work_id, signal, at,
         )?;
     } else if post_reply_from(
-        connection, blob_dir, identity, network, &job, status, text, at,
+        connection,
+        blob_dir,
+        identity,
+        network,
+        &job,
+        (status, failure),
+        text,
+        at,
     )? {
         let context = super::since_checkpoint_from(connection, network, &job.conversation_id)?;
         let works = super::reduce::works_from(connection, network, &job.conversation_id)?;
@@ -1072,20 +1081,20 @@ fn end_job_from(
     }
     job.state = match outcome {
         JobOutcome::Completed => JobState::Completed { attempt },
-        JobOutcome::Failed(detail) => JobState::Failed { attempt, detail },
+        JobOutcome::Failed(failure) => JobState::Failed { attempt, failure },
         JobOutcome::Cancelled(evidence) => JobState::Cancelled {
             attempt: Some(attempt),
             evidence,
         },
         JobOutcome::Interrupted {
-            detail,
+            failure,
             process_unconfirmed,
         } => {
             fence(session)?;
             if process_unconfirmed {
-                save_pending_check(connection, &job, &attempt, &detail, at)?;
+                save_pending_check(connection, &job, &attempt, &failure.detail, at)?;
             }
-            JobState::Interrupted { attempt, detail }
+            JobState::Interrupted { attempt, failure }
         }
     };
     if session.active.as_deref() == Some(job.trigger.as_str()) {
@@ -1137,7 +1146,10 @@ fn recover_session(
                 session,
                 job,
                 JobOutcome::Interrupted {
-                    detail: "设备重启了，没有自动重做".into(),
+                    failure: ExecFailure::new(
+                        FailureKind::Restarted,
+                        "the device restarted during this reply; it was not redone",
+                    ),
                     process_unconfirmed: true,
                 },
                 "",
@@ -1206,6 +1218,7 @@ impl Store {
                     status: None,
                     answers: None,
                     attestation: Some(attestation),
+                    failure: None,
                 },
                 attachments.iter().map(Attachment::blob).collect(),
                 created_at_ms,
@@ -1547,7 +1560,7 @@ impl Store {
         if matches!(job.state, JobState::Queued) {
             let evidence = "用户在开始前取消".to_owned();
             let outcome = JobOutcome::Cancelled(evidence.clone());
-            let (status, text) = reply_status(&outcome);
+            let (status, failure, text) = reply_status(&outcome);
             let change = TaskJobChange::Ended {
                 outcome: &outcome,
                 text: "",
@@ -1570,8 +1583,8 @@ impl Store {
                     identity,
                     network,
                     &job,
-                    status,
-                    text,
+                    (status, failure),
+                    text.into(),
                     at,
                 )?;
             }

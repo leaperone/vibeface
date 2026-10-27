@@ -9,6 +9,7 @@ use crate::{
     work::{Signal, WorkSpec},
 };
 use serde_json::json;
+use vibeface_bridge::failure::ExecFailure;
 
 struct Net {
     network: String,
@@ -51,6 +52,7 @@ fn user(net: &Net, id: &str, text: &str) -> EventBody {
                 status: None,
                 answers: None,
                 attestation: None,
+                failure: None,
             },
         )
         .expect("fixture client signs")
@@ -596,6 +598,7 @@ fn say(store: &mut Store, net: &Net, id: &str, report_results: bool) -> Result<(
             status: None,
             answers: None,
             attestation: None,
+            failure: None,
         },
     )?;
     store.accept_message(
@@ -848,7 +851,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         &id,
         Signal::TurnCompleted {
             turn_id: "u".into(),
-            status: "completed".into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
             text: "done".into(),
             error: None,
         },
@@ -870,8 +873,133 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
     Ok(())
 }
 
+/// A dispatch the target never took into the DAG is still the bot's to see: waiting ones are
+/// in its prompt, and a refusal or a removed target's unknown answer wakes it once.
 #[test]
-fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
+fn dispatches_the_dag_lacks_reach_the_bot_once() -> Result<()> {
+    use crate::work::{Dispatch, DispatchState};
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let (local, trigger) = (net.a.device_id()?, message_trigger("m1"));
+    let dispatch = |call: &str| -> Result<Dispatch> {
+        Ok(Dispatch {
+            spec: WorkSpec {
+                work_id: WorkSpec::id("c", &trigger, call),
+                conversation: "c".into(),
+                trigger: trigger.clone(),
+                target: net.b.device_id()?,
+                dispatcher: local.clone(),
+                call_ref: call.into(),
+                kind: WorkKind::Task,
+                cwd: "/tmp".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            },
+            state: DispatchState::Pending,
+        })
+    };
+    let (refused, lost) = (dispatch("refused")?, dispatch("lost")?);
+    store.save_dispatch(&refused)?;
+    store.save_dispatch(&lost)?;
+    let render = |store: &Store, trigger: &str| -> Result<Value> {
+        let job = store.scheduler_job("c", trigger)?.context("job")?;
+        let context = store.context(&net.network, "c", None)?;
+        let works = store.works(&net.network, "c")?;
+        let dispatches = store.undelivered_dispatches(&net.network, "c")?;
+        let (prompt, _) = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            &dispatches,
+            json!({}),
+            None,
+            &[],
+            None,
+            None,
+        )?;
+        prompt_data(&prompt)
+    };
+    let shown = render(&store, &trigger)?;
+    assert_eq!(
+        listed(&shown, "/works", "state"),
+        vec![json!("dispatch_waiting"), json!("dispatch_waiting")],
+        "the bot sees what it already sent, so it does not send it again"
+    );
+
+    let no = DispatchState::Rejected {
+        reason: "no bot".into(),
+        failure: None,
+    };
+    let woke = |store: &mut Store, state: &DispatchState| {
+        store
+            .answer_dispatch(
+                &net.network,
+                &local,
+                &refused.spec.work_id,
+                state.clone(),
+                true,
+            )
+            .map(|(_, receipt)| receipt.is_some())
+    };
+    assert!(woke(&mut store, &no)?, "a refusal wakes the bot");
+    assert!(
+        !woke(&mut store, &no)?,
+        "a repeated refusal wakes it no more"
+    );
+    assert!(
+        !woke(&mut store, &DispatchState::Accepted)?,
+        "the first answer stands"
+    );
+    let report = work_trigger(&refused.spec.work_id);
+    let job = store.scheduler_job("c", &report)?.context("refusal job")?;
+    assert_eq!(
+        (job.kind, job.reply_to.as_str()),
+        (TriggerKind::WorkResult, "m1")
+    );
+    let shown = render(&store, &report)?;
+    assert_eq!(
+        shown["trigger"]["event"]["body"]["state"],
+        "dispatch_rejected"
+    );
+    assert_eq!(shown["trigger"]["event"]["body"]["reason"], "no bot");
+
+    let removed = [net.b.device_id()?];
+    assert_eq!(store.drop_requests_to(&net.network, &local, &removed)?, 1);
+    assert_eq!(store.drop_requests_to(&net.network, &local, &removed)?, 0);
+    assert_eq!(
+        store
+            .dispatch(&lost.spec.work_id)?
+            .context("lost")?
+            .state
+            .name(),
+        "dispatch_unverified",
+        "a removed target may have taken it; it is not written off as refused"
+    );
+    assert!(
+        store
+            .scheduler_job("c", &work_trigger(&lost.spec.work_id))?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
@@ -914,21 +1042,39 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
     };
     let remote = spec("remote", &net.b)?;
     store.accept_work(&net.b, &net.network, remote.clone(), 3)?;
-    let abandoned = store.abandon_works(&net.a, &net.network, &[net.b.device_id()?], 4)?;
-    assert_eq!(abandoned, vec![("c".to_owned(), remote.work_id.clone())]);
+    let unknown = store.unverify_removed_works(&net.a, &net.network, &[net.b.device_id()?], 4)?;
+    assert_eq!(unknown, vec![("c".to_owned(), remote.work_id.clone())]);
+    let work = store
+        .works(&net.network, "c")?
+        .into_iter()
+        .find(|w| w.work_id == remote.work_id)
+        .context("work")?;
     assert_eq!(
-        outcome(&store, &remote.work_id)?,
-        Some(WorkOutcome::Abandoned)
+        (work.outcome, work.state, work.failure_reason.as_deref()),
+        (
+            Some(WorkOutcome::Unverified),
+            WorkStatus::Unverified,
+            Some("设备已移除，无法核对")
+        ),
+        "a removed device's work is not written off as never run"
+    );
+    assert!(
+        !store
+            .scheduler_jobs("c")?
+            .iter()
+            .any(|job| job.trigger == crate::scheduling::work_trigger(&remote.work_id)),
+        "an unknown result waits for the user"
     );
     assert!(
         store
-            .abandon_works(&net.a, &net.network, &[net.b.device_id()?], 5)?
+            .unverify_removed_works(&net.a, &net.network, &[net.b.device_id()?], 5)?
             .is_empty()
     );
     let concluded = |outcome| Signal::Concluded {
         outcome,
         text: "late".into(),
         reason: Some("lost".into()),
+        failure: None,
     };
     store.apply_work_signal(
         &net.b,
@@ -940,7 +1086,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
     assert_eq!(
         outcome(&store, &remote.work_id)?,
         Some(WorkOutcome::Completed),
-        "a real result beats abandonment"
+        "a real result beats the unknown one"
     );
 
     let local = spec("local", &net.a)?;
@@ -959,6 +1105,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
         result_text: String::new(),
         failure_reason: None,
         attestation: None,
+        failure: None,
     };
     store.append_event(&net.b, &net.network, "c", unsigned, vec![], 9)?;
     assert_eq!(
@@ -978,6 +1125,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             result_text: "checked".into(),
             failure_reason: None,
             attestation: None,
+            failure: None,
         },
     )?
     else {
@@ -1046,6 +1194,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
             result_text: String::new(),
             failure_reason: None,
             attestation: None,
+            failure: None,
         },
     )?
     else {
@@ -1075,7 +1224,7 @@ fn removed_targets_abandon_and_signed_choices_settle() -> Result<()> {
         &running.work_id,
         Signal::TurnCompleted {
             turn_id: "tu".into(),
-            status: "completed".into(),
+            status: vibeface_bridge::turn::TurnStatus::Completed,
             text: "late".into(),
             error: None,
         },
@@ -1425,6 +1574,7 @@ fn bot_reply(id: &str, to: &str) -> EventBody {
         status: Some(ReplyStatus::Completed),
         answers: None,
         attestation: None,
+        failure: None,
     }
 }
 
@@ -3419,6 +3569,7 @@ fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Resul
                 status: None,
                 answers: Some(question.into()),
                 attestation: None,
+                failure: None,
             },
         )?
         .attestation()
@@ -3539,6 +3690,7 @@ fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()
             &context,
             &job,
             &works,
+            &[],
             json!({}),
             None,
             &[],
@@ -3927,19 +4079,25 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
 }
 
 #[test]
-fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Result<()> {
+fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
     let raw = "CURSOR_API_KEY is required for the Cursor SDK manager";
-    for (id, outcome) in [
-        ("m1", JobOutcome::Failed(raw.into())),
+    let failure = ExecFailure::new(FailureKind::MissingKey, raw);
+    for (id, outcome, status) in [
+        (
+            "m1",
+            JobOutcome::Failed(failure.clone()),
+            ReplyStatus::Failed,
+        ),
         (
             "m2",
             JobOutcome::Interrupted {
-                detail: raw.into(),
+                failure: failure.clone(),
                 process_unconfirmed: true,
             },
+            ReplyStatus::Interrupted,
         ),
     ] {
         store.accept_message(
@@ -3971,10 +4129,13 @@ fn a_failed_turn_replies_in_plain_words_and_keeps_the_raw_detail_local() -> Resu
         let reply = store
             .message(&net.network, "c", &claimed.job.message_id)?
             .context("reply")?;
-        assert!(!reply.text.contains("CURSOR_API_KEY"), "{}", reply.text);
-        assert!(reply.text.contains("设备 → Bot 与任务"), "{}", reply.text);
+        assert_eq!(
+            (reply.status, reply.failure, reply.text.as_str()),
+            (Some(status), Some(FailureKind::MissingKey), ""),
+            "the shared reply names the kind, never the raw cause"
+        );
         assert!(
-            matches!(&job.state, JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } if detail == raw),
+            matches!(&job.state, JobState::Failed { failure: kept, .. } | JobState::Interrupted { failure: kept, .. } if *kept == failure),
             "the raw cause stays on the local job"
         );
     }
@@ -4091,7 +4252,7 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
         state: JobState::Queued,
     };
     let materialize = |bot: Value| {
-        crate::scheduler::materialize(&context, &job, &works, bot, None, &[], None, None)
+        crate::scheduler::materialize(&context, &job, &works, &[], bot, None, &[], None, None)
             .map(|(prompt, _)| prompt)
     };
     let newest = json!(
@@ -4361,7 +4522,10 @@ fn a_refused_turn_start_leaves_its_messages_for_the_next_turn() -> Result<()> {
                 )?;
                 JobOutcome::Completed
             } else {
-                JobOutcome::Failed("the model is unknown".into())
+                JobOutcome::Failed(ExecFailure::new(
+                    FailureKind::NoModel,
+                    "the model is unknown",
+                ))
             };
             store.finish_job(
                 &net.a,
@@ -4665,8 +4829,17 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
         };
         let works = store.works(&net.network, "c")?;
         let bot = crate::scheduler::bot_value(store, &net.network, "c", 100)?;
-        let rendered =
-            crate::scheduler::materialize(&context, &job, &works, bot, None, &[], resumed, thread)?;
+        let rendered = crate::scheduler::materialize(
+            &context,
+            &job,
+            &works,
+            &[],
+            bot,
+            None,
+            &[],
+            resumed,
+            thread,
+        )?;
         Ok::<_, anyhow::Error>((rendered, context.basis))
     };
     let rule = "Operate only inside this personal network";

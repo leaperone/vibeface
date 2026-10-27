@@ -62,9 +62,13 @@ test("works, reply status and pending checks keep their exact shape", () => {
   assert.deepEqual(parsed.messages[1].attachments, [{ hash: "file", size: 20, name: "报告.pdf" }])
   assert.throws(() => parseConversation({ ...context, messages: [{ ...sent, attachments: [{ hash: "file", size: 20 }] }] }), "an attachment without a name fails closed")
   assert.equal(parseConversation(context).scheduler, null)
-  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified", "abandoned"]) {
+  for (const outcome of ["completed", "failed", "interrupted", "rejected", "unverified"]) {
     assert.equal(parseConversation({ ...context, works: [{ ...work, state: "finished", outcome }] }).works[0].outcome, outcome)
   }
+  assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "finished", outcome: "abandoned" }] }))
+  assert.equal(parseConversation({ ...context, messages: [{ ...message, status: "failed", failure: "quota" }] }).messages[0].failure, "quota")
+  assert.equal(parseConversation({ ...context, works: [{ ...work, failure: "execution_disabled" }] }).works[0].failure, "execution_disabled")
+  assert.throws(() => parseConversation({ ...context, messages: [{ ...message, failure: "usage limit" }] }), "an unknown failure kind fails closed")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: undefined }] }), "a DAG work always has a state")
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting" }] }))
   assert.throws(() => parseConversation({ ...context, works: [{ ...work, state: "waiting_for_device" }] }), "undelivered dispatches arrive as deliveries")
@@ -81,8 +85,11 @@ test("works, reply status and pending checks keep their exact shape", () => {
   const delivered = parseConversation({ ...context, works: [work], deliveries: [
     { work_id: "new", target_node: "other", state: "dispatch_rejected", kind: "codex", title: "新任务", cwd: "/p", reason: "project unavailable" },
     { work_id: "work", target_node: "worker", state: "stop_timed_out" },
+    { work_id: "lost", target_node: "gone", state: "dispatch_unverified", kind: "task", title: "旧任务", cwd: "/p", reason: "设备已移除，无法核对" },
   ] })
   assert.equal(delivered.works[0].stop, "stop_timed_out")
+  assert.equal(delivered.works[2].state, "dispatch_unverified")
+  assert.deepEqual(pendingChecks(delivered, [], "chat"), [], "an unknown dispatch has nothing in the DAG to settle")
   assert.deepEqual(delivered.works[1], { work_id: "new", trigger: "", target_node: "other", cwd: "/p", title: "新任务", prompt: "", state: "dispatch_rejected", summary: "", outcome: null, result_text: "", failure_reason: "project unavailable" })
   assert.throws(() => parseConversation({ ...context, deliveries: [{ work_id: "w", target_node: "n", state: "waiting_for_device" }] }))
   assert.throws(() => parseConversation({ ...context, scheduler: { ...scheduler, jobs: [{ ...scheduler.jobs[0], state: 1 }] } }))

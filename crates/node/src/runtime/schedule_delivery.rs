@@ -5,16 +5,18 @@ use crate::scheduling::{
     JobOutcome, JobState, PendingCheck, SchedulerJob, SteerCandidate, SteerOutcome, SteerTarget,
 };
 use futures_util::FutureExt;
+use vibeface_bridge::{
+    failure::{ExecFailure, FailureKind},
+    turn::{TurnStatus, turn_snapshot},
+};
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));
-    if let JobState::Failed { detail, .. } | JobState::Interrupted { detail, .. } = &job.state {
-        let detail = crate::logging::scrub(detail);
-        value["detail"] = json!(detail);
-        value["error"] = json!(detail);
+    if let JobState::Failed { failure, .. } | JobState::Interrupted { failure, .. } = &job.state {
+        value["failure"]["detail"] = json!(crate::logging::scrub(&failure.detail));
     }
     Ok(value)
 }
@@ -129,7 +131,10 @@ impl Runtime {
                 &trigger,
                 &attempt,
                 JobOutcome::Interrupted {
-                    detail: "回复进程意外结束，结果待核对。".into(),
+                    failure: ExecFailure::new(
+                        FailureKind::Lost,
+                        "the reply process ended unexpectedly; its result is unverified",
+                    ),
                     process_unconfirmed: true,
                 },
                 "",
@@ -546,11 +551,13 @@ fn steer_settlement(
         .iter()
         .find(|turn| codex_server::sent_by(turn, message_id))
     else {
-        return target.map(|turn| (turn["status"] != "inProgress").then_some(JobState::Queued));
+        return target.map(|turn| {
+            (turn_snapshot(turn).status != Some(TurnStatus::InProgress)).then_some(JobState::Queued)
+        });
     };
-    let outcome = match turn["status"].as_str() {
-        Some("inProgress") => return Some(None),
-        Some("completed") if turn["id"] == into.turn_id => SteerOutcome::Answered,
+    let outcome = match turn_snapshot(turn).status {
+        Some(TurnStatus::InProgress) => return Some(None),
+        Some(TurnStatus::Completed) if turn["id"] == into.turn_id => SteerOutcome::Answered,
         _ => SteerOutcome::Unfinished,
     };
     Some(Some(JobState::Steered {

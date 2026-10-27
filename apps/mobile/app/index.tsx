@@ -12,7 +12,7 @@ export default function Home() {
   const wide = useWide()
   if (wide) return <>
     <Stack.Screen options={{ headerShown: false }} />
-    <View className="flex-1 justify-center"><EmptyState icon={MessageSquare} title="选一个 bot 开始聊天" /></View>
+    <View className="flex-1 justify-center"><EmptyState icon={MessageSquare} title="选一个 Bot 开始聊天" /></View>
   </>
   return <>
     <Stack.Screen options={{

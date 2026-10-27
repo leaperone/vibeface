@@ -38,7 +38,7 @@ impl Runtime {
             )
             .await?;
         self.publish_changed(network, scope, Changed::Event(&event.hash));
-        self.abandon_revoked_works(network).await;
+        self.unverify_revoked_works(network).await;
         self.schedule_wakeup.notify_one();
         self.outbox_wakeup.notify_one();
         Ok(json!({"conversation":self.store.lock().await.conversation(network, scope)?}))

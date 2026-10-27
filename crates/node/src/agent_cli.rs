@@ -3,7 +3,10 @@
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 use std::{future::Future, path::Path};
-use vibeface_bridge::codex::{Delivery, DirectSession, Outgoing};
+use vibeface_bridge::{
+    codex::{Delivery, DirectSession, Outgoing},
+    failure::{ExecFailure, FailureKind},
+};
 use vibeface_protocol::now_ms;
 
 /// Registers the work with the Node (`track`), binds its thread before the send, sends the prompt
@@ -63,11 +66,11 @@ where
         .as_str()
         .context("the Node returned no work ID")?
         .to_owned();
-    let fail = |reason: String| bind(json!({"work_id":work_id,"failed":reason}));
+    let fail = |failure: ExecFailure| bind(json!({"work_id":work_id,"failed":failure}));
     ready().await;
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
-        Err(error) => return fail(error.message).await,
+        Err(error) => return fail(error.failure()).await,
     };
     let thread = match tracked["thread_id"].as_str() {
         Some(thread) => thread.to_owned(),
@@ -80,14 +83,22 @@ where
                 .await;
             match started.map(|reply| reply["thread"]["id"].as_str().map(str::to_owned)) {
                 Ok(Some(thread)) => thread,
-                Ok(None) => return fail("thread/start returned no thread".into()).await,
-                Err(error) => return fail(error.message).await,
+                Ok(None) => {
+                    let failure =
+                        ExecFailure::new(FailureKind::Unknown, "thread/start returned no thread");
+                    return fail(failure).await;
+                }
+                Err(error) => return fail(error.failure()).await,
             }
         }
     };
     bind(json!({"work_id":work_id,"thread_id":thread})).await?;
     if now_ms() >= tracked["send_by_ms"].as_u64().unwrap_or(0) {
-        return fail("the send window passed before the turn was sent".into()).await;
+        let failure = ExecFailure::new(
+            FailureKind::TimedOut,
+            "the send window passed before the turn was sent",
+        );
+        return fail(failure).await;
     }
     let outgoing = Outgoing {
         thread_id: thread,
@@ -104,7 +115,7 @@ where
     let report = match delivery {
         Delivery::Delivered { turn_id, .. } => json!({"work_id":work_id,"turn_id":turn_id}),
         Delivery::Unknown { reason } => json!({"work_id":work_id,"unknown":reason}),
-        Delivery::Rejected { reason } => json!({"work_id":work_id,"failed":reason}),
+        Delivery::Rejected { failure } => json!({"work_id":work_id,"failed":failure}),
     };
     bind(report).await
 }

@@ -15,6 +15,8 @@ pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
 use vibeface_bridge::{
     agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
     codex::DirectSession,
+    failure::{ExecFailure, FailureKind},
+    turn::{TurnStatus, turn_snapshot},
 };
 
 /// Codex accepts 65536 bytes of user input per message.
@@ -98,23 +100,24 @@ impl ManagerKind {
     }
 }
 
+/// `outcome` is how certain the end is; `failure` why the turn failed.
 #[derive(Debug)]
 pub struct ManagerError {
-    pub kind: ManagerFailure,
+    pub outcome: ManagerFailure,
     pub session_id: Option<String>,
-    pub message: String,
+    pub failure: ExecFailure,
 }
 impl ManagerError {
     pub fn uncertain(&self) -> bool {
-        self.kind == ManagerFailure::Unknown
+        self.outcome == ManagerFailure::Unknown
     }
     pub fn cancelled(&self) -> bool {
-        self.kind == ManagerFailure::Cancelled
+        self.outcome == ManagerFailure::Cancelled
     }
 }
 impl std::fmt::Display for ManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        self.failure.fmt(f)
     }
 }
 impl std::error::Error for ManagerError {}
@@ -142,9 +145,12 @@ where
     }
     if *cancel.borrow() {
         return Err(ManagerError {
-            kind: ManagerFailure::Cancelled,
+            outcome: ManagerFailure::Cancelled,
             session_id: previous_session_id.map(str::to_owned),
-            message: "management cancelled before SDK launch".into(),
+            failure: ExecFailure::new(
+                FailureKind::Unknown,
+                "management cancelled before SDK launch",
+            ),
         }
         .into());
     }
@@ -154,17 +160,23 @@ where
             sdk_bin,
             agents,
         } => {
-            let not_started = |message: &str| ManagerError {
-                kind: ManagerFailure::Failed,
+            let not_started = |kind, detail: &str| ManagerError {
+                outcome: ManagerFailure::Failed,
                 session_id: previous_session_id.map(str::to_owned),
-                message: message.into(),
+                failure: ExecFailure::new(kind, detail),
             };
-            let bridge = bridge
-                .as_ref()
-                .ok_or_else(|| not_started("this Node has no Cursor SDK bridge yet"))?;
+            let bridge = bridge.as_ref().ok_or_else(|| {
+                not_started(
+                    FailureKind::MissingBinary,
+                    "this Node has no Cursor SDK bridge yet",
+                )
+            })?;
             let (api_key, env) = crate::providers::cursor_launch(&config.provider_env);
             let api_key = api_key.ok_or_else(|| {
-                not_started("CURSOR_API_KEY is required for the Cursor SDK manager")
+                not_started(
+                    FailureKind::MissingKey,
+                    "CURSOR_API_KEY is required for the Cursor SDK manager",
+                )
             })?;
             let turn = SdkTurn {
                 executable: sdk_bin.clone(),
@@ -196,9 +208,9 @@ where
                 .await
                 .map_err(|error| {
                     ManagerError {
-                        message: error.to_string(),
-                        kind: error.kind,
+                        outcome: error.outcome,
                         session_id: error.session_id,
+                        failure: error.failure,
                     }
                     .into()
                 })
@@ -338,7 +350,7 @@ impl Answer {
 
 /// The status of `turn` as the thread records it, `None` while it runs or when the thread
 /// cannot be read.
-async fn turn_status(session: &mut DirectSession, thread: &str, turn: &str) -> Option<String> {
+async fn turn_status(session: &mut DirectSession, thread: &str, turn: &str) -> Option<TurnStatus> {
     let reply = session
         .request(
             "thread/read",
@@ -350,9 +362,8 @@ async fn turn_status(session: &mut DirectSession, thread: &str, turn: &str) -> O
         .as_array()?
         .iter()
         .find(|t| t["id"] == turn)
-        .and_then(|t| t["status"].as_str())
-        .filter(|status| *status != "inProgress")
-        .map(str::to_owned)
+        .and_then(|t| turn_snapshot(t).status)
+        .filter(|status| *status != TurnStatus::InProgress)
 }
 
 /// Interrupts the turn and waits for it to end; true once Codex reports it ended.
@@ -395,31 +406,43 @@ where
         "manager workspace must be an existing absolute directory"
     );
     let secrets = secret_values(config);
-    let error = |kind, session_id: Option<&str>, message: String| -> anyhow::Error {
+    let error = |outcome, session_id: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
-            kind,
+            outcome,
             session_id: session_id.map(str::to_owned),
-            message: redact_string(message, &secrets),
+            failure: ExecFailure {
+                detail: redact_string(failure.detail, &secrets),
+                ..failure
+            },
         }
         .into()
     };
-    let failed = |session_id: Option<&str>, message: String| {
-        error(ManagerFailure::Failed, session_id, message)
+    let failed = |session_id: Option<&str>, failure: ExecFailure| {
+        error(ManagerFailure::Failed, session_id, failure)
     };
+    // Faults of this Node's own bookkeeping, not of Codex.
+    let own = |detail: String| ExecFailure::new(FailureKind::Unknown, detail);
     // A stop before the turn started ends the reply as stopped; nothing ran.
     let stopped = |session_id: Option<&str>| {
         error(
             ManagerFailure::Cancelled,
             session_id,
-            "stopped before the Codex turn started".into(),
+            own("stopped before the Codex turn started".into()),
         )
     };
     if *cancel.borrow() {
         return Err(stopped(previous));
     }
-    let mut session = DirectSession::connect(socket)
-        .await
-        .map_err(|e| failed(previous, format!("Codex App Server: {}", e.message)))?;
+    let mut session = DirectSession::connect(socket).await.map_err(|e| {
+        let failure = e.failure();
+        failed(
+            previous,
+            ExecFailure {
+                detail: format!("Codex App Server: {}", failure.detail),
+                ..failure
+            },
+        )
+    })?;
     let mut env = config.tool_env.clone();
     if let Some(token) = &config.tool_token {
         env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
@@ -444,7 +467,7 @@ where
             params["threadId"] = json!(id);
             match session.request("thread/resume", params).await {
                 Ok(_) => Some(id.to_owned()),
-                Err(e) if e.uncertain => return Err(failed(previous, e.message)),
+                Err(e) if e.uncertain => return Err(failed(previous, e.failure())),
                 // Codex no longer has the thread; the conversation goes on in a new one.
                 Err(_) => None,
             }
@@ -469,7 +492,7 @@ where
             let started = session
                 .request("thread/start", thread_params)
                 .await
-                .map_err(|e| failed(previous, e.message))?;
+                .map_err(|e| failed(previous, e.failure()))?;
             let id = started["thread"]["id"]
                 .as_str()
                 .context("Codex started a thread without an ID")?
@@ -484,14 +507,14 @@ where
         return Err(if *cancel.borrow() {
             stopped(native)
         } else {
-            failed(native, format!("persist the Codex thread: {e}"))
+            failed(native, own(format!("persist the Codex thread: {e}")))
         });
     }
     let client_id = match &config.codex_turn {
         Some(turn) => {
             (turn.record)(thread.clone(), None)
                 .await
-                .map_err(|e| failed(native, format!("record the Codex turn: {e}")))?;
+                .map_err(|e| failed(native, own(format!("record the Codex turn: {e}"))))?;
             turn.client_id.clone()
         }
         None => uuid::Uuid::new_v4().to_string(),
@@ -506,14 +529,14 @@ where
     }
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
-        Err(e) if !e.uncertain => return Err(failed(native, e.message)),
+        Err(e) if !e.uncertain => return Err(failed(native, e.failure())),
         Err(e) => match session.read_back(&thread, &client_id).await {
             Ok(Some(turn)) => Some(turn),
-            _ => return Err(error(ManagerFailure::Unknown, native, e.message)),
+            _ => return Err(error(ManagerFailure::Unknown, native, e.failure())),
         },
     }
     .context("Codex started a turn without an ID")
-    .map_err(|e| error(ManagerFailure::Unknown, native, e.to_string()))?;
+    .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
     if let Some(record) = &config.codex_turn
         && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
     {
@@ -523,7 +546,11 @@ where
         } else {
             ManagerFailure::Unknown
         };
-        return Err(error(kind, native, format!("record the Codex turn: {e}")));
+        return Err(error(
+            kind,
+            native,
+            own(format!("record the Codex turn: {e}")),
+        ));
     }
     let mut answer = Answer::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
@@ -532,9 +559,9 @@ where
             biased;
             _ = agent::wait_for_cancel(&mut cancel) => {
                 break if stop_turn(&mut session, &thread, &turn).await {
-                    Err(error(ManagerFailure::Cancelled, native, "Codex turn interrupted".into()))
+                    Err(error(ManagerFailure::Cancelled, native, own("Codex turn interrupted".into())))
                 } else {
-                    Err(error(ManagerFailure::Unknown, native, "Codex did not confirm the interrupt".into()))
+                    Err(error(ManagerFailure::Unknown, native, own("Codex did not confirm the interrupt".into())))
                 };
             }
             _ = tokio::time::sleep_until(deadline) => {
@@ -543,12 +570,12 @@ where
                 } else {
                     ManagerFailure::Unknown
                 };
-                break Err(error(kind, native, "Codex management timed out".into()));
+                break Err(error(kind, native, ExecFailure::new(FailureKind::TimedOut, "Codex management timed out")));
             }
             message = session.notification() => match message {
                 Ok(message) => message,
                 // The turn may go on without this connection; reconciliation reads it.
-                Err(e) => break Err(error(ManagerFailure::Unknown, native, e.message)),
+                Err(e) => break Err(error(ManagerFailure::Unknown, native, e.failure())),
             },
         };
         if !of_turn(&message, &thread, &turn) {
@@ -559,23 +586,22 @@ where
         if let Some(update) = codex_progress(&message) {
             progress(update)
                 .await
-                .map_err(|e| error(ManagerFailure::Unknown, native, e.to_string()))?;
+                .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
         }
         if message["method"] == "turn/completed" {
-            let ended = &message["params"]["turn"];
-            break match ended["status"].as_str() {
-                Some("completed") => Ok(()),
-                Some("interrupted") => Err(error(
+            let ended = turn_snapshot(&message["params"]["turn"]);
+            break match ended.status {
+                Some(TurnStatus::Completed) => Ok(()),
+                Some(TurnStatus::Interrupted) => Err(error(
                     ManagerFailure::Cancelled,
                     native,
-                    "Codex turn was interrupted".into(),
+                    own("Codex turn was interrupted".into()),
                 )),
                 _ => Err(failed(
                     native,
-                    ended["error"]["message"]
-                        .as_str()
-                        .unwrap_or("Codex turn failed")
-                        .into(),
+                    ended
+                        .error
+                        .unwrap_or_else(|| own("Codex turn failed".into())),
                 )),
             };
         }
@@ -953,7 +979,7 @@ mod tests {
             drop(stopper.await);
             let error = error.downcast_ref::<ManagerError>().unwrap();
             assert_eq!(
-                (error.kind, error.session_id.as_deref()),
+                (error.outcome, error.session_id.as_deref()),
                 (expected, Some("thread-1"))
             );
             assert_eq!(fake.calls("thread/resume").len(), 1);

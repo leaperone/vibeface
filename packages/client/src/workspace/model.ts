@@ -7,6 +7,7 @@ import type {
 } from "./types.ts"
 import { answerId } from "./questions.ts"
 import type { ProviderId } from "../lib/node.ts"
+import { failureKinds, type FailureKind } from "../lib/errors.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
   const normalized = value.trim()
@@ -65,7 +66,7 @@ export function parseNotifications(value: unknown): NotificationRecord[] {
 }
 function message(value: unknown): TranscriptMessage {
   const data = record(value)
-  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender) }
+  return { message_id: text(data.message_id), role: text(data.role), text: text(data.text), event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), in_reply_to: optionalText(data.in_reply_to), status: data.status == null ? undefined : replyStatus(data.status), ...failure(data.failure), attachments: attachments(data.attachments), answers: optionalText(data.answers), rank: optionalText(data.rank), sender: data.sender == null ? undefined : sender(data.sender) }
 }
 function sender(value: unknown) {
   const data = record(value)
@@ -77,6 +78,16 @@ function replyStatus(value: unknown): ReplyStatus {
     default: throw new Error("未知的回复状态。")
   }
 }
+function failureKind(value: unknown): FailureKind | undefined {
+  if (value == null) return undefined
+  if (!failureKinds.includes(value as FailureKind)) throw new Error("失败原因无法识别。")
+  return value as FailureKind
+}
+/** Present only when the record names one, so records without it keep their shape. */
+function failure(value: unknown): { failure?: FailureKind } {
+  const kind = failureKind(value)
+  return kind ? { failure: kind } : {}
+}
 function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
@@ -84,7 +95,7 @@ function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities), remote = data.remote == null ? null : record(data.remote)
   return {
     unanswered: list(data.unanswered).map(text),
-    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), error: optionalText(job.error), pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
     provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined,
     remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
   }
@@ -98,7 +109,7 @@ function workState(value: unknown): WorkState {
 function workOutcome(value: unknown): WorkOutcome | null {
   switch (value) {
     case undefined: case null: return null
-    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": case "abandoned": return value
+    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": return value
     default: throw new Error("任务结果无法识别。")
   }
 }
@@ -112,7 +123,7 @@ function work(value: unknown): WorkRecord {
   return {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
-    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), kind: workKind(data.kind), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), kind: workKind(data.kind), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id),
   }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
@@ -120,8 +131,8 @@ export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[
   const rows = [...works]
   for (const item of list(value)) {
     const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
-    if (state === "dispatch_waiting" || state === "dispatch_rejected") {
-      rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason) })
+    if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") {
+      rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason), ...failure(data.failure) })
     } else if (state === "stop_waiting" || state === "stop_timed_out") {
       const index = rows.findIndex((row) => row.work_id === work_id)
       if (index >= 0) rows[index] = { ...rows[index], stop: state }
@@ -140,7 +151,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
  */
 export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
-  if (item.outcome || item.state === "finished" || item.state === "dispatch_waiting" || item.state === "dispatch_rejected") return null
+  if (item.outcome || item.state === "finished" || item.state.startsWith("dispatch_")) return null
   const node = nodes.find((candidate) => candidate.device_id === item.target_node)
   if (!node || node.revoked) return null
   if (!node.online) return "offline"

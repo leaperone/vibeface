@@ -7,6 +7,7 @@ use std::{
 };
 use tokio::sync::watch;
 use vibeface_bridge::agent::{AgentFailure, AgentRunError, SdkBridge, SdkTurn, ToolCallbackConfig};
+use vibeface_bridge::failure::FailureKind;
 
 fn starts(log: &Path) -> Vec<u32> {
     std::fs::read_to_string(log)
@@ -123,7 +124,9 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
 
     turn.timeout_secs = 1;
     let (hung, _) = reply(&bridge, &turn, "hang").await;
-    assert_eq!(hung.unwrap_err().kind, AgentFailure::Unknown);
+    let hung = hung.unwrap_err();
+    assert_eq!(hung.outcome, AgentFailure::Unknown);
+    assert_eq!(hung.failure.kind, FailureKind::TimedOut);
     assert!(
         gone(restarted).await,
         "a bridge left with an unknown turn ends after it"

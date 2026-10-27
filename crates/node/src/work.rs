@@ -3,6 +3,7 @@
 //! the pending-check list and the Web state all derive from it.
 use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
+use vibeface_bridge::{failure::ExecFailure, turn::TurnStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkSpec {
@@ -48,11 +49,43 @@ pub struct Dispatch {
 pub enum DispatchState {
     Pending,
     Accepted,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureKind>,
+    },
+    /// The target can no longer answer (it was removed); whether it took the work is unknown.
+    Unverified {
+        reason: String,
+    },
 }
 
-/// A stop request for another Node's work that has not reached it yet. It is retried until the
-/// target confirms, the work ends, or `deadline_ms` passes.
+impl DispatchState {
+    /// How the dispatch reads to the bot and in the conversation until the DAG names the work.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Pending => "dispatch_waiting",
+            Self::Accepted => "dispatch_accepted",
+            Self::Rejected { .. } => "dispatch_rejected",
+            Self::Unverified { .. } => "dispatch_unverified",
+        }
+    }
+    /// Refused, or left unknown: the DAG will not report it, so the dispatcher does.
+    pub fn ended(&self) -> bool {
+        matches!(self, Self::Rejected { .. } | Self::Unverified { .. })
+    }
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { reason, .. } | Self::Unverified { reason } => Some(reason),
+            Self::Pending | Self::Accepted => None,
+        }
+    }
+}
+
+/// A stop the user asked for, stored before anything is sent. For another Node's work it is
+/// delivered until that Node takes it or the work ends; for this Node's own work it is kept and
+/// retried until the work ends. `timed_out` only shows that `deadline_ms` passed unconfirmed; it
+/// never ends the retries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StopRequest {
     pub work_id: String,
@@ -97,9 +130,11 @@ pub enum WorkState {
         outcome: WorkOutcome,
     },
     /// The real result cannot be proven. `probe` says a later App Server probe may settle it;
-    /// otherwise only the user does.
+    /// otherwise only the user does. Without a known turn, `thread` is the journaled thread a
+    /// late send may still have started it in.
     Unverified {
         handle: Option<Handle>,
+        thread: Option<String>,
         evidence: String,
         probe: bool,
     },
@@ -111,6 +146,18 @@ impl WorkState {
             Self::Running { handle } | Self::Interrupting { handle } => Some(handle),
             Self::Unverified { handle, .. } => handle.as_ref(),
             _ => None,
+        }
+    }
+    /// The thread the work runs or may have started in.
+    pub fn thread(&self) -> Option<&str> {
+        match self {
+            Self::Starting { thread } => thread.as_deref(),
+            Self::Unverified {
+                handle: None,
+                thread,
+                ..
+            } => thread.as_deref(),
+            state => state.handle().map(|handle| handle.thread_id.as_str()),
         }
     }
     pub fn finished(&self) -> bool {
@@ -153,9 +200,9 @@ pub enum Probe {
     Running { turn_id: String, epoch: u64 },
     Terminal {
         turn_id: String,
-        status: String,
+        status: TurnStatus,
         text: String,
-        error: Option<String>,
+        error: Option<ExecFailure>,
     },
     /// The thread has no turn: nothing started.
     NotStarted,
@@ -177,8 +224,8 @@ pub enum Signal {
         turn_id: String,
         epoch: u64,
     },
-    /// Nothing started: the Agent reported a refusal, or the window passed without a turn.
-    StartRejected(String),
+    /// Nothing started: the Agent reported a refusal, or the window passed before it bound a thread.
+    StartRejected(ExecFailure),
     Text(String),
     /// A plan or commentary update; persisted at most every `PROGRESS_INTERVAL_MS`.
     Progress {
@@ -188,9 +235,9 @@ pub enum Signal {
     InterruptRequested,
     TurnCompleted {
         turn_id: String,
-        status: String,
+        status: TurnStatus,
         text: String,
-        error: Option<String>,
+        error: Option<ExecFailure>,
     },
     /// The App Server restarted; live requests from the old epoch are gone.
     Disconnected,
@@ -200,11 +247,13 @@ pub enum Signal {
     Settled(WorkOutcome),
     /// The coordination process of an unverified agent task is gone; its turn did not finish.
     ProcessExited,
-    /// An agent task's coordination turn ended; its reply is the result.
+    /// An agent task's coordination turn ended; its reply is the result. `failure` names the
+    /// execution failure that ended it, if one did.
     Concluded {
         outcome: WorkOutcome,
         text: String,
         reason: Option<String>,
+        failure: Option<FailureKind>,
     },
 }
 
@@ -251,6 +300,7 @@ fn finish(
     record: &mut WorkRecord,
     outcome: WorkOutcome,
     reason: Option<String>,
+    failure: Option<FailureKind>,
 ) -> Option<EventBody> {
     record.state = WorkState::Finished { outcome };
     Some(EventBody::WorkFinished {
@@ -258,11 +308,25 @@ fn finish(
         outcome,
         result_text: bounded(&record.text),
         failure_reason: reason.map(|reason| bounded(&reason)),
+        failure,
         attestation: None,
     })
 }
 
+/// Ends the work with an execution failure, its detail as the reason.
+fn finish_failed(
+    record: &mut WorkRecord,
+    outcome: WorkOutcome,
+    failure: Option<ExecFailure>,
+) -> Option<EventBody> {
+    let (reason, kind) = failure.map(|f| (f.detail, f.kind)).unzip();
+    finish(record, outcome, reason, kind)
+}
+
 const DISCONNECTED: &str = "执行器连接已断开，等待重新核对";
+/// The Agent bound a thread, then no turn showed up by the window's end. Its `turn/start` may
+/// still be in flight, so the work is neither started nor refused.
+const SEND_UNSEEN: &str = "发送时限过了还没看到这次回合，不知道是否已开始";
 
 fn unverified(
     record: &mut WorkRecord,
@@ -270,8 +334,13 @@ fn unverified(
     evidence: &str,
     probe: bool,
 ) -> Option<EventBody> {
+    let thread = match handle {
+        Some(_) => None,
+        None => record.state.thread().map(str::to_owned),
+    };
     record.state = WorkState::Unverified {
         handle,
+        thread,
         evidence: evidence.into(),
         probe,
     };
@@ -280,6 +349,7 @@ fn unverified(
         outcome: WorkOutcome::Unverified,
         result_text: bounded(&record.text),
         failure_reason: Some(bounded(evidence)),
+        failure: None,
         attestation: None,
     })
 }
@@ -295,12 +365,12 @@ fn progress(record: &WorkRecord, phase: WorkPhase, summary: &str) -> Option<Even
     })
 }
 
-fn turn_outcome(status: &str) -> Option<WorkOutcome> {
+fn turn_outcome(status: &TurnStatus) -> Option<WorkOutcome> {
     match status {
-        "completed" => Some(WorkOutcome::Completed),
-        "failed" => Some(WorkOutcome::Failed),
-        "interrupted" => Some(WorkOutcome::Interrupted),
-        _ => None,
+        TurnStatus::Completed => Some(WorkOutcome::Completed),
+        TurnStatus::Failed => Some(WorkOutcome::Failed),
+        TurnStatus::Interrupted => Some(WorkOutcome::Interrupted),
+        TurnStatus::InProgress | TurnStatus::Other(_) => None,
     }
 }
 
@@ -330,9 +400,17 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             };
             progress(record, WorkPhase::Started, "执行已开始")
         }
-        (Accepted | Starting { .. }, Signal::StartRejected(reason)) => {
-            finish(record, WorkOutcome::Rejected, Some(reason))
-        }
+        (
+            Accepted
+            | Starting { .. }
+            | Unverified {
+                handle: None,
+                thread: Some(_),
+                probe: true,
+                ..
+            },
+            Signal::StartRejected(failure),
+        ) => finish_failed(record, WorkOutcome::Rejected, Some(failure)),
         (Running { .. } | Interrupting { .. }, Signal::Text(text)) => {
             record.text = bounded(&text);
             None
@@ -366,11 +444,11 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 record.text = bounded(&text);
             }
             match turn_outcome(&status) {
-                Some(outcome) => finish(record, outcome, error),
+                Some(outcome) => finish_failed(record, outcome, error),
                 None => unverified(
                     record,
                     Some(handle),
-                    &format!("执行器返回未知状态：{status}"),
+                    &format!("执行器返回未知状态：{}", status.as_str()),
                     true,
                 ),
             }
@@ -384,23 +462,51 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         (Running { handle } | Interrupting { handle }, Signal::Disconnected) => {
             record.state = Unverified {
                 handle: Some(handle),
+                thread: None,
                 evidence: DISCONNECTED.into(),
                 probe: true,
             };
             None
         }
+        // A send whose turn was not seen in time may still start; it is then followed as usual.
+        (
+            Unverified {
+                handle: None,
+                thread: Some(thread),
+                probe: true,
+                ..
+            },
+            Signal::TurnStarted { turn_id, epoch },
+        ) => {
+            record.state = Running {
+                handle: Handle {
+                    thread_id: thread,
+                    turn_id,
+                    epoch,
+                },
+            };
+            progress(record, WorkPhase::Started, "执行已开始")
+        }
         (
             Starting {
                 thread: Some(thread),
+            }
+            | Unverified {
+                handle: None,
+                thread: Some(thread),
+                probe: true,
+                ..
             },
             Signal::Probed(probe),
         ) => match probe {
-            Probe::NotStarted | Probe::Missing => finish(
-                record,
-                WorkOutcome::Rejected,
-                Some("协调 Agent 没有在时限内开始这项工作".into()),
-            ),
+            // Reported once, when the window ends; a later probe that finds nothing adds nothing.
+            Probe::NotStarted | Probe::Missing if matches!(record.state, Unverified { .. }) => None,
+            Probe::NotStarted | Probe::Missing => unverified(record, None, SEND_UNSEEN, true),
             Probe::Running { turn_id, epoch } => {
+                let summary = match record.state {
+                    Unverified { .. } => "找到了这次回合，继续跟进",
+                    _ => "设备重启后已继续跟进",
+                };
                 record.state = Running {
                     handle: Handle {
                         thread_id: thread,
@@ -408,7 +514,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                         epoch,
                     },
                 };
-                progress(record, WorkPhase::Running, "设备重启后已继续跟进")
+                progress(record, WorkPhase::Running, summary)
             }
             Probe::Terminal {
                 turn_id,
@@ -487,6 +593,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             record,
             WorkOutcome::Interrupted,
             Some("Bot 进程已退出，任务没有做完".into()),
+            Some(FailureKind::Lost),
         ),
         (Unverified { .. } | Accepted | Starting { .. }, Signal::Settled(outcome)) => {
             record.state = Finished { outcome };
@@ -498,6 +605,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                 outcome,
                 text,
                 reason,
+                failure,
             },
         ) => {
             record.text = bounded(&text);
@@ -508,7 +616,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                     reason.as_deref().unwrap_or("Bot 进程没有确认退出"),
                     false,
                 ),
-                outcome => finish(record, outcome, reason),
+                outcome => finish(record, outcome, reason, failure),
             }
         }
         _ => None,
@@ -600,7 +708,7 @@ mod tests {
         transition(&mut work, Signal::InterruptRequested);
         let completed = |status: &str| Signal::TurnCompleted {
             turn_id: "tu".into(),
-            status: status.into(),
+            status: TurnStatus::of(status),
             text: String::new(),
             error: None,
         };
@@ -609,6 +717,23 @@ mod tests {
             transition(&mut timed_out, Signal::InterruptTimedOut),
             Some(EventBody::WorkFinished {
                 outcome: WorkOutcome::Unverified,
+                ..
+            })
+        ));
+        let mut failed = work.clone();
+        assert!(matches!(
+            transition(
+                &mut failed,
+                Signal::TurnCompleted {
+                    turn_id: "tu".into(),
+                    status: TurnStatus::Failed,
+                    text: String::new(),
+                    error: Some(ExecFailure::new(FailureKind::Quota, "429")),
+                }
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Failed,
+                failure: Some(FailureKind::Quota),
                 ..
             })
         ));
@@ -629,18 +754,11 @@ mod tests {
         assert!(work.send_window_over(SEND_WINDOW_MS + RECONCILE_GRACE_MS));
         transition(&mut work, Signal::ThreadCreated("th".into()));
         assert!(matches!(
-            transition(&mut work.clone(), Signal::Probed(Probe::NotStarted)),
-            Some(EventBody::WorkFinished {
-                outcome: WorkOutcome::Rejected,
-                ..
-            })
-        ));
-        assert!(matches!(
             transition(
                 &mut work,
                 Signal::Probed(Probe::Terminal {
                     turn_id: "tu".into(),
-                    status: "completed".into(),
+                    status: TurnStatus::Completed,
                     text: "done".into(),
                     error: None,
                 })
@@ -677,5 +795,95 @@ mod tests {
             "a disconnect then a missing turn is reported once"
         );
         assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
+    }
+
+    #[test]
+    fn a_send_unseen_by_the_window_is_unverified_and_a_late_turn_is_followed() {
+        let mut work = record();
+        transition(&mut work, Signal::ThreadCreated("th".into()));
+        assert!(matches!(
+            transition(&mut work, Signal::Probed(Probe::NotStarted)),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Unverified,
+                ..
+            })
+        ));
+        assert_eq!(work.state.thread(), Some("th"));
+        assert!(
+            transition(&mut work, Signal::Probed(Probe::NotStarted)).is_none(),
+            "an unseen send is reported once"
+        );
+        let mut late = work.clone();
+        assert!(matches!(
+            transition(
+                &mut late,
+                Signal::TurnStarted {
+                    turn_id: "tu".into(),
+                    epoch: 1
+                }
+            ),
+            Some(EventBody::WorkProgress {
+                phase: WorkPhase::Started,
+                ..
+            })
+        ));
+        assert!(matches!(
+            transition(
+                &mut late,
+                Signal::TurnCompleted {
+                    turn_id: "tu".into(),
+                    status: TurnStatus::Completed,
+                    text: "done".into(),
+                    error: None,
+                }
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Completed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            transition(
+                &mut work,
+                Signal::Probed(Probe::Running {
+                    turn_id: "tu".into(),
+                    epoch: 2
+                })
+            ),
+            Some(EventBody::WorkProgress { .. })
+        ));
+        assert_eq!(work.state.handle().map(|handle| handle.epoch), Some(2));
+
+        let mut refused = work.clone();
+        refused.state = WorkState::Unverified {
+            handle: None,
+            thread: Some("th".into()),
+            evidence: String::new(),
+            probe: true,
+        };
+        assert!(matches!(
+            transition(
+                &mut refused,
+                Signal::StartRejected(ExecFailure::new(FailureKind::Rejected, "refused"))
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Rejected,
+                failure: Some(FailureKind::Rejected),
+                failure_reason: Some(ref reason),
+                ..
+            }) if reason == "refused"
+        ));
+
+        let mut unbound = record();
+        assert!(matches!(
+            transition(
+                &mut unbound,
+                Signal::StartRejected(ExecFailure::new(FailureKind::TimedOut, "window over"))
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Rejected,
+                ..
+            })
+        ));
     }
 }

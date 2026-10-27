@@ -5,7 +5,7 @@ import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toas
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { rawError, taskError } from "@vibeface/client/lib/errors.ts"
+import { failureText, rawError, taskError } from "@vibeface/client/lib/errors.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
@@ -14,7 +14,7 @@ import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
 import { questionOpen } from "@vibeface/client/workspace/questions.ts"
 
-const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "stop_timed_out"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 // The route change unmounts the panel, so focus would otherwise drop to <body>. Module scope keeps the ref stable across renders.
 function holdFocus(node: HTMLElement | null) {
@@ -82,7 +82,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   }, [botId, from])
   // The last progress line is stale once a task ends, so it never stands in for a result.
   // A task settled by hand carries no text either, so an empty result shows no section rather than an odd placeholder.
-  const result = work?.result_text || (work?.failure_reason ? taskError(work.failure_reason) : "")
+  const result = work?.result_text || (work?.failure ? failureText(work.failure) : "") || (work?.failure_reason ? taskError(work.failure_reason) : "")
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null

@@ -161,6 +161,9 @@ pub struct Runtime {
     pub(crate) codex: Arc<codex_server::CodexServer>,
     codex_epoch: std::sync::atomic::AtomicU64,
     progress_sequence: std::sync::atomic::AtomicU64,
+    /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
+    /// stop and its deadline are stored, so a restart retries at once.
+    stop_retries: std::sync::Mutex<HashMap<String, (u32, i64)>>,
     pub local_access: Arc<crate::local_access::LocalAccess>,
     /// Operator token of the public entry's relay: this entry's own, or the one it serves.
     pub(crate) entry_token: Option<String>,
@@ -297,6 +300,7 @@ impl Runtime {
             codex,
             codex_epoch: std::sync::atomic::AtomicU64::new(0),
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
+            stop_retries: std::sync::Mutex::new(HashMap::new()),
             local_access,
             entry_token,
             write_state: tokio::sync::watch::Sender::new(WriteState::Writable),
@@ -407,7 +411,7 @@ impl Runtime {
                 {
                     node.start_writers(events);
                     if let Ok(state) = node.membership_state().await {
-                        node.abandon_revoked_works(&state.genesis.network_id).await;
+                        node.unverify_revoked_works(&state.genesis.network_id).await;
                     }
                 }
             });

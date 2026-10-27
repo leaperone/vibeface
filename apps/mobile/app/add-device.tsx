@@ -35,7 +35,7 @@ export default function AddDevice() {
     const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 3000)
     return () => clearInterval(timer)
   }, [result, ready])
-  if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理员能添加设备" />
+  if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理设备能添加设备" />
 
   const generate = () => {
     setResult(null); setUsed(false); setAdded(null)

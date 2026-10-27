@@ -761,6 +761,7 @@ mod tests {
                     status: None,
                     answers: None,
                     attestation: None,
+                    failure: None,
                 },
             )?;
             identity.sign_event(Event {
@@ -815,6 +816,7 @@ mod tests {
             status,
             answers: None,
             attestation: None,
+            failure: None,
         };
         let network = identity.fixture_network_id()?;
         let client = identity.fixture_admin();

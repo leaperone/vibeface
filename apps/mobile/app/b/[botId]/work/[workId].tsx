@@ -3,7 +3,7 @@ import { Link2, ListChecks, RotateCw, Square } from 'lucide-react-native'
 import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { humanError, rawError } from '@vibeface/client/lib/errors.ts'
+import { failureText, rawError, taskError } from '@vibeface/client/lib/errors.ts'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
@@ -34,7 +34,7 @@ export default function TaskDetail() {
   const device = work.target_node
   const progress = shared.liveProgress.find((item) => item.kind === 'native' && item.work_id === workId && item.target_node === device)
   const canStop = state !== 'awaiting_confirmation' && !work.outcome && !work.stop && ['accepted', 'running'].includes(work.state)
-  const result = work.result_text || (work.failure_reason ? humanError(work.failure_reason, undefined, '这个任务') : state === 'completed' ? '没有返回文字' : '')
+  const result = work.result_text || failureText(work.failure) || (work.failure_reason ? taskError(work.failure_reason) : state === 'completed' ? '没有返回文字' : '')
   // Stopping one input steered into a turn stops every work sharing that turn.
   const sharing = work.turn_id ? data!.works.filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const active = taskActive(state)
@@ -51,7 +51,7 @@ export default function TaskDetail() {
         <Text selectable className="font-mono text-meta">{progress.text}</Text>
       </ScrollView> : null}
     </View>
-    {result && !active ? <Section title="结果"><Text selectable>{result}</Text></Section> : null}
+    {result && !active ? <Section title={work.result_text || state === 'completed' ? '结果' : '原因'}><Text selectable>{result}</Text></Section> : null}
     {state === 'awaiting_confirmation' ? <Text className="text-muted-foreground">
       {confirmText({ reason: confirmReason(work, shared.nodes) ?? 'unverified', detail: work.failure_reason ?? '' }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。
     </Text> : null}
@@ -64,7 +64,7 @@ export default function TaskDetail() {
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
     {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="min-h-11 self-start" icon={RotateCw} disabled={!shared.writable}
-      action={async () => { if (await shared.sendMessage(`再试一次「${work.title || '这个任务'}」`)) router.back() }}>让 bot 再试</ActionButton> : null}
+      action={async () => { if (await shared.sendMessage(`再试一次「${work.title || '这个任务'}」`)) router.back() }}>让 Bot 再试</ActionButton> : null}
     <Section title="详情">
       {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}

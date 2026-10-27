@@ -102,7 +102,7 @@ export default function ChatScreen() {
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
-  if (!bot || !id) return <EmptyState icon={Bot} title="没有这个 bot" />
+  if (!bot || !id) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const blocked = workspace.connection.state === 'offline' ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
   const send = () => {
     const { text, files } = draft
@@ -127,7 +127,7 @@ export default function ChatScreen() {
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerRight: () => <Link href={`/b/${bot.bot_id}/about`} asChild>
-        <Button variant="ghost" size="icon" accessibilityLabel="bot 信息"><Icon as={Bot} /></Button>
+        <Button variant="ghost" size="icon" accessibilityLabel="Bot 信息"><Icon as={Bot} /></Button>
       </Link>,
     }} />
     <View className="flex-1">

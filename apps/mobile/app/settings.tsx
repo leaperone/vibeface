@@ -52,7 +52,7 @@ export default function Settings() {
       <LinkRow href="/transfers" icon={ArrowRightLeft} label="公益转发与实验付费交付" />
     </Section>
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
-      <LinkRow href="/ai" icon={SlidersHorizontal} label="AI 设置" />
+      <LinkRow href="/ai" icon={SlidersHorizontal} label="Bot 与任务" />
     </Section> : null}
     <Section icon={FileKey} title="恢复文件">
       <LinkRow href="/recovery" icon={KeyRound} label="换恢复密码" />
@@ -116,8 +116,8 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
       <Icon as={kindIcon(member)} className="text-muted-foreground" />
       {/* Title and subtitle, as a system cell. The name wraps in full so the inline crown is never cut off with it. */}
       <View className="min-w-0 flex-1">
-        <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理员" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
-        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '本机' : '当前连接'}</Text> : null}
+        <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
+        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
       </View>
       <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
       <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
