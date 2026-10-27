@@ -22,6 +22,7 @@ function checkReason(check: Pick<PendingCheck, "detail">): string {
 export function confirmText(check: Pick<WorkCheck, "reason" | "detail">, device: string): string {
   return check.reason === "offline" ? `${device} 离线了，报不回这个任务的结果。`
     : check.reason === "disconnected" ? `${device} 上的 Codex 断开了，报不回这个任务的结果。`
+    : check.detail.startsWith("设备已移除") ? `${device} 已移除，报不回这个任务的结果。`
     : checkReason(check)
 }
 

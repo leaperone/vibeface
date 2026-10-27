@@ -408,7 +408,7 @@ impl Runtime {
                 {
                     node.start_writers(events);
                     if let Ok(state) = node.membership_state().await {
-                        node.abandon_revoked_works(&state.genesis.network_id).await;
+                        node.unverify_revoked_works(&state.genesis.network_id).await;
                     }
                 }
             });

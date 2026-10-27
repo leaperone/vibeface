@@ -1,28 +1,13 @@
 use super::*;
 use crate::{
+    scheduler::dispatch_row,
     store::{
         bot_settings::{ChangeRequest, bot_message_id, change_id},
         bots::created_bot_id,
     },
     tools::{Effect, Tool},
-    work::{Dispatch, DispatchState, WorkSpec},
+    work::WorkSpec,
 };
-
-/// A dispatch to another device that has not shown up as work yet.
-fn dispatch_value(dispatch: &Dispatch) -> Value {
-    let spec = &dispatch.spec;
-    let mut value = json!({"work_id":spec.work_id,"call_ref":spec.call_ref,
-        "target_node":spec.target,"kind":spec.kind});
-    match &dispatch.state {
-        DispatchState::Pending => value["state"] = json!("waiting_for_device"),
-        DispatchState::Accepted => value["state"] = json!("accepted"),
-        DispatchState::Rejected { reason } => {
-            value["state"] = json!("rejected");
-            value["reason"] = json!(reason);
-        }
-    }
-    value
-}
 
 impl Runtime {
     /// The one entry for coordination tools: the Cursor SDK callback and `vibeface tool` both land here.
@@ -88,16 +73,27 @@ impl Runtime {
                     .await
             }
             Tool::Context => self.agent_context(network, &scope, &args).await,
+            // Dispatches the DAG does not name yet are listed too, so none is sent twice.
             Tool::WorkStatus => {
-                let works = self.store.lock().await.works(network, &scope)?;
+                let store = self.store.lock().await;
+                let works = store.works(network, &scope)?;
+                let dispatches = store.undelivered_dispatches(network, &scope)?;
+                drop(store);
                 Ok(match args["work_id"].as_str() {
-                    Some(id) => json!(
-                        works
-                            .into_iter()
-                            .find(|work| work.work_id == id)
-                            .context("work not found in this conversation")?
-                    ),
-                    None => json!({ "works": works }),
+                    Some(id) => match works.into_iter().find(|work| work.work_id == id) {
+                        Some(work) => json!(work),
+                        None => dispatch_row(
+                            dispatches
+                                .iter()
+                                .find(|dispatch| dispatch.spec.work_id == id)
+                                .context("work not found in this conversation")?,
+                        ),
+                    },
+                    None => {
+                        let mut rows: Vec<Value> = works.iter().map(|work| json!(work)).collect();
+                        rows.extend(dispatches.iter().map(dispatch_row));
+                        json!({ "works": rows })
+                    }
                 })
             }
             Tool::CallLookup => {
@@ -116,7 +112,7 @@ impl Runtime {
                     return Ok(json!(work));
                 }
                 if let Some(dispatch) = store.dispatch(&id)? {
-                    return Ok(dispatch_value(&dispatch));
+                    return Ok(dispatch_row(&dispatch));
                 }
                 if let Some(change) =
                     store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
@@ -514,8 +510,8 @@ impl Runtime {
             thread: thread.clone(),
         };
         if target != local {
-            let dispatch = self.send_dispatch(network, spec).await?;
-            return Ok(dispatch_value(&dispatch));
+            let dispatch = self.send_dispatch(network, spec, false).await?;
+            return Ok(dispatch_row(&dispatch));
         }
         ensure!(
             self.providers().switches.execution,

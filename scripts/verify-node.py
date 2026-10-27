@@ -3275,7 +3275,7 @@ def phase4_acceptance(options):
                                                     "target_node": b.device_id}}]})
         turn(a, r4["trigger"])
         remote = next(row for row in records(a, "manager-tools.jsonl") if row["call_ref"] == "outside-agent")["result"]
-        require(remote["state"] == "rejected" and "outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
+        require(remote["state"] == "dispatch_rejected" and "outside configured roots" in remote["reason"], "B refuses an agent task outside its roots")
         send(a.client, "p4-unsigned", "no signature", unsigned=True, status=400)
         passed("authority-checks", codex="outside configured roots", agent=remote["reason"][:80], unsigned="rejected")
 
@@ -3292,10 +3292,11 @@ def phase4_acceptance(options):
         require(delivery(a.client, lost) == "stop_waiting", "the work shows the waiting stop")
         wait_for("the stop request times out", lambda: delivery(a.client, lost) == "stop_timed_out", timeout=60)
         a.client.revoke(c.device_id, head(a, network, c.device_id))
-        abandoned = wait_for("A abandons the revoked device's work", lambda: (lambda row: row if row["outcome"] == "abandoned" else None)(
+        unknown = wait_for("A leaves the revoked device's work for the user", lambda: (lambda row: row if row["outcome"] == "unverified" else None)(
             works(a.client)[lost]), timeout=60)
-        require(delivery(a.client, lost) is None, "the abandoned work drops its stop request")
-        passed("offline-stop-and-revoke", stop="stop_timed_out", outcome=abandoned["outcome"])
+        require(unknown["failure_reason"] == "设备已移除，无法核对", "a removed device's work is not written off as never run")
+        require(delivery(a.client, lost) is None, "the unknown work drops its stop request")
+        passed("offline-stop-and-revoke", stop="stop_timed_out", outcome=unknown["outcome"])
 
         check_dir = folder("p4-check")
         r6a = send(a.client, "p4-m6a", {"label": "p4-m6a", "dispatch": {"label": "p4-check-done", "cwd": str(check_dir),

@@ -97,7 +97,8 @@ pub enum WorkOutcome {
     Rejected,
     /// The real result cannot be proven; only the user or a later probe settles it.
     Unverified,
-    /// Its target was removed before reporting a result; written by the conversation's owner.
+    /// No longer written: a removed target's open work is recorded `Unverified`. Removing the
+    /// variant changes the stored event format, so it goes with the next `DATA_EPOCH` bump.
     Abandoned,
 }
 
@@ -615,7 +616,7 @@ pub enum EventBody {
         turn_id: Option<String>,
     },
     /// Written by the target. The user settles an `unverified` result through any entry Node,
-    /// signed; the owner records `abandoned` after the target is removed.
+    /// signed; the owner records `unverified` after the target is removed.
     WorkFinished {
         work_id: String,
         outcome: WorkOutcome,

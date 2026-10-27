@@ -48,7 +48,35 @@ pub struct Dispatch {
 pub enum DispatchState {
     Pending,
     Accepted,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
+    /// The target can no longer answer (it was removed); whether it took the work is unknown.
+    Unverified {
+        reason: String,
+    },
+}
+
+impl DispatchState {
+    /// How the dispatch reads to the bot and in the conversation until the DAG names the work.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Pending => "dispatch_waiting",
+            Self::Accepted => "dispatch_accepted",
+            Self::Rejected { .. } => "dispatch_rejected",
+            Self::Unverified { .. } => "dispatch_unverified",
+        }
+    }
+    /// Refused, or left unknown: the DAG will not report it, so the dispatcher does.
+    pub fn ended(&self) -> bool {
+        matches!(self, Self::Rejected { .. } | Self::Unverified { .. })
+    }
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { reason } | Self::Unverified { reason } => Some(reason),
+            Self::Pending | Self::Accepted => None,
+        }
+    }
 }
 
 /// A stop the user asked for, stored before anything is sent. For another Node's work it is
@@ -99,9 +127,11 @@ pub enum WorkState {
         outcome: WorkOutcome,
     },
     /// The real result cannot be proven. `probe` says a later App Server probe may settle it;
-    /// otherwise only the user does.
+    /// otherwise only the user does. Without a known turn, `thread` is the journaled thread a
+    /// late send may still have started it in.
     Unverified {
         handle: Option<Handle>,
+        thread: Option<String>,
         evidence: String,
         probe: bool,
     },
@@ -113,6 +143,18 @@ impl WorkState {
             Self::Running { handle } | Self::Interrupting { handle } => Some(handle),
             Self::Unverified { handle, .. } => handle.as_ref(),
             _ => None,
+        }
+    }
+    /// The thread the work runs or may have started in.
+    pub fn thread(&self) -> Option<&str> {
+        match self {
+            Self::Starting { thread } => thread.as_deref(),
+            Self::Unverified {
+                handle: None,
+                thread,
+                ..
+            } => thread.as_deref(),
+            state => state.handle().map(|handle| handle.thread_id.as_str()),
         }
     }
     pub fn finished(&self) -> bool {
@@ -179,7 +221,7 @@ pub enum Signal {
         turn_id: String,
         epoch: u64,
     },
-    /// Nothing started: the Agent reported a refusal, or the window passed without a turn.
+    /// Nothing started: the Agent reported a refusal, or the window passed before it bound a thread.
     StartRejected(String),
     Text(String),
     /// A plan or commentary update; persisted at most every `PROGRESS_INTERVAL_MS`.
@@ -265,6 +307,9 @@ fn finish(
 }
 
 const DISCONNECTED: &str = "执行器连接已断开，等待重新核对";
+/// The Agent bound a thread, then no turn showed up by the window's end. Its `turn/start` may
+/// still be in flight, so the work is neither started nor refused.
+const SEND_UNSEEN: &str = "发送时限过了还没看到这次回合，不知道是否已开始";
 
 fn unverified(
     record: &mut WorkRecord,
@@ -272,8 +317,13 @@ fn unverified(
     evidence: &str,
     probe: bool,
 ) -> Option<EventBody> {
+    let thread = match handle {
+        Some(_) => None,
+        None => record.state.thread().map(str::to_owned),
+    };
     record.state = WorkState::Unverified {
         handle,
+        thread,
         evidence: evidence.into(),
         probe,
     };
@@ -332,9 +382,17 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
             };
             progress(record, WorkPhase::Started, "执行已开始")
         }
-        (Accepted | Starting { .. }, Signal::StartRejected(reason)) => {
-            finish(record, WorkOutcome::Rejected, Some(reason))
-        }
+        (
+            Accepted
+            | Starting { .. }
+            | Unverified {
+                handle: None,
+                thread: Some(_),
+                probe: true,
+                ..
+            },
+            Signal::StartRejected(reason),
+        ) => finish(record, WorkOutcome::Rejected, Some(reason)),
         (Running { .. } | Interrupting { .. }, Signal::Text(text)) => {
             record.text = bounded(&text);
             None
@@ -386,23 +444,51 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
         (Running { handle } | Interrupting { handle }, Signal::Disconnected) => {
             record.state = Unverified {
                 handle: Some(handle),
+                thread: None,
                 evidence: DISCONNECTED.into(),
                 probe: true,
             };
             None
         }
+        // A send whose turn was not seen in time may still start; it is then followed as usual.
+        (
+            Unverified {
+                handle: None,
+                thread: Some(thread),
+                probe: true,
+                ..
+            },
+            Signal::TurnStarted { turn_id, epoch },
+        ) => {
+            record.state = Running {
+                handle: Handle {
+                    thread_id: thread,
+                    turn_id,
+                    epoch,
+                },
+            };
+            progress(record, WorkPhase::Started, "执行已开始")
+        }
         (
             Starting {
                 thread: Some(thread),
+            }
+            | Unverified {
+                handle: None,
+                thread: Some(thread),
+                probe: true,
+                ..
             },
             Signal::Probed(probe),
         ) => match probe {
-            Probe::NotStarted | Probe::Missing => finish(
-                record,
-                WorkOutcome::Rejected,
-                Some("协调 Agent 没有在时限内开始这项工作".into()),
-            ),
+            // Reported once, when the window ends; a later probe that finds nothing adds nothing.
+            Probe::NotStarted | Probe::Missing if matches!(record.state, Unverified { .. }) => None,
+            Probe::NotStarted | Probe::Missing => unverified(record, None, SEND_UNSEEN, true),
             Probe::Running { turn_id, epoch } => {
+                let summary = match record.state {
+                    Unverified { .. } => "找到了这次回合，继续跟进",
+                    _ => "设备重启后已继续跟进",
+                };
                 record.state = Running {
                     handle: Handle {
                         thread_id: thread,
@@ -410,7 +496,7 @@ pub fn transition(record: &mut WorkRecord, signal: Signal) -> Option<EventBody> 
                         epoch,
                     },
                 };
-                progress(record, WorkPhase::Running, "设备重启后已继续跟进")
+                progress(record, WorkPhase::Running, summary)
             }
             Probe::Terminal {
                 turn_id,
@@ -631,13 +717,6 @@ mod tests {
         assert!(work.send_window_over(SEND_WINDOW_MS + RECONCILE_GRACE_MS));
         transition(&mut work, Signal::ThreadCreated("th".into()));
         assert!(matches!(
-            transition(&mut work.clone(), Signal::Probed(Probe::NotStarted)),
-            Some(EventBody::WorkFinished {
-                outcome: WorkOutcome::Rejected,
-                ..
-            })
-        ));
-        assert!(matches!(
             transition(
                 &mut work,
                 Signal::Probed(Probe::Terminal {
@@ -679,5 +758,87 @@ mod tests {
             "a disconnect then a missing turn is reported once"
         );
         assert!(transition(&mut work, Signal::Probed(Probe::Missing)).is_none());
+    }
+
+    #[test]
+    fn a_send_unseen_by_the_window_is_unverified_and_a_late_turn_is_followed() {
+        let mut work = record();
+        transition(&mut work, Signal::ThreadCreated("th".into()));
+        assert!(matches!(
+            transition(&mut work, Signal::Probed(Probe::NotStarted)),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Unverified,
+                ..
+            })
+        ));
+        assert_eq!(work.state.thread(), Some("th"));
+        assert!(
+            transition(&mut work, Signal::Probed(Probe::NotStarted)).is_none(),
+            "an unseen send is reported once"
+        );
+        let mut late = work.clone();
+        assert!(matches!(
+            transition(
+                &mut late,
+                Signal::TurnStarted {
+                    turn_id: "tu".into(),
+                    epoch: 1
+                }
+            ),
+            Some(EventBody::WorkProgress {
+                phase: WorkPhase::Started,
+                ..
+            })
+        ));
+        assert!(matches!(
+            transition(
+                &mut late,
+                Signal::TurnCompleted {
+                    turn_id: "tu".into(),
+                    status: "completed".into(),
+                    text: "done".into(),
+                    error: None,
+                }
+            ),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Completed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            transition(
+                &mut work,
+                Signal::Probed(Probe::Running {
+                    turn_id: "tu".into(),
+                    epoch: 2
+                })
+            ),
+            Some(EventBody::WorkProgress { .. })
+        ));
+        assert_eq!(work.state.handle().map(|handle| handle.epoch), Some(2));
+
+        let mut refused = work.clone();
+        refused.state = WorkState::Unverified {
+            handle: None,
+            thread: Some("th".into()),
+            evidence: String::new(),
+            probe: true,
+        };
+        assert!(matches!(
+            transition(&mut refused, Signal::StartRejected("refused".into())),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Rejected,
+                ..
+            })
+        ));
+
+        let mut unbound = record();
+        assert!(matches!(
+            transition(&mut unbound, Signal::StartRejected("window over".into())),
+            Some(EventBody::WorkFinished {
+                outcome: WorkOutcome::Rejected,
+                ..
+            })
+        ));
     }
 }

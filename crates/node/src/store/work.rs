@@ -14,6 +14,9 @@ use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, TransactionBehavior, params};
 use std::path::Path;
 
+/// Why a removed device's work or dispatch can only be settled by the user.
+const REMOVED: &str = "设备已移除，无法核对";
+
 const RUN_COLUMNS: &str = "work_id,conversation_id,kind,state,thread_id,turn_id,codex_epoch,outcome,evidence,probe,result_text,send_by_ms,progress,progress_at_ms";
 
 type RunRow = (
@@ -58,6 +61,7 @@ fn record_from(row: RunRow) -> Result<WorkRecord> {
             outcome: enum_from(&outcome.context("work run outcome missing")?)?,
         },
         "unverified" => WorkState::Unverified {
+            thread: thread.filter(|_| handle.is_none()),
             handle,
             evidence: evidence.unwrap_or_default(),
             probe: probe.unwrap_or(false),
@@ -117,10 +121,7 @@ pub(super) fn run_finished(connection: &Connection, work_id: &str) -> Result<boo
 
 fn save_run(connection: &Connection, record: &WorkRecord) -> Result<()> {
     let handle = record.state.handle();
-    let thread = match &record.state {
-        WorkState::Starting { thread } => thread.as_ref(),
-        _ => handle.map(|handle| &handle.thread_id),
-    };
+    let thread = record.state.thread();
     let (outcome, evidence, probe) = match &record.state {
         WorkState::Finished { outcome } => (Some(enum_text(outcome)), None, None),
         WorkState::Unverified {
@@ -361,9 +362,10 @@ impl Store {
         settle_local_from(&self.connection, network)
     }
 
-    /// Open works on removed devices become `abandoned`, recorded once by the conversation's
-    /// owner, so nothing waits forever on a device that can no longer report.
-    pub fn abandon_works(
+    /// Open works on removed devices become `unverified`, recorded once by the conversation's
+    /// owner: the device can no longer report, and whether it ran them is unknown. The user
+    /// settles them like any other unverified result.
+    pub fn unverify_removed_works(
         &mut self,
         identity: &LocalIdentity,
         network: &str,
@@ -374,7 +376,7 @@ impl Store {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut abandoned = Vec::new();
+        let mut unverified = Vec::new();
         for conversation in super::conversations_from(&tx, network)? {
             if conversation.owner.as_deref() != Some(local.as_str()) {
                 continue;
@@ -391,27 +393,19 @@ impl Store {
                     &conversation.conversation_id,
                     EventBody::WorkFinished {
                         work_id: work.work_id.clone(),
-                        outcome: WorkOutcome::Abandoned,
+                        outcome: WorkOutcome::Unverified,
                         result_text: String::new(),
-                        failure_reason: Some("设备已移除，任务已放弃、未执行".into()),
+                        failure_reason: Some(REMOVED.into()),
                         attestation: None,
                     },
                     vec![],
                     at,
                 )?;
-                scheduler::admit_work_result_from(
-                    &tx,
-                    network,
-                    &local,
-                    &conversation.conversation_id,
-                    &work.work_id,
-                    WorkOutcome::Abandoned,
-                )?;
-                abandoned.push((conversation.conversation_id.clone(), work.work_id));
+                unverified.push((conversation.conversation_id.clone(), work.work_id));
             }
         }
         tx.commit()?;
-        Ok(abandoned)
+        Ok(unverified)
     }
 
     pub fn work_record(&self, work_id: &str) -> Result<Option<WorkRecord>> {
@@ -466,6 +460,9 @@ fn query_dispatches(
                 "rejected" => DispatchState::Rejected {
                     reason: reason.unwrap_or_default(),
                 },
+                "unverified" => DispatchState::Unverified {
+                    reason: reason.unwrap_or_default(),
+                },
                 other => bail!("unknown dispatch state {other}"),
             };
             Ok(Dispatch {
@@ -481,6 +478,7 @@ fn save_dispatch_row(connection: &Connection, dispatch: &Dispatch) -> Result<()>
         DispatchState::Pending => ("pending", None),
         DispatchState::Accepted => ("accepted", None),
         DispatchState::Rejected { reason } => ("rejected", Some(reason)),
+        DispatchState::Unverified { reason } => ("unverified", Some(reason)),
     };
     connection.execute(
         "INSERT OR REPLACE INTO work_dispatches(work_id,spec,state,reason) VALUES(?,?,?,?)",
@@ -492,6 +490,10 @@ fn save_dispatch_row(connection: &Connection, dispatch: &Dispatch) -> Result<()>
         ],
     )?;
     Ok(())
+}
+
+pub(super) fn dispatch_from(connection: &Connection, work_id: &str) -> Result<Option<Dispatch>> {
+    Ok(query_dispatches(connection, "work_id=?", [work_id])?.pop())
 }
 
 impl Store {
@@ -510,12 +512,55 @@ impl Store {
         Ok(dispatch.clone())
     }
 
+    /// The target's answer to a waiting dispatch; the first answer stands. With `notify`, a
+    /// refusal the bot did not see in its own turn wakes it once through the work's trigger.
+    pub fn answer_dispatch(
+        &mut self,
+        network: &str,
+        local: &str,
+        work_id: &str,
+        state: DispatchState,
+        notify: bool,
+    ) -> Result<(Dispatch, Option<AdmissionReceipt>)> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut dispatch = dispatch_from(&tx, work_id)?.context("dispatch not found")?;
+        if dispatch.state != DispatchState::Pending {
+            return Ok((dispatch, None));
+        }
+        dispatch.state = state;
+        save_dispatch_row(&tx, &dispatch)?;
+        let receipt = match notify {
+            true => scheduler::admit_dispatch_result_from(&tx, network, local, &dispatch)?,
+            false => None,
+        };
+        tx.commit()?;
+        Ok((dispatch, receipt))
+    }
+
     pub fn dispatch(&self, work_id: &str) -> Result<Option<Dispatch>> {
-        Ok(query_dispatches(&self.connection, "work_id=?", [work_id])?.pop())
+        dispatch_from(&self.connection, work_id)
     }
 
     pub fn dispatches(&self) -> Result<Vec<Dispatch>> {
         query_dispatches(&self.connection, "1", [])
+    }
+
+    /// This conversation's dispatches the DAG does not name yet: waiting for their device,
+    /// refused, unknown, or accepted but not synced back.
+    pub fn undelivered_dispatches(&self, network: &str, scope: &str) -> Result<Vec<Dispatch>> {
+        let works = reduce::works_from(&self.connection, network, scope)?;
+        Ok(self
+            .dispatches()?
+            .into_iter()
+            .filter(|dispatch| {
+                dispatch.spec.conversation == scope
+                    && !works
+                        .iter()
+                        .any(|work| work.work_id == dispatch.spec.work_id)
+            })
+            .collect())
     }
 
     pub fn save_stop_request(&mut self, request: &StopRequest) -> Result<()> {
@@ -557,14 +602,23 @@ impl Store {
         Ok(())
     }
 
-    /// A removed device will never answer: its dispatches are refused and stop requests dropped.
-    pub fn drop_requests_to(&mut self, removed: &[DeviceId]) -> Result<()> {
-        for mut dispatch in query_dispatches(&self.connection, "state='pending'", [])? {
+    /// A removed device will never answer: whether it took a waiting dispatch is unknown, which
+    /// wakes the bot once; its stop requests are dropped.
+    pub fn drop_requests_to(
+        &mut self,
+        network: &str,
+        local: &str,
+        removed: &[DeviceId],
+    ) -> Result<usize> {
+        let mut woken = 0;
+        for dispatch in query_dispatches(&self.connection, "state='pending'", [])? {
             if removed.contains(&dispatch.spec.target) {
-                dispatch.state = DispatchState::Rejected {
-                    reason: "设备已移除，任务已放弃、未执行".into(),
+                let state = DispatchState::Unverified {
+                    reason: REMOVED.into(),
                 };
-                save_dispatch_row(&self.connection, &dispatch)?;
+                let (_, receipt) =
+                    self.answer_dispatch(network, local, &dispatch.spec.work_id, state, true)?;
+                woken += usize::from(receipt.is_some());
             }
         }
         for request in self.stop_requests()? {
@@ -572,6 +626,6 @@ impl Store {
                 self.forget_stop_request(&request.work_id)?;
             }
         }
-        Ok(())
+        Ok(woken)
     }
 }
