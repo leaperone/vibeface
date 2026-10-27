@@ -14,6 +14,7 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 | Bridge | Bridge 和 Node 的核心检查 |
 | Protocol | Protocol、Bridge 和 Node 的核心检查 |
 | Secure、密码学验收脚本 | Secure、Node 和浏览器密码学互通 |
+| Delivery 领域库、proof、合约和服务入口 | Delivery 与 Node 核心检查、新 guest 的公开证明验证和本地 EVM 验收 |
 | Cargo manifest、锁文件、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试。
@@ -22,9 +23,82 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 
 Web 路径优先于 Node 路径。Node 对 Protocol、Bridge、Secure 的依赖用于向上扩展检查范围。PR 按 `merge-base(base, head)..head` 的完整差异选取，删除与重命名包括旧、新路径。无法识别的输入选择整个工作区核心检查。
 
+`delivery` 路径先于通用 Node 和 Cargo 路径匹配。它包括 `crates/delivery/`、`proofs/delivery/`、`contracts/delivery/`、`tests/fixtures/delivery-probe/`、`crates/node/src/delivery/`、发现实现、服务入口与本地钱包边界，以及两个 delivery 验收脚本。Delivery 领域库向上触发 Node 检查，因此 Rust 任务所需的 Web 和密码学资源仍会构建。完整工作区检查也要求 `delivery` 任务成功。
+
 Linux 制品核对 checksum、源码提交、版本、target、WASM 和存储 epoch，再以 `verify-node.py --web-only` 启动真实进程，检查网页资源、SPA 路由、CSP、缓存与 404。它不执行多 Node 业务验收，也不验证浏览器渲染。
 
 Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证建网页面以及建网、下载恢复文件、跳过 AI 设置、创建 Bot 和刷新后保留的流程。它不调用真实模型。CI 上传浏览器测试报告，排除下载的恢复文件和 Node 数据。
+
+## 可验证交付的核心检查
+
+`delivery` 任务使用 Rust 1.98.1 构建独立的 `proofs/delivery` host。guest 编译器固定为 RISC Zero Rust `r0.1.97.0`，由 `scripts/install-delivery-toolchain.py` 校验官方归档 SHA-256 后安装到 `.artifacts/vdp/risc0/`。它不改全局 Rust 配置，Node 默认构建不依赖重型 proof host。
+
+规范 guest 只在 Linux x86_64 构建。CI 把源码、Cargo 缓存、编译器和产物分别挂到 `/work`、`/cargo`、`/risc0` 和 `/artifacts`，再调用唯一入口 `proofs/delivery/build.sh`。固定路径和 guest 的 remap 参数避免把不同机器的绝对路径写入不同的 image。Mac 原生构建不能作为该规范 image 的证明验收。
+
+`scripts/check-delivery.py` 读取 `proofs/delivery/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
+
+现状：这 13 个证明夹具需要在 x86_64 大内存机器上生成，CI 的 11 GiB runner 和 ARM Mac 都生成不了，仓库暂不包含 `proofs/delivery/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败。
+
+所有 receipt 还必须绑定产品的 `proofs/delivery/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
+
+合约检查使用锁定的 solc、Ganache 和 ethers。官方 verifier 源码逐项校验摘要，`compile.mjs --check-trust` 对比重新编译的 runtime 与已提交的 `trust.json`，不改 tracked 文件。检查还包括账务正反例、官方 published fixture、两连续窗口的 Rust 与 Solidity 编码比较，以及当前 delivery image 的真实 seal 在生产 adapter 上的验真和篡改拒绝。
+
+这些结果分别保留在 `.artifacts/vdp/` 和 `.artifacts/vdp/contracts/`。CI 只上传公开 journal、结果和合成公开向量，不上传私密见证、密钥、Node 数据或工具链。官方 published fixture 和账务测试有各自的标签，它们不能替代当前 delivery image 的证明。
+
+在上述固定路径的 Linux sandbox 中执行同一核心检查：
+
+```sh
+python3 scripts/check-delivery.py --check-fixtures
+python3 scripts/install-delivery-toolchain.py
+CARGO_HOME=/cargo RISC0_HOME=/risc0 python3 scripts/check-delivery.py
+```
+
+Mac 或未配置上述挂载的 Linux 主机使用同一 sandbox 入口：
+
+```sh
+python3 scripts/check-delivery.py --check-fixtures
+python3 scripts/check-delivery.py --sandbox
+```
+
+`--sandbox` 先检查 fixture，再用固定的 `proofs/delivery/Sandbox.Dockerfile` 构建本地镜像。构建上下文仅含 Dockerfile 和 gnark 启动脚本。容器只挂四个目录，复用 `.artifacts/vdp/cargo`、`.artifacts/vdp/risc0` 和 `.artifacts/vdp/canonical`，不挂 Docker socket，不把 host 凭证或 dev mode 作为参数或挂载传入容器。内存上限为 11 GiB，内存与交换合计也限 11 GiB，最多 64 个进程。容器先在内部安装固定 guest 编译器，再执行默认完整检查。Preflight proof 域使用此入口，Mac 不安装原生 guest 编译器。
+
+`--check-fixtures` 只核对公开文件结构和 schema，不验证证明。两个脚本的 `--self-test` 也只验证工具自身的正反例。整个 fixture 目录不存在时按上文跳过 receipt 验证；fixture 不全、缺编译器、依赖或 verifier 时退出失败，不能把未验证结果记为通过。
+
+普通 PR 和扩展 CI 不生成新的昂贵证明，也不为新容量或资源上限背书。显式手动选中的 `delivery_live` 按下文生成新的真实证明。修改密码关系或 guest 后，先验收新 image 的真实证明，再更新公开 fixture。生产 adapter 的 seal 验真只能证明该公开关系，不能单独证明托管合约已经收付款或用户已读。
+
+当计划选中 `delivery` 时，Linux x64 package 任务还以本次打包的 Node 和 JS/WASM 执行 `verify-node.py --delivery-charity`。它先以 `--locked` 构建独立的 `tests/fixtures/delivery-probe`，产物放在 `.artifacts/delivery-probe/target`。probe 编译时包含当前产品的发现实现，进程验收重新核对该源码摘要。公网角色、不同个人网络的 Node、真实 loopback QUIC/Noise、免费发现、公益文件恢复及私人协议拒绝使用真实进程验证。CI 仅上传该模式的公开 `report.json`。
+
+公益进程验收与 paid proof 任务各自必须通过。公益收据不代表链上交付或结算。Preflight 对 probe 和相关服务改动单独运行 fmt 与最小 locked build，不把这一构建当作进程验收。
+
+## 手动生成真实付费交付证据
+
+现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
+
+该入口还通过 `mobile.yml` 的 `workflow_call` 构建同一提交的 Android release APK，不构建 iOS。Android 构建记录实际 APK 摘要、release variant、application id，以及 arm64-v8a 和 x86_64 两份安全库的 ELF ABI 与摘要。`delivery-live` 只接收同一 run、同一 SHA 的 Android、Linux x64 Node 包、Web 和 WASM，并重新核对源码、归档和原生库字节及生成资源的隐私收据。
+
+Android 的 UBRN 配置保留项目自行维护的 `android/proguard-rules.pro`，与现有 CMake、Gradle 和 manifest 一样列入 `noOverwrite`。生成器不得以通用 JNA 规则覆盖实际 React Native 模块的 R8 keep 规则。打包后仍要求整个源码 checkout 与本次提交一致，不通过恢复文件或忽略 dirty 状态补造来源。
+
+固定 sandbox 先运行打包 Node 的真实网页进程。只有明确的 GLIBC symbol 或 loader 不兼容才从同一提交和已经验证的 Web/WASM 实际构建 Node，并单独记录这一来源。业务或验收失败直接阻塞任务。任务安装固定 guest 编译器，重编实际 guest 和 host，核对产品 profile，构建真实 QUIC probe，再写入权限为 `0600` 的全新本机部署配置。
+
+`verify-node.py --delivery` 生成十三份唯一真实证明。严格最大文件订单产生七份，原文件必须覆盖实际 130816 字节边界，独立只读 observer 验证实际 29 TestToken 提现。rotate、revoke、register 产生三份新的密钥证明，记录实际 serial、intent、交易及 journal 和 receipt 摘要。普通订单复用最后有效的 register 证明，由真实网页选文件、确认报价和付款，真实 Android 接收、断线、恢复并保存 4096 字节原文件，再产生三份 source、hold、open 证明。普通订单使用自己的四份公开证明 bundle 和只读 observer，独立核对 17 TestToken 提现。复用的 binding 不计为新证明。
+
+同一严格订单还执行 16 项客户端权限检查、7 项有效 Agent token 检查、8 项服务授权检查，以及三台 Node 各自的 RPC、SYNC、BLOB 私人协议拒绝。真实普通成员和本机会话保留同网络读权限，写入和付款需要管理成员。Agent 工具正例在拒绝前后都成功，过期服务授权使用实际 Provider 正确签名。检查时钱包实际解锁，财务、对象、设置、DAG 和工作记录保持不变，正常 Agent 完成只增加原回合的一条回复。公开 summary 只包含固定计数和前后状态摘要，不导出 token、服务授权签名字节或本机启动材料。
+
+外层脚本在宿主启动 Chromium 和专属 root AOSP x86_64 AVD。受认证的 loopback controller 发布私有 `0600` 描述文件后，两个 e2e worker 同时驱动 Web 和指定 Android APK。Node 验收与 e2e 必须同时成功，订单、intent、文件 SHA-256、离线观察及真实保存记录均须一致。仅退出码为零、跳过测试或已有公开 fixture 均不能通过。任一进程失败会终止本任务另一进程，恢复本任务接收端的 ADB reverse，并关闭专属 AVD 和私有 ADB server。
+
+controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数据进入全部分支。`stage` 明确区分 `bootstrap`、`inspections`、`ordinary`、`complete`。两个 UI 提前配对并观察原订单的部分退款、真实 HTTP502 未知交易，以及接收密钥 key1 到 Rotate2。检查时钱包锁定，广播数为零，proof 和金融 intent 行保持不变，故障清除后才确认检查。只有 `stage=ordinary` 才允许普通订单的 prepare、confirm、accept。单次 inspection 有独立上限；整个 UI 测试与宿主 join 使用既有 LIVE 剩余总截止，普通订单自身仍保留原一小时上限。
+
+`ui-inspections.json` 只包含四次真实 Node 和 PNG 交叉验证的检查结果，生成证明数为零。外层按严格订单的 public journal 绑定 source/receiver Peer 和 key ID、serial，再核对实际分支的 12/12/17、未知状态下撤回的窗口证明，以及四张 PNG 的字节摘要。普通订单另保留 `web-settled.png`，与原 17/17/0 及真实 Web 验收共验。真实 provider 已提交前缀、held 和 key-published 的 SIGKILL 恢复结果另按固定 case 投影，明确复用了原订单的缓存材料。
+
+整个 Node、EVM、prover 和其包装进程保持 root、固定 HOME、既定四挂载及同一 cgroup，内存上限为 11 GiB，零交换，上限为 64 个进程。Node 使用两个 Tokio worker threads。容器只增加 host network，共享本机 loopback。宿主 UI 和 AVD 不计入该 proof cgroup 的资源记录。任何 OOM 计数增长、资源观察失败或缺少证明均失败。只有 proof、两个真实 UI 和清理全部成功后，宿主才把 `PROOFS_PASS` 更新为最终 `PASS`。
+
+若 paid process 后续失败，外层只尝试保留本次唯一 summary 对应的 strict 七份公开证明。全部 receipt 必须由当前 host 再次验真，绑定当前 image、profile、journal 与 receipt 摘要，且原独立 observer 确认 strict 29 的实际收付款，才整组发布。缺少任何数据均不发布该组。`partialEvidence.scope=strict-only` 始终伴随整体 FAIL，不代表分支恢复、普通 UI 或当前 canonical 状态通过。UI 先失败时，固定 controller abort 后仅在原总截止内给收尾留证一个有界窗口，随后执行原定清理并保留原异常。
+
+完整验收还要求本次 session 的固定 branch index、全部 24 个有限分支、三个 key 观察及 core-restored。逐项核对 index 的文件 SHA-256、真实 ledger、Node 观察范围、同一生命周期 journal 和恢复后的 strict 29 TestToken 结果。缺少任一分支、恢复仍为 pending、旧文件摘要不同或只剩证明总数，均不能通过。incoming 分支只证明原 Node 签名交易在受控原链的实际资金行为，保留 `NOT_TESTED_ORIGINAL_BROADCAST_RAW_ONLY` 标记。
+
+宿主用 `xvfb-run` 分配专用 DISPLAY、`1440x1000x24` 屏幕及任务内的 `0600` XAUTHORITY，Web 使用 headed 模式。e2e 全程视频仍关闭。测试只在配对后录制三个指定短片，Web 为报价确认和同 intent 重载，Android 为接收后离线与恢复后保存。每段最多 180 秒。宿主独立核对 MP4 容器、视频流、时长、文件 SHA-256 和真实退出方式，合并两端独立收据为 `video-metadata.json`。ffmpeg 必须以 q 正常退出，Android screenrecord 保留实际 SIGINT 对应的退出码或信号。
+
+上传清单仅含公开 receipt 与对应 JSON、两个 settlement bundle 及各自 observer、安全 summary/resource、固定白名单中的分支与恢复记录、原有五个 UI JSON 和 PNG、检查清单及指定新增五张 PNG，以及 `web-confirm.mp4`、`android-accept-offline.mp4`、`android-resume-save.mp4` 和对应合并元数据。分支记录是受控分支的历史证据，不能当作恢复后的当前 canonical 状态。join 邀请、全程 attempt 视频、trace、controller token、原始文件、Node 数据、钱包、私密见证及原始日志不上传。测试链限 loopback 31337，不使用真实资产、公共部署或 AI Provider，也不据此宣称绝对链终局性或 iOS 付费验收。
 
 ## 定期、手动和发布检查
 

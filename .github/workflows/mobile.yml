@@ -3,11 +3,16 @@ name: mobile
 # Extended platform build: run by hand, or on a pull request labelled `mobile`.
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      android_only:
+        type: boolean
+        default: false
   pull_request:
     types: [labeled, synchronize]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: mobile-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -15,11 +20,13 @@ permissions:
 
 jobs:
   android:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')
+    if: inputs.android_only || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -42,23 +49,33 @@ jobs:
           cache-read-only: ${{ github.event_name == 'pull_request' }}
       - run: pnpm install --frozen-lockfile
       - run: scripts/build-mobile-secure.sh android
+      - name: Verify generated native sources match this commit
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python3 -c 'import os, runpy; runpy.run_path("scripts/run-delivery-live.py")["source_commit"](os.environ["SOURCE_COMMIT"])'
       - name: Build the release APK
         working-directory: apps/mobile
         run: |
           npx expo prebuild --platform android --no-install
           cd android && ./gradlew assembleRelease --build-cache -PreactNativeArchitectures=arm64-v8a,x86_64
+      - name: Bind release APK and native ABI bytes to this source commit
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: python3 scripts/run-delivery-live.py --record-android-apk apps/mobile/android/app/build/outputs/apk/release --source-commit "$SOURCE_COMMIT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: vibeface-android-${{ github.sha }}
-          path: apps/mobile/android/app/build/outputs/apk/release/*.apk
+          path: .artifacts/mobile-android/
           if-no-files-found: error
 
   ios:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')
+    if: ${{ !inputs.android_only && (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim

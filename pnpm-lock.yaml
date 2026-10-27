@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@e2e-dev/mobile':
+        specifier: 0.12.4
+        version: 0.12.4(ai@7.0.153(zod@4.6.7))(e2e@0.21.3(ai@7.0.153(zod@4.6.7)))
       '@e2e-dev/web':
         specifier: ^0.15.3
         version: 0.15.3(e2e@0.21.3(ai@7.0.153(zod@4.6.7)))
@@ -712,6 +715,16 @@ packages:
 
   '@dotenvx/primitives@0.8.0':
     resolution: {integrity: sha512-VYJy0uhFm9zTJ1TxBaW/pA8bjbOM/OttaNMwZ1RHG4JKyRG7DhSdiqD1ipQoAyoD22olUtxbP78W9xY3Wd11bg==}
+
+  '@e2e-dev/mobile@0.12.4':
+    resolution: {integrity: sha512-vciASBS2iVArOa43N2a4f9IzC6KsTNCE/e4S3IOdvRCMJ0/oNAtLW8i95FptrLI2A4tBu0dAzjzOUssi0PhLbA==}
+    engines: {node: ^22.22.3 || >=24.8.0}
+    peerDependencies:
+      ai: ^7.0.0
+      e2e: '>=0.15.0 <1'
+    peerDependenciesMeta:
+      ai:
+        optional: true
 
   '@e2e-dev/web@0.15.3':
     resolution: {integrity: sha512-S15TxVQsSTvjEd00r/fZs0tX/gvq53EhWMtSCYhydnMA9QdfE83GpgiXeRqrBDzNhfbm6f1TwJeANw+qW/4T4A==}
@@ -2624,6 +2637,16 @@ packages:
     resolution: {integrity: sha512-d8OWDVdZMgjhLUT9ZPgSv/BdFFF9pVuscC0JdUSz3bjwE15gcp6u/o0/JooM2yyAWC49KThFhXlgTXRa9B7yng==}
     engines: {node: '>=18.18'}
     hasBin: true
+
+  agent-device@0.21.29:
+    resolution: {integrity: sha512-wd9xWriaq6syAxgxH7zUO5MvbnQS1AVWpypLuWqarIM4+O07YVDieK4uZSmsKm2cZlI8oXvW2AAKhLKn48gcdQ==}
+    engines: {node: '>=22.12'}
+    hasBin: true
+    peerDependencies:
+      ai: ^6.0.0 || ^7.0.0
+    peerDependenciesMeta:
+      ai:
+        optional: true
 
   ai@7.0.153:
     resolution: {integrity: sha512-Ib8v374jWn9FXsjADXodRaP7fsMutlmPsbTLT5gYBDyadFcF9XxfYX1CSSxgSvE1r06MmOeYVwvQjFb3CcBi1Q==}
@@ -6127,6 +6150,15 @@ snapshots:
 
   '@dotenvx/primitives@0.8.0': {}
 
+  '@e2e-dev/mobile@0.12.4(ai@7.0.153(zod@4.6.7))(e2e@0.21.3(ai@7.0.153(zod@4.6.7)))':
+    dependencies:
+      agent-device: 0.21.29(ai@7.0.153(zod@4.6.7))
+      e2e: 0.21.3(ai@7.0.153(zod@4.6.7))
+      pngjs: 7.0.0
+      zod: 4.6.1
+    optionalDependencies:
+      ai: 7.0.153(zod@4.6.7)
+
   '@e2e-dev/web@0.15.3(e2e@0.21.3(ai@7.0.153(zod@4.6.7)))':
     dependencies:
       e2e: 0.21.3(ai@7.0.153(zod@4.6.7))
@@ -6563,7 +6595,7 @@ snapshots:
       '@jest/schemas': 29.6.3
       '@types/istanbul-lib-coverage': 2.0.6
       '@types/istanbul-reports': 3.0.4
-      '@types/node': 22.20.5
+      '@types/node': 24.19.2
       '@types/yargs': 17.0.35
       chalk: 4.1.2
 
@@ -8364,6 +8396,10 @@ snapshots:
 
   agent-cli-detector@0.1.7: {}
 
+  agent-device@0.21.29(ai@7.0.153(zod@4.6.7)):
+    optionalDependencies:
+      ai: 7.0.153(zod@4.6.7)
+
   ai@7.0.153(zod@4.6.7):
     dependencies:
       '@ai-sdk/gateway': 4.0.126(zod@4.6.7)
@@ -9575,7 +9611,7 @@ snapshots:
   jest-util@29.7.0:
     dependencies:
       '@jest/types': 29.6.3
-      '@types/node': 22.20.5
+      '@types/node': 24.19.2
       chalk: 4.1.2
       ci-info: 3.9.0
       graceful-fs: 4.2.11
@@ -9592,7 +9628,7 @@ snapshots:
 
   jest-worker@29.7.0:
     dependencies:
-      '@types/node': 22.20.5
+      '@types/node': 24.19.2
       jest-util: 29.7.0
       merge-stream: 2.0.0
       supports-color: 8.1.1

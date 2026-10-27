@@ -140,7 +140,7 @@ pub(crate) fn rank(lamport: u64, created_at_ms: i64, hash: &str) -> String {
     format!("{lamport:020}:{created_at_ms:020}:{hash}")
 }
 
-fn private_file_connection(path: &Path) -> Result<Connection> {
+pub(crate) fn private_file_connection(path: &Path) -> Result<Connection> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path
         .parent()

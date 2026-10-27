@@ -15,6 +15,7 @@ import { Route as JoinRouteImport } from './routes/join'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
+import { Route as AppTransfersRouteImport } from './routes/_app/transfers'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
@@ -50,6 +51,11 @@ const AppSettingsRoute = AppSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => AppRoute,
 } as any)
+const AppTransfersRoute = AppTransfersRouteImport.update({
+  id: '/transfers',
+  path: '/transfers',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppBBotIdRoute = AppBBotIdRouteImport.update({
   id: '/b/$botId',
   path: '/b/$botId',
@@ -82,6 +88,7 @@ export interface FileRoutesByFullPath {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
+  '/transfers': typeof AppTransfersRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/logs': typeof AppSettingsLogsRoute
@@ -93,6 +100,7 @@ export interface FileRoutesByTo {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
+  '/transfers': typeof AppTransfersRoute
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
@@ -107,6 +115,7 @@ export interface FileRoutesById {
   '/join': typeof JoinRoute
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
+  '/_app/transfers': typeof AppTransfersRoute
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
@@ -122,6 +131,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
+    | '/transfers'
     | '/b/$botId'
     | '/devices/$deviceId'
     | '/settings/logs'
@@ -133,6 +143,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
+    | '/transfers'
     | '/'
     | '/b/$botId'
     | '/devices/$deviceId'
@@ -146,6 +157,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/_app/inbox'
     | '/_app/settings'
+    | '/_app/transfers'
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/devices/$deviceId'
@@ -204,6 +216,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/transfers': {
+      id: '/_app/transfers'
+      path: '/transfers'
+      fullPath: '/transfers'
+      preLoaderRoute: typeof AppTransfersRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/b/$botId': {
       id: '/_app/b/$botId'
       path: '/b/$botId'
@@ -257,6 +276,7 @@ const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
 interface AppRouteChildren {
   AppInboxRoute: typeof AppInboxRoute
   AppSettingsRoute: typeof AppSettingsRoute
+  AppTransfersRoute: typeof AppTransfersRoute
   AppIndexRoute: typeof AppIndexRoute
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
@@ -267,6 +287,7 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppInboxRoute: AppInboxRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppTransfersRoute: AppTransfersRoute,
   AppIndexRoute: AppIndexRoute,
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,

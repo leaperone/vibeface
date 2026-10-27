@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { Bell, BellOff, Check, ChevronRight, CircleCheck, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -46,6 +46,9 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
+    <SettingsGroup title="文件传输">
+      <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="公益转发与实验付费交付"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
+    </SettingsGroup>
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer="恢复文件只有一份有效，丢了不能补">
       <CurrentRecoveryFile />
       <RecoveryControls />

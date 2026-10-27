@@ -1,6 +1,6 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { ArrowRightLeft, Bell, BellRing, ChevronRight, Crown, FileKey, Globe, KeyRound, Laptop, LogOut, MonitorSmartphone, Palette, Plus, SlidersHorizontal, Smartphone, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState, type ReactNode } from 'react'
 import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
@@ -48,6 +48,9 @@ export default function Settings() {
       </Link> : null}
     </Section>
     {device.ready ? <Notifications /> : null}
+    <Section icon={ArrowRightLeft} title="文件传输">
+      <LinkRow href="/transfers" icon={ArrowRightLeft} label="公益转发与实验付费交付" />
+    </Section>
     {device.ready?.principal.can_manage ? <Section icon={Sparkles} title="AI">
       <LinkRow href="/ai" icon={SlidersHorizontal} label="Bot 与任务" />
     </Section> : null}
@@ -81,7 +84,7 @@ function Notifications() {
   </Section>
 }
 
-function LinkRow({ href, icon, label }: { href: '/ai' | '/recovery'; icon: LucideIcon; label: string }) {
+function LinkRow({ href, icon, label }: { href: '/ai' | '/recovery' | '/transfers'; icon: LucideIcon; label: string }) {
   return <Link href={href} asChild>
     <Pressable className="min-h-12 flex-row items-center gap-3 overflow-hidden rounded-xl border border-border px-4 py-2 active:bg-muted">
       <Icon as={icon} className="text-muted-foreground" />

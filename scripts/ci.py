@@ -12,16 +12,18 @@ import subprocess
 import tempfile
 
 
-PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi")
+PACKAGES = ("vibeface-protocol", "vibeface-bridge", "vibeface-secure", "vibeface", "vibeface-secure-ffi", "vibeface-delivery")
 DEPENDENTS = {
     "protocol": ("bridge", "node"),
     "bridge": ("node",),
     "secure": ("node", "secure-ffi"),
     "node": (),
     "secure-ffi": (),
+    "delivery": ("node",),
 }
-CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi"), PACKAGES))
+CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delivery"), PACKAGES))
 PATH_RULES = (
+    ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
@@ -37,7 +39,7 @@ PLATFORMS = (
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "package", "npm-package", "npm-smoke")
+JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke")
 
 
 def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
@@ -69,6 +71,7 @@ def scope_plan(scopes, event, ref_type, channel):
     packages = [package for crate, package in CRATES.items() if crate in affected]
     web = full or "web" in scopes or "node" in affected
     slow = "node" in affected and extended
+    delivery = full or "delivery" in affected
     platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
     plan = {
         "full": full,
@@ -81,6 +84,7 @@ def scope_plan(scopes, event, ref_type, channel):
         "scopes": sorted(scopes),
         "web": web,
         "node": "node" in affected,
+        "delivery": delivery,
         "rust_packages": packages,
         "test_tiers": (["fast"] if packages else []) + (["slow"] if slow else []),
         "package_mode": "node" if "node" in affected and extended else "web",
@@ -94,6 +98,8 @@ def scope_plan(scopes, event, ref_type, channel):
         required.update(("rust-check", "rust-fast"))
     if slow:
         required.add("rust-slow")
+    if delivery:
+        required.add("delivery")
     if plan["npm"]:
         required.update(("npm-package", "npm-smoke"))
     plan["required_jobs"] = [job for job in JOBS if job in required]
@@ -165,6 +171,7 @@ def write_plan(plan, output=None):
             "web": str(plan["web"]).lower(),
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
+            "delivery": str(plan["delivery"]).lower(),
             "package": str("package" in plan["required_jobs"]).lower(),
             "package_matrix": json.dumps(plan["package_matrix"], separators=(",", ":")),
             "package_mode": plan["package_mode"],
@@ -192,7 +199,7 @@ def write_plan(plan, output=None):
             )
 
 
-def gate(needs, plan=None):
+def gate(needs, plan=None, delivery_live=False):
     if needs.get("plan", {}).get("result") != "success":
         raise ValueError("CI plan did not succeed")
     if plan is None:
@@ -200,9 +207,11 @@ def gate(needs, plan=None):
     expected = scope_plan(set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"])
     if any(plan[key] != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
-    required = expected["required_jobs"]
+    if delivery_live and plan["event"] != "workflow_dispatch":
+        raise ValueError("Live delivery proofs require explicit workflow_dispatch")
+    required = expected["required_jobs"] + (["delivery-live"] if delivery_live else [])
     failed = [job for job in required if needs.get(job, {}).get("result") != "success"]
-    failed.extend(job for job in JOBS if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
+    failed.extend(job for job in (*JOBS, "delivery-live") if job not in required and needs.get(job, {}).get("result") in {"failure", "cancelled"})
     if failed:
         raise ValueError(f"Required CI checks did not succeed: {', '.join(failed)}")
     print(f"CI gate passed: {', '.join(required)}")
@@ -268,11 +277,19 @@ def self_test():
         "bridge": ["vibeface-bridge", "vibeface"],
         "protocol": ["vibeface-protocol", "vibeface-bridge", "vibeface"],
         "secure": ["vibeface-secure", "vibeface", "vibeface-secure-ffi"],
+        "delivery": ["vibeface", "vibeface-delivery"],
     }
     for crate, packages in expected.items():
         plan = make_plan([f"crates/{crate}/src/lib.rs"])
         assert plan["rust_packages"] == packages and plan["test_tiers"] == ["fast"]
         assert plan["package_mode"] == "web" and plan["package_matrix"]["include"] == list(PLATFORMS[:1])
+    for path in ("crates/delivery/Cargo.toml", "crates/delivery/abi/Statement.sol", "proofs/delivery/guest/src/main.rs", "proofs/delivery/fixtures/manifest.json", "contracts/delivery/DeliveryEscrow.sol", "contracts/delivery/package-lock.json", "tests/fixtures/delivery-probe/Cargo.toml", "tests/fixtures/delivery-probe/Cargo.lock", "tests/fixtures/delivery-probe/src/main.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/delivery/wallet.rs", "crates/node/src/client.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"):
+        selected = make_plan([path])
+        assert selected["scopes"] == ["delivery"] and selected["delivery"]
+        assert selected["rust_packages"] == expected["delivery"] and selected["web"]
+        assert "delivery" in selected["required_jobs"]
+        assert "package" in selected["required_jobs"] and selected["package_matrix"]["include"][0]["target"] == "x86_64-unknown-linux-gnu"
+    assert not docs["delivery"] and not web["delivery"]
     for path in ("Cargo.toml", "Cargo.lock", "crates/node/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", ".github/workflows/ci.yml", "scripts/ci.py", "new-build-input"):
         assert make_plan([path])["rust_packages"] == list(PACKAGES)
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
@@ -317,6 +334,7 @@ def self_test():
     expect_failure(lambda: gate(needs, dict(ready, package_matrix={"include": list(PLATFORMS[:1])})))
     expect_failure(lambda: gate(needs, dict(ready, npm=False)))
     expect_failure(lambda: gate(needs, dict(ready, check_msrv=False)))
+    expect_failure(lambda: gate(needs, dict(ready, delivery=False)))
     complete = {job: {"result": "success"} for job in JOBS}
     complete["plan"] = {"result": "success", "outputs": {"plan": json.dumps(ready)}}
     gate(complete)
@@ -324,6 +342,25 @@ def self_test():
         incomplete = json.loads(json.dumps(complete))
         incomplete[job]["result"] = "skipped"
         expect_failure(lambda: gate(incomplete))
+    expect_failure(lambda: gate(complete, delivery_live=True))
+    complete["delivery-live"] = {"result": "success"}
+    gate(complete, delivery_live=True)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        broken = json.loads(json.dumps(complete))
+        broken["delivery-live"] = {"result": result}
+        expect_failure(lambda: gate(broken, delivery_live=True))
+    expect_failure(lambda: gate(needs, delivery_live=True))
+    delivery_plan = make_plan(["proofs/delivery/fixtures/manifest.json"])
+    delivery_needs = {job: {"result": "success" if job in delivery_plan["required_jobs"] else "skipped"} for job in JOBS}
+    delivery_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(delivery_plan)}}
+    gate(delivery_needs)
+    for result in ("failure", "cancelled", "skipped", "missing"):
+        broken = json.loads(json.dumps(delivery_needs))
+        broken["delivery"] = {"result": result}
+        expect_failure(lambda: gate(broken))
+    broken = json.loads(json.dumps(delivery_needs))
+    del broken["delivery"]
+    expect_failure(lambda: gate(broken))
     assert validate_slow_tests(["other::test", *SLOW_TESTS]) == {"other::test"}
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS[:-1]]))
     expect_failure(lambda: validate_slow_tests(["other::test", *SLOW_TESTS, SLOW_TESTS[0] + "_extra"]))
@@ -394,7 +431,68 @@ def self_test():
     protocol, epoch = (re.search(rf"^pub const {name}: u32 = (\d+);$", config, re.M)[1] for name in ("UPDATE_PROTOCOL", "DATA_EPOCH"))
     assert f'info["update_protocol"]=="{protocol}" && info["data_epoch"]=="{epoch}"' in (root / "install.sh").read_text(), "install.sh accepts the build's update protocol and data epoch"
     release_privacy_test(root, scratch)
+    gatekeeper_test(root, scratch)
     print("CI selector, event, test partition, check commands, rename/delete, gate and installer epoch self-tests passed")
+
+
+def gatekeeper_test(root, scratch):
+    import sys
+    import textwrap
+
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    step = workflow.split("      - name: Verify Developer ID signature\n", 1)[1]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+    accepted = (0, "Notarized Developer ID")
+    pending = (3, "Unnotarized Developer ID")
+    cases = (
+        ("accepted", [accepted], False, 0),
+        ("pending-accepted", [pending, accepted], False, 0),
+        ("pending-exhausted", [pending] * 4, False, 3),
+        ("other-status", [(2, pending[1])], False, 2),
+        ("other-source", [(3, "fixture rejection")], False, 3),
+        ("wrong-success-source", [(0, pending[1])], False, 1),
+        ("binary-changed", [accepted], True, 1),
+    )
+    with tempfile.TemporaryDirectory(prefix="gatekeeper-", dir=scratch) as directory:
+        fixture = Path(directory)
+        tools = fixture / "bin"
+        tools.mkdir()
+        stub = tools / "stub"
+        stub.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+            import json, os, sys
+            from pathlib import Path
+            tool = Path(sys.argv[0]).name
+            binary = Path(os.environ["PACKAGE"]) / "vibeface"
+            if tool == "codesign":
+                if sys.argv[1:] == ["--verify", "--strict", str(binary)]:
+                    sys.exit(0)
+                assert sys.argv[1:] == ["-dvvv", str(binary)]
+                print("Identifier=cn.leaperone.vibeface\\nTeamIdentifier=FIXTURETEAM\\nCodeDirectory flags=0x10000(runtime)")
+            elif tool == "spctl":
+                assert sys.argv[1:] == ["-a", "-vvv", "--ignore-cache", "--no-cache", "-t", "open", "--context", "context:primary-signature", str(binary)]
+                state = Path(os.environ["RUNNER_TEMP"]) / "calls"
+                index = int(state.read_text()) if state.exists() else 0
+                state.write_text(str(index + 1))
+                status, source = json.loads(os.environ["FIXTURE_ASSESSMENTS"])[index]
+                if os.environ["FIXTURE_MUTATE"] == "true":
+                    binary.write_text("changed")
+                print("source=" + source)
+                sys.exit(status)
+            else:
+                assert tool == "sleep" and sys.argv[1:] == ["15"]
+            '''))
+        stub.chmod(0o755)
+        for tool in ("codesign", "spctl", "sleep"):
+            (tools / tool).symlink_to(stub)
+        for name, assessments, mutate, expected in cases:
+            case = fixture / name
+            case.mkdir()
+            (case / "vibeface").write_text("original")
+            environment = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", PACKAGE=str(case), RUNNER_TEMP=str(case), VIBEFACE_CODESIGN_TEAM="FIXTURETEAM", FIXTURE_ASSESSMENTS=json.dumps(assessments), FIXTURE_MUTATE=json.dumps(mutate))
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"], input=script, env=environment, text=True, capture_output=True)
+            assert result.returncode == expected, (name, result.returncode, result.stdout, result.stderr)
+            assert int((case / "calls").read_text()) == len(assessments), name
+    print("Gatekeeper workflow control-flow self-tests passed; native assessment remains required")
 
 
 def release_privacy_test(root, scratch):
@@ -494,6 +592,7 @@ def main():
     plan.add_argument("--github-output")
     final_gate = commands.add_parser("gate")
     final_gate.add_argument("--plan", type=Path)
+    final_gate.add_argument("--delivery-live", action="store_true", help="also require the explicitly dispatched live proof job")
     needs = final_gate.add_mutually_exclusive_group(required=True)
     needs.add_argument("--needs", type=Path)
     needs.add_argument("--needs-env")
@@ -513,7 +612,7 @@ def main():
         write_plan(event_plan(args), args.github_output)
     elif args.command == "gate":
         needs = json.loads(args.needs.read_text() if args.needs else os.environ[args.needs_env])
-        gate(needs, json.loads(args.plan.read_text()) if args.plan else None)
+        gate(needs, json.loads(args.plan.read_text()) if args.plan else None, delivery_live=args.delivery_live)
     elif args.command in {"test", "check"}:
         packages = args.packages if args.packages else json.loads(os.environ[args.plan_env])["rust_packages"]
         if args.command == "test":

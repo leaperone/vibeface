@@ -3,17 +3,27 @@ base_branch = "main"
 [[scope]]
 prefix = ""
 name = "CI policy and Python syntax"
-check = "python3 scripts/ci.py --self-test && actionlint .github/workflows/ci.yml"
-build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\")]'"
+check = "python3 scripts/ci.py --self-test && python3 scripts/check-delivery.py --self-test && python3 scripts/install-delivery-toolchain.py --self-test && python3 scripts/run-delivery-live.py --self-test && actionlint .github/workflows/ci.yml"
+build = "python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(p).read_text()) for p in (\"scripts/ci.py\", \"scripts/verify-node.py\", \"scripts/build-inputs.py\", \"scripts/check-delivery.py\", \"scripts/install-delivery-toolchain.py\", \"scripts/run-delivery-live.py\")]'"
 
 [[domain_check]]
 name = "Rust workspace"
-trigger_paths = ["crates/node/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/*/Cargo.toml", "crates/node/build.rs", "crates/node/migrations/**", "crates/node/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
-command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface && cargo clippy --workspace --all-targets --locked -- -D warnings"
+trigger_paths = ["crates/delivery/**", "crates/node/src/**", "crates/bridge/src/**", "crates/protocol/src/**", "crates/secure/src/**", "crates/*/Cargo.toml", "crates/node/build.rs", "crates/node/migrations/**", "crates/node/schema.hcl", "Cargo.toml", "Cargo.lock", "rust-toolchain*", ".cargo/**"]
+command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo fmt --all -- --check && python3 scripts/ci.py test --tier fast --packages vibeface-protocol vibeface-bridge vibeface-secure vibeface vibeface-delivery && cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[[domain_check]]
+name = "Delivery proof and settlement"
+trigger_paths = ["crates/delivery/**", "proofs/delivery/**", "contracts/delivery/**", "crates/node/src/delivery/**", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py"]
+command = "python3 scripts/check-delivery.py --check-fixtures && python3 scripts/check-delivery.py --sandbox"
+
+[[domain_check]]
+name = "Delivery service probe"
+trigger_paths = ["tests/fixtures/delivery-probe/**", "crates/node/src/delivery/**", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/verify-node.py"]
+command = "cargo fmt --manifest-path tests/fixtures/delivery-probe/Cargo.toml -- --check && VIBEFACE_PROBE_SOURCE_ROOT=\"$PWD\" CARGO_TARGET_DIR=\"$PWD/.artifacts/delivery-probe/target\" cargo build --manifest-path tests/fixtures/delivery-probe/Cargo.toml --locked"
 
 [[domain_check]]
 name = "Web build and packaged resources"
-trigger_paths = ["crates/node/web/**", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
+trigger_paths = ["crates/node/web/**", "packages/client/**", "apps/mobile/**", "scripts/build-web.sh", "scripts/build-web-crypto.sh"]
 command = "bash scripts/build-web-crypto.sh && bash scripts/build-web.sh && cargo build -p vibeface --locked && python3 scripts/verify-node.py --binary target/debug/vibeface --artifacts .artifacts/preflight-web --web-only"
 
 [[domain_check]]
@@ -32,7 +42,7 @@ trigger_paths = ["crates/node/migrations/**", "crates/node/schema.hcl"]
 command = "atlas migrate validate --dir file://crates/node/migrations"
 
 [review]
-extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay."
+extra_checklist = "Check command deduplication, uncertain write results, device connection ownership, local socket permissions, and manager token budgets. A public Node may also schedule or execute; no permanent coordinator or task owner. Verify network and conversation scoping, complete DAG context and no side effects from replay. For paid delivery, require complete membership management authority, bound source/receiver/provider/wallet identities, canonical profile/image/schema, current key serial, independent service authorization, exact ERC20 balance accounting, nonce reservation before signing, durable signed bytes before broadcast, reconciliation of unknown transactions and reorgs, and distinct charity/recoverable/decrypted evidence."
 
 [report]
 language = "zh"
