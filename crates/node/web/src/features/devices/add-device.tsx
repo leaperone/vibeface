@@ -92,7 +92,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
     </PageActions>
     <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
-      <SheetContent ref={sheet} className="!w-full overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
+      <SheetContent ref={sheet} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}

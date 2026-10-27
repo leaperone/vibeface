@@ -40,7 +40,7 @@ export function ConversationList() {
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
     </div>
     {list}
-    <footer className="mt-6 grid gap-1 border-t px-1 pt-2 md:hidden"><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
+    <footer className="relative mt-6 grid gap-1 px-1 pt-2 before:absolute before:inset-x-3 before:top-0 before:border-t before:border-border md:hidden"><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
   </div>
 }
 
