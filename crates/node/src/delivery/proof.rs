@@ -549,6 +549,18 @@ mod tests {
         }
         panic!("proof lock fixture readiness timed out");
     }
+    /// Whether the lock can be taken again. Another test thread's fork holds a copy of a lock
+    /// descriptor until its child execs, so a released lock can read busy for a moment.
+    async fn released(receipt: &Path) -> bool {
+        for _ in 0..100 {
+            match process_lock(receipt) {
+                Ok(_) => return true,
+                Err(error) => assert!(error.is::<Busy>(), "{error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        false
+    }
     #[tokio::test]
     async fn a_crash_before_the_lock_does_not_block_a_fresh_proof() {
         let dir = lock_directory();
@@ -586,17 +598,8 @@ mod tests {
             "the proof descendant must retain the lock after its host exits"
         );
         drop(group);
-        let mut released = false;
-        for _ in 0..100 {
-            if let Ok(lock) = process_lock(&receipt) {
-                drop(lock);
-                released = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
         assert!(
-            released,
+            released(&receipt).await,
             "proof lock was not released after the process group exited"
         );
         assert_eq!(std::fs::read(&receipt).unwrap(), b"public receipt fixture");
@@ -619,8 +622,10 @@ mod tests {
         let _group = ProcessGroup(child.id().unwrap());
         drop(lock);
         assert_eq!(child.wait().await.unwrap().code(), Some(7));
-        let lock = process_lock(&receipt).unwrap();
-        drop(lock);
+        assert!(
+            released(&receipt).await,
+            "proof lock was not released after the error exit"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]

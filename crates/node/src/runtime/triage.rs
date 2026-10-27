@@ -1898,10 +1898,16 @@ mod tests {
         }
     }
 
+    /// The Node's turn reads and interrupts, in order. The bridge's thread observation polls a
+    /// live thread every few seconds with `includeTurns: false`; it is not the Node's.
     fn methods(requests: &mut tokio::sync::mpsc::UnboundedReceiver<Value>) -> Vec<String> {
         std::iter::from_fn(|| requests.try_recv().ok())
+            .filter(|request| match request["method"].as_str() {
+                Some("turn/interrupt") => true,
+                Some("thread/read") => request["params"]["includeTurns"] == true,
+                _ => false,
+            })
             .filter_map(|request| request["method"].as_str().map(str::to_owned))
-            .filter(|method| ["turn/interrupt", "thread/read"].contains(&method.as_str()))
             .collect()
     }
 
