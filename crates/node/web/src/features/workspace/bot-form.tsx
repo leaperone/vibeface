@@ -121,7 +121,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
               {botDevice ? "还没有可用的文件夹" : "设备能运行 Bot 后就能选"}
               {setupDevice ? <span><Link to="/devices/$deviceId" params={{ deviceId: setupDevice }} className="hit-area relative inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11" onClick={() => onOpenChange(false)}>
                 {botDevice ? "去添加" : "去设置"}<ChevronRight aria-hidden="true" className="size-3.5" />
-              </Link></span> : pending ? null : <span>在管理设备上设置</span>}
+              </Link></span> : pending || !ready ? null : <span>在管理设备上设置</span>}
             </FieldDescription>}
           </Field>
           <InlineError error={error} />
