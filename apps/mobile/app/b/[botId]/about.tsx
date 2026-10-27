@@ -15,7 +15,7 @@ export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
-  if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 bot" />
+  if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
   const empty = view && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
@@ -23,8 +23,8 @@ export default function BotAbout() {
     <Stack.Screen options={{ title: bot.name }} />
     <View className="gap-3">
       {shared.primary === bot.conversation_id
-        ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 bot</Text></View>
-        : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 bot</ActionButton>}
+        ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 Bot</Text></View>
+        : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
     </View>
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
     {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
@@ -64,7 +64,7 @@ export default function BotAbout() {
   </ScrollView>
 }
 
-const primaryHint = '没有 bot 负责的 Codex 会话，由主 bot 分派'
+const primaryHint = '没有 Bot 负责的 Codex 会话，由主 Bot 分派'
 
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <View className="gap-3">

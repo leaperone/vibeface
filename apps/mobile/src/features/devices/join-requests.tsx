@@ -52,7 +52,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   return <ActionCard icon={request.kind === 'node' ? Laptop : Smartphone} tone="info" title={`${request.name || '新设备'} 想加入`} actions={<>
     <Button variant="ghost" className="min-h-11" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
     {asking ? <Button className="min-h-11" disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
-      {request.kind === 'client' ? <Button variant="outline" className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理员'}</Text></Button> : null}
+      {request.kind === 'client' ? <Button variant="outline" className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理设备'}</Text></Button> : null}
       <Button className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
