@@ -53,7 +53,7 @@ export default function DeviceDetail() {
     </View> : null}
     {removable ? <View className="gap-3 rounded-xl border border-danger-border p-4">
       {removing ? <>
-        <Text>{deviceCopy.removeNotice(false)}</Text>
+        <Text>{deviceCopy.removeNotice(member.bot)}</Text>
         <View className="flex-row flex-wrap justify-end gap-2">
           <Button variant="ghost" className="min-h-11" onPress={() => setRemoving(false)}><Text>取消</Text></Button>
           <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('remove', async () => { await device.revoke(member.device_id); router.back() })}>

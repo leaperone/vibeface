@@ -5,6 +5,7 @@ import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { botReadiness } from '@vibeface/client/workspace/model.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
@@ -116,11 +117,14 @@ function Live({ children }: { children: ReactNode }) {
   for (const item of notifications) unread[item.conversation_id] = (unread[item.conversation_id] ?? 0) + 1
   for (const question of questions) if (question.conversation_id && !question.answer && !(question.question_id in answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
 
-  const members: Member[] = (device.directory?.members ?? []).map((member) => ({
-    device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-    online: member.kind === 'node' ? nodes.some((node) => node.device_id === member.device_id && node.online) : member.device_id === me,
-    current: member.device_id === me, entry: member.device_id === device.ready?.entry.device_id,
-  }))
+  const members: Member[] = (device.directory?.members ?? []).map((member) => {
+    const node = nodes.find((item) => item.device_id === member.device_id)
+    return {
+      device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
+      online: member.kind === 'node' ? node?.online === true : member.device_id === me,
+      current: member.device_id === me, entry: member.device_id === device.ready?.entry.device_id, bot: botReadiness(node) !== null,
+    }
+  })
 
   const actions = useMemo<WorkspaceActions>(() => {
     const select = async (id: string) => {
