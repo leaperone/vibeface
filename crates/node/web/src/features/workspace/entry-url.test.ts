@@ -876,11 +876,12 @@ test("conversation blocks sending until an online node can run the manager Agent
   try {
     composer()?.onChange?.('hello'); composer()?.onSubmit?.()
     assert.equal(composer()?.disabled, true)
-    assert.match(String(composer()?.hint), /运行 Bot/)
+    assert.match(String(composer()?.reason), /运行 Bot/)
     assert.equal(sent, 0)
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: false, roots: [] } }])
     assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
     assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
+    assert.equal(composer()?.reason, '运行 Bot 的设备需设置', "the greyed box still says why")
     currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()

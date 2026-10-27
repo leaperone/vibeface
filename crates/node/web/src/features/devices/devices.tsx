@@ -92,11 +92,11 @@ export function DevicesPage() {
   </div>
 }
 
-/** Captioned like a settings group, so a device reads the same as 设置. */
-function Section({ title, children }: { title: string; children: ReactNode }) {
+/** Captioned like a settings group, so a device reads the same as 设置. `bare`: the content brings its own cards. */
+function Section({ title, bare = false, children }: { title: string; bare?: boolean; children: ReactNode }) {
   return <section className="grid gap-2">
     <h3 className="px-1 text-meta font-medium text-muted-foreground">{title}</h3>
-    <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>
+    {bare ? children : <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>}
   </section>
 }
 
@@ -139,12 +139,12 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       <span>{row.entry ? "它的数据被复制过，已暂停。在另一台设备上移除它，再重新加入。" : canManage ? "它的数据被复制过。移除它，再在那台电脑上重新加入。" : "它的数据被复制过。用管理设备移除它，再重新加入。"}</span>
     </p> : null}
 
-    {row.kind === "node" && !copied ? <Section title={terms.ai.label}>
-      {row.entry && (canManage || localSession) ? <AiSettings /> : <div className="grid gap-1">
+    {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
+      <div className="grid gap-1">
         <p>{row.bot === "ready" ? terms.canRunBot.label : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
-      </div>}
+      </div>
     </Section> : null}
 
     {row.entry ? <Section title={terms.address.label}>
