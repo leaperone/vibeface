@@ -9,9 +9,8 @@ import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { hoursUntil, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { deviceIcon } from '@/features/devices/devices'
-import { setRotateHint } from '@/lib/rotate-hint'
 
 /** Where the reminder to change the recovery password leads: settings with that form open. */
 const PASSWORD_HASH = 'recovery-password'
@@ -62,24 +61,16 @@ export function RecoveryPendingCard() {
   const { busy, error, run } = useGenerationRun()
   const pending = device.pendingRecovery
   if (!pending) return null
-  const current = device.directory?.members ?? []
-  const kept = new Set(pending.members.map((member) => member.device_id))
-  const known = new Set(current.map((member) => member.device_id))
-  // What decides it: who comes in, and which devices here, this one included, go out.
-  const changes = [
-    ...pending.members.filter((member) => !known.has(member.device_id)).map((member) => ({ member, added: true })),
-    ...current.filter((member) => !kept.has(member.device_id)).map((member) => ({ member, added: false })),
-  ]
-  return <ActionCard icon={ShieldAlert} tone="danger" title="有人正在用恢复文件找回" meta={`${hoursUntil(pending.effective_at_ms - device.nodeClockOffset)} 小时后生效`} actions={<>
-    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>是我在找回</Button>
+  const changes = recoveryChanges(pending, device.directory?.members ?? [])
+  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={<>
+    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>{recoveryCopy.itsMe}</Button>
     {/* Solid here, unlike the soft global destructive: the time-limited step must outrank every other button on the page. */}
     <Button type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
       await device.vetoRecovery(pending.checkpoint)
-      if (device.ready) setRotateHint(device.ready.principal.network_id, true)
-      toast('已拦下', { tone: 'success' })
-    })}><BusyIcon busy={busy} icon={Hand} />拦下</Button>
+      toast(recoveryCopy.stopDone, { tone: 'success' })
+    })}><BusyIcon busy={busy} icon={Hand} />{recoveryCopy.stop}</Button>
   </>}>
-    {changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">不拦下，到时划掉的设备会被移出</p> : null}
+    {changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
       const Change = added ? CirclePlus : CircleMinus
@@ -98,13 +89,11 @@ export function RecoveryPendingCard() {
 export function RotateHintCard() {
   const device = useDevice()
   const navigate = useNavigate()
-  const network = device.ready?.principal.network_id
-  if (!network) return null
-  return <ActionCard icon={ShieldAlert} title="恢复文件可能泄露了" actions={<>
-    <Button type="button" variant="ghost" onClick={() => setRotateHint(network, false)}>以后再说</Button>
-    <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>换恢复密码</Button>
+  return <ActionCard icon={ShieldAlert} title={recoveryCopy.leaked} actions={<>
+    <Button type="button" variant="ghost" onClick={device.dismissRotateHint}>{recoveryCopy.later}</Button>
+    <Button type="button" onClick={() => void navigate({ to: '/settings', hash: PASSWORD_HASH })}>{recoveryCopy.rotate}</Button>
   </>}>
-    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />对方还能再试，换密码让旧文件作废</p>
+    <p className="flex items-center gap-2 text-meta text-muted-foreground"><Hand aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.leakedNote}</p>
   </ActionCard>
 }
 
@@ -279,7 +268,6 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
           try { work = device.replaceRecoveryFile({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) }) }
           finally { clearPasswords(form) }
           await work
-          if (device.ready) setRotateHint(device.ready.principal.network_id, false)
           if (!only) close()
         }, recoveryCopy.replaced)
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">

@@ -57,6 +57,8 @@ type DeviceContextValue = {
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
+  /** Left by a stop on this device: whoever started it holds the file, so a new password should retire it. */
+  rotateHint: boolean; dismissRotateHint(): void
   /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
   nodeClockOffset: number
   /** This browser's own recovery while it waits, or once a device stopped it. */
@@ -672,6 +674,10 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
    */
   async function vetoRecovery(checkpoint: string) {
     const connection = managing(), request = scoped()
+    await stopRecovery(connection, request, checkpoint)
+    setRotateHint(connection.principal.network_id, true)
+  }
+  async function stopRecovery(connection: ReadyConnection, request: ReturnType<typeof scoped>, checkpoint: string) {
     const read = async () => {
       const response = record(await request('directory'))
       const now = nodeNow(response) ?? Date.now()
@@ -1016,6 +1022,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
         try { await keepRecoveryFile(bytes, code) } finally { bytes.fill(0) }
       } finally { next.free(); password = '' }
       await connection.request('recover', { genesis: state.genesis, checkpoints, events: state.events })
+      setRotateHint(opened.networkId, false)
       await refreshDirectory()
     } finally { opened.release(); verified?.free() }
   }
@@ -1145,6 +1152,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     return () => { clearTimeout(timer); stop() }
   }, [ready])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
+  function setRotateHint(network: string, on: boolean) { try { store(`rotate-hint.${network}`, on || null) } catch {} setDismissals(count => count + 1) }
+  const rotateHint = !!ready?.principal.can_manage && load(`rotate-hint.${ready.principal.network_id}`) === true
   const pendingRecovery = ready?.principal.can_manage && directory?.pending && directory.pending.checkpoint !== recoveryOk ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
@@ -1156,7 +1165,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
-    pendingRecovery, vetoRecovery, nodeClockOffset,
+    pendingRecovery, vetoRecovery, nodeClockOffset, rotateHint,
+    dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, false) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
     forgetUnsavedRecovery() { setKept(null) },

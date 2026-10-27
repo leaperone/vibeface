@@ -8,6 +8,8 @@ import { Badge, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import { listTime } from '@/lib/time'
@@ -19,12 +21,13 @@ import { cn } from '@/lib/utils'
  */
 export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const workspace = useWorkspace()
+  const device = useDevice()
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
   const shared = useLive()
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const loading = !shared?.synced
-  const waiting = workspace.questions.filter((question) => question.answer === null).length
+  const waiting = workspace.questions.filter((question) => question.answer === null).length + Number(!!device.pendingRecovery) + Number(device.rotateHint)
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
@@ -37,7 +40,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
       <Text role="heading" className="text-3xl font-bold">消息</Text>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
     </View> : null}
-    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
+    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={device.pendingRecovery ? recoveryCopy.pending : waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">Bot</Text>
       <Link href="/new-bot" asChild>

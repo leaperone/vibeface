@@ -1,8 +1,8 @@
 import { Copy, KeyRound, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { useOpenJoins } from "@/features/devices/join"
 import { terms } from "@/lib/glossary"
-import { useRotateHint } from "@/lib/rotate-hint"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { recoveryCopy } from "@vibeface/client/identity/copy.ts"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { botReadiness, workChecks } from "@vibeface/client/workspace/model.ts"
@@ -27,9 +27,8 @@ export function useInbox(): InboxItem[] {
   const items: InboxItem[] = []
   const chat = bot ? `/b/${bot.bot_id}` : "/"
   const write = workspace.writeState
-  const rotate = useRotateHint(device.ready?.principal.can_manage ? device.ready.principal.network_id : undefined)
-  if (device.pendingRecovery) items.push({ key: "recovery", icon: ShieldAlert, title: "有人正在用恢复文件找回", to: "/inbox", kind: "recovery" })
-  if (rotate) items.push({ key: "rotate", icon: KeyRound, title: "换个恢复密码", to: "/inbox", kind: "rotate" })
+  if (device.pendingRecovery) items.push({ key: "recovery", icon: ShieldAlert, title: recoveryCopy.pending, to: "/inbox", kind: "recovery" })
+  if (device.rotateHint) items.push({ key: "rotate", icon: KeyRound, title: recoveryCopy.rotate, to: "/inbox", kind: "rotate" })
   if (write.state === "read_only") items.push({ key: "write:read_only", icon: terms.readOnly.icon, title: "这台电脑暂时只读", to: "/inbox", kind: "write", write: "read_only" })
   if (write.state === "forked") items.push({ key: "write:forked", icon: Copy, title: "这台电脑的数据被复制过", to: "/inbox", kind: "write", write: "forked" })
   else if (write.conflicts.length) items.push({ key: "write:conflicts", icon: Copy, title: "有设备的数据被复制过", to: "/inbox", kind: "write", write: "conflicts" })
