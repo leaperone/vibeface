@@ -1,5 +1,5 @@
 import { array, boolean, record, text } from '../lib/node.ts'
-import type { DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
+import type { Acceptance, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
 const protocolMaxBytes = 16 * 65_536
@@ -150,7 +150,7 @@ export function walletNotice(wallet: DeliveryStatus['wallet']): string {
     case 'absent': return '未创建钱包。公益转发仍可使用。'
     case 'locked': return '钱包已锁定。订单仍可查看，付款需在发送设备本机解锁。'
     case 'unlocked': return '钱包已在本机解锁。每笔付款仍需单独确认。'
-    case 'unavailable': return '钱包暂不可用。请在发送设备 本机检查，从独立钱包备份恢复后重启。公益转发和订单查看仍可使用。'
+    case 'unavailable': return '钱包暂不可用。请在发送设备本机检查，从独立钱包备份恢复后重启。公益转发和订单查看仍可使用。'
   }
 }
 
@@ -184,3 +184,58 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
   ]
   return rows.map(([label, seconds]) => [label, new Date(seconds * 1000).toLocaleString(undefined, { timeZoneName: 'short' })])
 }
+
+export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '公益转发' }, { value: 'paid', label: '付费交付' }]
+export const acceptanceOptions: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
+
+/** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
+export function sizeLabel(bytes: number, floor = false): string {
+  if (bytes < 1024) return `${bytes} 字节`
+  const [value, unit] = bytes < 1024 * 1024 ? [bytes / 1024, 'KB'] : [bytes / 1024 / 1024, 'MB']
+  const digits = value < 10 ? 1 : 0
+  const scale = 10 ** digits
+  return `${(floor ? Math.floor(value * scale) / scale : value).toFixed(digits)} ${unit}`
+}
+export function orderTitle(order: DeliveryOrder): string {
+  if (order.name) return order.name
+  return order.role === 'provider' ? '代为转发的文件' : '待接收的文件'
+}
+/** One line under a transfer record: 免费 · 48 KB · 已送达. */
+export function orderSummary(order: DeliveryOrder): string {
+  return `${order.mode === 'charity' ? '免费' : '付费'} · ${sizeLabel(order.bytes)} · ${phaseLabels[order.phase]}`
+}
+export function orderStatus(order: DeliveryOrder): string {
+  return order.mode === 'paid' ? `${phaseLabels[order.phase]} · ${paymentLabels[order.payment.state]}` : phaseLabels[order.phase]
+}
+export function orderHeading(order: DeliveryOrder): string {
+  return order.role === 'sender' && order.phase === 'prepared' ? '确认发送' : '传输详情'
+}
+/** What this device can do with a transfer now; a file is saved only after the send is confirmed. */
+export function orderActions(order: DeliveryOrder) {
+  return {
+    confirm: order.role === 'sender' && order.phase === 'prepared',
+    accept: order.role === 'receiver' && !canRead(order) && order.phase !== 'refunded' && order.phase !== 'failed',
+    save: canRead(order) && order.phase !== 'prepared',
+  }
+}
+export const transferCopy = {
+  offline: '重新连接后可查看传输记录，不会重复付款。',
+  loading: '正在读取传输设置。',
+  off: '打开后可以加密收发文件',
+  adminOnly: '只有管理设备能更改设置和发送',
+  free: '全程加密 · 免费',
+  connectionId: '连接 ID · 收文件时发给对方',
+  receiver: '接收方的连接 ID',
+  provider: '中转设备的连接 ID',
+  providerHint: '只经手加密后的文件，不会加入你的设备',
+  noRecords: '还没有传输记录',
+  strict: '对方确认打开后才付款。对方离线或没确认时，中转设备可能收不到费用。',
+  walletFirst: '先在发送设备本机创建或解锁钱包，再刷新。',
+  unknownPayment: '付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。',
+  walletDetails: '钱包的创建、解锁和备份通过本机命令行完成。个人恢复文件不包含钱包和订单解密密钥。',
+  prepareDetails: '下一步会把文件交给当前连接的可信设备加密，还不付款。同一文件和条款不会重复发送。原订单完成后，选择相同文件和条款，点“作为新订单再次发送”才会另建一笔。',
+  prepare: (mode: DeliveryMode) => mode === 'paid' ? '查看费用' : '下一步',
+  confirm: (mode: DeliveryMode) => mode === 'paid' ? '确认并付款' : '确认发送',
+  maxSize: (bytes: number) => `最大 ${sizeLabel(bytes, true)}`,
+  tooLarge: (bytes: number) => `文件超过 ${sizeLabel(bytes, true)}，换一个小点的`,
+} as const

@@ -30,12 +30,11 @@ export function ConversationList() {
         name={bot.name} mark={workspace.primary === bot.conversation_id ? <PrimaryMark /> : null} />
     </li>
   })}</ul>
-  else if (!workspace.joined) list = <EmptyState icon={Bot} title="还没有 Bot" />
   else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
-  else if (!workspace.writable) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
-  else list = <EmptyState icon={Bot} title="还没有 Bot" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
+  else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
+  else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? "没有待处理"} />
+    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? (workspace.synced ? "没有待处理" : "")} />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>

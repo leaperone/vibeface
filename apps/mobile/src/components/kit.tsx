@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
-import { Check, Copy, type LucideIcon } from 'lucide-react-native'
+import { Check, ChevronDown, ChevronRight, Copy, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AccessibilityInfo, View } from 'react-native'
+import { AccessibilityInfo, Pressable, View } from 'react-native'
 import { useUniwind } from 'uniwind'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -60,6 +60,17 @@ export function CopyableId({ value, label }: { value: string; label: string }) {
       clearTimeout(timer.current)
       timer.current = setTimeout(() => setCopied(false), 1500)
     }}><Icon as={copied ? Check : Copy} className={cn('size-4', copied && 'text-success')} /></Button>
+  </View>
+}
+
+/** Technical detail folded away by default, as the web's <Details>. */
+export function Details({ children, label = '详细信息' }: { children: ReactNode; label?: string }) {
+  const [open, setOpen] = useState(false)
+  return <View>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 self-start" onPress={() => setOpen(!open)}>
+      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{label}</Text>
+    </Pressable>
+    {open ? <View className="gap-2">{children}</View> : null}
   </View>
 }
 

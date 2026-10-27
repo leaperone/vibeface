@@ -244,7 +244,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             : <div className="flex flex-wrap justify-center gap-2">
               {examples.map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
-        </div> : workspace.writable ? <NoBot /> : null}
+        </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot ? <PromptInput
         above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"

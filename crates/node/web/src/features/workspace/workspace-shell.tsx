@@ -118,6 +118,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <SidebarGroupAction title="新 Bot" aria-label="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={openCreator}><Plus /></SidebarGroupAction>
             <SidebarGroupContent>
               <SidebarMenu>
+                {!workspace.bots.length && !workspace.synced ? [0, 1, 2].map((item) => <SidebarMenuItem key={item} aria-hidden="true"><Skeleton className="h-10 max-md:h-11" /></SidebarMenuItem>) : null}
                 {workspace.bots.map((bot) => {
                   const active = chatRoute && !missingBot && bot.bot_id === workspace.selectedBot?.bot_id
                   const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id))
