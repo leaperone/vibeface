@@ -12,6 +12,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { messageOf } from "@vibeface/client/lib/node.ts"
+import { folderSetup } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
@@ -39,14 +40,9 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const submitting = useRef(false)
   const wasOpen = useRef(false)
   useEffect(() => { submitting.current = false; setBusy(false); setError("") }, [workspace.generation])
-  // Folders come only from devices that run a bot, so with none of those the hint points at setting one up.
-  const botDevices = workspace.nodes.filter((node) => !node.revoked && node.online && node.capabilities?.manager)
-  const botDevice = botDevices.length > 0
-  // A device's AI settings are editable only from the device this page is connected to, by an admin or on that computer itself.
-  const here = ready?.entry.device_id
-  const setupDevice = !ready || pending ? undefined
-    : ready.principal.can_manage ? (botDevices.find((node) => node.device_id === here) ?? botDevices[0])?.device_id ?? here
-    : ready.principal.source === "local_session" && (!botDevice || botDevices.some((node) => node.device_id === here)) ? here : undefined
+  const setup = ready ? folderSetup(workspace.nodes, ready.principal, ready.entry.device_id) : undefined
+  const botDevice = setup?.add ?? false
+  const setupDevice = pending ? undefined : setup?.device
   const projects = workspace.nodes.flatMap((node, index) => {
     if (node.revoked || !node.online || !node.capabilities?.manager) return []
     const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)

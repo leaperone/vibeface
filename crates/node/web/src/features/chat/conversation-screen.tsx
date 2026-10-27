@@ -21,11 +21,8 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { canSend, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import './chat.css'
-
-/** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
-const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.

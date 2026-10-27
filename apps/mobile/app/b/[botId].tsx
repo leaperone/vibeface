@@ -7,6 +7,7 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
+import { starters } from '@vibeface/client/chat/protocol.ts'
 import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -18,8 +19,6 @@ import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
-
-const examples = ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？']
 
 /** One row of the chat: a message, or a question or status line between them. */
 type Entry = { key: string; message: ChatMessage; last: boolean; grouped: boolean } | (Row & { attached?: boolean })
@@ -152,7 +151,7 @@ export default function ChatScreen() {
         <Monogram name={bot.name} seed={bot.bot_id} hero />
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
-          {examples.map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
+          {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
         </View>
       </View>
     </Animated.View>}

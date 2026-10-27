@@ -200,7 +200,7 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
     </View>
     <View className="flex-row flex-wrap items-center gap-2">
       <Icon as={icon} className={cn('size-4', tone)} />
-      <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}{shown.state === 'connected' && shown.user_agent ? ` · ${shown.user_agent}` : ''}</Text>
+      <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}</Text>
       <Button variant="ghost" className="min-h-11" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
         <Icon as={testing ? LoaderCircle : PlugZap} /><Text>测试连接</Text>
       </Button>

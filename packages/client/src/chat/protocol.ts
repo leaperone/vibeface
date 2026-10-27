@@ -2,6 +2,9 @@ import { inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 
+/** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
+export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
+
 type SendGate = {
   hasConversation: boolean
   loaded: boolean
