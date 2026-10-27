@@ -120,7 +120,7 @@ test('charity resets strict mode and rejects every financial or strong proof fie
   assert.equal(changeMode({ ...draft, mode: 'paid', acceptance: 'strict' }, 'charity').acceptance, 'recoverable')
   let calls = 0
   const client = createDeliveryClient(connection(async () => { calls += 1; return order() }), { getItem: () => null, setItem: () => { throw new Error('must not store a strict charity intent') } })
-  await assert.rejects(client.prepare({ ...draft, acceptance: 'strict' }, file, status), /公益转发不使用付费解密证明/)
+  await assert.rejects(client.prepare({ ...draft, acceptance: 'strict' }, file, status), /公益转发不能选/)
   assert.equal(calls, 0)
   assert.throws(() => parseOrder({ ...order(), acceptance: 'strict' }))
   for (const field of ['chain_id', 'asset', 'payer', 'provider_wallet', 'tx_hash']) assert.throws(() => parseOrder({ ...order(), payment: { ...order().payment, [field]: field === 'chain_id' ? '31337' : field === 'tx_hash' ? `0x${'88'.repeat(32)}` : `0x${'88'.repeat(20)}` } }))
@@ -156,7 +156,7 @@ test('preparing B cannot erase the unknown A intent and returning to A after res
   assert.notEqual(preparations[0].intent_id, preparations[1].intent_id)
   assert.equal(resumed.payment.state, 'unknown')
   const before = calls.length
-  await assert.rejects(firstClient.confirm(resumed), /需要先刷新或对账/)
+  await assert.rejects(firstClient.confirm(resumed), /需要先刷新或点“检查进度”/)
   assert.equal(calls.length, before, 'an unknown transaction cannot be confirmed as a new payment')
   assert.equal([...records.keys()].filter(key => key.includes('.intent.')).length, 2)
 })
@@ -176,18 +176,18 @@ test('same-file retries keep a completed intent while an explicit new send check
   })
   const client = createDeliveryClient(transport, storage)
   const first = await client.prepare(draft, file, status)
-  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /尚未确认结束/)
+  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /还没结束/)
   const complete: DeliveryOrder = { ...first, phase: 'recoverable', evidence: 'charity_receipt', windows: first.windows.map(window => ({ ...window, state: 'held' })) }
   stored.set(first.intent_id, complete)
   assert.equal((await client.prepare(draft, file, status)).intent_id, first.intent_id, 'ordinary retry never means a new send')
   lookupMissing = true
-  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /尚未确认结束/)
+  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /还没结束/)
   lookupMissing = false; losePrepare = true
   await assert.rejects(client.prepare(draft, file, status, first.intent_id), /response lost/)
   const attempted = calls.at(-1)?.intent_id
   assert.notEqual(attempted, first.intent_id)
   const before = calls.length
-  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /已有的新意图/)
+  await assert.rejects(client.prepare(draft, file, status, first.intent_id), /已有新的一次/)
   assert.equal(calls.length, before, 'another click cannot replace the new unknown intent')
   const resumed = await createDeliveryClient(transport, storage).prepare(draft, file, status)
   assert.equal(resumed.intent_id, attempted)

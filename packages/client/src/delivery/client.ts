@@ -38,7 +38,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       const intent = parsePending(JSON.parse(saved))
       if (intent.fingerprint !== fingerprint) throw new Error('intent fingerprint mismatch')
       return intent
-    } catch { throw new Error('读不了上次传输意图。先在订单列表对账，不要清除应用数据或重新付款。') }
+    } catch { throw new Error('读不了上次的发送记录。先在传输记录里点“检查进度”，不要清除应用数据或重新付款。') }
   }
   function recent(): string | null {
     const saved = storage.getItem(`${intentPrefix}.recent`)
@@ -48,7 +48,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     const value = record(await request('find_intent', { intent_id: intentId(id) }))
     if (value.order === null) return null
     const order = parseOrder(value.order)
-    if (order.intent_id !== id || order.role !== 'sender' || order.source_peer !== connection.entry.device_id) throw new Error('查询结果不属于原发送意图。')
+    if (order.intent_id !== id || order.role !== 'sender' || order.source_peer !== connection.entry.device_id) throw new Error('查询结果不属于原来那次发送。')
     return order
   }
   const client = {
@@ -62,7 +62,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
-      if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('公益转发不使用付费解密证明，请改用公益收据。')
+      if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('公益转发不能选“对方打开后付款”。')
       if (!status.enabled || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled) throw new Error('这台设备尚未启用所选传输方式。')
       if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
       const bytes = new Uint8Array(await file.arrayBuffer())
@@ -75,12 +75,12 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
       const fingerprint = await sha256(new TextEncoder().encode(JSON.stringify({ ...params, sha256: digest, bytes: file.size })))
       const previous = pending(fingerprint)
       if (restartIntentId !== undefined) {
-        if (previous?.intent_id !== intentId(restartIntentId)) throw new Error('再次发送须选择原订单相同的文件和条款；已有的新意图请先对账。')
+        if (previous?.intent_id !== intentId(restartIntentId)) throw new Error('再次发送须选择原订单相同的文件和条款；已有新的一次请先点“检查进度”。')
         const observed = await findIntent(restartIntentId)
-        if (!observed || !canRestart(observed)) throw new Error('原意图尚未确认结束。先查询原订单，不创建另一笔付款。')
+        if (!observed || !canRestart(observed)) throw new Error('原来那次发送还没结束。先查看原订单，不会另付一笔。')
         if (observed.mode !== draft.mode || observed.acceptance !== draft.acceptance || observed.receiver_peer !== params.receiver_peer || observed.provider_peer !== params.provider_peer
-          || observed.name !== name || observed.sha256 !== digest || observed.bytes !== file.size) throw new Error('原意图的文件或条款对不上，不能创建新订单。')
-        if (pending(fingerprint)?.intent_id !== previous.intent_id) throw new Error('此文件的意图已在另一处更新，请先刷新并查询原订单。')
+          || observed.name !== name || observed.sha256 !== digest || observed.bytes !== file.size) throw new Error('原来那次发送的文件或条款对不上，不能创建新订单。')
+        if (pending(fingerprint)?.intent_id !== previous.intent_id) throw new Error('这个文件的发送记录已在另一处更新，请先刷新并查看原订单。')
       }
       const intent = previous && restartIntentId === undefined ? previous : { intent_id: crypto.randomUUID(), fingerprint }
       current()
@@ -88,18 +88,18 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
         storage.setItem(`${intentPrefix}.intent.${fingerprint}`, JSON.stringify(intent))
         storage.setItem(`${intentPrefix}.recent`, intent.intent_id)
       }
-      catch { throw new Error('无法保存付款意图，尚未提交。请允许保存本地数据后重试。') }
+      catch { throw new Error('无法保存这次发送记录，尚未提交。请允许保存本地数据后重试。') }
       const order = parseOrder(await request('prepare', { ...params, intent_id: intent.intent_id, content_base64: toBase64(bytes) }))
       if (order.intent_id !== intent.intent_id || order.role !== 'sender' || order.source_peer !== status.node_peer || order.receiver_peer !== params.receiver_peer || order.provider_peer !== params.provider_peer
         || order.mode !== draft.mode || order.acceptance !== draft.acceptance || order.name !== name || order.sha256 !== digest || order.bytes !== file.size
-        || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查询原意图。')
+        || BigInt(order.payment.total) > BigInt(params.max_service_amount) || BigInt(order.payment.gas_cap) > BigInt(params.max_gas_amount)) throw new Error('设备返回的订单与本次选择不一致，未确认付款。请先查看原订单。')
       return order
     },
     async confirm(order: DeliveryOrder) {
       manage()
-      if (order.role !== 'sender' || order.phase !== 'prepared') throw new Error('这笔订单需要先刷新或对账，不能重新确认付款。')
+      if (order.role !== 'sender' || order.phase !== 'prepared') throw new Error('这笔订单需要先刷新或点“检查进度”，不能重新确认付款。')
       const confirmed = parseOrder(await request('confirm', { intent_id: order.intent_id }))
-      if (!same(authorization(confirmed), authorization(order))) throw new Error('确认结果与原订单的条款不一致。先对账原意图，不会自动再次付款。')
+      if (!same(authorization(confirmed), authorization(order))) throw new Error('确认结果与原订单的条款不一致。先点“检查进度”，不会自动再次付款。')
       return confirmed
     },
     async get(orderId: string) { return parseOrder(await request('get', { order_id: peer(orderId) })) },
@@ -124,6 +124,8 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
+  // A failed read clears itself on the next good read; a failed action stays until the next action.
+  const [readError, setReadError] = useState('')
   const [notice, setNotice] = useState('')
   const alive = useRef(false), running = useRef<string | null>(null), sequence = useRef(0)
   const reading = useRef<typeof client | null>(null)
@@ -144,15 +146,15 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
       if (ordersResult.status === 'rejected') throw ordersResult.reason
       const nextStatus = statusResult.value, nextOrders = ordersResult.value
       if (!current() || owner !== sequence.current) return
-      setStatus(nextStatus); setOrders(nextOrders); setError('')
+      setStatus(nextStatus); setOrders(nextOrders); setReadError('')
       const recent = client.recent()
       if (recent) setSelectedId(previous => previous ?? nextOrders.find(order => order.intent_id === recent)?.order_id ?? null)
-    } catch (cause) { if (current() && owner === sequence.current) setError(messageOf(cause)) }
+    } catch (cause) { if (current() && owner === sequence.current) setReadError(messageOf(cause)) }
     finally { if (reading.current === client) reading.current = null }
   }
   useEffect(() => {
     alive.current = true; running.current = null
-    setStatus(null); setOrders([]); setSelectedId(null); setBusy(null); setError(''); setNotice('')
+    setStatus(null); setOrders([]); setSelectedId(null); setBusy(null); setError(''); setReadError(''); setNotice('')
     void refresh()
     const foreground = platform.onForeground(() => { void refresh() })
     return () => { alive.current = false; sequence.current += 1; foreground() }
@@ -172,7 +174,7 @@ export function useDelivery(connection: ReadyConnection, platform: Platform) {
   }
   const selected = orders.find(order => order.order_id === selectedId) ?? null
   return {
-    status, orders, selected, busy, error, notice,
+    status, orders, selected, busy, error: error || readError, notice,
     canManage: connection.principal.source === 'membership' && connection.principal.can_manage,
     select: setSelectedId,
     refresh: () => run('refresh', refresh),

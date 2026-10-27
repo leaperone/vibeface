@@ -1020,20 +1020,22 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       if (!mounted) return
       identityRef.current = me; setIdentity(me)
       if (version !== generation.current) return
-      // A browser that was in its network resumes it; the join page must not flash in between.
-      setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
       // A recovery sent from here comes first; one its Node no longer knows is forgotten.
       const wait = invitation ? null : loadWait()
-      if (wait) {
-        setRecovery({ status: 'waiting', effectiveAt: null })
-        await checkRecovery(wait).catch(() => {})
-        if (!mounted || loadWait() || session.current) return
-      }
       // A launch link opens the localhost page; a browser already joined there keeps that identity instead.
       const launch = invitation || resumeTargets().length ? null : localLaunch
       // Only the local launcher's origin serves /api/local/info; a browser learns it is on one from a launch link.
       // After 断开 only a click (a launch link) opens it again, not the remembered local session.
       const stay = load('stay-disconnected') === true
+      const localFirst = !invitation && !wait && (launch !== null || !stay && load('local-origin') === true)
+      // A browser that was in its network resumes it, and the local page stays loading while it opens;
+      // the join page must not flash in between.
+      if (!localFirst) setPhase(!invitation && resumeTargets().length ? 'reconnecting' : 'disconnected')
+      if (wait) {
+        setRecovery({ status: 'waiting', effectiveAt: null })
+        await checkRecovery(wait).catch(() => {})
+        if (!mounted || loadWait() || session.current) return
+      }
       if (!invitation && (launch || !stay && load('local-origin') === true)) {
         const local = await localEntry(me, launch)
         if (!mounted || version !== generation.current) return
@@ -1044,6 +1046,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
           if (await opening && launch?.rejoin) await rejoin(local).catch(cause => { if (mounted) setError(messageOf(cause)) })
           return
         }
+        setPhase(resumeTargets().length ? 'reconnecting' : 'disconnected')
       }
       const pending = invitation ? null : loadJoining()
       if (pending) {
