@@ -15,6 +15,7 @@ import {
 export function PromptInput({
   value,
   hint,
+  reason,
   disabled,
   busy,
   onChange,
@@ -26,7 +27,9 @@ export function PromptInput({
   children,
 }: {
   value: string
-  hint: ReactNode
+  hint: string
+  /** Why it cannot send; a disabled box shows it in place of its placeholder, or under the box while it holds a draft. */
+  reason: string
   disabled: boolean
   busy: boolean
   onChange: (value: string) => void
@@ -52,6 +55,7 @@ export function PromptInput({
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
   const limit = `${attachmentLimit / 2 ** 20} MiB`
+  const note = hint || (disabled && value ? reason : '')
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
   // between two content heights, so the change is replayed from the height last shown. It lets go once there, so a
   // resized window still fits the text.
@@ -89,12 +93,12 @@ export function PromptInput({
             required
             maxLength={100000}
             value={value}
-            placeholder={files.length ? '给附件写句说明' : '发消息'}
+            placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}
             disabled={disabled}
             // Read-only, not disabled, while sending: a disabled box drops focus, which folds it and closes a phone's keyboard.
             readOnly={busy}
             aria-label="给 Bot 发消息"
-            aria-describedby={hint ? 'manager-hint' : undefined}
+            aria-describedby={note ? 'manager-hint' : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
             className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-150', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
@@ -145,7 +149,7 @@ export function PromptInput({
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-2 text-meta text-muted-foreground empty:hidden">
         {unfit ? <p role="alert" className="flex basis-full items-center gap-1.5 text-danger"><CircleAlertIcon aria-hidden="true" className="size-4 shrink-0" />{unfit.size ? `附件超过 ${limit}` : '附件是空文件'}，移除后再发送</p> : null}
-        {hint ? <p id="manager-hint">{hint}</p> : null}
+        {note ? <p id="manager-hint">{note}</p> : null}
         {children}
       </div>
     </form>
