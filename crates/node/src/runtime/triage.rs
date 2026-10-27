@@ -2070,10 +2070,11 @@ mod tests {
             node.live_probe_at
                 .store(now_ms() - 60_000, std::sync::atomic::Ordering::Relaxed);
             node.reconcile_works(&network).await?;
-            assert_eq!(
-                methods(&mut requests),
-                ["thread/read"],
-                "read, never resent"
+            // The background reconciler may read too; reads are harmless, a resend is not.
+            let sent = methods(&mut requests);
+            assert!(
+                !sent.is_empty() && sent.iter().all(|method| method == "thread/read"),
+                "read, never resent: {sent:?}"
             );
             assert!(matches!(
                 state(&node, "w-missed").await?,
