@@ -218,9 +218,10 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
-  // Nothing pushes a device's bot readiness; the device list, the inbox and onboarding read it from `nodes`, so read them again when it moves.
+  // Nothing pushes a device's bot readiness or folders; the device list, the inbox, onboarding and the new bot form read them from `nodes`, so read them again when they move.
   const botState = response?.providers.find((item) => item.roles.includes("agent"))?.state
-  useEffect(() => { if (botState && workspace.isCurrent()) void workspace.refresh().catch(() => {}) }, [botState])
+  const folders = response?.settings.roots.join("\n")
+  useEffect(() => { if (folders !== undefined && workspace.isCurrent()) void workspace.refresh().catch(() => {}) }, [botState, folders])
   useEffect(() => {
     if (!starting) return
     const timer = setTimeout(() => void load(), 2000)
@@ -299,7 +300,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
     </form> : null
-  const serverSettings = server ? <AppServerSettings server={server} home={item.home} sessions={item.sessions} display={display} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
+  // Keyed by the roles, so switching one drops a test result that no longer matches what runs.
+  const serverSettings = server ? <AppServerSettings key={item.roles.join()} server={server} home={item.home} sessions={item.sessions} display={display} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
   const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
     .then((ok) => { if (ok) toast(next === null ? `已删除「${name}」` : `已保存「${name}」`, { tone: "success" }); return ok })
   const addName = newName.trim().toUpperCase()

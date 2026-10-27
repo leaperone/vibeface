@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
@@ -102,7 +103,7 @@ function AiSettings() {
   const live = useLive()
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
-  useEffect(() => { if (folders !== undefined) void live?.refresh().catch(() => {}) }, [botState, folders])
+  useEffect(() => { if (folders !== undefined) live?.refresh().then(() => setError((shown) => shown?.at === 'refresh' ? null : shown), (cause) => { if (ready?.isCurrent()) setError({ at: 'refresh', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
   if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-28 rounded-xl bg-muted" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
@@ -116,7 +117,7 @@ function AiSettings() {
       change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
       saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
     <PathList label="可用文件夹" items={roots} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
-    {error && (error.at === 'roots' || error.at === '') ? <ErrorText error={error.text} /> : null}
+    {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
 }
 
@@ -142,9 +143,9 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle icon={Bot} label={`${name} 运行 Bot`} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
+      <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
       {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
-      {item.supports.includes('execution') ? <Toggle icon={ListChecks} label={`${name} 执行任务`} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
+      {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
     {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 pb-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
@@ -159,7 +160,8 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
     </Pressable>
     {open ? <View className="gap-5 px-3 pb-3">
-      {item.app_server ? <AppServerSettings server={item.app_server} working={working} save={change} test={test} /> : null}
+      {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
+      {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
       {item.bin !== null ? <Field label="程序">
         <SaveRow value={bin} saved={item.bin ?? ''} placeholder="codex" mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
       </Field> : null}
@@ -171,9 +173,16 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
   </View>
 }
 
-function Toggle({ icon, label, pressed, busy, disabled, onPress }: { icon: LucideIcon; label: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
+const roles = {
+  bot: { ...deviceCopy.roles.bot, icon: Bot },
+  execution: { ...deviceCopy.roles.execution, icon: ListChecks },
+}
+
+function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
+  const { label, hint, icon } = roles[role]
   // While a save runs the toggles keep their look and ignore taps; the spinner says which one is changing.
-  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={label} accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
+  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
+    accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
     <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
   </Button>
 }

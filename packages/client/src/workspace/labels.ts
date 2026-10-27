@@ -66,6 +66,8 @@ export function addressName(address: string) {
   try { return new URL(address).hostname } catch { return address }
 }
 
+/** A browser-or-phone device named like a phone; any other is a browser. */
+export const phoneName = (name: string) => /iphone|android|ipad|phone|手机/i.test(name)
 export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {
