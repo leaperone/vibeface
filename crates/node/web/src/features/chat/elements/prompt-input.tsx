@@ -15,6 +15,7 @@ import {
 export function PromptInput({
   value,
   hint,
+  reason,
   disabled,
   busy,
   onChange,
@@ -26,7 +27,9 @@ export function PromptInput({
   children,
 }: {
   value: string
-  hint: ReactNode
+  hint: string
+  /** Why it cannot send; a disabled box shows it in place of its placeholder. */
+  reason: string
   disabled: boolean
   busy: boolean
   onChange: (value: string) => void
@@ -89,7 +92,7 @@ export function PromptInput({
             required
             maxLength={100000}
             value={value}
-            placeholder={files.length ? '给附件写句说明' : '发消息'}
+            placeholder={disabled && reason ? reason : files.length ? '给附件写句说明' : '发消息'}
             disabled={disabled}
             // Read-only, not disabled, while sending: a disabled box drops focus, which folds it and closes a phone's keyboard.
             readOnly={busy}

@@ -18,8 +18,14 @@ export function roleLabel(role: string): string {
 export function canSend(input: SendGate): boolean {
   return Boolean(input.hasConversation && input.loaded && !input.busy)
 }
-export function composerHint(input: Omit<SendGate, 'busy'>): string {
+/** Whether any device can run the bot now: `offline` when the only ones that could are away, `none` when none is set up to. */
+export type BotReach = 'ready' | 'needs_setup' | 'offline' | 'none'
+/** Why the box cannot send yet, short enough to stand in for its placeholder. */
+export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }): string {
   if (!input.hasConversation) return ''
+  if (input.bot === 'offline') return '能运行 Bot 的设备离线了'
+  if (input.bot === 'needs_setup') return '运行 Bot 的设备需设置'
+  if (input.bot === 'none') return '还没设置运行 Bot 的设备'
   if (!input.loaded) return '稍等'
   return ''
 }

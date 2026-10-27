@@ -45,4 +45,9 @@ export const recoveryCopy = {
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
   removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
+  /** A provider's two switches on a device; `hint` says what each turns on, named for the provider's row. */
+  roles: {
+    bot: { label: '运行 Bot', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
+    execution: { label: '执行任务', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
+  },
 }

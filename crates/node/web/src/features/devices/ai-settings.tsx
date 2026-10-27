@@ -5,6 +5,7 @@ import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast,
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
@@ -228,8 +229,8 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
 
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
-  return <div className="grid gap-5">
-    <ul className="grid gap-3">
+  return <div className="grid gap-6">
+    <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">
       {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
         error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
@@ -240,16 +241,24 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   </div>
 }
 
+const roles = {
+  bot: { ...deviceCopy.roles.bot, icon: terms.bot.icon },
+  execution: { ...deviceCopy.roles.execution, icon: terms.task.icon },
+}
+
 /**
- * A chip that turns one use of a provider on or off. A small switch inside says it is a control, not a status; on, the chip is also tinted,
- * so a phone without hover still reads it. Never solid, so the page's own next step stays the only filled button.
+ * A chip that turns one use of a provider on or off: its icon tells the two apart, a small switch says it is a control, not a status,
+ * and on, the chip is also tinted so a phone without hover still reads it. A phone shows the icon and switch alone; the words stay in the name.
+ * Never solid, so the page's own next step stays the only filled button.
  */
-function RoleToggle({ label, name, pressed, busy, disabled, onClick }: { label: string; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
-  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} disabled={disabled}
-    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
-    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
+function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
+  const { label, hint, icon: Icon } = roles[role]
+  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
+    className={cn("rounded-full max-sm:px-2.5", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
+    {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
+    <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span>}{label}
+    </span><span className="max-sm:sr-only">{label}</span>
   </Button>
 }
 
@@ -297,22 +306,21 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   // The Codex folder shows with the App Server above.
   const env = item.env.filter((row) => row.name !== "CODEX_HOME")
 
-  return <li className="overflow-hidden rounded-xl border">
-    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2">
+  return <li>
+    <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
       <div className="flex items-center gap-3">
         <Icon aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
         <span className="font-medium whitespace-nowrap">{name}</span>
         {item.state === "off" ? null : <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>}
       </div>
-      {/* Two toggles share a row of their own on a phone; one stays beside the name. */}
-      <div className={cn("ms-auto flex shrink-0 gap-2", executable && "max-sm:ms-0 max-sm:grid max-sm:basis-full max-sm:grid-cols-2")}>
-        <RoleToggle label={`运行 ${terms.bot.label}`} name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+      <div className="ms-auto flex shrink-0 gap-2">
+        <RoleToggle role="bot" name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
           onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
-        {executable ? <RoleToggle label="执行任务" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
+        {executable ? <RoleToggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
     </div>
-    {notFound ? <div className="grid gap-2 px-3 pb-2 text-meta">
+    {notFound ? <div className="grid gap-2 px-4 sm:ps-12 pb-2 text-meta">
       <span role="status" className="flex min-w-0 items-center gap-1.5 text-warning"><Unplug aria-hidden="true" className="size-4 shrink-0" />没找到这台电脑上的 Codex</span>
       <div className="flex flex-wrap items-center gap-2">
         <Button asChild variant="outline" size="sm"><a href={install.codex} target="_blank" rel="noopener noreferrer"><Download aria-hidden="true" />怎么装</a></Button>
@@ -320,23 +328,23 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       </div>
       <ManualCodex onboarding={onboarding} working={working} busy={busy} save={manual} />
     </div> : issue?.code === "env_missing" ? <KeyField key={issue.name} name={issue.name} working={working} busy={busy === `${item.provider}:env:${issue.name}`} more={item.issues.length - 1} save={saveKey} />
-    : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-3 pb-2 text-meta text-warning">
+    : issue ? <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 sm:ps-12 pb-2 text-meta text-warning">
       <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
           onClick={() => void change("app_server", { app_server: spawnServer })}>改由 Vibeface 启动</button>
         : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
-    </p> : missing.length ? <ul className="grid gap-1.5 px-3 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
+    </p> : missing.length ? <ul className="grid gap-1.5 px-4 sm:ps-12 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
       <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
       <span className="min-w-0 truncate">{check.label}</span>
       <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={install[item.provider]} target="_blank" rel="noopener noreferrer">怎么装</a>
     </li>)}</ul> : null}
-    {onboarding ? null : <details id={`provider-${item.provider}`} className="details border-t">
-      <summary className="flex min-h-11 items-center gap-1 px-3 text-meta text-muted-foreground hover:text-foreground">
+    {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
+      <summary className="-mt-2 flex min-h-10 w-fit items-center gap-1 px-4 sm:ps-12 pe-4 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
       </summary>
-      <div className="grid gap-4 px-3 pb-3">
+      <div className="grid gap-5 px-4 sm:ps-12 pt-1 pb-4">
         {serverSettings}
 
         {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} fixBin={issue?.code === "bin_missing"} working={working}
@@ -385,7 +393,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>
     </details>}
-    {error && !notFound ? <InlineError error={error} className="px-3 pb-3" /> : null}
+    {error && !notFound ? <InlineError error={error} className="px-4 sm:ps-12 pb-3" /> : null}
   </li>
 }
 
@@ -396,7 +404,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
 function KeyField({ name, working, busy, more, save }: { name: string; working: boolean; busy: boolean; more: number; save(name: string, value: string): Promise<boolean> }) {
   const [value, setValue] = useState("")
   const label = keyName(name)
-  return <form className="grid gap-2 px-3 pb-3" onSubmit={(event) => {
+  return <form className="grid gap-2 px-4 sm:ps-12 pb-3" onSubmit={(event) => {
     event.preventDefault()
     if (value) void save(name, value).then((ok) => { if (ok) setValue("") })
   }}>
@@ -418,7 +426,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
 /** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
 function BotHint() {
   return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
-    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开「运行 {terms.bot.label}」
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开「{deviceCopy.roles.bot.label}」
   </p>
 }
 
@@ -449,8 +457,9 @@ function BotDetails({ manager, display, fixBin, working, busy, save }: { manager
 function Folders({ roots, display, busy, save }: { roots: string[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
-  return <div className="grid gap-2">
-    <p className="text-meta font-medium text-muted-foreground">{terms.folders.label}</p>
+  return <section className="grid gap-2">
+    <h3 className="px-1 text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
+    <div className="grid gap-2 rounded-xl border bg-card p-3 shadow-xs">
     {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       <FolderPath path={root} shown={display[root]} />
@@ -460,7 +469,8 @@ function Folders({ roots, display, busy, save }: { roots: string[]; display: Dis
       <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
-  </div>
+    </div>
+  </section>
 }
 
 /** A long path gives up its parent folders first, so the folder's own name stays readable. `shown`: its `~/…` form. */

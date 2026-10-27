@@ -187,9 +187,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  // An empty chat already offers the setup button in its middle.
-  const hint = notice || (bot && !agentReady ? (managerOffline && !unready ? '能运行 Bot 的设备离线了' : !entries.length ? '' : unready ? '运行 Bot 的设备需设置' : '还没设置运行 Bot 的设备')
-    : bot ? composerHint(gate) : '')
+  const reason = composerHint({ ...gate, bot: agentReady ? 'ready' : managerOffline && !unready ? 'offline' : unready ? 'needs_setup' : 'none' })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
   // A device that only needs setup is fixable now, so it comes before one that is offline.
@@ -251,7 +249,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
           <terms.inbox.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
         value={text}
-        hint={hint}
+        hint={notice}
+        reason={reason}
         disabled={sendDisabled}
         busy={messageBusy}
         onStop={stopJob && workspace.writable && bot ? () => { setSendError(null); workspace.cancelManager(stopJob.trigger).catch(setSendError) } : undefined}

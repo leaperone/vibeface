@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
 
-const ready = { hasConversation: true, loaded: true }
+const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
 test('send waits for a loaded conversation', () => {
   assert.equal(roleLabel('user'), '你')
   assert.equal(roleLabel('assistant'), 'Bot')
   assert.equal(canSend({ ...ready, busy: false }), true)
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')
+  assert.equal(composerHint({ ...ready, bot: 'needs_setup' }), '运行 Bot 的设备需设置')
 })
 test('an explicit retry preserves the complete original message request', () => {
   const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', pending: null })
