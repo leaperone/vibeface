@@ -32,6 +32,17 @@ export function ActionCard({ icon, tone = 'warning', title, children, actions }:
   </View>
 }
 
+/** A titled step on a full screen, as the web's <Panel>. */
+export function Panel({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
+  return <View className="gap-4">
+    <View className="flex-row items-center gap-2">
+      <Icon as={icon} className="text-muted-foreground" />
+      <Text role="heading" className="text-heading font-semibold">{title}</Text>
+    </View>
+    {children}
+  </View>
+}
+
 export function EmptyState({ icon, title, action }: { icon: LucideIcon; title: string; action?: ReactNode }) {
   return <View className="items-center gap-3 px-4 py-12">
     <Icon as={icon} className="size-8 text-muted-foreground" />
@@ -64,8 +75,8 @@ export function CopyableId({ value, label }: { value: string; label: string }) {
 }
 
 /** Technical detail folded away by default, as the web's <Details>. */
-export function Details({ children, label = '详细信息' }: { children: ReactNode; label?: string }) {
-  const [open, setOpen] = useState(false)
+export function Details({ children, label = '详细信息', open: initial = false }: { children: ReactNode; label?: string; open?: boolean }) {
+  const [open, setOpen] = useState(initial)
   return <View>
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 self-start" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{label}</Text>

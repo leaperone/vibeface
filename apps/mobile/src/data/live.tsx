@@ -27,8 +27,10 @@ export function LiveWorkspace({ children }: { children: ReactNode }) {
 function useConnection(): { session: Session; connection: Connection } {
   const device = useDevice()
   const access = accessOf({ ready: Boolean(device.ready), phase: device.phase, joining: Boolean(device.joining), savedEntries: device.entries.length, invitation: false, offlineRetryMs: null })
-  const session: Session = access.kind === 'member' || access.kind === 'resuming' || access.kind === 'loading' && device.entries.length ? { phase: 'ready' }
-    : device.joining ? { phase: 'joining', deviceName: device.joining.name, code: device.joining.code ?? null }
+  // A recovery still waiting, or one whose new file is not confirmed as saved yet, holds the phone on the join screen.
+  const session: Session = device.recovery || device.ready && device.recovered ? { phase: 'unjoined' }
+    : access.kind === 'member' || access.kind === 'resuming' || access.kind === 'loading' && device.entries.length ? { phase: 'ready' }
+    : device.joining ? { phase: 'joining', code: device.joining.code ?? null }
     : { phase: 'unjoined' }
   const { link } = device
   const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
