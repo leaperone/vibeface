@@ -1,6 +1,5 @@
 //! Management SDKs receive visible context and explicit Node capabilities.
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -21,14 +20,6 @@ use vibeface_bridge::{
 
 /// Codex accepts 65536 bytes of user input per message.
 const MAX_PROMPT: usize = 65_536;
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[value(rename_all = "snake_case")]
-pub enum ManagerKind {
-    CursorSdk,
-    CodexSdk,
-}
 
 /// The SDK a turn runs in, with only what that SDK needs.
 #[derive(Clone)]
@@ -80,24 +71,6 @@ pub struct ManagerConfig {
     pub provider_env: BTreeMap<String, String>,
     pub process_started: Option<agent::ProcessStarted>,
     pub codex_turn: Option<CodexTurn>,
-}
-
-impl ManagerKind {
-    pub fn capabilities(self) -> Value {
-        json!({
-            "verified": false,
-            "streaming": true,
-            "cancel": true,
-            "steer": self == ManagerKind::CodexSdk,
-            "resume_local_session": true,
-            "text_stream_mode": match self { ManagerKind::CursorSdk => "delta_and_snapshot", ManagerKind::CodexSdk => "snapshot" },
-            "cancel_request": true,
-            "cancel_confirmation": true,
-            "cancel_confirmation_evidence": match self { ManagerKind::CursorSdk => "provider_terminal_or_managed_process_exit", ManagerKind::CodexSdk => "app_server_turn_end" },
-            "native_steer": self == ManagerKind::CodexSdk,
-            "run_reconcile": false,
-        })
-    }
 }
 
 /// `outcome` is how certain the end is; `failure` why the turn failed.

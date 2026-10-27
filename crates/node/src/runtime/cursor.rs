@@ -2,7 +2,6 @@
 //! process only carries what is the same for every turn: the Node-wide shell environment and
 //! one callback token. A tool callback names its agent, and the agent picks the attempt.
 use super::*;
-use crate::manager::ManagerKind;
 use vibeface_bridge::agent::{SdkBridge, ToolCallbackConfig};
 
 /// Process groups of the running bridges, with the program each one runs.
@@ -57,7 +56,7 @@ impl Runtime {
         };
         let launch = self
             .manager()
-            .filter(|manager| manager.provider == ManagerKind::CursorSdk)
+            .filter(|manager| manager.provider == Provider::Cursor)
             .and_then(|manager| {
                 let (key, env) =
                     crate::providers::cursor_launch(&self.provider_env(manager.provider));

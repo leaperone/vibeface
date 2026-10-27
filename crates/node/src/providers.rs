@@ -1,23 +1,31 @@
-//! The AI providers this Node runs locally and the variables each provider's processes get. The
-//! bot's provider and the execution switch live in `config.json`; the variables are model keys,
-//! so they stay in one private file of the data directory and never reach events, logs or the
-//! web, which only learns which names are set.
-use crate::manager::ManagerKind;
+//! The AI providers this Node runs locally, what a bot on each can do, and the variables each
+//! provider's processes get. The bot's provider and the execution switch live in `config.json`;
+//! the variables are model keys, so they stay in one private file of the data directory and
+//! never reach events, logs or the web, which only learns which names are set.
+use crate::scheduling::TriggerKind;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+use vibeface_bridge::agent::CustomToolConfig;
 
 pub const ENV_FILE: &str = "provider-env.json";
 const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+/// A provider, and the backend a bot runs on with it. Its methods are everything the scheduler
+/// and the settings need to know about that backend; nothing else matches on the provider.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
+    #[value(name = "codex_sdk")]
     Codex,
+    #[value(name = "cursor_sdk")]
     Cursor,
 }
 
@@ -27,6 +35,16 @@ pub enum Provider {
 pub enum Role {
     Agent,
     Execution,
+}
+
+/// What a bot turn's prompt carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptMode {
+    /// The thread keeps its instructions, the tool catalog and what it was shown, so a turn
+    /// carries only what is new and a thread lost on the App Server is replaced by a full one.
+    Thread,
+    /// Every turn carries everything.
+    Turn,
 }
 
 impl Provider {
@@ -41,19 +59,83 @@ impl Provider {
         }
     }
 
-    pub fn of(kind: ManagerKind) -> Self {
-        match kind {
-            ManagerKind::CodexSdk => Provider::Codex,
-            ManagerKind::CursorSdk => Provider::Cursor,
+    /// How the bot's settings, the CLI and peers name the bot on this provider.
+    pub fn sdk_name(self) -> &'static str {
+        match self {
+            Provider::Codex => "codex_sdk",
+            Provider::Cursor => "cursor_sdk",
         }
     }
 
-    /// The bot runtime that runs on this provider.
-    pub fn manager_kind(self) -> ManagerKind {
+    /// A Codex bot runs its turns on this Node's App Server, which must be up first.
+    pub fn on_app_server(self) -> bool {
+        self == Provider::Codex
+    }
+
+    /// Whether a queued user message can join the bot's running reply.
+    pub fn supports_steer(self) -> bool {
+        self == Provider::Codex
+    }
+
+    pub fn prompt_mode(self) -> PromptMode {
         match self {
-            Provider::Codex => ManagerKind::CodexSdk,
-            Provider::Cursor => ManagerKind::CursorSdk,
+            Provider::Codex => PromptMode::Thread,
+            Provider::Cursor => PromptMode::Turn,
         }
+    }
+
+    /// The tools a turn of `kind` is offered. A thread lists them once for all its turns, so it
+    /// gets every tool a user's own turn has.
+    pub fn tools_for(self, kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
+        crate::scheduler::tools(match self.prompt_mode() {
+            PromptMode::Thread => TriggerKind::Human,
+            PromptMode::Turn => kind,
+        })
+    }
+
+    /// The model the bot runs with: Cursor needs one, and Codex reads "auto" as a model name,
+    /// so there an empty one means its default.
+    pub fn model(self, model: &str) -> String {
+        match self {
+            Provider::Cursor if model.trim().is_empty() => "auto".into(),
+            Provider::Codex if model == "auto" => String::new(),
+            _ => model.into(),
+        }
+    }
+
+    pub fn capabilities(self) -> Value {
+        let codex = self == Provider::Codex;
+        json!({
+            "verified": false,
+            "streaming": true,
+            "cancel": true,
+            "steer": self.supports_steer(),
+            "resume_local_session": true,
+            "text_stream_mode": if codex { "snapshot" } else { "delta_and_snapshot" },
+            "cancel_request": true,
+            "cancel_confirmation": true,
+            "cancel_confirmation_evidence": if codex { "app_server_turn_end" } else { "provider_terminal_or_managed_process_exit" },
+            "native_steer": self.supports_steer(),
+            "run_reconcile": false,
+        })
+    }
+}
+
+/// `ManagerSettings.provider` as `config.json` and the settings API spell it.
+pub mod sdk_name {
+    use super::Provider;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(provider: &Provider, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(provider.sdk_name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Provider, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Provider::ALL
+            .into_iter()
+            .find(|provider| provider.sdk_name() == name)
+            .ok_or_else(|| D::Error::unknown_variant(&name, &["codex_sdk", "cursor_sdk"]))
     }
 }
 

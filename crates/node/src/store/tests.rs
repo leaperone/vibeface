@@ -2721,7 +2721,7 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
     };
     let runs = |store: &Store, provider: Provider| -> Result<Option<String>> {
         let device = crate::config::ManagerSettings {
-            provider: provider.manager_kind(),
+            provider,
             workspace: "/w".into(),
             model: "auto".into(),
             cursor_sdk_bin: "/sdk".into(),

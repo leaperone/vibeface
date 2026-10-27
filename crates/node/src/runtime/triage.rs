@@ -20,6 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use vibeface_bridge::codex::ServerRequest;
 
 const WAKE_EVERY: Duration = Duration::from_secs(20);
 pub const TRIAGE_URL_ENV: &str = "VIBEFACE_TRIAGE_URL";
@@ -393,17 +394,16 @@ impl Runtime {
     /// the fallback at once when there is none or no bot owns its thread. The same request asked
     /// again, as after a reconnect, keeps its ID: it takes the new connection's JSON-RPC ID and
     /// stays with the question or the Agent event it already has, so nothing is asked twice.
-    pub(crate) async fn on_codex_request(self: &Arc<Self>, params: &Value) {
-        let method = params["method"].as_str().unwrap_or_default();
-        let request_id = triage::request_id(method, &params["params"])
+    pub(crate) async fn on_codex_request(self: &Arc<Self>, handed: &ServerRequest) {
+        let request_id = triage::request_id(&handed.method, &handed.params)
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         let mut request = CodexRequest {
             request_id: request_id.clone(),
-            rpc_id: params["id"].clone(),
-            method: method.into(),
-            thread_id: params["threadId"].as_str().map(str::to_owned),
-            turn_id: params["params"]["turnId"].as_str().map(str::to_owned),
-            params: params["params"].clone(),
+            rpc_id: json!(handed.id),
+            method: handed.method.clone(),
+            thread_id: handed.thread_id.clone(),
+            turn_id: handed.params["turnId"].as_str().map(str::to_owned),
+            params: handed.params.clone(),
             received_ms: now_ms(),
             answer_by_ms: Some(now_ms() + AGENT_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
@@ -727,9 +727,7 @@ impl Runtime {
         let Some(settings) = self.manager() else {
             return Ok(());
         };
-        if settings.provider == manager::ManagerKind::CodexSdk {
-            self.codex.ready().await;
-        }
+        self.manager_backend_ready(settings.provider).await;
         let program = std::env::current_exe()?;
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
@@ -1607,7 +1605,7 @@ mod tests {
 
     fn with_agent(node: &Runtime) {
         node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
-            provider: crate::manager::ManagerKind::CodexSdk,
+            provider: crate::providers::Provider::Codex,
             workspace: "/tmp".into(),
             model: "fixture".into(),
             cursor_sdk_bin: "/nonexistent".into(),
@@ -1691,7 +1689,16 @@ mod tests {
         serde_json::from_str(message.to_text().unwrap()).unwrap()
     }
 
-    async fn app_server(node: &Runtime) -> Result<(Server, Value)> {
+    fn handed(id: i64, method: &str, params: Value) -> ServerRequest {
+        ServerRequest {
+            id: vibeface_protocol::RpcId::Number(id),
+            method: method.into(),
+            thread_id: params["threadId"].as_str().map(str::to_owned),
+            params,
+        }
+    }
+
+    async fn app_server(node: &Runtime) -> Result<(Server, ServerRequest)> {
         use futures_util::SinkExt as _;
         let listener = tokio::net::UnixListener::bind(named_socket(node))?;
         let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
@@ -1707,8 +1714,10 @@ mod tests {
         while node.codex.client().snapshot().await["pending_requests"] == json!([]) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let handed = json!({"id":41,"method":"item/commandExecution/requestApproval","threadId":"t-1","params":params});
-        Ok((server, handed))
+        Ok((
+            server,
+            handed(41, "item/commandExecution/requestApproval", params),
+        ))
     }
 
     async fn answered_once(server: &mut Server) -> Value {
@@ -1807,7 +1816,7 @@ mod tests {
             let waiting = node.store.lock().await.stop_requests()?;
             assert!(waiting.iter().any(|request| request.work_id == "w-stop"));
 
-            let epoch = node.codex_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let epoch = node.codex.epoch();
             let turn = crate::work::Signal::TurnStarted {
                 turn_id: "u-1".into(),
                 epoch,
@@ -1870,7 +1879,7 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, &network, spec, now_ms())?;
-        let epoch = node.codex_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let epoch = node.codex.epoch();
         let turn = crate::work::Signal::TurnStarted {
             turn_id: "u-1".into(),
             epoch,
@@ -1961,7 +1970,6 @@ mod tests {
                 spec,
                 now_ms() - window,
             )?;
-            let bound = json!({"work_id":"w-late","thread_id":"t-late"});
             node.store.lock().await.apply_work_signal(
                 &node.identity,
                 &network,
@@ -1992,13 +2000,24 @@ mod tests {
                     if thread == "t-late"
             ));
             assert!(
-                node.bind_work(&network, "c", &bound).await.is_err(),
+                node.bind_work(
+                    &network,
+                    "c",
+                    "w-late",
+                    vibeface_bridge::codex::StartReport::Thread {
+                        thread_id: "t-late".into()
+                    }
+                )
+                .await
+                .is_err(),
                 "past its window the work takes no new thread"
             );
 
             started.store(true, Ordering::SeqCst);
-            let late = json!({"work_id":"w-late","turn_id":"u-1"});
-            node.bind_work(&network, "c", &late).await?;
+            let late = vibeface_bridge::codex::StartReport::Turn {
+                turn_id: "u-1".into(),
+            };
+            node.bind_work(&network, "c", "w-late", late).await?;
             assert!(matches!(
                 state(&node, "w-late").await?,
                 crate::work::WorkState::Running { ref handle } if handle.turn_id == "u-1"
@@ -2407,7 +2426,7 @@ mod tests {
 
     /// The App Server asks `rpc` for the approval of item `i-1` in turn `u-1` of thread `t-1`;
     /// returns what the bridge hands the Node.
-    async fn ask_approval(node: &Runtime, server: &mut Server, rpc: u64) -> Result<Value> {
+    async fn ask_approval(node: &Runtime, server: &mut Server, rpc: i64) -> Result<ServerRequest> {
         use futures_util::SinkExt as _;
         let params = json!({"threadId":"t-1","turnId":"u-1","itemId":"i-1","command":"rm -rf build","reason":"clean"});
         let method = "item/commandExecution/requestApproval";
@@ -2424,7 +2443,7 @@ mod tests {
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        Ok(json!({"id":rpc,"method":method,"threadId":"t-1","params":params}))
+        Ok(handed(rpc, method, params))
     }
 
     async fn raise_for(node: &Runtime) -> Result<(String, String)> {

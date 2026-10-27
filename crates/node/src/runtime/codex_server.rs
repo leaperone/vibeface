@@ -3,10 +3,11 @@
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
 use super::*;
 use crate::providers::{CodexLaunch, CodexTarget};
-use crate::work::Probe;
+use crate::scheduling::{SteerOutcome, SteerTarget};
+use crate::work::{Probe, Signal};
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::{
-    codex::{CodexClient, CodexError},
+    codex::{CodexClient, CodexError, ExecEvent},
     turn::{TurnStatus, turn_snapshot},
 };
 
@@ -31,6 +32,122 @@ pub(crate) fn sent_by(turn: &Value, client_id: &str) -> bool {
         .any(|item| item["type"] == "userMessage" && item["clientId"] == client_id)
 }
 
+/// A plan as one line per step, the current step marked, for the persisted progress.
+fn plan_summary(params: &Value) -> String {
+    params["plan"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            let mark = match step["status"].as_str() {
+                Some("completed") => "✓",
+                Some("inProgress") => "→",
+                _ => "·",
+            };
+            format!("{mark} {}", step["step"].as_str().unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How the App Server took a steer.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SteerAck {
+    Accepted,
+    /// Nothing was sent, as when the turn had just ended.
+    Refused(String),
+    /// It may have been sent; only the thread tells.
+    Unknown,
+}
+
+/// Where a steered message went. Codex takes steered input only into a running turn.
+#[derive(Debug, PartialEq)]
+pub(crate) enum SteerTrace {
+    /// The thread does not show the target turn.
+    TargetUnseen,
+    /// It may still arrive: the turn holding it, or the target turn, still runs.
+    Pending,
+    /// The target turn ended without it: it never arrived.
+    NotArrived,
+    /// It is in a turn that ended: answered when that is the completed target turn.
+    Ended(SteerOutcome),
+}
+
+fn steer_trace(turns: &[Value], message_id: &str, target: &str) -> SteerTrace {
+    let Some(turn) = turns.iter().find(|turn| sent_by(turn, message_id)) else {
+        return match turns.iter().find(|turn| turn["id"] == target) {
+            None => SteerTrace::TargetUnseen,
+            Some(turn) if turn_snapshot(turn).status == Some(TurnStatus::InProgress) => {
+                SteerTrace::Pending
+            }
+            Some(_) => SteerTrace::NotArrived,
+        };
+    };
+    match turn_snapshot(turn).status {
+        Some(TurnStatus::InProgress) => SteerTrace::Pending,
+        Some(TurnStatus::Completed) if turn["id"] == target => {
+            SteerTrace::Ended(SteerOutcome::Answered)
+        }
+        _ => SteerTrace::Ended(SteerOutcome::Unfinished),
+    }
+}
+
+/// What an App Server notification says about a turn's work.
+pub(crate) struct TurnEvent<'a> {
+    pub thread: Option<&'a str>,
+    pub turn: Option<&'a str>,
+    /// The turn started or ended.
+    pub boundary: bool,
+    pub signal: Option<Signal>,
+}
+
+pub(crate) fn turn_event(event: &Value) -> TurnEvent<'_> {
+    let method = event["method"].as_str().unwrap_or_default();
+    let params = &event["params"];
+    let turn = params["turnId"]
+        .as_str()
+        .or_else(|| params["turn"]["id"].as_str());
+    let item = &params["item"];
+    let signal = match method {
+        "item/completed" if item["type"] == "agentMessage" && item["phase"] == "commentary" => {
+            Some(Signal::Progress {
+                summary: item["text"].as_str().unwrap_or_default().into(),
+                at_ms: now_ms(),
+            })
+        }
+        "item/completed"
+            if item["type"] == "agentMessage"
+                && (item["phase"].is_null() || item["phase"] == "final_answer") =>
+        {
+            Some(Signal::Text(
+                item["text"].as_str().unwrap_or_default().into(),
+            ))
+        }
+        "turn/plan/updated" => Some(Signal::Progress {
+            summary: plan_summary(params),
+            at_ms: now_ms(),
+        }),
+        "turn/completed" => {
+            let ended = turn_snapshot(&params["turn"]);
+            Some(Signal::TurnCompleted {
+                turn_id: turn.unwrap_or_default().into(),
+                status: ended
+                    .status
+                    .unwrap_or_else(|| TurnStatus::Other("unknown".into())),
+                text: String::new(),
+                error: ended.error,
+            })
+        }
+        _ => None,
+    };
+    TurnEvent {
+        thread: params["threadId"].as_str(),
+        turn,
+        boundary: matches!(method, "turn/started" | "turn/completed"),
+        signal,
+    }
+}
+
 impl CodexServer {
     pub(crate) fn client(&self) -> &CodexClient {
         &self.client
@@ -52,6 +169,45 @@ impl CodexServer {
             .await
             .map(|_| ())
     }
+    /// Sends the user's queued message into the running turn of `into`, keyed by its message ID.
+    pub(crate) async fn steer(&self, into: &SteerTarget, message_id: &str, text: &str) -> SteerAck {
+        let message = json!({"message_id":message_id,"text":text});
+        let text = format!(
+            "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
+        );
+        let params = json!({"threadId":into.thread_id,"expectedTurnId":into.turn_id,
+            "clientUserMessageId":message_id,
+            "input":[{"type":"text","text":text,"text_elements":[]}]});
+        match self.client.request("turn/steer", params).await {
+            Ok(_) => SteerAck::Accepted,
+            Err(error) if !error.uncertain => SteerAck::Refused(error.message),
+            Err(_) => SteerAck::Unknown,
+        }
+    }
+
+    /// Where a message steered into `into` went, as its thread shows it; `None` when the thread
+    /// could not be read. It only reads.
+    pub(crate) async fn read_back(
+        &self,
+        into: &SteerTarget,
+        message_id: &str,
+    ) -> Option<SteerTrace> {
+        let reply = self
+            .client
+            .request(
+                "thread/read",
+                json!({"threadId":into.thread_id,"includeTurns":true}),
+            )
+            .await
+            .ok()?;
+        let turns = reply["thread"]["turns"].as_array()?;
+        Some(steer_trace(turns, message_id, &into.turn_id))
+    }
+
+    /// The connection the turns the Node reads now run under; see `Handle::epoch`.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
     /// Reads the journaled thread; it never starts or replays work. Without a known turn, the
     /// turn is the one whose user message carries `client_id`.
     pub(crate) async fn probe(
@@ -59,8 +215,8 @@ impl CodexServer {
         thread: &str,
         turn: Option<&str>,
         client_id: &str,
-        epoch: u64,
     ) -> Result<Probe, CodexError> {
+        let epoch = self.epoch();
         let reply = match self
             .client
             .request(
@@ -111,6 +267,8 @@ pub(crate) struct CodexServer {
     inner: Arc<Inner>,
     /// Wakes sends waiting for the client to connect.
     connected: tokio::sync::Notify,
+    /// Numbers the client's connections; the Node persists it, so it only grows.
+    epoch: std::sync::atomic::AtomicU64,
 }
 
 /// How long a send waits for the App Server, as right after the Node starts, before it is refused.
@@ -476,7 +634,7 @@ impl CodexServer {
         target: CodexTarget,
         identity: &LocalIdentity,
         data_dir: &Path,
-        events: mpsc::UnboundedSender<Value>,
+        events: mpsc::UnboundedSender<ExecEvent>,
     ) -> Result<Self> {
         let directory = socket_dir(identity, data_dir)?;
         let (endpoint, receiver) = tokio::sync::watch::channel(None);
@@ -503,6 +661,7 @@ impl CodexServer {
             client,
             inner: Arc::new(inner),
             connected: tokio::sync::Notify::new(),
+            epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -510,7 +669,9 @@ impl CodexServer {
         tokio::spawn(self.inner.clone().supervise());
     }
 
-    pub(super) fn connected(&self) {
+    /// A new connection, numbered `epoch`; requests and turns of earlier ones are read again.
+    pub(super) fn connected(&self, epoch: u64) {
+        self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
         self.connected.notify_waiters();
     }
 
@@ -628,6 +789,45 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steered_message_is_traced_only_from_what_its_thread_shows() {
+        let turn = |id: &str, status: &str, sent: bool| {
+            let items = if sent {
+                json!([{"type":"userMessage","clientId":"m"}])
+            } else {
+                json!([])
+            };
+            json!({"id":id,"status":status,"items":items})
+        };
+        let trace = |turns: &[Value]| steer_trace(turns, "m", "r");
+        assert_eq!(trace(&[turn("r", "inProgress", true)]), SteerTrace::Pending);
+        assert_eq!(
+            trace(&[turn("r", "inProgress", false)]),
+            SteerTrace::Pending
+        );
+        assert_eq!(
+            trace(&[turn("r", "completed", true)]),
+            SteerTrace::Ended(SteerOutcome::Answered)
+        );
+        assert_eq!(
+            trace(&[turn("r", "interrupted", true)]),
+            SteerTrace::Ended(SteerOutcome::Unfinished)
+        );
+        assert_eq!(
+            trace(&[turn("r", "completed", false), turn("x", "completed", true)]),
+            SteerTrace::Ended(SteerOutcome::Unfinished)
+        );
+        assert_eq!(
+            trace(&[turn("r", "interrupted", false)]),
+            SteerTrace::NotArrived
+        );
+        assert_eq!(trace(&[]), SteerTrace::TargetUnseen);
+        assert_eq!(
+            trace(&[turn("x", "completed", false)]),
+            SteerTrace::TargetUnseen
+        );
+    }
     use crate::providers::{AppServerMode, Local, Provider, ProviderEnv};
     use futures_util::{SinkExt as _, StreamExt as _};
     use std::os::unix::fs::PermissionsExt;

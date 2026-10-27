@@ -4,6 +4,7 @@ use crate::{
     identity::{AuthorizationView, GovernanceAction, IdentityKind, NetworkState},
     maintenance::Gate,
     model::*,
+    providers::Provider,
     store::{Store, WriteState},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -158,7 +159,6 @@ pub struct Runtime {
     pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
-    codex_epoch: std::sync::atomic::AtomicU64,
     progress_sequence: std::sync::atomic::AtomicU64,
     /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
     /// stop and its deadline are stored, so a restart retries at once.
@@ -170,7 +170,7 @@ pub struct Runtime {
     /// Bumped on every membership change, so open sessions and connections recheck their peer.
     pub(crate) membership: tokio::sync::watch::Sender<u64>,
     _process_lock: Arc<std::fs::File>,
-    codex_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    codex_rx: Mutex<Option<mpsc::UnboundedReceiver<vibeface_bridge::codex::ExecEvent>>>,
     pub(crate) triage: triage::TriageState,
     pub(crate) node_join: std::sync::Mutex<Option<crate::client::NodeJoinTask>>,
     rejoin: tokio::sync::Notify,
@@ -248,7 +248,7 @@ impl Runtime {
         let codex_agent = config
             .manager
             .as_ref()
-            .is_some_and(|manager| manager.provider == crate::manager::ManagerKind::CodexSdk);
+            .is_some_and(|manager| manager.provider.on_app_server());
         providers.validate(codex_agent)?;
         let codex = Arc::new(codex_server::CodexServer::open(
             providers.codex_target(codex_agent),
@@ -295,7 +295,6 @@ impl Runtime {
             cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
-            codex_epoch: std::sync::atomic::AtomicU64::new(0),
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
             local_access,
@@ -463,7 +462,10 @@ impl Runtime {
     /// Work, scheduling and observation append to the log, so they wait for `writable`.
     /// ponytail: a Node that forks later keeps these running and its appends fail; stop them
     /// if a forked device turns out to keep running work.
-    fn start_writers(self: &Arc<Self>, events: mpsc::UnboundedReceiver<Value>) {
+    fn start_writers(
+        self: &Arc<Self>,
+        events: mpsc::UnboundedReceiver<vibeface_bridge::codex::ExecEvent>,
+    ) {
         self.start_codex(events);
         self.start_schedule_delivery();
         self.start_observation_worker();
@@ -562,9 +564,9 @@ impl Runtime {
         let mut codex = self.codex.capability().await;
         codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
-            "manager":manager,
+            "manager":manager.map(Provider::sdk_name),
             "manager_ready":self.manager_ready().await,
-            "manager_capabilities":manager.map(|kind|kind.capabilities()),
+            "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})
     }
 

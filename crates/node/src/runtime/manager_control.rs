@@ -287,7 +287,7 @@ impl Runtime {
         let thread = turn.thread.as_str();
         match self
             .codex
-            .probe(thread, turn.turn.as_deref(), attempt_id, 0)
+            .probe(thread, turn.turn.as_deref(), attempt_id)
             .await
         {
             Ok(Probe::Running { turn_id, .. }) => {

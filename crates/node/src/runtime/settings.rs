@@ -2,7 +2,7 @@ use super::Runtime;
 use super::codex_server::Link;
 use crate::config::{Config, ManagerSettings};
 use crate::discovery::{self, Paths, Target};
-use crate::manager::{ManagerConfig, ManagerKind, Sdk};
+use crate::manager::{ManagerConfig, Sdk};
 use crate::providers::{self, AppServer, AppServerMode, Provider, Role};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -54,7 +54,7 @@ impl ProviderChange {
 
     /// `default` is the bot a provider starts when none runs yet.
     fn apply(self, target: Target, default: Option<ManagerSettings>) -> Result<()> {
-        let kind = self.provider.manager_kind();
+        let provider = self.provider;
         match self.bot {
             Some(true) => {
                 let mut chosen = target
@@ -62,18 +62,16 @@ impl ProviderChange {
                     .take()
                     .or(default)
                     .context("no bot to start")?;
-                chosen.provider = kind;
-                // Cursor needs a model; Codex reads "auto" as a model name, so it gets its default.
-                match kind {
-                    ManagerKind::CursorSdk if chosen.model.trim().is_empty() => {
-                        chosen.model = "auto".into()
-                    }
-                    ManagerKind::CodexSdk if chosen.model == "auto" => chosen.model.clear(),
-                    _ => {}
-                }
+                chosen.provider = provider;
+                chosen.model = provider.model(&chosen.model);
                 *target.manager = Some(chosen);
             }
-            Some(false) if target.manager.as_ref().is_some_and(|m| m.provider == kind) => {
+            Some(false)
+                if target
+                    .manager
+                    .as_ref()
+                    .is_some_and(|m| m.provider == provider) =>
+            {
                 *target.manager = None
             }
             _ => {}
@@ -132,14 +130,11 @@ impl Runtime {
     }
 
     /// What a newly chosen bot starts with; the workspace is created when it is chosen.
-    fn default_manager(&self, provider: ManagerKind) -> Result<ManagerSettings> {
+    fn default_manager(&self, provider: Provider) -> Result<ManagerSettings> {
         Ok(ManagerSettings {
             provider,
             workspace: self.data_dir.canonicalize()?.join("manager-workspace"),
-            model: match provider {
-                ManagerKind::CursorSdk => "auto".into(),
-                ManagerKind::CodexSdk => String::new(),
-            },
+            model: provider.model(""),
             cursor_sdk_bin: DEFAULT_CURSOR_BIN.into(),
         })
     }
@@ -166,12 +161,12 @@ impl Runtime {
     /// the Node-wide shell environment; the caller adds what belongs to the turn.
     pub(crate) fn manager_config(&self, settings: ManagerSettings) -> ManagerConfig {
         let sdk = match settings.provider {
-            ManagerKind::CursorSdk => Sdk::Cursor {
+            Provider::Cursor => Sdk::Cursor {
                 bridge: self.cursor.get().cloned(),
                 sdk_bin: settings.cursor_sdk_bin,
                 agents: self.cursor_agents.clone(),
             },
-            ManagerKind::CodexSdk => Sdk::Codex {
+            Provider::Codex => Sdk::Codex {
                 socket: self.codex.socket(),
             },
         };
@@ -191,9 +186,15 @@ impl Runtime {
         }
     }
 
-    /// The variables this Node sets for the provider behind `kind`, and only that provider.
-    pub(crate) fn provider_env(&self, kind: ManagerKind) -> BTreeMap<String, String> {
-        self.providers().env.get(Provider::of(kind)).clone()
+    /// The variables this Node sets for `provider`, and only that provider.
+    pub(crate) fn provider_env(&self, provider: Provider) -> BTreeMap<String, String> {
+        self.providers().env.get(provider).clone()
+    }
+
+    /// Whether the bot's backend can take a turn, waiting a while for an App Server that is
+    /// still coming up with the Node.
+    pub(crate) async fn manager_backend_ready(&self, provider: Provider) -> bool {
+        !provider.on_app_server() || self.codex.ready().await
     }
 
     async fn provider_status(
@@ -207,7 +208,7 @@ impl Runtime {
         let bot = settings
             .manager
             .as_ref()
-            .is_some_and(|m| Provider::of(m.provider) == provider);
+            .is_some_and(|m| m.provider == provider);
         let execution = provider == Provider::Codex && local.switches.execution;
         let roles: Vec<Role> = [(bot, Role::Agent), (execution, Role::Execution)]
             .into_iter()
@@ -300,21 +301,21 @@ impl Runtime {
             return false;
         };
         let status = self
-            .provider_status(Provider::of(manager.provider), &self.providers(), &settings)
+            .provider_status(manager.provider, &self.providers(), &settings)
             .await;
         status["state"] == "ready"
     }
 
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
-        let default = self.default_manager(ManagerKind::CodexSdk)?;
+        let default = self.default_manager(Provider::Codex)?;
         let defaults = json!({
             "workspace":default.workspace, "cursor_sdk_bin":default.cursor_sdk_bin,
         });
         let local = self.providers();
         let mut missing = Vec::new();
         if let Some(manager) = &settings.manager {
-            if manager.provider == ManagerKind::CursorSdk {
+            if manager.provider == Provider::Cursor {
                 if !executable(&manager.cursor_sdk_bin) {
                     missing.push("Cursor SDK Bridge");
                 }
@@ -378,9 +379,8 @@ impl Runtime {
         let _save = self.config_save.lock().await;
         let _work = self.maintenance.enter()?;
         self.authorize_settings_write(subject, local_cookie).await?;
-        let kind = change.provider.manager_kind();
         let default = match change.bot {
-            Some(true) if self.manager().is_none() => Some(self.default_manager(kind)?),
+            Some(true) if self.manager().is_none() => Some(self.default_manager(change.provider)?),
             _ => None,
         };
         let change = change.expand(&self.host);
@@ -428,7 +428,7 @@ impl Runtime {
         triage.validate()?;
         let codex_agent = manager
             .as_ref()
-            .is_some_and(|manager| manager.provider == ManagerKind::CodexSdk);
+            .is_some_and(|manager| manager.provider.on_app_server());
         next.validate(codex_agent)?;
         let manager_changed = manager != previous_manager;
         if manager_changed
@@ -512,7 +512,7 @@ impl Runtime {
                 "invalid manager model"
             );
             ensure!(
-                manager.provider != ManagerKind::CursorSdk || !manager.model.trim().is_empty(),
+                manager.provider != Provider::Cursor || !manager.model.trim().is_empty(),
                 "Cursor SDK requires a model"
             );
             ensure!(
