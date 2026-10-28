@@ -31,15 +31,14 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
   const close = () => setAt(null)
   return <>
     <Pressable ref={button} onPress={() => button.current?.measureInWindow((x, y, _width, height) => setAt({ x, y: y + height }))}
-      accessibilityRole="button" accessibilityLabel={`连接：${look.label}`} className="size-11 items-center justify-center rounded-full active:bg-muted">
+      accessibilityRole="button" accessibilityLabel={`连接：${look.label}`} accessibilityState={{ expanded: at !== null }} className="size-11 items-center justify-center rounded-full active:bg-muted">
       <Icon as={look.icon} className={cn('size-5', toneText[look.tone])} />
     </Pressable>
     <Modal transparent statusBarTranslucent navigationBarTranslucent visible={at !== null} animationType="fade" onRequestClose={close}>
-      <Pressable className="flex-1" onPress={close} accessibilityLabel="关闭">
-        {at ? <View style={{ position: 'absolute', left: at.x, top: at.y + 4 }} className="w-64 rounded-xl border border-border bg-background px-2 shadow-lg">
-          <ConnectionPill connection={connection} />
-        </View> : null}
-      </Pressable>
+      <Pressable className="absolute inset-0" onPress={close} accessibilityRole="button" accessibilityLabel="关闭" />
+      {at ? <View style={{ position: 'absolute', left: at.x, top: at.y + 4 }} className="w-64 rounded-xl border border-border bg-background px-2 shadow-lg">
+        <ConnectionPill connection={connection} />
+      </View> : null}
     </Modal>
   </>
 }
