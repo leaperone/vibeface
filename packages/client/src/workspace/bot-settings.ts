@@ -108,9 +108,10 @@ export function scheduleName(scheduleId: string, bot: BotSettings | undefined, c
 
 /**
  * Where each turn's changes show: after the last reply to the person's message, else after that message.
- * Changes whose message is not on screen come back as `rest`, oldest first.
+ * A turn whose message is in another chat, such as one bot changing another, sits after the last message before it,
+ * and `first` holds turns older than every message, oldest first.
  */
-export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to">[], changes: readonly BotChangeRecord[]) {
+export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms">[], changes: readonly BotChangeRecord[]) {
   const anchor = new Map<string, string>()
   for (const message of messages) {
     if (message.role === "user") anchor.set(message.message_id, message.message_id)
@@ -118,15 +119,15 @@ export function placeChanges(messages: readonly Pick<TranscriptMessage, "message
   }
   const turns = new Map<string, BotChangeRecord[]>()
   for (const record of changes) {
-    const cause = record.cause?.message_id ?? ""
+    const cause = record.cause?.message_id ?? record.change_id
     turns.set(cause, [...turns.get(cause) ?? [], record])
   }
-  const after = new Map<string, BotChangeRecord[]>()
-  const rest: BotChangeRecord[][] = []
+  const after = new Map<string, BotChangeRecord[][]>()
+  const first: BotChangeRecord[][] = []
   for (const [cause, items] of turns) {
-    const at = anchor.get(cause)
-    if (at) after.set(at, items)
-    else rest.push(items)
+    const at = anchor.get(cause) ?? messages.filter((message) => message.created_at_ms <= items[0].created_at_ms).at(-1)?.message_id
+    if (at) after.set(at, [...after.get(at) ?? [], items])
+    else first.push(items)
   }
-  return { after, rest }
+  return { after, first }
 }

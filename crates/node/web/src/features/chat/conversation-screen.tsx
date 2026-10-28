@@ -111,7 +111,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Steering already went into the running reply; it only settles once that reply ends.
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
-  const entries: ChatEntry[] = []
+  const entries: ChatEntry[] = placedChanges.first.map(changeRow)
   const waiting: ChatEntry[] = []
   for (const message of threadReplies(data?.messages ?? [], merged)) {
     const start = entries.length
@@ -133,14 +133,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
-    const turn = placedChanges.after.get(message.message_id)
-    if (turn) entries.push(changeRow(turn))
+    for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
     if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
   entries.push(...asides.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
   for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
-  for (const turn of placedChanges.rest) entries.push(changeRow(turn))
   if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 
