@@ -440,15 +440,24 @@ impl Opencode {
         Ok(None)
     }
 
-    /// Creates session `id` in `directory`: opencode's v2 API takes the Node's ID and answers
-    /// the same for one it has.
-    async fn create(&self, conn: &Conn, id: &str, directory: &str) -> Result<(), ExecFailure> {
-        let body = json!({"id":id,"location":{"directory":directory}});
+    /// Creates a session in `directory`; its ID. The session's own rules allow every tool but
+    /// questions, which nobody answers: they come after the agent's and the user's configured
+    /// rules, and the last that matches wins. A subagent's session does not take them.
+    async fn create(&self, conn: &Conn, directory: &str) -> Result<String, ExecFailure> {
+        let body = json!({"permission":[{"permission":"*","pattern":"*","action":"allow"},
+            {"permission":"question","pattern":"*","action":"deny"}]});
+        let query = [("directory", directory)];
         match self
-            .call(conn, Method::POST, "/api/session", &[], Some(&body))
+            .call(conn, Method::POST, "/session", &query, Some(&body))
             .await
         {
-            Ok((200..=299, _)) => Ok(()),
+            Ok((200..=299, session)) => match session["id"].as_str() {
+                Some(id) if vibeface_protocol::validate_id(id).is_ok() => Ok(id.to_owned()),
+                _ => Err(ExecFailure::new(
+                    FailureKind::Unknown,
+                    "opencode created a session without an ID",
+                )),
+            },
             Ok((status, body)) => Err(http_failure(status, &body)),
             Err(error) => Err(ExecFailure::new(
                 FailureKind::Transport,
@@ -581,9 +590,9 @@ impl Opencode {
         }
     }
 
-    /// One bot turn in its session on the serve. The session is created with the Node's own ID
-    /// and saved before anything is sent; the message ID comes from the attempt, so a send whose
-    /// fate is unknown is read back by it and never sent twice.
+    /// One bot turn in its session on the serve. The session is created and saved before
+    /// anything is sent; the message ID comes from the attempt, so a send whose fate is unknown
+    /// is read back by it and never sent twice.
     pub(crate) async fn run_turn<F, P, PF>(
         &self,
         config: &ManagerConfig,
@@ -648,8 +657,7 @@ impl Opencode {
                 (id.to_owned(), directory.to_owned(), prompt)
             }
             _ => {
-                let id = format!("ses_{}", crate::crypto::random_hex(13));
-                (self.create(&conn, &id, workspace).await).map_err(|f| failed(previous, f))?;
+                let id = (self.create(&conn, workspace).await).map_err(|f| failed(previous, f))?;
                 // A session opencode no longer has is replaced by a new one, which needs it all.
                 let fresh = previous
                     .and(config.codex_turn.as_ref())
@@ -1118,10 +1126,6 @@ fn hashed(prefix: &str, seed: &str, len: usize) -> String {
     format!("{prefix}{}", &crate::crypto::digest(seed.as_bytes())[..len])
 }
 
-fn work_session(work_id: &str) -> String {
-    hashed("ses_", &format!("vibeface-work:{work_id}"), 26)
-}
-
 /// The message a work is sent as: a restart reads the run back by it.
 fn work_message(work_id: &str) -> String {
     hashed("msg_", &format!("vibeface-work:{work_id}"), 24)
@@ -1253,11 +1257,10 @@ impl Executor for Opencode {
                         );
                         return reject(failure).await;
                     }
-                    let session = work_session(id);
-                    if let Err(failure) = self.create(&conn, &session, &work.cwd).await {
-                        return reject(failure).await;
+                    match self.create(&conn, &work.cwd).await {
+                        Ok(session) => (session, work.cwd.clone()),
+                        Err(failure) => return reject(failure).await,
                     }
-                    (session, work.cwd.clone())
                 }
             };
             // Journaled before the send: a restart reads the run back by the work's message.
@@ -1484,6 +1487,8 @@ mod tests {
     #[derive(Default)]
     struct FakeSession {
         directory: String,
+        /// The session's own permission rules.
+        permission: Value,
         busy: bool,
         messages: Vec<Value>,
     }
@@ -1589,18 +1594,23 @@ mod tests {
         (StatusCode::NOT_FOUND, Json(body)).into_response()
     }
 
-    async fn create(State(api): State<Api>, Json(body): Json<Value>) -> Json<Value> {
-        let id = body["id"].as_str().unwrap_or_default().to_owned();
-        let directory = body["location"]["directory"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
+    async fn create(
+        State(api): State<Api>,
+        Query(query): Query<HashMap<String, String>>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let directory = query.get("directory").cloned().unwrap_or_default();
         let mut fake = api.fake.lock().unwrap();
-        let session = (fake.sessions.entry(id.clone())).or_insert_with(|| FakeSession {
+        let id = format!("ses_fake{}", fake.sessions.len() + 1);
+        let session = FakeSession {
             directory,
+            permission: body["permission"].clone(),
             ..Default::default()
-        });
-        Json(json!({"data":{"id":id,"directory":session.directory}}))
+        };
+        let created =
+            json!({"id":id,"directory":session.directory,"permission":session.permission});
+        fake.sessions.insert(id, session);
+        Json(created)
     }
 
     async fn status(
@@ -1751,7 +1761,7 @@ mod tests {
                 events: tokio::sync::broadcast::channel(1024).0,
             };
             let app = Router::new()
-                .route("/api/session", post(create))
+                .route("/session", post(create))
                 .route("/session/status", get(status))
                 .route("/session/{id}", get(session))
                 .route("/session/{id}/message", get(messages))
@@ -1983,6 +1993,12 @@ mod tests {
                 (session.clone(), Some(message.clone()))
             ]
         );
+        assert_eq!(
+            place.fake.lock().unwrap().sessions[&session].permission,
+            json!([{"permission":"*","pattern":"*","action":"allow"},
+                {"permission":"question","pattern":"*","action":"deny"}]),
+            "the session's own rules win over the user's opencode permission"
+        );
         let sent = &place.prompts()[0];
         assert_eq!(sent["session"], session.as_str());
         assert_eq!(
@@ -2114,7 +2130,14 @@ mod tests {
         assert_eq!(record.text, "re:do it");
         let prompts = place.prompts();
         assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0]["session"], work_session("w-1").as_str());
+        let session = prompts[0]["session"].as_str().context("session")?;
+        let rules = place.fake.lock().unwrap().sessions[session]
+            .permission
+            .clone();
+        assert_eq!(
+            rules[0],
+            json!({"permission":"*","pattern":"*","action":"allow"})
+        );
         assert_eq!(
             prompts[0]["body"]["messageID"],
             work_message("w-1").as_str()
@@ -2156,14 +2179,18 @@ mod tests {
     async fn an_opencode_session_without_the_work_reads_as_not_started() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
-        let (mut work, _) = crate::work::accept(spec("t", &place, "do it"), 0);
-        crate::work::transition(&mut work, Signal::ThreadCreated(work_session("w-1")));
-        assert_eq!(server.probe(&work).await?, Probe::Missing);
+        let (accepted, _) = crate::work::accept(spec("t", &place, "do it"), 0);
+        let on = |session: &str| {
+            let mut work = accepted.clone();
+            crate::work::transition(&mut work, Signal::ThreadCreated(session.into()));
+            work
+        };
+        assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
         let conn = server.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
-        let created = server.create(&conn, &work_session("w-1"), &cwd).await;
-        created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
-        assert_eq!(server.probe(&work).await?, Probe::NotStarted);
+        let created = server.create(&conn, &cwd).await;
+        let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        assert_eq!(server.probe(&on(&session)).await?, Probe::NotStarted);
         assert!(place.prompts().is_empty());
         Ok(())
     }
