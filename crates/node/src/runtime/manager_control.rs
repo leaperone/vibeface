@@ -281,6 +281,10 @@ impl Runtime {
     /// reply was already recorded as interrupted; an unreachable App Server, or another one than
     /// the turn ran on, leaves it unknown.
     async fn codex_turn_ended(&self, turn: &ReplyTurn, attempt_id: &str) -> bool {
+        // A turn on no App Server ran in the recorded process groups, which have all exited.
+        if turn.server.is_empty() {
+            return true;
+        }
         if turn.server != self.codex.server() {
             return false;
         }

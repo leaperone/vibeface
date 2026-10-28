@@ -211,8 +211,13 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         .context("local tool listener is not ready")?;
     // A Codex thread keeps the Shell environment it was created with, tool URL included: when
     // the Node could not get its earlier tool port back, a new thread starts. It lives on one
-    // App Server; another one starts a new thread too, and so do new thread instructions.
-    let server = node.codex.server();
+    // App Server; another one starts a new thread too, and so do new thread instructions. A
+    // thread of a provider without an App Server is on none.
+    let server = if provider.on_app_server() {
+        node.codex.server()
+    } else {
+        String::new()
+    };
     let tool_cli = std::env::current_exe()?;
     // A thread lists the tools once, with the guidance that holds for all its turns.
     let guide = manager::codex_instructions(
