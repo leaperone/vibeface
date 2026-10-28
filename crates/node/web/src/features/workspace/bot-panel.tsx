@@ -2,14 +2,14 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
-import { formatIn, formatWhen, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { folderLabels, formatIn, formatWhen, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -87,6 +87,9 @@ export function BotPanelButton() {
             {owner ? <SettingsRow icon={owner === ready?.entry.device_id ? Laptop : Server} label="运行设备">
               {ownerNode && !ownerNode.online ? <span className="inline-flex items-center gap-1 text-warning"><WifiOff aria-hidden="true" className="size-4" />离线</span> : null}
               <span className="max-w-48 truncate" title={deviceName}>{deviceName}</span>
+            </SettingsRow> : null}
+            {bot.project ? <SettingsRow icon={FolderOpen} label={folderLabels.project}>
+              <span className="max-w-48 truncate" title={bot.project.cwd}>{projectPlace(bot.project, owner, (id) => nodeName(id, { nodes: workspace.nodes, directory }))}</span>
             </SettingsRow> : null}
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
               <span className="max-w-48 truncate font-mono" title={model}>{model}</span>

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
+import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
@@ -444,7 +445,7 @@ function BotDetails({ manager, display, working, busy, save }: { manager: Manage
   }}>
     <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
     {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
-    {field("workspace", "Bot 工作文件夹")}
+    {field("workspace", folderLabels.botRun)}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }

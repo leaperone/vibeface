@@ -6,6 +6,7 @@ import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
@@ -231,7 +232,7 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
   return <View className="gap-3">
     <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
-    {field('workspace', 'Bot 工作文件夹')}
+    {field('workspace', folderLabels.botRun)}
     {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>
