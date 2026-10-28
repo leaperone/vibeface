@@ -108,7 +108,7 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
         await expect(offlineCard).toBeVisible({ timeout: 30000 });
         offlineScreenshot = await preserveScreenshot('android-offline.png', await app.screenshot('ordinary-paid-android-offline'));
         await device.back();
-        await expect(offlineCard).toBeHidden({ timeout: 30000 });
+        await expect(screen.getByLabel(/^(?!连接：)(.* · )?(离线|连接中|同步中|在线)$/)).toBeHidden({ timeout: 30000 });
         await device.home();
         await background();
         await event('offline-visible');
