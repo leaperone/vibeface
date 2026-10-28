@@ -29,11 +29,12 @@ export default function Settings() {
   const [leaving, setLeaving] = useState(false)
   const { busy, error, run } = useRun()
   const scroll = useRef<ScrollViewInstance>(null)
+  const reveal = useRef(false)
   // Leaving would take the last way to approve devices and settings with it, so say so instead of offering it.
   const sole = workspace.members.some((member) => member.current && member.admin) && !workspace.members.some((member) => !member.current && member.admin)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   // The confirmation opens at the foot of the page, below the fold on a phone.
-  return <ScrollView ref={scroll} onContentSizeChange={() => { if (leaving) scroll.current?.scrollToEnd() }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     {/* The home header already shows the connection, so settings starts with the devices. */}
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
@@ -65,7 +66,7 @@ export default function Settings() {
           <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
           <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
         </View>
-      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); setLeaving(true) }}>
+      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setLeaving(true) }}>
         <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开{self}</Text>
       </Button>}
     </View>

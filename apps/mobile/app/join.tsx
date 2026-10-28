@@ -27,6 +27,8 @@ export default function JoinScreen() {
   const session = workspace.session
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
+  // The request is out, so the Node has spent the link.
+  useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
@@ -64,8 +66,8 @@ function LostKey() {
   </Panel>
 }
 
-// A link is single-use: once a join started from it, coming back here after 取消 or 断开 must not offer it again.
-let filled: string | null = null
+// A link is single-use: once a join request went out with it, coming back here after 取消 or 断开 must not offer it again.
+let submitted = '', spent = ''
 
 function JoinForm() {
   const workspace = useWorkspace()
@@ -75,7 +77,7 @@ function JoinForm() {
   // The raw URL keeps the ticket after `#`, which router params drop; every new `vibeface://join?link=` refills the field.
   useEffect(() => {
     const link = url ? new URL(url).searchParams.get('link') : null
-    if (link && link !== filled) { filled = link; setInvitation(link) }
+    if (link && link !== spent) setInvitation(link)
   }, [url])
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
@@ -84,6 +86,7 @@ function JoinForm() {
   const submit = async () => {
     setError('')
     setBusy(true)
+    submitted = invitation.trim()
     try { await workspace.actions.join(invitation.trim(), name.trim()) }
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
