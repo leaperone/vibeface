@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -40,15 +40,6 @@ function BrandMark({ className }: { className?: string }) {
 
 export function Wordmark({ className }: { className?: string }) {
   return <span className={cn("inline-flex items-center gap-2 text-heading font-semibold tracking-tight", className)}><BrandMark />Vibeface</span>
-}
-
-/** Bots share one quiet tile with their initial; only the primary bot takes the brand color. */
-export function BotAvatar({ name, primary = false, size = "md", className }: { name: string; primary?: boolean; size?: "sm" | "md" | "lg"; className?: string }) {
-  // "我的" says whose bot it is, not which; a name left with only "Bot" shows the bot icon.
-  const rest = name.trim().replace(/^我的\s*/, "")
-  const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
-  return <span aria-hidden="true" className={cn("grid shrink-0 place-items-center font-semibold ring-1 select-none ring-inset", primary ? "bg-brand-soft text-brand ring-brand/20" : "bg-muted text-muted-foreground ring-border",
-    size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
 
 /** The primary bot's star. Alone, its name shows on hover and to screen readers; `labeled` writes it out. */
