@@ -3,7 +3,7 @@ import test from 'node:test'
 import { backTo, byRecent, homeBot } from './home.ts'
 import type { BotRecord } from './types.ts'
 
-const bot = (id: string, at?: number): BotRecord => ({ bot_id: id, conversation_id: `c-${id}`, name: id, instructions: '', models: {}, skills: null, event_hash: id, last_message: at === undefined ? null : { text: 'hi', role: 'assistant', created_at_ms: at } })
+const bot = (id: string, at?: number): BotRecord => ({ bot_id: id, conversation_id: `c-${id}`, name: id, instructions: '', models: {}, skills: null, event_hash: id, last_message: at === undefined ? null : { text: 'hi', role: 'assistant', created_at_ms: at }, busy: null })
 const bots = [bot('a', 1), bot('b', 3), bot('c')]
 
 test('a phone opens to the conversation list', () => {

@@ -7,9 +7,11 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
+import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
+import { botMood, BotFace, ScreenFaces } from '@/components/bot-face'
+import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -127,8 +129,8 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras) : []
-  // The bot's hue carries from its monogram into the send button and starter chips, so each chat reads as that bot's.
-  const tint = botTint(botHue(bot.bot_id), theme === 'dark')
+  // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
+  const tint = botTint(faceOf(bot.bot_id).hue, theme === 'dark')
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
     <Stack.Screen options={{
@@ -162,7 +164,7 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <Monogram name={bot.name} seed={bot.bot_id} hero />
+        <ScreenFaces><BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={80} primary={workspace.primary === bot.conversation_id} /></ScreenFaces>
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
         {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}

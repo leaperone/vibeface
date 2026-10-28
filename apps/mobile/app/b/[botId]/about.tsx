@@ -4,16 +4,19 @@ import type { ReactNode } from 'react'
 import { Alert, ScrollView, View } from 'react-native'
 import { formatIn, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
 import { ActionButton } from '@/components/action'
+import { botMood, BotFace } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 
 /** A bot as the web's bot panel shows it: primary or not, what it does, its schedules, notes and the shared skills. Changes are made by asking it in the chat. */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
+  const workspace = useWorkspace()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
   if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
@@ -21,7 +24,8 @@ export default function BotAbout() {
   const empty = view && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
-    <View className="gap-3">
+    <View className="items-start gap-3">
+      <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, shared)} size={80} />
       {shared.primary === bot.conversation_id
         ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 Bot</Text></View>
         : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}

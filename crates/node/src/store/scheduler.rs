@@ -1310,6 +1310,27 @@ impl Store {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
     }
 
+    /// Each busy conversation on this device; a reply running outranks messages still waiting.
+    pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
+        let mut statement = self.connection.prepare(
+            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering')
+             UNION ALL SELECT conversation_id,'queued' FROM scheduler_outbox",
+        )?;
+        let rows =
+            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut busy = std::collections::BTreeMap::new();
+        for row in rows {
+            let (conversation, state) = row?;
+            let now = match state.as_str() {
+                "running" | "cancelling" => Busy::Replying,
+                _ => Busy::Thinking,
+            };
+            let entry = busy.entry(conversation).or_insert(now);
+            *entry = (*entry).max(now);
+        }
+        Ok(busy)
+    }
+
     pub fn scheduler_outbox(&self) -> Result<Vec<OutboxEntry>> {
         let mut statement = self.connection.prepare(
             "SELECT conversation_id,trigger FROM scheduler_outbox ORDER BY conversation_id,trigger",

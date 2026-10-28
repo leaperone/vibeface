@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowDownToLine, ArrowRightLeft, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { ActionCard, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { BotFace, botMood } from '@/components/app/bot-face'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -235,7 +236,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
+          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={48} />
           <div className="grid justify-items-center gap-1">
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}

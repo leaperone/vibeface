@@ -4,7 +4,8 @@ import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
 import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { BotAvatar, EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
+import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
+import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
@@ -60,9 +61,10 @@ export function BotPanelButton() {
   const models = Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
+  const mood = botMood(bot, workspace)
   return <>
     <button type="button" className="-ms-1.5 flex min-h-11 min-w-0 items-center gap-2 rounded-lg ps-1 pe-1.5 outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 enabled:hover:bg-muted enabled:active:bg-muted md:min-h-10 dark:enabled:hover:bg-muted/50" aria-haspopup="dialog" title={bot.name} disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
-      <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} />
+      <BotFace botId={bot.bot_id} mood={mood} size={32} />
       <span className="min-w-0 truncate">{bot.name}</span>
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
@@ -74,7 +76,7 @@ export function BotPanelButton() {
         if (composer) { event.preventDefault(); composer.focus() }
       }}>
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
-          <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
+          <BotFace botId={bot.bot_id} mood={mood} size={48} />
           <span className="grid min-w-0 gap-0.5">
             <SheetTitle className="text-title font-semibold break-words">{bot.name}</SheetTitle>
             <SheetDescription className="text-meta">在聊天里说一声就能改</SheetDescription>
