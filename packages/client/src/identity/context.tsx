@@ -1175,20 +1175,29 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 30_000)
     return () => clearInterval(timer)
   }, [recovery?.status])
+  const otherNodes = !!directory && directory.members.filter(member => member.kind === 'node').length > 1
   useEffect(() => {
     if (!ready) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
-    // The Node pushes one on every membership change; join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    // The connected Node pushes membership, recovery and its own join changes. A join waiting on another Node
+    // is only seen by asking, so a manager in a network with several Nodes still rereads every 30s.
     const refresh = () => { void refreshDirectory().catch(() => {}) }
     let poll: ReturnType<typeof setInterval> | undefined
-    if (ready.principal.can_manage) { refresh(); poll = setInterval(refresh, 30_000) }
+    if (ready.principal.can_manage) { refresh(); if (otherNodes) poll = setInterval(refresh, 30_000) }
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
       clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
     return () => { clearTimeout(timer); clearInterval(poll); stop() }
-  }, [ready])
+  }, [ready, otherNodes])
+  useEffect(() => {
+    if (!joins.length) return
+    // A join expires on the Node's clock without a push; reread once the first one is due.
+    const due = Math.min(...joins.map(item => item.expires_at_ms)) - (Date.now() + nodeClockOffset)
+    const timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, Math.max(due + 1000, 5000))
+    return () => clearTimeout(timer)
+  }, [joins, nodeClockOffset])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
   function setRotateHint(network: string, recoveryKey: string | null) { try { store(`rotate-hint.${network}`, recoveryKey) } catch {} setDismissals(count => count + 1) }
   const rotateHint = !!ready?.principal.can_manage && !!directory && load(`rotate-hint.${ready.principal.network_id}`) === directory.recovery_key

@@ -270,7 +270,7 @@ impl Client {
             params,
         };
         send_value(&mut self.socket, &mut self.channel, &request).await?;
-        tokio::time::timeout(CALL_TIMEOUT, async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let value: Value = serde_json::from_slice(
                     &receive_value(&mut self.socket, &mut self.channel).await?,
@@ -841,7 +841,7 @@ async fn dispatch(
                 "join key differs from this channel's device"
             );
             let request = node.store.lock().await.join(&join, &session.device_id)?;
-            notify_join(node, &request);
+            node.publish_reread(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
@@ -871,7 +871,7 @@ async fn dispatch(
                     .await
                     .join_status(join_id, &session.device_id, reveal)?;
             if reveal.is_some() {
-                notify_join(node, &request);
+                node.publish_reread(&request.network_id);
             }
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
@@ -888,7 +888,7 @@ async fn dispatch(
                 .lock()
                 .await
                 .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
-            notify_join(node, &request);
+            node.publish_reread(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
@@ -1179,7 +1179,7 @@ pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) ->
         node.install_membership(state.clone()).await?;
         request
     };
-    notify_join(node, &request);
+    node.publish_reread(&request.network_id);
     Ok(serde_json::to_value(request)?)
 }
 
@@ -1200,13 +1200,6 @@ async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> 
             json!({"type":"changed","conversation_id":payload["conversation_id"]})
         }
     }
-}
-
-fn notify_join(node: &Runtime, request: &JoinRequest) {
-    let _ = node.events.send(crate::runtime::Update {
-        network_id: request.network_id.clone(),
-        payload: json!({"type":"join","join_id":request.join_id,"status":request.status}),
-    });
 }
 
 /// Reads membership; a member wins over a local cookie.
@@ -1852,6 +1845,22 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    /// The payload of the next push this client receives.
+    async fn next_push(client: &mut Client) -> Result<Value> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value: Value = serde_json::from_slice(
+                    &receive_value(&mut client.socket, &mut client.channel).await?,
+                )?;
+                if value["type"] == "changed" {
+                    return Ok(value["payload"].clone());
+                }
+            }
+        })
+        .await
+        .context("no push arrived")?
+    }
 
     #[tokio::test]
     async fn delivery_requires_a_current_managing_member_and_does_not_create_a_wallet_for_free_use()
@@ -3220,6 +3229,15 @@ mod tests {
             let grant = GovernanceEvent::grant(&admin, &node.membership_state().await?.project()?, Member::client(&fresh, "phone", false)?)?;
             assert_eq!(manager.call("approve", json!({"join_id":rejoin,"event":grant})).await?["status"], "joined");
             assert_eq!(rejoining.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            rejoining.call("subscribe", json!({})).await?;
+            manager.call("subscribe", json!({})).await?;
+            let later = LocalIdentity::generate();
+            manager.call("invite", invite([5; 32])?).await?;
+            connect(later.clone()).await?.call("join", join(&later, [5; 32], &nonce)?).await?;
+            for client in [&mut manager, &mut rejoining] {
+                assert_eq!(next_push(client).await?, json!({"type":"changed"}),
+                    "a new join tells every open page to reread, and tells nothing about the request");
+            }
 
             let replacement = LocalIdentity::generate();
             let before = node.membership_state().await?;
@@ -3248,6 +3266,7 @@ mod tests {
             refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
             let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
+            assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");
