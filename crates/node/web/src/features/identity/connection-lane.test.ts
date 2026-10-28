@@ -801,6 +801,24 @@ for (const responded of [true, false]) test(`a ${responded ? 'rejected' : 'disco
   } finally { app.close() }
 })
 
+for (const reply of ['withdrawn', 'lost']) test(`cancelling a waiting join withdraws it once at the entry when the reply is ${reply}`, async () => {
+  const app = deviceHarness({ joining: 'pending' })
+  const hold = deferred(); app.holds.set('join_withdraw', hold)
+  try {
+    app.render(); await settle(); app.render()
+    assert.equal(app.render().joining?.join_id, 'join')
+    app.render().cancelJoin()
+    assert.equal(app.render().joining, null)
+    assert.equal(app.render().phase, 'disconnected')
+    assert.equal(app.stored.get('vibeface.pending-join') ?? 'null', 'null')
+    if (reply === 'withdrawn') hold.resolve(joinRequest('withdrawn')); else hold.reject(new Error('connection lost'))
+    await settle(); await settle()
+    assert.deepEqual(app.requests.filter(request => request.method === 'join_withdraw').map(request => request.params.join_id), ['join'])
+    assert.equal(app.render().error, '')
+    assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
 for (const stage of ['authenticate', 'info', 'subscribe']) test(`cancelJoin during ${stage} cannot restore the cancelled connection`, async () => {
   const app = deviceHarness({ joining: 'joined' })
   const hold = deferred(); app.holds.set(stage, hold)

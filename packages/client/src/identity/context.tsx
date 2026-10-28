@@ -812,7 +812,18 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const next = { ...mine, status: status.status, code }
     joiningRef.current = next; setJoining(next)
   }
-  const cancelJoin = disconnect
+  /**
+   * Cancelling takes the request back at the entry so the manager's approval card goes away now, not at expiry.
+   * One withdraw over the live channel, never retried: a lost reply leaves the request to expire on its own.
+   */
+  const cancelJoin = useCallback(() => {
+    const pending = joiningRef.current, active = session.current
+    if (pending && active && entryKey(active.entry) === entryKey(pending.entry)) {
+      session.current = null
+      void active.channel.request('join_withdraw', { join_id: pending.join_id }).catch(() => {}).finally(() => active.channel.close())
+    }
+    disconnect()
+  }, [disconnect])
   async function createLocalNetwork(nameValue: string, password: string, nodeName?: string) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。请用加入链接或恢复文件。')
     const name = deviceName(nameValue)
@@ -1175,20 +1186,29 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 30_000)
     return () => clearInterval(timer)
   }, [recovery?.status])
+  const otherNodes = !!directory && directory.members.filter(member => member.kind === 'node').length > 1
   useEffect(() => {
     if (!ready) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
-    // The Node pushes one on every membership change; join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    // The connected Node pushes membership, recovery and its own join changes. A join waiting on another Node
+    // is only seen by asking, so a manager in a network with several Nodes still rereads every 30s.
     const refresh = () => { void refreshDirectory().catch(() => {}) }
     let poll: ReturnType<typeof setInterval> | undefined
-    if (ready.principal.can_manage) { refresh(); poll = setInterval(refresh, 30_000) }
+    if (ready.principal.can_manage) { refresh(); if (otherNodes) poll = setInterval(refresh, 30_000) }
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
       clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
     return () => { clearTimeout(timer); clearInterval(poll); stop() }
-  }, [ready])
+  }, [ready, otherNodes])
+  useEffect(() => {
+    if (!joins.length) return
+    // A join expires on the Node's clock without a push; reread once the first one is due.
+    const due = Math.min(...joins.map(item => item.expires_at_ms)) - (Date.now() + nodeClockOffset)
+    const timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, Math.max(due + 1000, 5000))
+    return () => clearTimeout(timer)
+  }, [joins, nodeClockOffset])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
   function setRotateHint(network: string, recoveryKey: string | null) { try { store(`rotate-hint.${network}`, recoveryKey) } catch {} setDismissals(count => count + 1) }
   const rotateHint = !!ready?.principal.can_manage && !!directory && load(`rotate-hint.${ready.principal.network_id}`) === directory.recovery_key
