@@ -121,7 +121,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
-                        <BotFace botId={bot.bot_id} mood={mood} size={20} />
+                        <BotFace botId={bot.bot_id} mood={mood} size={28} className="size-7!" />
                         <span className="min-w-0 flex-1 truncate">{bot.name}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</span>
                         {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
                         {marked ? <Dot label="有新进展" /> : null}
