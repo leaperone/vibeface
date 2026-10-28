@@ -5,7 +5,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { onlyManagerText } from '@vibeface/client/identity/copy.ts'
+import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -30,8 +30,7 @@ export default function Settings() {
   const { busy, error, run } = useRun()
   const scroll = useRef<ScrollViewInstance>(null)
   const reveal = useRef(false)
-  // Leaving would take the last way to approve devices and settings with it, so say so instead of offering it.
-  const sole = workspace.members.some((member) => member.current && member.admin) && !workspace.members.some((member) => !member.current && member.admin)
+  const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   // The confirmation opens at the foot of the page, below the fold on a phone.
   return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">

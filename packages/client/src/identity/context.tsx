@@ -215,6 +215,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
+  // A link is single-use: once a join request went out with it, 取消 or 断开 must not bring it back.
+  const spentLinks = useRef(new Set<string>())
+  const spend = (link: string) => { spentLinks.current.add(link); setInitialInvitation(current => current === link ? '' : current) }
   const [localSetup, setLocalSetup] = useState<LocalSetup | null>(null)
   const [removedFrom, setRemovedFrom] = useState<ConnectionEntry | null>(null)
   const [rejoined, setRejoined] = useState(false)
@@ -534,6 +537,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     try {
       for (;;) {
         const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        spend(linkText)
         if (reply.status === 'cancelled') return 'cancelled'
         if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
         if (reply.status === 'joined') break
@@ -768,6 +772,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       let response: ReturnType<typeof parseJoinRequest>
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
+      spend(linkText)
       if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
       if (response.status === 'rejected' || response.status === 'expired') throw new Error(spentInviteText)
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
@@ -799,8 +804,6 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
-      // The link is single-use; a later visit to the join screen starts empty.
-      setInitialInvitation('')
       return
     }
     if (status.status === 'rejected' || status.status === 'expired') {
@@ -1073,7 +1076,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     } finally { opened.release(); verified?.free() }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
-  useEffect(() => page?.watchInvitation(invitation => { setInitialInvitation(invitation); setError('') }), [])
+  useEffect(() => page?.watchInvitation(invitation => { if (!spentLinks.current.has(invitation)) { setInitialInvitation(invitation); setError('') } }), [])
   useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
   useEffect(() => {
     let mounted = true
