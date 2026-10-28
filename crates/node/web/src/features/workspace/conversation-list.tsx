@@ -9,6 +9,7 @@ import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
+import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { terms } from "@/lib/glossary"
 import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
@@ -17,7 +18,7 @@ import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
-  const open = useInbox().filter((item) => !item.done)
+  const open = waitingItems(useInbox())
   const questions = openQuestions(workspace.questions)
   const now = Date.now()
   const bots = byRecent(workspace.bots)

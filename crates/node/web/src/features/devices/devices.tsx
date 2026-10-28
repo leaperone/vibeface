@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { isLoopback, phoneName } from "@vibeface/client/workspace/labels.ts"
+import { deviceOnline, isLoopback, phoneName } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
@@ -34,8 +34,7 @@ export function useDeviceRows(): DeviceRow[] {
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
       entry, browser: id === identity?.deviceId,
-      // Before the device list arrives, the computer this page talks through is as online as the connection.
-      online: kind === "node" ? node?.online ?? (entry && connectionOnline) : undefined, bot: botReadiness(node), admin: member?.manage ?? false,
+      online: deviceOnline(kind, node, entry && connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }

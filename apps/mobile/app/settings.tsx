@@ -111,7 +111,7 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
         <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
         {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
       </View>
-      <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
+      {member.online !== undefined ? <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} /> : null}
       <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
     </Pressable>
   </Link>

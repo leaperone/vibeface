@@ -1176,12 +1176,12 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     return () => clearInterval(timer)
   }, [recovery?.status])
   useEffect(() => {
-    if (!ready?.principal.can_manage) return
+    if (!ready) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
-    // Join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    // The Node pushes one on every membership change; join requests and recoveries are not pushed, so a manager also rereads them every 30s.
     const refresh = () => { void refreshDirectory().catch(() => {}) }
-    refresh()
-    const poll = setInterval(refresh, 30_000)
+    let poll: ReturnType<typeof setInterval> | undefined
+    if (ready.principal.can_manage) { refresh(); poll = setInterval(refresh, 30_000) }
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return

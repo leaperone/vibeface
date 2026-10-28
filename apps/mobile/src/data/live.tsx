@@ -4,7 +4,8 @@ import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/pro
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
-import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness } from '@vibeface/client/workspace/model.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
@@ -19,6 +20,13 @@ const SharedContext = createContext<Shared | null>(null)
 
 /** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
 export const useLive = () => useContext(SharedContext)
+
+/** 待处理, item for item as the web lists it; nothing before a member connection. */
+export function useInbox(): InboxItem[] {
+  const device = useDevice()
+  const shared = useLive()
+  return shared ? inboxItems({ device, workspace: shared }) : []
+}
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
 export function LiveWorkspace({ children }: { children: ReactNode }) {
@@ -116,11 +124,11 @@ function Live({ children }: { children: ReactNode }) {
   for (const question of questions) if (question.conversation_id && !question.answer && !(question.question_id in answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
 
   const members: Member[] = (device.directory?.members ?? []).map((member) => {
-    const node = nodes.find((item) => item.device_id === member.device_id)
+    const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-      online: member.kind === 'node' ? node?.online === true : member.device_id === me,
-      current: member.device_id === me, entry: member.device_id === device.ready?.entry.device_id, bot: botReadiness(node) !== null,
+      online: deviceOnline(member.kind, node, entry && (connection.state === 'online' || connection.state === 'syncing')),
+      current: member.device_id === me, entry, bot: botReadiness(node) !== null,
     }
   })
 

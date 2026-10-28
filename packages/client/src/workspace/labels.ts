@@ -68,6 +68,18 @@ export function addressName(address: string) {
 
 /** A browser-or-phone device named like a phone; any other is a browser. */
 export const phoneName = (name: string) => /iphone|android|ipad|phone|手机/i.test(name)
+
+/** Joins and members carry only node or client, so a client named like a phone counts as one, everywhere it shows. */
+export type DeviceForm = "computer" | "phone" | "browser"
+export const deviceForm = (kind: "node" | "client", name: string): DeviceForm => kind === "node" ? "computer" : phoneName(name) ? "phone" : "browser"
+export const formName: Record<DeviceForm, string> = { computer: "电脑", phone: "手机", browser: "浏览器" }
+
+/**
+ * A computer's reachability as the Node reports it; `throughEntry` stands in for the connected one before that read.
+ * A browser or phone has none: only the Node it happens to be connected to would know.
+ */
+export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, throughEntry: boolean) =>
+  kind === "node" ? node?.online ?? throughEntry : undefined
 export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {

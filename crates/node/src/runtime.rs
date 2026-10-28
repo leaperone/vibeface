@@ -343,17 +343,25 @@ impl Runtime {
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
-        let mut state = incoming;
-        if store.has_network()? {
-            state = store.public_state()?.merge(&state)?;
-        }
+        let previous = if store.has_network()? {
+            Some(store.public_state()?)
+        } else {
+            None
+        };
+        let state = match &previous {
+            Some(previous) => previous.merge(&incoming)?,
+            None => incoming,
+        };
+        // Clients read the device list on a change, so a join, removal or permission change
+        // shows on every open page without a reload.
+        let changed = previous.as_ref() != Some(&state);
         let network = state.genesis.network_id.clone();
         let (view, rebuilt) = store.install_state(state)?;
         if rebuilt {
             store.settle_local_works(&network)?;
         }
         drop(store);
-        if rebuilt {
+        if rebuilt || changed {
             self.publish_reread(&network);
         }
         self.membership.send_modify(|changes| *changes += 1);
@@ -521,7 +529,8 @@ impl Runtime {
         self.publish_changed(network, scope, Changed::Event(&event.hash));
         Ok(event)
     }
-    /// Clients reread everything: which events count changed, or a member Node came or went.
+    /// Clients reread everything: which events count changed, the membership changed, or a member
+    /// Node came or went.
     pub(crate) fn publish_reread(&self, network: &str) {
         let _ = self.events.send(Update {
             network_id: network.into(),
