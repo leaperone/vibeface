@@ -3574,7 +3574,7 @@ mod tests {
             let network = node.network_id().await?;
             let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
             let access = Access {
-                network_id: network,
+                network_id: network.clone(),
                 human: false,
                 conversation_id: Some("c".into()),
                 manager: None,
@@ -3601,14 +3601,52 @@ mod tests {
                 .tool(access.clone(), "track_work", send("r2", json!("codex")))
                 .await;
             let only = node
-                .tool(access, "track_work", send("r3", Value::Null))
+                .tool(access.clone(), "track_work", send("r3", Value::Null))
                 .await;
+            {
+                let mut providers = node.providers.lock().unwrap();
+                providers.switches.execution.insert(Provider::Claude);
+                (providers.bins).insert(Provider::Claude, "/nonexistent/claude".into());
+            }
+            // A Codex thread is no session of Claude Code's own works.
+            let foreign = node
+                .tool(access.clone(), "track_work", send("r4", json!("claude")))
+                .await;
+            let local = node.identity.device_id()?;
+            let earlier = crate::work::WorkSpec {
+                work_id: "w-earlier".into(),
+                conversation: "c".into(),
+                trigger: "message:m0".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "w-earlier".into(),
+                kind: crate::model::WorkKind::Agent(Provider::Claude),
+                cwd: String::new(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t-claude".into()),
+            };
+            (node.store.lock().await).accept_work(&node.identity, &network, earlier, now_ms())?;
+            let own = json!({"thread":"t-claude","call_ref":"r5","title":"t","prompt":"p",
+                "agent":"claude"});
+            let own = node.tool(access, "track_work", own).await;
             node.finish_manager_attempt(&attempt).await;
             let off = off.expect_err("claude executes no work here");
             assert!(format!("{off:#}").contains("turned off"), "{off:#}");
             assert_eq!(named?["may_send"], true, "the Codex CLI sends it");
             assert_eq!(retried?["may_send"], false, "a retry never sends again");
             assert_eq!(only?["may_send"], true, "codex is the only executor");
+            let foreign = foreign.expect_err("a session no Claude Code work ran in");
+            assert!(
+                format!("{foreign:#}").contains("sessions this device's works ran in"),
+                "{foreign:#}"
+            );
+            let on_thread = node.store.lock().await.work_records_on_thread("t-other")?;
+            assert_eq!(on_thread.len(), 2, "the refused work left nothing behind");
+            // It goes on to Claude Code, which finds no directory for a session without one.
+            assert_eq!(own?["may_send"], false);
             Ok::<_, anyhow::Error>(())
         }
         .await;

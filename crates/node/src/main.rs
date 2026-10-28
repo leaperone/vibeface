@@ -546,7 +546,7 @@ async fn main() -> Result<()> {
                         std::env::var_os("VIBEFACE_TOOL_TOKEN").is_some(),
                         "codex send runs inside a bot turn (VIBEFACE_NODE_URL and VIBEFACE_TOOL_TOKEN); outside one, ask the bot in its chat"
                     );
-                    let args = json!({"thread":thread,"prompt":text,"call_ref":id,
+                    let args = json!({"thread":thread,"prompt":text,"call_ref":id,"agent":"codex",
                         "model":model,"effort":effort,"images":image});
                     let result = dispatch_work(&args, &id, &socket()?).await?;
                     println!("{}", serde_json::to_string(&result)?);
@@ -1558,8 +1558,9 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
                 call_id,
             )
         },
-        || async {
-            let _ = post_tool("wait_work", json!({}), call_id).await;
+        |agent| async move {
+            let ready = post_tool("wait_work", json!({"agent":agent}), call_id).await;
+            ready.ok()?["agent"].as_str().map(str::to_owned)
         },
         socket,
     )

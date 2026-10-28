@@ -350,7 +350,7 @@ impl Runtime {
             }
             Tool::WaitWork => {
                 drop((_lease, _work));
-                Ok(json!({"connected": self.codex.ready().await}))
+                Ok(json!({"agent": self.ready_for(&args["agent"]).await}))
             }
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             Tool::DispatchWork => {
@@ -362,8 +362,8 @@ impl Runtime {
                     |work_id, report| async move {
                         self.bind_work(network, scope, &work_id, report).await
                     },
-                    || async {
-                        self.codex.ready().await;
+                    |agent| async move {
+                        (self.ready_for(&agent).await).map(|agent| agent.name().to_owned())
                     },
                     &socket,
                 )
@@ -521,6 +521,23 @@ impl Runtime {
                 bail!("agent picks a provider of this device; another device's bot picks its own")
             }
         };
+        // The Codex App Server runs every turn of its threads itself. Another provider's session
+        // may be open in a program the Node does not see, so it takes work only in a session one
+        // of its works on this device ran in.
+        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind)
+            && provider != Provider::Codex
+        {
+            let store = self.store.lock().await;
+            let own = (store.work_records_on_thread(thread)?.iter()).any(|run| {
+                run.kind == kind
+                    && matches!(store.conversation(network, &run.conversation), Ok(Some(_)))
+            });
+            ensure!(
+                own,
+                "{} takes work only in sessions this device's works ran in; dispatch it without thread, or follow an earlier work with continues",
+                provider.label()
+            );
+        }
         let spec = WorkSpec {
             work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
             conversation: scope.into(),
@@ -564,6 +581,17 @@ impl Runtime {
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
             "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread}),
         )
+    }
+
+    /// The provider a work naming `agent` would run on here, once the Node's App Server
+    /// connection is up when that is Codex; `None` when none would, as `track_work` then says.
+    async fn ready_for(&self, agent: &Value) -> Option<Provider> {
+        let agent = serde_json::from_value(agent.clone()).ok()?;
+        let provider = self.executing(agent).ok()?;
+        if provider == Provider::Codex {
+            self.codex.ready().await;
+        }
+        Some(provider)
     }
 
     /// The provider a work on this device runs on: the one asked for, or the only one that
