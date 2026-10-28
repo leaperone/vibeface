@@ -124,13 +124,13 @@ impl Provider {
         }
     }
 
-    /// What the runtime can run on each provider: the Cursor bridge and Claude Code run only
-    /// bots, and pi and opencode run neither yet.
+    /// What the runtime can run on each provider: the Cursor bridge runs only bots, and
+    /// pi and opencode run neither yet.
     pub fn supports(self) -> &'static [Role] {
         match self {
             Provider::Codex => &[Role::Agent, Role::Execution],
             Provider::Cursor => &[Role::Agent],
-            Provider::Claude => &[Role::Agent],
+            Provider::Claude => &[Role::Agent, Role::Execution],
             Provider::Pi | Provider::Opencode => &[],
         }
     }

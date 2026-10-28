@@ -3454,7 +3454,7 @@ mod tests {
                 node.executor(Provider::Codex)?,
                 &*node.codex
             ));
-            assert!(node.executor(Provider::Claude).is_err());
+            assert!(node.executor(Provider::Cursor).is_err());
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;

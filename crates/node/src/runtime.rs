@@ -255,7 +255,7 @@ impl Runtime {
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         providers.validate(codex_agent)?;
-        let claude = claude::Claude::open(dir);
+        let claude = claude::Claude::open(dir, providers.env.get(Provider::Claude));
         let codex = Arc::new(codex_server::CodexServer::open(
             providers.codex_target(codex_agent),
             &identity,

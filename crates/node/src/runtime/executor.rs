@@ -71,7 +71,8 @@ impl Runtime {
     pub(super) fn executor(&self, provider: Provider) -> Result<&dyn Executor> {
         match provider {
             Provider::Codex => Ok(self.codex.as_ref()),
-            Provider::Cursor | Provider::Claude | Provider::Pi | Provider::Opencode => {
+            Provider::Claude => Ok(&self.claude),
+            Provider::Cursor | Provider::Pi | Provider::Opencode => {
                 bail!("{} runs no work on this device yet", provider.label())
             }
         }
