@@ -168,7 +168,7 @@
 
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
-| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测 |
+| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测。离线 Node 的 `capabilities` 是本 Node 本次运行中它最后一次回答的能力，还没回答过的为 `null` |
 | `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改；`primary` 为主 Bot 的会话 ID |
 | `set_primary_bot` | `conversation_id`、`attestation` | 本人选定主 Bot，写入 `bots` scope |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
@@ -353,7 +353,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 2. 对每个对方领先的作者发 `{"type":"pull", author, from_seq, limit}`，对方按 `seq` 升序返回主分支事件，每批最多 1024 条、合计 8 MiB。
 3. 对方的头本机没有时，从两边较小的序号起每次加倍退后、每次拉一条，直到拉到本机已有的事件，再向后拉回对方那一支。
 4. `forks` 是本机所有分叉作者从分叉序号起两支事件 hash 的摘要，没有分叉时为空字符串。摘要不同时发 `{"type":"forks", after}`，`after` 为上一页最后一条的 `[author, seq, hash]` 或 `null`，对方返回其后的分叉证据，每页限额同 `pull`，每轮最多 64 页。
-5. 本机追加事件后向已连接的成员发 `{"type":"have", author, seq, hash}`，对方落后时立即同步。收到的 Hello 带本机没有的头、不同的成员目录摘要或新的一对不同分叉摘要时，也立即同步。空闲连接每 60 秒重新 Hello。
+5. 本机追加事件后向已连接的成员发 `{"type":"have", author, seq, hash}`，对方落后时立即同步。收到的 Hello 带本机没有的头、不同的成员目录摘要或新的一对不同分叉摘要时，也立即同步。空闲连接每 60 秒重新 Hello。对方主动关闭它连来的连接时立即重新同步。与某个成员的同步由成功变为失败或由失败恢复时，向已订阅的客户端推送一条不带会话的 `changed`，客户端据此重读 `nodes`。
 6. `boot` 是对端本次启动的编号。编号变化说明对端重启，本机立即关闭到它的旧连接并重新同步，不等 QUIC 空闲超时。
 
 同步只写入历史和投影，不重新执行历史中的操作。同步失败按退避重试，最长间隔 30 秒。
