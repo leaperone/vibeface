@@ -384,7 +384,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return next
       })
     })
-    // Pushes carry every change but a device coming online or going offline; this catches those and anything missed.
+    // A device coming or going is pushed once the Node's sync notices; this rereads sooner while one is away and catches anything missed.
     let ticks = 0
     const timer = setInterval(() => {
       ticks += 1

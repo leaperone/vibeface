@@ -6,7 +6,7 @@
 use super::*;
 use crate::net::{self, AddressRecord, Net, SignedAddress};
 use iroh::{
-    endpoint::Connection,
+    endpoint::{Connection, ConnectionError},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use std::sync::Weak;
@@ -36,6 +36,8 @@ pub(super) struct PeerSync {
     forks: Option<String>,
     /// This boot has seen the peer hold nothing of this device's log beyond ours.
     confirmed: bool,
+    /// What the peer last answered to `capabilities`, kept to show while it is offline.
+    capabilities: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -346,10 +348,12 @@ impl Runtime {
             self.serve_blobs(connection, network, remote).await;
             return Ok(());
         }
-        let watched = connection.clone();
+        let (watched, closed) = (connection.clone(), connection.clone());
+        let node = self.clone();
+        let peer = remote.clone();
         net::serve_streams(connection, move |request: Value| {
             let (node, connection, network, remote) = (
-                self.clone(),
+                node.clone(),
                 watched.clone(),
                 network.clone(),
                 remote.clone(),
@@ -368,6 +372,15 @@ impl Runtime {
             }
         })
         .await;
+        // A peer that shut down closed this itself; syncing now tells clients it went offline.
+        if let Some(
+            ConnectionError::ApplicationClosed(_)
+            | ConnectionError::ConnectionClosed(_)
+            | ConnectionError::Reset,
+        ) = closed.close_reason()
+        {
+            self.wake_sync(&peer);
+        }
         Ok(())
     }
 
@@ -709,10 +722,11 @@ impl Runtime {
                 let network = network.clone();
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
-                    let rerun = {
+                    let (rerun, presence_changed) = {
                         let mut states = node.sync_peers.lock().expect("sync peers");
                         let entry = states.entry(peer.clone()).or_default();
                         entry.running = false;
+                        let was_failing = entry.failures > 0;
                         match &result {
                             Ok(()) => {
                                 entry.failures = 0;
@@ -730,8 +744,11 @@ impl Runtime {
                         if rerun {
                             entry.due = Some(Instant::now());
                         }
-                        rerun
+                        (rerun, was_failing != (entry.failures > 0))
                     };
+                    if presence_changed {
+                        node.publish_reread(&network);
+                    }
                     if result.is_err() {
                         node.align(&network).await;
                     }
@@ -855,6 +872,16 @@ impl Runtime {
             tracing::debug!(%peer, %error, "attachment download pending");
         }
         Ok(())
+    }
+
+    /// The peer's capabilities: `answer` when it gave one, otherwise the last it gave.
+    pub(crate) fn peer_capabilities(&self, peer: &str, answer: Option<Value>) -> Value {
+        let mut states = self.sync_peers.lock().expect("sync peers");
+        let known = &mut states.entry(peer.to_owned()).or_default().capabilities;
+        if answer.is_some() {
+            *known = answer;
+        }
+        known.clone().unwrap_or(Value::Null)
     }
 
     /// Whether the last sync with `peer` failed.
@@ -1132,7 +1159,7 @@ impl Runtime {
             ingested
         };
         if rebuilt {
-            self.publish_rebuilt(network);
+            self.publish_reread(network);
         }
         let mut scopes = BTreeSet::new();
         for (event, status) in events.iter().zip(&statuses) {
@@ -2781,6 +2808,82 @@ mod tests {
         for dir in [dir_a, dir_b] {
             let _ = std::fs::remove_dir_all(dir);
         }
+        result
+    }
+
+    /// A bot computer that goes offline is announced to clients and keeps its last capabilities,
+    /// so a client tells "its device is offline" from "no device runs a bot".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offline_node_is_announced_and_listed_with_its_last_capabilities() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            b.settings.lock().expect("settings").manager = Some(config::ManagerSettings {
+                provider: crate::providers::Provider::Cursor,
+                workspace: dir_b.join("manager-workspace"),
+                model: String::new(),
+                cursor_sdk_bin: "cursor-sdk".into(),
+            });
+            a.net()?.learn(&b.net()?.addr()).await;
+            let peer = ib.device_id()?;
+            let access = Access {
+                network_id: network.clone(),
+                human: true,
+                conversation_id: None,
+                manager: None,
+            };
+            let listed = |nodes: Value| {
+                nodes["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|node| node["device_id"] == *peer))
+                    .cloned()
+                    .context("the peer is listed")
+            };
+            a.wake_sync(&peer);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !a
+                    .sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .get(&peer)
+                    .is_some_and(|state| state.synced_ms.is_some() && state.failures == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .context("first sync")?;
+            let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
+            assert_eq!(online["online"], true);
+            assert_eq!(online["capabilities"]["manager"], "cursor_sdk");
+            let mut events = a.events.subscribe();
+            b.stop_network().await;
+            a.wake_sync(&peer);
+            tokio::time::timeout(Duration::from_secs(40), async {
+                loop {
+                    let update = events.recv().await?;
+                    if update.network_id == network && update.payload == json!({"type":"changed"}) {
+                        return anyhow::Ok(());
+                    }
+                }
+            })
+            .await
+            .context("clients are told to reread once the peer stops answering")??;
+
+            let offline = listed(a.rpc(access, json!({"method":"nodes"})).await?)?;
+            assert_eq!(offline["online"], false);
+            assert_eq!(offline["capabilities"], online["capabilities"]);
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
         result
     }
 

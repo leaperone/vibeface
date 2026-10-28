@@ -354,7 +354,7 @@ impl Runtime {
         }
         drop(store);
         if rebuilt {
-            self.publish_rebuilt(&network);
+            self.publish_reread(&network);
         }
         self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
@@ -521,8 +521,8 @@ impl Runtime {
         self.publish_changed(network, scope, Changed::Event(&event.hash));
         Ok(event)
     }
-    /// Which events count changed, so every conversation may read differently now.
-    pub(crate) fn publish_rebuilt(&self, network: &str) {
+    /// Clients reread everything: which events count changed, or a member Node came or went.
+    pub(crate) fn publish_reread(&self, network: &str) {
         let _ = self.events.send(Update {
             network_id: network.into(),
             payload: json!({"type":"changed"}),
@@ -626,29 +626,30 @@ impl Runtime {
                     .collect();
                 let probes = members.iter().map(|member| async {
                     if member.device_id == local {
-                        return self.capabilities().await;
+                        return (true, self.capabilities().await);
                     }
                     // A Node the sync loop cannot reach would hold this answer for the timeout.
-                    if self.sync_failing(&member.device_id) {
-                        return Value::Null;
-                    }
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        self.peer_request(
-                            network,
-                            &member.device_id,
-                            json!({"type":"capabilities"}),
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(Value::Null)
+                    let answer = if self.sync_failing(&member.device_id) {
+                        None
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            self.peer_request(
+                                network,
+                                &member.device_id,
+                                json!({"type":"capabilities"}),
+                            ),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    };
+                    let live = answer.is_some();
+                    (live, self.peer_capabilities(&member.device_id, answer))
                 });
                 let probes = futures_util::future::join_all(probes).await;
-                for (member, capabilities) in members.into_iter().zip(probes) {
+                for (member, (live, capabilities)) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
-                    let live = !capabilities.is_null();
                     let (seq, hash) = match heads.get(&member.device_id) {
                         Some((seq, hash)) => (*seq, Some(hash)),
                         None => (0, None),
