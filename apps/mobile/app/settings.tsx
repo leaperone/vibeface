@@ -25,6 +25,7 @@ export default function Settings() {
   const { theme, hasAdaptiveThemes } = useUniwind()
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
+  const { busy, error, run } = useRun()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     {/* The home header already shows the connection, so settings starts with the devices. */}
@@ -50,9 +51,10 @@ export default function Settings() {
     <View className="border-t border-border pt-6">
       {leaving ? <View className="gap-3">
         <Text>断开后，要用加入链接才能回来。</Text>
+        {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
         <View className="flex-row gap-2">
           <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
-          <Button variant="destructive" className="min-h-11" onPress={workspace.actions.disconnect}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
+          <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
         </View>
       </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); setLeaving(true) }}>
         <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开这台手机</Text>

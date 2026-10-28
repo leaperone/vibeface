@@ -62,7 +62,8 @@ export type WorkspaceActions = {
   send(conversationId: string, text: string, attachments: Attachment[]): Promise<void>
   stop(conversationId: string): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
-  disconnect(): void
+  /** Takes this phone out of the network; coming back takes a join link. */
+  leave(): Promise<void>
 }
 
 export type Workspace = WorkspaceSnapshot & { actions: WorkspaceActions }
