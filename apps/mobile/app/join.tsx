@@ -4,7 +4,7 @@ import { useLinkingURL } from 'expo-linking'
 import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
-import { View } from 'react-native'
+import { Platform, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -63,6 +63,8 @@ function LostKey() {
   </Panel>
 }
 
+const defaultName = Platform.OS === 'ios' && Platform.isPad ? '我的平板' : '我的手机'
+
 function JoinForm() {
   const workspace = useWorkspace()
   const device = useDevice()
@@ -73,7 +75,7 @@ function JoinForm() {
     const link = url ? new URL(url).searchParams.get('link') : null
     if (link) setInvitation(link)
   }, [url])
-  const [name, setName] = useState('我的手机')
+  const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -97,7 +99,7 @@ function JoinForm() {
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
-      <Input accessibilityLabel={joinCopy.deviceName} placeholder="我的手机" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
+      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
     </View>
     {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
     <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
