@@ -2112,9 +2112,9 @@ def triage_checks(run, workspace, a, network, passed):
         thread_id = next(thread_id for thread_id, thread in threads.items() if thread["cwd"].endswith(owner))
         completed_turn = threads[thread_id]["turns"][-1]["id"]
         replayed = node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id,
-                            "turn_id": completed_turn, "cwd": threads[thread_id]["cwd"], "last_bot_message": "done"}))
+                            "turn_id": completed_turn, "cwd": threads[thread_id]["cwd"], "last_assistant_message": "done"}))
         hook = {"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-1", "cwd": str(raise_dir),
-                "last_bot_message": "需要你决定下一步 needs-human"}
+                "last_assistant_message": "需要你决定下一步 needs-human"}
         for _ in range(2):
             node_cli(a, "hook", "codex", stdin=json.dumps(hook))
         tested_hook = json.loads(node_cli(a, "hook", "codex", "--test").stdout)
@@ -2140,7 +2140,7 @@ def triage_checks(run, workspace, a, network, passed):
                 "a 5xx is retried with the same event_id until accepted")
         require(str(workspace) not in json.dumps(signed), "the signed webhook must not expose the local workspace path")
         dead_hook = {"hook_event_name": "Stop", "session_id": "dead-session", "turn_id": "dead-turn", "cwd": str(raise_dir),
-                     "last_bot_message": "dead-letter needs-human"}
+                     "last_assistant_message": "dead-letter needs-human"}
         node_cli(a, "hook", "codex", stdin=json.dumps(dead_hook))
         wait_for("a 4xx goes to the dead letters", lambda: a.client.call("triage_settings")["outbox"]["dead"] >= 1, timeout=90)
         foreign = next(row for row in a.client.rpc("questions")["questions"] if row["about"]["session_id"] == "dead-session")
@@ -2167,7 +2167,7 @@ def triage_checks(run, workspace, a, network, passed):
         decide_dir = workspace / "triage-raise-decision"
         decide_dir.mkdir()
         node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": thread_id, "turn_id": "hook-turn-decision",
-                                                       "cwd": str(decide_dir), "last_bot_message": "choose-next needs-human"}))
+                                                       "cwd": str(decide_dir), "last_assistant_message": "choose-next needs-human"}))
         pending = wait_for("the Agent asks about the live session again", lambda: next(
             (row for row in a.client.rpc("questions")["questions"] if row["about"]["cwd"] == "workspace-1/triage-raise-decision"), None), timeout=90)
         tokens = a.client.call("create_decision_token", {"label": "grok"})
@@ -2215,7 +2215,7 @@ def foreign_session_checks(run, workspace, a, network, passed):
 
     def hook(session, turn, message="tests fail", **extra):
         node_cli(a, "hook", "codex", stdin=json.dumps({"hook_event_name": "Stop", "session_id": session, "turn_id": turn,
-                                                       "cwd": str(directory), "last_bot_message": message, **extra}))
+                                                       "cwd": str(directory), "last_assistant_message": message, **extra}))
 
     def listed(conversation):
         return {row["session_id"]: row for row in a.client.rpc("conversation", conversation_id=conversation)["sessions"]}

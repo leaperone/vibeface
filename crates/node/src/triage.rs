@@ -169,7 +169,7 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         session_id: s(input, "session_id"),
         turn_id: s(input, "turn_id"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_bot_message"),
+        last_message: s(input, "last_assistant_message"),
         detail,
         ..Default::default()
     })
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn every_source_of_one_turn_gets_one_event_id() {
         let node = "n".repeat(64);
-        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_bot_message":"done"}))
+        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_assistant_message":"done"}))
             .unwrap()
             .seal(&node, "h", 1)
             .unwrap();
