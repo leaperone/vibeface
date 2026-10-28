@@ -1,10 +1,11 @@
 import { Star } from 'lucide-react-native'
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { AccessibilityInfo, AppState, View } from 'react-native'
 import Animated, { useAnimatedProps, useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import Svg, { Circle, Defs, Path, RadialGradient, Stop } from 'react-native-svg'
 import { useUniwind } from 'uniwind'
-import { BODY, HALO, colors, eyePaths, faceOf, mix, outlinePath, pose, thinkingDots, type Face, type Mood, type Pose } from '@vibeface/client/avatar/face.ts'
+import { colors, faceOf, HALO, pose, thinkingDots, type Mood } from '@vibeface/client/avatar/face.ts'
+import { ASLEEP, faceMotion, type Frame } from '@vibeface/client/avatar/motion.ts'
 import { moodOf } from '@vibeface/client/avatar/mood.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import type { BotRecord } from '@vibeface/client/workspace/types.ts'
@@ -15,13 +16,6 @@ import { cn } from '@/lib/utils'
 
 const AnimatedPath = Animated.createAnimatedComponent(Path)
 const AnimatedCircle = Animated.createAnimatedComponent(Circle)
-/** The pose drawn when motion is off: eyes open, mid-drift, so each mood still reads. */
-const STILL_T = 2600
-const BLEND_MS = 420
-/** Asleep is the only mood that drains colour; a grey body fades in over the coloured one as saturation drops. */
-const ASLEEP = 0.35
-
-type Frame = { body: string; ring: string; left: string; right: string; ringOpacity: number; grey: number; dx: number; dy: number; rotate: number; scale: number; dots: number[] }
 
 /**
  * One JS-thread clock for every face on screen. face.ts is plain TypeScript shared with the web, not worklets, so each
@@ -51,26 +45,6 @@ function useReduced() {
   return value
 }
 
-function phase(id: string) {
-  let h = 0
-  for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0
-  return h % 10000
-}
-
-// Idle, waiting and asleep keep the outline still, so its path is rebuilt only when a radius moved.
-function frameOf(face: Face, p: Pose, t: number, size: number, outline: { radii: number[]; body: string; ring: string }): Frame {
-  if (p.radii.some((r, i) => r !== outline.radii[i])) {
-    outline.radii = p.radii
-    outline.body = outlinePath(p.radii, 50, 50, BODY)
-    outline.ring = outlinePath(p.radii, 50, 50, HALO.r)
-  }
-  const [left, right] = eyePaths(face, p)
-  return {
-    body: outline.body, ring: outline.ring, left, right, ringOpacity: p.ring, grey: Math.min(1, Math.max(0, (1 - p.saturation) / (1 - ASLEEP))),
-    dx: p.dx * size / 100, dy: p.dy * size / 100, rotate: p.rotate, scale: p.scale, dots: thinkingDots(p, t).map((dot) => dot.opacity),
-  }
-}
-
 /** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the row says the mood. */
 export function BotFace({ botId, mood, size, primary }: { botId: string; mood: Mood; size: 44 | 80; primary?: boolean }) {
   const { theme } = useUniwind()
@@ -79,44 +53,25 @@ export function BotFace({ botId, mood, size, primary }: { botId: string; mood: M
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
   const motionOff = useReduced()
   const gradient = `face${useId().replace(/[^a-zA-Z0-9]/g, '')}`
-  const frame = useSharedValue<Frame>(useState(() => frameOf(face, pose(face, mood, STILL_T), STILL_T, size, { radii: [], body: '', ring: '' }))[0])
-  const follow = useRef((_: Mood) => {})
+  const motion = useMemo(() => faceMotion(botId, mood), [botId])
+  const frame = useSharedValue<Frame>(useState(() => motion.frame(null))[0])
 
   useEffect(() => {
-    const offset = phase(botId), outline = { radii: [] as number[], body: '', ring: '' }
-    // start < 0: a blend waits for its first frame to start its clock.
-    let shown = mood, from: Pose | null = null, start = 0, last: Pose | null = null
-    const draw = (now: number, t: number) => {
-      let p = pose(face, shown, t)
-      if (from) {
-        if (start < 0) start = now
-        const k = Math.min(1, (now - start) / BLEND_MS)
-        p = mix(from, p, 1 - (1 - k) ** 3)
-        if (k >= 1) from = null
-      }
-      last = p
-      frame.value = frameOf(face, p, t, size, outline)
-    }
-    const tick = (now: number) => draw(now, now + offset)
-    draw(0, motionOff ? STILL_T : performance.now() + offset)
-    follow.current = (next: Mood) => {
-      if (next === shown) return
-      from = last
-      start = -1
-      shown = next
-      if (motionOff || !active) { from = null; draw(0, STILL_T) }
-    }
+    const draw = (now: number | null) => { frame.value = motion.frame(now) }
+    draw(motionOff ? null : performance.now())
     if (motionOff) return
-    ticks.add(tick)
+    ticks.add(draw)
     kick()
-    return () => { ticks.delete(tick) }
-    // A mood change goes through follow, so it blends from the current pose instead of restarting the clock.
-  }, [face, size, motionOff, frame, botId])
-  useEffect(() => { follow.current(mood) }, [mood])
+    return () => { ticks.delete(draw) }
+  }, [motion, motionOff, frame])
+  useEffect(() => {
+    motion.follow(mood)
+    if (motionOff || !active) frame.value = motion.frame(null)
+  }, [motion, mood, motionOff, frame])
 
   const bodyStyle = useAnimatedStyle(() => {
     const f = frame.value
-    return { transform: [{ translateX: f.dx }, { translateY: f.dy }, { rotate: `${f.rotate}deg` }, { scale: f.scale }] }
+    return { transform: [{ translateX: f.dx * size / 100 }, { translateY: f.dy * size / 100 }, { rotate: `${f.rotate}deg` }, { scale: f.scale }] }
   })
   const bodyProps = useAnimatedProps(() => ({ d: frame.value.body }))
   const greyProps = useAnimatedProps(() => ({ d: frame.value.body, opacity: frame.value.grey }))
