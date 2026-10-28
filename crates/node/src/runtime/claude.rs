@@ -1,11 +1,13 @@
 //! Claude Code on this device. A bot turn and a dispatched work are each one
 //! `claude -p --input-format stream-json --output-format stream-json` process in its own group.
 //! The Node names the session and the user message before anything is sent, so a turn it lost
-//! sight of is read back from Claude Code's own transcript and never sent again.
+//! sight of is read back from Claude Code's own transcript and never sent again. Hooks of the
+//! owner's own sessions hold permission requests and questions for the bot.
 use super::executor::{Executor, SteerAck, SteerTrace};
 use super::*;
 use crate::manager::{self, CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::SteerTarget;
+use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
 use std::io::BufRead as _;
@@ -1133,6 +1135,79 @@ impl Executor for Claude {
     }
 }
 
+/// What a `PermissionRequest` of the owner's own session asks, for the bot: the tool and what
+/// the model said it is for, never the command or the file contents, and how to answer.
+pub(crate) fn describe_request(input: &Value) -> String {
+    let tool = input["tool_name"].as_str().unwrap_or("a tool");
+    let tool_input = &input["tool_input"];
+    if request_kind(input) == RequestKind::Question {
+        let questions: Vec<String> = tool_input["questions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|question| {
+                let options: Vec<&str> = question["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| option["label"].as_str())
+                    .collect();
+                let text = question["question"].as_str().unwrap_or_default();
+                format!("{text} [{}]", options.join(" | "))
+            })
+            .collect();
+        return format!(
+            "Claude Code asks: {}. Answer with {{\"answers\":{{\"QUESTION\":\"ANSWER\"}}}}.",
+            questions.join("; ")
+        );
+    }
+    let what = tool_input["description"]
+        .as_str()
+        .or_else(|| tool_input["file_path"].as_str())
+        .map(|what| format!(": {what}"))
+        .unwrap_or_default();
+    format!(
+        "{tool}{what}. Answer with {{\"behavior\":\"allow\"}} or {{\"behavior\":\"deny\",\"message\":\"WHY\"}}."
+    )
+}
+
+/// `AskUserQuestion` asks a question; every other tool asks permission.
+pub(crate) fn request_kind(input: &Value) -> RequestKind {
+    match input["tool_name"] == "AskUserQuestion" {
+        true => RequestKind::Question,
+        false => RequestKind::Permission,
+    }
+}
+
+/// What `vibeface hook claude` prints for the answer to its `PermissionRequest`: allow, with
+/// the question's answers filled in, or deny. `None` prints nothing, which leaves the decision
+/// to the session, as for `{"decision":null}` or an answer that fits neither.
+pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
+    if input["hook_event_name"] != "PermissionRequest" {
+        return None;
+    }
+    let decision = match (&answer["answers"], answer["behavior"].as_str()) {
+        (Value::Object(answers), _) if request_kind(input) == RequestKind::Question => {
+            if !answers.values().all(Value::is_string) {
+                return None;
+            }
+            let mut updated = input["tool_input"].clone();
+            updated.as_object_mut()?;
+            updated["answers"] = Value::Object(answers.clone());
+            json!({"behavior":"allow","updatedInput":updated})
+        }
+        (_, Some("allow")) => match &answer["updatedInput"] {
+            updated @ Value::Object(_) => json!({"behavior":"allow","updatedInput":updated}),
+            _ => json!({"behavior":"allow"}),
+        },
+        (_, Some("deny")) => json!({"behavior":"deny",
+            "message":answer["message"].as_str().unwrap_or("The owner's bot declined this."),
+            "interrupt":answer["interrupt"] == true}),
+        _ => return None,
+    };
+    Some(json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":decision}}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,6 +1745,102 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    fn asks(tool: &str, tool_input: Value) -> Value {
+        json!({"hook_event_name":"PermissionRequest","session_id":"s-own","cwd":"/w",
+            "transcript_path":"","tool_name":tool,"tool_input":tool_input,"permission_suggestions":[]})
+    }
+
+    #[tokio::test]
+    async fn a_permission_request_waits_for_the_bot_and_gets_its_answer() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, _) = node(&place).await?;
+        node.settings.lock().unwrap().manager = Some(crate::config::ManagerSettings {
+            provider: Provider::Claude,
+            workspace: place.dir.join("work"),
+            model: String::new(),
+        });
+        let input = asks(
+            "Bash",
+            json!({"command":"rm -rf build","description":"Clean the build"}),
+        );
+        let event = crate::triage::from_claude_hook(&input, 42).context("a hook event")?;
+        assert_eq!(
+            (event.event, event.hold),
+            (
+                crate::triage::Kind::NeedsInput,
+                Some(RequestKind::Permission)
+            )
+        );
+        assert!(event.detail.contains("Clean the build") && !event.detail.contains("rm -rf"));
+        let held = node.ingest_agent_event(event).await?;
+        let request_id = held["request_id"]
+            .as_str()
+            .context("a held request")?
+            .to_owned();
+        let waiting = tokio::spawn({
+            let node = node.clone();
+            let request_id = request_id.clone();
+            async move { node.wait_request(&request_id).await }
+        });
+        tokio::task::yield_now().await;
+        node.triage_command(json!({"action":"respond","request_id":request_id,
+            "result":{"behavior":"allow"}}))
+            .await?;
+        let answer = waiting.await?;
+        assert_eq!(
+            hook_output(&input, &answer),
+            Some(
+                json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+                "decision":{"behavior":"allow"}}})
+            )
+        );
+        assert_eq!(
+            hook_output(&input, &json!({"behavior":"deny","message":"not now"})),
+            Some(
+                json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+                "decision":{"behavior":"deny","message":"not now","interrupt":false}}})
+            )
+        );
+        // What `wait_request` gives at the deadline: nothing is printed and the session decides.
+        assert_eq!(hook_output(&input, &json!({"decision":null})), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_question_is_answered_with_its_answers_filled_in() {
+        let questions = json!([{"question":"Which database?","header":"DB","multiSelect":false,
+            "options":[{"label":"Postgres","description":"server"},{"label":"SQLite","description":"file"}]}]);
+        let input = asks("AskUserQuestion", json!({"questions":questions}));
+        let event = crate::triage::from_claude_hook(&input, 7).expect("a hook event");
+        assert_eq!(event.hold, Some(RequestKind::Question));
+        assert!(
+            event.detail.contains("Which database? [Postgres | SQLite]"),
+            "{}",
+            event.detail
+        );
+        assert_eq!(
+            hook_output(&input, &json!({"answers":{"Which database?":"SQLite"}})),
+            Some(
+                json!({"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{
+                "behavior":"allow","updatedInput":{"questions":questions,
+                "answers":{"Which database?":"SQLite"}}}}})
+            )
+        );
+        assert_eq!(
+            hook_output(&input, &json!({"answers":{"Which database?":2}})),
+            None
+        );
+        assert_eq!(hook_output(&input, &json!({"decision":null})), None);
+    }
+
+    #[test]
+    fn a_stop_hook_carries_the_last_reply() {
+        let stop = json!({"hook_event_name":"Stop","session_id":"s-own","cwd":"/w",
+            "last_assistant_message":"done"});
+        let event = crate::triage::from_claude_hook(&stop, 3).expect("a hook event");
+        assert_eq!(event.last_message, "done");
     }
 
     #[test]

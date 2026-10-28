@@ -175,8 +175,8 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
     })
 }
 
-/// A Claude Code hook's stdin (`Stop`, `StopFailure`, `Notification`); `transcript_bytes` keys
-/// the turn.
+/// A Claude Code hook's stdin (`Stop`, `StopFailure`, `Notification`, `PermissionRequest`);
+/// `transcript_bytes` keys the turn. A permission request or question waits for the answer.
 pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
     let (event, status, detail) = match input["hook_event_name"].as_str()? {
         "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
@@ -196,6 +196,11 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
                 .trim()
                 .into(),
         ),
+        "PermissionRequest" => (
+            Kind::NeedsInput,
+            None,
+            crate::runtime::claude::describe_request(input),
+        ),
         _ => return None,
     };
     Some(AgentEvent {
@@ -206,8 +211,9 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
         session_id: s(input, "session_id"),
         turn_id: format!("tx:{transcript_bytes}"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_bot_message"),
+        last_message: s(input, "last_assistant_message"),
         detail,
+        hold: (event == Kind::NeedsInput).then(|| crate::runtime::claude::request_kind(input)),
         ..Default::default()
     })
 }
@@ -556,7 +562,14 @@ pub fn add_hooks(settings: &mut Value, file: &HookFile, command: &str) -> Result
         if entries.iter().any(|entry| ours(entry, file.agent)) {
             continue;
         }
-        entries.push(json!({"hooks":[{"type":"command","command":command,"timeout":10}]}));
+        // A Claude Code permission request waits for the bot's answer.
+        let timeout = match (file.agent, *event) {
+            (Provider::Claude, "PermissionRequest") => {
+                crate::runtime::AGENT_ANSWER_WITHIN.as_secs() + 30
+            }
+            _ => 10,
+        };
+        entries.push(json!({"hooks":[{"type":"command","command":command,"timeout":timeout}]}));
         added.push((*event).to_owned());
     }
     Ok(added)
@@ -774,7 +787,7 @@ mod tests {
         let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
         assert_eq!(
             add_hooks(&mut settings, claude, &command).unwrap(),
-            ["Stop", "StopFailure", "Notification"]
+            ["Stop", "StopFailure", "Notification", "PermissionRequest"]
         );
         assert!(
             add_hooks(&mut settings, claude, &command)
@@ -783,12 +796,18 @@ mod tests {
         );
         assert_eq!(settings["hooks"]["Stop"][0], other);
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(installed(&settings, claude).len(), 3);
+        assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 150,
+            "a permission request outlasts the wait for the bot's answer"
+        );
+        assert_eq!(installed(&settings, claude).len(), 4);
         assert!(installed(&settings, codex).is_empty());
-        assert_eq!(remove_hooks(&mut settings, claude).len(), 3);
+        assert_eq!(remove_hooks(&mut settings, claude).len(), 4);
         assert_eq!(
             settings,
-            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[]}})
+            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[],
+                "PermissionRequest":[]}})
         );
         assert!(add_hooks(&mut json!([]), codex, &command).is_err());
     }

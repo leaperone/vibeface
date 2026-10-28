@@ -158,7 +158,7 @@ impl Provider {
             }),
             Provider::Claude => Some(Watch::Hooks {
                 file: ".claude/settings.json",
-                events: &["Stop", "StopFailure", "Notification"],
+                events: &["Stop", "StopFailure", "Notification", "PermissionRequest"],
             }),
             Provider::Cursor | Provider::Pi | Provider::Opencode => None,
         }

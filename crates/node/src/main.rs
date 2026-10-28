@@ -1710,8 +1710,8 @@ fn hook_event(agent: Provider, input: &Value) -> Result<Option<vibeface::triage:
 
 async fn hook(options: Hook) -> Result<()> {
     use vibeface::triage::{self, AgentEvent};
-    let mut event = if options.test {
-        AgentEvent {
+    let (mut event, input) = if options.test {
+        let event = AgentEvent {
             source: triage::Source::Test,
             agent: options.agent,
             session_id: "test".into(),
@@ -1719,7 +1719,8 @@ async fn hook(options: Hook) -> Result<()> {
             cwd: std::env::current_dir()?.to_string_lossy().into(),
             test: true,
             ..Default::default()
-        }
+        };
+        (event, Value::Null)
     } else {
         let mut input = Vec::new();
         std::io::stdin().take(1 << 20).read_to_end(&mut input)?;
@@ -1727,7 +1728,7 @@ async fn hook(options: Hook) -> Result<()> {
         let Some(event) = hook_event(options.agent, &input)? else {
             return Ok(());
         };
-        event
+        (event, input)
     };
     if !event.cwd.is_empty() {
         let top = git(&event.cwd, &["rev-parse", "--show-toplevel"]);
@@ -1767,8 +1768,12 @@ async fn hook(options: Hook) -> Result<()> {
                     vibeface::runtime::AGENT_ANSWER_WITHIN + Duration::from_secs(10),
                 )
                 .await?;
-                if answer != json!({"decision":null}) {
-                    println!("{}", serde_json::to_string(&answer)?);
+                let output = match options.agent {
+                    Provider::Claude => vibeface::runtime::claude::hook_output(&input, &answer),
+                    _ => (answer != json!({"decision":null})).then_some(answer),
+                };
+                if let Some(output) = output {
+                    println!("{}", serde_json::to_string(&output)?);
                 }
             }
         }
