@@ -2,6 +2,7 @@ import * as Clipboard from 'expo-clipboard'
 import { Check, ChevronDown, ChevronRight, Copy, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, Pressable, View } from 'react-native'
+import { oklch } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -94,6 +95,6 @@ export function Badge({ count }: { count: number }) {
 /** A bot's face hue as a solid fill with legible ink on it, and a soft edge for outlines, so its chat's accents read as that bot's. */
 export function botTint(hue: number, dark: boolean) {
   return dark
-    ? { fill: `hsl(${hue}, 40%, 72%)`, ink: `hsl(${hue}, 30%, 12%)`, edge: `hsl(${hue}, 25%, 34%)` }
-    : { fill: `hsl(${hue}, 45%, 34%)`, ink: '#fff', edge: `hsl(${hue}, 35%, 80%)` }
+    ? { fill: oklch(0.78, 0.09, hue), ink: oklch(0.2, 0.03, hue), edge: oklch(0.42, 0.05, hue) }
+    : { fill: oklch(0.45, 0.1, hue), ink: '#fff', edge: oklch(0.86, 0.04, hue) }
 }

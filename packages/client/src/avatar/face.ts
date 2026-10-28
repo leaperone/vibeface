@@ -14,10 +14,9 @@ export const BODY = 36
 export const HALO = { r: BODY + 1.5 + 1.2, width: 2.4 }
 const OUTLINES: Outline[] = ['round', 'squircle', 'drop', 'bean', 'cloud']
 const EYES: Eyes[] = ['dot', 'pill', 'oval', 'wide']
-// The hues and hash mobile used before faces, so chat accents keep matching the face.
-const HUES = [8, 32, 52, 100, 160, 200, 235, 280]
-// Those HSL hues mapped to the OKLCH hue that reads as the same colour.
-const OK_HUE: Record<number, number> = { 8: 22, 32: 55, 52: 100, 100: 135, 160: 170, 200: 225, 235: 275, 280: 320 }
+// OKLCH hues. 60 to 90 is left to the amber waiting halo so no face blurs into it.
+const HUES = [20, 45, 100, 130, 155, 180, 205, 230, 255, 285, 315, 345]
+const YELLOW = 100
 const ANGLES = Array.from({ length: SAMPLES }, (_, i) => 2 * Math.PI * i / SAMPLES)
 
 export function faceOf(id: string): Face {
@@ -135,10 +134,10 @@ export function eyePaths(face: Face, p: Pose): string[] {
 
 /** Body gradient stops (radial, centred at 38% 30%), ink and the warning halo, all at one perceived lightness. */
 export function colors(face: Face, dark: boolean, saturation: number): Colors {
-  const h = OK_HUE[face.hue] ?? face.hue
+  const h = face.hue
   const s = clamp(saturation, 0, 1)
   // Yellow only reads clean near its natural lightness; at the shared one it turns olive and blurs into the amber halo.
-  const lift = h === OK_HUE[52] ? 0.08 : 0
+  const lift = h === YELLOW ? 0.08 : 0
   const [l, c] = dark ? [0.70 + lift, 0.10] : [0.74 + lift, 0.11]
   const base = oklch(l, c * s, h)
   const ink = oklch(dark ? 0.18 : 0.24, 0.04 * s, h)
@@ -154,7 +153,7 @@ export function colors(face: Face, dark: boolean, saturation: number): Colors {
 }
 
 // OKLCH to sRGB hex; chroma shrinks until the colour fits the gamut so hue and lightness hold.
-function oklch(l: number, c: number, h: number) {
+export function oklch(l: number, c: number, h: number) {
   const a = h * Math.PI / 180
   for (let chroma = c; ; chroma = Math.max(0, chroma - 0.005)) {
     const rgb = oklabToSrgb(l, chroma * Math.cos(a), chroma * Math.sin(a))

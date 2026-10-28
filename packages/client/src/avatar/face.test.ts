@@ -5,11 +5,11 @@ import { colors, eyePaths, faceOf, mix, pose, thinkingDots, type Mood, type Outl
 const outlines: Outline[] = ['round', 'squircle', 'drop', 'bean', 'cloud']
 const moods: Mood[] = ['idle', 'thinking', 'replying', 'waiting', 'asleep']
 
-test('a bot keeps its face and its existing chat hue', () => {
+test('a bot keeps its face, and no face takes the halo amber', () => {
   assert.deepEqual(faceOf('bot-a'), faceOf('bot-a'))
-  assert.equal(faceOf('bot-a').hue, 52)
-  assert.equal(faceOf('codex').hue, 32)
-  assert.equal(faceOf('小管家').hue, 100)
+  const hues = new Set(Array.from({ length: 400 }, (_, i) => faceOf(`bot-${i}`).hue))
+  assert.equal(hues.size, 12)
+  for (const hue of hues) assert.ok(hue < 60 || hue > 90, `hue ${hue}`)
 })
 
 test('ids spread over every outline and eye shape', () => {
