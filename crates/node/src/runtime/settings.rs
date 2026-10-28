@@ -168,7 +168,11 @@ impl Runtime {
             Provider::Codex => Sdk::Codex {
                 socket: self.codex.socket(),
             },
-            Provider::Claude | Provider::Pi | Provider::Opencode => {
+            Provider::Claude => Sdk::Claude {
+                bin: self.providers().bin(Provider::Claude),
+                processes: self.claude.processes(),
+            },
+            Provider::Pi | Provider::Opencode => {
                 anyhow::bail!("{} does not run bots here yet", settings.provider.label())
             }
         };

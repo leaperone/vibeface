@@ -34,6 +34,11 @@ pub enum Sdk {
     /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
     /// from the Shell environment the thread was created with.
     Codex { socket: PathBuf },
+    /// Each turn is one `claude -p` process; `processes` records its group.
+    Claude {
+        bin: PathBuf,
+        processes: Arc<crate::runtime::claude::Processes>,
+    },
 }
 
 impl Sdk {
@@ -41,6 +46,7 @@ impl Sdk {
         match self {
             Sdk::Cursor { .. } => crate::providers::Provider::Cursor,
             Sdk::Codex { .. } => crate::providers::Provider::Codex,
+            Sdk::Claude { .. } => crate::providers::Provider::Claude,
         }
     }
 }
@@ -201,6 +207,19 @@ where
             run_codex(
                 config,
                 socket,
+                prompt,
+                previous_session_id,
+                persist_session,
+                cancel,
+                progress,
+            )
+            .await
+        }
+        Sdk::Claude { bin, processes } => {
+            crate::runtime::claude::run_bot(
+                config,
+                bin,
+                processes,
                 prompt,
                 previous_session_id,
                 persist_session,
@@ -598,7 +617,7 @@ where
         usage: None,
     })
 }
-fn secret_values(config: &ManagerConfig) -> Vec<String> {
+pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
         .tool_env
         .values()
@@ -690,13 +709,13 @@ fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
     keys.dedup();
     Ok(keys)
 }
-fn redact_string(mut text: String, secrets: &[String]) -> String {
+pub(crate) fn redact_string(mut text: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|value| !value.is_empty()) {
         text = text.replace(secret, "[redacted]");
     }
     text
 }
-fn redact(value: Value, secrets: &[String]) -> Value {
+pub(crate) fn redact(value: Value, secrets: &[String]) -> Value {
     match value {
         Value::String(text) => Value::String(redact_string(text, secrets)),
         Value::Array(items) => Value::Array(

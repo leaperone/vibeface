@@ -124,13 +124,14 @@ impl Provider {
         }
     }
 
-    /// What the runtime can run on each provider: the Cursor bridge runs only bots, and
-    /// Claude Code, pi and opencode run neither yet.
+    /// What the runtime can run on each provider: the Cursor bridge and Claude Code run only
+    /// bots, and pi and opencode run neither yet.
     pub fn supports(self) -> &'static [Role] {
         match self {
             Provider::Codex => &[Role::Agent, Role::Execution],
             Provider::Cursor => &[Role::Agent],
-            Provider::Claude | Provider::Pi | Provider::Opencode => &[],
+            Provider::Claude => &[Role::Agent],
+            Provider::Pi | Provider::Opencode => &[],
         }
     }
 
@@ -189,12 +190,12 @@ impl Provider {
         })
     }
 
-    /// The model the bot runs with: Cursor needs one, and Codex reads "auto" as a model name,
-    /// so there an empty one means its default.
+    /// The model the bot runs with: Cursor needs one, and Codex and Claude Code read "auto" as a
+    /// model name, so there an empty one means their default.
     pub fn model(self, model: &str) -> String {
         match self {
             Provider::Cursor if model.trim().is_empty() => "auto".into(),
-            Provider::Codex if model == "auto" => String::new(),
+            Provider::Codex | Provider::Claude if model == "auto" => String::new(),
             _ => model.into(),
         }
     }

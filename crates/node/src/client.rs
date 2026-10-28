@@ -2526,7 +2526,6 @@ mod tests {
             json!({"provider":"cursor","execution":true}),
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
-            json!({"provider":"claude","bot":true}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
             assert!(

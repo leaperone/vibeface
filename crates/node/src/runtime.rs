@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 pub(crate) mod agent_tools;
 mod bots;
 mod chat_controls;
+pub mod claude;
 mod codex_server;
 mod cursor;
 mod executor;
@@ -160,6 +161,7 @@ pub struct Runtime {
     pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
+    pub(crate) claude: claude::Claude,
     progress_sequence: std::sync::atomic::AtomicU64,
     /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
     /// stop and its deadline are stored, so a restart retries at once.
@@ -253,6 +255,7 @@ impl Runtime {
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         providers.validate(codex_agent)?;
+        let claude = claude::Claude::open(dir);
         let codex = Arc::new(codex_server::CodexServer::open(
             providers.codex_target(codex_agent),
             &identity,
@@ -300,6 +303,7 @@ impl Runtime {
             cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
+            claude,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
             live_probe_at: std::sync::atomic::AtomicI64::new(now_ms()),
@@ -491,11 +495,13 @@ impl Runtime {
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
-    /// Stops the managed App Server and Cursor bridge; the Node calls this on SIGTERM before exiting.
+    /// Stops the managed App Server, Claude Code processes and Cursor bridge; the Node calls this
+    /// on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.delivery.shutdown().await;
         self.stop_network().await;
         self.codex.stop().await;
+        self.claude.stop().await;
         if let Some(bridge) = self.cursor.get() {
             bridge.stop().await;
         }
