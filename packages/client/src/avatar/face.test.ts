@@ -45,7 +45,8 @@ test('mix lands exactly on either end', () => {
 })
 
 test('every hue gives in-gamut hex colours in both themes, asleep included', () => {
-  for (const hue of [8, 32, 52, 100, 160, 200, 235, 280]) for (const dark of [false, true]) for (const saturation of [1, 0.35]) {
+  const hues = new Set(Array.from({ length: 400 }, (_, i) => faceOf(`bot-${i}`).hue))
+  for (const hue of hues) for (const dark of [false, true]) for (const saturation of [1, 0.35]) {
     for (const value of Object.values(colors({ ...faceOf('bot-a'), hue }, dark, saturation))) assert.match(value, /^#[0-9a-f]{6}$/)
   }
 })
