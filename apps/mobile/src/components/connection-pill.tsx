@@ -15,9 +15,9 @@ const looks: Record<Connection['state'], { label: string; icon: LucideIcon; tone
 
 export function ConnectionPill({ connection }: { connection: Connection }) {
   const look = looks[connection.state]
-  return <View accessible accessibilityLabel={`经 ${connection.entry} · ${look.label}`} className="min-h-11 flex-row items-center gap-2 px-2">
+  return <View accessible accessibilityLabel={connection.entry ? `经 ${connection.entry} · ${look.label}` : look.label} className="min-h-11 flex-row items-center gap-2 px-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />
-    <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">经 {connection.entry}</Text>
+    <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{connection.entry ? `经 ${connection.entry}` : ''}</Text>
     <Text className="text-meta text-muted-foreground">{look.label}</Text>
   </View>
 }

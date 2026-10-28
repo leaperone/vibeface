@@ -85,10 +85,10 @@ export function Details({ children, label = '详细信息', open: initial = fals
   </View>
 }
 
-export function Badge({ count }: { count: number }) {
+export function Badge({ count, fill, ink }: { count: number; fill?: string; ink?: string }) {
   if (!count) return null
-  return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-foreground px-1.5">
-    <Text maxFontSizeMultiplier={1.4} className="text-[11px] leading-5 font-semibold text-background" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text>
+  return <View accessibilityLabel={`${count} 条未读`} className="min-w-5 items-center rounded-full bg-foreground px-1.5" style={fill ? { backgroundColor: fill } : undefined}>
+    <Text maxFontSizeMultiplier={1.4} className="text-[11px] leading-5 font-semibold text-background" style={[{ fontVariant: ['tabular-nums'] }, ink ? { color: ink } : null]}>{count}</Text>
   </View>
 }
 

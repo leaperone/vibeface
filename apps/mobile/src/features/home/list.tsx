@@ -1,10 +1,12 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, Inbox, Plus, Settings, Star } from 'lucide-react-native'
+import { Bot, ChevronRight, Inbox, Plus, Settings, Star } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
+import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { useUniwind, withUniwind } from 'uniwind'
 import { ConnectionPill } from '@/components/connection-pill'
-import { Badge, EmptyState, Monogram } from '@/components/kit'
+import { Badge, botHue, botTint, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -15,13 +17,20 @@ import { useLive } from '@/data/live'
 import { listTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 
+const Item = withUniwind(Animated.View)
+// A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
+const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMotion(ReduceMotion.System)
+const fadeIn = FadeIn.duration(200).reduceMotion(ReduceMotion.System)
+const fadeOut = FadeOut.duration(150).reduceMotion(ReduceMotion.System)
+
 /**
- * The home list, as on the web: 待处理 first, then every bot by its newest message. As a sidebar it draws its own
- * title and settings button in place of the native header, and keeps the open screen's row lit.
+ * The home list: a 待处理 card while something waits, then every bot by its newest message. As a sidebar it draws its
+ * own title, new-bot and settings buttons in place of the native header, and keeps the open screen's row lit.
  */
-export function HomeList({ sidebar }: { sidebar?: boolean }) {
+export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?: number }) {
   const workspace = useWorkspace()
   const device = useDevice()
+  const dark = useUniwind().theme === 'dark'
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
   const shared = useLive()
@@ -34,46 +43,56 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
   const replace = sidebar === true && pathname !== '/'
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('grow gap-2 px-1', sidebar ? 'px-2' : 'w-full max-w-2xl self-center pb-8')}
-    contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : undefined}>
-    {sidebar ? <View className="flex-row items-center justify-between ps-3 pt-2">
-      <Text role="heading" className="text-3xl font-bold">消息</Text>
+  // Entering animations skip the first render, so only a 待处理 card that appears later fades in.
+  return <LayoutAnimationConfig skipEntering><ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('px-2', sidebar ? 'grow' : 'w-full max-w-2xl self-center pb-8')}
+    contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : { minHeight }}>
+    {sidebar ? <View className="mb-2 flex-row items-center ps-3 pt-2">
+      <Text role="heading" className="flex-1 text-3xl font-bold">消息</Text>
+      <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
     </View> : null}
-    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={device.pendingRecovery ? recoveryCopy.pending : waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
-    <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
-      <Text role="heading" className="text-meta font-medium text-muted-foreground">Bot</Text>
-      <Link href="/new-bot" asChild>
-        <Button variant="ghost" size="icon" className="-me-1 size-11" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button>
+    {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
+      <Link href="/inbox" replace={replace} asChild>
+        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border border-warning-border bg-warning-soft px-3 py-2.5 active:opacity-70', active('/inbox') && 'border-warning')}>
+          <View className="size-11 items-center justify-center rounded-full bg-warning/15"><Icon as={Inbox} className="text-warning" /></View>
+          <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
+          <Icon as={ChevronRight} className="text-muted-foreground" />
+        </Pressable>
       </Link>
-    </View>
-    {bots.length ? bots.map((bot) => {
+    </Item> : null}
+    {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message
-      return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name}
-        mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
-        unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
-        preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
-    }) : loading ? <View accessibilityLabel="正在读取 Bot" className="gap-2">{[0, 1, 2].map((item) => <View key={item} className="h-16 rounded-xl bg-muted/60" />)}</View> : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
+      return <Item key={bot.bot_id} layout={move}>
+        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name} tint={botTint(botHue(bot.bot_id), dark)}
+          mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+          unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
+          preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
+        {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
+      </Item>
+    }) : loading ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
+      <View className="size-11 rounded-full bg-muted" />
+      <View className="flex-1 gap-2"><View className="h-3.5 w-1/3 rounded-full bg-muted" /><View className="h-3 w-2/3 rounded-full bg-muted/60" /></View>
+    </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
-    </Link> : undefined} />}
-    <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
-  </ScrollView>
+    </Link> : undefined} /></View>}
+    <View className="mt-auto px-1 pt-6"><ConnectionPill connection={workspace.connection} /></View>
+  </ScrollView></LayoutAnimationConfig>
 }
 
-function Row({ href, replace, active, avatar, name, mark, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }) {
+function Row({ href, replace, active, avatar, name, mark, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {
   return <Link href={href} replace={replace} asChild>
     <Pressable accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">
           <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
-            <Text numberOfLines={1} className="shrink font-medium">{name}</Text>{mark}
+            <Text numberOfLines={1} className={cn('shrink', unread ? 'font-semibold' : 'font-medium')}>{name}</Text>{mark}
           </View>
-          {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
+          {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={[{ fontVariant: ['tabular-nums'] }, unread ? { color: tint.fill } : null]}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">
-          <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{preview}</Text>
-          <Badge count={unread} />
+          <Text numberOfLines={1} className={cn('min-w-0 flex-1 text-meta', unread ? 'text-foreground' : 'text-muted-foreground')}>{preview}</Text>
+          <Badge count={unread} fill={tint.fill} ink={tint.ink} />
         </View>
       </View>
     </Pressable>
