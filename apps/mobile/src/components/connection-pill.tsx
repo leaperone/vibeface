@@ -36,7 +36,7 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
   const [at, setAt] = useState<{ x: number; y: number } | null>(null)
   // A rotation or resize moves the icon away from where the card was placed.
   useEffect(() => setOpen(false), [window.width, window.height])
-  // A little left of the icon, so on the phone the card also covers the large title's first glyph beneath it.
+  // A little left of and, by its padding, below the large title's first glyph, so no stroke shows past the rounded corner.
   const left = at ? Math.max(8, at.x - 8) : 0
   return <>
     <Pressable ref={button} onPress={() => button.current?.measureInWindow((x, y, _width, height) => { setAt({ x, y: y + height }); setOpen(true) })}
@@ -45,7 +45,7 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
     </Pressable>
     <Modal transparent statusBarTranslucent navigationBarTranslucent visible={open} animationType="fade" onRequestClose={() => setOpen(false)}>
       <Pressable className="absolute inset-0" onPress={() => setOpen(false)} accessibilityRole="button" accessibilityLabel="关闭" />
-      {at ? <View style={{ position: 'absolute', left, top: at.y + 4, width: Math.min(320, window.width - left - 8) }} className="rounded-xl border border-border bg-background px-2 shadow-lg">
+      {at ? <View style={{ position: 'absolute', left, top: at.y + 4, width: Math.min(320, window.width - left - 8) }} className="rounded-xl border border-border bg-background px-2 py-1 shadow-lg">
         <ConnectionPill connection={connection} />
       </View> : null}
     </Modal>
