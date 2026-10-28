@@ -164,9 +164,12 @@ export function folderSuggestions(response: NodeSettingsResponse): { path: strin
   return response.suggested_roots.filter((path) => !response.settings.roots.includes(path)).map((path) => ({ path, label: response.display_paths[path] ?? path }))
 }
 
-/** Turning a bot on. A device's first bot also runs its tasks, so its first work request does not stop at a switch. */
+/**
+ * Turning a bot on. On a device not set up yet (no bot, no tasks, no folders) it also runs its tasks, so the first work
+ * request does not stop at a switch; once someone has set it up, their choice stands.
+ */
 export function botOnChange(response: NodeSettingsResponse, provider: ProviderStatus): { bot: true; execution?: true } {
-  const first = response.settings.manager === null && !response.providers.some((item) => item.roles.includes('execution'))
+  const first = response.settings.manager === null && !response.settings.roots.length && !response.providers.some((item) => item.roles.includes('execution'))
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
 }
 

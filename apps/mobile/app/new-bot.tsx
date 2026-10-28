@@ -61,7 +61,7 @@ export default function NewBot() {
       {options.length > 1 ? <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
         {options.map((item, index) => {
           const selected = same(item.project)
-          return <Pressable key={item.project ? `${item.project.target_node}:${item.project.cwd}` : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}
+          return <Pressable key={item.project ? projectKey(item.project) : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}
             disabled={locked} onPress={() => setProject(item.project)}
             className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted', index > 0 && 'border-t border-border', locked && !selected && 'opacity-50')}>
             <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
