@@ -1302,7 +1302,10 @@ impl Executor for Opencode {
                         turn_id: message,
                         epoch,
                     };
-                    node.signal_work(network, id, signal).await?;
+                    // The work runs now; its follower reads the turn back.
+                    if let Err(error) = node.signal_work(network, id, signal).await {
+                        tracing::warn!(%error, work_id = id, "the opencode work waits for its probe");
+                    }
                 }
                 Sent::Refused(failure) => return reject(failure).await,
                 Sent::Unknown(detail) => {

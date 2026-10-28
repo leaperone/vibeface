@@ -3,8 +3,9 @@
 //! unknown, reads it back instead of sending again.
 use super::*;
 use crate::scheduling::{SteerOutcome, SteerTarget};
-use crate::work::{Probe, WorkRecord, WorkSpec};
+use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
+use vibeface_bridge::failure::{ExecFailure, FailureKind};
 
 /// How the provider took a steer.
 #[derive(Debug, PartialEq)]
@@ -35,8 +36,9 @@ pub(crate) trait Executor: Send + Sync {
     /// or that of the work it continues. `args` are `dispatch_work`'s, with model, effort and
     /// images. The thread is journaled (`Signal::ThreadCreated`) before anything is sent, so a
     /// restart reads the turn back by the work ID. `true` leaves the send to the dispatching
-    /// Agent, which reports it through `bind_work`. On an error the reconcile refuses the work
-    /// once its send window is over.
+    /// Agent, which reports it through `bind_work`. An error means nothing was started, and
+    /// `Runtime::start_work` rejects the work; once something may run, the follower and probes
+    /// settle it.
     fn start<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
@@ -67,6 +69,30 @@ pub(crate) trait Executor: Send + Sync {
 }
 
 impl Runtime {
+    /// Has `executor` start a work registered just now. A start that fails rejects the work, so
+    /// the Agent sees the failure and dispatches again under a new `call_ref`; a retry of this
+    /// one finds the work and starts nothing.
+    pub(super) async fn start_work(
+        self: &Arc<Self>,
+        executor: &dyn Executor,
+        network: &str,
+        work: &WorkSpec,
+        thread: Option<&str>,
+        args: &Value,
+    ) -> Result<bool> {
+        let error = match executor.start(self, network, work, thread, args).await {
+            Ok(may_send) => return Ok(may_send),
+            Err(error) => error,
+        };
+        let failure = ExecFailure::new(FailureKind::Rejected, format!("{error:#}"));
+        if let Err(signal) =
+            (self.signal_work(network, &work.work_id, Signal::StartRejected(failure))).await
+        {
+            tracing::warn!(%signal, work_id = work.work_id, "a failed start waits for the reconcile");
+        }
+        Err(error.context("the work was not started; dispatch it again under a new call_ref"))
+    }
+
     /// Where `provider`'s turns run on this device.
     pub(super) fn executor(&self, provider: Provider) -> Result<&dyn Executor> {
         match provider {

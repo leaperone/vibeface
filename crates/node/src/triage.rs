@@ -189,6 +189,9 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
                 .trim()
                 .into(),
         ),
+        // A held permission request that got no answer falls back to Claude Code's own prompt,
+        // which notifies again; the request already woke the Agent.
+        "Notification" if input["notification_type"] == "permission_prompt" => return None,
         "Notification" => (
             Kind::Notification,
             None,
@@ -276,16 +279,7 @@ pub fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
             Some(RequestKind::Permission),
         ),
         "question.asked" => {
-            let questions: Vec<String> = (input["questions"].as_array().into_iter().flatten())
-                .map(|question| {
-                    let options: Vec<&str> = (question["options"].as_array().into_iter())
-                        .flatten()
-                        .filter_map(|option| option["label"].as_str())
-                        .collect();
-                    let text = question["question"].as_str().unwrap_or_default();
-                    format!("{text} [{}]", options.join(" | "))
-                })
-                .collect();
+            let questions = question_lines(&input["questions"]);
             // The answer's form comes first: the Agent sees the start of a long detail.
             let detail = format!(
                 "Answer with {{\"answers\":[[\"LABEL\"]]}}, the labels chosen for each question in order, or {{\"reject\":true}}. opencode asks: {}.",
@@ -315,6 +309,23 @@ pub fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
         hold,
         ..Default::default()
     })
+}
+
+/// Each question of a request with its option labels, as `text [A | B]`, or its bare text when
+/// it offers none; the Agent answers with the labels.
+pub(crate) fn question_lines(questions: &Value) -> Vec<String> {
+    (questions.as_array().into_iter().flatten())
+        .map(|question| {
+            let text = question["question"].as_str().unwrap_or_default();
+            let options: Vec<&str> = (question["options"].as_array().into_iter().flatten())
+                .filter_map(|option| option["label"].as_str())
+                .collect();
+            match options.is_empty() {
+                true => text.to_owned(),
+                false => format!("{text} [{}]", options.join(" | ")),
+            }
+        })
+        .collect()
 }
 
 /// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
@@ -790,6 +801,15 @@ mod tests {
         assert_eq!(
             (claude.turn_id.as_str(), claude.event),
             ("tx:10", Kind::Notification)
+        );
+        assert_eq!(
+            from_claude_hook(
+                &json!({"hook_event_name":"Notification","session_id":"c",
+                    "notification_type":"permission_prompt","message":"Claude needs your permission"}),
+                10,
+            ),
+            None,
+            "the prompt a held permission request falls back to does not wake the Agent again"
         );
         let asks = |command: &str| {
             from_claude_hook(

@@ -1164,21 +1164,7 @@ pub(crate) fn describe_request(input: &Value) -> String {
     let tool = input["tool_name"].as_str().unwrap_or("a tool");
     let tool_input = &input["tool_input"];
     if request_kind(input) == RequestKind::Question {
-        let questions: Vec<String> = tool_input["questions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|question| {
-                let options: Vec<&str> = question["options"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|option| option["label"].as_str())
-                    .collect();
-                let text = question["question"].as_str().unwrap_or_default();
-                format!("{text} [{}]", options.join(" | "))
-            })
-            .collect();
+        let questions = crate::triage::question_lines(&tool_input["questions"]);
         return format!(
             "Claude Code asks: {}. Answer with {{\"answers\":{{\"QUESTION\":\"ANSWER\"}}}}.",
             questions.join("; ")
@@ -1818,6 +1804,71 @@ mod tests {
             }
         }
         assert_eq!(rejected, 1, "one session runs one work at a time");
+        Ok(())
+    }
+
+    /// A provider whose start fails before anything runs, as on a store error.
+    struct Unstartable;
+
+    impl Executor for Unstartable {
+        fn start<'a>(
+            &'a self,
+            _: &'a Arc<Runtime>,
+            _: &'a str,
+            _: &'a WorkSpec,
+            _: Option<&'a str>,
+            _: &'a Value,
+        ) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async { bail!("the store is busy") })
+        }
+
+        fn probe<'a>(&'a self, _: &'a WorkRecord) -> BoxFuture<'a, Result<Probe>> {
+            unreachable!()
+        }
+
+        fn interrupt<'a>(&'a self, _: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
+            unreachable!()
+        }
+
+        fn steer<'a>(
+            &'a self,
+            _: &'a SteerTarget,
+            _: &'a str,
+            _: &'a str,
+        ) -> BoxFuture<'a, SteerAck> {
+            unreachable!()
+        }
+
+        fn read_back<'a>(
+            &'a self,
+            _: &'a SteerTarget,
+            _: &'a str,
+        ) -> BoxFuture<'a, Option<SteerTrace>> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_work_whose_start_fails_is_rejected_for_a_new_dispatch() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, network) = node(&place).await?;
+        let spec = spec(&node, &place, "r1", "never run")?;
+        node.store
+            .lock()
+            .await
+            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        let error = node
+            .start_work(&Unstartable, &network, &spec, None, &json!({}))
+            .await
+            .expect_err("the start failed");
+        assert!(format!("{error:#}").contains("new call_ref"), "{error:#}");
+        assert_eq!(
+            record(&node, &spec.work_id).await?.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected
+            },
+            "a retry under the same call_ref finds it ended instead of waiting forever"
+        );
         Ok(())
     }
 

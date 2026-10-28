@@ -574,8 +574,14 @@ impl Runtime {
                 .and_then(|work| work.thread_id),
         };
         let may_send = created
-            && (self.work_executor(&record)?)
-                .start(self, network, &spec, thread.as_deref(), args)
+            && self
+                .start_work(
+                    self.work_executor(&record)?,
+                    network,
+                    &spec,
+                    thread.as_deref(),
+                    args,
+                )
                 .await?;
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
