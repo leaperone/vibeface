@@ -7,6 +7,8 @@ export const joinCopy = {
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
+  linkFilled: '已填入加入链接',
+  deviceName: '这台设备的名字',
 }
 
 /** Hours until `at`, at least one while it has not passed. */
