@@ -1,13 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { deviceOnline, isLoopback, phoneName } from "@vibeface/client/workspace/labels.ts"
+import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
@@ -41,7 +41,8 @@ export function useDeviceRows(): DeviceRow[] {
 
 export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): LucideIcon {
   if (row.kind === "node") return row.entry ? Laptop : Server
-  return phoneName(row.name) ? Smartphone : Monitor
+  const form = deviceForm(row.kind, row.name)
+  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : Monitor
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {

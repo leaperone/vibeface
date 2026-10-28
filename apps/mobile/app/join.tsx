@@ -19,6 +19,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
 import { useRun } from '@/lib/use-run'
+import { defaultName, self } from '@/platform'
 
 export default function JoinScreen() {
   const workspace = useWorkspace()
@@ -26,10 +27,12 @@ export default function JoinScreen() {
   const session = workspace.session
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
+  // The request is out, so the Node has spent the link.
+  useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-8 self-center px-6 py-10" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
         <Animated.View layout={LinearTransition.reduceMotion(ReduceMotion.System)}>
@@ -57,11 +60,14 @@ function LostKey() {
   const device = useDevice()
   const { busy, error, run } = useRun()
   return <Panel icon={ShieldAlert} title="需要重新加入">
-    <Text className="text-muted-foreground">这台手机保存的登录信息不见了。</Text>
+    <Text className="text-muted-foreground">{self}保存的登录信息不见了。</Text>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
     <Button className="min-h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
   </Panel>
 }
+
+// A link is single-use: once a join request went out with it, coming back here after 取消 or 断开 must not offer it again.
+let submitted = '', spent = ''
 
 function JoinForm() {
   const workspace = useWorkspace()
@@ -71,15 +77,16 @@ function JoinForm() {
   // The raw URL keeps the ticket after `#`, which router params drop; every new `vibeface://join?link=` refills the field.
   useEffect(() => {
     const link = url ? new URL(url).searchParams.get('link') : null
-    if (link) setInvitation(link)
+    if (link && link !== spent) setInvitation(link)
   }, [url])
-  const [name, setName] = useState('我的手机')
+  const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const submit = async () => {
     setError('')
     setBusy(true)
+    submitted = invitation.trim()
     try { await workspace.actions.join(invitation.trim(), name.trim()) }
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
@@ -97,7 +104,7 @@ function JoinForm() {
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
-      <Input accessibilityLabel={joinCopy.deviceName} placeholder="我的手机" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
+      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
     </View>
     {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
     <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>

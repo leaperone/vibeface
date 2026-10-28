@@ -1068,7 +1068,7 @@ test('the only management device is told to hand over management before 断开',
     app.render(); await settle(); app.render()
     const verify = app.secure.verifyState
     app.secure.verifyState = () => ({ ...verify(), governanceTemplate: () => { throw new Error('the network needs at least one management device') } })
-    await assert.rejects(app.render().leave(), /这个浏览器是唯一的管理设备。先把另一台设备设为管理设备再断开/)
+    await assert.rejects(app.render().leave(), /这个浏览器是唯一的管理设备，先把另一台设为管理设备再断开/)
     assert.deepEqual(leaves(app), [])
     assert.equal(app.render().ready?.isCurrent(), true)
     assert.equal(app.calls.includes('replace-key'), false)
