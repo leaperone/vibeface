@@ -83,7 +83,16 @@ impl Host {
             .flat_map(std::env::split_paths)
             .filter(|dir| dir.is_absolute())
             .collect();
-        dirs.extend(self.home.iter().map(|home| home.join(".local/bin")));
+        let home = |dir: &str| self.home.as_ref().map(|home| home.join(dir));
+        dirs.extend(home(".local/bin"));
+        // Where Claude Code's and opencode's own installers put them.
+        // ponytail: pi comes from npm, found here only in Homebrew's or the official Node's
+        // global folder; another one (nvm, a custom prefix) needs PATH or a chosen path.
+        dirs.extend(match name {
+            "claude" => home(".claude/local"),
+            "opencode" => home(".opencode/bin"),
+            _ => None,
+        });
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
         if name == "codex" {
             dirs.push("/Applications/Codex.app/Contents/Resources".into());
@@ -686,5 +695,28 @@ mod tests {
         );
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn claude_code_and_opencode_are_found_where_their_installers_put_them() {
+        let root = scratch("installers");
+        let host = Host {
+            codex_home: None,
+            home: Some(root.clone()),
+            path: Some("/usr/bin:/bin".into()),
+        };
+        for path in [".claude/local/claude", ".opencode/bin/opencode"].map(|p| root.join(p)) {
+            program(&path);
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(host.program(name), Some(path.clone()));
+        }
+        let native = root.join(".local/bin/claude");
+        program(&native);
+        assert_eq!(
+            host.program("claude"),
+            Some(native),
+            "the native install comes first"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
