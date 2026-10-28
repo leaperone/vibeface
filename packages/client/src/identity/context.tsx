@@ -5,6 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
+import { onlyManagerText } from './copy.ts'
 import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
@@ -662,7 +663,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     if (!connection?.isCurrent()) throw new Error(`连上后才能断开${self}。`)
     const request = scoped(), me = own().deviceId
     const { entry: from, principal: { network_id: networkId } } = connection
-    const onlyManager = (cause: unknown) => /at least one management device/i.test(String(cause)) ? new Error(`${self}是唯一的管理设备。先把另一台设备设为管理设备再断开，或者保留${self}。`) : cause
+    const onlyManager = (cause: unknown) => /at least one management device/i.test(String(cause)) ? new Error(onlyManagerText(self)) : cause
     const response = record(await request('directory'))
     const verified = verifyState(response.state, networkId, nodeNow(response))
     let event: Record<string, unknown>

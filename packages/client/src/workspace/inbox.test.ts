@@ -34,6 +34,7 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {
   assert.equal(formName[deviceForm('client', join('pending').name)], '手机')
   assert.equal(formName[deviceForm('client', 'Chrome')], '浏览器')
+  assert.equal(formName[deviceForm('client', '我的 iPad')], '平板')
   assert.equal(formName[deviceForm('node', '我的手机')], '电脑')
   assert.equal(deviceOnline('client', undefined, false), undefined, 'no device knows whether a browser on another connection is open')
   assert.equal(deviceOnline('node', { online: false }, true), false)

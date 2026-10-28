@@ -11,6 +11,7 @@ import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { cn } from '@/lib/utils'
+import { self } from '@/platform'
 import { useRun } from '@/lib/use-run'
 
 export default function DeviceDetail() {
@@ -34,7 +35,7 @@ export default function DeviceDetail() {
             <View className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
             <Text className={cn('text-meta', member.online ? 'text-success' : 'text-muted-foreground')}>{member.online ? '在线' : '离线'}</Text>
           </View> : null}
-          {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
+          {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text> : null}
           {member.admin ? <View className="flex-row items-center gap-1"><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理</Text></View> : null}
         </View>
         {member.online === false ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}

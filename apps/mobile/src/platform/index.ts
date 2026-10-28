@@ -1,4 +1,4 @@
-import { AppState } from 'react-native'
+import { AppState, Platform as Native } from 'react-native'
 import { Directory, File, Paths } from 'expo-file-system'
 import * as DocumentPicker from 'expo-document-picker'
 import * as Notifications from 'expo-notifications'
@@ -15,10 +15,14 @@ const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
 const createdKey = 'vibeface.device-created'
 const outboxPrefix = 'outbox:'
-const lostKeyMessage = '这台手机的设备密钥不见了。请用管理设备生成的加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。'
+/** The same app runs on iPad, which calls itself a tablet, as the shared device forms do. */
+export const tablet = Native.OS === 'ios' && Native.isPad
+export const self = tablet ? '这台平板' : '这台手机'
+export const defaultName = tablet ? '我的 iPad' : '我的手机'
+const lostKeyMessage = `${self}的设备密钥不见了。请用管理设备生成的加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。`
 
 let identity: NativeIdentity | undefined
-/** The device secret lives in the Keychain / Keystore, readable only by this app on this phone. */
+/** The device secret lives in the Keychain / Keystore, readable only by this app on this device. */
 const phoneKeys: DeviceKeys = {
   async load({ replaceLostKey }) {
     const saved = await SecureStore.getItemAsync(secretKey)
@@ -110,5 +114,5 @@ export const mobilePlatform: Platform = {
       return 'saved'
     },
   },
-  self: '这台手机',
+  self,
 }
