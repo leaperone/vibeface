@@ -11,6 +11,9 @@ export const joinCopy = {
   deviceName: '这台设备的名字',
 }
 
+/** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
+export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
+
 /** Hours until `at`, at least one while it has not passed. */
 export const hoursUntil = (at: number, now = Date.now()) => Math.max(1, Math.ceil((at - now) / 3_600_000))
 

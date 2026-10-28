@@ -1,10 +1,11 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
 import { ArrowRightLeft, BellRing, ChevronRight, Crown, KeyRound, LogOut, MonitorSmartphone, Palette, Plus, Sparkles, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useState, type ReactNode } from 'react'
-import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View } from 'react-native'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { onlyManagerText } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -15,6 +16,7 @@ import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { cn } from '@/lib/utils'
+import { self } from '@/platform'
 import { useRun } from '@/lib/use-run'
 
 const themes = [{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }] as const
@@ -26,8 +28,13 @@ export default function Settings() {
   const current = hasAdaptiveThemes ? 'system' : theme
   const [leaving, setLeaving] = useState(false)
   const { busy, error, run } = useRun()
+  const scroll = useRef<ScrollViewInstance>(null)
+  const reveal = useRef(false)
+  // Leaving would take the last way to approve devices and settings with it, so say so instead of offering it.
+  const sole = workspace.members.some((member) => member.current && member.admin) && !workspace.members.some((member) => !member.current && member.admin)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  // The confirmation opens at the foot of the page, below the fold on a phone.
+  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     {/* The home header already shows the connection, so settings starts with the devices. */}
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
@@ -49,15 +56,18 @@ export default function Settings() {
       <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
     </Section>
     <View className="border-t border-border pt-6">
-      {leaving ? <View className="gap-3">
+      {leaving && sole ? <View className="gap-3">
+        <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-0.5 size-4 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
+        <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+      </View> : leaving ? <View className="gap-3">
         <Text>断开后，要用加入链接才能回来。</Text>
         {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
         <View className="flex-row gap-2">
           <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
           <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
         </View>
-      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); setLeaving(true) }}>
-        <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开这台手机</Text>
+      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setLeaving(true) }}>
+        <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开{self}</Text>
       </Button>}
     </View>
   </ScrollView>
@@ -109,7 +119,7 @@ function MemberRow({ member, first }: { member: Member; first: boolean }) {
       {/* Title and subtitle, as a system cell. The name wraps in full so the inline crown is never cut off with it. */}
       <View className="min-w-0 flex-1">
         <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
-        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
+        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text> : null}
       </View>
       {member.online !== undefined ? <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} /> : null}
       <Icon as={ChevronRight} className="size-4 text-muted-foreground" />

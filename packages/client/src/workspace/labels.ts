@@ -66,13 +66,11 @@ export function addressName(address: string) {
   try { return new URL(address).hostname } catch { return address }
 }
 
-/** A browser-or-phone device named like a phone; any other is a browser. */
-export const phoneName = (name: string) => /iphone|android|ipad|phone|手机|平板/i.test(name)
-
-/** Joins and members carry only node or client, so a client named like a phone counts as one, everywhere it shows. */
-export type DeviceForm = "computer" | "phone" | "browser"
-export const deviceForm = (kind: "node" | "client", name: string): DeviceForm => kind === "node" ? "computer" : phoneName(name) ? "phone" : "browser"
-export const formName: Record<DeviceForm, string> = { computer: "电脑", phone: "手机", browser: "浏览器" }
+/** Joins and members carry only node or client, so a client named like a tablet or a phone counts as one, everywhere it shows. */
+export type DeviceForm = "computer" | "tablet" | "phone" | "browser"
+export const deviceForm = (kind: "node" | "client", name: string): DeviceForm =>
+  kind === "node" ? "computer" : /ipad|tablet|平板/i.test(name) ? "tablet" : /iphone|android|phone|手机/i.test(name) ? "phone" : "browser"
+export const formName: Record<DeviceForm, string> = { computer: "电脑", tablet: "平板", phone: "手机", browser: "浏览器" }
 
 /**
  * A computer's reachability as the Node reports it; `throughEntry` stands in for the connected one before that read.
