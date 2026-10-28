@@ -35,7 +35,7 @@ export function faceMotion(botId: string, mood: Mood) {
       let p = pose(face, shown, t)
       if (from && now !== null) {
         if (start < 0) start = now
-        const k = Math.min(1, (now - start) / BLEND_MS)
+        const k = Math.min(1, Math.max(0, (now - start) / BLEND_MS))
         p = mix(from, p, 1 - (1 - k) ** 3)
         if (k >= 1) from = null
       } else from = null

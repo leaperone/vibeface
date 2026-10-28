@@ -14,9 +14,9 @@ export const BODY = 36
 export const HALO = { r: BODY + 1.5 + 1.2, width: 2.4 }
 const OUTLINES: Outline[] = ['round', 'squircle', 'drop', 'bean', 'cloud']
 const EYES: Eyes[] = ['dot', 'pill', 'oval', 'wide']
-// Same hues and hash as the mobile botHue, so chat accents keep matching the face.
+// The hues and hash mobile used before faces, so chat accents keep matching the face.
 const HUES = [8, 32, 52, 100, 160, 200, 235, 280]
-// botHue's HSL hues mapped to the OKLCH hue that reads as the same colour.
+// Those HSL hues mapped to the OKLCH hue that reads as the same colour.
 const OK_HUE: Record<number, number> = { 8: 22, 32: 55, 52: 100, 100: 135, 160: 170, 200: 225, 235: 275, 280: 320 }
 const ANGLES = Array.from({ length: SAMPLES }, (_, i) => 2 * Math.PI * i / SAMPLES)
 

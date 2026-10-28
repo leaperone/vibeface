@@ -9,7 +9,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
-import { botMood, BotFace } from '@/components/bot-face'
+import { botMood, BotFace, ScreenFaces } from '@/components/bot-face'
 import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -161,7 +161,7 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={80} primary={workspace.primary === bot.conversation_id} />
+        <ScreenFaces><BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={80} primary={workspace.primary === bot.conversation_id} /></ScreenFaces>
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
         <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}

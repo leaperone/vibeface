@@ -1,5 +1,6 @@
 import { Star } from 'lucide-react-native'
-import { useEffect, useId, useMemo, useState } from 'react'
+import { useFocusEffect } from 'expo-router'
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, AppState, View } from 'react-native'
 import Animated, { useAnimatedProps, useAnimatedStyle, useSharedValue } from 'react-native-reanimated'
 import Svg, { Circle, Defs, Path, RadialGradient, Stop } from 'react-native-svg'
@@ -45,13 +46,22 @@ function useReduced() {
   return value
 }
 
+/** Faces inside a screen another screen covers stop drawing, as the web does for faces scrolled out of view. */
+const Covered = createContext(false)
+export function ScreenFaces({ children }: { children: ReactNode }) {
+  const [covered, setCovered] = useState(false)
+  useFocusEffect(useCallback(() => { setCovered(false); return () => setCovered(true) }, []))
+  return <Covered.Provider value={covered}>{children}</Covered.Provider>
+}
+
 /** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the row says the mood. */
 export function BotFace({ botId, mood, size, primary }: { botId: string; mood: Mood; size: 44 | 80; primary?: boolean }) {
   const { theme } = useUniwind()
   const dark = theme === 'dark'
   const face = useMemo(() => faceOf(botId), [botId])
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
-  const motionOff = useReduced()
+  const reducedMotion = useReduced()
+  const motionOff = useContext(Covered) || reducedMotion
   const gradient = `face${useId().replace(/[^a-zA-Z0-9]/g, '')}`
   const motion = useMemo(() => faceMotion(botId, mood), [botId])
   const frame = useSharedValue<Frame>(useState(() => motion.frame(null))[0])
@@ -120,7 +130,7 @@ export function botMood(bot: BotRecord, workspace: Workspace, live: ReturnType<t
   const owner = live?.conversationId === bot.conversation_id ? live.data?.conversation?.owner : undefined
   return moodOf({
     busy,
-    waiting: workspace.questions.some((question) => question.conversation_id === bot.conversation_id && questionOpen(question)),
+    waiting: workspace.questions.some((question) => question.conversation_id === bot.conversation_id && questionOpen(question) && !(question.question_id in (live?.answered ?? {}))),
     offline: Boolean(owner) && live?.nodes.find((node) => node.device_id === owner)?.online === false,
   })
 }

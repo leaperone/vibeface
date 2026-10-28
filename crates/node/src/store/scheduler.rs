@@ -1313,7 +1313,7 @@ impl Store {
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
     pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
         let mut statement = self.connection.prepare(
-            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling')
+            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering')
              UNION ALL SELECT conversation_id,'queued' FROM scheduler_outbox",
         )?;
         let rows =
