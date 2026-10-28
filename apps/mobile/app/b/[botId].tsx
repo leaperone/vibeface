@@ -1,6 +1,6 @@
 import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, LoaderCircle } from 'lucide-react-native'
+import { Bot, Crown, LoaderCircle, MessageSquareOff } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
@@ -9,6 +9,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { botMood, BotFace, ScreenFaces } from '@/components/bot-face'
 import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -86,8 +87,10 @@ export default function ChatScreen() {
   useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
   const extras = useChatExtras(id ?? '', botId)
   const live = useLive()
-  // No device can run a bot at all: the entry device's AI settings set one up; an offline one only needs to come back.
-  const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
+  const device = useDevice()
+  // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
+  const reach = live ? botReach(live.nodes) : 'ready'
+  const canSetUp = device.ready?.principal.can_manage === true
   // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s.
   const latestLive = useRef(live)
   latestLive.current = live
@@ -163,20 +166,21 @@ export default function ChatScreen() {
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
         <ScreenFaces><BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={80} primary={workspace.primary === bot.conversation_id} /></ScreenFaces>
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
-        <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
-        </View>
+        </View> : <>
+          <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="size-4 text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
+          {reach === 'offline' ? null : canSetUp ? <Link href="/ai" asChild>
+            <Button className="min-h-11"><Icon as={Bot} /><Text>设置运行 Bot 的设备</Text></Button>
+          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">请在管理设备上设置</Text></View>}
+        </>}
       </View>
     </Animated.View>}
     </View>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
-          {noAgent ? <Link href="/ai" asChild>
-            <Button variant="link" className="min-h-11 self-start px-2"><Text>去配置</Text></Button>
-          </Link> : null}
-        </Composer>
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
       </View>
     </KeyboardStickyView>
   </View>
