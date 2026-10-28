@@ -5452,7 +5452,7 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
             kind: WorkKind::Codex,
-            cwd: "/tmp".into(),
+            cwd: format!("/tmp/{thread}"),
             title: "t".into(),
             prompt: "p".into(),
             continues: None,
@@ -5470,6 +5470,11 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
     };
     assert_eq!(on("t-a")?, ["w0"]);
     assert_eq!(on("t-b")?, ["w1"]);
+    assert_eq!(
+        store.work_cwd_on_thread("t-b")?.as_deref(),
+        Some("/tmp/t-b")
+    );
+    assert_eq!(store.work_cwd_on_thread("t-c")?, None);
     Ok(())
 }
 
@@ -5578,5 +5583,49 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
     }
     let expected: Vec<Value> = (0..30).rev().map(|i| json!(format!("w{i:02}"))).collect();
     assert_eq!(seen, expected, "every work once, newest first");
+    Ok(())
+}
+
+#[test]
+fn the_users_project_choice_replaces_and_clears_a_bots_folder() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(&net.a, &net.network, "c", bot(&net, "Helper")?, vec![], 2)?;
+    let set = |project: Option<crate::model::BotProject>| {
+        net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::BotProjectSet {
+                project,
+                attestation: None,
+            },
+        )
+    };
+    let project = crate::model::BotProject {
+        target_node: net.a.device_id()?,
+        cwd: "/srv/demo".into(),
+    };
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        set(Some(project.clone()))?,
+        vec![],
+        3,
+    )?;
+    assert_eq!(store.bots(&net.network)?[0].project, Some(project));
+    store.append_event(&net.a, &net.network, "c", set(None)?, vec![], 4)?;
+    assert_eq!(store.bots(&net.network)?[0].project, None);
+    let unsigned = EventBody::BotProjectSet {
+        project: None,
+        attestation: None,
+    };
+    assert!(
+        store
+            .append_event(&net.a, &net.network, "c", unsigned, vec![], 5)
+            .is_err(),
+        "only the user moves a bot's folder"
+    );
     Ok(())
 }

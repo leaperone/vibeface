@@ -62,6 +62,8 @@ export type NodeSettingsResponse = {
   providers: ProviderStatus[]
   /** How Settings shows each path under the home folder (`~/…`); edits still use the full path. */
   display_paths: Record<string, string>
+  /** Usual project folders on that device not yet among its folders, offered with one click. */
+  suggested_roots: string[]
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -172,6 +174,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
     providers: array(v.providers).map(parseProvider),
     display_paths: Object.fromEntries(Object.entries(record(v.display_paths)).map(([path, shown]) => [path, text(shown)])),
+    suggested_roots: strings(v.suggested_roots),
   }
 }
 const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']

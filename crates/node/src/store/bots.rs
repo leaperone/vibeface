@@ -88,13 +88,13 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
     ))
 }
 
-/// `BotCreated` gives the first name and instructions; a chat change with a later rank replaces
-/// each. A bot follows its device's model and uses every shared skill until the chat sets them;
+/// `BotCreated` gives the first name, instructions and project; a chat change, or the user's
+/// `BotProjectSet`, with a later rank replaces each. A bot follows its device's model and uses every shared skill until the chat sets them;
 /// an emptied model stays as a row so it outranks the one it replaced.
 const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
     CASE WHEN n.rank>b.rank THEN n.value ELSE b.name END,
     CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
-    b.project,b.event_hash,
+    CASE WHEN p.rank>b.rank THEN p.value ELSE b.project END,b.event_hash,
     (SELECT json_group_object(m.provider,m.model) FROM bot_models m WHERE m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.model<>''),
     s.value";
 const CREATED_COLUMNS: &str =
@@ -145,12 +145,16 @@ fn select_bots(
          LEFT JOIN bot_profiles n ON n.network_id=b.network_id AND n.conversation_id=b.conversation_id AND n.field='name'
          LEFT JOIN bot_profiles i ON i.network_id=b.network_id AND i.conversation_id=b.conversation_id AND i.field='instructions'
          LEFT JOIN bot_profiles s ON s.network_id=b.network_id AND s.conversation_id=b.conversation_id AND s.field='skills'
+         LEFT JOIN bot_profiles p ON p.network_id=b.network_id AND p.conversation_id=b.conversation_id AND p.field='project'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
         let (mut bot, project, models, skills) = row?;
-        bot.project = project.map(|p| serde_json::from_str(&p)).transpose()?;
+        bot.project = project
+            .map(|p| serde_json::from_str::<Option<BotProject>>(&p))
+            .transpose()?
+            .flatten();
         bot.models = serde_json::from_str(&models)?;
         bot.skills = skills
             .map(|s| serde_json::from_str(&s))

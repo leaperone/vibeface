@@ -13,7 +13,7 @@ import { Message, type ChatMessage } from './message'
 
 /** One row of the conversation: a message bubble, or a task, change, question or hand-off row between them. */
 export type ChatEntry =
-  | { key: string; anchor?: boolean; message: ChatMessage; schedule?: string; retry?: () => Promise<void> }
+  | { key: string; anchor?: boolean; message: ChatMessage; schedule?: string; retry?: () => Promise<void>; detail?: string }
   | { key: string; anchor?: undefined; node: ReactNode }
 
 /** `user`, `assistant`, or `bot:<conversation_id>` for another bot's message. */
@@ -69,7 +69,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
               const last = !next || !continues(next, entry)
               return (
                 <MessageScrollerItem key={entry.key} messageId={entry.key} scrollAnchor={index === anchor || undefined} className={cn(index > 0 && (stacked(entry, entries[index - 1]) ? 'mt-2' : 'mt-6'), entered.current.has(entry.key) && 'message-enter')}>
-                  {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} last={last} retry={entry.retry} /> : entry.node}
+                  {'message' in entry ? <Message message={entry.message} schedule={entry.schedule} last={last} retry={entry.retry} detail={entry.detail} /> : entry.node}
                 </MessageScrollerItem>
               )
             })}
