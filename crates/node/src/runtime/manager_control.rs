@@ -435,7 +435,7 @@ impl Runtime {
 }
 
 /// Signal 0 only asks whether the recorded group still exists; it never signals the processes.
-fn group_alive(group: u32) -> bool {
+pub(super) fn group_alive(group: u32) -> bool {
     let Ok(group) = libc::pid_t::try_from(group) else {
         return false;
     };

@@ -39,6 +39,11 @@ pub enum Sdk {
         bin: PathBuf,
         processes: Arc<crate::runtime::claude::Processes>,
     },
+    /// Each turn runs its own `pi --mode rpc` process; see `runtime::pi`.
+    Pi {
+        bin: PathBuf,
+        pi: Arc<crate::runtime::pi::Pi>,
+    },
 }
 
 impl Sdk {
@@ -47,6 +52,7 @@ impl Sdk {
             Sdk::Cursor { .. } => crate::providers::Provider::Cursor,
             Sdk::Codex { .. } => crate::providers::Provider::Codex,
             Sdk::Claude { .. } => crate::providers::Provider::Claude,
+            Sdk::Pi { .. } => crate::providers::Provider::Pi,
         }
     }
 }
@@ -220,6 +226,18 @@ where
                 config,
                 bin,
                 processes,
+                prompt,
+                previous_session_id,
+                persist_session,
+                cancel,
+                progress,
+            )
+            .await
+        }
+        Sdk::Pi { bin, pi } => {
+            pi.run_bot(
+                config,
+                bin,
                 prompt,
                 previous_session_id,
                 persist_session,

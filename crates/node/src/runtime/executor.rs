@@ -72,7 +72,8 @@ impl Runtime {
         match provider {
             Provider::Codex => Ok(self.codex.as_ref()),
             Provider::Claude => Ok(&self.claude),
-            Provider::Cursor | Provider::Pi | Provider::Opencode => {
+            Provider::Pi => Ok(self.pi.as_ref()),
+            Provider::Cursor | Provider::Opencode => {
                 bail!("{} runs no work on this device yet", provider.label())
             }
         }

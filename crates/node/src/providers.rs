@@ -125,13 +125,13 @@ impl Provider {
     }
 
     /// What the runtime can run on each provider: the Cursor bridge runs only bots, and
-    /// pi and opencode run neither yet.
+    /// opencode runs neither yet.
     pub fn supports(self) -> &'static [Role] {
         match self {
             Provider::Codex => &[Role::Agent, Role::Execution],
             Provider::Cursor => &[Role::Agent],
-            Provider::Claude => &[Role::Agent, Role::Execution],
-            Provider::Pi | Provider::Opencode => &[],
+            Provider::Claude | Provider::Pi => &[Role::Agent, Role::Execution],
+            Provider::Opencode => &[],
         }
     }
 
@@ -143,8 +143,8 @@ impl Provider {
     /// Whether a queued user message can join the bot's running reply.
     pub fn supports_steer(self) -> bool {
         match self {
-            Provider::Codex => true,
-            Provider::Cursor | Provider::Claude | Provider::Pi | Provider::Opencode => false,
+            Provider::Codex | Provider::Pi => true,
+            Provider::Cursor | Provider::Claude | Provider::Opencode => false,
         }
     }
 
@@ -190,12 +190,12 @@ impl Provider {
         })
     }
 
-    /// The model the bot runs with: Cursor needs one, and Codex and Claude Code read "auto" as a
+    /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
     /// model name, so there an empty one means their default.
     pub fn model(self, model: &str) -> String {
         match self {
             Provider::Cursor if model.trim().is_empty() => "auto".into(),
-            Provider::Codex | Provider::Claude if model == "auto" => String::new(),
+            Provider::Codex | Provider::Claude | Provider::Pi if model == "auto" => String::new(),
             _ => model.into(),
         }
     }

@@ -172,7 +172,11 @@ impl Runtime {
                 bin: self.providers().bin(Provider::Claude),
                 processes: self.claude.processes(),
             },
-            Provider::Pi | Provider::Opencode => {
+            Provider::Pi => Sdk::Pi {
+                bin: self.providers().bin(Provider::Pi),
+                pi: self.pi.clone(),
+            },
+            Provider::Opencode => {
                 anyhow::bail!("{} does not run bots here yet", settings.provider.label())
             }
         };
