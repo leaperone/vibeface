@@ -50,7 +50,7 @@ import uuid
 
 def definitions_of(bots):
     """Listed Bots without the read-only preview of their latest message."""
-    return [{key: value for key, value in bot.items() if key != "last_message"} for bot in bots]
+    return [{key: value for key, value in bot.items() if key not in ("last_message", "busy")} for bot in bots]
 
 
 def require(condition, description):
