@@ -63,7 +63,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
       <MessageScroller className="h-auto min-h-24 flex-1">
         <MessageScrollerViewport aria-label="聊天记录">
           {/* Room for a toast over the composer, so the last card can scroll clear of it. */}
-          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 pt-6 pb-[calc(1.5rem+var(--toast-cover,0px))] sm:px-6 lg:px-8">
+          <MessageScrollerContent className="mx-auto w-full max-w-(--page-width) gap-0 px-4 pt-6 pb-[calc(1.5rem+var(--toast-cover,0px))] sm:px-6">
             {entries.map((entry, index) => {
               const next = entries[index + 1]
               const last = !next || !continues(next, entry)
@@ -76,7 +76,7 @@ export function Chat({ entries, empty }: { entries: ChatEntry[]; empty: ReactNod
           </MessageScrollerContent>
         </MessageScrollerViewport>
         {/* Sits at the composer's end, level with the waiting pill at its start, so the two never crowd each other. */}
-        <MessageScrollerButton behavior={typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'} aria-label="回到最新消息" title="回到最新" className="size-8 inset-s-auto translate-x-0 rounded-full shadow-sm rtl:translate-x-0 data-[direction=end]:bottom-0 inset-e-[max(1rem,calc(50%-23rem))] max-md:size-11 sm:inset-e-[max(1.5rem,calc(50%-22.5rem))] lg:inset-e-[max(2rem,calc(50%-22rem))]" />
+        <MessageScrollerButton behavior={typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'} aria-label="回到最新消息" title="回到最新" className="size-8 inset-s-auto translate-x-0 rounded-full shadow-sm rtl:translate-x-0 data-[direction=end]:bottom-0 inset-e-[max(1rem,calc(50%-23rem))] max-md:size-11 sm:inset-e-[max(1.5rem,calc(50%-22.5rem))]" />
       </MessageScroller>
     </MessageScrollerProvider>
   )

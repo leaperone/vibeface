@@ -64,7 +64,9 @@ function Icon({ as: IconComponent, className, ...props }: IconProps) {
   return (
     <StyledIcon
       as={IconComponent}
-      className={cn('text-foreground size-5', textClass, className)}
+      // 16 inside rows and buttons, as on the web; navigation and status icons ask for size-5.
+      className={cn('text-foreground size-4', textClass, className)}
+      strokeWidth={1.75}
       {...props}
     />
   );

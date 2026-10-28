@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowDownToLine, ArrowRightLeft, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
-import { BotFace, botMood } from '@/components/app/bot-face'
+import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
+import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -51,6 +52,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const sentDrafts = useRef(new Map<string, { message_id: string; text: string }>())
   const { conversationId, data, messagePending, messageBusy, chatSlot } = workspace
   const bot = workspace.selectedBot
+  const dark = useDark()
+  const tint = bot ? botTint(faceOf(bot.bot_id).hue, dark) : undefined
   const text = drafts.get(conversationId) ?? ''
   const jobs = data?.scheduler?.jobs ?? []
   const unanswered = data?.scheduler?.unanswered ?? []
@@ -236,7 +239,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={96} />
+          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={96} halo={tint?.glow} />
           <div className="grid justify-items-center gap-1">
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
@@ -247,7 +250,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
-              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
+              {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} type="button" variant="outline" className="rounded-full text-muted-foreground hover:text-foreground" style={{ borderColor: tint?.edge }} onClick={() => { setText(example); document.getElementById('message-text')?.focus() }}>{example}</Button>)}
             </div>}
         </div> : workspace.synced ? <NoBot /> : null}
       />
@@ -256,6 +259,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
           <terms.inbox.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
+        tint={tint}
         value={text}
         hint={notice}
         reason={reason}

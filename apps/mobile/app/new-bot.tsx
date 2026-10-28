@@ -42,15 +42,15 @@ export default function NewBot() {
   const setup = ready && here ? folderSetup(shared.nodes, ready.principal, here) : undefined
   const locked = Boolean(pending) || busy !== null
   const disabled = busy !== null || !shared.writable || !(pending?.name ?? name).trim()
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {/* In the header, so the keyboard never covers it. */}
-    <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="min-h-11 px-3" disabled={disabled} onPress={() => void create()}>
+    <Stack.Screen options={{ headerRight: () => <Button variant="ghost" className="px-3" disabled={disabled} onPress={() => void create()}>
       {busy ? <Icon as={LoaderCircle} /> : null}<Text className="font-semibold">{pending ? '再试一次' : '创建'}</Text>
     </Button> }} />
     {pending ? <Text role="status" className="rounded-lg bg-muted p-3 text-meta">{pending.submission?.state === 'rejected' ? '上次没建成，确认后可以修改。' : '上次没确认是否建好，内容保持不变。'}</Text> : null}
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">名称</Text>
-      <Input accessibilityLabel="名称" placeholder="例如：项目 Bot" className="min-h-11" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
+      <Input accessibilityLabel="名称" placeholder="例如：项目 Bot" maxLength={512} value={name} editable={!locked} onChangeText={setName} />
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">它负责什么 <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
@@ -58,7 +58,7 @@ export default function NewBot() {
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{folderLabels.project} <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
-      <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
+      <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
         {options.map((item, index) => {
           const selected = same(item.project)
           return <Pressable key={item.project ? `${item.project.target_node}:${item.project.cwd}` : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}

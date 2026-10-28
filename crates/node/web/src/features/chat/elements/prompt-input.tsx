@@ -24,6 +24,7 @@ export function PromptInput({
   files = [],
   onFiles,
   above,
+  tint,
   children,
 }: {
   value: string
@@ -39,6 +40,8 @@ export function PromptInput({
   onFiles?: (files: File[]) => void
   /** Floats over the transcript, just above the box. */
   above?: ReactNode
+  /** The bot's tint, taken by the send button once there is something to send. */
+  tint?: { fill: string; ink: string }
   children?: ReactNode
 }) {
   const formRef = useRef<HTMLFormElement>(null)
@@ -54,6 +57,7 @@ export function PromptInput({
   // Caught on pick: the upload would only refuse it after the person pressed Send.
   const unfits = (file: File) => !file.size || file.size > attachmentLimit
   const unfit = files.find(unfits)
+  const sendable = !disabled && !busy && Boolean(value.trim()) && !unfit
   const limit = `${attachmentLimit / 2 ** 20} MiB`
   const note = hint || (disabled && value ? reason : '')
   // The box sizes itself to the text (field-sizing), already at its new height when this runs; CSS cannot ease
@@ -79,7 +83,7 @@ export function PromptInput({
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) setOpen(false) }}
       onSubmit={(event) => {
         event.preventDefault()
-        if (disabled || busy || !value.trim() || unfit) return
+        if (!sendable) return
         onSubmit()
       }}
     >
@@ -101,7 +105,7 @@ export function PromptInput({
             aria-describedby={note ? 'manager-hint' : undefined}
             title="Enter 发送，Shift+Enter 换行"
             rows={1}
-            className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-150', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
+            className={cn('px-4 transition-[height,color,background-color,border-color,box-shadow] duration-200', open ? 'basis-auto min-h-24 max-h-[min(20rem,calc(var(--app-height,100dvh)*0.45))] overflow-y-auto py-3' : 'h-13 min-h-13 overflow-hidden py-3.5 md:h-12 md:min-h-12 md:py-3')}
             onFocus={() => setOpen(true)}
             onTransitionEnd={(event) => { if (event.propertyName === 'height') event.currentTarget.style.height = '' }}
             onChange={(event: ChangeEvent<HTMLTextAreaElement>) => onChange(event.target.value)}
@@ -117,7 +121,7 @@ export function PromptInput({
               <input ref={pickerRef} type="file" multiple hidden onChange={(event) => { onFiles([...files, ...event.target.files ?? []]); event.target.value = '' }} />
               <InputGroupButton type="button" variant="ghost" size="icon-sm" className="relative size-9 rounded-full text-muted-foreground hover:text-foreground max-md:size-11" aria-label={files.length ? `添加附件，已选 ${files.length} 个` : '添加附件'} title="添加附件" disabled={disabled || busy} onMouseDown={keepFocus} onClick={() => pickerRef.current?.click()}>
                 <PaperclipIcon aria-hidden="true" />
-                {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[0.625rem] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
+                {!open && files.length ? <span aria-hidden="true" className="absolute end-1 top-1 grid min-w-4 place-items-center rounded-full bg-primary px-1 text-[11px] leading-4 text-primary-foreground tabular-nums">{files.length}</span> : null}
               </InputGroupButton>
               {open && files.map((file, index) => <span key={`${file.name}:${index}`} title={file.name} className={cn('flex max-w-56 min-w-0 items-center gap-1 rounded-full ps-3 text-meta', unfits(file) ? 'border border-danger-border bg-danger-soft text-danger' : 'bg-muted')}>
                 {unfits(file) ? <CircleAlertIcon aria-label={file.size ? `超过 ${limit}` : '空文件'} className="-ms-1 size-3.5 shrink-0" /> : null}
@@ -133,11 +137,12 @@ export function PromptInput({
                 type={stop ? 'button' : 'submit'}
                 variant={stop ? 'outline' : 'default'}
                 size="icon-sm"
-                disabled={!stop && (disabled || busy || !value.trim() || Boolean(unfit))}
+                disabled={!stop && !sendable}
                 aria-busy={busy || undefined}
                 aria-label={stop ? '停止' : '发送'}
                 title={stop ? '停止' : '发送'}
-                className="size-9 rounded-full transition-[background-color,transform,opacity] active:scale-95 max-md:size-11"
+                style={!stop && sendable && tint ? { backgroundColor: tint.fill, color: tint.ink } : undefined}
+                className={cn('size-9 rounded-full max-md:size-11', !stop && (sendable ? 'hover:opacity-88' : 'bg-muted text-muted-foreground disabled:opacity-100'))}
                 onMouseDown={keepFocus}
                 onClick={stop}
               >

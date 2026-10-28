@@ -27,7 +27,7 @@ export default function TaskDetail() {
   useEffect(() => { if (shared && bot && shared.conversationId !== bot.conversation_id) void shared.selectBot(bot).catch(() => {}) }, [bot?.conversation_id])
   const data = shared && bot && shared.conversationId === bot.conversation_id ? shared.data : null
   const work = data?.works.find((item) => item.work_id === workId)
-  if (!shared || !work) return <><Stack.Screen options={{ title: '任务' }} /><EmptyState icon={ListChecks} title={data ? '找不到这个任务' : '稍等'} /></>
+  if (!shared || !work) return <><Stack.Screen options={{ title: '任务' }} /><EmptyState icon={ListChecks} title={data ? '找不到这个任务' : '稍等'} className="flex-1 justify-center" /></>
 
   const lookup = { nodes: shared.nodes, directory }
   const state = shownState(work, shared.nodes)
@@ -38,7 +38,7 @@ export default function TaskDetail() {
   // Stopping one input steered into a turn stops every work sharing that turn.
   const sharing = work.turn_id ? data!.works.filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const active = taskActive(state)
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="gap-1">
       <View className="flex-row flex-wrap items-center gap-x-2">
@@ -60,10 +60,10 @@ export default function TaskDetail() {
         <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
       </View>)}
     </Section> : null}
-    {canStop ? <ActionButton variant="outline" className="min-h-11 self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
+    {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="min-h-11 self-start" icon={RotateCw} disabled={!shared.writable}
+    {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="self-start" icon={RotateCw} disabled={!shared.writable}
       action={async () => { if (await shared.sendMessage(`再试一次「${work.title || '这个任务'}」`)) router.back() }}>让 Bot 再试</ActionButton> : null}
     <Section title="详情">
       {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}

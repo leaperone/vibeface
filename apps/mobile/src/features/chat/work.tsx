@@ -1,7 +1,7 @@
 import { Link } from 'expo-router'
 import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
-import { Pressable, TextInput, View } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
@@ -11,7 +11,7 @@ import type { BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView
 import { ActionButton } from '@/components/action'
 import { ActionCard } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
-import { caret } from '@/components/ui/input'
+import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
@@ -107,7 +107,7 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
     </Link>
   }
   return <Link href={href} asChild>
-    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 active:bg-muted">
+    <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 shadow-xs active:bg-muted dark:border-line-strong">
       <Icon as={active ? LoaderCircle : CircleQuestionMark} className={cn('size-5', active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
@@ -158,8 +158,7 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
     <ActionButton disabled={!shared.writable} action={answer('completed')}>做完了</ActionButton>
   </>}>
     <Text>{confirmText(check, device)}它实际做完了吗？</Text>
-    <TextInput {...caret} accessibilityLabel="补充说明" placeholder="补充说明（可选）" placeholderTextColorClassName="accent-muted-foreground" maxLength={2000}
-      className="min-h-11 rounded-lg border border-border bg-background px-3 font-sans text-body text-foreground" value={note} onChangeText={setNote} />
+    <Input accessibilityLabel="补充说明" placeholder="补充说明（可选）" maxLength={2000} value={note} onChangeText={setNote} />
   </ActionCard>
 }
 
@@ -176,7 +175,7 @@ function changeTitle(changes: BotChange[]) {
 
 /** What one turn changed in the bot, item by item. */
 function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
-  return <View className="gap-3 rounded-xl border border-border bg-card p-4">
+  return <View className="gap-3 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
     <View className="flex-row items-center gap-2">
       <Icon as={CircleCheck} className="size-4 text-success" />
       <Text role="heading" className="text-meta font-medium text-muted-foreground">{changeTitle(records.map((record) => record.change))}</Text>

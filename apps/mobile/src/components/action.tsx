@@ -1,4 +1,4 @@
-import { LoaderCircle, type LucideIcon } from 'lucide-react-native'
+import { CircleAlert, LoaderCircle, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { View } from 'react-native'
 import { messageOf } from '@vibeface/client/lib/node.ts'
@@ -20,7 +20,10 @@ export function useAction() {
 }
 
 export function ErrorText({ error }: { error: string }) {
-  return error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null
+  return error ? <View role="alert" accessible className="flex-row items-start gap-2">
+    <Icon as={CircleAlert} className="mt-0.5 text-danger" />
+    <Text className="min-w-0 flex-1 text-meta text-danger">{error}</Text>
+  </View> : null
 }
 
 /** A button that runs its action, spins while it runs and shows why it failed under it. */
@@ -29,7 +32,7 @@ export function ActionButton({ icon, iconClassName, children, action, disabled, 
 }) {
   const { busy, error, run } = useAction()
   return <View className="gap-1">
-    <Button {...props} className={className ?? 'h-11'} disabled={disabled || busy !== null} onPress={() => void run('run', action)}>
+    <Button {...props} className={className} disabled={disabled || busy !== null} onPress={() => void run('run', action)}>
       {busy ? <Icon as={LoaderCircle} /> : icon ? <Icon as={icon} className={iconClassName} /> : null}
       <Text>{children}</Text>
     </Button>
