@@ -100,10 +100,15 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
         assert(!(await reversePresent()), 'Only the task receiver reverse is removed');
         await device.closeApp();
         await device.openApp(appId);
-        const offline = screen.getByLabel('连接：离线');
+        const offline = screen.getByLabel(/^连接：(.* · )?离线$/);
         await expect(offline).toBeVisible({ timeout: 45000 });
         assert(!(await reversePresent()), 'The real app reports a failed connection while its receiver reverse remains absent');
+        await offline.click({ timeout: 30000 });
+        const offlineCard = screen.getByLabel(/^(?!连接：)(.* · )?离线$/);
+        await expect(offlineCard).toBeVisible({ timeout: 30000 });
         offlineScreenshot = await preserveScreenshot('android-offline.png', await app.screenshot('ordinary-paid-android-offline'));
+        await device.back();
+        await expect(screen.getByLabel(/^(?!连接：)(.* · )?(离线|连接中|同步中|在线)$/)).toBeHidden({ timeout: 30000 });
         await device.home();
         await background();
         await event('offline-visible');
