@@ -132,7 +132,7 @@ pub enum Severity {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseReason {
-    /// The App Server request it held is gone, so no answer can reach it.
+    /// The request it held is gone, so no answer can reach it.
     RequestLost,
 }
 
@@ -153,7 +153,8 @@ pub struct Subject {
     pub cwd: String,
     /// One line: what the session last said.
     pub summary: String,
-    /// The App Server request `node` holds until the question is answered.
+    /// The request `node` holds until the question is answered: an App Server's, or one a
+    /// session's hook, plugin or extension waits on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }

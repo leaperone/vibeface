@@ -703,7 +703,7 @@ impl Pi {
             None => vec!["--session-id".into(), session.clone()],
         };
         // The instructions go in a file: with the tool catalog they can outgrow one argument.
-        let guide = crate::manager::codex_instructions(
+        let guide = crate::manager::bot_instructions(
             config.tool_cli.as_deref(),
             &config.custom_tools,
             &config.instructions,

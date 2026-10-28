@@ -89,7 +89,7 @@ pub struct ManagerConfig {
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
-    /// Guidance that holds for the whole Codex thread; see `codex_instructions`.
+    /// Guidance that holds for the bot's whole thread; see `bot_instructions`.
     pub instructions: String,
     pub tool_env: BTreeMap<String, String>,
     /// Lets this turn's tool calls act as it; without one they are refused.
@@ -267,11 +267,11 @@ where
     }
 }
 
-/// The developer instructions a Codex thread starts and resumes with: how to reach Node tools,
-/// their catalog, then `instructions`. Codex keeps them with the thread, so turns carry only
-/// their own prompt. Node tools go through the CLI in its Shell, whose environment carries the
-/// turn's scope.
-pub fn codex_instructions(
+/// The instructions a bot's thread runs with: how to reach Node tools, their catalog, then
+/// `instructions`. They stay out of each turn's prompt: Codex takes them as the thread's
+/// developer instructions, Claude Code, pi and opencode as a system prompt with every turn.
+/// Node tools go through the CLI in the bot's shell, whose environment carries the turn's scope.
+pub fn bot_instructions(
     tool_cli: Option<&Path>,
     tools: &BTreeMap<String, CustomToolConfig>,
     instructions: &str,
@@ -301,7 +301,7 @@ pub fn codex_instructions(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let host = "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server with `vibeface codex`. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
+    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
     let text = format!(
         "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
@@ -490,7 +490,7 @@ where
         thread_params["model"] = json!(config.model);
     }
     // Resuming sends them again: a thread Codex reloads rebuilds its context from them.
-    let instructions = codex_instructions(
+    let instructions = bot_instructions(
         config.tool_cli.as_deref(),
         &config.custom_tools,
         &config.instructions,

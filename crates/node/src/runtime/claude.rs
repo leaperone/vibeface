@@ -665,7 +665,7 @@ where
         env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
     }
     // Claude Code keeps no instructions with a session, so every turn brings them.
-    let instructions = manager::codex_instructions(
+    let instructions = manager::bot_instructions(
         config.tool_cli.as_deref(),
         &config.custom_tools,
         &config.instructions,

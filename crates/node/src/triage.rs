@@ -412,12 +412,12 @@ one first; the user can always type an answer instead. While a question about th
 The answer comes back to that bot as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a request its session holds until it is answered: a Codex App Server \
-request, or a hook waiting for its answer. `{cli} requests` shows each in full. Answer it yourself with \
-`{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full access). Only when the user \
-must decide, add `--request-id REQUEST_ID` to the raise: an App Server request then waits for the answer, \
-and the bot has {answer_within_secs} seconds after it to respond; a hook's request still ends \
-{answer_within_secs} seconds after it came. A request neither answered nor raised is declined after \
-{answer_within_secs} seconds or when this turn ends; a hook's goes back to its session undecided.\n\
+request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \
+Answer it yourself with `{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full \
+access). Only when the user must decide, add `--request-id REQUEST_ID` to the raise: an App Server \
+request then waits for the answer, and the bot has {answer_within_secs} seconds after it to respond; any other request still ends {answer_within_secs} seconds \
+after it came. A request neither answered nor raised is declined after {answer_within_secs} seconds or \
+when this turn ends; one that is not the App Server's goes back to its session undecided.\n\
 - A request of kind `continue` holds a session whose turn ended: `{{\"text\":\"TEXT\"}}` as its RESULT_JSON \
 sends TEXT to the session as its user's next message. Send one only to carry out what the user asked for.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",

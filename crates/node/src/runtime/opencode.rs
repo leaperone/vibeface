@@ -708,7 +708,7 @@ impl Opencode {
         };
         // Progress is best effort: the turn goes on without the stream after a while.
         let _ = tokio::time::timeout(Duration::from_secs(5), ready).await;
-        let instructions = manager::codex_instructions(
+        let instructions = manager::bot_instructions(
             config.tool_cli.as_deref(),
             &config.custom_tools,
             &config.instructions,
