@@ -2884,7 +2884,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
-                cursor_sdk_bin: "cursor-sdk".into(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             let peer = ib.device_id()?;
@@ -2917,7 +2916,7 @@ mod tests {
             .context("first sync")?;
             let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
             assert_eq!(online["online"], true);
-            assert_eq!(online["capabilities"]["manager"], "cursor_sdk");
+            assert_eq!(online["capabilities"]["manager"], "cursor");
             let mut events = a.events.subscribe();
             b.stop_network().await;
             a.wake_sync(&peer);

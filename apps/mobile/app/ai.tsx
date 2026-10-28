@@ -144,9 +144,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       {issue.code === 'app_server_not_found' && item.app_server
         ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
         : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
-    </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 py-2">
-      <Icon as={CircleX} className="size-4 text-danger" /><Text className="shrink text-meta">{check.label}</Text>
-    </View>)}
+    </View> : null}
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-3 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
     </Pressable>

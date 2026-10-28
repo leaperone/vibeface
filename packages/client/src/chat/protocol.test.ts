@@ -30,7 +30,7 @@ test('chat rereads readiness only while a device that could reply is not ready y
 test('a bot computer the Node lists offline with its last capabilities reads as offline, not missing', () => {
   const nodes = parseNodes({ nodes: [
     { device_id: 'here', name: 'Server', local: true, online: true, revoked: false, capabilities: { manager: null, manager_ready: false, relay: true, roots: [] } },
-    { device_id: 'mac', name: 'Mac', local: false, online: false, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: true, relay: false, roots: ['/work'] } },
+    { device_id: 'mac', name: 'Mac', local: false, online: false, revoked: false, capabilities: { manager: 'codex', manager_ready: true, relay: false, roots: ['/work'] } },
   ] })
   const reach = botReach(nodes)
   assert.equal(reach, 'offline')
