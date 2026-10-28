@@ -812,7 +812,18 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const next = { ...mine, status: status.status, code }
     joiningRef.current = next; setJoining(next)
   }
-  const cancelJoin = disconnect
+  /**
+   * Cancelling takes the request back at the entry so the manager's approval card goes away now, not at expiry.
+   * One withdraw over the live channel, never retried: a lost reply leaves the request to expire on its own.
+   */
+  const cancelJoin = useCallback(() => {
+    const pending = joiningRef.current, active = session.current
+    if (pending && active && entryKey(active.entry) === entryKey(pending.entry)) {
+      session.current = null
+      void active.channel.request('join_withdraw', { join_id: pending.join_id }).catch(() => {}).finally(() => active.channel.close())
+    }
+    disconnect()
+  }, [disconnect])
   async function createLocalNetwork(nameValue: string, password: string, nodeName?: string) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。请用加入链接或恢复文件。')
     const name = deviceName(nameValue)
