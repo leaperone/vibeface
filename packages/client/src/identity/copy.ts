@@ -1,3 +1,5 @@
+import type { Member, PendingRecovery } from '../lib/node.ts'
+
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
@@ -40,6 +42,28 @@ export const recoveryCopy = {
   needsPassword: '没有恢复密码，这个文件打不开',
   onlyCopy: '只有这一份，丢了不能补',
   keptApart: '已把文件和密码分开保存',
+  pending: '有人正在用恢复文件找回',
+  effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
+  outIfNotStopped: '不拦下，到时划掉的设备会被移出',
+  itsMe: '是我在找回',
+  stop: '拦下',
+  stopAsk: '拦下这次找回？',
+  stopNote: '拦下后对方的新恢复文件用不了，设备保持不变',
+  stopDone: '已拦下',
+  leaked: '恢复文件可能泄露了',
+  leakedNote: '对方还能再试，换密码让旧文件作废',
+  later: '以后再说',
+  rotate: '换恢复密码',
+}
+
+/** What a pending recovery would change: the devices it brings in, then the ones here it would remove. */
+export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
+  const kept = new Set(pending.members.map((member) => member.device_id))
+  const known = new Set(current.map((member) => member.device_id))
+  return [
+    ...pending.members.filter((member) => !known.has(member.device_id)).map((member) => ({ member, added: true })),
+    ...current.filter((member) => !kept.has(member.device_id)).map((member) => ({ member, added: false })),
+  ]
 }
 
 export const deviceCopy = {

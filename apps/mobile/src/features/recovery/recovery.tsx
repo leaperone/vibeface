@@ -1,17 +1,19 @@
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, Download, FileCheck, FileKey, FileWarning, Hourglass, KeyRound, Laptop, ShieldX, Smartphone, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, ShieldAlert, ShieldX, Smartphone, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
-import { Switch, View } from 'react-native'
+import { Alert, Switch, View } from 'react-native'
+import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
-import { Details, Panel } from '@/components/kit'
+import { ActionCard, Details, Panel } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
+import { deviceIcon } from '@/features/devices/device-icon'
 import { useRun } from '@/lib/use-run'
 
 type PickedFile = { name: string; file: RecoveryFile }
@@ -144,6 +146,48 @@ function UnsavedRecoveryFile() {
     <SaveRecoveryFile code={unsavedRecovery.code} saved={false} onSaved={(saved) => { if (saved) forgetUnsavedRecovery() }} save={save} />
     {errorText(error)}
   </View>
+}
+
+/** Someone is recovering the network with a recovery file; this managing phone can stop it before it takes effect. */
+export function RecoveryPendingCard() {
+  const device = useDevice()
+  const { busy, error, run } = useRun()
+  const pending = device.pendingRecovery
+  if (!pending) return null
+  const changes = recoveryChanges(pending, device.directory?.members ?? [])
+  const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
+    { text: '取消', style: 'cancel' },
+    { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', () => device.vetoRecovery(pending.checkpoint)) },
+  ])
+  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<>
+    <Button variant="ghost" className="min-h-11" disabled={busy !== null} onPress={device.dismissPendingRecovery}><Text>{recoveryCopy.itsMe}</Text></Button>
+    <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={stop}><Icon as={Hand} /><Text>{busy ? '处理中' : recoveryCopy.stop}</Text></Button>
+  </>}>
+    {hint(Hourglass, recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset), 'text-danger')}
+    {changes.some(({ added }) => !added) ? <Text className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</Text> : null}
+    {changes.map(({ member, added }) => {
+      const current = member.device_id === device.identity?.deviceId
+      return <View key={member.device_id} className="min-w-0 flex-row items-center gap-2">
+        <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
+        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current, entry: false })} className="size-4 text-muted-foreground" />
+        <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
+        {current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这台手机</Text> : null}
+      </View>
+    })}
+    {errorText(error)}
+  </ActionCard>
+}
+
+/** Left after stopping a recovery: whoever started it holds the file, so a new password retires it. */
+export function RotateHintCard() {
+  const device = useDevice()
+  if (!device.rotateHint) return null
+  return <ActionCard icon={ShieldAlert} title={recoveryCopy.leaked} actions={<>
+    <Button variant="ghost" className="min-h-11" onPress={device.dismissRotateHint}><Text>{recoveryCopy.later}</Text></Button>
+    <Link href="/recovery" asChild><Button className="min-h-11"><Text>{recoveryCopy.rotate}</Text></Button></Link>
+  </>}>
+    {hint(Hand, recoveryCopy.leakedNote)}
+  </ActionCard>
 }
 
 /** This phone's recovery while it waits on the device it went through, or once one of the devices it would replace stopped it. */

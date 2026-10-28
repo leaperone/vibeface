@@ -57,6 +57,8 @@ type DeviceContextValue = {
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
+  /** Left by a stop on this device until the recovery key changes: whoever started it holds the file. */
+  rotateHint: boolean; dismissRotateHint(): void
   /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
   nodeClockOffset: number
   /** This browser's own recovery while it waits, or once a device stopped it. */
@@ -672,6 +674,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
    */
   async function vetoRecovery(checkpoint: string) {
     const connection = managing(), request = scoped()
+    // Whoever started it still holds the file: remind this device to retire it until the recovery key changes.
+    const remind = () => setRotateHint(connection.principal.network_id, directory?.recovery_key ?? null)
     const read = async () => {
       const response = record(await request('directory'))
       const now = nodeNow(response) ?? Date.now()
@@ -686,6 +690,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       // In effect, the recovery may have removed this device, so the refresh may fail; the outcome is what counts.
       const refreshed = refreshDirectory()
       if (!stopped) { refreshed.catch(() => {}); throw new Error('这次找回已经生效，没能拦下。') }
+      remind()
       await refreshed
     }
     const { event, stopped } = await read()
@@ -698,6 +703,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       if (!after || after.event) throw cause
       return done(after.stopped)
     }
+    remind()
     await refreshDirectory()
   }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
@@ -1137,14 +1143,20 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   useEffect(() => {
     if (!ready?.principal.can_manage) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
+    // Join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    const refresh = () => { void refreshDirectory().catch(() => {}) }
+    refresh()
+    const poll = setInterval(refresh, 30_000)
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
-      clearTimeout(timer); timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, 300)
+      clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
-    return () => { clearTimeout(timer); stop() }
+    return () => { clearTimeout(timer); clearInterval(poll); stop() }
   }, [ready])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
+  function setRotateHint(network: string, recoveryKey: string | null) { try { store(`rotate-hint.${network}`, recoveryKey) } catch {} setDismissals(count => count + 1) }
+  const rotateHint = !!ready?.principal.can_manage && !!directory && load(`rotate-hint.${ready.principal.network_id}`) === directory.recovery_key
   const pendingRecovery = ready?.principal.can_manage && directory?.pending && directory.pending.checkpoint !== recoveryOk ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
@@ -1156,7 +1168,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
-    pendingRecovery, vetoRecovery, nodeClockOffset,
+    pendingRecovery, vetoRecovery, nodeClockOffset, rotateHint,
+    dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
     forgetUnsavedRecovery() { setKept(null) },

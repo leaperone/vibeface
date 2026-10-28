@@ -10,17 +10,20 @@ import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { EmptyState } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@/data/context'
 import { useWide } from '@/lib/layout'
 import { QuestionCard } from '@/features/chat/question-card'
+import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
 
 const Group = withUniwind(Animated.View)
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMotion(ReduceMotion.System)
 
-/** Questions nobody answered, grouped by bot; each group names its bot once and leads to its chat. */
+/** A recovery to stop first, then questions nobody answered, grouped by bot; each group names its bot once and leads to its chat. */
 export default function Inbox() {
   const workspace = useWorkspace()
+  const device = useDevice()
   const wide = useWide()
   const bar = useHeaderHeight()
   const insets = useSafeAreaInsets()
@@ -41,6 +44,8 @@ export default function Inbox() {
   const below = Math.max(0, frame.height - bar - insets.bottom - 56)
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
   return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
+    {device.pendingRecovery ? <RecoveryPendingCard /> : null}
+    {device.rotateHint ? <RotateHintCard /> : null}
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} replace={wide} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
@@ -48,7 +53,7 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
+    </Group>) : device.pendingRecovery || device.rotateHint ? null : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
       <EmptyState icon={InboxIcon} title="没有要你决定的事" />
     </Animated.View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
