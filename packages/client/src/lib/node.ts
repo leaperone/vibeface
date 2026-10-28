@@ -159,6 +159,17 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
   if (setup.entry.address !== origin || setup.entry.local) throw new Error('本机设置和当前页面对不上。')
   return setup
 }
+/** The usual project folders the device found, each named as Settings shows paths, for adding with one tap. */
+export function folderSuggestions(response: NodeSettingsResponse): { path: string; label: string }[] {
+  return response.suggested_roots.filter((path) => !response.settings.roots.includes(path)).map((path) => ({ path, label: response.display_paths[path] ?? path }))
+}
+
+/** Turning a bot on. A device's first bot also runs its tasks, so its first work request does not stop at a switch. */
+export function botOnChange(response: NodeSettingsResponse, provider: ProviderStatus): { bot: true; execution?: true } {
+  const first = response.settings.manager === null && !response.providers.some((item) => item.roles.includes('execution'))
+  return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
+}
+
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   const v = record(value, '设备设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
   let manager: ManagerSettings | null = null

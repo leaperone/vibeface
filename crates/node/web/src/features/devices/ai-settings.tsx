@@ -9,7 +9,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
@@ -238,7 +238,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
-    {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={response.suggested_roots} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -288,8 +288,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
   const notFound = (error as { code?: unknown } | null)?.code === "codex_missing"
-  // A first bot here also runs its tasks, so the first work request does not stop at a switch.
-  const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, { [role]: true, ...(onboarding && role === "bot" && executable ? { execution: true } : {}) }).then((ok) => { if (!ok) void reconcile() }) }
+  const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, role === "bot" ? botOnChange(response, item) : { execution: true }).then((ok) => { if (!ok) void reconcile() }) }
   const saveKey = (name: string, value: string) => change(`env:${name}`, { env: { [name]: value } })
     .then((ok) => { if (ok) toast(`${keyName(name)} 已保存`, { tone: "success" }); return ok })
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
@@ -458,7 +457,7 @@ function BotDetails({ manager, display, fixBin, working, busy, save }: { manager
   </form>
 }
 
-function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: string[]; display: Display; busy: boolean; save(roots: string[]): void }) {
+function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
@@ -469,8 +468,8 @@ function Folders({ roots, suggested, display, busy, save }: { roots: string[]; s
       <FolderPath path={root} shown={display[root]} />
       <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
-    {suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map((path) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
-      <Plus aria-hidden="true" />{display[path] ?? path}
+    {suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
+      <Plus aria-hidden="true" />{label}
     </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">
       <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
