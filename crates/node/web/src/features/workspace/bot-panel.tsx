@@ -149,4 +149,4 @@ export function BotPanelButton() {
   </>
 }
 
-const primaryHint = "接手没有 Bot 负责的 Codex 会话"
+const primaryHint = "接手没有 Bot 负责的会话"

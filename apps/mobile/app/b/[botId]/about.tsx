@@ -68,7 +68,7 @@ export default function BotAbout() {
   </ScrollView>
 }
 
-const primaryHint = '没有 Bot 负责的 Codex 会话，由主 Bot 分派'
+const primaryHint = '没有 Bot 负责的会话，由主 Bot 分派'
 
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <View className="gap-3">
