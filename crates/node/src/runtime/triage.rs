@@ -450,17 +450,17 @@ impl Runtime {
             .as_ref()
             .and_then(|thread| lock(&self.triage.threads).get(thread).map(|t| t.0.clone()))
             .unwrap_or_default();
-        if cwd.is_empty() {
-            if let Some(thread) = &request.thread_id {
-                cwd = self
-                    .store
-                    .lock()
-                    .await
-                    .work_cwd_on_thread(thread)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-            }
+        if cwd.is_empty()
+            && let Some(thread) = &request.thread_id
+        {
+            cwd = self
+                .store
+                .lock()
+                .await
+                .work_cwd_on_thread(thread)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
         }
         if cwd.is_empty() {
             cwd = request.params["cwd"]
