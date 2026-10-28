@@ -1,15 +1,17 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, FolderOpen, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, ScrollView, View } from 'react-native'
-import { formatIn, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { folderLabels, formatIn, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
 import { ActionButton } from '@/components/action'
 import { botMood, BotFace } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@/data/context'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
 /** A bot as the web's bot panel shows it: primary or not, what it does, its schedules, notes and the shared skills. Changes are made by asking it in the chat. */
@@ -17,6 +19,7 @@ export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
   const workspace = useWorkspace()
+  const { directory } = useDevice()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
   if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
@@ -31,6 +34,7 @@ export default function BotAbout() {
         : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
     </View>
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
+    {bot.project ? <Section icon={FolderOpen} title={folderLabels.project}><Text selectable>{projectPlace(bot.project, shared.data?.conversation?.owner, (id) => nodeName(id, { nodes: shared.nodes, directory }))}</Text></Section> : null}
     {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
     {schedules.length ? <Section icon={CalendarClock} title="定时任务" count={schedules.length}>
       {schedules.map((schedule) => <View key={schedule.schedule_id} className="flex-row items-start gap-3">
