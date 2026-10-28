@@ -3,7 +3,7 @@ import { Bot, Inbox, Plus, Settings, Star } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
-import { ConnectionPill } from '@/components/connection-pill'
+import { ConnectionMenu } from '@/components/connection-pill'
 import { Badge, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -38,7 +38,10 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : undefined}>
     {sidebar ? <View className="flex-row items-center justify-between ps-3 pt-2">
       <Text role="heading" className="text-3xl font-bold">消息</Text>
-      <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
+      <View className="-me-1 flex-row items-center">
+        <ConnectionMenu connection={workspace.connection} />
+        <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
+      </View>
     </View> : null}
     <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-full bg-muted"><Icon as={Inbox} className="text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={device.pendingRecovery ? recoveryCopy.pending : waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
@@ -56,7 +59,6 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
     }) : loading ? <View accessibilityLabel="正在读取 Bot" className="gap-2">{[0, 1, 2].map((item) => <View key={item} className="h-16 rounded-xl bg-muted/60" />)}</View> : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} />}
-    <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView>
 }
 
