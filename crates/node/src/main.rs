@@ -64,10 +64,10 @@ enum Action {
     Update(Update),
     /// Join a personal network with an invite link from a management device.
     Join(Join),
-    /// Forward a Codex or Claude Code hook's stdin to this device's Node, printing the answer
-    /// when its session waits on one; always exits 0.
+    /// Forward a coding agent's hook stdin to this device's Node, printing the answer when its
+    /// session waits on one; always exits 0.
     Hook(Hook),
-    /// Install, remove, check or test this Node's Codex and Claude Code hooks.
+    /// Install, remove, check or test this Node's hooks and extensions in coding agents.
     Hooks(Hooks),
     /// The coordination Agent's triage answers: list pending events, ask about or dismiss one.
     Triage(Triage),
@@ -307,7 +307,7 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Explicit home directory holding the `.codex` and `.claude` hook configuration.
+    /// Explicit home directory holding the coding agents' hook and extension files.
     #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
@@ -1702,7 +1702,9 @@ fn hook_event(agent: Provider, input: &Value) -> Result<Option<vibeface::triage:
                 })
                 .flatten()
         }
-        Provider::Cursor | Provider::Pi | Provider::Opencode => {
+        // Its extension runs only in sessions the user drives.
+        Provider::Pi => triage::from_pi_extension(input),
+        Provider::Cursor | Provider::Opencode => {
             bail!("{} has no hooks", agent.name())
         }
     })
@@ -1876,6 +1878,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         fs::write(&file.path, serde_json::to_vec_pretty(&settings)?)?;
         println!("{}: changed {}", file.path.display(), changed.join(", "));
     }
+    extensions(&options, home, &program, &data_dir)?;
     if let HooksAction::Install = options.action {
         let config = home.join(".codex/config.toml");
         let enabled = fs::read_to_string(&config)
@@ -1897,6 +1900,57 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!(
             "Codex asks to trust a new hook before its first run; sessions already open pick hooks up after a restart or resume."
         );
+    }
+    Ok(())
+}
+
+/// The extension files of `vibeface hooks`: written whole, and removed only when the Node wrote
+/// them.
+fn extensions(options: &Hooks, home: &Path, program: &Path, data_dir: &Path) -> Result<()> {
+    use vibeface::providers::Watch;
+    for agent in Provider::ALL {
+        let Some(Watch::Extension { file, source }) = agent.watch() else {
+            continue;
+        };
+        let path = home.join(file);
+        let current = match fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let ours = current
+            .as_deref()
+            .is_some_and(|text| text.lines().next() == source.lines().next());
+        let code = vibeface::triage::extension_code(source, program, agent, data_dir);
+        let shown = path.display();
+        match options.action {
+            HooksAction::Status | HooksAction::Test => {
+                println!(
+                    "{shown}: {}",
+                    if ours { "installed" } else { "not installed" }
+                );
+            }
+            HooksAction::Install if current.as_deref() == Some(code.as_str()) => {
+                println!("{shown}: unchanged");
+            }
+            HooksAction::Install if current.is_some() && !ours => {
+                bail!("{shown} was not written by vibeface; left unchanged")
+            }
+            HooksAction::Install if options.dry_run => println!("{shown}: would write"),
+            HooksAction::Install => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, code)?;
+                println!("{shown}: written; sessions already open load it after a restart");
+            }
+            HooksAction::Uninstall if !ours => println!("{shown}: unchanged"),
+            HooksAction::Uninstall if options.dry_run => println!("{shown}: would remove"),
+            HooksAction::Uninstall => {
+                fs::remove_file(&path)?;
+                println!("{shown}: removed");
+            }
+        }
     }
     Ok(())
 }
@@ -2420,6 +2474,46 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooks_install_writes_the_pi_extension_once_and_removes_only_its_own() {
+        let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
+        let (home, data) = (dir.join("home"), dir.join("data"));
+        let run = async |action: &str| {
+            let parsed = Cli::try_parse_from([
+                "vibeface",
+                "hooks",
+                action,
+                "--home",
+                home.to_str().unwrap(),
+                "--data-dir",
+                data.to_str().unwrap(),
+            ])
+            .unwrap();
+            let Some(Action::Hooks(options)) = parsed.command else {
+                panic!("expected hooks")
+            };
+            hooks(options).await
+        };
+        let extensions = home.join(".pi/agent/extensions");
+        let path = extensions.join("vibeface.ts");
+        run("install").await.unwrap();
+        let code = fs::read_to_string(&path).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let hook = json!([program, "hook", "pi", "--data-dir", data]).to_string();
+        assert!(code.starts_with("// vibeface:") && !code.contains("__VIBEFACE_HOOK__"));
+        assert!(code.contains(&format!("const HOOK = {hook};")), "{code}");
+        run("install").await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), code);
+        assert_eq!(fs::read_dir(&extensions).unwrap().count(), 1);
+        run("uninstall").await.unwrap();
+        assert!(!path.exists());
+        fs::write(&path, "// the user's own\n").unwrap();
+        assert!(run("install").await.is_err());
+        run("uninstall").await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "// the user's own\n");
         fs::remove_dir_all(dir).unwrap();
     }
 }

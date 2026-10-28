@@ -218,6 +218,31 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
     })
 }
 
+/// What the vibeface pi extension sends when a run of a pi session settles, keyed by the
+/// session's last entry. A run the user stopped is left alone; one that replied or failed holds
+/// its session for what it does next.
+pub fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
+    let (status, detail) = match input["stop_reason"].as_str()? {
+        "stop" => ("completed", String::new()),
+        "length" => ("failed", "pi stopped at the model's output limit".into()),
+        "error" => ("failed", s(input, "error")),
+        _ => return None,
+    };
+    Some(AgentEvent {
+        source: Source::Hook,
+        agent: Provider::Pi,
+        event: Kind::TurnEnd,
+        status: Some(status.into()),
+        session_id: s(input, "session_id"),
+        turn_id: s(input, "turn_id"),
+        cwd: s(input, "cwd"),
+        last_message: s(input, "last_message"),
+        detail,
+        hold: Some(RequestKind::Continue),
+        ..Default::default()
+    })
+}
+
 /// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
 /// is one the user drives. `codex exec`, MCP and sub-agent sessions run without anyone
 /// watching them.
@@ -328,6 +353,8 @@ must decide, add `--request-id REQUEST_ID` to the raise: an App Server request t
 and the bot has {answer_within_secs} seconds after it to respond; a hook's request still ends \
 {answer_within_secs} seconds after it came. A request neither answered nor raised is declined after \
 {answer_within_secs} seconds or when this turn ends; a hook's goes back to its session undecided.\n\
+- A request of kind `continue` holds a session whose turn ended: `{{\"text\":\"TEXT\"}}` as its RESULT_JSON \
+sends TEXT to the session as its user's next message. Send one only to carry out what the user asked for.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
         serde_json::to_string_pretty(&items)?
     ))
@@ -514,8 +541,21 @@ pub fn hook_files(home: &Path) -> Vec<HookFile> {
                 path: home.join(file),
                 events,
             }),
+            Watch::Extension { .. } => None,
         })
         .collect()
+}
+
+/// An extension's code as `vibeface hooks install` writes it (see `Watch::Extension`).
+pub fn extension_code(source: &str, program: &Path, agent: Provider, data_dir: &Path) -> String {
+    let hook = json!([
+        program.to_string_lossy(),
+        "hook",
+        agent.name(),
+        "--data-dir",
+        data_dir.to_string_lossy()
+    ]);
+    source.replace("__VIBEFACE_HOOK__", &hook.to_string())
 }
 
 pub fn hook_command(program: &Path, agent: Provider, data_dir: &Path) -> String {
@@ -810,5 +850,35 @@ mod tests {
                 "PermissionRequest":[]}})
         );
         assert!(add_hooks(&mut json!([]), codex, &command).is_err());
+    }
+
+    #[test]
+    fn a_settled_pi_run_holds_its_session_unless_the_user_stopped_it() {
+        let input = |stop: &str| {
+            json!({"session_id":"s","turn_id":"e9","cwd":"/p","stop_reason":stop,
+                "error":"429 rate limited","last_message":"done"})
+        };
+        let ended = AgentEvent {
+            source: Source::Hook,
+            agent: Provider::Pi,
+            event: Kind::TurnEnd,
+            status: Some("completed".into()),
+            session_id: "s".into(),
+            turn_id: "e9".into(),
+            cwd: "/p".into(),
+            last_message: "done".into(),
+            hold: Some(RequestKind::Continue),
+            ..Default::default()
+        };
+        assert_eq!(from_pi_extension(&input("stop")), Some(ended));
+        let failed = from_pi_extension(&input("error")).unwrap();
+        assert_eq!(
+            (failed.status.as_deref(), failed.detail.as_str()),
+            (Some("failed"), "429 rate limited")
+        );
+        for stop in ["aborted", "toolUse"] {
+            assert!(from_pi_extension(&input(stop)).is_none(), "{stop}");
+        }
+        assert!(from_pi_extension(&json!({"session_id":"s"})).is_none());
     }
 }

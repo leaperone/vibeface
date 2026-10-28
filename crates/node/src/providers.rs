@@ -59,6 +59,13 @@ pub enum Watch {
         file: &'static str,
         events: &'static [&'static str],
     },
+    /// An extension the provider loads from `file`, relative to the home directory: `source`
+    /// with `__VIBEFACE_HOOK__` replaced by the JSON argv of `vibeface hook <provider>`. Its
+    /// first line marks the file as the Node's.
+    Extension {
+        file: &'static str,
+        source: &'static str,
+    },
 }
 
 /// What a bot turn's prompt carries.
@@ -160,7 +167,11 @@ impl Provider {
                 file: ".claude/settings.json",
                 events: &["Stop", "StopFailure", "Notification", "PermissionRequest"],
             }),
-            Provider::Cursor | Provider::Pi | Provider::Opencode => None,
+            Provider::Pi => Some(Watch::Extension {
+                file: ".pi/agent/extensions/vibeface.ts",
+                source: include_str!("../extensions/pi.ts"),
+            }),
+            Provider::Cursor | Provider::Opencode => None,
         }
     }
 

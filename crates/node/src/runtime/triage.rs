@@ -2616,6 +2616,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pi_session_whose_turn_ended_gets_its_next_message_or_nothing() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let ended = |turn: &str| {
+                triage::from_pi_extension(&json!({"session_id":"p1","turn_id":turn,"cwd":"/w",
+                    "stop_reason":"stop","last_message":"Tests written."}))
+                .context("a turn end")
+            };
+            let held = node.ingest_agent_event(ended("e1")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let listed =
+                node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
+            assert_eq!(
+                (listed["provider"].clone(), listed["kind"].clone()),
+                (json!("pi"), json!("continue"))
+            );
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            node.triage_command(json!({"action":"respond","request_id":request_id,
+                "result":{"text":"Now run them."}}))
+                .await?;
+            assert_eq!(waiting.await?, json!({"text":"Now run them."}));
+
+            let held = node.ingest_agent_event(ended("e2")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            node.triage
+                .requests
+                .lock()
+                .unwrap()
+                .get_mut(&request_id)
+                .context("held")?
+                .answer_by_ms = Some(now_ms() + 50);
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"decision":null}),
+                "nothing is sent to a session nobody answered"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn without_an_agent_requests_are_declined_and_events_dropped() -> Result<()> {
         let (node, _, dir) = node().await?;
         let result = async {

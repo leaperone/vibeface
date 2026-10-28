@@ -1652,4 +1652,12 @@ mod tests {
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
+
+    #[test]
+    fn the_extension_stays_out_of_the_runs_the_node_starts() {
+        let Some(crate::providers::Watch::Extension { source, .. }) = Provider::Pi.watch() else {
+            panic!("pi is watched through its extension");
+        };
+        assert!(source.contains(&format!("if (process.env.{RUN_ENV}) return;")));
+    }
 }
