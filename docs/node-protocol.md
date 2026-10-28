@@ -169,7 +169,7 @@
 
 | method | 主要字段 | 结果或行为 |
 |---|---|---|
-| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测。离线 Node 的 `capabilities` 是本 Node 本次运行中它最后一次回答的能力，还没回答过的为 `null` |
+| `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测。离线 Node 的 `capabilities` 是它最后一次回答的能力，只存在本 Node 自己的存储里，不进共享记录，重启后仍在；从没回答过的为 `null` |
 | `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改；`primary` 为主 Bot 的会话 ID |
 | `set_primary_bot` | `conversation_id`、`attestation` | 本人选定主 Bot，写入 `bots` scope |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
@@ -385,6 +385,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `hand_over_session` | 另一台设备上的 Bot 转交或不再关注本设备运行的会话，带发起 Bot 的会话 `from` 和它看到的 `version`；本设备核对归属与版本后写入，状态已成立时不写 |
 | `cancel_manager`、`resolve` | 转发本人的管理控制，要求 `human: true` |
 | `pending_joins`、`approve_join` | 汇总其他入口上的加入请求，把批准转发到保存请求的 Node |
+| `join_changed` | 保存请求的 Node 告知本机持有的加入请求有变化，不带请求内容；收到的 Node 向本机客户端推送不带会话的 `changed`，不回传、不转发 |
 
 ### Relay 与公共入口
 
@@ -450,7 +451,7 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 ## 通知和自动后续
 
-加密通道推送 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress`、`write_state` 与失效提醒。本机签名成员目录有变化时（加入、撤销、自行离开、权限变化或同步合并来的新事件），Node 推送一条不带会话的 `changed`，客户端据此重读 `directory`。本机持有的加入请求被提交、揭示随机数、批准、拒绝或撤回时，Node 推送同样不带内容的 `changed`，不含 `join_id` 或状态；管理设备重读 `join_status`，其他成员只重读 `directory`。加入请求按 Node 时钟过期，不推送；客户端在最早的 `expires_at_ms` 之后重读。另一台 Node 持有的请求只能经 `join_status` 询问得到，成员目录有多台 Node 时，管理设备另外每 30 秒重读一次。客户端读取 `notifications`，用稳定 `client_id` 确认 `notification_id`，不同浏览器各自确认。
+加密通道推送 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress`、`write_state` 与失效提醒。本机签名成员目录有变化时（加入、撤销、自行离开、权限变化或同步合并来的新事件），Node 推送一条不带会话的 `changed`，客户端据此重读 `directory`。本机持有的加入请求被提交、揭示随机数、批准、拒绝或撤回时，Node 推送同样不带内容的 `changed`，不含 `join_id` 或状态；管理设备重读 `join_status`，其他成员只重读 `directory`。保存请求的 Node 同时向同步未失败的其他成员 Node 发 `join_changed`，它们各自向本机客户端推送同样的 `changed`，所以连在任何一台 Node 上的管理设备都能立即重读到另一台 Node 持有的请求（`join_status` 不带 `join_id` 时经 `pending_joins` 汇总）。通知只发一次，不重试；当时连不上的 Node 在同步恢复时会推送 `changed`，客户端届时重读。加入请求按 Node 时钟过期，不推送；列表里每条请求都带保存它的 Node 给出的 `expires_at_ms`，客户端在最早的到期时间之后重读，仍未过期就每 5 秒再读，直到它消失。客户端读取 `notifications`，用稳定 `client_id` 确认 `notification_id`，不同浏览器各自确认。
 
 管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`，`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`。临时进度不写入事件日志。客户端读取 `conversation` 时，入口为该会话建立有界的只读观察，经 `progress_read` 从负责人和执行节点读取进度。回合状态变化时，该设备在进度环里放一条只在环内的 `job_changed` 提示，观察方收到后让客户端重读会话；它不进事件日志，也不推给本机客户端。
 

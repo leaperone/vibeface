@@ -654,7 +654,10 @@ impl Runtime {
                         .and_then(Result::ok)
                     };
                     let live = answer.is_some();
-                    (live, self.peer_capabilities(&member.device_id, answer))
+                    (
+                        live,
+                        self.peer_capabilities(&member.device_id, answer).await,
+                    )
                 });
                 let probes = futures_util::future::join_all(probes).await;
                 for (member, (live, capabilities)) in members.into_iter().zip(probes) {

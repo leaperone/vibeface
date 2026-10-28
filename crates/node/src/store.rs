@@ -787,6 +787,27 @@ impl Store {
             .query_map([network_id], |r| r.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
+    /// A member Node's last `capabilities` answer, kept only here to show while it is offline.
+    pub fn peer_capabilities(&self, peer: &str) -> Result<Option<Value>> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM identity_meta WHERE key=?",
+                [format!("capabilities:{peer}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?)
+    }
+    pub fn keep_peer_capabilities(&self, peer: &str, capabilities: &Value) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO identity_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [format!("capabilities:{peer}"), capabilities.to_string()],
+        )?;
+        Ok(())
+    }
     /// A host-wide counter, so request IDs of a restarted App Server never repeat.
     pub fn next_codex_epoch(&mut self) -> Result<u64> {
         let tx = self
