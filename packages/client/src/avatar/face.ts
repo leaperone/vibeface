@@ -17,7 +17,7 @@ const EYES: Eyes[] = ['dot', 'pill', 'oval', 'wide']
 // Same hues and hash as the mobile botHue, so chat accents keep matching the face.
 const HUES = [8, 32, 52, 100, 160, 200, 235, 280]
 // botHue's HSL hues mapped to the OKLCH hue that reads as the same colour.
-const OK_HUE: Record<number, number> = { 8: 22, 32: 55, 52: 90, 100: 135, 160: 170, 200: 225, 235: 275, 280: 320 }
+const OK_HUE: Record<number, number> = { 8: 22, 32: 55, 52: 100, 100: 135, 160: 170, 200: 225, 235: 275, 280: 320 }
 const ANGLES = Array.from({ length: SAMPLES }, (_, i) => 2 * Math.PI * i / SAMPLES)
 
 export function faceOf(id: string): Face {
@@ -137,7 +137,9 @@ export function eyePaths(face: Face, p: Pose): string[] {
 export function colors(face: Face, dark: boolean, saturation: number): Colors {
   const h = OK_HUE[face.hue] ?? face.hue
   const s = clamp(saturation, 0, 1)
-  const [l, c] = dark ? [0.70, 0.10] : [0.74, 0.11]
+  // Yellow only reads clean near its natural lightness; at the shared one it turns olive and blurs into the amber halo.
+  const lift = h === OK_HUE[52] ? 0.08 : 0
+  const [l, c] = dark ? [0.70 + lift, 0.10] : [0.74 + lift, 0.11]
   const base = oklch(l, c * s, h)
   const ink = oklch(dark ? 0.18 : 0.24, 0.04 * s, h)
   // Thinking dots sit on the page, not the body, so dark ink would vanish on a dark page.
