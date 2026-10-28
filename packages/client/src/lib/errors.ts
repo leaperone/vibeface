@@ -30,7 +30,7 @@ const patterns: [RegExp, string][] = [
   [/explicit App Server socket/i, '还没填 Codex 的连接路径。'],
   [/App Server socket must be an absolute path/i, '连接路径要是绝对路径。'],
   [/explicit absolute CODEX_HOME/i, '由 Vibeface 启动前，先填 Codex 目录。'],
-  [/Codex SDK|Codex rejected|App Server/i, 'Codex 没能完成这次回复。请再发一次；一直不行就去设备页检查 Codex。'],
+  [/Codex SDK|Codex rejected|Codex turn failed|App Server/i, 'Codex 没能完成这次回复。请再发一次；一直不行就去设备页检查 Codex。'],
   [/peer (did not answer|is unreachable|connection closed|closed the stream|stream failed)|target connection closed|client target refused/i, '另一台设备没有回应，可能关机或断网了。等它上线后再试。'],
   [/client disconnected|client channel idle|membership state closed/i, '连接断开了，正在重新连接。'],
   [/Failed to fetch|NetworkError|Load failed/i, '连不上设备，请检查网络后再试。'],
@@ -137,6 +137,11 @@ export const failureKinds = Object.keys(failures) as FailureKind[]
 /** The words for a failure kind; empty for `unknown`, whose caller words it from what it knows. */
 export function failureText(kind: FailureKind | null | undefined): string {
   return kind ? failures[kind] : ''
+}
+
+/** Why a reply failed, in the reader's words: its kind, else the device's own text, else a plain line. */
+export function replyFailure(kind: FailureKind | null | undefined, detail?: string): string {
+  return failureText(kind) || humanError(detail ?? '', undefined, '这次回复')
 }
 
 /** The untranslated text, for 详细信息; empty when the shown message already is the original. */

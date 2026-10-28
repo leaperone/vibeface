@@ -541,7 +541,7 @@ impl Runtime {
         if !self.providers().switches.execution {
             return Err(vibeface_bridge::failure::ExecFailure::new(
                 vibeface_bridge::failure::FailureKind::ExecutionDisabled,
-                "Codex execution is turned off on this device",
+                "Codex execution is turned off on this device; ask the user to turn it on with propose_provider_config execution=true",
             )
             .into());
         }

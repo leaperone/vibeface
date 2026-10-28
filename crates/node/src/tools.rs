@@ -331,9 +331,10 @@ impl Tool {
                 &["node", "session_id", "version"],
             ),
             Tool::ProposeProviderConfig => (
-                "Ask the user in this chat to allow paths this device's providers use. Give the paths you found with your Shell, or none to have the Node look on this device: CODEX_HOME of the Node's environment, else ~/.codex, its app-server-control/app-server-control.sock and sessions folder, and the Cursor SDK Bridge program while Cursor runs the bot. execution=true also turns on Codex executing work here. Only absolute paths that exist; never keys, tokens or other variables. Nothing changes now: the chat shows an allow/deny card and the user's answer comes back to you as a new turn. Calling again in the same turn with the same values returns the same card. If nothing differs from the current settings, status is unchanged.",
+                "Ask the user in this chat to allow paths this device's providers use. Give the paths you found with your Shell, or none to have the Node look on this device: CODEX_HOME of the Node's environment, else ~/.codex, its app-server-control/app-server-control.sock and sessions folder, and the Cursor SDK Bridge program while Cursor runs the bot. execution=true also turns on Codex executing work here; roots adds folders work may run in, such as the user's projects folder you found. Only absolute paths that exist; never keys, tokens or other variables. Nothing changes now: the chat shows an allow/deny card and the user's answer comes back to you as a new turn. Calling again in the same turn with the same values returns the same card. If nothing differs from the current settings, status is unchanged.",
                 json!({"execution":{"type":"boolean","const":true},"codex_home":string(),"app_server_socket":string(),
-                "codex_sessions":string(),"cursor_sdk_bin":string()}),
+                "codex_sessions":string(),"cursor_sdk_bin":string(),
+                "roots":{"type":"array","items":string(),"maxItems":16,"uniqueItems":true}}),
                 &[],
             ),
             Tool::ApplyProviderConfig => (

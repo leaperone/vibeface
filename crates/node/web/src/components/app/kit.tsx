@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
-import { ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { ChevronDown, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -138,7 +138,7 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
   </>
 }
 
-/** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
+/** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button; `expanded` marks one that folds out below itself. */
 /** `stacked`: on a phone the control gets its own full line under the label, lined up with it. */
 export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false, ref }: {
   icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean; ref?: Ref<HTMLButtonElement>
@@ -146,7 +146,7 @@ export function SettingsRow({ icon, label, description, tone, children, onClick,
   const end = children ? <span className={cn("ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground", stacked && "max-sm:basis-full max-sm:ps-11")}>{children}</span> : null
   if (onClick) return <button ref={ref} type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
-    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
+    {expanded === undefined ? null : <ChevronDown aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-180")} />}
   </button>
   return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
 }
@@ -157,7 +157,7 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
     <summary className={cn(rowLayout, "interactive-row cursor-pointer list-none flex-nowrap [&::-webkit-details-marker]:hidden")}>
       <RowLead icon={icon} label={label} />
       {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
-      <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90", !value && "ms-auto")} />
+      <ChevronDown aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-180", !value && "ms-auto")} />
     </summary>
     <div className="grid gap-3 px-4 pb-4 sm:ps-15">{children}</div>
   </details>

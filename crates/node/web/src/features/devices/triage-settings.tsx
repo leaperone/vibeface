@@ -67,9 +67,42 @@ export function TriageSettings() {
     if (path && !config.projects.some((item) => item.prefix === path)) void save("projects", { projects: [...config.projects, { prefix: path, outlet: config.default_outlet === "both" ? "record" : "both" }] })
   }
   const { pending, delivered, dead } = settings.outbox
+  // Until a chat is connected there is nothing to forward, so only connecting shows.
+  const connected = Boolean(settings.webhook_url)
+
+  const webhookForm = <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
+    <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
+    <label htmlFor="webhook-url" className={fieldLabel}>地址</label>
+    <Input id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+    <label htmlFor="webhook-secret" className={fieldLabel}>密钥</label>
+    {confirming === "secret" ? <p className="text-meta text-foreground">清除后提醒发不出去</p> : null}
+    <div className="flex min-w-0 gap-2">
+      <Input id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />
+      {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
+        <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
+        <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
+      </> : <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => setConfirming("secret")}><Trash2 aria-hidden="true" /></Button>}
+    </div>
+    <div className="flex flex-wrap items-center gap-2">
+      <Button type="submit" variant="outline" disabled={Boolean(busy) || (url.trim() === settings.webhook_url && !secret)}><BusyIcon busy={busy === "webhook"} />保存</Button>
+      <Button type="button" variant="ghost" disabled={Boolean(busy) || !settings.webhook_url || !settings.webhook_secret_set} onClick={() => {
+        setTest(null)
+        void call("test", "test_webhook").then((result) => {
+          const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
+          if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? "没有响应"}` })
+        })
+      }}><BusyIcon busy={busy === "test"} icon={Zap} />测试</Button>
+      {test ? <span role="status" className={cn("flex items-center gap-1 text-meta", test.ok ? "text-success" : "text-danger")}>{test.ok ? <CircleCheck aria-hidden="true" className="size-4" /> : <CircleX aria-hidden="true" className="size-4" />}{test.text}</span> : null}
+      {pending + delivered + dead ? <ul aria-label="发送记录" className="ms-auto flex items-center gap-3 text-meta tabular-nums text-muted-foreground">
+        {([[delivered, "已送达", CircleCheck, "text-success"], [pending, "待重试", Clock, ""], [dead, "失败", CircleX, "text-danger"]] as const).map(([count, label, Icon, tone]) =>
+          count ? <li key={label} className="flex items-center gap-1" title={label}><Icon aria-hidden="true" className={cn("size-4", tone)} /><span className="sr-only">{label} </span>{count}</li> : null)}
+      </ul> : null}
+    </div>
+  </form>
 
   return <>
     {header}
+    {connected ? <>
     <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时" stacked>
       <Segmented label="会话等你时" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
@@ -88,37 +121,11 @@ export function TriageSettings() {
         <Button type="button" variant="outline" disabled={Boolean(busy) || !prefix.trim()} onClick={addProject}><Plus aria-hidden="true" />添加</Button>
       </div>
     </SettingsDisclosure>
+    </> : null}
 
-    <SettingsDisclosure icon={terms.externalChat.icon} label={chat} value={settings.webhook_url ? "已连接" : "未连接"} open={!settings.webhook_url && config.default_outlet === "both"}>
-      <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
-        <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
-        <label htmlFor="webhook-url" className={fieldLabel}>地址</label>
-        <Input id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
-        <label htmlFor="webhook-secret" className={fieldLabel}>密钥</label>
-        {confirming === "secret" ? <p className="text-meta text-foreground">清除后提醒发不出去</p> : null}
-        <div className="flex min-w-0 gap-2">
-          <Input id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />
-          {!settings.webhook_secret_set ? null : confirming === "secret" ? <>
-            <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setConfirming("")}>取消</Button>
-            <Button type="button" size="sm" variant="destructive" disabled={Boolean(busy)} onClick={() => { setConfirming(""); void save("webhook", {}, { webhook_secret: null }) }}>清除</Button>
-          </> : <Button type="button" variant="ghost" size="icon" aria-label="清除密钥" title="清除密钥" disabled={Boolean(busy)} onClick={() => setConfirming("secret")}><Trash2 aria-hidden="true" /></Button>}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button type="submit" variant="outline" disabled={Boolean(busy) || (url.trim() === settings.webhook_url && !secret)}><BusyIcon busy={busy === "webhook"} />保存</Button>
-          <Button type="button" variant="ghost" disabled={Boolean(busy) || !settings.webhook_url || !settings.webhook_secret_set} onClick={() => {
-            setTest(null)
-            void call("test", "test_webhook").then((result) => {
-              const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-              if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? "没有响应"}` })
-            })
-          }}><BusyIcon busy={busy === "test"} icon={Zap} />测试</Button>
-          {test ? <span role="status" className={cn("flex items-center gap-1 text-meta", test.ok ? "text-success" : "text-danger")}>{test.ok ? <CircleCheck aria-hidden="true" className="size-4" /> : <CircleX aria-hidden="true" className="size-4" />}{test.text}</span> : null}
-          {pending + delivered + dead ? <ul aria-label="发送记录" className="ms-auto flex items-center gap-3 text-meta tabular-nums text-muted-foreground">
-            {([[delivered, "已送达", CircleCheck, "text-success"], [pending, "待重试", Clock, ""], [dead, "失败", CircleX, "text-danger"]] as const).map(([count, label, Icon, tone]) =>
-              count ? <li key={label} className="flex items-center gap-1" title={label}><Icon aria-hidden="true" className={cn("size-4", tone)} /><span className="sr-only">{label} </span>{count}</li> : null)}
-          </ul> : null}
-        </div>
-      </form>
+    {/* Until a chat is connected the header opens straight onto connecting it. */}
+    {connected ? <SettingsDisclosure icon={terms.externalChat.icon} label={chat} value="已连接">
+      {webhookForm}
 
       <Details label={`让${chat}代你回答`}>
         <p className="flex items-center gap-2 text-meta text-foreground"><terms.secret.icon aria-hidden="true" className="size-4" />{chat}用这个地址和授权码回话</p>
@@ -149,7 +156,9 @@ export function TriageSettings() {
           })}><BusyIcon busy={busy === "token"} icon={Plus} />生成授权码</Button>
         </div>
       </Details>
-    </SettingsDisclosure>
+    </SettingsDisclosure> : <div className="grid gap-3 px-4 py-3 sm:ps-15">
+      {webhookForm}
+    </div>}
     {error ? <div className="px-4 py-3"><InlineError error={error} /></div> : null}
   </>
 }

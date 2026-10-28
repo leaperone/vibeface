@@ -55,7 +55,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
   const taskOpen = /^\/b\/[^/]+\/work\//.test(pathname)
-  const back = backTo(pathname)
+  const back = backTo(pathname, useRouterState({ select: (state) => (state.location.search as { bot?: string }).bot }))
   const nested = Boolean(back) && back !== "/" && !chatRoute
   const [creatingBot, setCreatingBot] = useState(false)
   const creatorTrigger = useRef<HTMLElement | null>(null)

@@ -2,7 +2,7 @@ import { Bot, CirclePause, CircleX, Clock } from 'lucide-react-native'
 import { View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion, useReducedMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
-import { failureText } from '@vibeface/client/lib/errors.ts'
+import { failureText, replyFailure } from '@vibeface/client/lib/errors.ts'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import type { ChatMessage } from '@/data/types'
@@ -43,7 +43,7 @@ export function Message({ message, last, offline }: { message: ChatMessage; last
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
-  const cause = failureText(message.failure)
+  const cause = failed ? replyFailure(message.failure) : failureText(message.failure)
   const entering = message.created_at_ms > Date.now() - 2000 ? rise : undefined
   const time = last && message.created_at_ms ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shortTime(message.created_at_ms)}</Text> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">

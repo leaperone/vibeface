@@ -11,6 +11,18 @@ export function projectPlace(project: BotProject, owner: string | null | undefin
   return project.target_node === owner ? folder : `${deviceName(project.target_node)} · ${folder}`
 }
 
+export type ProjectChoice = { key: string; project: BotProject; label: string }
+export const projectKey = (project: BotProject) => JSON.stringify([project.target_node, project.cwd])
+
+/** The folders a bot can work in: each folder of an online device that runs bots, named with its device. */
+export function projectChoices(nodes: readonly NodeInfo[], deviceName: (node: NodeInfo, index: number) => string): ProjectChoice[] {
+  return nodes.flatMap((node, index) => node.revoked || !node.online || !node.capabilities?.manager ? []
+    : (node.capabilities.roots ?? []).map((cwd) => {
+      const project = { target_node: node.device_id, cwd }
+      return { key: projectKey(project), project, label: `${deviceName(node, index)} · ${projectName(cwd)}` }
+    }))
+}
+
 /**
  * Where a new bot's folder gets set up when none is offered. Folders come only from devices that run a bot (`add`), and a
  * device's AI settings are editable only through the connected device `here`, by an admin or on that computer itself.

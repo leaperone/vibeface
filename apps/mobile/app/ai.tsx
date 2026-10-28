@@ -305,12 +305,39 @@ function Triage() {
   }
   const other = (outlet: Outlet): Outlet => outlet === 'both' ? 'record' : 'both'
   const { pending, delivered, dead } = settings.outbox
+  // Until a chat is connected there is nothing to forward, so only connecting shows.
+  const connected = Boolean(settings.webhook_url)
+  const connect = <>
+    <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} />
+    <View className="flex-row gap-2">
+      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+      {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
+    </View>
+    <View className="flex-row flex-wrap items-center gap-2">
+      <Button variant="outline" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
+        onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
+        {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
+      </Button>
+      <Button variant="ghost" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
+        setTest(null)
+        void call('test', 'test_webhook').then((result) => {
+          const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
+          if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
+        })
+      }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
+      {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
+    </View>
+    {pending + delivered + dead ? <View className="flex-row items-center gap-3">
+      {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
+        count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
+    </View> : null}
+  </>
   return <View className="gap-6">
-    <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
-      onChange={(value) => void save('default', { default_outlet: value })} />
+    {connected ? <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
+      onChange={(value) => void save('default', { default_outlet: value })} /> : null}
     {/* The two folds sit together as one list of extras under the choice above. */}
     <View>
-      <Details label="按文件夹另设" open={config.projects.length > 0}>
+      {connected ? <Details label="按文件夹另设" open={config.projects.length > 0}>
         <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
           trailing={(prefix) => {
             const project = config.projects.find((item) => item.prefix === prefix)!
@@ -319,32 +346,10 @@ function Triage() {
               onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
           }}
           onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
-      </Details>
-      {/* Folded as on the web, its state in the label; open while 也发给外部聊天 still has nowhere to send. */}
-      <Details label={`外部聊天 · ${settings.webhook_url ? '已连接' : '未连接'}`} open={!settings.webhook_url && config.default_outlet === 'both'}>
-        <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} />
-        <View className="flex-row gap-2">
-          <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
-          {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
-        </View>
-        <View className="flex-row flex-wrap items-center gap-2">
-          <Button variant="outline" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
-            onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
-            {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
-          </Button>
-          <Button variant="ghost" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
-            setTest(null)
-            void call('test', 'test_webhook').then((result) => {
-              const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-              if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
-            })
-          }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
-          {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
-        </View>
-        {pending + delivered + dead ? <View className="flex-row items-center gap-3">
-          {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
-            count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
-        </View> : null}
+      </Details> : null}
+      {/* Folded as on the web once connected; until then connecting shows on its own. */}
+      {connected ? <Details label="外部聊天 · 已连接">
+        {connect}
         <Details label="让外部聊天代你回答">
           <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
           {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
@@ -365,7 +370,7 @@ function Triage() {
             })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
           </View>
         </Details>
-      </Details>
+      </Details> : <View className="gap-3">{connect}</View>}
     </View>
     {error ? <ErrorText error={error.text} /> : null}
   </View>

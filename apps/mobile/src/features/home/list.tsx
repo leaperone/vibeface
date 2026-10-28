@@ -46,7 +46,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
         <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
       </View>
     </View> : null}
-    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-xl bg-muted ring-1 ring-border"><Icon as={Inbox} className="size-5 text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={device.pendingRecovery ? recoveryCopy.pending : waiting ? `${waiting} 件事等你决定` : loading ? '' : '没有要你决定的事'} />
+    <Row href="/inbox" replace={replace} active={active('/inbox')} avatar={<View className="size-11 items-center justify-center rounded-xl bg-muted ring-1 ring-border"><Icon as={Inbox} className="size-5 text-muted-foreground" /></View>} name="待处理" unread={waiting} preview={device.pendingRecovery ? recoveryCopy.pending : waiting ? `${waiting} 件事等你决定` : ''} />
     <View className="-mb-2 flex-row items-center justify-between ps-3 pt-4">
       <Text role="heading" className="text-meta font-medium text-muted-foreground">Bot</Text>
       <Link href="/new-bot" asChild>
@@ -75,10 +75,10 @@ function Row({ href, replace, active, avatar, name, mark, label, preview, unread
           <View className="min-w-0 flex-1 flex-row items-center gap-1.5"><Text numberOfLines={1} className="shrink font-medium">{name}</Text>{mark}</View>
           {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
         </View>
-        <View className="flex-row items-center gap-2">
+        {preview || unread ? <View className="flex-row items-center gap-2">
           <Text numberOfLines={1} className="min-w-0 flex-1 text-meta text-muted-foreground">{preview}</Text>
           <Badge count={unread} />
-        </View>
+        </View> : null}
       </View>
     </Pressable>
   </Link>

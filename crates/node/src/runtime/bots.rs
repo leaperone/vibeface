@@ -223,6 +223,50 @@ impl Runtime {
         Ok(json!({"primary":self.store.lock().await.primary_bot(&access.network_id)?}))
     }
 
+    /// The user moves a bot's project folder, or clears it; asking for the current one writes nothing.
+    pub(super) async fn set_bot_project(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user moves a bot's project");
+        let scope = id(input, "conversation_id")?;
+        if let Some(allowed) = &access.conversation_id {
+            ensure!(allowed == &scope, "outside this client's conversation");
+        }
+        let project: Option<BotProject> = input
+            .get("project")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let bot = self
+            .store
+            .lock()
+            .await
+            .bot_for_conversation(&access.network_id, &scope)?
+            .context("no such bot")?;
+        if bot.project == project {
+            return Ok(json!({"bot":bot}));
+        }
+        if let Some(project) = &project {
+            self.validate_bot_project(&access.network_id, project)
+                .await?;
+        }
+        let event = self
+            .append(
+                &access.network_id,
+                &scope,
+                EventBody::BotProjectSet {
+                    project,
+                    attestation: Some(attestation(input)?),
+                },
+            )
+            .await?;
+        tracing::info!(
+            event = "bot.project",
+            conversation_id = scope,
+            "bot project set"
+        );
+        self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
+        Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
+    }
+
     pub(super) async fn validate_bot_project(
         &self,
         network: &str,
