@@ -3196,7 +3196,10 @@ mod tests {
             let mut watching = connect(phone.clone()).await?;
             watching.call("subscribe", json!({})).await?;
             let leave = GovernanceEvent::revoke(&phone, &view, Revocation::new(&phone.device_id()?, None)?)?;
+            let mut updates = node.events.subscribe();
             assert_eq!(joiner.call("revoke", json!({"event":leave})).await?["revoked"], true, "an ordinary client leaves on its own");
+            assert!(std::iter::from_fn(|| updates.try_recv().ok()).any(|update| update.payload == json!({"type":"changed"})),
+                "open pages are told to reread the device list once a device leaves");
             assert!(joiner.call("revoke", json!({"event":leave})).await.is_err(), "a left device cannot sign again");
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);

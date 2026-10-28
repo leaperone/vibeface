@@ -36,8 +36,8 @@ export type Conversation = {
 /** A file picked for the next message. */
 export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
 
-/** `bot`: the device runs a bot right now, so removing it stops that bot. */
-export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean; current: boolean; entry: boolean; bot: boolean }
+/** `bot`: the device runs a bot right now, so removing it stops that bot. `online`: known for computers only. */
+export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: boolean }
 
 type WorkspaceSnapshot = {
   session: Session

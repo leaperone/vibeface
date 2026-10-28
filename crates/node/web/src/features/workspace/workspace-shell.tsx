@@ -22,6 +22,7 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { BotPanelButton } from "./bot-panel"
 import { BotForm } from "./bot-form"
 import { useInbox } from "./inbox"
+import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { LocalSession } from "./local-session"
@@ -49,7 +50,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const workspace = useWorkspace()
   const device = useDevice()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
-  const waiting = useInbox().filter((item) => !item.done).length
+  const waiting = waitingItems(useInbox()).length
   const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")

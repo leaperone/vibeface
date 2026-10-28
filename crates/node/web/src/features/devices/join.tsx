@@ -4,13 +4,12 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { JoinRequest } from "@vibeface/client/lib/node.ts"
 import { deviceIcon } from "./devices"
+import { openJoins } from "@vibeface/client/workspace/inbox.ts"
+import { deviceForm, formName } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 
 /** Requests an admin can still act on. */
-export function useOpenJoins(): JoinRequest[] {
-  const device = useDevice()
-  return device.ready?.principal.can_manage ? device.joins.filter((request) => request.status === "pending" || request.status === "confirming") : []
-}
+export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
 
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
 /**
@@ -79,7 +78,7 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
     icon={deviceIcon({ kind: request.kind, name: request.name, entry: false })}
     tone="info"
     title={<span className="flex min-w-0"><span className="truncate" title={request.name || undefined}>{request.name || "新设备"}</span><span className="shrink-0">&nbsp;想加入</span></span>}
-    meta={request.kind === "node" ? "电脑" : "浏览器"}
+    meta={formName[deviceForm(request.kind, request.name)]}
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", () => device.rejectJoin(request.join_id), "已拒绝")}>拒绝</Button>
       {request.status === "pending" && !auto ? <Button type="button" disabled={busy} onClick={() => void action.run("start", () => device.startApproval(request.join_id))}>{action.busy === "start" ? "处理中" : "显示安全码"}</Button>

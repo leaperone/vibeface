@@ -13,7 +13,8 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
-import { useLive } from '@/data/live'
+import { useInbox, useLive } from '@/data/live'
+import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
 import { listTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 
@@ -29,7 +30,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const shared = useLive()
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const loading = !shared?.synced
-  const waiting = workspace.questions.filter((question) => question.answer === null).length + Number(!!device.pendingRecovery) + Number(device.rotateHint)
+  const waiting = waitingItems(useInbox()).length
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))

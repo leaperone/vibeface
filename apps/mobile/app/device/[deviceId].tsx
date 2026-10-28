@@ -30,14 +30,14 @@ export default function DeviceDetail() {
       <View className="min-w-0 flex-1 gap-1">
         <Text className="text-title font-semibold">{member.name}</Text>
         <View className="flex-row flex-wrap items-center gap-3">
-          <View className="flex-row items-center gap-1.5">
+          {member.online !== undefined ? <View className="flex-row items-center gap-1.5">
             <View className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} />
             <Text className={cn('text-meta', member.online ? 'text-success' : 'text-muted-foreground')}>{member.online ? '在线' : '离线'}</Text>
-          </View>
+          </View> : null}
           {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? '这台手机' : '当前连接'}</Text> : null}
           {member.admin ? <View className="flex-row items-center gap-1"><Icon as={Crown} className="size-3.5 text-muted-foreground" /><Text className="text-meta text-muted-foreground">管理</Text></View> : null}
         </View>
-        {member.kind === 'node' && !member.online ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
+        {member.online === false ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
     {/* The AI page sets up the computer this phone connects through, so its detail leads there instead of ending. */}

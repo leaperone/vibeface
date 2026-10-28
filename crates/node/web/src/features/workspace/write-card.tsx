@@ -9,8 +9,8 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
 import type { ConflictVersion } from "@vibeface/client/workspace/types.ts"
+import type { WriteCardKind } from "@vibeface/client/workspace/inbox.ts"
 
-export type WriteCardKind = "read_only" | "forked" | "conflicts"
 
 const summary = (version: ConflictVersion | null) => {
   if (!version) return "这台电脑上没有"
