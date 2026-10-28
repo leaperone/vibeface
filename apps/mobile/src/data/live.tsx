@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
-import { composerHint, threadReplies, type BotReach } from '@vibeface/client/chat/protocol.ts'
+import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
@@ -96,9 +96,6 @@ function Live({ children }: { children: ReactNode }) {
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
-    const unready = nodes.some((node) => botReadiness(node) === 'needs_setup')
-    const reach: BotReach = nodes.some((node) => botReadiness(node) === 'ready') ? 'ready' : unready ? 'needs_setup'
-      : nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
       messages, questions: data.questions, works: data.works,
@@ -109,7 +106,7 @@ function Live({ children }: { children: ReactNode }) {
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
-      blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '') || composerHint({ hasConversation: true, loaded: true, bot: reach }) || null,
+      blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '') || composerHint({ hasConversation: true, loaded: true, bot: botReach(nodes) }) || null,
       sending: shared.messageBusy,
     }
   }

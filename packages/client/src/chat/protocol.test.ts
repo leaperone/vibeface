@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
 test('send waits for a loaded conversation', () => {
@@ -10,6 +10,21 @@ test('send waits for a loaded conversation', () => {
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')
   assert.equal(composerHint({ ...ready, bot: 'needs_setup' }), '运行 Bot 的设备需设置')
+})
+test('chat rereads readiness only while a device that could reply is not ready yet', () => {
+  const node = (online: boolean, manager_ready: boolean | null) => ({
+    device_id: 'd', name: 'Mac', local: false, online, revoked: false,
+    capabilities: manager_ready === null ? undefined : { manager: 'codex', manager_ready, relay: false, roots: [], codex_connected: false },
+  })
+  assert.equal(botReach([]), 'none')
+  assert.equal(botReach([node(true, null)]), 'none')
+  assert.equal(botReach([node(true, false)]), 'needs_setup')
+  assert.equal(botReach([node(false, false)]), 'offline')
+  assert.equal(botReach([node(false, false), node(true, false), node(true, true)]), 'ready')
+  assert.equal(awaitsDevice('none'), false, 'with no device to wait on, setting one up rereads it')
+  assert.equal(awaitsDevice('ready'), false)
+  assert.equal(awaitsDevice('needs_setup'), true)
+  assert.equal(awaitsDevice('offline'), true)
 })
 test('an explicit retry preserves the complete original message request', () => {
   const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', pending: null })

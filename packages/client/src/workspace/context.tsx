@@ -60,6 +60,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   // Read synchronously: the chat route selects its conversation in the same commit that sets the view.
   const viewRef = useRef<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const nodesRef = useRef(nodes)
+  nodesRef.current = nodes
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
@@ -273,7 +275,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       void notify(nextNotifications)
       void refreshNotificationButton()
     } catch (caught) {
-      if (current()) { readConnection.current = null; dataRef.current = null; setData(null) }
+      // What the page shows stays; writes wait for the next full read.
+      if (current()) readConnection.current = null
       throw caught
     } finally {
       if (refreshingConnection.current === connection) refreshingRef.current = false
@@ -381,12 +384,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return next
       })
     })
-    // Pushes carry every change; this catches a device going offline, which nothing pushes, and anything missed.
+    // Pushes carry every change but a device coming online or going offline; this catches those and anything missed.
     let ticks = 0
     const timer = setInterval(() => {
       ticks += 1
       if (ticks % 20 === 0) scheduleRefresh()
-      else if (openWorksRef.current.length) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
+      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
     }, 15000)
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {

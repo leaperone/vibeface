@@ -7,8 +7,7 @@ import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimat
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { starters } from '@vibeface/client/chat/protocol.ts'
-import { botReadiness } from '@vibeface/client/workspace/model.ts'
+import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
 import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -87,17 +86,17 @@ export default function ChatScreen() {
   const live = useLive()
   // No device can run a bot at all: the entry device's AI settings set one up; an offline one only needs to come back.
   const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
-  // Nothing pushes a device's bot readiness, so while no device can reply and this chat is on screen, read it again every 10s.
+  // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s.
   const latestLive = useRef(live)
   latestLive.current = live
-  const replyReady = live?.nodes.some((node) => botReadiness(node) === 'ready') ?? true
+  const awaiting = live ? awaitsDevice(botReach(live.nodes)) : false
   useFocusEffect(useCallback(() => {
-    if (replyReady) return
+    if (!awaiting) return
     const read = () => void latestLive.current?.refresh().catch(() => {})
     read()
     const timer = setInterval(read, 10000)
     return () => clearInterval(timer)
-  }, [replyReady]))
+  }, [awaiting]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is

@@ -21,7 +21,7 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import './chat.css'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
@@ -57,7 +57,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const agentReady = workspace.nodes.some((node) => botReadiness(node) === 'ready')
+  const reach = botReach(workspace.nodes), agentReady = reach === 'ready'
   const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
@@ -178,7 +178,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
-  const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
   const notice = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
@@ -187,11 +186,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const reason = composerHint({ ...gate, bot: agentReady ? 'ready' : managerOffline && !unready ? 'offline' : unready ? 'needs_setup' : 'none' })
+  const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
-  // A device that only needs setup is fixable now, so it comes before one that is offline.
-  const away = managerOffline && !unready
+  const away = reach === 'offline'
   const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
@@ -208,16 +206,17 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     })
   }, [conversationId, data, messagePending])
   useEffect(() => { setSendError(null) }, [conversationId])
-  // Nothing pushes a device's bot readiness, so while no device can reply to an open bot, read it again every 10s.
+  // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s.
   const latest = useRef(workspace)
   latest.current = workspace
+  const awaiting = Boolean(bot) && awaitsDevice(reach)
   useEffect(() => {
-    if (!bot || agentReady) return
+    if (!awaiting) return
     const read = () => { if (latest.current.isCurrent()) void latest.current.refresh().catch(() => {}) }
     read()
     const timer = setInterval(read, 10000)
     return () => clearInterval(timer)
-  }, [Boolean(bot), agentReady])
+  }, [awaiting])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {

@@ -1,6 +1,7 @@
-import { inputText } from '../workspace/model.ts'
+import { botReadiness, inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
+import type { NodeInfo } from '../workspace/types.ts'
 
 /** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
 export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
@@ -20,6 +21,14 @@ export function canSend(input: SendGate): boolean {
 }
 /** Whether any device can run the bot now: `offline` when the only ones that could are away, `none` when none is set up to. */
 export type BotReach = 'ready' | 'needs_setup' | 'offline' | 'none'
+/** A device that only needs setup is fixable now, so it comes before one that is offline. */
+export function botReach(nodes: NodeInfo[]): BotReach {
+  if (nodes.some((node) => botReadiness(node) === 'ready')) return 'ready'
+  if (nodes.some((node) => botReadiness(node) === 'needs_setup')) return 'needs_setup'
+  return nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
+}
+/** A device that exists but is not ready yet may become ready on its own; with none, setting one up rereads it. */
+export const awaitsDevice = (reach: BotReach) => reach === 'offline' || reach === 'needs_setup'
 /** Why the box cannot send yet, short enough to stand in for its placeholder. */
 export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }): string {
   if (!input.hasConversation) return ''
