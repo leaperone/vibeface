@@ -5,7 +5,7 @@ import { Pressable, Switch, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
@@ -117,7 +117,7 @@ function AiSettings() {
       error={error?.at === item.provider ? error.text : ''}
       change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
       saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
-    <PathList label="可用文件夹" items={roots} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
+    <PathList label="可用文件夹" items={roots} shown={response.display_paths} suggested={folderSuggestions(response)} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
     {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
 }
@@ -145,7 +145,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
     </View>
-    <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
+    <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} />
     {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
     {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-4 py-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
@@ -310,7 +310,7 @@ function Triage() {
   const connect = <>
     <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} />
     <View className="flex-row gap-2">
-      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '密钥，至少 16 个字符'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
       {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
     </View>
     <View className="flex-row flex-wrap items-center gap-2">
@@ -370,23 +370,31 @@ function Triage() {
             })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
           </View>
         </Details>
-      </Details> : <View className="gap-3">{connect}</View>}
+      </Details> : <Field label="外部聊天">{connect}</Field>}
     </View>
     {error ? <ErrorText error={error.text} /> : null}
   </View>
 }
 
-/** Folder paths with a remove button each and a field to add one; a long path keeps its last folder readable. */
-function PathList({ label, items, busy, trailing, onChange }: { label: string; items: string[]; busy: boolean; trailing?: (item: string) => ReactNode; onChange(next: string[]): void }) {
+/**
+ * Folder paths with a remove button each, one-tap folders the device found (`suggested`) and a field to add one; a long
+ * path keeps its last folder readable. `shown`: a path's `~/…` form.
+ */
+function PathList({ label, items, shown = {}, suggested = [], busy, trailing, onChange }: {
+  label: string; items: string[]; shown?: Record<string, string>; suggested?: { path: string; label: string }[]; busy: boolean; trailing?: (item: string) => ReactNode; onChange(next: string[]): void
+}) {
   const [path, setPath] = useState('')
   const add = () => { const next = path.trim(); setPath(''); if (next && !items.includes(next)) onChange([...items, next]) }
   const body = <>
     {items.map((item) => <View key={item} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
-      <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{item}</Text>
+      <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{shown[item] ?? item}</Text>
       {trailing?.(item)}
-      <Button variant="ghost" size="icon" accessibilityLabel={`移除 ${item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel={`移除 ${shown[item] ?? item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
     </View>)}
+    {suggested.length ? <View className="flex-row flex-wrap gap-2">{suggested.map((folder) => <Button key={folder.path} variant="outline" accessibilityLabel={`添加 ${folder.label}`} disabled={busy} onPress={() => onChange([...items, folder.path])}>
+      <Icon as={Plus} /><Text className="font-mono text-meta">{folder.label}</Text>
+    </Button>)}</View> : null}
     <View className="flex-row gap-2">
       <Input accessibilityLabel="文件夹路径" placeholder="/path/to/project" autoCapitalize="none" autoCorrect={false} className="min-w-0 flex-1 font-mono" value={path} editable={!busy}
         returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />

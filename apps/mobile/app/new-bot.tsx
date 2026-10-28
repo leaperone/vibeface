@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { folderLabels, folderSetup, projectChoices } from '@vibeface/client/workspace/bot-settings.ts'
+import { folderLabels, folderSetup, projectChoices, projectKey } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { projectName } from '@vibeface/client/workspace/questions.ts'
 import type { BotProject } from '@vibeface/client/workspace/types.ts'
@@ -32,7 +32,8 @@ export default function NewBot() {
   const projects = projectChoices(shared.nodes, (node, index) => nodeName(node.device_id, lookup, `设备 ${index + 1}`))
   const same = (item?: BotProject) => item?.target_node === project?.target_node && item?.cwd === project?.cwd
   const options: { project?: BotProject; label: string }[] = [{ project: undefined, label: '不选' }, ...projects]
-  if (pending?.project && !projects.some((item) => same(item.project))) options.push({ project: pending.project, label: `${nodeName(pending.project.target_node, lookup, '原来的设备')} · ${projectName(pending.project.cwd)}` })
+  const saved = pending?.project && projectKey(pending.project)
+  if (pending?.project && !projects.some((item) => item.key === saved)) options.push({ project: pending.project, label: `${nodeName(pending.project.target_node, lookup, '原来的设备')} · ${projectName(pending.project.cwd)}` })
   const create = () => run('create', async () => {
     const bot = await shared.createBot(pending ? { name: pending.name, instructions: pending.instructions, project: pending.project } : { name, instructions, project })
     if (bot) router.replace(`/b/${bot.bot_id}`)
@@ -57,10 +58,10 @@ export default function NewBot() {
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{folderLabels.project} <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
-      <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
+      {options.length > 1 ? <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
         {options.map((item, index) => {
           const selected = same(item.project)
-          return <Pressable key={item.project ? `${item.project.target_node}:${item.project.cwd}` : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}
+          return <Pressable key={item.project ? projectKey(item.project) : 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected, disabled: locked }}
             disabled={locked} onPress={() => setProject(item.project)}
             className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted', index > 0 && 'border-t border-border', locked && !selected && 'opacity-50')}>
             <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
@@ -68,11 +69,11 @@ export default function NewBot() {
             {selected ? <Icon as={Check} className="size-4" /> : null}
           </Pressable>
         })}
-      </View>
-      {projects.length || pending?.project ? null : <View className="flex-row flex-wrap items-center gap-x-2">
+      </View> : <View className="flex-row flex-wrap items-center gap-x-2">
+        <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
         <Text className="text-meta text-muted-foreground">{setup?.add ? '还没有可用的文件夹' : '设备能运行 Bot 后就能选'}</Text>
         {/* This phone edits only the AI settings of the device it connects through. */}
-        {pending || !setup ? null : setup.device === here ? <Link href="/ai" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-0.5">
+        {pending || !setup ? null : setup.device === here ? <Link href={{ pathname: '/ai', params: { sheet: '1' } }} asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-0.5">
           <Text className="text-meta font-medium">{setup.add ? '去添加' : '去设置'}</Text><Icon as={ChevronRight} className="size-3.5" />
         </Pressable></Link> : setup.device ? null : <Text className="text-meta text-muted-foreground">在管理设备上设置</Text>}
       </View>}
