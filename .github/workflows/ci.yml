@@ -426,7 +426,8 @@ jobs:
           grep -qx "TeamIdentifier=$VIBEFACE_CODESIGN_TEAM" <<< "$details"
           grep -Eq '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<< "$details"
           binary_sha="$(shasum -a 256 "$PACKAGE/vibeface" | cut -d ' ' -f 1)"
-          for attempt in 1 2 3 4; do
+          delays=(15 30 60 120 120 120 120 120 120)
+          for attempt in $(seq 0 "${#delays[@]}"); do
             assessment="$RUNNER_TEMP/gatekeeper-assessment-$attempt.txt"
             if spctl -a -vvv --ignore-cache --no-cache -t open --context context:primary-signature "$PACKAGE/vibeface" >"$assessment" 2>&1; then
               assessment_status=0
@@ -440,10 +441,10 @@ jobs:
               grep -qx 'source=Notarized Developer ID' "$assessment"
               break
             fi
-            if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq 4; then
+            if test "$assessment_status" -ne 3 || ! grep -qx 'source=Unnotarized Developer ID' "$assessment" || test "$attempt" -eq "${#delays[@]}"; then
               exit "$assessment_status"
             fi
-            sleep 15
+            sleep "${delays[$attempt]}"
           done
       - name: Verify packaged Web assets and process
         env:
