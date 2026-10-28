@@ -212,9 +212,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     // A Codex thread keeps the Shell environment it was created with, tool URL included: when
     // the Node could not get its earlier tool port back, a new thread starts. It lives on one
     // App Server; another one starts a new thread too, and so do new thread instructions. A
-    // thread of a provider without an App Server is on none.
+    // thread of a provider without an App Server is on none, but for opencode, whose sessions
+    // live in its own store whichever serve runs them.
     let server = if provider.on_app_server() {
         node.codex.server()
+    } else if provider == crate::providers::Provider::Opencode {
+        crate::runtime::opencode::SERVER.to_owned()
     } else {
         String::new()
     };

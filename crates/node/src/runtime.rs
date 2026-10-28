@@ -27,6 +27,7 @@ mod executor;
 mod followup;
 mod manager_control;
 mod observation;
+pub mod opencode;
 mod peers;
 pub mod pi;
 mod schedule_delivery;
@@ -164,6 +165,7 @@ pub struct Runtime {
     pub(crate) codex: Arc<codex_server::CodexServer>,
     pub(crate) claude: claude::Claude,
     pub(crate) pi: Arc<pi::Pi>,
+    pub(crate) opencode: Arc<opencode::Opencode>,
     progress_sequence: std::sync::atomic::AtomicU64,
     /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
     /// stop and its deadline are stored, so a restart retries at once.
@@ -264,6 +266,11 @@ impl Runtime {
             dir,
             tx,
         )?);
+        let opencode = Arc::new(opencode::Opencode::open(
+            dir,
+            providers.bin(Provider::Opencode),
+            providers.env.get(Provider::Opencode).clone(),
+        )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
             config.local_auto_access,
@@ -307,6 +314,7 @@ impl Runtime {
             codex,
             claude,
             pi: Arc::new(pi::Pi::new(dir)),
+            opencode,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
             live_probe_at: std::sync::atomic::AtomicI64::new(now_ms()),
@@ -505,6 +513,7 @@ impl Runtime {
         self.stop_network().await;
         self.codex.stop().await;
         self.claude.stop().await;
+        self.opencode.stop().await;
         if let Some(bridge) = self.cursor.get() {
             bridge.stop().await;
         }

@@ -176,9 +176,9 @@ impl Runtime {
                 bin: self.providers().bin(Provider::Pi),
                 pi: self.pi.clone(),
             },
-            Provider::Opencode => {
-                anyhow::bail!("{} does not run bots here yet", settings.provider.label())
-            }
+            Provider::Opencode => Sdk::Opencode {
+                server: self.opencode.clone(),
+            },
         };
         Ok(ManagerConfig {
             sdk,
@@ -453,6 +453,10 @@ impl Runtime {
             self.triage.set_config(triage);
         }
         self.codex.retarget(next.codex_target(codex_agent));
+        (self.opencode).set_launch(
+            next.bin(Provider::Opencode),
+            next.env.get(Provider::Opencode).clone(),
+        );
         if manager_changed
             || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor)
             || next.bin(Provider::Cursor) != previous.bin(Provider::Cursor)

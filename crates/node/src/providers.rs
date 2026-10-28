@@ -131,14 +131,13 @@ impl Provider {
         }
     }
 
-    /// What the runtime can run on each provider: the Cursor bridge runs only bots, and
-    /// opencode runs neither yet.
+    /// What the runtime can run on each provider: the Cursor bridge runs only bots.
     pub fn supports(self) -> &'static [Role] {
         match self {
-            Provider::Codex => &[Role::Agent, Role::Execution],
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
+                &[Role::Agent, Role::Execution]
+            }
             Provider::Cursor => &[Role::Agent],
-            Provider::Claude | Provider::Pi => &[Role::Agent, Role::Execution],
-            Provider::Opencode => &[],
         }
     }
 
@@ -150,8 +149,8 @@ impl Provider {
     /// Whether a queued user message can join the bot's running reply.
     pub fn supports_steer(self) -> bool {
         match self {
-            Provider::Codex | Provider::Pi => true,
-            Provider::Cursor | Provider::Claude | Provider::Opencode => false,
+            Provider::Codex | Provider::Pi | Provider::Opencode => true,
+            Provider::Cursor | Provider::Claude => false,
         }
     }
 
@@ -188,7 +187,8 @@ impl Provider {
     fn reserved_env(self) -> &'static [&'static str] {
         match self {
             Provider::Cursor => &["CURSOR_SDK_"],
-            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => &[],
+            Provider::Opencode => &["OPENCODE_SERVER_", "OPENCODE_CONFIG_CONTENT"],
+            Provider::Codex | Provider::Claude | Provider::Pi => &[],
         }
     }
 

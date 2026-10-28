@@ -44,6 +44,11 @@ pub enum Sdk {
         bin: PathBuf,
         pi: Arc<crate::runtime::pi::Pi>,
     },
+    /// Turns run on this Node's opencode serve; `vibeface tool` reads the turn from the tool
+    /// environment the serve's plugin gives the session's shells.
+    Opencode {
+        server: Arc<crate::runtime::opencode::Opencode>,
+    },
 }
 
 impl Sdk {
@@ -53,6 +58,7 @@ impl Sdk {
             Sdk::Codex { .. } => crate::providers::Provider::Codex,
             Sdk::Claude { .. } => crate::providers::Provider::Claude,
             Sdk::Pi { .. } => crate::providers::Provider::Pi,
+            Sdk::Opencode { .. } => crate::providers::Provider::Opencode,
         }
     }
 }
@@ -245,6 +251,18 @@ where
                 progress,
             )
             .await
+        }
+        Sdk::Opencode { server } => {
+            server
+                .run_turn(
+                    config,
+                    prompt,
+                    previous_session_id,
+                    persist_session,
+                    cancel,
+                    progress,
+                )
+                .await
         }
     }
 }

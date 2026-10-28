@@ -285,6 +285,9 @@ impl Runtime {
         if turn.server.is_empty() {
             return true;
         }
+        if turn.server == super::opencode::SERVER {
+            return self.opencode.run_ended(&turn.thread).await;
+        }
         if turn.server != self.codex.server() {
             return false;
         }
