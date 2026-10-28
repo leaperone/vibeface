@@ -1,5 +1,15 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotChangeRecord, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+import { projectName } from "./questions.ts"
+import type { BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+
+/** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
+export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const
+
+/** A bot's project folder by its name; the device is named too when it is not the one running the bot. */
+export function projectPlace(project: BotProject, owner: string | null | undefined, deviceName: (deviceId: string) => string): string {
+  const folder = projectName(project.cwd)
+  return project.target_node === owner ? folder : `${deviceName(project.target_node)} · ${folder}`
+}
 
 /**
  * Where a new bot's folder gets set up when none is offered. Folders come only from devices that run a bot (`add`), and a

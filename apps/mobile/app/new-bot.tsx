@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { folderSetup } from '@vibeface/client/workspace/bot-settings.ts'
+import { folderLabels, folderSetup } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { projectName } from '@vibeface/client/workspace/questions.ts'
 import type { BotProject } from '@vibeface/client/workspace/types.ts'
@@ -57,7 +57,7 @@ export default function NewBot() {
       <Textarea accessibilityLabel="它负责什么" placeholder="例如：帮我维护项目，回答问题并检查修改。" className="min-h-28" maxLength={8192} value={instructions} editable={!locked} onChangeText={setInstructions} />
     </View>
     <View className="gap-2">
-      <Text className="text-meta font-medium text-muted-foreground">工作文件夹 <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
+      <Text className="text-meta font-medium text-muted-foreground">{folderLabels.project} <Text className="text-meta text-muted-foreground/70">可选</Text></Text>
       <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
         {options.map((item, index) => {
           const selected = same(item.project)
