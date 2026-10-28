@@ -2673,6 +2673,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_opencode_permission_gets_its_reply_or_goes_back_to_the_session() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let asks = |request: &str| {
+                triage::from_opencode_plugin(&json!({"event":"permission.asked",
+                    "session_id":"ses_1","request_id":request,"cwd":"/w","permission":"bash"}))
+                .context("a permission request")
+            };
+            let held = node.ingest_agent_event(asks("per_1")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let listed =
+                node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
+            assert_eq!(
+                (listed["provider"].clone(), listed["kind"].clone()),
+                (json!("opencode"), json!("permission"))
+            );
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            node.triage_command(json!({"action":"respond","request_id":request_id,
+                "result":{"reply":"always"}}))
+                .await?;
+            assert_eq!(waiting.await?, json!({"reply":"always"}));
+
+            let held = node.ingest_agent_event(asks("per_2")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            node.triage
+                .requests
+                .lock()
+                .unwrap()
+                .get_mut(&request_id)
+                .context("held")?
+                .answer_by_ms = Some(now_ms() + 50);
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"decision":null}),
+                "an unanswered request is left to the user"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn without_an_agent_requests_are_declined_and_events_dropped() -> Result<()> {
         let (node, _, dir) = node().await?;
         let result = async {

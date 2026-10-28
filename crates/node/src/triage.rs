@@ -243,6 +243,71 @@ pub fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
     })
 }
 
+/// What the vibeface opencode plugin sends: a settled run, keyed by its last reply, or a
+/// permission or question a session asks, keyed by the request and held for the answer. A
+/// permission is named by its kind; its commands stay out.
+pub fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
+    let request = || input["request_id"].as_str().filter(|id| !id.is_empty());
+    let (event, status, turn_id, detail, hold) = match input["event"].as_str()? {
+        "session.idle" => {
+            let status = input["status"]
+                .as_str()
+                .filter(|status| matches!(*status, "completed" | "interrupted" | "failed"))?;
+            let turn = s(input, "turn_id");
+            (Kind::TurnEnd, Some(status), turn, s(input, "error"), None)
+        }
+        "permission.asked" => (
+            Kind::NeedsInput,
+            None,
+            request()?.to_owned(),
+            format!(
+                "opencode asks to use {}. Answer with {{\"reply\":\"once\"}}, {{\"reply\":\"always\"}} or {{\"reply\":\"reject\"}}.",
+                input["permission"].as_str().unwrap_or("a tool")
+            ),
+            Some(RequestKind::Permission),
+        ),
+        "question.asked" => {
+            let questions: Vec<String> = (input["questions"].as_array().into_iter().flatten())
+                .map(|question| {
+                    let options: Vec<&str> = (question["options"].as_array().into_iter())
+                        .flatten()
+                        .filter_map(|option| option["label"].as_str())
+                        .collect();
+                    let text = question["question"].as_str().unwrap_or_default();
+                    format!("{text} [{}]", options.join(" | "))
+                })
+                .collect();
+            // The answer's form comes first: the Agent sees the start of a long detail.
+            let detail = format!(
+                "Answer with {{\"answers\":[[\"LABEL\"]]}}, the labels chosen for each question in order, or {{\"reject\":true}}. opencode asks: {}.",
+                questions.join("; ")
+            );
+            let request = request()?.to_owned();
+            (
+                Kind::NeedsInput,
+                None,
+                request,
+                detail,
+                Some(RequestKind::Question),
+            )
+        }
+        _ => return None,
+    };
+    Some(AgentEvent {
+        source: Source::Hook,
+        agent: Provider::Opencode,
+        event,
+        status: status.map(String::from),
+        session_id: s(input, "session_id"),
+        turn_id,
+        cwd: s(input, "cwd"),
+        last_message: s(input, "last_message"),
+        detail,
+        hold,
+        ..Default::default()
+    })
+}
+
 /// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
 /// is one the user drives. `codex exec`, MCP and sub-agent sessions run without anyone
 /// watching them.
@@ -880,5 +945,45 @@ mod tests {
             assert!(from_pi_extension(&input(stop)).is_none(), "{stop}");
         }
         assert!(from_pi_extension(&json!({"session_id":"s"})).is_none());
+    }
+
+    #[test]
+    fn the_opencode_plugin_reports_settled_runs_and_holds_requests() {
+        let idle = json!({"event":"session.idle","session_id":"ses_1","turn_id":"msg_9",
+            "cwd":"/p","status":"completed","last_message":"done"});
+        let ended = AgentEvent {
+            source: Source::Hook,
+            agent: Provider::Opencode,
+            event: Kind::TurnEnd,
+            status: Some("completed".into()),
+            session_id: "ses_1".into(),
+            turn_id: "msg_9".into(),
+            cwd: "/p".into(),
+            last_message: "done".into(),
+            ..Default::default()
+        };
+        assert_eq!(from_opencode_plugin(&idle), Some(ended));
+        let asks = from_opencode_plugin(&json!({"event":"permission.asked","session_id":"ses_1",
+            "request_id":"per_1","permission":"bash","patterns":["rm -rf build"]}))
+        .unwrap();
+        assert_eq!(
+            (asks.event, asks.turn_id.as_str(), asks.hold),
+            (Kind::NeedsInput, "per_1", Some(RequestKind::Permission))
+        );
+        assert!(asks.detail.starts_with("opencode asks to use bash."));
+        assert!(!asks.detail.contains("rm -rf"), "commands stay out");
+        let question = from_opencode_plugin(&json!({"event":"question.asked","session_id":"ses_1",
+            "request_id":"que_1","questions":[{"question":"Which?","options":[{"label":"A"},
+            {"label":"B"}]}]}))
+        .unwrap();
+        assert_eq!(question.hold, Some(RequestKind::Question));
+        assert!(question.detail.ends_with("opencode asks: Which? [A | B]."));
+        for input in [
+            json!({"event":"session.idle","session_id":"ses_1","status":"busy"}),
+            json!({"event":"permission.asked","session_id":"ses_1"}),
+            json!({"event":"session.error","session_id":"ses_1"}),
+        ] {
+            assert!(from_opencode_plugin(&input).is_none(), "{input}");
+        }
     }
 }

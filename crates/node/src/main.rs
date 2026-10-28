@@ -1704,9 +1704,9 @@ fn hook_event(agent: Provider, input: &Value) -> Result<Option<vibeface::triage:
         }
         // Its extension runs only in sessions the user drives.
         Provider::Pi => triage::from_pi_extension(input),
-        Provider::Cursor | Provider::Opencode => {
-            bail!("{} has no hooks", agent.name())
-        }
+        // Its plugin stays out of the Node's own serve.
+        Provider::Opencode => triage::from_opencode_plugin(input),
+        Provider::Cursor => bail!("{} has no hooks", agent.name()),
     })
 }
 
@@ -2514,6 +2514,39 @@ mod tests {
         assert!(run("install").await.is_err());
         run("uninstall").await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "// the user's own\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hooks_install_writes_the_opencode_plugin_once() {
+        let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
+        let (home, data) = (dir.join("home"), dir.join("data"));
+        let run = async |action: &str| {
+            let parsed = Cli::try_parse_from([
+                "vibeface",
+                "hooks",
+                action,
+                "--home",
+                home.to_str().unwrap(),
+                "--data-dir",
+                data.to_str().unwrap(),
+            ])
+            .unwrap();
+            let Some(Action::Hooks(options)) = parsed.command else {
+                panic!("expected hooks")
+            };
+            hooks(options).await
+        };
+        let path = home.join(".config/opencode/plugins/vibeface.ts");
+        run("install").await.unwrap();
+        let code = fs::read_to_string(&path).unwrap();
+        let program = std::env::current_exe().unwrap();
+        let hook = json!([program, "hook", "opencode", "--data-dir", data]).to_string();
+        assert!(code.contains(&format!("const HOOK = {hook};")), "{code}");
+        run("install").await.unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), code);
+        run("uninstall").await.unwrap();
+        assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 }

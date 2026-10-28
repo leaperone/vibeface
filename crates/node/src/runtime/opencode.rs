@@ -2191,4 +2191,14 @@ mod tests {
             Err(FailureKind::NoModel)
         );
     }
+
+    #[test]
+    fn the_installed_opencode_plugin_watches_nothing_in_the_nodes_serve() {
+        let Some(crate::providers::Watch::Extension { source, .. }) = Provider::Opencode.watch()
+        else {
+            panic!("opencode is watched through its plugin");
+        };
+        assert!(source.contains(&format!("const ENV_DIR = process.env.{ENV_MARKER};")));
+        assert!(source.contains("if (ENV_DIR) return HOOK ? {} : { \"shell.env\": shellEnv };"));
+    }
 }

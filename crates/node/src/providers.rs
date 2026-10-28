@@ -170,7 +170,11 @@ impl Provider {
                 file: ".pi/agent/extensions/vibeface.ts",
                 source: include_str!("../extensions/pi.ts"),
             }),
-            Provider::Cursor | Provider::Opencode => None,
+            Provider::Opencode => Some(Watch::Extension {
+                file: ".config/opencode/plugins/vibeface.ts",
+                source: crate::runtime::opencode::PLUGIN,
+            }),
+            Provider::Cursor => None,
         }
     }
 
