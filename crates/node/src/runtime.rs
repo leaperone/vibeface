@@ -34,7 +34,7 @@ mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
-pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
+pub use triage::{AGENT_ANSWER_WITHIN, SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();

@@ -22,6 +22,8 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 pub const TOOL_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 const MAX_CLIENT_SOCKETS: usize = 256;
 const HOOKS: &str = "/api/hooks";
+/// A hook whose event holds a request waits here for the answer.
+const HOOKS_WAIT: &str = "/api/hooks/wait";
 const TRIAGE: &str = "/api/triage";
 const LOG: &str = "/api/log";
 
@@ -263,6 +265,7 @@ fn browser_router(node: Arc<Runtime>, sites: Vec<Site>, local: bool) -> Router {
     if local {
         routes = routes
             .route(HOOKS, post(hooks))
+            .route(HOOKS_WAIT, post(wait_hook))
             .route(TRIAGE, post(triage))
             .route(LOG, post(log));
     }
@@ -293,6 +296,9 @@ async fn boundary(State(app): State<App>, request: Request, next: Next) -> Respo
                 Method::GET | Method::HEAD | Method::OPTIONS
             ) {
                 Ok(None)
+            } else if request.uri().path() == HOOKS_WAIT {
+                // A hook waits up to its request's deadline; that must not hold off an update.
+                app.node.maintenance.enter().map(|_| None)
             } else {
                 app.node.maintenance.enter().map(Some)
             };
@@ -361,7 +367,7 @@ async fn check_boundary(
     if path == "/api/local/setup" {
         check_local_setup(site, headers, ip)?;
     }
-    if path == HOOKS || path == TRIAGE || path == LOG {
+    if path == HOOKS || path == HOOKS_WAIT || path == TRIAGE || path == LOG {
         check_hook(headers, ip)?;
     }
     let unsafe_method = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
@@ -378,6 +384,7 @@ async fn check_boundary(
         let is_tool = path == TOOL_PATH || path == "/api/local/launch" || path == "/api/decision";
         let bearer_call = (is_tool && bearer(headers).is_some())
             || path == HOOKS
+            || path == HOOKS_WAIT
             || path == TRIAGE
             || path == LOG;
         if !bearer_call
@@ -738,6 +745,13 @@ async fn hooks(
             .await
             .map_err(ApiError::bad)?,
     ))
+}
+
+async fn wait_hook(State(app): State<App>, Json(input): Json<Value>) -> ApiResult<Json<Value>> {
+    let request_id = input["request_id"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad("request_id is required"))?;
+    Ok(Json(app.node.wait_request(request_id).await))
 }
 
 /// The coordination Agent's triage answers, from `vibeface triage` on this device.
@@ -1156,14 +1170,15 @@ mod tests {
                         }
                     }
                 }
-                for path in ["/api/hooks", "/api/triage", LOG] {
+                for path in [HOOKS, HOOKS_WAIT, TRIAGE, LOG] {
                     let url = format!("{}{path}", origins[0]);
                     let event = json!({"session_id":"s","turn_id":"t","action":"events"});
                     let status = |request: reqwest::RequestBuilder| async {
                         Ok::<_, anyhow::Error>(request.send().await?.status())
                     };
                     let body = match path {
-                        "/api/hooks" => json!({"session_id":"s","turn_id":"t"}),
+                        HOOKS => json!({"session_id":"s","turn_id":"t"}),
+                        HOOKS_WAIT => json!({}),
                         LOG => json!({"source":"node","records":[]}),
                         _ => event,
                     };

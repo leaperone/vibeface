@@ -50,6 +50,17 @@ pub enum Role {
     Execution,
 }
 
+/// How the Node hears from the provider's sessions it did not start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// `vibeface hook <provider>` on these events of a JSON hook file, relative to the home
+    /// directory.
+    Hooks {
+        file: &'static str,
+        events: &'static [&'static str],
+    },
+}
+
 /// What a bot turn's prompt carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptMode {
@@ -133,6 +144,22 @@ impl Provider {
         match self {
             Provider::Codex => true,
             Provider::Cursor | Provider::Claude | Provider::Pi | Provider::Opencode => false,
+        }
+    }
+
+    /// `vibeface hooks install` sets this up; `None` when the Node does not watch the
+    /// provider's own sessions.
+    pub fn watch(self) -> Option<Watch> {
+        match self {
+            Provider::Codex => Some(Watch::Hooks {
+                file: ".codex/hooks.json",
+                events: &["Stop", "PermissionRequest"],
+            }),
+            Provider::Claude => Some(Watch::Hooks {
+                file: ".claude/settings.json",
+                events: &["Stop", "StopFailure", "Notification"],
+            }),
+            Provider::Cursor | Provider::Pi | Provider::Opencode => None,
         }
     }
 

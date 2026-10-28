@@ -488,9 +488,9 @@ impl Runtime {
                 );
                 self.codex_state(network, input).await
             }
-            "codex_respond" => {
+            "respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
-                self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                self.answer_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
             "hand_over_session" => {

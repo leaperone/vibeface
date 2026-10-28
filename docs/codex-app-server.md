@@ -122,7 +122,7 @@
 
 ## 服务端请求
 
-工作线程用 `approvalPolicy=never` 和 `danger-full-access` 启动，正常不会收到审批。Node 订阅的线程上的请求和不属于线程的请求都没有固定策略：Node 挂起请求，记一行日志（方法和线程，不含命令文本），立即唤醒本机协调 Agent。Agent 用 `vibeface codex requests` 查看、`vibeface codex respond <request_id> '<result-json>'` 回答；需要本人拍板时用 `vibeface triage raise --request-id` 在负责该线程的助手聊天里提问，提问挂住请求直到有回答，回答后该助手有 120 秒应答。线程不属于任何助手时立即兜底。没有协调 Agent、唤醒失败或 120 秒内没有回答也没有提问时，按下表兜底并记录。Node 没有订阅的线程留给原客户端回答。
+工作线程用 `approvalPolicy=never` 和 `danger-full-access` 启动，正常不会收到审批。Node 订阅的线程上的请求和不属于线程的请求都没有固定策略：Node 挂起请求，记一行日志（方法和线程，不含命令文本），立即唤醒本机协调 Agent。Agent 用 `vibeface requests` 查看、`vibeface respond <request_id> '<result-json>'` 回答；需要本人拍板时用 `vibeface triage raise --request-id` 在负责该线程的助手聊天里提问，提问挂住请求直到有回答，回答后该助手有 120 秒应答。线程不属于任何助手时立即兜底。没有协调 Agent、唤醒失败或 120 秒内没有回答也没有提问时，按下表兜底并记录。Node 没有订阅的线程留给原客户端回答。
 
 | 方法 | 兜底回复 |
 |---|---|

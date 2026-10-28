@@ -1,7 +1,7 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
 //! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
 //! installation. The coordination Agent judges; nothing here decides what matters.
-use crate::providers::Provider;
+use crate::providers::{Provider, Watch};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,6 +34,18 @@ pub enum Kind {
     Notification,
 }
 
+/// What a request a session holds asks for.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// To allow something, as running a tool.
+    Permission,
+    /// An answer to a question the session asked.
+    Question,
+    /// What the session does next, now that its turn ended.
+    Continue,
+}
+
 /// Normalized event (design 4.1). Hooks send it without `node`, `host` and `event_id`; the
 /// receiving Node fills those in `seal`, so every source derives the same ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -58,8 +70,11 @@ pub struct AgentEvent {
     pub detail: String,
     pub ts_ms: i64,
     pub test: bool,
-    /// An App Server request waiting for an answer; set by the Node, never by a hook.
+    /// A request waiting for an answer; set by the Node, never by a hook.
     pub request_id: Option<String>,
+    /// Set by a hook that waits for the answer on `/api/hooks/wait`: its session holds a request
+    /// of this kind.
+    pub hold: Option<RequestKind>,
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -300,12 +315,13 @@ the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the li
 one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
 The answer comes back to that bot as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
-- An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
-shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
-(the thread already runs with full access). Only when the user must decide, add `--request-id REQUEST_ID` \
-to the raise: the request then waits for the answer, and the bot has {answer_within_secs} seconds \
-after it to respond. A request neither answered nor raised is declined after {answer_within_secs} seconds \
-or when this turn ends.\n\
+- An event with a request_id is a request its session holds until it is answered: a Codex App Server \
+request, or a hook waiting for its answer. `{cli} requests` shows each in full. Answer it yourself with \
+`{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full access). Only when the user \
+must decide, add `--request-id REQUEST_ID` to the raise: an App Server request then waits for the answer, \
+and the bot has {answer_within_secs} seconds after it to respond; a hook's request still ends \
+{answer_within_secs} seconds after it came. A request neither answered nor raised is declined after \
+{answer_within_secs} seconds or when this turn ends; a hook's goes back to its session undecided.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
         serde_json::to_string_pretty(&items)?
     ))
@@ -483,22 +499,17 @@ pub struct HookFile {
     pub events: &'static [&'static str],
 }
 
-pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> [HookFile; 2] {
-    [
-        HookFile {
-            agent: Provider::Codex,
-            path: codex_home
-                .map(Path::to_owned)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("hooks.json"),
-            events: &["Stop", "PermissionRequest"],
-        },
-        HookFile {
-            agent: Provider::Claude,
-            path: home.join(".claude/settings.json"),
-            events: &["Stop", "StopFailure", "Notification"],
-        },
-    ]
+pub fn hook_files(home: &Path) -> Vec<HookFile> {
+    Provider::ALL
+        .into_iter()
+        .filter_map(|agent| match agent.watch()? {
+            Watch::Hooks { file, events } => Some(HookFile {
+                agent,
+                path: home.join(file),
+                events,
+            }),
+        })
+        .collect()
 }
 
 pub fn hook_command(program: &Path, agent: Provider, data_dir: &Path) -> String {
@@ -749,7 +760,9 @@ mod tests {
     #[test]
     fn hook_install_appends_once_and_removes_only_its_own_entries() {
         let home = Path::new("/home/u");
-        let [codex, claude] = hook_files(home, None);
+        let [codex, claude] = &hook_files(home)[..] else {
+            panic!("Codex and Claude Code take hooks");
+        };
         assert_eq!(codex.path, home.join(".codex/hooks.json"));
         let command = hook_command(
             Path::new("/opt/vibeface"),
@@ -760,23 +773,23 @@ mod tests {
         let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
         let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
         assert_eq!(
-            add_hooks(&mut settings, &claude, &command).unwrap(),
+            add_hooks(&mut settings, claude, &command).unwrap(),
             ["Stop", "StopFailure", "Notification"]
         );
         assert!(
-            add_hooks(&mut settings, &claude, &command)
+            add_hooks(&mut settings, claude, &command)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(settings["hooks"]["Stop"][0], other);
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(installed(&settings, &claude).len(), 3);
-        assert!(installed(&settings, &codex).is_empty());
-        assert_eq!(remove_hooks(&mut settings, &claude).len(), 3);
+        assert_eq!(installed(&settings, claude).len(), 3);
+        assert!(installed(&settings, codex).is_empty());
+        assert_eq!(remove_hooks(&mut settings, claude).len(), 3);
         assert_eq!(
             settings,
             json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[]}})
         );
-        assert!(add_hooks(&mut json!([]), &codex, &command).is_err());
+        assert!(add_hooks(&mut json!([]), codex, &command).is_err());
     }
 }

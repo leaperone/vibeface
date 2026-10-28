@@ -1196,11 +1196,11 @@ def fixture_triage(run, initial, prompt, bot):
                   "request_id": event.get("request_id"), "cwd": event["cwd"], "pid": os.getpid()}
         mode = directive.get("request_mode", "respond")
         if event.get("request_id"):
-            listed = json.loads(fixture_cli(initial, "codex", "requests").stdout)["requests"]
+            listed = json.loads(fixture_cli(initial, "requests").stdout)["requests"]
             require(any(row["request_id"] == event["request_id"] for row in listed),
-                    "codex requests lists the held App Server request")
+                    "requests lists the held App Server request")
             if mode == "respond":
-                answers = [json.loads(fixture_cli(initial, "codex", "respond", event["request_id"],
+                answers = [json.loads(fixture_cli(initial, "respond", event["request_id"],
                                                   json.dumps({"decision": "accept"})).stdout) for _ in range(2)]
                 action.update(action="respond", answers=answers)
             elif mode == "ask":
@@ -1332,7 +1332,7 @@ def fixture_manager(run, initial, bot):
                     "a settings card's answer is applied once; a repeat reads it back")
         elif about.get("request_id"):
             result = json.dumps({"decision": "accept" if answer == "允许" else "decline"})
-            replies = [json.loads(fixture_cli(initial, "codex", "respond", about["request_id"], result, "--node", about["node"]).stdout)
+            replies = [json.loads(fixture_cli(initial, "respond", about["request_id"], result, "--node", about["node"]).stdout)
                        for _ in range(2)]
         else:
             replies = [json.loads(fixture_cli(initial, "codex", "send", about["session_id"], answer, "--id", body["message_id"]).stdout)
@@ -1929,7 +1929,7 @@ def work_checks(run, workspace, a, network, passed):
                        if row["session_id"] == finished["thread_id"] and row.get("request_id")])
     require(len(replies) == 1 and replies[0]["result"] == {"decision": "accept"} and len(actions) == 1
             and actions[0]["answers"][0] == actions[0]["answers"][1] and actions[0]["answers"][0]["by"] == "agent",
-            "the coordination Agent answers the App Server request once through codex respond; a repeat returns the first answer")
+            "the coordination Agent answers the App Server request once through respond; a repeat returns the first answer")
     passed("a server request goes to the coordination Agent, which answers it once", work_id=work_id)
 
     name = "chat-work-ignored"
@@ -1971,7 +1971,7 @@ def work_checks(run, workspace, a, network, passed):
     require(len(replies) == 1 and replies[0]["result"] == {"decision": "decline"} and len(turns) == 1
             and turns[0]["trigger"] == "message:a-" + question_id and len(acted) == 1
             and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
-            "the answer is one turn of the bot, whose codex respond reaches Codex once")
+            "the answer is one turn of the bot, whose respond reaches Codex once")
     require(all(row["question_id"] != question_id for row in a.client.rpc("questions")["questions"])
             and any(row["question_id"] == question_id and row["answer"]["text"] == "拒绝" for row in snapshot(name)["questions"]),
             "the answered question leaves the pending list and shows its answer in the chat")
@@ -3334,7 +3334,7 @@ def phase4_acceptance(options):
         acted = [row for row in records(a, "answer-actions.jsonl") if row["question_id"] == question_id]
         require(len(answers) == 1 and answers[0]["message"]["result"] == {"decision": "accept"} and len(acted) == 1
                 and acted[0]["replies"][0] == acted[0]["replies"][1] and acted[0]["replies"][0]["by"] == "agent",
-                "A's bot answers B's held request once with codex respond --node")
+                "A's bot answers B's held request once with respond --node")
         starts = [row for row in codex_rpc(b, "thread/start") if row["message"]["params"]["cwd"] == str(task_dir)]
         require(len(starts) == 1 and starts[0]["message"]["params"].get("approvalPolicy") == "never",
                 "B's Agent starts the child itself with full access")

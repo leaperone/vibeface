@@ -64,12 +64,26 @@ enum Action {
     Update(Update),
     /// Join a personal network with an invite link from a management device.
     Join(Join),
-    /// Forward a Codex or Claude Code hook's stdin to this device's Node; always exits 0.
+    /// Forward a Codex or Claude Code hook's stdin to this device's Node, printing the answer
+    /// when its session waits on one; always exits 0.
     Hook(Hook),
     /// Install, remove, check or test this Node's Codex and Claude Code hooks.
     Hooks(Hooks),
     /// The coordination Agent's triage answers: list pending events, ask about or dismiss one.
     Triage(Triage),
+    /// List the requests sessions hold for the coordination Agent: App Server requests and
+    /// hooks waiting for an answer.
+    Requests(LocalNode),
+    /// Answer a held request once with its result JSON; answering again prints the first answer.
+    Respond {
+        request_id: String,
+        result: String,
+        /// The device holding the request, when it is not this one.
+        #[arg(long, value_name = "DEVICE")]
+        node: Option<String>,
+        #[command(flatten)]
+        local: LocalNode,
+    },
     /// Add a record to this device's Node log, e.g. from the coordination Agent or a script.
     Log(LogRecord),
     /// Read this device's Node log, newest last.
@@ -118,21 +132,6 @@ enum CodexCommand {
     },
     /// Print the thread's notifications as JSON lines.
     Watch { thread: String },
-    /// List the App Server requests waiting for the coordination Agent.
-    Requests {
-        #[command(flatten)]
-        local: LocalNode,
-    },
-    /// Answer a waiting request once with its result JSON; answering again prints the first answer.
-    Respond {
-        request_id: String,
-        result: String,
-        /// The device holding the request, when it is not this one.
-        #[arg(long, value_name = "DEVICE")]
-        node: Option<String>,
-        #[command(flatten)]
-        local: LocalNode,
-    },
 }
 
 #[derive(Args)]
@@ -339,7 +338,7 @@ enum TriageAction {
         severity: String,
         #[arg(long)]
         question: String,
-        /// Hold this App Server request until the question is answered.
+        /// Hold this request until the question is answered.
         #[arg(long)]
         request_id: Option<String>,
         /// An answer the user can pick; repeat for more.
@@ -556,21 +555,20 @@ async fn main() -> Result<()> {
                 CodexCommand::Watch { thread } => {
                     run(&socket()?, Command::Watch { thread_id: thread }).await
                 }
-                CodexCommand::Requests { local } => {
-                    codex_requests(&local, json!({"action":"requests"})).await
-                }
-                CodexCommand::Respond {
-                    request_id,
-                    result,
-                    node,
-                    local,
-                } => {
-                    let result: serde_json::Value =
-                        serde_json::from_str(&result).context("result must be JSON")?;
-                    let body = json!({"action":"respond","request_id":request_id,"result":result,"node":node});
-                    codex_requests(&local, body).await
-                }
             }
+        }
+        Action::Requests(local) => post_triage(&local, json!({"action":"requests"})).await,
+        Action::Respond {
+            request_id,
+            result,
+            node,
+            local,
+        } => {
+            let result: serde_json::Value =
+                serde_json::from_str(&result).context("result must be JSON")?;
+            let body =
+                json!({"action":"respond","request_id":request_id,"result":result,"node":node});
+            post_triage(&local, body).await
         }
         Action::Hook(options) => {
             if let Err(error) = hook(options).await {
@@ -930,7 +928,7 @@ fn utc_time(ms: i64) -> String {
     )
 }
 
-async fn codex_requests(local: &LocalNode, body: serde_json::Value) -> Result<()> {
+async fn post_triage(local: &LocalNode, body: serde_json::Value) -> Result<()> {
     let result = post_local(
         &local_node_url(local)?,
         "api/triage",
@@ -1758,8 +1756,26 @@ async fn hook(options: Hook) -> Result<()> {
     .await;
     match sent {
         Ok(result) if options.test => println!("{result}"),
-        Ok(_) => {}
+        // The session waits on the request this event holds: print its answer for the session,
+        // or nothing so that the session decides.
+        Ok(result) => {
+            if let Some(request_id) = result["request_id"].as_str() {
+                let answer = post_local(
+                    &local_node_url(&options.local)?,
+                    "api/hooks/wait",
+                    &json!({"request_id":request_id}),
+                    vibeface::runtime::AGENT_ANSWER_WITHIN + Duration::from_secs(10),
+                )
+                .await?;
+                if answer != json!({"decision":null}) {
+                    println!("{}", serde_json::to_string(&answer)?);
+                }
+            }
+        }
         Err(error) => {
+            // Nobody waits for the answer to a spooled event.
+            let mut body = body;
+            body["hold"] = serde_json::Value::Null;
             let spool = options
                 .local
                 .data
@@ -1803,7 +1819,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         Err(_) => options.local.data.data_dir.clone(),
     };
     let stamp = vibeface::runtime::now_ms();
-    for file in triage::hook_files(home, None) {
+    for file in triage::hook_files(home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -1895,15 +1911,7 @@ async fn triage(options: Triage) -> Result<()> {
         }
         TriageAction::Dismiss { event_id } => json!({"action":"dismiss","event_id":event_id}),
     };
-    let result = post_local(
-        &local_node_url(&options.local)?,
-        "api/triage",
-        &body,
-        Duration::from_secs(30),
-    )
-    .await?;
-    println!("{}", serde_json::to_string(&result)?);
-    Ok(())
+    post_triage(&options.local, body).await
 }
 
 #[cfg(test)]
