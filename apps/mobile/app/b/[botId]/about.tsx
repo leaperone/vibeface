@@ -27,7 +27,7 @@ export default function BotAbout() {
   if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
-  const empty = view && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
+  const empty = view && !bot.project && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
   const lookup = { nodes: shared.nodes, directory }
   const choices = projectChoices(shared.nodes, (node, index) => nodeName(node.device_id, lookup, `设备 ${index + 1}`))
   const projectNow = bot.project ? projectKey(bot.project) : ''
