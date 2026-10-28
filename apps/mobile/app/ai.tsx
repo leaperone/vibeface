@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Pressable, View } from 'react-native'
+import { Pressable, Switch, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
@@ -9,7 +9,7 @@ import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type A
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
-import { EmptyState, toneText, type Tone } from '@/components/kit'
+import { Details, EmptyState, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -143,17 +143,16 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
-      {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
-      {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
-    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 pb-2">
+    <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
+    {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
+    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 py-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
         ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
         : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
-    </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 pb-2">
+    </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 py-2">
       <Icon as={CircleX} className="size-4 text-danger" /><Text className="shrink text-meta">{check.label}</Text>
     </View>)}
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-3 active:bg-muted/60" onPress={() => setOpen(!open)}>
@@ -180,11 +179,13 @@ const roles = {
 
 function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   const { label, hint, icon } = roles[role]
-  // While a save runs the toggles keep their look and ignore taps; the spinner says which one is changing.
-  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
-    accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
-    <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
-  </Button>
+  // A named row with a system switch, so on and off read at a glance. While a save runs the switches keep their look and
+  // ignore taps; the spinner says which one is changing.
+  return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-3">
+    <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
+    <Text className="min-w-0 flex-1">{label}</Text>
+    <Switch value={pressed} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)} onValueChange={disabled ? undefined : onPress} />
+  </View>
 }
 
 const modes: [AppServerMode, string, LucideIcon][] = [['system', '用已在运行的', Monitor], ['spawn', '自己启动', Play]]
@@ -306,61 +307,65 @@ function Triage() {
   return <View className="gap-6">
     <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
       onChange={(value) => void save('default', { default_outlet: value })} />
-    <Field label="按文件夹另设">
-      <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
-        trailing={(prefix) => {
-          const project = config.projects.find((item) => item.prefix === prefix)!
-          const [, text] = outlets.find(([value]) => value === project.outlet)!
-          return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
-            onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
-        }}
-        onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
-    </Field>
-    <Field label="转发到外部聊天">
-      <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
-      <View className="flex-row gap-2">
-        <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
-        {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
-      </View>
-      <View className="flex-row flex-wrap items-center gap-2">
-        <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
-          onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
-          {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
-        </Button>
-        <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
-          setTest(null)
-          void call('test', 'test_webhook').then((result) => {
-            const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-            if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
-          })
-        }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
-        {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
-      </View>
-      {pending + delivered + dead ? <View className="flex-row items-center gap-3">
-        {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
-          count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
-      </View> : null}
-    </Field>
-    <Field label="让外部聊天代你回答">
-      <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
-      {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
-        <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
-      </View> : null}
-      {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-        <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
-        <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
-      </View>)}
-      <View className="flex-row gap-2">
-        <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-        <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
-          const value = (result as { token?: unknown } | null)?.token
-          if (typeof value === 'string') { setToken(value); setLabel('') }
-        })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
-      </View>
-    </Field>
+    {/* The two folds sit together as one list of extras under the choice above. */}
+    <View>
+      <Details label="按文件夹另设" open={config.projects.length > 0}>
+        <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
+          trailing={(prefix) => {
+            const project = config.projects.find((item) => item.prefix === prefix)!
+            const [, text] = outlets.find(([value]) => value === project.outlet)!
+            return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
+              onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
+          }}
+          onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
+      </Details>
+      {/* Folded as on the web, its state in the label; open while 也发给外部聊天 still has nowhere to send. */}
+      <Details label={`外部聊天 · ${settings.webhook_url ? '已连接' : '未连接'}`} open={!settings.webhook_url && config.default_outlet === 'both'}>
+        <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
+        <View className="flex-row gap-2">
+          <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+          {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
+        </View>
+        <View className="flex-row flex-wrap items-center gap-2">
+          <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
+            onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
+            {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
+          </Button>
+          <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
+            setTest(null)
+            void call('test', 'test_webhook').then((result) => {
+              const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
+              if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
+            })
+          }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
+          {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
+        </View>
+        {pending + delivered + dead ? <View className="flex-row items-center gap-3">
+          {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
+            count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
+        </View> : null}
+        <Details label="让外部聊天代你回答">
+          <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
+          {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
+            <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
+          </View> : null}
+          {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
+            <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
+          </View>)}
+          <View className="flex-row gap-2">
+            <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
+            <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
+              const value = (result as { token?: unknown } | null)?.token
+              if (typeof value === 'string') { setToken(value); setLabel('') }
+            })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
+          </View>
+        </Details>
+      </Details>
+    </View>
     {error ? <ErrorText error={error.text} /> : null}
   </View>
 }

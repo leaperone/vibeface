@@ -34,7 +34,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
   const replace = sidebar === true && pathname !== '/'
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('grow gap-2 px-1', sidebar ? 'px-2' : 'w-full max-w-2xl self-center pb-8')}
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('gap-2 px-1', sidebar ? 'grow px-2' : 'w-full max-w-2xl self-center pb-8')}
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : undefined}>
     {sidebar ? <View className="flex-row items-center justify-between ps-3 pt-2">
       <Text role="heading" className="text-3xl font-bold">消息</Text>
@@ -56,7 +56,8 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
     }) : loading ? <View accessibilityLabel="正在读取 Bot" className="gap-2">{[0, 1, 2].map((item) => <View key={item} className="h-16 rounded-xl bg-muted/60" />)}</View> : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} />}
-    <View className="mt-auto border-t border-border px-1 pt-2"><ConnectionPill connection={workspace.connection} /></View>
+    {/* The phone's automatic inset already adds the bar, so only the sidebar grows to pin this to its foot; growing on the phone pushed it a page down. */}
+    <View className={cn('border-t border-border px-1 pt-2', sidebar ? 'mt-auto' : 'mt-4')}><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView>
 }
 

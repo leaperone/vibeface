@@ -1,7 +1,7 @@
-import { Stack, router, useLocalSearchParams } from 'expo-router'
-import { Crown, MonitorSmartphone, Trash2 } from 'lucide-react-native'
+import { Link, Stack, router, useLocalSearchParams } from 'expo-router'
+import { ChevronRight, Crown, MonitorSmartphone, Sparkles, Trash2 } from 'lucide-react-native'
 import { useState } from 'react'
-import { ScrollView, Switch, View } from 'react-native'
+import { Pressable, ScrollView, Switch, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { CopyableId, Details, EmptyState } from '@/components/kit'
@@ -40,10 +40,14 @@ export default function DeviceDetail() {
         {member.kind === 'node' && !member.online ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
-    <Details>
-      <Text className="text-meta text-muted-foreground">设备编号</Text>
-      <CopyableId value={member.device_id} label="设备编号" />
-    </Details>
+    {/* The AI page sets up the computer this phone connects through, so its detail leads there instead of ending. */}
+    {member.entry && device.ready?.principal.can_manage ? <Link href="/ai" asChild>
+      <Pressable className="min-h-12 flex-row items-center gap-3 rounded-xl border border-border px-4 py-2 active:bg-muted">
+        <Icon as={Sparkles} className="text-muted-foreground" />
+        <Text className="min-w-0 flex-1 font-medium">Bot 与任务</Text>
+        <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+      </Pressable>
+    </Link> : null}
     {manageable ? <View className="gap-2">
       <View className="min-h-11 flex-row items-center justify-between gap-3">
         <View className="min-w-0 flex-1 flex-row items-center gap-2"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text>管理设备</Text></View>
@@ -66,5 +70,9 @@ export default function DeviceDetail() {
         <Icon as={Trash2} className="text-danger" /><Text className="text-danger">移除设备</Text>
       </Button>}
     </View> : null}
+    <Details>
+      <Text className="text-meta text-muted-foreground">设备编号</Text>
+      <CopyableId value={member.device_id} label="设备编号" />
+    </Details>
   </ScrollView>
 }
