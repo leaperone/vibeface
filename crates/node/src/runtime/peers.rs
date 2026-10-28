@@ -3075,7 +3075,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
-                cursor_sdk_bin: "cursor-sdk".into(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             first_sync(&a, &peer).await?;
@@ -3089,7 +3088,7 @@ mod tests {
         let copy = dir_a.with_extension("restarted");
         let result = async {
             let online = online?;
-            assert_eq!(online["capabilities"]["manager"], "cursor_sdk");
+            assert_eq!(online["capabilities"]["manager"], "cursor");
             std::process::Command::new("cp")
                 .arg("-R")
                 .args([&dir_a, &copy])
