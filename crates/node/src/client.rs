@@ -2010,7 +2010,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2096,7 +2096,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2355,7 +2355,7 @@ mod tests {
         crate::logging::capture(&logs)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2543,7 +2543,7 @@ mod tests {
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
-        assert!(!node.providers().switches.execution);
+        assert!(node.providers().switches.execution.is_empty());
         assert!(matches!(
             node.providers().codex_target(true),
             crate::providers::CodexTarget::Spawn(_)
@@ -2605,7 +2605,7 @@ mod tests {
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
         assert!(reopened.manager().is_none());
-        assert!(!providers.switches.execution);
+        assert!(providers.switches.execution.is_empty());
         assert_eq!(
             providers.bin(Provider::Codex),
             std::path::PathBuf::from("/fixture/codex")

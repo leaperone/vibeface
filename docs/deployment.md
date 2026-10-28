@@ -45,7 +45,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFA
 		"codex": "<Codex 程序的绝对路径>"
 	},
 	"providers": {
-		"execution": true,
+		"execution": ["codex"],
 		"codex_app_server": {
 			"mode": "system",
 			"socket": "<App Server socket 的绝对路径>"

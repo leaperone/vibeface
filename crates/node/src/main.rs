@@ -1561,7 +1561,7 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
             )
         },
         || async {
-            let _ = post_tool("wait_codex", json!({}), call_id).await;
+            let _ = post_tool("wait_work", json!({}), call_id).await;
         },
         socket,
     )

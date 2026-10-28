@@ -348,7 +348,7 @@ impl Runtime {
                 self.bind_work(network, &scope, field(&args, "work_id")?, report)
                     .await
             }
-            Tool::WaitCodex => {
+            Tool::WaitWork => {
                 drop((_lease, _work));
                 Ok(json!({"connected": self.codex.ready().await}))
             }
@@ -469,8 +469,9 @@ impl Runtime {
         Ok(json!({"events":rows,"more":more || cut}))
     }
 
-    /// Registers a dispatch before anything is sent. On this device it returns `may_send` only to
-    /// the call that created the work; another device's bot gets the task instead.
+    /// Registers a dispatch before anything is sent, then has its provider start it. Only the
+    /// call that created the work gets `may_send`, and only when the dispatching Agent sends it
+    /// itself; another device's bot gets the task instead.
     async fn track_work(
         self: &Arc<Self>,
         access: &Access,
@@ -511,6 +512,15 @@ impl Runtime {
                 "this thread is a bot's own reply thread; message that bot with message_bot instead"
             );
         }
+        let agent: Option<Provider> =
+            serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
+        let kind = match agent {
+            _ if target == local => WorkKind::Agent(self.executing(agent)?),
+            None => WorkKind::Task,
+            Some(_) => {
+                bail!("agent picks a provider of this device; another device's bot picks its own")
+            }
+        };
         let spec = WorkSpec {
             work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
             conversation: scope.into(),
@@ -518,11 +528,7 @@ impl Runtime {
             target: target.clone(),
             dispatcher: local.clone(),
             call_ref: call_ref.into(),
-            kind: if target == local {
-                WorkKind::Codex
-            } else {
-                WorkKind::Task
-            },
+            kind,
             // A thread's directory is only informational and may be unknown.
             cwd: match &thread {
                 Some(_) => optional("cwd").unwrap_or_default(),
@@ -538,17 +544,8 @@ impl Runtime {
             let dispatch = self.send_dispatch(network, spec, false).await?;
             return Ok(dispatch_row(&dispatch));
         }
-        if !self.providers().switches.execution {
-            return Err(vibeface_bridge::failure::ExecFailure::new(
-                vibeface_bridge::failure::FailureKind::ExecutionDisabled,
-                "Codex execution is turned off on this device",
-            )
-            .into());
-        }
-        let cwd = spec.cwd.clone();
-        let continues = spec.continues.clone();
-        let (record, created) = self.accept_dispatch(network, spec).await?;
-        let thread = match &continues {
+        let (record, created) = self.accept_dispatch(network, spec.clone()).await?;
+        let thread = match &spec.continues {
             None => thread,
             Some(original) => self
                 .store
@@ -559,10 +556,39 @@ impl Runtime {
                 .find(|work| &work.work_id == original)
                 .and_then(|work| work.thread_id),
         };
+        let may_send = created
+            && (self.work_executor(&record)?)
+                .start(self, network, &spec, thread.as_deref(), args)
+                .await?;
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
-            "may_send":created,"send_by_ms":record.send_by_ms,"cwd":cwd,"thread_id":thread}),
+            "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread}),
         )
+    }
+
+    /// The provider a work on this device runs on: the one asked for, or the only one that
+    /// executes work here.
+    fn executing(&self, agent: Option<Provider>) -> Result<Provider> {
+        use vibeface_bridge::failure::{ExecFailure, FailureKind};
+        let execution = self.providers().switches.execution;
+        let off = |what: String| -> anyhow::Error {
+            ExecFailure::new(FailureKind::ExecutionDisabled, what).into()
+        };
+        match agent {
+            Some(agent) if execution.contains(&agent) => Ok(agent),
+            Some(agent) => Err(off(format!(
+                "{} execution is turned off on this device",
+                agent.label()
+            ))),
+            None => match Vec::from_iter(&execution)[..] {
+                [only] => Ok(*only),
+                [] => Err(off("execution is turned off on this device".into())),
+                _ => bail!(
+                    "this device executes work on {}; name one as agent",
+                    Vec::from_iter(execution.iter().map(|provider| provider.name())).join(", ")
+                ),
+            },
+        }
     }
 }
 

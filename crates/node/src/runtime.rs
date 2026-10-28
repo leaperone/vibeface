@@ -22,6 +22,7 @@ mod bots;
 mod chat_controls;
 mod codex_server;
 mod cursor;
+mod executor;
 mod followup;
 mod manager_control;
 mod observation;
@@ -580,7 +581,12 @@ impl Runtime {
         let settings = self.settings_snapshot();
         let manager = self.manager().map(|m| m.provider);
         let mut codex = self.codex.capability().await;
-        codex["enabled"] = json!(self.providers().switches.execution);
+        codex["enabled"] = json!(
+            self.providers()
+                .switches
+                .execution
+                .contains(&Provider::Codex)
+        );
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
             "manager_ready":self.manager_ready().await,

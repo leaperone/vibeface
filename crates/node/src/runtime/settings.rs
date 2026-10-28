@@ -25,7 +25,7 @@ pub struct ProviderChange {
     provider: Provider,
     /// `true` moves the bot to this provider; `false` stops it if it runs here.
     bot: Option<bool>,
-    /// Whether Codex executes dispatched work.
+    /// Whether this provider executes dispatched work.
     execution: Option<bool>,
     /// The provider's program; empty restores its default.
     bin: Option<PathBuf>,
@@ -81,13 +81,19 @@ impl ProviderChange {
             }
             _ => {}
         }
-        if let Some(execution) = self.execution {
-            ensure!(
-                provider.supports().contains(&Role::Execution),
-                "{} does not execute dispatched work here yet",
-                provider.label()
-            );
-            target.local.switches.execution = execution;
+        match self.execution {
+            Some(true) => {
+                ensure!(
+                    provider.supports().contains(&Role::Execution),
+                    "{} does not execute dispatched work here yet",
+                    provider.label()
+                );
+                target.local.switches.execution.insert(provider);
+            }
+            Some(false) => {
+                target.local.switches.execution.remove(&provider);
+            }
+            None => {}
         }
         if let Some(bin) = self.bin {
             let trimmed = PathBuf::from(bin.to_string_lossy().trim());
@@ -205,7 +211,7 @@ impl Runtime {
             .manager
             .as_ref()
             .is_some_and(|m| m.provider == provider);
-        let execution = provider.on_app_server() && local.switches.execution;
+        let execution = local.switches.execution.contains(&provider);
         let roles: Vec<Role> = [(bot, Role::Agent), (execution, Role::Execution)]
             .into_iter()
             .filter_map(|(serves, role)| serves.then_some(role))
@@ -227,9 +233,7 @@ impl Runtime {
             })
             .collect();
         let mut starting = false;
-        let link = provider
-            .on_app_server()
-            .then_some(self.codex.link().await);
+        let link = provider.on_app_server().then_some(self.codex.link().await);
         if !roles.is_empty() {
             if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));
@@ -310,7 +314,10 @@ impl Runtime {
             "missing_prerequisites"
         };
         let mut providers = Vec::new();
-        for provider in Provider::ALL.into_iter().filter(|p| !p.supports().is_empty()) {
+        for provider in Provider::ALL
+            .into_iter()
+            .filter(|p| !p.supports().is_empty())
+        {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
         let mut response = json!({"settings":settings,"defaults":defaults,
@@ -343,7 +350,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Chooses or stops the bot on a provider, turns Codex execution on or off, sets the
+    /// Chooses or stops the bot on a provider, turns its execution on or off, sets the
     /// provider's program and variables, then restarts what runs on it. This is the only place
     /// that decides what each provider is used for. The variables are written only to this
     /// Node's private file.
@@ -534,7 +541,7 @@ pub(crate) struct Proposal {
 #[serde(deny_unknown_fields)]
 struct ProposalInput {
     #[serde(default)]
-    execution: bool,
+    execution: BTreeSet<Provider>,
     codex_home: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     codex_sessions: Option<PathBuf>,
@@ -554,8 +561,15 @@ impl ProposalInput {
             })
             .transpose()
         };
+        for provider in &self.execution {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+        }
         Ok(Paths {
-            execution: self.execution.then_some(true),
+            execution: self.execution,
             app_server: existing(self.app_server_socket, "app_server_socket", |path| {
                 path.symlink_metadata().is_ok()
             })?
@@ -597,7 +611,10 @@ impl Runtime {
             .context("invalid provider proposal")?
             .paths()?;
         let codex = given.is_empty()
-            || given.execution.is_some()
+            || given
+                .execution
+                .iter()
+                .any(|provider| provider.on_app_server())
             || given.app_server.is_some()
             || given.codex_home.is_some()
             || given.codex_sessions.is_some();
@@ -697,15 +714,8 @@ impl Runtime {
     fn proposal_text(&self, paths: &Paths) -> String {
         let shown = |path: &PathBuf| self.host.display(path);
         let mut lines = vec!["要把这台电脑的 AI 设置改成这样吗？".to_owned()];
-        if let Some(on) = paths.execution {
-            lines.push(
-                if on {
-                    "用 Codex 执行任务"
-                } else {
-                    "不再用 Codex 执行任务"
-                }
-                .into(),
-            );
+        for provider in &paths.execution {
+            lines.push(format!("用 {} 执行任务", provider.label()));
         }
         if let Some(server) = &paths.app_server {
             lines.push(match (&server.mode, &server.socket) {

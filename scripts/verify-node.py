@@ -569,7 +569,7 @@ class Node:
         configuration.update(values)
         if app_server is not None:
             configuration["providers"]["codex_app_server"] = app_server
-            configuration["providers"]["execution"] = True
+            configuration["providers"]["execution"] = ["codex"]
             if app_server["mode"] == "spawn":
                 env_path = self.directory / "provider-env.json"
                 providers = json.loads(env_path.read_text()) if env_path.exists() else {}
@@ -4340,7 +4340,7 @@ def free_delivery_settings(spy, profile, *, enabled):
 def isolate_delivery_node(node):
     config = json.loads((node.directory / "config.json").read_text())
     config["manager"] = None
-    config["providers"]["execution"] = False
+    config["providers"]["execution"] = []
     config["triage"]["scan_codex_sessions"] = False
     private_json(node.directory / "config.json", config)
 

@@ -371,10 +371,7 @@ fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
 fn subject(node: &str, session: &str, cwd: &str, summary: &str) -> Result<()> {
     decode32(node)?;
     ensure!(
-        !session.is_empty()
-            && session.len() <= 256
-            && cwd.len() <= 4096
-            && summary.len() <= 1024,
+        !session.is_empty() && session.len() <= 256 && cwd.len() <= 4096 && summary.len() <= 1024,
         "invalid session subject"
     );
     Ok(())
@@ -564,12 +561,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 !text.trim().is_empty() && text.len() <= 1024,
                 "a question is 1-1024 bytes"
             );
-            subject(
-                &about.node,
-                &about.session_id,
-                &about.cwd,
-                &about.summary,
-            )?;
+            subject(&about.node, &about.session_id, &about.cwd, &about.summary)?;
             about.request_id.as_deref().map(id).transpose()?;
             ensure!(choices.len() <= 8, "at most 8 choices");
             for (index, choice) in choices.iter().enumerate() {

@@ -4,7 +4,7 @@ use super::*;
 use crate::scheduling::{
     JobOutcome, JobState, PendingCheck, SchedulerJob, SteerOutcome, SteerTarget,
 };
-use codex_server::{SteerAck, SteerTrace};
+use executor::{SteerAck, SteerTrace};
 use futures_util::FutureExt;
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 
@@ -208,17 +208,19 @@ impl Runtime {
         for job in steering {
             self.settle_steer(network, &job).await?;
         }
-        if !self
+        let Some(provider) = self
             .manager()
-            .is_some_and(|manager| manager.provider.supports_steer())
-        {
+            .map(|manager| manager.provider)
+            .filter(|provider| provider.supports_steer())
+        else {
             return Ok(());
-        }
+        };
+        let executor = self.executor(provider)?;
         let candidates = self
             .store
             .lock()
             .await
-            .steer_candidates(network, &local, boot)?;
+            .steer_candidates(network, &local, boot, provider)?;
         for candidate in candidates {
             let (scope, trigger) = (&candidate.conversation_id, &candidate.trigger);
             if !self.store.lock().await.begin_steer(
@@ -232,9 +234,7 @@ impl Runtime {
                 continue;
             }
             self.publish_changed(network, scope, Changed::Job(trigger));
-            let steer = self
-                .codex
-                .steer(&candidate.into, &candidate.message_id, &candidate.text);
+            let steer = executor.steer(&candidate.into, &candidate.message_id, &candidate.text);
             match tokio::time::timeout(STEER_WAIT, steer)
                 .await
                 .unwrap_or(SteerAck::Unknown)
@@ -291,7 +291,11 @@ impl Runtime {
         {
             return Ok(());
         }
-        let read = self.codex.read_back(into, &job.reply_to);
+        let read = async {
+            (self.executor(into.provider).ok()?)
+                .read_back(into, &job.reply_to)
+                .await
+        };
         let trace = tokio::time::timeout(STEER_WAIT, read).await.ok().flatten();
         let Some(next) =
             next_steer_state(trace, into, *unread_since_ms, *running_since_ms, now_ms())
@@ -569,6 +573,7 @@ mod tests {
 
     fn into() -> SteerTarget {
         SteerTarget {
+            provider: Provider::Codex,
             attempt_id: "a".into(),
             thread_id: "t".into(),
             turn_id: "r".into(),

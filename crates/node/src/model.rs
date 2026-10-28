@@ -70,13 +70,32 @@ pub enum ReplyStatus {
     Failed,
 }
 
+/// `Agent`: a turn on one of this device's providers that the Node watches, named by the
+/// provider. `task`: work handed to a device's coordination Agent as a task turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-/// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
-/// `task`: work handed to a device's coordination Agent as a task turn.
+#[serde(into = "String", try_from = "String")]
 pub enum WorkKind {
-    Codex,
+    Agent(Provider),
     Task,
+}
+
+impl From<WorkKind> for String {
+    fn from(kind: WorkKind) -> String {
+        match kind {
+            WorkKind::Agent(provider) => provider.name().into(),
+            WorkKind::Task => "task".into(),
+        }
+    }
+}
+
+impl TryFrom<String> for WorkKind {
+    type Error = serde_json::Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name == "task" {
+            return Ok(WorkKind::Task);
+        }
+        serde_json::from_value(serde_json::Value::String(name)).map(WorkKind::Agent)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

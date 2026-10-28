@@ -343,7 +343,7 @@ impl Runtime {
     }
 
     /// Whether the work's device can still report it: this Node with the run on record, or a
-    /// reachable one; a Codex work also needs that device's App Server connected.
+    /// reachable one; a work on the App Server also needs that device's App Server connected.
     async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
         let codex = if work.target_node == self.identity.device_id()? {
             let run = self.store.lock().await.work_record(&work.work_id)?;
@@ -363,7 +363,10 @@ impl Runtime {
                 _ => return Ok(false),
             }
         };
-        Ok(work.kind == WorkKind::Task || codex["connected"] == true)
+        Ok(match work.kind {
+            WorkKind::Agent(provider) if provider.on_app_server() => codex["connected"] == true,
+            _ => true,
+        })
     }
 
     async fn settle_work_check(

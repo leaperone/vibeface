@@ -34,8 +34,8 @@ export type WorkRecord = {
   failure_reason: string | null
   /** Why it failed, as a kind; `failure_reason` keeps the original text. */
   failure?: FailureKind
-  /** `codex`: a Codex turn its device watches; `task`: a task run by its device's coordination Agent. */
-  kind?: "codex" | "task"
+  /** A provider: a turn on it that its device watches; `task`: a task run by its device's coordination Agent. */
+  kind?: ProviderId | "task"
   /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
   turn_id?: string

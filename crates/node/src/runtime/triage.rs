@@ -1581,7 +1581,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         configuration.providers.codex_app_server.socket = Some(socket.into());
-        configuration.providers.execution = true;
+        configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
         configuration.save(&dir)?;
         config::private_write(
@@ -1799,7 +1799,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "r".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -1867,7 +1867,7 @@ mod tests {
             target: local.clone(),
             dispatcher: local,
             call_ref: work_id.into(),
-            kind: crate::model::WorkKind::Codex,
+            kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -1961,7 +1961,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "late".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2914,7 +2914,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "r".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3188,6 +3188,63 @@ mod tests {
                 refused.to_string().contains("own reply thread"),
                 "{refused:#}"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_work_runs_on_the_provider_it_names() -> Result<()> {
+        use crate::providers::Provider;
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            assert!(std::ptr::addr_eq(
+                node.executor(Provider::Codex)?,
+                &*node.codex
+            ));
+            assert!(node.executor(Provider::Claude).is_err());
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network,
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
+                .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let send = |call_ref: &str, agent: Value| {
+                json!({"thread":"t-other","call_ref":call_ref,"title":"t","prompt":"p","agent":agent})
+            };
+            let off = node
+                .tool(access.clone(), "track_work", send("r1", json!("claude")))
+                .await;
+            let named = node
+                .tool(access.clone(), "track_work", send("r2", json!("codex")))
+                .await;
+            let retried = node
+                .tool(access.clone(), "track_work", send("r2", json!("codex")))
+                .await;
+            let only = node
+                .tool(access, "track_work", send("r3", Value::Null))
+                .await;
+            node.finish_manager_attempt(&attempt).await;
+            let off = off.expect_err("claude executes no work here");
+            assert!(format!("{off:#}").contains("turned off"), "{off:#}");
+            assert_eq!(named?["may_send"], true, "the Codex CLI sends it");
+            assert_eq!(retried?["may_send"], false, "a retry never sends again");
+            assert_eq!(only?["may_send"], true, "codex is the only executor");
             Ok::<_, anyhow::Error>(())
         }
         .await;

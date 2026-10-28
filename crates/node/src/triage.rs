@@ -751,7 +751,11 @@ mod tests {
         let home = Path::new("/home/u");
         let [codex, claude] = hook_files(home, None);
         assert_eq!(codex.path, home.join(".codex/hooks.json"));
-        let command = hook_command(Path::new("/opt/vibeface"), Provider::Claude, Path::new("/d'x"));
+        let command = hook_command(
+            Path::new("/opt/vibeface"),
+            Provider::Claude,
+            Path::new("/d'x"),
+        );
         assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
         let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
         let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});

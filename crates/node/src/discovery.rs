@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -171,12 +171,12 @@ pub fn sessions_dir(codex_home: &Path) -> Option<PathBuf> {
     sessions.is_dir().then_some(sessions)
 }
 
-/// Provider paths for this device, each `None` when it stays as it is. Only paths and the
-/// execution switch: variables with keys never pass through here.
+/// Provider paths for this device, each `None` when it stays as it is, and the providers to
+/// turn execution on for. Variables with keys never pass through here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Paths {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution: Option<bool>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub execution: BTreeSet<Provider>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_server: Option<AppServer>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,7 +202,7 @@ impl Paths {
     /// Which settings this sets, for logs that must not hold the paths.
     pub fn names(&self) -> Vec<String> {
         [
-            ("execution", self.execution.is_some()),
+            ("execution", !self.execution.is_empty()),
             ("app_server", self.app_server.is_some()),
             ("codex_home", self.codex_home.is_some()),
             ("codex_sessions", self.codex_sessions.is_some()),
@@ -222,8 +222,10 @@ impl Paths {
     pub fn or(self, other: Paths) -> Paths {
         let mut bins = other.bins;
         bins.extend(self.bins);
+        let mut execution = other.execution;
+        execution.extend(self.execution);
         Paths {
-            execution: self.execution.or(other.execution),
+            execution,
             app_server: self.app_server.or(other.app_server),
             codex_home: self.codex_home.or(other.codex_home),
             bins,
@@ -239,7 +241,9 @@ impl Paths {
         Paths {
             execution: self
                 .execution
-                .filter(|on| *on != target.local.switches.execution),
+                .difference(&target.local.switches.execution)
+                .copied()
+                .collect(),
             app_server: self
                 .app_server
                 .filter(|server| *server != target.local.switches.codex_app_server),
@@ -257,9 +261,11 @@ impl Paths {
     }
 
     pub fn apply(&self, target: Target) -> Result<()> {
-        if let Some(on) = self.execution {
-            target.local.switches.execution = on;
-        }
+        target
+            .local
+            .switches
+            .execution
+            .extend(self.execution.iter().copied());
         if let Some(server) = &self.app_server {
             target.local.switches.codex_app_server = server.clone();
         }
@@ -282,11 +288,12 @@ impl Paths {
 pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     let local = &*target.local;
     let codex = codex
-        || local.switches.execution
-        || target
-            .manager
-            .as_ref()
-            .is_some_and(|m| m.provider.on_app_server());
+        || local.switches.app_server_used(
+            target
+                .manager
+                .as_ref()
+                .is_some_and(|m| m.provider.on_app_server()),
+        );
     let home_set = local.env.get(Provider::Codex).contains_key(CODEX_HOME);
     let mut paths = Paths::default();
     let server = &local.switches.codex_app_server;
@@ -330,7 +337,7 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     for provider in Provider::ALL {
         let launches = match provider.on_app_server() {
             true => codex && spawn,
-            false => bot == Some(provider),
+            false => bot == Some(provider) || local.switches.execution.contains(&provider),
         };
         let bin = local.bin(provider);
         if launches
@@ -601,7 +608,7 @@ mod tests {
         // Saved by a Node before discovery: execution on, nothing to run it with.
         let mut config =
             serde_json::to_value(Config::local("127.0.0.1:0".parse()?, vec![], false))?;
-        config["providers"]["execution"] = true.into();
+        config["providers"]["execution"] = serde_json::json!(["codex"]);
         std::fs::write(dir.join("config.json"), serde_json::to_vec(&config)?)?;
         let host = Host {
             codex_home: None,

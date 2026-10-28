@@ -1139,7 +1139,7 @@ impl Runtime {
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
             "device_id":self.identity.device_id()?, "config":{
                 "public_entry":self.config.public_entry,"project_roots":settings.roots.len(),
-                "manager_enabled":settings.manager.is_some(),"execution_enabled":self.providers().switches.execution,
+                "manager_enabled":settings.manager.is_some(),"execution":self.providers().switches.execution,
                 "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
             "peers":peers,
@@ -2411,7 +2411,7 @@ mod tests {
                 target: ib.device_id()?,
                 dispatcher: ia.device_id()?,
                 call_ref: "remote".into(),
-                kind: WorkKind::Codex,
+                kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),

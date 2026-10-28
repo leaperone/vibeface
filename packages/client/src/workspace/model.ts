@@ -115,8 +115,8 @@ function workOutcome(value: unknown): WorkOutcome | null {
 }
 function workKind(value: unknown): WorkRecord["kind"] {
   if (value == null) return undefined
-  if (value !== "codex" && value !== "task") throw new Error("任务类型无法识别。")
-  return value
+  if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
+  throw new Error("任务类型无法识别。")
 }
 function work(value: unknown): WorkRecord {
   const data = record(value)

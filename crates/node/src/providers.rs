@@ -1,5 +1,5 @@
 //! The AI providers this Node runs locally, what a bot on each can do, and the variables each
-//! provider's processes get. The bot's provider and the execution switch live in `config.json`;
+//! provider's processes get. The bot's provider and which providers execute work live in `config.json`;
 //! the variables are model keys, so they stay in one private file of the data directory and
 //! never reach events, logs or the web, which only learns which names are set.
 use crate::scheduling::TriggerKind;
@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 use vibeface_bridge::agent::CustomToolConfig;
@@ -210,20 +210,36 @@ pub struct AppServer {
 }
 
 /// What the providers do besides the bot, which `Config.manager` chooses. A provider is in
-/// use while the bot runs on it or, for Codex, while it executes dispatched work.
+/// use while the bot runs on it or while it executes dispatched work.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
-    /// Dispatched work runs on the Codex App Server.
-    pub execution: bool,
+    /// The providers dispatched work runs on.
+    pub execution: BTreeSet<Provider>,
     #[serde(default)]
     pub codex_app_server: AppServer,
 }
 
 impl Providers {
+    /// Whether the App Server is in use: for the bot (`codex_agent`) or to execute work.
+    pub fn app_server_used(&self, codex_agent: bool) -> bool {
+        codex_agent
+            || self
+                .execution
+                .iter()
+                .any(|provider| provider.on_app_server())
+    }
+
     pub fn validate(&self, codex_agent: bool) -> Result<()> {
+        for provider in &self.execution {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+        }
         ensure!(
-            !(self.execution || codex_agent)
+            !self.app_server_used(codex_agent)
                 || self.codex_app_server.mode != AppServerMode::System
                 || self.codex_app_server.socket.is_some(),
             "set an explicit App Server socket before enabling system execution"
@@ -411,7 +427,7 @@ impl Local {
 
     pub fn validate(&self, codex_agent: bool) -> Result<()> {
         self.switches.validate(codex_agent)?;
-        if (self.switches.execution || codex_agent)
+        if self.switches.app_server_used(codex_agent)
             && self.switches.codex_app_server.mode == AppServerMode::Spawn
         {
             ensure!(
@@ -427,7 +443,7 @@ impl Local {
     /// The variables reach only an App Server the Node starts; the system one keeps its own.
     pub fn codex_target(&self, codex_agent: bool) -> CodexTarget {
         let app_server = &self.switches.codex_app_server;
-        match (self.switches.execution || codex_agent, app_server.mode) {
+        match (self.switches.app_server_used(codex_agent), app_server.mode) {
             (false, _) => CodexTarget::Off,
             (true, AppServerMode::System) => match &app_server.socket {
                 Some(socket) => CodexTarget::System(socket.clone()),
@@ -521,36 +537,44 @@ mod tests {
     }
 
     #[test]
-    fn the_execution_switch_decides_whether_codex_runs_work() {
+    fn the_execution_set_decides_whether_codex_runs_work() {
         let mut local = Local {
             switches: Providers::default(),
             bins: BTreeMap::new(),
             env: ProviderEnv::default(),
         };
-        assert!(!local.switches.execution && local.switches.validate(false).is_ok());
+        assert!(local.switches.execution.is_empty() && local.switches.validate(false).is_ok());
         assert!(local.codex_target(false) == CodexTarget::Off);
         assert!(local.validate(true).is_err());
-        local.switches.execution = true;
+        local.switches.execution.insert(Provider::Codex);
         assert!(local.validate(false).is_err());
         local.switches.codex_app_server.socket = Some("/configured/app-server.sock".into());
         assert!(local.validate(false).is_ok());
         assert!(matches!(local.codex_target(false), CodexTarget::System(_)));
-        local.switches.execution = false;
+        local.switches.execution.clear();
         assert!(local.validate(true).is_ok());
         assert!(matches!(local.codex_target(true), CodexTarget::System(_)));
         assert!(local.codex_target(false) == CodexTarget::Off);
+        local.switches.execution.insert(Provider::Cursor);
+        assert!(
+            local.validate(true).is_err(),
+            "only a provider that executes work joins the set"
+        );
         assert!(
             serde_json::from_value::<Providers>(serde_json::json!({
-                "execution":true,"codex":{"enabled":true,"roles":["agent"]},
+                "execution":["codex"],"codex":{"enabled":true,"roles":["agent"]},
             }))
             .is_err(),
             "per-provider switches are gone"
+        );
+        assert!(
+            serde_json::from_value::<Providers>(serde_json::json!({"execution":true})).is_err()
         );
     }
 
     #[test]
     fn codex_execution_requires_an_explicit_socket_or_spawn_mode() -> Result<()> {
-        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":true}))?;
+        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":["codex"]}))?;
         let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
