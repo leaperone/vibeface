@@ -31,7 +31,7 @@ const Fade = withUniwind(Animated.View)
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
-  const rows: Entry[] = []
+  const rows: Entry[] = [...extras.first]
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
