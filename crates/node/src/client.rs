@@ -841,7 +841,7 @@ async fn dispatch(
                 "join key differs from this channel's device"
             );
             let request = node.store.lock().await.join(&join, &session.device_id)?;
-            node.publish_reread(&request.network_id);
+            node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
@@ -871,7 +871,7 @@ async fn dispatch(
                     .await
                     .join_status(join_id, &session.device_id, reveal)?;
             if reveal.is_some() {
-                node.publish_reread(&request.network_id);
+                node.join_changed(&request.network_id);
             }
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
@@ -888,7 +888,7 @@ async fn dispatch(
                 .lock()
                 .await
                 .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
-            node.publish_reread(&request.network_id);
+            node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
@@ -1159,7 +1159,11 @@ fn stays(view: &AuthorizationView, node_id: &str) -> Result<()> {
 
 /// One approval step for a join this Node holds; `admin` is the authenticated manager, here or
 /// at the entry that forwarded it.
-pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) -> Result<Value> {
+pub(crate) async fn approve_join(
+    node: &Arc<Runtime>,
+    admin: &str,
+    params: &Value,
+) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
         node.store.lock().await.reject_join(join_id, admin)?
@@ -1179,7 +1183,7 @@ pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) ->
         node.install_membership(state.clone()).await?;
         request
     };
-    node.publish_reread(&request.network_id);
+    node.join_changed(&request.network_id);
     Ok(serde_json::to_value(request)?)
 }
 

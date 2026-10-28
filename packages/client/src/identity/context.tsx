@@ -1186,22 +1186,19 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 30_000)
     return () => clearInterval(timer)
   }, [recovery?.status])
-  const otherNodes = !!directory && directory.members.filter(member => member.kind === 'node').length > 1
   useEffect(() => {
     if (!ready) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
-    // The connected Node pushes membership, recovery and its own join changes. A join waiting on another Node
-    // is only seen by asking, so a manager in a network with several Nodes still rereads every 30s.
+    // Membership, recovery and join changes are pushed, including joins waiting on another member Node.
     const refresh = () => { void refreshDirectory().catch(() => {}) }
-    let poll: ReturnType<typeof setInterval> | undefined
-    if (ready.principal.can_manage) { refresh(); if (otherNodes) poll = setInterval(refresh, 30_000) }
+    if (ready.principal.can_manage) refresh()
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
       clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
-    return () => { clearTimeout(timer); clearInterval(poll); stop() }
-  }, [ready, otherNodes])
+    return () => { clearTimeout(timer); stop() }
+  }, [ready])
   useEffect(() => {
     if (!joins.length) return
     // A join expires on the Node's clock without a push; reread once the first one is due.
