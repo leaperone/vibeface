@@ -404,6 +404,13 @@ pub(crate) fn apply(
                 }
             }
         }
+        // `null` clears it; see `store::bots::MERGED_COLUMNS`.
+        EventBody::BotProjectSet { project, .. } => {
+            connection.execute(
+                "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,'project',?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                params![network, scope, serde_json::to_string(project)?, rank],
+            )?;
+        }
         EventBody::BotDeleted { .. } => {
             connection.execute(
                 "INSERT OR IGNORE INTO bot_deletions(network_id,conversation_id) VALUES(?,?)",

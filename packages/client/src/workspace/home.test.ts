@@ -29,4 +29,6 @@ test('the list puts the newest message first and silent bots last', () => {
 test('on a phone every page leads back toward the list', () => {
   assert.equal(backTo('/'), null)
   for (const [from, to] of [['/b/bot', '/'], ['/b/bot/work/w1', '/b/bot'], ['/inbox', '/'], ['/devices', '/'], ['/devices/d1', '/devices'], ['/settings', '/'], ['/settings/logs', '/settings']]) assert.equal(backTo(from), to, from)
+  assert.equal(backTo('/devices/d1', 'bot'), '/b/bot')
+  assert.equal(backTo('/settings', 'bot'), '/')
 })

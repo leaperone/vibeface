@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { folderLabels, folderSetup } from '@vibeface/client/workspace/bot-settings.ts'
+import { folderLabels, folderSetup, projectChoices } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { projectName } from '@vibeface/client/workspace/questions.ts'
 import type { BotProject } from '@vibeface/client/workspace/types.ts'
@@ -29,10 +29,9 @@ export default function NewBot() {
   const { busy, error, run } = useAction()
   if (!shared) return null
   const lookup = { nodes: shared.nodes, directory }
-  const projects = shared.nodes.flatMap((node, index) => node.revoked || !node.online || !node.capabilities?.manager ? []
-    : (node.capabilities.roots ?? []).map((cwd) => ({ project: { target_node: node.device_id, cwd }, label: `${nodeName(node.device_id, lookup, `设备 ${index + 1}`)} · ${projectName(cwd)}` })))
+  const projects = projectChoices(shared.nodes, (node, index) => nodeName(node.device_id, lookup, `设备 ${index + 1}`))
   const same = (item?: BotProject) => item?.target_node === project?.target_node && item?.cwd === project?.cwd
-  const options = [{ project: undefined, label: '不选' }, ...projects]
+  const options: { project?: BotProject; label: string }[] = [{ project: undefined, label: '不选' }, ...projects]
   if (pending?.project && !projects.some((item) => same(item.project))) options.push({ project: pending.project, label: `${nodeName(pending.project.target_node, lookup, '原来的设备')} · ${projectName(pending.project.cwd)}` })
   const create = () => run('create', async () => {
     const bot = await shared.createBot(pending ? { name: pending.name, instructions: pending.instructions, project: pending.project } : { name, instructions, project })

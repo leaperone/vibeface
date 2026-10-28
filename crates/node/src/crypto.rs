@@ -131,6 +131,7 @@ impl LocalIdentity {
             | EventBody::WorkFinished { attestation, .. }
             | EventBody::NotificationAcked { attestation, .. }
             | EventBody::PrimaryBotSet { attestation, .. }
+            | EventBody::BotProjectSet { attestation, .. }
             | EventBody::ScheduleControlled { attestation, .. } => *attestation = value,
             _ => anyhow::bail!("this event carries no device signature"),
         }
@@ -318,6 +319,7 @@ fn validate_attestation(event: &Event) -> Result<()> {
         | EventBody::BotDeleted { .. }
         | EventBody::NotificationAcked { .. }
         | EventBody::PrimaryBotSet { .. }
+        | EventBody::BotProjectSet { .. }
         | EventBody::ScheduleControlled { .. } => UserSignature::Required,
         EventBody::WorkFinished {
             outcome: WorkOutcome::Completed | WorkOutcome::Interrupted,
@@ -544,6 +546,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         EventBody::ConversationCreated { .. } => ensure!(
             event.scope_id != BOTS_SCOPE,
             "the bots scope is not a conversation"
+        ),
+        EventBody::BotProjectSet { .. } => ensure!(
+            event.scope_id != BOTS_SCOPE,
+            "a bot's project is set in its own conversation"
         ),
         EventBody::PrimaryBotSet {
             conversation_id, ..

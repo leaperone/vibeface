@@ -95,6 +95,29 @@ impl Host {
 
     /// `path` as the owner reads it in a question: under the home folder as `~/…`, elsewhere
     /// only its last two parts, so the full path stays on this computer.
+    /// The usual project folders in the home folder that exist, for a first folder to offer.
+    pub fn project_folders(&self) -> Vec<PathBuf> {
+        let Some(home) = &self.home else {
+            return Vec::new();
+        };
+        let mut found: Vec<PathBuf> = [
+            "projects",
+            "Developer",
+            "code",
+            "src",
+            "dev",
+            "repos",
+            "workspace",
+            "work",
+        ]
+        .iter()
+        .filter_map(|name| home.join(name).canonicalize().ok())
+        .filter(|path| path.is_dir())
+        .collect();
+        found.dedup();
+        found
+    }
+
     pub fn display(&self, path: &Path) -> String {
         self.tilde(path).unwrap_or_else(|| {
             let parts: Vec<_> = path.components().rev().take(2).collect();

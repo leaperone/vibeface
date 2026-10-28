@@ -1,14 +1,15 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { AddDevice } from '@/features/devices/add-device'
 import { DevicesPage } from '@/features/devices/devices'
+import { botSearch } from '@vibeface/client/workspace/home.ts'
 
 export const Route = createFileRoute('/_app/devices/')({
-  validateSearch: (search: Record<string, unknown>): { add?: true } => search.add === true || search.add === 'true' ? { add: true } : {},
+  validateSearch: (search: Record<string, unknown>): { add?: true; bot?: string } => ({ ...(search.add === true || search.add === 'true' ? { add: true as const } : {}), ...botSearch(search) }),
   component: Devices,
 })
 
 function Devices() {
-  const { add } = Route.useSearch()
+  const { add, bot } = Route.useSearch()
   const navigate = useNavigate()
-  return <><DevicesPage /><AddDevice opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: {}, replace: true }) }} /></>
+  return <><DevicesPage /><AddDevice opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: { bot }, replace: true }) }} /></>
 }

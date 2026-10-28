@@ -323,6 +323,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (item.method === "delete_bot") return !parseBots(await connection.rpc("bots")).some((bot) => bot.conversation_id === item.params.conversation_id)
     // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "set_primary_bot") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
+    if (item.method === "set_bot_project") {
+      const project = parseBots(await connection.rpc("bots")).find((bot) => bot.conversation_id === item.params.conversation_id)?.project ?? null
+      const wanted = item.params.project as BotProject | null
+      return project?.target_node === wanted?.target_node && project?.cwd === wanted?.cwd
+    }
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -602,6 +607,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
       const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
       try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      await refreshRef.current()
+    }),
+    /** `null` clears it; the bot then asks where to work. */
+    setBotProject: (id: string, project: BotProject | null) => withMutation(`bot-project:${id}`, async () => {
+      const attestation = await attest(id, { type: "bot_project_set", project })
+      try { await signedWrite("bot-project", `${id}:${project?.target_node ?? ""}:${project?.cwd ?? ""}`, "set_bot_project", { conversation_id: id, project, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()
