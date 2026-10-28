@@ -6,7 +6,9 @@ import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, W
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
-import { BotAvatar, claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, Skeleton, toast, Wordmark } from "@/components/app/kit"
+import { BotFace, botMood } from "@/components/app/bot-face"
+import { moodLabel } from "@vibeface/client/avatar/mood.ts"
 import { useOpenJoins } from "@/features/devices/join"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -114,11 +116,12 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                 {workspace.bots.map((bot) => {
                   const active = chatRoute && !missingBot && bot.bot_id === workspace.selectedBot?.bot_id
                   const marked = !active && (workspace.notifications.some((item) => item.conversation_id === bot.conversation_id))
+                  const mood = botMood(bot, workspace)
                   return <SidebarMenuItem key={bot.bot_id}>
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
-                        <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="sm" />
-                        <span className="min-w-0 flex-1 truncate">{bot.name}</span>
+                        <BotFace botId={bot.bot_id} mood={mood} size={20} />
+                        <span className="min-w-0 flex-1 truncate">{bot.name}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</span>
                         {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
                         {marked ? <Dot label="有新进展" /> : null}
                       </Link>

@@ -28,7 +28,7 @@ export default function Settings() {
   const { busy, error, run } = useRun()
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
-    {/* The home list already shows the connection, so settings starts with the devices. */}
+    {/* The home header already shows the connection, so settings starts with the devices. */}
     <Section icon={MonitorSmartphone} title="我的设备">
       <JoinRequests />
       <View className="overflow-hidden rounded-xl border border-border">

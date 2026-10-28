@@ -160,6 +160,16 @@ pub struct SteerTarget {
     pub turn_id: String,
 }
 
+/// What a bot is doing on the device that schedules it, for its avatar in the bot list.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Busy {
+    /// A message waits for delivery, in the queue, or claimed with no reply started yet.
+    Thinking,
+    /// A reply is running or being stopped.
+    Replying,
+}
+
 /// How the reply a message joined ended.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
