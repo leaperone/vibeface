@@ -1,15 +1,17 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, Inbox, Plus, Settings, Star } from 'lucide-react-native'
+import { Bot, Inbox, Plus, Settings } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { ConnectionMenu } from '@/components/connection-pill'
-import { Badge, EmptyState, Monogram } from '@/components/kit'
+import { botMood, BotFace } from '@/components/bot-face'
+import { Badge, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import { listTime } from '@/lib/time'
@@ -51,9 +53,9 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
       </Link>
     </View>
     {bots.length ? bots.map((bot) => {
-      const last = bot.last_message
-      return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name}
-        mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+      const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
+      return <Row key={bot.bot_id} href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace botId={bot.bot_id} mood={mood} size={44} primary={primary} />} name={bot.name}
+        label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
         unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
         preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
     }) : loading ? <View accessibilityLabel="正在读取 Bot" className="gap-2">{[0, 1, 2].map((item) => <View key={item} className="h-16 rounded-xl bg-muted/60" />)}</View> : <EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
@@ -62,15 +64,13 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   </ScrollView>
 }
 
-function Row({ href, replace, active, avatar, name, mark, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string }) {
+function Row({ href, replace, active, avatar, name, label, preview, unread, time }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; label?: string; preview: string; unread: number; time?: string }) {
   return <Link href={href} replace={replace} asChild>
-    <Pressable accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
+    <Pressable accessibilityLabel={label && [label, preview, time, unread ? `${unread} 条未读` : ''].filter(Boolean).join('，')} accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">
-          <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
-            <Text numberOfLines={1} className="shrink font-medium">{name}</Text>{mark}
-          </View>
+          <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{name}</Text>
           {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">

@@ -2,6 +2,7 @@ import { Link, Stack } from 'expo-router'
 import { MessageSquare, Settings } from 'lucide-react-native'
 import { View } from 'react-native'
 import { ConnectionMenu } from '@/components/connection-pill'
+import { ScreenFaces } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -25,6 +26,6 @@ export default function Home() {
         <Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button>
       </Link>,
     }} />
-    <HomeList />
+    <ScreenFaces><HomeList /></ScreenFaces>
   </>
 }

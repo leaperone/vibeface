@@ -34,8 +34,7 @@ export function mergeNotifications(notifications: NotificationRecord[], records:
 }
 
 export function mergeBots(bots: BotRecord[], records: ConversationRecords): BotRecord[] {
-  if (!records.last_message) return bots
-  return bots.map((bot) => bot.conversation_id === records.conversation_id ? { ...bot, last_message: records.last_message } : bot)
+  return bots.map((bot) => bot.conversation_id === records.conversation_id ? { ...bot, last_message: records.last_message ?? bot.last_message, busy: records.busy } : bot)
 }
 
 /** Works no result has settled yet, across conversations: a settled one leaves the list. */

@@ -4170,6 +4170,78 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
 }
 
 #[test]
+fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
+    use crate::scheduling::Busy;
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    assert_eq!(store.busy_conversations()?.get("c"), None);
+    for (id, at) in [("m1", 2), ("m2", 3)] {
+        store.accept_message(
+            &net.a,
+            &net.network,
+            "c",
+            id,
+            "hi",
+            vec![],
+            true,
+            signature(&net, id, "hi")?,
+            at,
+        )?;
+    }
+    assert_eq!(store.busy_conversations()?.get("c"), Some(&Busy::Thinking));
+
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .context("job")?;
+    assert_eq!(
+        store.busy_conversations()?.get("c"),
+        Some(&Busy::Thinking),
+        "claimed, nothing written yet"
+    );
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &claimed.job.trigger, &attempt)?;
+    assert_eq!(
+        store.busy_conversations()?.get("c"),
+        Some(&Busy::Replying),
+        "a running reply outranks the queued message"
+    );
+
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "ok",
+        4,
+    )?;
+    assert_eq!(
+        store.busy_conversations()?.get("c"),
+        Some(&Busy::Thinking),
+        "the second message still waits"
+    );
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot-1", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &claimed.job.trigger, &attempt)?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &claimed.job.trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "ok",
+        5,
+    )?;
+    assert_eq!(store.busy_conversations()?.get("c"), None);
+    Ok(())
+}
+
+#[test]
 fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
