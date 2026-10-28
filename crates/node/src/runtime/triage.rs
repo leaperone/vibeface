@@ -8,6 +8,7 @@ use crate::{
     manager::{self, ManagerConfig},
     model::{Choice, EventBody, Subject},
     net,
+    providers::Provider,
     triage::{self, AgentEvent, Delivery, OutboxEntry, Severity, TriageConfig},
 };
 use anyhow::{Context as _, Result, bail, ensure};
@@ -148,15 +149,15 @@ fn summary(event: &AgentEvent) -> String {
         .collect()
 }
 
-fn subject(event: &AgentEvent, request_id: Option<String>) -> Result<Subject> {
-    Ok(Subject {
+fn subject(event: &AgentEvent, request_id: Option<String>) -> Subject {
+    Subject {
         node: event.node.clone(),
-        agent: name(event.agent)?,
+        agent: Some(event.agent),
         session_id: event.session_id.clone(),
         cwd: event.cwd.clone(),
         summary: summary(event),
         request_id,
-    })
+    }
 }
 
 fn shared_event(event: &AgentEvent, roots: &[PathBuf]) -> AgentEvent {
@@ -375,7 +376,7 @@ impl Runtime {
             &self.identity,
             network,
             &primary,
-            &subject(&shared_event(event, &self.settings_snapshot().roots), None)?,
+            &subject(&shared_event(event, &self.settings_snapshot().roots), None),
             now_ms(),
         )?;
         if let Some(written) = written {
@@ -451,7 +452,7 @@ impl Runtime {
             .unwrap_or_default();
         let event = AgentEvent {
             source: triage::Source::AppServer,
-            agent: triage::Agent::Codex,
+            agent: Provider::Codex,
             event: triage::Kind::NeedsInput,
             session_id: request.thread_id.clone().unwrap_or(NO_THREAD.into()),
             turn_id: format!("request:{request_id}"),
@@ -650,7 +651,7 @@ impl Runtime {
                     .map_or("completed", |status| status.as_str());
                 let event = AgentEvent {
                     source: triage::Source::AppServer,
-                    agent: triage::Agent::Codex,
+                    agent: Provider::Codex,
                     event: triage::Kind::TurnEnd,
                     status: Some(status.into()),
                     session_id: thread,
@@ -732,7 +733,7 @@ impl Runtime {
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
             tool_cli: Some(program),
-            ..self.manager_config(settings)
+            ..self.manager_config(settings)?
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
@@ -898,7 +899,7 @@ impl Runtime {
                     about: subject(
                         &shared_event(&event, &self.settings_snapshot().roots),
                         request_id,
-                    )?,
+                    ),
                 };
                 self.raise(&network, &event, question).await?
             }
@@ -1608,7 +1609,6 @@ mod tests {
             provider: crate::providers::Provider::Codex,
             workspace: "/tmp".into(),
             model: "fixture".into(),
-            cursor_sdk_bin: "/nonexistent".into(),
         });
     }
 
@@ -2629,7 +2629,7 @@ mod tests {
 
     fn turn(session: &str, turn: &str, cwd: &str) -> AgentEvent {
         AgentEvent {
-            source: triage::Source::CodexHook,
+            source: triage::Source::Hook,
             session_id: session.into(),
             turn_id: turn.into(),
             cwd: cwd.into(),

@@ -41,7 +41,9 @@ vibeface join '<加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFA
 
 ```json
 {
-	"codex_bin": "<Codex 程序的绝对路径>",
+	"bins": {
+		"codex": "<Codex 程序的绝对路径>"
+	},
 	"providers": {
 		"execution": true,
 		"codex_app_server": {
@@ -60,8 +62,7 @@ Node 只连接这个 socket，不搜索其他正在运行的会话，也不启�
 {
 	"codex": {
 		"CODEX_HOME": "<该 Codex 实例的数据目录绝对路径>"
-	},
-	"cursor": {}
+	}
 }
 ```
 

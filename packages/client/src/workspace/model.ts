@@ -6,7 +6,7 @@ import type {
   BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
 } from "./types.ts"
 import { answerId } from "./questions.ts"
-import type { ProviderId } from "../lib/node.ts"
+import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -221,9 +221,8 @@ function edit(value: unknown): FieldEdit | undefined {
   const data = record(value)
   return { before: text(data.before), after: text(data.after) }
 }
-const providers: readonly ProviderId[] = ["codex", "cursor"]
 function provider(value: unknown): ProviderId {
-  if (!providers.includes(value as ProviderId)) throw new Error("模型的 provider 无法识别。")
+  if (!providerIds.includes(value as ProviderId)) throw new Error("模型的 provider 无法识别。")
   return value as ProviderId
 }
 function modelEdit(value: unknown): ModelEdit | undefined {
@@ -377,7 +376,7 @@ function severity(value: unknown): Severity {
 }
 function subject(value: unknown): QuestionSubject {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
+  return { node: text(data.node), agent: data.agent === null ? null : provider(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
 }
 function closeReason(value: unknown): CloseReason {
   if (value !== "request_lost") throw new Error("问题关闭的原因无法识别。")
@@ -402,7 +401,7 @@ function sentBotMessage(value: unknown): SentBotMessage {
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), muted: data.muted === true, created_at_ms: number(data.created_at_ms) }
+  return { node: text(data.node), agent: provider(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), muted: data.muted === true, created_at_ms: number(data.created_at_ms) }
 }
 /** Every unanswered question across the network. */
 export function parseQuestions(value: unknown): Question[] {

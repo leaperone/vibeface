@@ -101,7 +101,7 @@ vibeface --data-dir "$VIBEFACE_DATA_DIR"
 vibeface init \
 	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
-	--manager codex_sdk \
+	--manager codex \
 	--codex-socket '<App Server socket 的绝对路径>' \
 	--workspace /absolute/path/to/manager-workspace
 ```
@@ -109,7 +109,7 @@ vibeface init \
 | 参数 | 说明 |
 |---|---|
 | `--root` | 允许 Agent 访问的项目目录，可重复。 |
-| `--manager` | 协调 Agent 的 SDK，取值 `codex_sdk` 或 `cursor_sdk`。 |
+| `--manager` | 运行协调 Agent 的产品，取值 `codex` 或 `cursor`。 |
 | `--workspace` | 协调 Agent 的工作目录，须与项目目录分开。 |
 | `--model` | 模型名。省略时 Codex 用自身默认配置，Cursor 默认 `auto`。 |
 | `--listen` | 监听地址，默认 `127.0.0.1:4790`。 |

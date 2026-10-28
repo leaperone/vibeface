@@ -36,6 +36,15 @@ pub enum Sdk {
     Codex { socket: PathBuf },
 }
 
+impl Sdk {
+    pub fn provider(&self) -> crate::providers::Provider {
+        match self {
+            Sdk::Cursor { .. } => crate::providers::Provider::Cursor,
+            Sdk::Codex { .. } => crate::providers::Provider::Codex,
+        }
+    }
+}
+
 /// Records a turn's `(thread, turn)` on the App Server; the turn is `None` before `turn/start`.
 pub type TurnRecorder = Arc<
     dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
@@ -609,9 +618,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
             })
             .map(|(_, value)| value),
     );
-    if matches!(config.sdk, Sdk::Codex { .. })
-        && let Ok(keys) = provider_environment_keys(&config.provider_env)
-    {
+    if let Ok(keys) = config.sdk.provider().key_variables(&config.provider_env) {
         values.extend(
             keys.iter()
                 .filter_map(|key| std::env::var(key).ok())

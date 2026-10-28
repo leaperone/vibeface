@@ -1,5 +1,6 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import type { Question } from "./types.ts"
+import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
 export const answerId = (questionId: string) => `a-${questionId}`
@@ -57,5 +58,4 @@ export function placeByTime<T extends { created_at_ms: number }>(messages: reado
 
 export const projectName = (cwd: string) => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd
 
-const agents: Record<string, string> = { codex: "Codex", claude: "Claude Code" }
-export const agentName = (agent: string) => agents[agent] ?? agent
+export const agentName = (agent: ProviderId) => providerNames[agent]

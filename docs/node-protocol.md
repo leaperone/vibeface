@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=6`，数据库 `user_version=6`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=7`，数据库 `user_version=7`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
 
 ## 身份与数据范围
 
@@ -18,7 +18,7 @@
 
 ## 本机配置
 
-`config.json` 由 `init` 生成。网页通过加密客户端通道修改 `manager`、`roots`、`providers` 和 `codex_bin` 后，新操作立即读取；其他字段手动修改后重启生效。字段名固定，不接受未知字段。
+`config.json` 由 `init` 生成。网页通过加密客户端通道修改 `manager`、`roots`、`providers` 和 `bins` 后，新操作立即读取；其他字段手动修改后重启生效。字段名固定，不接受未知字段。
 
 | 字段 | 含义 |
 |---|---|
@@ -32,10 +32,10 @@
 | `public_entry` | `true` 表示不加入个人网络。默认提供网页、relay 和密文转发；`discovery-only` 时仅提供发现服务和可选静态网页；两种模式都可另行启用独立文件交付服务 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
-| `manager` | Bot 配置，`provider` 是运行 Bot 的服务（`codex_sdk` 或 `cursor_sdk`），关闭时为 `null` |
+| `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex` 或 `cursor`），关闭时为 `null` |
 | `providers.execution` | 默认 `false`，显式启用后由 Codex App Server 执行派发的工作；`false` 时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
 | `providers.codex_app_server` | `{mode, socket}`：`system` 要求 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境设置 `CODEX_HOME`。用到 Codex 而缺失时，`init`、启动和 `configure_provider` 从本机找出并写入，见[部署配置](deployment.md#配置-sdk-与-app-server) |
-| `codex_bin` | 托管 App Server 使用的 Codex CLI，默认 `codex` |
+| `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
 
@@ -55,18 +55,17 @@
 
 配置了 `network.bind` 时关闭 iroh 的端口映射，不发布未配置的路由器地址。`public_entry=true` 要求 `relay_listen`，且不能同时有 `entry`、`manager` 或 `roots`。`discovery-only` 还要求非零 UDP 端口，不能配置 `bind`、`relays`、`n0_relays`、`relay_url` 或其他发现服务。
 
-启用管理 Agent 时，`manager` 对象包含以下全部字段。程序路径在后台运行时使用绝对路径。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
+启用管理 Agent 时，`manager` 对象包含以下全部字段。Cursor 模式要求非空 `model`，Codex 模式可用空字符串选择其默认模型。
 
 ```json
 {
-	"provider": "cursor_sdk",
+	"provider": "cursor",
 	"workspace": "/absolute/manager-workspace",
-	"model": "auto",
-	"cursor_sdk_bin": "/absolute/bin/cursor-sdk-bridge"
+	"model": "auto"
 }
 ```
 
-`provider` 也可为 `codex_sdk`，此时 Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，只有 Codex 支持原生 steer，均不支持 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
+`provider` 也可为 `codex`，此时 Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，只有 Codex 支持原生 steer，均不支持 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
 
 ## 数据目录
 
@@ -74,8 +73,8 @@
 |---|---|
 | `identity.json` | 设备私钥，0600 |
 | `config.json` | 本机配置，0600 |
-| `data-epoch.json` | `{"data_epoch":6}`，程序拒绝其他 epoch |
-| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=6` |
+| `data-epoch.json` | `{"data_epoch":7}`，程序拒绝其他 epoch |
+| `node.sqlite3` | 成员目录、签名日志、投影和本机表，`user_version=7` |
 | `bootstrap.json` | 建网前的一次性本机 capability，公共入口没有 |
 | `entry-token` | 公共入口的运营者令牌，64 个十六进制字符，0600；公共入口和使用它的成员 Node 各有一份 |
 | `blobs/sha256/<前两位>/<hash>` | 附件正文，`blobs/partial/` 为续传暂存 |
@@ -139,9 +138,9 @@
 | `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
 | `log` | `records`：1 到 20 条 `{level, event, message, conversation_id?, work_id?, fields?}` | 浏览器写日志，来源记为 `web`，每条 JSON 不超过 8 KiB，每台设备每分钟 120 条 |
 | `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
-| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}` 和 `providers`。`providers` 每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
-| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型、工作目录和程序路径，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
-| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`execution` 只用于 Codex。`bin` 和 `app_server` 只用于 Codex。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
+| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}`（`missing` 列出 Bot 缺程序的产品）和 `providers`。`providers` 只列 `supports` 非空的产品，每项为 `{provider, roles, supports, state, issues, bin, app_server, env}`，`bin` 是它实际运行的程序：`roles` 是它现在的用途（运行 Bot 为 `agent`，Codex 执行工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
+| `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型和工作目录，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
+| `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join` | `secret`、`public_key`、`kind`、`name`、`commit` | 新设备提交加入请求，`public_key` 必须是本通道设备 |
@@ -245,7 +244,7 @@ Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合�
 
 ## 工作
 
-每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。`propose_provider_config { execution?, codex_home?, app_server_socket?, codex_sessions?, cursor_sdk_bin? }` 提议本设备的路径：给出的必须是存在的绝对路径，其余由 Node 补齐，只留与现有设置不同的项；都相同时返回 `{status: "unchanged"}`。否则在本聊天写一张「允许 / 不允许」提问卡片，卡片里的路径缩写成 `~/…`，返回 `{status: "asked", question_id, proposed}`，此时什么都不写。本人回答后的那一轮，Bot 用 `apply_provider_config { question_id }`：回答为「允许」时经 `configure_provider` 的同一写入路径写入，返回 `{status: "applied", applied, also_filled}`；其他回答返回 `{status: "declined"}`，不写。同一提问重复调用只读回第一次的结果。提议只存在内存，Node 重启后要重新提议。密钥和其他变量不经这两个工具。`context { at? | before? | after?: {author, seq}, types?, limit?, blob_hash?, offset? }` 按本轮领取时的 `basis` 读历史，位置不随新事件移动：不给位置读最新的，`before` 或 `after` 读某条事件之前或之后的，`types` 按事件类型过滤，`more` 表示该方向还有；一页最多 32000 字节，单个事件最多 8000 字节；`at` 只读该事件，把事件体的 JSON 文本从 `offset` 字节起放进 `body_json`，整个结果不超过 32000 字节，`next_offset` 指向下一页，各页拼接即完整事件体；位置超出本轮 `basis` 时报错。带 `blob_hash` 时读附件，`limit` 以 KiB 计、最多 32，UTF-8 文本以 `text` 返回并在字符边界分页，其他内容为 `data_base64`，附件还没到本机时返回 `pending_download: true`。`work_status { work_id? | before?, limit? }` 给出单个工作的完整记录（结果超过 32000 字节时截断并标 `result_truncated`），或从新到旧分页列出本会话的工作，`before` 接上一页最后一个 `work_id`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
+每台设备只有一个协调角色：协调 Agent 加 Node 运行时。协调 Agent 的 Shell 完全访问本机，用 `vibeface codex call|send|watch` 直接经 `VIBEFACE_CODEX_SOCKET` 调用本机 App Server。需要 Node 记录和观察的工作用协调工具 `dispatch_work { title, prompt, cwd, call_ref, target_node?, parent?, continues?, thread?, model?, effort?, images? }` 派发。`title` 是给本人看的几个字，最长 120 字符。`work_id` 由 `(会话, trigger, call_ref)` 派生，同一轮重试同一 `call_ref` 返回原工作；结果不明时用 `call_lookup` 查询。`hand_over_session { node, session_id, version, to? | stop_following? }` 把本 Bot 名下的外来会话转给 `to`（另一个 Bot 的会话 ID 或名称，给自己即重新关注），或 `stop_following: true` 不再关注；`version` 取自 `bot.sessions`，是最后改动该会话归属的事件 hash 前 16 位。只有会话当前所属的 Bot 能操作，运行该会话的设备写入；状态已成立时不写、重试只读回；版本已变时不写，错误里给出当前版本。返回 `{node, session_id, conversation_id, muted, version, changed}`。`propose_provider_config { execution?, codex_home?, app_server_socket?, codex_sessions?, bins? }` 提议本设备的路径：给出的必须是存在的绝对路径，其余由 Node 补齐，只留与现有设置不同的项；都相同时返回 `{status: "unchanged"}`。否则在本聊天写一张「允许 / 不允许」提问卡片，卡片里的路径缩写成 `~/…`，返回 `{status: "asked", question_id, proposed}`，此时什么都不写。本人回答后的那一轮，Bot 用 `apply_provider_config { question_id }`：回答为「允许」时经 `configure_provider` 的同一写入路径写入，返回 `{status: "applied", applied, also_filled}`；其他回答返回 `{status: "declined"}`，不写。同一提问重复调用只读回第一次的结果。提议只存在内存，Node 重启后要重新提议。密钥和其他变量不经这两个工具。`context { at? | before? | after?: {author, seq}, types?, limit?, blob_hash?, offset? }` 按本轮领取时的 `basis` 读历史，位置不随新事件移动：不给位置读最新的，`before` 或 `after` 读某条事件之前或之后的，`types` 按事件类型过滤，`more` 表示该方向还有；一页最多 32000 字节，单个事件最多 8000 字节；`at` 只读该事件，把事件体的 JSON 文本从 `offset` 字节起放进 `body_json`，整个结果不超过 32000 字节，`next_offset` 指向下一页，各页拼接即完整事件体；位置超出本轮 `basis` 时报错。带 `blob_hash` 时读附件，`limit` 以 KiB 计、最多 32，UTF-8 文本以 `text` 返回并在字符边界分页，其他内容为 `data_base64`，附件还没到本机时返回 `pending_download: true`。`work_status { work_id? | before?, limit? }` 给出单个工作的完整记录（结果超过 32000 字节时截断并标 `result_truncated`），或从新到旧分页列出本会话的工作，`before` 接上一页最后一个 `work_id`。其他协调工具为 `nodes`、`context`、`work_status`、`interrupt_work`、`read_skill { skill_id }`、`recall { query? }`、`fetch_url { url }`、`list_bots {}`、`read_bot { bot }`，以及 `dispatch_work` 内部使用的 `track_work` 和 `bind_work`。`fetch_url` 只读 http 和 https，解析出的每个地址都必须是公网地址，连接固定到核对过的地址，不走代理，最多 5 次跳转并逐跳核对，15 秒超时，正文最多 2 MiB，返回 `{ status, final_url, content_type, title, text, truncated }`，文字最多 20000 字符。
 
 唤醒工具 `remind { call_ref, note, in_minutes? | at_ms? }` 和 `message_bot { call_ref, bot, text }` 提供给除 Agent 任务和路由外的所有轮次。`remind` 写一个一次性 schedule（深度为当前加一，1 分钟至 366 天后）；`message_bot` 在对方会话写 `BotMessaged`，`message_id` 由 `(会话, trigger, call_ref)` 派生，每个 bot 每小时最多 10 条，正文最多 4000 字节。
 

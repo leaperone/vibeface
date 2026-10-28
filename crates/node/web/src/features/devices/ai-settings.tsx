@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Download, ExternalLink, FolderOpen, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -11,7 +11,7 @@ import { terms } from "@/lib/glossary"
 import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
-export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: "可用", tone: "success", icon: CircleCheck },
   needs_setup: { label: "需设置", tone: "warning", icon: CircleAlert },
@@ -19,13 +19,11 @@ const states: Record<ProviderStatus["state"], { label: string; tone: Tone; icon:
   off: { label: "未使用", tone: "neutral", icon: CircleDashed },
 }
 /** Where each provider's program comes from, and how the device uses it. */
-const install: Record<ProviderId, string> = { codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-sdk" }
-const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk" }
-// Names come from runtime/settings.rs readiness.missing.
-const checks: Record<ProviderId, { key: string; label: string }[]> = {
-  codex: [{ key: "Codex CLI", label: "缺少 Codex 命令行" }],
-  cursor: [{ key: "Cursor SDK Bridge", label: "缺少 Cursor 组件" }],
+const install: Record<ProviderId, string> = {
+  codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-sdk", claude: "https://docs.anthropic.com/en/docs/claude-code",
+  pi: "https://www.npmjs.com/package/@earendil-works/pi-coding-agent", opencode: "https://opencode.ai",
 }
+const guide: Partial<Record<ProviderId, string>> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk" }
 const services: Record<string, string> = { CURSOR_API_KEY: "Cursor", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
 /** A variable the provider needs, named after its service where there is one; the variable itself goes in a tooltip. */
 const keyName = (name: string) => services[name] ? `${services[name]} ${terms.secret.label}` : name
@@ -270,17 +268,16 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
-  const executable = item.supports.includes("execution") && !onboarding
+  const botable = item.supports.includes("agent"), executable = item.supports.includes("execution") && !onboarding
   const manager = bot ? response.settings.manager : null
-  const missing = bot ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
-  const state = states[item.state === "ready" && missing.length ? "needs_setup" : item.state]
+  const state = states[item.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [value, setValue] = useState("")
   const [newName, setNewName] = useState("")
   const [newValue, setNewValue] = useState("")
-  const [bin, setBin] = useState(item.bin ?? "")
-  useEffect(() => setBin(item.bin ?? ""), [item.bin])
+  const [bin, setBin] = useState(item.bin)
+  useEffect(() => setBin(item.bin), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
   const issue = item.state === "needs_setup" ? item.issues[0] : undefined
   const server = item.app_server
@@ -292,14 +289,14 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     .then((ok) => { if (ok) toast(`${keyName(name)} 已保存`, { tone: "success" }); return ok })
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
     .then((ok) => { if (!ok) void reconcile(); return ok })
-  const binForm = item.bin !== null ? <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
+  const binForm = <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); void change("bin", { bin: bin.trim() }) }}>
       <label htmlFor={`${item.provider}-bin`} className="text-meta font-medium text-muted-foreground">程序</label>
       <div className="flex min-w-0 gap-2">
-        <PathInput id={`${item.provider}-bin`} saved={item.bin ?? ""} display={display} placeholder="codex" value={bin} disabled={working}
+        <PathInput id={`${item.provider}-bin`} saved={item.bin} display={display} placeholder={item.bin.split(/[\\/]/).pop()} value={bin} disabled={working}
           data-fix={issue?.code === "bin_missing" ? "" : undefined} onChange={(event) => setBin(event.target.value)} />
-        {bin.trim() !== (item.bin ?? "") ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
+        {bin.trim() !== item.bin ? <Button type="submit" variant="outline" disabled={working}><BusyIcon busy={busy === `${item.provider}:bin`} />保存</Button> : null}
       </div>
-    </form> : null
+    </form>
   // Keyed by the roles, so switching one drops a test result that no longer matches what runs.
   const serverSettings = server ? <AppServerSettings key={item.roles.join()} server={server} home={item.home} sessions={item.sessions} display={display} working={working} blocked={issue?.code === "bin_missing"} busy={busy} save={change} test={test}>{binForm}</AppServerSettings> : binForm
   const setVariable = (key: string, name: string, next: string | null) => change(key, { env: { [name]: next } })
@@ -316,8 +313,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         {item.state === "off" ? null : <StatusPill tone={state.tone} icon={state.icon} className={cn(item.state === "starting" && "[&>svg]:animate-spin")}>{state.label}</StatusPill>}
       </div>
       <div className="ms-auto flex shrink-0 gap-2">
-        <RoleToggle role="bot" name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
-          onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} />
+        {botable ? <RoleToggle role="bot" name={name} pressed={bot} busy={busy === `${item.provider}:bot`} disabled={busy !== ""}
+          onClick={() => bot ? void change("bot", { bot: false }) : turnOn("bot")} /> : null}
         {executable ? <RoleToggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ""}
           onClick={() => execution ? void change("execution", { execution: false }) : turnOn("execution")} /> : null}
       </div>
@@ -335,13 +332,9 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
           onClick={() => void change("app_server", { app_server: spawnServer })}>改由 Vibeface 启动</button>
-        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
+        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider] ?? install[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
-    </p> : missing.length ? <ul className="grid gap-1.5 px-4 sm:ps-12 pb-2">{missing.map((check) => <li key={check.key} className="flex min-w-0 items-center gap-2 text-meta">
-      <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" />
-      <span className="min-w-0 truncate">{check.label}</span>
-      <a className="hit-area relative shrink-0 font-medium underline underline-offset-4" href={install[item.provider]} target="_blank" rel="noopener noreferrer">怎么装</a>
-    </li>)}</ul> : null}
+    </p> : null}
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
       <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
         <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
@@ -349,7 +342,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <div className="grid gap-5 px-4 sm:ps-12 pt-1 pb-4">
         {serverSettings}
 
-        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} fixBin={issue?.code === "bin_missing"} working={working}
+        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
@@ -432,26 +425,25 @@ function BotHint() {
   </p>
 }
 
-const botFields = ["model", "workspace", "cursor_sdk_bin"] as const
+const botFields = ["model", "workspace"] as const
 
-/** The bot's model, folder and programs, inside the settings of the provider it runs on. */
-function BotDetails({ manager, display, fixBin, working, busy, save }: { manager: ManagerSettings; display: Display; fixBin: boolean; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+/** The bot's model and folder, inside the settings of the provider it runs on. */
+function BotDetails({ manager, display, working, busy, save }: { manager: ManagerSettings; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
-  const cursor = manager.provider === "cursor_sdk"
+  const cursor = manager.provider === "cursor"
   const dirty = botFields.some((key) => draft[key] !== manager[key])
-  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; fix?: boolean; plain?: boolean } = {}) => {
-    const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required, "data-fix": extra.fix ? "" : undefined,
+  const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
+    const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
     return <label className="grid gap-1 text-meta">{label}{extra.plain ? <Input {...props} maxLength={256} /> : <PathInput {...props} saved={manager[key]} display={display} />}</label>
   }
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
-    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim(), cursor_sdk_bin: draft.cursor_sdk_bin.trim() })
+    void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim() })
   }}>
     <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
     {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
     {field("workspace", "Bot 工作文件夹")}
-    {cursor ? field("cursor_sdk_bin", "Cursor 组件", { fix: fixBin }) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }

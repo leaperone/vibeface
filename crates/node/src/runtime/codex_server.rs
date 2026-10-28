@@ -951,7 +951,7 @@ mod tests {
         )?;
         let mut local = Local {
             switches: Default::default(),
-            codex_bin: fixture.clone(),
+            bins: BTreeMap::from([(Provider::Codex, fixture.clone())]),
             env,
         };
         local.switches.execution = true;
@@ -1061,7 +1061,7 @@ mod tests {
                     socket: Some(control.clone()),
                 },
             },
-            codex_bin: program,
+            bins: BTreeMap::from([(Provider::Codex, program)]),
             env: ProviderEnv::default(),
         };
         assert_eq!(
@@ -1131,7 +1131,7 @@ mod tests {
                     socket: Some(candidate.clone()),
                 },
             },
-            codex_bin: "codex".into(),
+            bins: BTreeMap::new(),
             env: ProviderEnv::default(),
         };
         let identity = LocalIdentity::generate();

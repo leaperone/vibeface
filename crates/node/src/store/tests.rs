@@ -2760,7 +2760,6 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
             provider,
             workspace: "/w".into(),
             model: "auto".into(),
-            cursor_sdk_bin: "/sdk".into(),
         };
         let bot = store.bot_for_conversation(&net.network, "c")?;
         Ok(crate::scheduler::bot_model(&device, bot.as_ref()))
@@ -3580,7 +3579,7 @@ fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
         }],
         about: Subject {
             node: net.a.device_id()?,
-            agent: "codex".into(),
+            agent: Some(crate::providers::Provider::Codex),
             session_id: session.into(),
             cwd: "/w".into(),
             summary: "tests fail".into(),
@@ -3699,7 +3698,7 @@ fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()
     conversation(&mut store, &net)?;
     let mut card = question(&net, "q-settings", "provider-setup-1")?;
     if let EventBody::QuestionAsked { about, .. } = &mut card {
-        about.agent = crate::runtime::SETTINGS_AGENT.into();
+        about.agent = None;
     }
     store.ask(&net.a, &net.network, "c", card, 2)?;
     store.ask(
@@ -3949,7 +3948,7 @@ fn a_hand_over_from_an_old_version_writes_nothing() -> Result<()> {
     second_bot(&mut local, &net, "Other")?;
     let about = Subject {
         node: net.a.device_id()?,
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: "s1".into(),
         cwd: "/w".into(),
         summary: "tests fail".into(),
@@ -3996,7 +3995,7 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
     let node = net.a.device_id()?;
     let about = Subject {
         node: node.clone(),
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: "s1".into(),
         cwd: "/w".into(),
         summary: "tests fail".into(),
@@ -4454,7 +4453,7 @@ fn the_bot_prompt_lists_the_newest_sessions_it_follows() -> Result<()> {
     let node = net.a.device_id()?;
     let about = |session: &str| Subject {
         node: node.clone(),
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: session.into(),
         cwd: "/work/project".into(),
         summary: format!("{session}: {}", "tests fail again. ".repeat(6)),

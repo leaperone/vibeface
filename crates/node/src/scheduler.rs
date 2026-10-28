@@ -313,7 +313,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             tool_token: Some(token.clone()),
             process_started: Some(process_recorder(&node, &attempt.id)),
             codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
-            ..node.manager_config(settings)
+            ..node.manager_config(settings)?
         };
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
@@ -1032,7 +1032,7 @@ pub(crate) fn materialize(
     })).or_else(|| dispatches.iter().find(|dispatch| job.trigger == crate::scheduling::work_trigger(&dispatch.spec.work_id))
         .map(|dispatch| json!({"body":dispatch_row(dispatch)})));
     let settings_card = matches!(&history.question, Some(EventBody::QuestionAsked { about, .. })
-        if about.agent == crate::runtime::SETTINGS_AGENT);
+        if about.agent.is_none());
     let question = history
         .question
         .as_ref()
@@ -1196,7 +1196,6 @@ mod tests {
             provider,
             workspace: "/w".into(),
             model: model.into(),
-            cursor_sdk_bin: "/sdk".into(),
         };
         let codex = |model, guide| {
             session_key(

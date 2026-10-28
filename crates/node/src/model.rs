@@ -126,9 +126,10 @@ pub const BOTS_SCOPE: &str = "bots";
 #[serde(deny_unknown_fields)]
 pub struct Subject {
     pub node: DeviceId,
-    /// `codex` or `claude`.
-    pub agent: String,
-    /// A Codex thread ID or a Claude Code session ID.
+    /// The provider running the session; `None` when the question is about `node`'s own
+    /// settings, whose answer goes to `apply_provider_config`.
+    pub agent: Option<crate::providers::Provider>,
+    /// The provider's thread or session ID.
     pub session_id: String,
     pub cwd: String,
     /// One line: what the session last said.
@@ -657,7 +658,7 @@ pub enum EventBody {
     /// deleted included, or the bot its owner hands it to. The latest by rank stands.
     SessionAttributed {
         node: DeviceId,
-        agent: String,
+        agent: crate::providers::Provider,
         session_id: String,
         cwd: String,
         summary: String,

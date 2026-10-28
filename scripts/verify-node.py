@@ -572,8 +572,8 @@ class Node:
             configuration["providers"]["execution"] = True
             if app_server["mode"] == "spawn":
                 env_path = self.directory / "provider-env.json"
-                providers = json.loads(env_path.read_text()) if env_path.exists() else {"codex": {}, "cursor": {}}
-                providers["codex"]["CODEX_HOME"] = str(self.directory / "home/.codex")
+                providers = json.loads(env_path.read_text()) if env_path.exists() else {}
+                providers.setdefault("codex", {})["CODEX_HOME"] = str(self.directory / "home/.codex")
                 private_json(env_path, providers)
         private_json(path, configuration)
 
@@ -704,9 +704,8 @@ def fixture_wrapper(run, name, mode):
 
 
 def fixture_manager_settings(run, workspace):
-    """Bot turns run on the fixture App Server, so `codex_bin` must be the `--fixture-codex` wrapper."""
-    return {"provider": "codex_sdk", "workspace": str(workspace), "model": "controlled-fixture",
-            "cursor_sdk_bin": "unused-fixture"}
+    """Bot turns run on the fixture App Server, so `bins.codex` must be the `--fixture-codex` wrapper."""
+    return {"provider": "codex", "workspace": str(workspace), "model": "controlled-fixture"}
 
 
 def fixture_record(run, filename, record):
@@ -1327,7 +1326,7 @@ def fixture_manager(run, initial, bot):
     if kind == "answer":
         question, answer = context["trigger"]["question"], body["text"]
         about = question["about"]
-        if about.get("agent") == "vibeface":
+        if about["agent"] is None:
             replies = [tool("apply_provider_config", {"question_id": question["question_id"]}) for _ in range(2)]
             require(replies[0] == replies[1] and replies[0]["status"] in ("applied", "declined"),
                     "a settings card's answer is applied once; a repeat reads it back")
@@ -1391,7 +1390,7 @@ def fixture_manager(run, initial, bot):
     # Screens show these replies, so only an explicit test label is echoed back.
     explicit = directive.get("label")
     spoken = "已看过任务结果" if autonomous else "收到，已处理"
-    if kind == "answer" and question["about"].get("agent") == "vibeface":
+    if kind == "answer" and question["about"]["agent"] is None:
         spoken = "设置已更新" if replies[0]["status"] == "applied" else "没有改动设置"
     while True:
         sequence += 1
@@ -2301,7 +2300,7 @@ def no_agent_checks(run, a, passed):
     a.start()
     a.client.connect()
     a.client.authenticate()
-    dropped = local_post(a, "/api/hooks", {"source": "codex_hook", "agent": "codex", "event": "turn_end",
+    dropped = local_post(a, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end",
                                            "session_id": "no-agent", "turn_id": "t", "cwd": "/tmp"})
     require(dropped["status"] == "dropped", "without an Agent an event is dropped, not queued")
     marker = run / "fixture-codex-global-request"
@@ -2491,7 +2490,7 @@ def chat_agent_acceptance(options):
         for name in ("A", "BOT-OTHER-NETWORK"):
             node = Node(run, name, binary, workspace, helper)
             node.configure(timeout_secs=600, manager=fixture_manager_settings(run, workspace) if name == "A" else None,
-                           codex_bin=str(codex) if name == "A" else sys.executable, app_server=SPAWN_APP_SERVER,
+                           bins={"codex": str(codex) if name == "A" else sys.executable}, app_server=SPAWN_APP_SERVER,
                            daily_decision_limit=100)
             nodes.append(node)
         a, outsider = nodes
@@ -2625,7 +2624,7 @@ def phase1_acceptance(options):
     try:
         a = Node(run, "A", binary, workspace, helper)
         nodes.append(a)
-        a.configure(timeout_secs=600, manager=manager, codex_bin=str(codex), app_server=SPAWN_APP_SERVER,
+        a.configure(timeout_secs=600, manager=manager, bins={"codex": str(codex)}, app_server=SPAWN_APP_SERVER,
                     daily_decision_limit=100)
         a.start()
         network = a.bootstrap()
@@ -2907,7 +2906,7 @@ def acceptance(options):
         for name in ("A", "P", "B", "C", "OTHER-NETWORK"):
             nodes.append(Node(run, name, binary, workspace, helper))
         a, p, b, c, outsider = nodes
-        a.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
+        a.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER, daily_decision_limit=100)
         p.configure_network(relay_listen=f"127.0.0.1:{relay_port}")
         a.configure_network(relays=[relay_url])
@@ -3210,7 +3209,7 @@ def phase4_acceptance(options):
             root = roots[node.name] = run / ("fixture-" + node.name)
             root.mkdir(mode=0o700)
             node.configure(timeout_secs=600, daily_decision_limit=100,
-                           codex_bin=str(fixture_wrapper(root, "fixture-codex", "--fixture-codex")),
+                           bins={"codex": str(fixture_wrapper(root, "fixture-codex", "--fixture-codex"))},
                            app_server=SPAWN_APP_SERVER,
                            manager=fixture_manager_settings(root, workspace))
             node.configure_network(relays=[relay_url])
@@ -3562,7 +3561,7 @@ def public_entry_acceptance(options):
         for node in (m, x):
             node.configure_network(bind=f"[::1]:{node.port}")
         m.configure(timeout_secs=600, daily_decision_limit=100, manager=fixture_manager_settings(fixture, workspace),
-                    codex_bin=str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex")),
+                    bins={"codex": str(fixture_wrapper(fixture, "fixture-codex", "--fixture-codex"))},
                     app_server=SPAWN_APP_SERVER)
         for node in nodes:
             node.start()
@@ -3622,7 +3621,7 @@ def public_entry_acceptance(options):
         thread_id = wait_for("M's Agent starts a Codex thread", lambda: next((thread_id for thread_id, thread in json.loads(
             (fixture / "fixture-codex-state.json").read_text())["threads"].items() if thread["cwd"] == str(work_dir)), None)
             if (fixture / "fixture-codex-state.json").exists() else None, timeout=60)
-        local_post(m, "/api/hooks", {"source": "codex_hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
+        local_post(m, "/api/hooks", {"source": "hook", "agent": "codex", "event": "turn_end", "session_id": thread_id,
                                      "turn_id": "pe-hook", "cwd": str(work_dir), "last_message": "需要你决定 needs-human"})
         question = wait_for("M's Agent asks in the chat that owns the thread", lambda: next(
             (row for row in m.client.rpc("questions")["questions"] if row["about"]["session_id"] == thread_id), None), timeout=90)
@@ -4076,7 +4075,7 @@ def auto_route_acceptance(options):
     try:
         target = Node(run, "TARGET", binary, workspace, helper)
         nodes.append(target)
-        target.configure(manager=fixture_manager_settings(run, workspace), codex_bin=str(fixture_wrapper(run, "fixture-codex", "--fixture-codex")),
+        target.configure(manager=fixture_manager_settings(run, workspace), bins={"codex": str(fixture_wrapper(run, "fixture-codex", "--fixture-codex"))},
                          app_server=SPAWN_APP_SERVER, daily_decision_limit=100, allowed_origins=[allowed])
         target.start()
         network = target.bootstrap()
@@ -6275,7 +6274,7 @@ def delivery_paid_run(options, configuration, deployment):
             isolate_delivery_node(node)
             if name == "S" and chain_recorder:
                 node.configure(timeout_secs=600, manager=fixture_manager_settings(principals, workspace),
-                    codex_bin=str(fixture_wrapper(principals, "fixture-codex", "--fixture-codex")), app_server=SPAWN_APP_SERVER)
+                    bins={"codex": str(fixture_wrapper(principals, "fixture-codex", "--fixture-codex"))}, app_server=SPAWN_APP_SERVER)
             node.configure_network(pkarr={"publish": True, "resolve": True, "urls": [relay.url], "publish_direct": True})
             node.start()
             if name != "P":

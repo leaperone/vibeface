@@ -19,6 +19,7 @@ use vibeface::{
     local_access::Launcher,
     maintenance,
     net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
+    providers::Provider,
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -229,18 +230,18 @@ struct Init {
     #[arg(long)]
     allow_insecure_lan: bool,
     #[arg(long, value_enum, requires = "workspace")]
-    manager: Option<vibeface::providers::Provider>,
+    manager: Option<Provider>,
     #[arg(long, requires = "manager")]
     workspace: Option<PathBuf>,
     #[arg(long, requires = "manager")]
     model: Option<String>,
-    #[arg(long, default_value = "cursor-sdk-bridge")]
-    cursor_sdk_bin: PathBuf,
+    /// A provider's program, e.g. `cursor=/opt/bin/cursor-sdk-bridge`; the others run their
+    /// default name. May be repeated.
+    #[arg(long = "bin", value_name = "PROVIDER=PATH", value_parser = provider_bin)]
+    bins: Vec<(Provider, PathBuf)>,
     /// Socket of the running Codex App Server; found under the Codex folder when omitted.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
-    #[arg(long, default_value = "codex")]
-    codex_bin: PathBuf,
     /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
     #[arg(long = "relay", value_name = "URL")]
     relays: Vec<String>,
@@ -270,12 +271,6 @@ struct Init {
     relay_token_file: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum HookAgent {
-    Codex,
-    Claude,
-}
-
 #[derive(Args)]
 struct LocalNode {
     #[command(flatten)]
@@ -288,7 +283,7 @@ struct LocalNode {
 #[derive(Args)]
 struct Hook {
     #[arg(value_enum)]
-    agent: HookAgent,
+    agent: Provider,
     #[command(flatten)]
     local: LocalNode,
     /// Send a test event instead of reading stdin.
@@ -1080,7 +1075,7 @@ fn init(options: Init) -> Result<()> {
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
     configuration.providers.codex_app_server.socket = options.codex_socket;
-    configuration.codex_bin = options.codex_bin;
+    configuration.bins = options.bins.into_iter().collect();
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
     } else {
@@ -1131,7 +1126,6 @@ fn init(options: Init) -> Result<()> {
                 .canonicalize()
                 .context("resolve manager workspace")?,
             model: manager.model(options.model.as_deref().unwrap_or_default()),
-            cursor_sdk_bin: options.cursor_sdk_bin,
         });
     }
     let mut env = vibeface::providers::ProviderEnv::default();
@@ -1306,6 +1300,11 @@ fn create_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn origin(value: &str) -> Result<Url> {
     config::http_origin(value).context("invalid node URL")
+}
+
+fn provider_bin(value: &str) -> Result<(Provider, PathBuf), String> {
+    let (provider, path) = value.split_once('=').ok_or("use PROVIDER=PATH")?;
+    Ok((ValueEnum::from_str(provider, false)?, path.into()))
 }
 
 fn is_loopback(url: &Url) -> bool {
@@ -1667,12 +1666,13 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
     (output.status.success() && !text.is_empty()).then_some(text)
 }
 
-/// Whether a hook comes from a session the user drives: Codex tells by its rollout's first
-/// line, Claude Code by the entry point it hands its hooks.
-fn interactive_hook(agent: HookAgent, input: &Value) -> bool {
+/// The event a provider's hook input describes. `None` for a hook the Node does not read and
+/// for a session nobody drives: Codex tells by its rollout's first line, Claude Code by the
+/// entry point it hands its hooks.
+fn hook_event(agent: Provider, input: &Value) -> Result<Option<vibeface::triage::AgentEvent>> {
     use vibeface::triage;
-    match agent {
-        HookAgent::Codex => {
+    Ok(match agent {
+        Provider::Codex => {
             let first = input["transcript_path"]
                 .as_str()
                 .and_then(|path| fs::File::open(path).ok())
@@ -1688,11 +1688,26 @@ fn interactive_hook(agent: HookAgent, input: &Value) -> bool {
                 .unwrap_or_default();
             let meta = triage::rollout_meta(&first);
             triage::interactive_codex(&meta["source"], meta["originator"].as_str())
+                .then(|| triage::from_codex_hook(input))
+                .flatten()
         }
-        HookAgent::Claude => {
+        Provider::Claude => {
             triage::interactive_claude(std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref())
+                .then(|| {
+                    triage::from_claude_hook(
+                        input,
+                        input["transcript_path"]
+                            .as_str()
+                            .and_then(|path| fs::metadata(path).ok())
+                            .map_or(0, |metadata| metadata.len()),
+                    )
+                })
+                .flatten()
         }
-    }
+        Provider::Cursor | Provider::Pi | Provider::Opencode => {
+            bail!("{} has no hooks", agent.name())
+        }
+    })
 }
 
 async fn hook(options: Hook) -> Result<()> {
@@ -1700,6 +1715,7 @@ async fn hook(options: Hook) -> Result<()> {
     let mut event = if options.test {
         AgentEvent {
             source: triage::Source::Test,
+            agent: options.agent,
             session_id: "test".into(),
             turn_id: uuid::Uuid::new_v4().to_string(),
             cwd: std::env::current_dir()?.to_string_lossy().into(),
@@ -1710,25 +1726,10 @@ async fn hook(options: Hook) -> Result<()> {
         let mut input = Vec::new();
         std::io::stdin().take(1 << 20).read_to_end(&mut input)?;
         let input: Value = serde_json::from_slice(&input).context("hook input is not JSON")?;
-        if !interactive_hook(options.agent, &input) {
+        let Some(event) = hook_event(options.agent, &input)? else {
             return Ok(());
-        }
-        let event = match options.agent {
-            HookAgent::Codex => triage::from_codex_hook(&input),
-            HookAgent::Claude => triage::from_claude_hook(
-                &input,
-                input["transcript_path"]
-                    .as_str()
-                    .and_then(|path| fs::metadata(path).ok())
-                    .map_or(0, |metadata| metadata.len()),
-            ),
         };
-        let Some(event) = event else { return Ok(()) };
         event
-    };
-    event.agent = match options.agent {
-        HookAgent::Codex => triage::Agent::Codex,
-        HookAgent::Claude => triage::Agent::Claude,
     };
     if !event.cwd.is_empty() {
         let top = git(&event.cwd, &["rev-parse", "--show-toplevel"]);
@@ -2315,12 +2316,27 @@ mod tests {
                 "--data-dir",
                 "/data/node",
                 "--manager",
-                "cursor_sdk",
+                "cursor",
                 "--workspace",
-                "."
+                ".",
+                "--bin",
+                "cursor=/opt/bin/cursor-sdk-bridge"
             ])
             .is_ok()
         );
+        for refused in [
+            &["--manager", "cursor_sdk", "--workspace", "."][..],
+            &["--bin", "/opt/bin/claude"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    ["vibeface", "init", "--data-dir", "/data/node"]
+                        .into_iter()
+                        .chain(refused.iter().copied())
+                )
+                .is_err()
+            );
+        }
         assert!(Cli::try_parse_from(["vibeface", "tool", "dispatch_work", "--json", "{}"]).is_ok());
         assert!(
             Cli::try_parse_from([

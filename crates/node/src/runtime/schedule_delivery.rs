@@ -26,7 +26,7 @@ impl Runtime {
         };
         let mut capabilities = manager.provider.capabilities();
         capabilities["configured"] = json!(true);
-        json!({"provider":manager.provider.sdk_name(),"model":manager.model,"capabilities":capabilities})
+        json!({"provider":manager.provider,"model":manager.model,"capabilities":capabilities})
     }
 
     pub(super) fn start_schedule_delivery(self: &Arc<Self>) {

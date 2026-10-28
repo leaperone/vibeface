@@ -7,7 +7,7 @@ use std::{
 };
 
 /// Bumped whenever stored data stops being readable by the previous build.
-pub const DATA_EPOCH: u32 = 6;
+pub const DATA_EPOCH: u32 = 7;
 /// SHA-256 over the migration files (`migrations/*.sql`, by name) that `DATA_EPOCH` stores.
 /// Any schema change fails a test until both constants change together.
 pub const DATA_EPOCH_SCHEMA_SHA256: &str =
@@ -48,7 +48,9 @@ pub struct Config {
     pub roots: Vec<PathBuf>,
     pub network: crate::net::NetworkConfig,
     pub manager: Option<ManagerSettings>,
-    pub codex_bin: PathBuf,
+    /// The programs chosen for providers; the others run their `default_bin`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bins: std::collections::BTreeMap<crate::providers::Provider, PathBuf>,
     pub timeout_secs: u64,
     pub daily_decision_limit: u64,
     /// Where triaged local sessions go; the webhook secret is a separate private file.
@@ -61,11 +63,9 @@ pub struct Config {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagerSettings {
-    #[serde(with = "crate::providers::sdk_name")]
     pub provider: crate::providers::Provider,
     pub workspace: PathBuf,
     pub model: String,
-    pub cursor_sdk_bin: PathBuf,
 }
 impl Config {
     pub fn local(listen: SocketAddr, roots: Vec<PathBuf>, allow_insecure_lan: bool) -> Self {
@@ -81,7 +81,7 @@ impl Config {
             roots,
             network: crate::net::NetworkConfig::default(),
             manager: None,
-            codex_bin: "codex".into(),
+            bins: Default::default(),
             timeout_secs: 600,
             daily_decision_limit: 20,
             triage: Default::default(),
@@ -97,7 +97,7 @@ impl Config {
     fn register_private_paths(&self, dir: &Path) {
         for path in std::iter::once(dir)
             .chain(self.roots.iter().map(PathBuf::as_path))
-            .chain(std::iter::once(self.codex_bin.as_path()))
+            .chain(self.bins.values().map(PathBuf::as_path))
             .chain(
                 self.providers
                     .codex_app_server
@@ -111,7 +111,6 @@ impl Config {
         }
         if let Some(manager) = &self.manager {
             crate::logging::add_private_path(&manager.workspace);
-            crate::logging::add_private_path(&manager.cursor_sdk_bin);
         }
         for project in &self.triage.projects {
             crate::logging::add_private_path(Path::new(&project.prefix));
@@ -168,11 +167,17 @@ impl Config {
                 .as_ref()
                 .is_some_and(|manager| manager.provider.on_app_server()),
         )?;
-        ensure!(
-            !self.codex_bin.as_os_str().is_empty(),
-            "the Codex program path must not be empty"
-        );
+        for (provider, bin) in &self.bins {
+            crate::providers::validate_bin(*provider, bin)?;
+        }
         if let Some(m) = &self.manager {
+            ensure!(
+                m.provider
+                    .supports()
+                    .contains(&crate::providers::Role::Agent),
+                "{} does not run bots",
+                m.provider.name()
+            );
             ensure!(m.workspace.is_dir(), "manager workspace does not exist");
         }
         Ok(())

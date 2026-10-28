@@ -27,7 +27,7 @@ pub struct ProviderChange {
     bot: Option<bool>,
     /// Whether Codex executes dispatched work.
     execution: Option<bool>,
-    /// The Codex program; empty restores the default.
+    /// The provider's program; empty restores its default.
     bin: Option<PathBuf>,
     /// Which Codex App Server to use.
     app_server: Option<AppServer>,
@@ -57,6 +57,11 @@ impl ProviderChange {
         let provider = self.provider;
         match self.bot {
             Some(true) => {
+                ensure!(
+                    provider.supports().contains(&Role::Agent),
+                    "{} does not run bots here yet",
+                    provider.label()
+                );
                 let mut chosen = target
                     .manager
                     .take()
@@ -78,39 +83,28 @@ impl ProviderChange {
         }
         if let Some(execution) = self.execution {
             ensure!(
-                self.provider == Provider::Codex,
-                "only Codex executes dispatched work"
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
             );
             target.local.switches.execution = execution;
         }
         if let Some(bin) = self.bin {
-            ensure!(
-                self.provider == Provider::Codex,
-                "only Codex has a program path here"
-            );
-            let text = bin.to_string_lossy();
-            ensure!(
-                text.len() <= 4096 && !text.contains('\0'),
-                "invalid Codex program path"
-            );
-            target.local.codex_bin = match text.trim() {
-                "" => DEFAULT_CODEX_BIN.into(),
-                trimmed => trimmed.into(),
-            };
+            let trimmed = PathBuf::from(bin.to_string_lossy().trim());
+            if trimmed.as_os_str().is_empty() {
+                target.local.bins.remove(&provider);
+            } else {
+                providers::validate_bin(provider, &trimmed)?;
+                target.local.bins.insert(provider, trimmed);
+            }
         }
         if let Some(app_server) = self.app_server {
-            ensure!(
-                self.provider == Provider::Codex,
-                "only Codex has an App Server"
-            );
+            ensure!(provider.on_app_server(), "only Codex has an App Server");
             target.local.switches.codex_app_server = app_server;
         }
-        target.local.env.apply(self.provider, self.env)
+        target.local.env.apply(provider, self.env)
     }
 }
-
-const DEFAULT_CODEX_BIN: &str = "codex";
-const DEFAULT_CURSOR_BIN: &str = "cursor-sdk-bridge";
 
 fn executable(path: &Path) -> bool {
     discovery::runnable(path, std::env::var_os("PATH").as_ref())
@@ -135,7 +129,6 @@ impl Runtime {
             provider,
             workspace: self.data_dir.canonicalize()?.join("manager-workspace"),
             model: provider.model(""),
-            cursor_sdk_bin: DEFAULT_CURSOR_BIN.into(),
         })
     }
 
@@ -159,18 +152,21 @@ impl Runtime {
 
     /// A turn of the bot `settings` describe, in its provider's SDK on this Node. Its tools see
     /// the Node-wide shell environment; the caller adds what belongs to the turn.
-    pub(crate) fn manager_config(&self, settings: ManagerSettings) -> ManagerConfig {
+    pub(crate) fn manager_config(&self, settings: ManagerSettings) -> Result<ManagerConfig> {
         let sdk = match settings.provider {
             Provider::Cursor => Sdk::Cursor {
                 bridge: self.cursor.get().cloned(),
-                sdk_bin: settings.cursor_sdk_bin,
+                sdk_bin: self.providers().bin(Provider::Cursor),
                 agents: self.cursor_agents.clone(),
             },
             Provider::Codex => Sdk::Codex {
                 socket: self.codex.socket(),
             },
+            Provider::Claude | Provider::Pi | Provider::Opencode => {
+                anyhow::bail!("{} does not run bots here yet", settings.provider.label())
+            }
         };
-        ManagerConfig {
+        Ok(ManagerConfig {
             sdk,
             workspace: settings.workspace,
             model: settings.model,
@@ -183,7 +179,7 @@ impl Runtime {
             provider_env: self.provider_env(settings.provider),
             process_started: None,
             codex_turn: None,
-        }
+        })
     }
 
     /// The variables this Node sets for `provider`, and only that provider.
@@ -209,32 +205,18 @@ impl Runtime {
             .manager
             .as_ref()
             .is_some_and(|m| m.provider == provider);
-        let execution = provider == Provider::Codex && local.switches.execution;
+        let execution = provider.on_app_server() && local.switches.execution;
         let roles: Vec<Role> = [(bot, Role::Agent), (execution, Role::Execution)]
             .into_iter()
             .filter_map(|(serves, role)| serves.then_some(role))
             .collect();
-        // Codex bots run on the App Server; the system one runs with its own program and
-        // variables.
-        let launches = provider == Provider::Cursor || app_server.mode == AppServerMode::Spawn;
+        let launches = local.launches(provider);
         let mut issues = Vec::new();
-        let (bin, required) = match provider {
-            Provider::Codex => {
-                let required = crate::manager::provider_environment_keys(configured)
-                    .unwrap_or_else(|_| {
-                        issues.push(json!({"code":"config_invalid"}));
-                        vec![]
-                    });
-                (local.codex_bin.clone(), required)
-            }
-            Provider::Cursor => (
-                settings
-                    .manager
-                    .as_ref()
-                    .map_or(DEFAULT_CURSOR_BIN.into(), |m| m.cursor_sdk_bin.clone()),
-                vec!["CURSOR_API_KEY".to_owned()],
-            ),
-        };
+        let bin = local.bin(provider);
+        let required = provider.key_variables(configured).unwrap_or_else(|_| {
+            issues.push(json!({"code":"config_invalid"}));
+            vec![]
+        });
         let inherited = |name: &str| std::env::var_os(name).is_some_and(|value| !value.is_empty());
         let names: BTreeSet<&String> = configured.keys().chain(&required).collect();
         let env: Vec<Value> = names
@@ -245,7 +227,9 @@ impl Runtime {
             })
             .collect();
         let mut starting = false;
-        let link = (provider == Provider::Codex).then_some(self.codex.link().await);
+        let link = provider
+            .on_app_server()
+            .then_some(self.codex.link().await);
         if !roles.is_empty() {
             if launches && !executable(&bin) {
                 issues.push(json!({"code":"bin_missing","path":bin}));
@@ -276,13 +260,13 @@ impl Runtime {
         } else {
             "ready"
         };
+        let codex = provider.on_app_server();
         json!({
-            "provider":provider, "roles":roles, "supports":provider.supports(),
-            "bin":(provider == Provider::Codex).then_some(&local.codex_bin),
-            "app_server":(provider == Provider::Codex).then(|| json!({"mode":app_server.mode,
+            "provider":provider, "roles":roles, "supports":provider.supports(), "bin":bin,
+            "app_server":codex.then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
-            "home":(provider == Provider::Codex).then(|| configured.get(discovery::CODEX_HOME)),
-            "sessions":(provider == Provider::Codex).then(|| self.triage.config().codex_sessions),
+            "home":codex.then(|| configured.get(discovery::CODEX_HOME)),
+            "sessions":codex.then(|| self.triage.config().codex_sessions),
             "env":env, "state":state, "issues":issues,
         })
     }
@@ -309,21 +293,14 @@ impl Runtime {
     pub(crate) async fn node_settings(&self) -> Result<Value> {
         let settings = self.settings_snapshot();
         let default = self.default_manager(Provider::Codex)?;
-        let defaults = json!({
-            "workspace":default.workspace, "cursor_sdk_bin":default.cursor_sdk_bin,
-        });
+        let defaults = json!({"workspace":default.workspace});
         let local = self.providers();
         let mut missing = Vec::new();
-        if let Some(manager) = &settings.manager {
-            if manager.provider == Provider::Cursor {
-                if !executable(&manager.cursor_sdk_bin) {
-                    missing.push("Cursor SDK Bridge");
-                }
-            } else if local.switches.codex_app_server.mode == AppServerMode::Spawn
-                && !executable(&local.codex_bin)
-            {
-                missing.push("Codex CLI");
-            }
+        if let Some(manager) = &settings.manager
+            && local.launches(manager.provider)
+            && !executable(&local.bin(manager.provider))
+        {
+            missing.push(manager.provider);
         }
         let readiness = if settings.manager.is_none() {
             "disabled"
@@ -333,7 +310,7 @@ impl Runtime {
             "missing_prerequisites"
         };
         let mut providers = Vec::new();
-        for provider in Provider::ALL {
+        for provider in Provider::ALL.into_iter().filter(|p| !p.supports().is_empty()) {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
         let mut response = json!({"settings":settings,"defaults":defaults,
@@ -433,13 +410,13 @@ impl Runtime {
         let manager_changed = manager != previous_manager;
         if manager_changed
             || next.switches != previous.switches
-            || next.codex_bin != previous.codex_bin
+            || next.bins != previous.bins
             || triage != previous_triage
         {
             let mut configuration = Config::load(&self.data_dir)?;
             configuration.manager = manager.clone();
             configuration.providers = next.switches.clone();
-            configuration.codex_bin = next.codex_bin.clone();
+            configuration.bins = next.bins.clone();
             configuration.triage = triage.clone();
             configuration.save(&self.data_dir)?;
         }
@@ -461,7 +438,10 @@ impl Runtime {
             self.triage.set_config(triage);
         }
         self.codex.retarget(next.codex_target(codex_agent));
-        if manager_changed || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor) {
+        if manager_changed
+            || next.env.get(Provider::Cursor) != previous.env.get(Provider::Cursor)
+            || next.bin(Provider::Cursor) != previous.bin(Provider::Cursor)
+        {
             self.refresh_cursor();
         }
         self.schedule_wakeup.notify_one();
@@ -502,7 +482,6 @@ impl Runtime {
         settings.roots.dedup();
         if let Some(manager) = &mut settings.manager {
             manager.workspace = self.host.expand(&manager.workspace);
-            manager.cursor_sdk_bin = self.host.expand(&manager.cursor_sdk_bin);
             ensure!(
                 manager.workspace.is_absolute(),
                 "manager workspace must be an existing absolute directory"
@@ -514,10 +493,6 @@ impl Runtime {
             ensure!(
                 manager.provider != Provider::Cursor || !manager.model.trim().is_empty(),
                 "Cursor SDK requires a model"
-            );
-            ensure!(
-                !manager.cursor_sdk_bin.as_os_str().is_empty(),
-                "manager program paths must not be empty"
             );
             self.ensure_default_workspace(&manager.workspace)?;
             manager.workspace = manager
@@ -542,9 +517,6 @@ impl Runtime {
     }
 }
 
-/// The agent a settings card is about: the user's answer goes to `apply_provider_config`, not
-/// to a session.
-pub(crate) const SETTINGS_AGENT: &str = "vibeface";
 /// The answer that lets a proposal be written; any other answer writes nothing.
 pub(crate) const ALLOW: &str = "允许";
 const DENY: &str = "不允许";
@@ -566,7 +538,8 @@ struct ProposalInput {
     codex_home: Option<PathBuf>,
     app_server_socket: Option<PathBuf>,
     codex_sessions: Option<PathBuf>,
-    cursor_sdk_bin: Option<PathBuf>,
+    #[serde(default)]
+    bins: BTreeMap<Provider, PathBuf>,
 }
 
 impl ProposalInput {
@@ -591,11 +564,21 @@ impl ProposalInput {
                 socket: Some(socket),
             }),
             codex_home: existing(self.codex_home, "codex_home", Path::is_dir)?,
-            codex_bin: None,
+            bins: self
+                .bins
+                .into_iter()
+                .map(|(provider, bin)| {
+                    ensure!(
+                        bin.is_absolute()
+                            && bin.as_os_str().len() <= 1024
+                            && discovery::runnable(&bin, None),
+                        "bins.{} must be an absolute path that exists on this device",
+                        provider.name()
+                    );
+                    Ok((provider, bin))
+                })
+                .collect::<Result<_>>()?,
             codex_sessions: existing(self.codex_sessions, "codex_sessions", Path::is_dir)?,
-            cursor_sdk_bin: existing(self.cursor_sdk_bin, "cursor_sdk_bin", |path| {
-                discovery::runnable(path, None)
-            })?,
         })
     }
 }
@@ -679,7 +662,7 @@ impl Runtime {
                 .into(),
             about: crate::model::Subject {
                 node: device,
-                agent: SETTINGS_AGENT.into(),
+                agent: None,
                 session_id: format!("provider-setup-{}", &question_id[2..18]),
                 cwd: String::new(),
                 summary: "Bot 与任务".into(),
@@ -734,14 +717,15 @@ impl Runtime {
         }
         let named = [
             ("Codex 目录", &paths.codex_home),
-            ("Codex 程序", &paths.codex_bin),
             ("会话目录", &paths.codex_sessions),
-            ("Cursor 组件", &paths.cursor_sdk_bin),
         ];
         for (label, path) in named {
             if let Some(path) = path {
                 lines.push(format!("{label}：{}", shown(path)));
             }
+        }
+        for (provider, bin) in &paths.bins {
+            lines.push(format!("{} 程序：{}", provider.label(), shown(bin)));
         }
         let mut text = crate::logging::scrub(&lines.join("\n"));
         while text.len() > 1024 {

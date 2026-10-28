@@ -33,7 +33,6 @@ mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
-pub(crate) use settings::SETTINGS_AGENT;
 pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
@@ -245,7 +244,7 @@ impl Runtime {
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
         let providers = crate::providers::Local {
             switches: config.providers.clone(),
-            codex_bin: config.codex_bin.clone(),
+            bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
         let codex_agent = config
@@ -583,7 +582,7 @@ impl Runtime {
         let mut codex = self.codex.capability().await;
         codex["enabled"] = json!(self.providers().switches.execution);
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
-            "manager":manager.map(Provider::sdk_name),
+            "manager":manager,
             "manager_ready":self.manager_ready().await,
             "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})

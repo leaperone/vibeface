@@ -30,10 +30,10 @@ export type JoinRequest = {
   admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
-export type ManagerSettings = { provider: 'cursor_sdk' | 'codex_sdk'; workspace: string; model: string; cursor_sdk_bin: string }
+export type ManagerSettings = { provider: ProviderId; workspace: string; model: string }
 export type NodeSettings = { roots: string[]; manager: ManagerSettings | null }
-export type ProviderId = 'codex' | 'cursor'
-export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor' }
+export type ProviderId = 'codex' | 'cursor' | 'claude' | 'pi' | 'opencode'
+export const providerNames: Record<ProviderId, string> = { codex: 'Codex', cursor: 'Cursor', claude: 'Claude Code', pi: 'pi', opencode: 'opencode' }
 type ProviderRole = 'agent' | 'execution'
 export type ProviderIssue = { code: 'bin_missing'; path: string } | { code: 'env_missing'; name: string } | { code: 'launch_failed'; detail: string } | { code: 'config_invalid' }
   | { code: 'app_server_not_found' } | { code: 'app_server_unreachable'; detail: string }
@@ -45,11 +45,11 @@ export type AppServerMode = 'system' | 'spawn'
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
- * runs on it, `execution` while Codex executes tasks; `off` means it runs nothing.
+ * runs on it, `execution` while it executes tasks; `off` means it runs nothing.
  * Variable values never come back, only whether each is set.
  */
 export type ProviderStatus = {
-  provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string | null; app_server: AppServer | null
+  provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string; app_server: AppServer | null
   /** Codex only: the Codex folder and the sessions folder the device uses. */
   home: string | null; sessions: string | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
@@ -57,8 +57,8 @@ export type ProviderStatus = {
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
-  defaults: Pick<ManagerSettings, 'workspace' | 'cursor_sdk_bin'>
-  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: string[] }
+  defaults: Pick<ManagerSettings, 'workspace'>
+  readiness: { manager: 'disabled' | 'authentication_unverified' | 'missing_prerequisites'; missing: ProviderId[] }
   providers: ProviderStatus[]
   /** How Settings shows each path under the home folder (`~/…`); edits still use the full path. */
   display_paths: Record<string, string>
@@ -162,19 +162,20 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   let manager: ManagerSettings | null = null
   if (settings.manager !== null) {
     const m = record(settings.manager)
-    if (m.provider !== 'cursor_sdk' && m.provider !== 'codex_sdk' || typeof m.model !== 'string') throw new Error('Bot 设置格式不对。')
-    manager = { provider: m.provider, workspace: text(m.workspace), model: m.model, cursor_sdk_bin: text(m.cursor_sdk_bin) }
+    if (typeof m.model !== 'string') throw new Error('Bot 设置格式不对。')
+    manager = { provider: oneOf(m.provider, providerIds), workspace: text(m.workspace), model: m.model }
   }
   if (readiness.manager !== 'disabled' && readiness.manager !== 'authentication_unverified' && readiness.manager !== 'missing_prerequisites') throw new Error('程序检查结果格式不对。')
   return {
     settings: { roots: strings(settings.roots), manager },
-    defaults: { workspace: text(defaults.workspace), cursor_sdk_bin: text(defaults.cursor_sdk_bin) },
-    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => text(value)) },
+    defaults: { workspace: text(defaults.workspace) },
+    readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => oneOf(value, providerIds)) },
     providers: array(v.providers).map(parseProvider),
     display_paths: Object.fromEntries(Object.entries(record(v.display_paths)).map(([path, shown]) => [path, text(shown)])),
   }
 }
-const providerIds: ProviderId[] = ['codex', 'cursor'], providerRoles: ProviderRole[] = ['agent', 'execution']
+export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']
+const providerRoles: ProviderRole[] = ['agent', 'execution']
 const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
@@ -213,7 +214,7 @@ function parseProvider(value: unknown): ProviderStatus {
   return {
     provider: oneOf(v.provider, providerIds),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
-    bin: v.bin === null ? null : text(v.bin), app_server: parseAppServer(v.app_server),
+    bin: text(v.bin), app_server: parseAppServer(v.app_server),
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),

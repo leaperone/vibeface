@@ -2186,7 +2186,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
-                cursor_sdk_bin: dir.join("missing-cursor-sdk"),
             }),
         };
         let refused = dispatch(
@@ -2202,7 +2201,8 @@ mod tests {
             "{refused}"
         );
         assert!(Config::load(&dir)?.manager.is_none());
-        let choose_cursor = json!({"provider":"cursor","bot":true});
+        let choose_cursor =
+            json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
         std::os::unix::fs::symlink(&project, &workspace)?;
         assert!(
             dispatch(
@@ -2225,7 +2225,7 @@ mod tests {
         .await?;
         assert!(workspace.is_dir());
         assert_eq!(
-            chosen["settings"]["manager"]["provider"], "cursor_sdk",
+            chosen["settings"]["manager"]["provider"], "cursor",
             "choosing the bot fills in the defaults"
         );
         assert_eq!(chosen["settings"]["manager"]["model"], "auto");
@@ -2259,7 +2259,7 @@ mod tests {
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
         assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
+        assert_eq!(saved["readiness"]["missing"], json!(["cursor"]));
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
@@ -2276,7 +2276,7 @@ mod tests {
             nodes["nodes"][0]["capabilities"]["roots"],
             json!([project.canonicalize()?])
         );
-        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor");
         assert_eq!(nodes["nodes"][0]["capabilities"]["manager_ready"], false);
         let persisted = Config::load(&dir)?;
         assert_eq!(persisted.network.relays, latest.network.relays);
@@ -2312,7 +2312,7 @@ mod tests {
         )
         .await?;
         let mut expected = saved["settings"].clone();
-        expected["manager"]["provider"] = json!("codex_sdk");
+        expected["manager"]["provider"] = json!("codex");
         expected["manager"]["model"] = json!("");
         assert_eq!(
             codex["settings"], expected,
@@ -2425,7 +2425,7 @@ mod tests {
                 "{text}"
             );
         }
-        assert_eq!(read["settings"]["manager"]["provider"], "codex_sdk");
+        assert_eq!(read["settings"]["manager"]["provider"], "codex");
         let codex = &read["providers"][0];
         assert_eq!(codex["provider"], "codex");
         assert_eq!(codex["roles"], json!(["agent", "execution"]));
@@ -2526,7 +2526,7 @@ mod tests {
             json!({"provider":"cursor","execution":true}),
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
-            json!({"provider":"cursor","bin":"/fixture/cursor"}),
+            json!({"provider":"claude","bot":true}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
             assert!(
@@ -2574,7 +2574,7 @@ mod tests {
             json!({"provider":"cursor","bot":true}),
         )
         .await?;
-        assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor");
         assert_eq!(moved["settings"]["manager"]["model"], "auto");
         assert_eq!(moved["providers"][0]["roles"], json!([]));
         assert_eq!(moved["providers"][0]["state"], "off");
@@ -2587,7 +2587,7 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            unchanged["settings"]["manager"]["provider"], "cursor_sdk",
+            unchanged["settings"]["manager"]["provider"], "cursor",
             "stopping the bot elsewhere leaves it running"
         );
         let stopped = dispatch(
@@ -2607,7 +2607,7 @@ mod tests {
         assert!(reopened.manager().is_none());
         assert!(!providers.switches.execution);
         assert_eq!(
-            providers.codex_bin,
+            providers.bin(Provider::Codex),
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(

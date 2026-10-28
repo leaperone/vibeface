@@ -1,6 +1,7 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
 //! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
 //! installation. The coordination Agent judges; nothing here decides what matters.
+use crate::providers::Provider;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,20 +17,12 @@ pub const FIRST_BACKOFF_MS: i64 = 10_000;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
+    /// The provider's hook, extension or plugin; `agent` says which provider.
     #[default]
-    CodexHook,
-    ClaudeHook,
+    Hook,
     AppServer,
     SessionScan,
     Test,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Agent {
-    #[default]
-    Codex,
-    Claude,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -51,7 +44,7 @@ pub struct AgentEvent {
     pub source: Source,
     pub host: String,
     pub node: String,
-    pub agent: Agent,
+    pub agent: Provider,
     pub event: Kind,
     pub status: Option<String>,
     pub session_id: String,
@@ -103,8 +96,8 @@ pub fn question_id(node: &str, event_id: &str) -> String {
 
 impl AgentEvent {
     /// Status is left out, so a hook, the App Server and a scan of the same turn collide.
-    pub fn id_for(node: &str, agent: Agent, session: &str, turn: &str, kind: Kind) -> String {
-        hex32(&[node, agent_name(agent), session, turn, kind_name(kind)])
+    pub fn id_for(node: &str, agent: Provider, session: &str, turn: &str, kind: Kind) -> String {
+        hex32(&[node, agent.name(), session, turn, kind_name(kind)])
     }
 
     pub fn seal(mut self, node: &str, host: &str, now_ms: i64) -> Result<Self> {
@@ -133,12 +126,6 @@ impl AgentEvent {
     }
 }
 
-fn agent_name(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Codex => "codex",
-        Agent::Claude => "claude",
-    }
-}
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::TurnEnd => "turn_end",
@@ -160,8 +147,8 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         _ => return None,
     };
     Some(AgentEvent {
-        source: Source::CodexHook,
-        agent: Agent::Codex,
+        source: Source::Hook,
+        agent: Provider::Codex,
         event,
         status,
         session_id: s(input, "session_id"),
@@ -197,8 +184,8 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
         _ => return None,
     };
     Some(AgentEvent {
-        source: Source::ClaudeHook,
-        agent: Agent::Claude,
+        source: Source::Hook,
+        agent: Provider::Claude,
         event,
         status,
         session_id: s(input, "session_id"),
@@ -269,7 +256,7 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
         };
         events.push(AgentEvent {
             source: Source::SessionScan,
-            agent: Agent::Codex,
+            agent: Provider::Codex,
             event: Kind::TurnEnd,
             status: Some(status.into()),
             session_id: s(&meta, "id"),
@@ -491,7 +478,7 @@ impl OutboxEntry {
 
 /// Hook files `vibeface hooks install` edits under a home directory.
 pub struct HookFile {
-    pub agent: Agent,
+    pub agent: Provider,
     pub path: PathBuf,
     pub events: &'static [&'static str],
 }
@@ -499,7 +486,7 @@ pub struct HookFile {
 pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> [HookFile; 2] {
     [
         HookFile {
-            agent: Agent::Codex,
+            agent: Provider::Codex,
             path: codex_home
                 .map(Path::to_owned)
                 .unwrap_or_else(|| home.join(".codex"))
@@ -507,28 +494,28 @@ pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> [HookFile; 2] {
             events: &["Stop", "PermissionRequest"],
         },
         HookFile {
-            agent: Agent::Claude,
+            agent: Provider::Claude,
             path: home.join(".claude/settings.json"),
             events: &["Stop", "StopFailure", "Notification"],
         },
     ]
 }
 
-pub fn hook_command(program: &Path, agent: Agent, data_dir: &Path) -> String {
+pub fn hook_command(program: &Path, agent: Provider, data_dir: &Path) -> String {
     let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
     format!(
         "{} hook {} --data-dir {}",
         quote(&program.to_string_lossy()),
-        agent_name(agent),
+        agent.name(),
         quote(&data_dir.to_string_lossy())
     )
 }
 
-fn ours(entry: &Value, agent: Agent) -> bool {
+fn ours(entry: &Value, agent: Provider) -> bool {
     entry["hooks"].as_array().is_some_and(|hooks| {
         hooks.iter().any(|hook| {
             hook["command"].as_str().is_some_and(|command| {
-                command.contains(&format!(" hook {} ", agent_name(agent)))
+                command.contains(&format!(" hook {} ", agent.name()))
                     && command.contains("vibeface")
             })
         })
@@ -764,7 +751,7 @@ mod tests {
         let home = Path::new("/home/u");
         let [codex, claude] = hook_files(home, None);
         assert_eq!(codex.path, home.join(".codex/hooks.json"));
-        let command = hook_command(Path::new("/opt/vibeface"), Agent::Claude, Path::new("/d'x"));
+        let command = hook_command(Path::new("/opt/vibeface"), Provider::Claude, Path::new("/d'x"));
         assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
         let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
         let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
