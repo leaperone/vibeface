@@ -75,12 +75,15 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let mut last = store.last_messages(&access.network_id)?;
+        let mut busy = store.busy_conversations()?;
         let bots: Vec<_> = bots
             .into_iter()
             .map(|bot| {
                 let last_message = last.remove(bot.conversation_id.as_str());
+                let busy = busy.remove(bot.conversation_id.as_str());
                 let mut value = json!(bot);
                 value["last_message"] = json!(last_message);
+                value["busy"] = json!(busy);
                 value
             })
             .collect();

@@ -187,7 +187,7 @@ test("workspace preserves bot and message requests while routing native decision
     notifier: { name: "浏览器提醒", permission: async () => "default", request: async () => "default", show() {} },
     onForeground: () => () => {}, foreground: () => true,
   }
-  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, event_hash: "bot-event", last_message: null }
+  const bot = { bot_id: "bot", conversation_id: "chat", name: "Bot", instructions: "处理项目", models: {}, skills: null, event_hash: "bot-event", last_message: null, busy: null }
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
