@@ -236,7 +236,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={48} />
+          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={96} />
           <div className="grid justify-items-center gap-1">
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
