@@ -31,8 +31,10 @@ const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// The session of an App Server request that belongs to no thread.
 const NO_THREAD: &str = "app-server";
-/// How long a held request waits for the coordination Agent before the fallback answer.
+/// How long a held App Server request waits for the coordination Agent before the fallback answer.
 pub const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
+/// How long a hook's held request waits; its session sits blocked in front of the user meanwhile.
+pub const HOOK_ANSWER_WITHIN: Duration = Duration::from_secs(30);
 const WEBHOOK_KEY: &str = "triage-webhook.key";
 const DECISION_TOKENS: &str = "decision-tokens.json";
 pub const SPOOL_DIR: &str = "hook-spool";
@@ -377,7 +379,7 @@ impl Runtime {
             session_id: event.session_id.clone(),
             kind,
             received_ms: now,
-            answer_by_ms: Some(now + AGENT_ANSWER_WITHIN.as_millis() as i64),
+            answer_by_ms: Some(now + HOOK_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
             reply: Reply::Hook {
                 answer: tokio::sync::watch::channel(None).0,
@@ -935,7 +937,12 @@ impl Runtime {
         }
         let turn = self
             .coordination_turn(|cli| {
-                triage::wake_prompt(&offered, cli, AGENT_ANSWER_WITHIN.as_secs())
+                triage::wake_prompt(
+                    &offered,
+                    cli,
+                    AGENT_ANSWER_WITHIN.as_secs(),
+                    HOOK_ANSWER_WITHIN.as_secs(),
+                )
             })
             .await;
         self.settle_offered(&fresh).await?;
@@ -2541,6 +2548,12 @@ mod tests {
                 (listed["provider"].clone(), listed["kind"].clone()),
                 (json!("claude"), json!("permission"))
             );
+            assert_eq!(
+                listed["answer_by_ms"].as_i64().context("a deadline")?
+                    - listed["received_ms"].as_i64().context("received")?,
+                HOOK_ANSWER_WITHIN.as_millis() as i64,
+                "a hook's request is held only as long as its session can wait"
+            );
             let waiting = tokio::spawn({
                 let node = node.clone();
                 let request_id = request_id.clone();
@@ -3108,7 +3121,7 @@ mod tests {
                 conversation_id: Some("c".into()),
                 manager: None,
             };
-            node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger)
+            node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
             let live = Access {
                 manager: Some(crate::runtime::ManagerAccess {
@@ -3535,8 +3548,14 @@ mod tests {
                 conversation_id: Some("c".into()),
                 manager: None,
             };
-            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
-                .await?;
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                crate::providers::Provider::Codex,
+            )
+            .await?;
             let access = Access {
                 manager: Some(crate::runtime::ManagerAccess {
                     attempt_id: attempt.clone(),
@@ -3579,7 +3598,7 @@ mod tests {
                 conversation_id: Some("c".into()),
                 manager: None,
             };
-            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
+            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
             let access = Access {
                 manager: Some(crate::runtime::ManagerAccess {

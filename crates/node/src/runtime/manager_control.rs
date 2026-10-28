@@ -21,6 +21,8 @@ const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) struct ActiveManager {
     access: Access,
+    /// The provider the reply runs on, whatever the device switched to since.
+    provider: crate::providers::Provider,
     token: String,
     cancel: watch::Sender<bool>,
     fenced: AtomicBool,
@@ -34,6 +36,7 @@ impl Runtime {
         mut access: Access,
         attempt_id: &str,
         trigger: &str,
+        provider: crate::providers::Provider,
     ) -> Result<watch::Receiver<bool>> {
         let mut controls = self.manager_controls.lock().await;
         if let Some(active) = controls.get(attempt_id) {
@@ -58,6 +61,7 @@ impl Runtime {
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
             access: access.clone(),
+            provider,
             token: token.clone(),
             cancel,
             fenced: AtomicBool::new(false),
@@ -66,6 +70,15 @@ impl Runtime {
         self.agent_tokens.lock().await.insert(token, access);
         controls.insert(attempt_id.into(), active);
         Ok(receiver)
+    }
+
+    /// The provider a reply of this process runs on.
+    pub(super) async fn attempt_provider(
+        &self,
+        attempt_id: &str,
+    ) -> Option<crate::providers::Provider> {
+        let controls = self.manager_controls.lock().await;
+        controls.get(attempt_id).map(|active| active.provider)
     }
 
     pub async fn fence_manager_attempt(&self, attempt_id: &str) -> Result<()> {

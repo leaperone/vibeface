@@ -340,7 +340,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             )?;
         }
         let cancel = node
-            .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger)
+            .register_manager_attempt(token.clone(), access.clone(), &attempt.id, &trigger, provider)
             .await?;
         registered = true;
         let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =

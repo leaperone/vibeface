@@ -1768,7 +1768,7 @@ async fn hook(options: Hook) -> Result<()> {
                     &local_node_url(&options.local)?,
                     "api/hooks/wait",
                     &json!({"request_id":request_id}),
-                    vibeface::runtime::AGENT_ANSWER_WITHIN + Duration::from_secs(10),
+                    vibeface::runtime::HOOK_ANSWER_WITHIN + Duration::from_secs(10),
                 )
                 .await?;
                 let output = match options.agent {
@@ -1827,6 +1827,8 @@ async fn hooks(options: Hooks) -> Result<()> {
         Err(_) => options.local.data.data_dir.clone(),
     };
     let stamp = vibeface::runtime::now_ms();
+    // Every file is read and checked before any is written: one that cannot change leaves all.
+    let mut planned = Vec::new();
     for file in triage::hook_files(home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
@@ -1854,32 +1856,54 @@ async fn hooks(options: Hooks) -> Result<()> {
                 continue;
             }
         };
+        planned.push((file.path, settings, changed, command));
+    }
+    let extensions = extensions(&options, home, &program, &data_dir)?;
+    for (path, settings, changed, command) in planned {
         if changed.is_empty() {
-            println!("{}: unchanged", file.path.display());
+            println!("{}: unchanged", path.display());
             continue;
         }
         if options.dry_run {
             println!(
                 "{}: would change {} with `{command}`",
-                file.path.display(),
+                path.display(),
                 changed.join(", ")
             );
             continue;
         }
-        if file.path.exists() {
-            let backup = file.path.with_file_name(format!(
+        if path.exists() {
+            let backup = path.with_file_name(format!(
                 "{}.bak-vibeface-{stamp}",
-                file.path.file_name().unwrap_or_default().to_string_lossy()
+                path.file_name().unwrap_or_default().to_string_lossy()
             ));
-            fs::copy(&file.path, &backup)?;
-            println!("{}: backed up to {}", file.path.display(), backup.display());
-        } else if let Some(parent) = file.path.parent() {
+            fs::copy(&path, &backup)?;
+            println!("{}: backed up to {}", path.display(), backup.display());
+        } else if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&file.path, serde_json::to_vec_pretty(&settings)?)?;
-        println!("{}: changed {}", file.path.display(), changed.join(", "));
+        fs::write(&path, serde_json::to_vec_pretty(&settings)?)?;
+        println!("{}: changed {}", path.display(), changed.join(", "));
     }
-    extensions(&options, home, &program, &data_dir)?;
+    for (path, step) in extensions {
+        let shown = path.display();
+        match step {
+            Step::Unchanged => println!("{shown}: unchanged"),
+            Step::Write(_) if options.dry_run => println!("{shown}: would write"),
+            Step::Write(code) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, code)?;
+                println!("{shown}: written; sessions already open load it after a restart");
+            }
+            Step::Remove if options.dry_run => println!("{shown}: would remove"),
+            Step::Remove => {
+                fs::remove_file(&path)?;
+                println!("{shown}: removed");
+            }
+        }
+    }
     if let HooksAction::Install = options.action {
         let config = home.join(".codex/config.toml");
         let enabled = fs::read_to_string(&config)
@@ -1905,10 +1929,23 @@ async fn hooks(options: Hooks) -> Result<()> {
     Ok(())
 }
 
-/// The extension files of `vibeface hooks`: written whole, and removed only when the Node wrote
-/// them.
-fn extensions(options: &Hooks, home: &Path, program: &Path, data_dir: &Path) -> Result<()> {
+/// What `vibeface hooks` does to one extension file.
+enum Step {
+    Unchanged,
+    Write(String),
+    Remove,
+}
+
+/// The extension files of `vibeface hooks` and what to do to each: written whole, and removed
+/// only when the Node wrote them. Status is printed here; nothing is written.
+fn extensions(
+    options: &Hooks,
+    home: &Path,
+    program: &Path,
+    data_dir: &Path,
+) -> Result<Vec<(PathBuf, Step)>> {
     use vibeface::providers::Watch;
+    let mut steps = Vec::new();
     for agent in Provider::ALL {
         let Some(Watch::Extension { file, source }) = agent.watch() else {
             continue;
@@ -1923,37 +1960,29 @@ fn extensions(options: &Hooks, home: &Path, program: &Path, data_dir: &Path) -> 
             .as_deref()
             .is_some_and(|text| text.lines().next() == source.lines().next());
         let code = vibeface::triage::extension_code(source, program, agent, data_dir);
-        let shown = path.display();
-        match options.action {
+        let step = match options.action {
             HooksAction::Status | HooksAction::Test => {
                 println!(
-                    "{shown}: {}",
+                    "{}: {}",
+                    path.display(),
                     if ours { "installed" } else { "not installed" }
                 );
+                continue;
             }
-            HooksAction::Install if current.as_deref() == Some(code.as_str()) => {
-                println!("{shown}: unchanged");
-            }
+            HooksAction::Install if current.as_deref() == Some(code.as_str()) => Step::Unchanged,
             HooksAction::Install if current.is_some() && !ours => {
-                bail!("{shown} was not written by vibeface; left unchanged")
+                bail!(
+                    "{} was not written by vibeface; nothing was changed",
+                    path.display()
+                )
             }
-            HooksAction::Install if options.dry_run => println!("{shown}: would write"),
-            HooksAction::Install => {
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&path, code)?;
-                println!("{shown}: written; sessions already open load it after a restart");
-            }
-            HooksAction::Uninstall if !ours => println!("{shown}: unchanged"),
-            HooksAction::Uninstall if options.dry_run => println!("{shown}: would remove"),
-            HooksAction::Uninstall => {
-                fs::remove_file(&path)?;
-                println!("{shown}: removed");
-            }
-        }
+            HooksAction::Install => Step::Write(code),
+            HooksAction::Uninstall if !ours => Step::Unchanged,
+            HooksAction::Uninstall => Step::Remove,
+        };
+        steps.push((path, step));
     }
-    Ok(())
+    Ok(steps)
 }
 
 async fn triage(options: Triage) -> Result<()> {
@@ -2512,7 +2541,15 @@ mod tests {
         run("uninstall").await.unwrap();
         assert!(!path.exists());
         fs::write(&path, "// the user's own\n").unwrap();
+        let claude = home.join(".claude/settings.json");
+        let before = fs::read(&claude).ok();
         assert!(run("install").await.is_err());
+        assert_eq!(
+            fs::read(&claude).ok(),
+            before,
+            "a refused install writes nothing"
+        );
+        assert!(!home.join(".config/opencode/plugins/vibeface.ts").exists());
         run("uninstall").await.unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "// the user's own\n");
         fs::remove_dir_all(dir).unwrap();

@@ -37,8 +37,11 @@ where
     let existing = args["thread"].as_str().map(str::to_owned);
     // A Codex send reads its thread before registering, so a missing thread leaves nothing
     // behind. The Node checks the session another provider would take the work in.
-    if let Some(thread) = &existing
-        && ready(args["agent"].clone()).await.as_deref() == Some("codex")
+    let readied = match &existing {
+        Some(_) => Some(ready(args["agent"].clone()).await),
+        None => None,
+    };
+    if let (Some(thread), Some(Some("codex"))) = (&existing, readied.as_ref().map(Option::as_deref))
     {
         let mut session = DirectSession::connect(socket)
             .await
@@ -72,7 +75,9 @@ where
         .to_owned();
     let report = |report| bind(work_id.clone(), report);
     let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
-    ready(args["agent"].clone()).await;
+    if readied.is_none() {
+        ready(args["agent"].clone()).await;
+    }
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
         Err(error) => return fail(error.failure()).await,

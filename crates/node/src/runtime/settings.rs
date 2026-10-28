@@ -322,10 +322,7 @@ impl Runtime {
             "missing_prerequisites"
         };
         let mut providers = Vec::new();
-        for provider in Provider::ALL
-            .into_iter()
-            .filter(|p| !p.supports().is_empty())
-        {
+        for provider in Provider::ALL {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
         let mut response = json!({"settings":settings,"defaults":defaults,

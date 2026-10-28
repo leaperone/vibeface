@@ -38,6 +38,17 @@ pub struct Pi {
     /// Per session: its pointer (`<session>.json`) and the bot's instructions (`<session>.md`).
     dir: PathBuf,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// Sessions a work resumes, from its start until its pi has ended.
+    resuming: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// A session claimed for a work that resumes it; released when that work's pi is done.
+struct Claim(Arc<Pi>, String);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        lock(&self.0.resuming).remove(&self.1);
+    }
 }
 
 /// A turn running in this process, by its session.
@@ -561,6 +572,7 @@ impl Pi {
         Self {
             dir: data_dir.join("pi"),
             live: Default::default(),
+            resuming: Default::default(),
         }
     }
 
@@ -575,6 +587,22 @@ impl Pi {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Keeps where pi writes `session` and the session's last entry so far.
+    fn keep(&self, session: &str, file: &Path, group: u32) -> Result<Option<String>> {
+        let after = entries(file)?
+            .last()
+            .and_then(|entry| entry["id"].as_str())
+            .map(str::to_owned);
+        let pointer = Pointer {
+            file: file.to_owned(),
+            group,
+            after: after.clone(),
+        };
+        config::private_dir(&self.dir)?;
+        config::private_write(&self.pointer_path(session)?, &serde_json::to_vec(&pointer)?)?;
+        Ok(after)
     }
 
     fn live_turn(&self, session: &str, turn: &str) -> Option<Live> {
@@ -605,24 +633,8 @@ impl Pi {
                 return Err(own(format!("pi opened session {}", state["sessionId"])));
             }
             let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
-            let kept = entries(&file).and_then(|entries| {
-                let after = entries
-                    .last()
-                    .and_then(|entry| entry["id"].as_str())
-                    .map(str::to_owned);
-                let pointer = Pointer {
-                    file: file.clone(),
-                    group: process.group,
-                    after: after.clone(),
-                };
-                config::private_dir(&self.dir)?;
-                config::private_write(
-                    &self.pointer_path(session)?,
-                    &serde_json::to_vec(&pointer)?,
-                )?;
-                Ok(after)
-            });
-            kept.map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
+            self.keep(session, &file, process.group)
+                .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         }
         .await;
         match opened {
@@ -968,6 +980,18 @@ impl Pi {
     }
 }
 
+/// Which session a work's pi opens.
+enum Origin {
+    New,
+    /// A new session forked from this file's.
+    Fork(PathBuf),
+    /// The session in this file goes on.
+    Resume {
+        session: String,
+        file: PathBuf,
+    },
+}
+
 /// A dispatched image as pi takes it.
 async fn image(path: &str) -> Result<Value> {
     let mime = match Path::new(path)
@@ -1013,7 +1037,8 @@ impl Runtime {
 }
 
 /// A pi work runs in a new session the Node starts and journals before anything is sent; a
-/// work that continues another one runs in a fork of that one's session.
+/// work that continues another one runs in a fork of that one's session, and one given a
+/// thread goes on in that session, which one of this device's works ran in.
 impl Executor for Pi {
     fn start<'a>(
         &'a self,
@@ -1024,20 +1049,50 @@ impl Executor for Pi {
         args: &'a Value,
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
+            let claim = match work.thread.as_deref() {
+                Some(session) if lock(&self.resuming).insert(session.to_owned()) => {
+                    Some(Claim(node.pi.clone(), session.to_owned()))
+                }
+                Some(_) => {
+                    let failure = ExecFailure::new(
+                        FailureKind::WriterBusy,
+                        "pi still runs another work in this session",
+                    );
+                    node.signal_work(network, &work.work_id, Signal::StartRejected(failure))
+                        .await?;
+                    bail!("pi still runs another work in this session");
+                }
+                None => None,
+            };
             let prepared = async {
-                // Another pi may be writing a session the Node did not start.
-                ensure!(
-                    work.thread.is_none(),
-                    "pi takes work only in sessions this device starts; dispatch it without thread"
-                );
-                let fork = match thread {
-                    Some(original) => Some(
-                        self.pointer(original)?
-                            .map(|pointer| pointer.file)
-                            .filter(|file| file.is_file())
-                            .context("the pi session of the work this one continues is gone")?,
+                let file = |session: &str, gone: &'static str| -> Result<(PathBuf, u32)> {
+                    self.pointer(session)?
+                        .filter(|pointer| pointer.file.is_file())
+                        .map(|pointer| (pointer.file, pointer.group))
+                        .context(gone)
+                };
+                let origin = match (work.thread.as_deref(), thread) {
+                    (Some(session), _) => {
+                        let (file, group) = file(session, "the pi session of this thread is gone")?;
+                        ensure!(
+                            !group_alive(group),
+                            "a pi started earlier still runs in this session"
+                        );
+                        // A restart before pi takes the prompt reads the session from here on.
+                        self.keep(session, &file, group)?;
+                        Origin::Resume {
+                            session: session.to_owned(),
+                            file,
+                        }
+                    }
+                    (None, Some(original)) => Origin::Fork(
+                        file(
+                            original,
+                            "the pi session of the work this one continues is gone",
+                        )?
+                        .0,
                     ),
-                    None => None,
+                    (None, None) => Origin::New,
                 };
                 let mut prompt = json!({"type":"prompt","message":work.prompt});
                 if let Some(paths) = args["images"].as_array() {
@@ -1047,9 +1102,9 @@ impl Executor for Pi {
                     }
                     prompt["images"] = json!(images);
                 }
-                Ok((fork, prompt))
+                Ok((origin, prompt))
             };
-            let (fork, prompt) = match prepared.await {
+            let (origin, prompt) = match prepared.await {
                 Ok(prepared) => prepared,
                 Err(e) => {
                     let failure = ExecFailure::new(FailureKind::Rejected, format!("{e:#}"));
@@ -1058,15 +1113,23 @@ impl Executor for Pi {
                     return Err(e);
                 }
             };
-            let session = uuid::Uuid::new_v4().to_string();
-            node.signal_work(
-                network,
-                &work.work_id,
-                Signal::ThreadCreated(session.clone()),
-            )
-            .await?;
-            let mut launch_args = vec!["--session-id".to_owned(), session.clone()];
-            if let Some(file) = fork {
+            let (session, mut launch_args) = match &origin {
+                Origin::Resume { session, file } => (
+                    session.clone(),
+                    vec!["--session".to_owned(), file.display().to_string()],
+                ),
+                Origin::New | Origin::Fork(_) => {
+                    let session = uuid::Uuid::new_v4().to_string();
+                    node.signal_work(
+                        network,
+                        &work.work_id,
+                        Signal::ThreadCreated(session.clone()),
+                    )
+                    .await?;
+                    (session.clone(), vec!["--session-id".to_owned(), session])
+                }
+            };
+            if let Origin::Fork(file) = &origin {
                 launch_args.extend(["--fork".into(), file.display().to_string()]);
             }
             if let Some(model) = args["model"].as_str().filter(|model| !model.is_empty()) {
@@ -1083,7 +1146,11 @@ impl Executor for Pi {
                 args: launch_args,
             };
             let (sender, mut reports) = mpsc::unbounded_channel();
-            tokio::spawn(node.pi.clone().run_work(launch, session, prompt, sender));
+            let run = node.pi.clone().run_work(launch, session, prompt, sender);
+            tokio::spawn(async move {
+                run.await;
+                drop(claim);
+            });
             let (node, network, conversation, work_id) = (
                 node.clone(),
                 network.to_owned(),
@@ -1579,6 +1646,54 @@ mod tests {
         );
         assert_eq!(record.text, "Hello");
         assert_eq!(prompts(&dir), ["do it"]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_work_given_a_thread_goes_on_in_that_session() -> Result<()> {
+        let dir = scratch("resume");
+        let (node, network) = node(&dir, "reply").await?;
+        dispatch(&node, &network, &dir).await?;
+        work(&node, WorkState::finished).await?;
+        let session = (node.store.lock().await.works(&network, "c")?)
+            .into_iter()
+            .find_map(|work| work.thread_id)
+            .context("a session")?;
+        let file = node.pi.pointer(&session)?.context("pointer")?.file;
+        let spec = WorkSpec {
+            prompt: "again".into(),
+            thread: Some(session.clone()),
+            ..spec("w-2", &node.identity.device_id()?, &dir)
+        };
+        node.store
+            .lock()
+            .await
+            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.pi
+            .start(&node, &network, &spec, Some(&session), &Value::Null)
+            .await?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let record = loop {
+            let record = node.store.lock().await.work_record("w-2")?.context("w-2")?;
+            if record.state.finished() || Instant::now() > deadline {
+                break record;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            record.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Completed
+            }
+        );
+        assert_eq!(prompts(&dir), ["do it", "again"]);
+        assert_eq!(node.pi.pointer(&session)?.context("pointer")?.file, file);
+        let users = entries(&file)?
+            .iter()
+            .filter(|entry| is_message(entry, "user"))
+            .count();
+        assert_eq!(users, 2, "both prompts are in the one session");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

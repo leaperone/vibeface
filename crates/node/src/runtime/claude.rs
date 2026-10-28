@@ -10,6 +10,7 @@ use crate::scheduling::SteerTarget;
 use crate::triage::RequestKind;
 use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
 use futures_util::future::BoxFuture;
+use std::collections::HashSet;
 use std::io::BufRead as _;
 use std::sync::{
     PoisonError, Weak,
@@ -790,9 +791,20 @@ where
 pub(crate) struct Claude {
     processes: Arc<Processes>,
     live: std::sync::Mutex<HashMap<String, Live>>,
+    /// Sessions a work is starting in, until its process is live or the start failed.
+    starting: std::sync::Mutex<HashSet<String>>,
     /// Where the last started work's Claude Code keeps transcripts; a work started before this
     /// Node did is read back from there too.
     projects: std::sync::Mutex<Option<PathBuf>>,
+}
+
+/// Releases a session claimed for a starting work; by then its process is live or never ran.
+struct Claim<'a>(&'a Claude, String);
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.starting().remove(&self.1);
+    }
 }
 
 /// A work whose process runs now.
@@ -811,6 +823,7 @@ impl Claude {
         Self {
             processes: Arc::new(Processes::new(pidfile)),
             live: Default::default(),
+            starting: Default::default(),
             projects: std::sync::Mutex::new(projects_dir(env)),
         }
     }
@@ -830,6 +843,10 @@ impl Claude {
 
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn starting(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.starting.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn projects(&self) -> Option<PathBuf> {
@@ -986,13 +1003,19 @@ impl Executor for Claude {
             let session = thread.map_or_else(|| derived(SESSION_SEED, work_id), str::to_owned);
             let message = derived(MESSAGE_SEED, work_id);
             // Two processes would interleave their turns in one transcript.
-            if self.live().values().any(|live| live.session == session) {
+            let claimed = {
+                let live = self.live();
+                !live.values().any(|live| live.session == session)
+                    && self.starting().insert(session.clone())
+            };
+            if !claimed {
                 return reject(ExecFailure::new(
                     FailureKind::WriterBusy,
                     "Claude Code still runs another work in this session",
                 ))
                 .await;
             }
+            let _claim = Claim(self, session.clone());
             // A session is resumed where it ran; Claude Code files it under that directory.
             let cwd = thread
                 .and_then(|session| transcript(projects.as_deref(), session))
@@ -1744,6 +1767,57 @@ mod tests {
                 outcome: WorkOutcome::Interrupted
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_works_started_at_once_in_one_session_run_one() -> Result<()> {
+        let place = Place::new()?;
+        let (node, _, network) = node(&place).await?;
+        let first = spec(&node, &place, "r1", "build it")?;
+        dispatch(&node, &network, &first).await?;
+        until(&node, &first.work_id, WorkState::finished).await?;
+        let session = derived(SESSION_SEED, &first.work_id);
+        let mut specs = Vec::new();
+        for call_ref in ["r2", "r3"] {
+            let spec = WorkSpec {
+                thread: Some(session.clone()),
+                ..spec(&node, &place, call_ref, "hang around")?
+            };
+            node.store.lock().await.accept_work(
+                &node.identity,
+                &network,
+                spec.clone(),
+                now_ms(),
+            )?;
+            specs.push(spec);
+        }
+        let (claude, args) = (node.executor(Provider::Claude)?, json!({}));
+        let (a, b) = tokio::join!(
+            claude.start(&node, &network, &specs[0], Some(&session), &args),
+            claude.start(&node, &network, &specs[1], Some(&session), &args),
+        );
+        a?;
+        b?;
+        let mut rejected = 0;
+        for spec in &specs {
+            let state = until(&node, &spec.work_id, |state| {
+                matches!(
+                    state,
+                    WorkState::Running { .. } | WorkState::Finished { .. }
+                )
+            })
+            .await?
+            .state;
+            if state
+                == (WorkState::Finished {
+                    outcome: WorkOutcome::Rejected,
+                })
+            {
+                rejected += 1;
+            }
+        }
+        assert_eq!(rejected, 1, "one session runs one work at a time");
         Ok(())
     }
 

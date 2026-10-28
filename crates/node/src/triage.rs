@@ -60,7 +60,8 @@ pub struct AgentEvent {
     pub event: Kind,
     pub status: Option<String>,
     pub session_id: String,
-    /// The turn's ID, or `tx:<transcript bytes>` for Claude Code, which has none.
+    /// The turn's ID. Claude Code has none: `tx:<transcript bytes>`, and for a permission request
+    /// also a hash of the tool and its input.
     pub turn_id: String,
     pub cwd: String,
     pub repo: Option<String>,
@@ -203,13 +204,21 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
         ),
         _ => return None,
     };
+    // Permission requests a turn asks at once share the transcript's length.
+    let turn_id = match event {
+        Kind::NeedsInput => format!(
+            "tx:{transcript_bytes}:{}",
+            hex32(&[&s(input, "tool_name"), &input["tool_input"].to_string()])
+        ),
+        _ => format!("tx:{transcript_bytes}"),
+    };
     Some(AgentEvent {
         source: Source::Hook,
         agent: Provider::Claude,
         event,
         status,
         session_id: s(input, "session_id"),
-        turn_id: format!("tx:{transcript_bytes}"),
+        turn_id,
         cwd: s(input, "cwd"),
         last_message: s(input, "last_assistant_message"),
         detail,
@@ -390,6 +399,7 @@ pub fn wake_prompt(
     events: &[(AgentEvent, Value)],
     cli: &str,
     answer_within_secs: u64,
+    hook_answer_within_secs: u64,
 ) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
@@ -415,9 +425,10 @@ The answer comes back to that bot as a new turn, and it acts on it.\n\
 request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \
 Answer it yourself with `{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full \
 access). Only when the user must decide, add `--request-id REQUEST_ID` to the raise: an App Server \
-request then waits for the answer, and the bot has {answer_within_secs} seconds after it to respond; any other request still ends {answer_within_secs} seconds \
-after it came. A request neither answered nor raised is declined after {answer_within_secs} seconds or \
-when this turn ends; one that is not the App Server's goes back to its session undecided.\n\
+request then waits for the answer, and the bot has {answer_within_secs} seconds after it to respond; any other request still ends {hook_answer_within_secs} seconds \
+after it came. A request neither answered nor raised is declined after {answer_within_secs} seconds \
+({hook_answer_within_secs} for one that is not the App Server's) or when this turn ends; one that is not the App Server's \
+goes back to its session undecided.\n\
 - A request of kind `continue` holds a session whose turn ended: `{{\"text\":\"TEXT\"}}` as its RESULT_JSON \
 sends TEXT to the session as its user's next message. Send one only to carry out what the user asked for.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
@@ -670,7 +681,7 @@ pub fn add_hooks(settings: &mut Value, file: &HookFile, command: &str) -> Result
         // A Claude Code permission request waits for the bot's answer.
         let timeout = match (file.agent, *event) {
             (Provider::Claude, "PermissionRequest") => {
-                crate::runtime::AGENT_ANSWER_WITHIN.as_secs() + 30
+                crate::runtime::HOOK_ANSWER_WITHIN.as_secs() + 15
             }
             _ => 10,
         };
@@ -780,6 +791,21 @@ mod tests {
             (claude.turn_id.as_str(), claude.event),
             ("tx:10", Kind::Notification)
         );
+        let asks = |command: &str| {
+            from_claude_hook(
+                &json!({"hook_event_name":"PermissionRequest","session_id":"c",
+                    "tool_name":"Bash","tool_input":{"command":command}}),
+                10,
+            )
+            .unwrap()
+            .turn_id
+        };
+        assert_ne!(
+            asks("ls"),
+            asks("pwd"),
+            "concurrent requests are told apart"
+        );
+        assert_eq!(asks("ls"), asks("ls"));
         assert!(AgentEvent::default().seal(&node, "h", 1).is_err());
     }
 
@@ -903,7 +929,7 @@ mod tests {
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
         assert_eq!(
-            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 150,
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 45,
             "a permission request outlasts the wait for the bot's answer"
         );
         assert_eq!(installed(&settings, claude).len(), 4);

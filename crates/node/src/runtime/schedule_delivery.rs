@@ -223,6 +223,11 @@ impl Runtime {
             .steer_candidates(network, &local, boot, provider)?;
         for candidate in candidates {
             let (scope, trigger) = (&candidate.conversation_id, &candidate.trigger);
+            // A reply that started before the device switched provider runs on the old one; the
+            // message waits for a reply of its own.
+            if self.attempt_provider(&candidate.into.attempt_id).await != Some(provider) {
+                continue;
+            }
             if !self.store.lock().await.begin_steer(
                 network,
                 &local,

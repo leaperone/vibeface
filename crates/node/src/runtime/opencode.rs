@@ -49,6 +49,17 @@ pub struct Opencode {
     /// Steered messages a completed turn answered.
     /// ponytail: in memory and cleared past 1024; one forgotten reads back as unfinished.
     answered: std::sync::Mutex<BTreeSet<String>>,
+    /// Uses of the serve in progress; while any lasts, a changed launch waits.
+    users: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One use of the serve, from taking its connection until the turn or call is over.
+struct Use(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Use {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -177,11 +188,12 @@ impl Opencode {
                 .build()?,
             live: Default::default(),
             answered: Default::default(),
+            users: Default::default(),
         })
     }
 
     /// The program and variables of the next serve; one running with others is replaced when
-    /// next used.
+    /// next used while nothing else uses it.
     pub(crate) fn set_launch(&self, bin: PathBuf, env: BTreeMap<String, String>) {
         *self.launch.lock().expect("launch") = Launch { bin, env };
     }
@@ -193,24 +205,28 @@ impl Opencode {
         }
     }
 
-    /// The running serve, started first when there is none, it died or its launch changed.
-    async fn conn(&self) -> Result<Conn> {
+    /// The running serve and a use of it. A serve is started first when there is none or it
+    /// died, and also when its launch changed and nothing else uses it: runs on it go on.
+    async fn conn(&self) -> Result<(Conn, Use)> {
+        use std::sync::atomic::Ordering::SeqCst;
         let launch = self.launch.lock().expect("launch").clone();
         let mut serve = self.serve.lock().await;
         if let Some(running) = serve.as_mut()
-            && running.launch == launch
+            && (running.launch == launch || self.users.load(SeqCst) > 0)
             && running
                 .child
                 .try_wait()
                 .is_ok_and(|status| status.is_none())
         {
-            return Ok(running.conn.clone());
+            self.users.fetch_add(1, SeqCst);
+            return Ok((running.conn.clone(), Use(self.users.clone())));
         }
         if let Some(old) = serve.take() {
             old.stop().await;
         }
         let started = self.spawn(launch).await?;
-        Ok(serve.insert(started).conn.clone())
+        self.users.fetch_add(1, SeqCst);
+        Ok((serve.insert(started).conn.clone(), Use(self.users.clone())))
     }
 
     /// The serve running now, never started here.
@@ -641,7 +657,8 @@ impl Opencode {
             return Err(stopped(previous));
         }
         let model = parse_model(&config.model).map_err(|failure| failed(previous, failure))?;
-        let conn = (self.conn().await).map_err(|e| failed(previous, launch_failure(&e)))?;
+        let (conn, _serving) =
+            (self.conn().await).map_err(|e| failed(previous, launch_failure(&e)))?;
         let resumed = match previous {
             Some(id) => self.session(&conn, id).await.map_err(|e| {
                 failed(
@@ -1230,7 +1247,7 @@ impl Executor for Opencode {
                 Ok(model) => model,
                 Err(failure) => return reject(failure).await,
             };
-            let conn = match self.conn().await {
+            let (conn, serving) = match self.conn().await {
                 Ok(conn) => conn,
                 Err(error) => return reject(launch_failure(&error)).await,
             };
@@ -1297,7 +1314,10 @@ impl Executor for Opencode {
                 }
             }
             let follower = follow(Arc::downgrade(node), network.to_owned(), id.to_owned());
-            tokio::spawn(follower);
+            tokio::spawn(async move {
+                follower.await;
+                drop(serving);
+            });
             Ok(false)
         })
     }
@@ -1306,7 +1326,7 @@ impl Executor for Opencode {
         Box::pin(async move {
             let session = work.state.thread().context("the work has no session")?;
             let id = work_message(&work.work_id);
-            let conn = self.conn().await?;
+            let (conn, _serving) = self.conn().await?;
             let Some(found) = self.session(&conn, session).await? else {
                 return Ok(Probe::Missing);
             };
@@ -1368,7 +1388,7 @@ impl Executor for Opencode {
     fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let session = work.state.thread().context("the work has no session")?;
-            let conn = self.conn().await?;
+            let (conn, _serving) = self.conn().await?;
             let found = (self.session(&conn, session).await?)
                 .context("opencode no longer has the session")?;
             let directory = found["directory"].as_str().unwrap_or_default();
@@ -1433,7 +1453,7 @@ impl Executor for Opencode {
             if self.answered.lock().expect("answered").contains(&id) {
                 return Some(SteerTrace::Ended(SteerOutcome::Answered));
             }
-            let conn = self.conn().await.ok()?;
+            let (conn, _serving) = self.conn().await.ok()?;
             if self.session(&conn, &into.thread_id).await.ok()?.is_none() {
                 return Some(SteerTrace::TargetUnseen);
             }
@@ -2186,12 +2206,37 @@ mod tests {
             work
         };
         assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
-        let conn = server.conn().await?;
+        let (conn, _serving) = server.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
         let created = server.create(&conn, &cwd).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         assert_eq!(server.probe(&on(&session)).await?, Probe::NotStarted);
         assert!(place.prompts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_changed_launch_waits_until_nothing_runs_on_the_serve() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (running, serving) = server.conn().await?;
+        let Launch { bin, mut env } = server.launch.lock().expect("launch").clone();
+        env.insert("VIBEFACE_FAKE_LAUNCH".into(), "2".into());
+        server.set_launch(bin, env);
+        let (during, _) = server.conn().await?;
+        assert_eq!(
+            (during.base, during.started_ms),
+            (running.base.clone(), running.started_ms),
+            "a run in progress keeps its serve"
+        );
+        drop(serving);
+        let (after, _) = server.conn().await?;
+        assert_ne!(
+            (after.base, after.started_ms),
+            (running.base, running.started_ms),
+            "an idle serve takes the new launch"
+        );
+        server.stop().await;
         Ok(())
     }
 
