@@ -68,13 +68,13 @@ bash scripts/build-web.sh
 
 ## 配置管理 Agent
 
-协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：在本机或另一台设备的 Codex App Server 上开一个 turn，或把任务交给另一台设备的协调 Agent，由它在那台设备上执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
+协调 Agent 理解用户指令，用宿主 SDK 的 Shell 和文件工具读取本机，通过 Node 的 `dispatch_work` 工具派发工作来修改代码：交给本机或另一台设备上打开了执行任务的 Agent，或把任务交给另一台设备的协调 Agent，由它在那台设备上执行并回传结果。SDK 会话缓存与共享聊天分开保存。`manager.workspace` 是 SDK 的本机工作目录，项目选择来自 `roots`。
 
 通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
-在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex 和 Cursor 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；Codex 行的任务图标开关本机执行任务。模型、Bot 工作文件夹和组件路径在 Bot 所在服务的**设置**里，允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
+在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；除 Cursor 外，各行的任务图标开关本机执行任务。模型、Bot 工作文件夹和组件路径在 Bot 所在服务的**设置**里，允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
-网页在每个服务那一行列出所需程序和准备状态。打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
+网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
 ### 使用 Cursor SDK
 
@@ -114,6 +114,35 @@ Codex Bot 的回合在 Codex App Server 上运行。装好并登录 Codex 后，
 可用 `--model` 指定模型，省略时使用 Codex 配置中的默认模型。
 
 Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的协调工具，工具令牌和地址经线程的 Shell 环境传入，Provider 凭证不放进 Shell 环境。Cursor SDK 与 Codex 的工具运行方式不同，不承诺相同的系统隔离。
+
+### 使用 Claude Code、pi 或 opencode
+
+三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先在同一用户下装好并登录，或在该服务的**设置**里填模型密钥变量。
+
+| 产品 | 程序 | 登录 | Node 怎么运行 |
+|---|---|---|---|
+| Claude Code | `claude` | `claude` 里的 `/login`，或变量 `ANTHROPIC_API_KEY` | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
+| pi | npm 包 `@earendil-works/pi-coding-agent` 的 `pi` | pi 里的 `/login`，或所用服务的密钥变量 | 每轮和每个任务一个 `pi --mode rpc --no-extensions` 进程 |
+| opencode | `opencode` | `opencode auth login`，或所用服务的密钥变量 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
+
+程序先在 Node 的 PATH 里找，再找 `~/.local/bin`、`~/.claude/local`（Claude Code）、`~/.opencode/bin`（opencode）、`/opt/homebrew/bin` 和 `/usr/local/bin`。后台服务没有交互式 shell 的 PATH：nvm 或自定义 npm 前缀装的 pi 要在设置里填绝对路径，并在 pi 的变量里设含 `node` 所在目录的 `PATH`。
+
+模型留空时用各自的默认模型；opencode 写成 `provider/model`。Claude Code 的进度按整条消息更新，Bot 回复中收到的新消息等这轮结束再处理。
+
+`dispatch_work` 的 `thread` 只接受本机任务跑过的 Claude Code、pi 或 opencode 会话；本人自己开的会话不接任务。
+
+### 回答本人自己开的会话
+
+`vibeface hooks install --home <home>` 写入各产品的监听入口，已打开的会话重启后加载：
+
+| 产品 | 写入 | Bot 能回答 |
+|---|---|---|
+| Codex | `.codex/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
+| Claude Code | `.claude/settings.json` 的 hooks | 权限请求和提问 |
+| pi | `.pi/agent/extensions/vibeface.ts` | 一轮结束后替本人发下一条消息；本人已接着输入时丢弃 |
+| opencode | `.config/opencode/plugins/vibeface.ts` | 权限请求和提问 |
+
+Bot 须在 120 秒内回答。超时后请求交回原程序，由本人在终端处理。
 
 ## 添加自己的设备
 

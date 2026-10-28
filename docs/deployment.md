@@ -82,10 +82,10 @@ Provider 的其他认证环境通过设备设置或服务配置填写。不要�
 }
 ```
 
-安装 hooks 时也必须明确选择被修改的配置所在 home：
+安装 hooks 时也必须明确选择被修改的配置所在 home，写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
-vibeface hooks install --data-dir "$VIBEFACE_DATA_DIR" --home '<包含 .codex 和 .claude 的目录>'
+vibeface hooks install --data-dir "$VIBEFACE_DATA_DIR" --home '<包含各 Agent 配置的目录>'
 vibeface hooks status --data-dir "$VIBEFACE_DATA_DIR" --home '<同一个目录>'
 ```
 
