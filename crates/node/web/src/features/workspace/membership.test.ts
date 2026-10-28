@@ -51,7 +51,7 @@ function loader(globals: Record<string, unknown>, stubs: (specifier: string) => 
 function workspace(source: 'membership' | 'local_session', readBefore: string[] | null) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = []
-  const rpcs: string[] = [], stored = new Map<string, string>()
+  const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks: (() => void)[] = []
   if (readBefore) stored.set(`vibeface.read-before.${browser}.${network}`, JSON.stringify(readBefore))
   let cursor = 0
   const react = {
@@ -85,6 +85,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
     async request(method: string) { if (method === 'write_state') return { state: 'writable', conflicts: [] }; return {} },
     async rpc(method: string, params: Record<string, unknown> = {}) {
       rpcs.push(method)
+      if (failing.has(method)) throw new Error('entry unreachable')
       if (method in reads) return reads[method]
       // The entry checks the signature against the membership directory, as `AuthorizationView::member` does.
       if (source !== 'membership') throw Object.assign(new Error(notMember), { responded: true })
@@ -93,7 +94,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
       return {}
     },
   }
-  const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {} }
+  const timers = { setTimeout: () => 0, clearTimeout() {}, setInterval: (tick: () => void) => { ticks.push(tick); return 0 }, clearInterval() {} }
   const load = loader({
     location: { pathname: `/b/${bot.bot_id}`, search: '' },
     ...timers,
@@ -116,7 +117,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
     afterRender.splice(0).forEach(run => run())
     return value
   }
-  return { render, rpcs, writes, stored, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, rpcs, writes, stored, reads, failing, ticks, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 async function open(source: 'membership' | 'local_session', readBefore: string[] | null = []) {
@@ -174,5 +175,40 @@ test('a new device starts with the history read and sends no read receipts for i
     assert.deepEqual(app.render().notifications, [])
     assert.equal(app.rpcs.filter(method => method === 'ack').length, 0)
     assert.equal(app.stored.get(`vibeface.read-before.${browser}.${network}`), JSON.stringify(['n-1']))
+  } finally { app.close() }
+})
+
+test('a failed refresh keeps the chat on screen and pauses writes until a read succeeds', async () => {
+  const app = await open('membership')
+  try {
+    assert.equal(app.render().data?.conversation?.conversation_id, conversationId)
+    app.failing.add('nodes')
+    for (let tick = 0; tick < 3; tick++) await assert.rejects(app.render().refresh(), /entry unreachable/)
+    const stale = app.render()
+    assert.equal(stale.data?.conversation?.conversation_id, conversationId, 'the chat does not blank on a failed read')
+    assert.equal(stale.writable, false, 'writes wait for a read that succeeds')
+    app.failing.delete('nodes')
+    await app.render().refresh(); await settle()
+    assert.equal(app.render().writable, true)
+  } finally { app.close() }
+})
+
+test('while a computer is offline, the periodic check rereads which devices are online', async () => {
+  const app = await open('membership')
+  try {
+    const computer = { device_id: entry, name: 'node', revoked: false, local: false, online: false, capabilities: null }
+    const nodeReads = () => app.rpcs.filter(method => method === 'nodes').length
+    const idle = nodeReads()
+    for (const tick of app.ticks) tick()
+    await settle()
+    assert.equal(nodeReads(), idle, 'nothing is reread while no device is offline')
+    app.reads.nodes = { nodes: [computer] }
+    await app.render().refresh(); await settle(); app.render()
+    const before = nodeReads()
+    app.reads.nodes = { nodes: [{ ...computer, online: true }] }
+    for (const tick of app.ticks) tick()
+    await settle(); app.render()
+    assert.equal(nodeReads(), before + 1)
+    assert.equal(app.render().nodes[0]?.online, true, 'the computer shows online without waiting for the full reread')
   } finally { app.close() }
 })
