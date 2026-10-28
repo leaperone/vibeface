@@ -69,10 +69,10 @@ test("changes sit after the reply to their message, else after the message, else
     { message_id: "u1", role: "user", created_at_ms: 10 }, { message_id: "a1", role: "assistant", in_reply_to: "u1", created_at_ms: 20 },
     { message_id: "u2", role: "user", created_at_ms: 30 },
   ]
-  const first = scheduleChange("u1", "x"), second = scheduleChange("u1", "y"), third = scheduleChange("u2", "z"), lost = scheduleChange("gone", "w", 25), uncaused = scheduleChange(null, "v", 5)
-  const placed = placeChanges(messages, [first, third, second, lost, uncaused])
+  const first = scheduleChange("u1", "x"), second = scheduleChange("u1", "y"), third = scheduleChange("u2", "z"), lost = scheduleChange("gone", "w", 25), uncaused = scheduleChange(null, "v", 5), later = scheduleChange(null, "u", 35)
+  const placed = placeChanges(messages, [first, third, second, lost, uncaused, later])
   assert.deepEqual(placed.after.get("a1"), [[first, second], [lost]])
-  assert.deepEqual(placed.after.get("u2"), [[third]])
+  assert.deepEqual(placed.after.get("u2"), [[third], [later]])
   assert.equal(placed.after.has("u1"), false)
   assert.deepEqual(placed.first, [[uncaused]])
   assert.equal(scheduleName("r", { skills: [], schedules: [], memory: [] }, [first, second]), "y")

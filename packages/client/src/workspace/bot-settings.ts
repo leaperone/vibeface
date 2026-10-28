@@ -119,7 +119,7 @@ export function placeChanges(messages: readonly Pick<TranscriptMessage, "message
   }
   const turns = new Map<string, BotChangeRecord[]>()
   for (const record of changes) {
-    const cause = record.cause?.message_id ?? ""
+    const cause = record.cause?.message_id ?? record.change_id
     turns.set(cause, [...turns.get(cause) ?? [], record])
   }
   const after = new Map<string, BotChangeRecord[][]>()
