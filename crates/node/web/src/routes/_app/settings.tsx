@@ -81,7 +81,7 @@ function SettingsPage() {
         </SheetHeader>
         <div className="flex justify-end gap-2 px-5 pt-2 pb-5">
           <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
-          <Button type="button" variant="destructive" onClick={() => device.disconnect()}>断开</Button>
+          <Button type="button" variant="destructive" onClick={() => { void workspace.run(async () => { setLeaving(false); await device.leave() }, '断开这个浏览器') }}>断开</Button>
         </div>
       </SheetContent>
     </Sheet>

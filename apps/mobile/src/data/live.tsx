@@ -59,7 +59,7 @@ function Offline({ children }: { children: ReactNode }) {
     send: async () => { throw new Error('还没连上') },
     stop: async () => {},
     answer: async () => { throw new Error('还没连上') },
-    disconnect: device.disconnect,
+    leave: device.leave,
   }), [device])
   return <WorkspaceProvider value={{ ...empty, session, connection, actions }}>{children}</WorkspaceProvider>
 }
@@ -149,9 +149,9 @@ function Live({ children }: { children: ReactNode }) {
         if (job) await latest.current.cancelManager(job.trigger)
       },
       answer: (question, text) => latest.current.answer(question, text),
-      disconnect: device.disconnect,
+      leave: device.leave,
     }
-  }, [device.join, device.cancelJoin, device.disconnect])
+  }, [device.join, device.cancelJoin, device.leave])
 
   useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
 

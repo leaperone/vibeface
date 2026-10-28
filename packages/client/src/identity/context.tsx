@@ -76,7 +76,7 @@ type DeviceContextValue = {
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
@@ -655,6 +655,41 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     await request('revoke', { event }); await refreshDirectory()
     for (const entry of savedEntries().filter(item => item.device_id === deviceId)) removeEntry(entry)
   }
+  /** Takes this device out of its network, then drops its key here: coming back is a join with a new key. */
+  async function leave() {
+    const connection = ready
+    if (connection?.isCurrent() && connection.principal.source === 'local_session') { disconnect(); return }
+    if (!connection?.isCurrent()) throw new Error(`连上后才能断开${self}。`)
+    const request = scoped(), me = own().deviceId
+    const { entry: from, principal: { network_id: networkId } } = connection
+    const onlyManager = (cause: unknown) => /at least one management device/i.test(String(cause)) ? new Error(`${self}是唯一的管理设备。先把另一台设备设为管理设备再断开，或者保留${self}。`) : cause
+    const response = record(await request('directory'))
+    const verified = verifyState(response.state, networkId, nodeNow(response))
+    let event: Record<string, unknown>
+    try { event = JSON.parse(verified.governanceTemplate(me, JSON.stringify({ type: 'revoke', device_id: me, cutoff_seq: 0, cutoff_hash: null }))) }
+    catch (cause) { throw onlyManager(cause) }
+    finally { verified.free() }
+    event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+    // The Node closes a removed device's channel, which can beat the reply; that close must not reconnect.
+    const target = reconnect.current; reconnect.current = null
+    try { await request('revoke', { event }) }
+    catch (cause) {
+      if (connection.isCurrent()) { reconnect.current = target; throw onlyManager(cause) }
+      // Whether it landed is unknown: a fresh connection asks the Node, and nothing is signed again.
+      const unconfirmed = () => { const failure = new Error(`${self}断开的结果还没确认。连上后再看看。`); setError(failure.message); return failure }
+      let active: Session, auth: Record<string, unknown>
+      try { active = await open(from); auth = record(await callSession(active, 'authenticate', { network_id: networkId })) }
+      catch { throw unconfirmed() }
+      if (auth.revoked !== true) {
+        if (auth.principal === null) { resetConnection(); throw unconfirmed() }
+        await authenticate(auth, active, { kind: 'network', networkId })
+        throw cause
+      }
+    }
+    const fresh = publicIdentity(await replaceClient())
+    identityRef.current = fresh; setIdentity(fresh)
+    disconnect()
+  }
   async function setManage(deviceId: string, manage: boolean) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId && item.kind === 'client')
@@ -1162,7 +1197,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },

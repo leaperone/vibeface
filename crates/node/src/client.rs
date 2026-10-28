@@ -901,8 +901,10 @@ async fn dispatch(
                     .await
             }
         }
+        // A manager revokes any device; any client may revoke itself, which the history checks.
         "revoke" => {
-            let view = manager_view(node, session).await?;
+            let view = node.membership_state().await?.project()?;
+            view.client(&session.device_id)?;
             let event: GovernanceEvent = from_field(&params, "event")?;
             ensure!(
                 event.issuer == session.device_id
@@ -912,6 +914,10 @@ async fn dispatch(
             );
             let mut state = node.membership_state().await?;
             state.append(event)?;
+            ensure!(
+                state.project()?.members.iter().any(|m| m.manage),
+                LAST_MANAGER
+            );
             node.install_membership(state.clone()).await?;
             authentication(node, session).await
         }
@@ -3174,12 +3180,24 @@ mod tests {
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
 
-            let mut watching = connect(phone.clone()).await?;
-            watching.call("subscribe", json!({})).await?;
             let view = node.membership_state().await?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;
             assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
-            manager.call("revoke", json!({"event":revoke})).await?;
+            let mut last = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&phone.device_id()?, None)?))?;
+            last.action = GovernanceAction::Revoke(Revocation::new(&admin.device_id()?, None)?);
+            manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", false)?})).await?;
+            let error = manager.call("revoke", json!({"event":last.sign(&admin)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
+            let view = node.membership_state().await?.project()?;
+            let mut forged = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&node_id, None)?))?;
+            forged.issuer = phone.device_id()?;
+            let error = joiner.call("revoke", json!({"event":forged.sign(&phone)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains("management permission required"), "{error:#}");
+            let mut watching = connect(phone.clone()).await?;
+            watching.call("subscribe", json!({})).await?;
+            let leave = GovernanceEvent::revoke(&phone, &view, Revocation::new(&phone.device_id()?, None)?)?;
+            assert_eq!(joiner.call("revoke", json!({"event":leave})).await?["revoked"], true, "an ordinary client leaves on its own");
+            assert!(joiner.call("revoke", json!({"event":leave})).await.is_err(), "a left device cannot sign again");
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
             assert!(joiner.call("join_status", json!({"join_id":join_id})).await.is_err());
@@ -3188,6 +3206,17 @@ mod tests {
             assert!(revoked_info["network_id"].is_null());
             assert!(revoked_info.get("connection_entry").is_none());
             assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
+            let rejoin = manager.call("invite", invite([4; 32])?).await?["join_id"].clone();
+            let error = connect(phone.clone()).await?.call("join", join(&phone, [4; 32], &nonce)?).await.unwrap_err();
+            assert!(format!("{error:#}").contains("already a member or was revoked"), "{error:#}");
+            let fresh = LocalIdentity::generate();
+            let mut rejoining = connect(fresh.clone()).await?;
+            assert_eq!(rejoining.call("join", join(&fresh, [4; 32], &nonce)?).await?["status"], "pending", "a new key joins with a new link");
+            manager.call("approve", json!({"join_id":rejoin,"admin_nonce":admin_nonce})).await?;
+            rejoining.call("join_status", json!({"join_id":rejoin,"reveal":nonce})).await?;
+            let grant = GovernanceEvent::grant(&admin, &node.membership_state().await?.project()?, Member::client(&fresh, "phone", false)?)?;
+            assert_eq!(manager.call("approve", json!({"join_id":rejoin,"event":grant})).await?["status"], "joined");
+            assert_eq!(rejoining.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
 
             let replacement = LocalIdentity::generate();
             let before = node.membership_state().await?;

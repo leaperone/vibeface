@@ -138,7 +138,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
     governancePayload: () => new Uint8Array(), inviteSigningPayload: () => new Uint8Array(),
     sealPackage: () => new Uint8Array([1, 2, 3]),
-    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: () => '{}', createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
+    verifyState: () => ({ free() {}, viewJson: () => JSON.stringify(membership), governanceTemplate: (issuer: string, action: string) => JSON.stringify({ issuer, action: JSON.parse(action) }), createRecoveryCheckpoint: () => JSON.stringify({ epoch: 2 }), createKeyRotation: () => JSON.stringify({ epoch: 2 }) }),
   }
   const timer = (run: () => void) => { const id = ++nextTimer; timers.set(id, run); return id }
   const sandbox = createContext({
@@ -193,7 +193,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, secure, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -997,6 +997,75 @@ test('a revoked browser stops reconnecting, forgets the network and goes to the 
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
     assert.equal(app.timers.size, 0)
     app.sockets[1].drop(); assert.equal(app.timers.size, 0)
+  } finally { app.close() }
+})
+
+const leaves = (app: ReturnType<typeof deviceHarness>) => app.requests.filter(request => request.method === 'revoke').map(request => plain(request.params.event))
+
+test('断开 revokes this browser\'s own key, and the next join offers a new one', async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    await app.render().leave()
+    assert.deepEqual(leaves(app), [{ issuer: subject, action: { type: 'revoke', device_id: subject, cutoff_seq: 0, cutoff_hash: null }, signature: 'signature' }])
+    assert.equal(app.render().ready, null)
+    assert.equal(app.render().identity?.deviceId, freshKey)
+    assert.equal(app.stored.get('vibeface.stay-disconnected'), 'true')
+    assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
+    app.sockets[0].drop(); assert.equal(app.timers.size, 0, 'the closed channel of a left device does not reconnect')
+    app.joinStatus.value = joinRequest('pending', { device_id: freshKey })
+    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    assert.deepEqual(app.requests.filter(request => request.method === 'join').map(request => request.params.public_key), [freshKey])
+    assert.equal(app.calls.filter(call => call === 'replace-key').length, 1)
+  } finally { app.close() }
+})
+
+for (const landed of [true, false]) test(`a lost 断开 reply asks the Node whether it ${landed ? 'landed' : 'did not land'} and never signs again`, async () => {
+  const app = deviceHarness({ saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    const reply = deferred(); app.holds.set('revoke', reply)
+    const leaving = app.render().leave()
+    await settle()
+    if (landed) app.holds.set('authenticate', { promise: Promise.resolve({ ...notMember, revoked: true }), resolve() {}, reject() {} })
+    app.sockets[0].drop(); reply.reject(new Error('connection lost'))
+    if (landed) {
+      await leaving
+      assert.equal(app.render().identity?.deviceId, freshKey)
+      assert.equal(app.render().ready, null)
+    } else {
+      await assert.rejects(leaving, /connection lost/)
+      assert.equal(app.render().identity?.deviceId, subject)
+      assert.equal(app.render().ready?.isCurrent(), true, 'a device still in the network stays connected')
+      assert.equal(app.calls.includes('replace-key'), false)
+    }
+    assert.equal(leaves(app).length, 1)
+    assert.equal(app.sockets.length, 2)
+  } finally { app.close() }
+})
+
+test('the only management device is told to hand over management before 断开', async () => {
+  const app = deviceHarness({ saved: true, management: true })
+  try {
+    app.render(); await settle(); app.render()
+    const verify = app.secure.verifyState
+    app.secure.verifyState = () => ({ ...verify(), governanceTemplate: () => { throw new Error('the network needs at least one management device') } })
+    await assert.rejects(app.render().leave(), /这个浏览器是唯一的管理设备。先把另一台设备设为管理设备再断开/)
+    assert.deepEqual(leaves(app), [])
+    assert.equal(app.render().ready?.isCurrent(), true)
+    assert.equal(app.calls.includes('replace-key'), false)
+  } finally { app.close() }
+})
+
+test('断开 on a local session only closes it: the browser was never a member', async () => {
+  const app = deviceHarness({ localSession: true })
+  try {
+    app.render(); await settle(); app.render()
+    assert.equal(app.render().ready?.principal.source, 'local_session')
+    await app.render().leave()
+    assert.deepEqual(leaves(app), [])
+    assert.equal(app.render().ready, null)
+    assert.equal(app.calls.includes('replace-key'), false)
   } finally { app.close() }
 })
 
