@@ -34,7 +34,7 @@ export function HomeList({ sidebar }: { sidebar?: boolean }) {
   const active = (href: string) => sidebar === true && (pathname === href || pathname.startsWith(`${href}/`))
   // The sidebar swaps the open screen rather than stacking another, keeping home underneath for when the window narrows.
   const replace = sidebar === true && pathname !== '/'
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('grow gap-2 px-1', sidebar ? 'px-2' : 'w-full max-w-2xl self-center pb-8')}
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName={cn('gap-2 px-1', sidebar ? 'px-2' : 'w-full max-w-2xl self-center pb-8')}
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : undefined}>
     {sidebar ? <View className="flex-row items-center justify-between ps-3 pt-2">
       <Text role="heading" className="text-3xl font-bold">消息</Text>
