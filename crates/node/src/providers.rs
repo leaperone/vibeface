@@ -223,7 +223,11 @@ impl Provider {
             "cancel": true,
             "steer": self.supports_steer(),
             "resume_local_session": true,
-            "text_stream_mode": if codex { "snapshot" } else { "delta_and_snapshot" },
+            // Claude Code's runner reads whole messages; the others stream text as well.
+            "text_stream_mode": match self {
+                Provider::Claude => "snapshot",
+                _ => "delta_and_snapshot",
+            },
             "cancel_request": true,
             "cancel_confirmation": true,
             "cancel_confirmation_evidence": if codex { "app_server_turn_end" } else { "provider_terminal_or_managed_process_exit" },
