@@ -23,7 +23,8 @@ const install: Record<ProviderId, string> = {
   codex: "https://github.com/openai/codex", cursor: docs + "node.md#使用-cursor-sdk", claude: "https://docs.anthropic.com/en/docs/claude-code",
   pi: "https://www.npmjs.com/package/@earendil-works/pi-coding-agent", opencode: "https://opencode.ai",
 }
-const guide: Partial<Record<ProviderId, string>> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk" }
+const agents = docs + "node.md#使用-claude-codepi-或-opencode"
+const guide: Record<ProviderId, string> = { codex: docs + "node.md#使用-codex-sdk", cursor: docs + "node.md#使用-cursor-sdk", claude: agents, pi: agents, opencode: agents }
 const services: Record<string, string> = { CURSOR_API_KEY: "Cursor", OPENAI_API_KEY: "OpenAI", ANTHROPIC_API_KEY: "Anthropic", GEMINI_API_KEY: "Gemini" }
 /** A variable the provider needs, named after its service where there is one; the variable itself goes in a tooltip. */
 const keyName = (name: string) => services[name] ? `${services[name]} ${terms.secret.label}` : name
@@ -332,7 +333,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
       <span className="min-w-0">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ""}</span>
       {issue.code === "app_server_not_found" && server ? <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" disabled={working}
           onClick={() => void change("app_server", { app_server: spawnServer })}>改由 Vibeface 启动</button>
-        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider] ?? install[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
+        : onboarding || issue.code === "bin_missing" ? <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={issue.code === "bin_missing" ? install[item.provider] : guide[item.provider]} target="_blank" rel="noopener noreferrer">{issue.code === "bin_missing" ? "怎么装" : "怎么设置"}</a>
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
