@@ -1401,7 +1401,8 @@ impl Executor for Opencode {
         Box::pin(async move {
             let session = work.state.thread().context("the work has no session")?;
             let id = work_message(&work.work_id);
-            let (conn, _serving) = self.conn().await?;
+            let conn = (self.running().await)
+                .context("no opencode serve runs; the next one reads this work back")?;
             let Some(found) = self.session(&conn, session).await? else {
                 return Ok(Probe::Missing);
             };
@@ -2254,6 +2255,13 @@ mod tests {
         until(&node, |state| matches!(state, WorkState::Running { .. })).await?;
         drop(node);
         let node = Arc::new(Runtime::reopen(&place.dir.join("node")).await?);
+        assert!(node.probe_work(&network, "w-1", true).await.is_err());
+        assert_eq!(
+            place.recorded("argv").lines().count(),
+            1,
+            "a probe started no serve"
+        );
+        drop(node.opencode.conn().await?);
         node.probe_work(&network, "w-1", true).await?;
         let record = until(&node, WorkState::finished).await?;
         assert_eq!(
@@ -2281,8 +2289,13 @@ mod tests {
             crate::work::transition(&mut work, Signal::ThreadCreated(session.into()));
             work
         };
-        assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
+        assert!(server.probe(&on("ses_gone")).await.is_err());
+        assert!(
+            place.recorded("argv").is_empty(),
+            "a probe started no serve"
+        );
         let (conn, _serving) = server.conn().await?;
+        assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
         let cwd = place.dir.join("work").display().to_string();
         let created = server.create(&conn, &cwd).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
