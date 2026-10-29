@@ -52,6 +52,19 @@ where
         session.close().await;
         let read = read
             .map_err(|error| anyhow::anyhow!("cannot read thread {thread}: {}", error.message))?;
+        // Codex refuses direct input on a sub-agent; its parent thread drives it.
+        if let Some(sub_agent) = read["thread"]["source"].get("subAgent") {
+            match (read["thread"]["parentThreadId"].as_str())
+                .or(sub_agent["thread_spawn"]["parent_thread_id"].as_str())
+            {
+                Some(parent) => bail!(
+                    "thread {thread} is a Codex sub-agent and takes no direct input; send to its parent thread {parent} instead"
+                ),
+                None => bail!(
+                    "thread {thread} is a Codex sub-agent and takes no direct input; dispatch it without thread"
+                ),
+            }
+        }
         args["cwd"] = json!(read["thread"]["cwd"].as_str().unwrap_or_default());
         if args["title"]
             .as_str()
@@ -204,4 +217,74 @@ pub enum Command {
     Watch {
         thread_id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn a_codex_sub_agent_thread_is_refused_before_anything_is_registered() -> Result<()> {
+        let dir =
+            std::path::PathBuf::from(format!("/tmp/vf-cli-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir)?;
+        let socket = dir.join("app.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let methods = Arc::new(Mutex::new(vec![]));
+        let seen = methods.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                while let Some(Ok(message)) = server.next().await {
+                    let Ok(request) = serde_json::from_slice::<Value>(&message.into_data()) else {
+                        continue;
+                    };
+                    seen.lock().unwrap().push(request["method"].clone());
+                    let result = match request["method"].as_str() {
+                        Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                        Some("thread/read") => json!({"thread":{"id":"sub","cwd":"/w",
+                            "parentThreadId":"lead","source":{"subAgent":{"thread_spawn":
+                            {"depth":1,"parent_thread_id":"lead"}}}}}),
+                        _ => json!({}),
+                    };
+                    if request.get("id").is_some() {
+                        let reply = json!({"id":request["id"],"result":result});
+                        let _ = server.send(reply.to_string().into()).await;
+                    }
+                }
+            }
+        });
+        let tracked = Arc::new(Mutex::new(false));
+        let track = |_| {
+            *tracked.lock().unwrap() = true;
+            async { Ok(json!({"may_send":true,"work_id":"w"})) }
+        };
+        let args = json!({"thread":"sub","prompt":"p","title":"t","call_ref":"r","agent":"codex"});
+        let refused = dispatch(
+            &args,
+            track,
+            |_, _| async { Ok(json!({})) },
+            |_| async { Some("codex".to_owned()) },
+            &socket,
+        )
+        .await;
+        std::fs::remove_dir_all(&dir)?;
+        let refused = refused.expect_err("Codex takes no direct input on a sub-agent");
+        assert!(
+            refused.to_string().contains("parent thread lead"),
+            "{refused:#}"
+        );
+        assert!(!*tracked.lock().unwrap(), "no work was registered");
+        assert!(
+            !methods.lock().unwrap().iter().any(|method| method
+                .as_str()
+                .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")),
+            "nothing was sent into the thread"
+        );
+        Ok(())
+    }
 }

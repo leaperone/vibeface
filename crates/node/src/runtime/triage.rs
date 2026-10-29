@@ -3809,6 +3809,9 @@ mod tests {
             let foreign = node
                 .tool(access.clone(), "track_work", send("r4", json!("claude")))
                 .await;
+            let defaulted = node
+                .tool(access.clone(), "track_work", send("r6", Value::Null))
+                .await;
             let local = node.identity.device_id()?;
             let earlier = crate::work::WorkSpec {
                 work_id: "w-earlier".into(),
@@ -3840,8 +3843,16 @@ mod tests {
                 format!("{foreign:#}").contains("sessions this device's works ran in"),
                 "{foreign:#}"
             );
+            assert_eq!(
+                defaulted?["may_send"],
+                true,
+                "with two executors the bot's own provider runs it"
+            );
             let on_thread = node.store.lock().await.work_records_on_thread("t-other")?;
-            assert_eq!(on_thread.len(), 2, "the refused work left nothing behind");
+            assert_eq!(on_thread.len(), 3, "the refused work left nothing behind");
+            assert!(
+                (on_thread.iter()).all(|run| run.kind == crate::model::WorkKind::Agent(Provider::Codex))
+            );
             // It goes on to Claude Code, which finds no directory for a session without one.
             let own = own?;
             assert_eq!(own["may_send"], false);
@@ -3852,6 +3863,56 @@ mod tests {
                 })?,
                 "the Agent sees the start it was refused"
             );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_bad_call_ref_is_named_so_the_agent_fixes_it_at_once() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                crate::providers::Provider::Codex,
+            )
+            .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let create = |call_ref: &str| json!({"call_ref":call_ref,"name":"2SOMEone/LEAPERone"});
+            let refused = node
+                .tool(access.clone(), "create_bot", create("bots/2SOMEone"))
+                .await;
+            let created = node
+                .tool(access, "create_bot", create("create-2someone"))
+                .await;
+            node.finish_manager_attempt(&attempt).await;
+            let refused = refused.expect_err("a call_ref with a slash");
+            assert!(
+                refused.to_string().starts_with("call_ref must contain"),
+                "{refused:#}"
+            );
+            assert_eq!(created?["name"], "2SOMEone/LEAPERone");
             Ok::<_, anyhow::Error>(())
         }
         .await;
