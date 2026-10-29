@@ -274,7 +274,8 @@ impl Runtime {
         };
         let codex = provider.on_app_server();
         json!({
-            "provider":provider, "roles":roles, "supports":provider.supports(), "bin":bin,
+            "provider":provider, "roles":roles, "supports":provider.supports(),
+            "installed":discovery::Host::current().installed(&bin), "bin":bin,
             "app_server":codex.then(|| json!({"mode":app_server.mode,
                 "socket":app_server.socket,"link":link})),
             "home":codex.then(|| configured.get(discovery::CODEX_HOME)),

@@ -4,12 +4,13 @@ import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import type { BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { ActionButton } from '@/components/action'
-import { ActionCard } from '@/components/kit'
+import { ActionCard, providerIcons } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
@@ -86,7 +87,12 @@ function TaskCard({ work, state, joined, botId, device }: { work: WorkRecord; st
   const open = active || state === 'waiting' || state === 'awaiting_confirmation'
   const failed = state === 'failed' || state === 'rejected' || state === 'dispatch_rejected'
   const href = `/b/${botId}/work/${work.work_id}` as const
+  const agent = work.kind === 'task' ? null : work.kind ?? null
   const meta = <View className="min-w-0 flex-row items-center gap-1">
+    {agent ? <>
+      <Icon as={providerIcons[agent]} className="size-3.5 text-muted-foreground" />
+      <Text className="text-meta text-muted-foreground">{providerNames[agent]} ·</Text>
+    </> : null}
     <Icon as={Laptop} className="size-3.5 text-muted-foreground" />
     <Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{device}</Text>
     <Text className="text-meta text-muted-foreground">· {taskLabel(state)}</Text>
