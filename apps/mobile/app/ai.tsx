@@ -81,6 +81,12 @@ function AiSettings() {
     change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
     saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
   return <View className="gap-6">
+    <View className="gap-1 px-1">
+      {(['bot', 'execution'] as const).map((role) => <View key={role} className="flex-row items-start gap-1.5">
+        <Icon as={roles[role].icon} className="mt-0.5 size-4 text-muted-foreground" />
+        <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
+      </View>)}
+    </View>
     {shown.map(card)}
     {folded.length ? <Details label={`未安装 · ${folded.map((item) => providerNames[item.provider]).join('、')}`} open={!shown.length}>
       <View className="gap-6">{folded.map(card)}</View>
@@ -145,8 +151,16 @@ const roles = {
 
 function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   const { label, hint, icon } = roles[role]
-  // A named row with a system switch, so on and off read at a glance. While a save runs the switches keep their look and
-  // ignore taps; the spinner says which one is changing.
+  // Only one provider runs the bot, so that row draws a radio dot: tapping it moves the bot here, tapping it again turns it off, hence a toggle for assistive tech.
+  // Executing tasks is a system switch any provider can have on. While a save runs the controls keep their look and ignore taps; the spinner says which one is changing.
+  if (role === 'bot') return <Pressable accessibilityRole="togglebutton" accessibilityState={{ checked: pressed, disabled }} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
+    onPress={disabled ? undefined : onPress} className="min-h-12 flex-row items-center gap-3 border-t border-border px-4 active:bg-muted">
+    <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
+    <Text className="min-w-0 flex-1">{label}</Text>
+    <View className={cn('size-5 items-center justify-center rounded-full border-2', pressed ? 'border-brand' : 'border-muted-foreground')}>
+      {pressed ? <View className="size-2.5 rounded-full bg-brand" /> : null}
+    </View>
+  </Pressable>
   return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-4">
     <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
     <Text className="min-w-0 flex-1">{label}</Text>

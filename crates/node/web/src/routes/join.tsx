@@ -11,7 +11,8 @@ export const Route = createFileRoute('/join')({ component: Page })
 
 function Page() {
   const { ready, initialInvitation, linkTarget } = useDevice()
-  if (!ready) return <ConnectionScreen lane="invite" />
+  // A session opened on this computer without joining comes here to join; it stays open behind the form until the join starts.
+  if (!ready || ready.principal.source === 'local_session') return <ConnectionScreen lane="invite" />
   return initialInvitation && linkTarget(initialInvitation) === 'other' ? <SwitchNetwork /> : <Navigate to="/" replace />
 }
 

@@ -14,6 +14,7 @@ import { botReadiness } from "@vibeface/client/workspace/model.ts"
 import { entryAddress, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings } from "./ai-settings"
 import { JoinRequests } from "./join"
+import { localCopy } from "@/features/workspace/local-session"
 
 type DeviceRow = {
   id: string; name: string; kind: "node" | "client"; member?: Member; node?: NodeInfo
@@ -34,7 +35,7 @@ export function useDeviceRows(): DeviceRow[] {
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
       entry, browser: id === identity?.deviceId,
-      online: deviceOnline(kind, node, entry && connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
+      online: deviceOnline(kind, node, entry, connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
@@ -154,13 +155,13 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
         : <p className="flex items-center gap-2"><terms.address.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />在哪都能打开</p>}
       {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
         <label className="flex min-h-11 items-center justify-between gap-3">
-          <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上直接打开" : "在那台电脑上直接打开"}</span><span className="text-meta text-muted-foreground">不用加入链接</span></span>
+          <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上免加入打开" : "在那台电脑上免加入打开"}</span><span className="text-meta text-muted-foreground">{localCopy.note}</span></span>
           <input type="checkbox" role="switch" className="switch" checked={device.localAutoAccess === true} aria-describedby="local-access-risk"
             disabled={action.busy !== null || device.localAutoAccess === null || localSession && !device.localAutoAccess}
             onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />
         </label>
         <p id="local-access-risk" className={cn("flex items-center gap-1.5 text-meta", device.localAutoAccess ? "text-warning" : "text-muted-foreground")}>
-          <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这" : "那"}台电脑上的人和程序不用批准就能进来，看你的对话、指挥你的 Bot
+          <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这" : "那"}台电脑上的人和程序不用批准就能看对话、改设置、替你回 Bot
         </p>
       </div> : null}
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}

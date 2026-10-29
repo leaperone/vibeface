@@ -73,11 +73,12 @@ export const deviceForm = (kind: "node" | "client", name: string): DeviceForm =>
 export const formName: Record<DeviceForm, string> = { computer: "电脑", tablet: "平板", phone: "手机", browser: "浏览器" }
 
 /**
- * A computer's reachability as the Node reports it; `throughEntry` stands in for the connected one before that read.
- * A browser or phone has none: only the Node it happens to be connected to would know.
+ * A computer's reachability as the Node reports it; `entry` marks the computer this device connects through, online
+ * before that read. A browser or phone has none: only the Node it happens to be connected to would know. While this
+ * device is offline the last report is stale: the computer it lost reads offline, the others unknown.
  */
-export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, throughEntry: boolean) =>
-  kind === "node" ? node?.online ?? throughEntry : undefined
+export const deviceOnline = (kind: "node" | "client", node: Pick<NodeInfo, "online"> | undefined, entry: boolean, connected: boolean) =>
+  kind !== "node" ? undefined : !connected ? (entry ? false : undefined) : node?.online ?? entry
 export const hostOf = (address: string) => { try { return new URL(address).host } catch { return "" } }
 
 const taskStates: Record<string, string> = {
@@ -87,6 +88,9 @@ const taskStates: Record<string, string> = {
   dispatch_waiting: "等设备接收", dispatch_rejected: "未接收", dispatch_unverified: "结果未知", stop_waiting: "停止中", stop_timed_out: "还在尝试停止",
 }
 export const taskLabel = (state: string) => taskStates[state] ?? stateNames[state] ?? state
+/** A task still running when this device went offline may have moved on since; it reads unknown, not running. */
+export const taskStale = (state: string, connected: boolean) => !connected && taskActive(state)
+export const staleTaskLabel = "状态未知"
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {

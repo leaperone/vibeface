@@ -1,5 +1,6 @@
 import { boolean, entryKey, parseEntry, record } from '@vibeface/client/lib/node.ts'
 import type { ConnectionEntry, PublicIdentity } from '@vibeface/client/lib/node.ts'
+import { unreachableText } from '@vibeface/client/lib/transport.ts'
 
 type LocalLaunch = { token: string; deviceId: string }
 
@@ -10,11 +11,9 @@ async function localResponse(response: Response): Promise<unknown> {
 
 export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch | null): Promise<ConnectionEntry | null> {
   let response: Response
+  // Unreachable is not "no session here": the caller keeps trying while the computer is off.
   try { response = await fetch('/api/local/info', { credentials: 'same-origin', cache: 'no-store', redirect: 'error' }) }
-  catch {
-    if (launch) throw new Error('连不上这台电脑。请确认 Vibeface 正在运行。')
-    return null
-  }
+  catch { throw new Error(launch ? '连不上这台电脑。请确认 Vibeface 正在运行。' : unreachableText) }
   // Only the launcher origin serves this; elsewhere the caller sends a launch on to it.
   if (response.status === 404 || !response.ok && !launch) return null
   const info = record(await localResponse(response))

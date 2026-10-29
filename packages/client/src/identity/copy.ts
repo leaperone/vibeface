@@ -3,7 +3,7 @@ import type { Member, PendingRecovery } from '../lib/node.ts'
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
-  showCode: '在发链接的设备上点“显示安全码”',
+  showCode: '在已有设备上比对安全码',
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
@@ -73,6 +73,7 @@ export const recoveryCopy = {
   saveNew: '保存新的恢复文件',
   recovered: '已找回，旧文件已作废',
   why: '设备都丢了时，用它和恢复密码找回',
+  passwordWhy: '设备都丢了时，用它和恢复文件找回',
   onlyCopy: '只有这一份，丢了不能补',
   keptApart: '已把文件和密码分开保存',
   pending: '有人正在用恢复文件找回',
@@ -109,10 +110,13 @@ export const deviceCopy = {
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
   botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot' },
   removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
-  /** A provider's two switches on a device; `hint` says what each turns on, named for the provider's row. */
+  /**
+   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
+   * above the providers; `hint` says it again for one provider's control.
+   */
   roles: {
-    bot: { label: '运行 Bot', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
-    execution: { label: '执行任务', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
+    bot: { label: '运行 Bot', note: '只选一个，Bot 用它回复聊天', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
+    execution: { label: '执行任务', note: '可开多个，Bot 派的任务交给它做', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
