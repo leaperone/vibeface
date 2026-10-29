@@ -3,6 +3,7 @@ import { File } from 'expo-file-system'
 import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
+import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
@@ -44,7 +45,7 @@ function useConnection(): { session: Session; connection: Connection } {
   const { link } = device
   const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
   const entry = device.ready?.entry ?? device.entry
-  return { session, connection: { state, entry: device.ready?.info.name ?? (entry ? device.entryName(entry) || addressName(entry.address) : '') } }
+  return { session, connection: { state, entry: device.ready?.info.name ?? (entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''), direct: entry?.kind === 'lan' } }
 }
 
 function Device({ children }: { children: ReactNode }) {

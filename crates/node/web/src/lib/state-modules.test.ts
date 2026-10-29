@@ -3,7 +3,8 @@ import test from 'node:test'
 import { nextLink, type Link } from '@vibeface/client/lib/link.ts'
 import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/client/lib/outbox.ts'
 import { joinTabs } from './tabs.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { candidates, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
+import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { failureKinds, failureText, humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
@@ -92,14 +93,14 @@ test('only entrance records signed by a current member Node of this network surv
 
 test('switching tries the entry that dropped, then entrances by last success; revoked ones leave the list', () => {
   const saved = [
-    { device_id: 'a'.repeat(64), seq: 1, gateway_url: 'https://a.example.com', public: true, last_ok_ms: 5 },
-    { device_id: 'b'.repeat(64), seq: 1, gateway_url: 'https://b.example.com', public: true, last_ok_ms: 9 },
-    { device_id: 'c'.repeat(64), seq: 1, gateway_url: 'https://c.example.com', public: true, last_ok_ms: 99 },
+    { device_id: 'a'.repeat(64), seq: 1, gateway_url: 'https://a.example.com', public: true, direct: [], last_ok_ms: 5 },
+    { device_id: 'b'.repeat(64), seq: 1, gateway_url: 'https://b.example.com', public: true, direct: [], last_ok_ms: 9 },
+    { device_id: 'c'.repeat(64), seq: 1, gateway_url: 'https://c.example.com', public: true, direct: [], last_ok_ms: 99 },
   ]
-  const merged = markReached(mergeEntrances(saved, [], view), { address: 'https://a.example.com', device_id: 'a'.repeat(64) }, 1)
+  const merged = markReached(mergeEntrances(saved, [], view), { kind: 'gateway', address: 'https://a.example.com', device_id: 'a'.repeat(64) }, 1)
   assert.deepEqual(merged.map(item => [item.device_id[0], item.last_ok_ms]), [['a', 1], ['b', 9]], 'c was revoked')
-  const order = candidates(merged, { address: 'http://127.0.0.1:5101', device_id: 'a'.repeat(64) })
-  assert.deepEqual(order.map(entry => entry.address), ['http://127.0.0.1:5101', 'https://b.example.com', 'https://a.example.com'])
+  const order = candidates(merged, { kind: 'gateway', address: 'http://127.0.0.1:5101', device_id: 'a'.repeat(64) })
+  assert.deepEqual(order.map(entryAddress), ['http://127.0.0.1:5101', 'https://b.example.com', 'https://a.example.com'])
   for (const local of ['https://localhost', 'https://10.0.0.2', 'https://box.local', 'http://a.example.com', 'https://intranet']) assert.equal(isPublicUrl(local), false, local)
 })
 
@@ -110,9 +111,26 @@ test('after a reload an older address record never replaces a newer one, withdra
   const stale = verifiedEntrances([address('a', 'https://old.example.com/', view.network_id, 6), address('b', 'https://withdrawn.example.com/', view.network_id, 3)], view, signedBySelf)
   const merged = mergeEntrances(reloaded, stale, view)
   assert.deepEqual(merged.map(item => [item.device_id[0], item.seq, item.gateway_url]), [['a', 7, 'https://new.example.com'], ['b', 4, null]])
-  assert.deepEqual(candidates(merged, { address: 'http://127.0.0.1:5101', device_id: a }).map(entry => entry.address), ['http://127.0.0.1:5101', 'https://new.example.com'], 'a withdrawn address is not tried')
+  assert.deepEqual(candidates(merged, { kind: 'gateway', address: 'http://127.0.0.1:5101', device_id: a }).map(entryAddress), ['http://127.0.0.1:5101', 'https://new.example.com'], 'a withdrawn address is not tried')
   const newer = mergeEntrances(merged, verifiedEntrances([address('b', 'https://back.example.com/', view.network_id, 5)], view, signedBySelf), view)
   assert.equal(newer.find(item => item.device_id === b)?.gateway_url, 'https://back.example.com')
+})
+
+test('the app tries a Node on its LAN before any web address, and one with no web address last', () => {
+  const a = 'a'.repeat(64), b = 'b'.repeat(64)
+  const record = (id: string, gateway: string | null, ips: string[]) => ({ payload: JSON.stringify({ version: 1, network_id: view.network_id, device_id: id.repeat(64), seq: 1, endpoint: { id: id.repeat(64), addrs: [...ips.map(ip => ({ Ip: ip })), { Relay: 'https://relay.example.com/' }] }, gateway_url: gateway }), signature: `signed-by-${id}` })
+  const list = verifiedEntrances([record('a', 'https://a.example.com/', ['192.168.1.4:7001', 'junk']), record('b', null, ['192.168.1.5:7002'])], view, signedBySelf)
+  assert.deepEqual(list.map(item => item.direct), [['192.168.1.4:7001'], ['192.168.1.5:7002']])
+  assert.deepEqual(storedEntrances(JSON.parse(JSON.stringify(list))), list)
+  assert.deepEqual(storedEntrances([{ device_id: a, seq: 1, gateway_url: null, public: false, last_ok_ms: 0 }]), [], 'a stored entrance of another shape is dropped')
+  const ways = (...args: Parameters<typeof candidates>) => candidates(...args).map(entry => `${entry.kind} ${entryAddress(entry)}`)
+  const web = { kind: 'gateway' as const, address: 'https://a.example.com', device_id: a }
+  assert.deepEqual(ways(list, web), ['gateway https://a.example.com'], 'a browser has no LAN')
+  assert.deepEqual(ways(list, web, new Map()), ['lan 192.168.1.4:7001', 'gateway https://a.example.com', 'lan 192.168.1.5:7002'], 'seen nowhere yet: where the Node signed it listens')
+  assert.deepEqual(ways(list, web, new Map([[b, ['192.168.1.9:7002']]])), ['lan 192.168.1.4:7001', 'lan 192.168.1.9:7002', 'gateway https://a.example.com'])
+  const lan = { kind: 'lan' as const, addrs: ['192.168.1.8:7001'], device_id: a }
+  assert.equal(markReached(list, lan, 5), list, 'only web entrances keep a last success')
+  assert.deepEqual(candidates(list, lan, new Map())[0], { kind: 'lan', addrs: ['192.168.1.8:7001', '192.168.1.4:7001'], device_id: a })
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {

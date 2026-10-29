@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react"
-import { Link } from "@tanstack/react-router"
 import { CircleCheck, Clock, Copy, Link2, Plus, Smartphone } from "lucide-react"
 import qrcode from "qrcode-generator"
 import { BusyIcon, Details, InlineError, PageActions } from "@/components/app/kit"
@@ -9,17 +8,16 @@ import { Textarea } from "@/components/ui/textarea"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
-import { isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { JoinRequests, useOpenJoins } from "./join"
 
-type Share = Invitation & { qr: string | null }
+/** `image`: the QR code of `qr`, which a phone's camera opens when the link is public, and the Vibeface app scans otherwise. */
+type Share = Invitation & { image: string | null }
 
 function share(invitation: Invitation): Share {
-  let qr: string | null = null
-  // A phone's camera opens a public HTTPS link only; any other address would scan into a dead page.
-  if (invitation.publicEntry) try { const code = qrcode(0, "M"); code.addData(invitation.link); code.make(); qr = code.createDataURL(4, 16) } catch {}
-  return { ...invitation, qr }
+  let image: string | null = null
+  try { const code = qrcode(0, "M"); code.addData(invitation.qr); code.make(); image = code.createDataURL(4, 16) } catch {}
+  return { ...invitation, image }
 }
 
 /** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
@@ -82,7 +80,6 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
     show()
     onOpened?.()
   }, [opening, ready])
-  const local = result ? isLoopback(result.link) : false
   if (!ready?.principal.can_manage) return null
 
   return <>
@@ -102,16 +99,13 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
             <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
           </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           {result && !used ? <div className="grid gap-3">
-            {result.qr ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.qr} alt="用手机相机扫码打开" /> : null}
+            {result.image ? <img className="size-56 justify-self-center rounded-lg bg-white p-2" src={result.image} alt={result.publicEntry ? "用手机相机扫码打开" : "用手机 App 扫码"} /> : null}
             <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={() => copy(result.link)}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? "已复制" : "复制链接"}</Button>
             <ul className="grid gap-1.5 text-meta text-muted-foreground">
               <li className="flex items-center gap-1.5"><terms.safetyCode.icon aria-hidden="true" className="size-4 shrink-0" />新设备打开后，回这里比对{terms.safetyCode.label}</li>
               <li className="flex items-center gap-1.5"><Clock aria-hidden="true" className="size-4 shrink-0" />只发给自己的设备，10 分钟内有效</li>
             </ul>
-            {result.qr ? null : <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
-              <span className="flex items-center gap-1.5"><Smartphone aria-hidden="true" className="size-4 shrink-0" />{local ? "手机打不开本机地址" : "手机打不开这个地址"}</span>
-              <Link className="hit-area relative font-medium text-foreground underline underline-offset-4" to="/devices/$deviceId" params={{ deviceId: ready.entry.device_id }} onClick={() => setOpen(false)}>怎么设置</Link>
-            </p>}
+            {result.publicEntry ? null : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Smartphone aria-hidden="true" className="size-4 shrink-0" />用手机 App 扫码</p>}
             <Details label="链接原文">
               <Textarea readOnly className="min-h-24 font-mono text-meta" value={result.link} onFocus={(event) => event.target.select()} />
               <p className="text-meta text-muted-foreground">另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p>

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
-import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { spentInvite } from '@vibeface/client/lib/errors.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
@@ -249,9 +249,9 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-1">{device.entries.map((entry) => {
-      const name = device.entryName(entry) || addressName(entry.address), host = hostOf(entry.address)
-      return <li key={`${entry.address}:${entry.device_id}:${entry.local === true}`} className="flex min-h-11 items-center rounded-lg bg-muted/60">
-        <Button type="button" variant="ghost" className="h-auto min-h-11 min-w-0 flex-1 justify-start" title={entry.address} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
+      const name = device.entryName(entry) || addressName(entryAddress(entry)), host = hostOf(entryAddress(entry))
+      return <li key={entryKey(entry)} className="flex min-h-11 items-center rounded-lg bg-muted/60">
+        <Button type="button" variant="ghost" className="h-auto min-h-11 min-w-0 flex-1 justify-start" title={entryAddress(entry)} disabled={linking || !usable} onClick={() => void run(() => device.connect(entry))}>
           <span className="truncate">{name}{host && host !== name ? <span className="ms-2 text-meta text-muted-foreground">{host}</span> : null}</span>
         </Button>
         <Button type="button" variant="ghost" size="icon" className="size-11 shrink-0 text-muted-foreground" aria-label={`移除 ${name}`} title="移除" disabled={linking} onClick={() => {

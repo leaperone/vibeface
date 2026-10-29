@@ -25,6 +25,7 @@ import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
+import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { LocalSession } from "./local-session"
 
 /** `landing`: the title takes the focus when the shell replaces the page the person was on. */
@@ -211,12 +212,12 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
   const workspace = useWorkspace()
   const device = useDevice()
   const { link, entrances } = device
-  const address = device.ready?.entry.address ?? ""
+  const address = device.ready ? entryAddress(device.ready.entry) : ""
   const entryId = device.ready?.entry.device_id
   const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
   const name = entryName || addressName(address)
   // Devices of another network this browser opened before; the current network fails over by itself.
-  const others = device.entries.filter((item) => !item.local && !device.directory?.members.some((member) => member.device_id === item.device_id))
+  const others = device.entries.filter((item) => item.kind !== "local" && !device.directory?.members.some((member) => member.device_id === item.device_id))
   const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
@@ -246,9 +247,9 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}
         {others.length ? <>
           <p className="mt-1 font-medium">换一台设备</p>
-          <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={`${item.address}:${item.device_id}`}>
+          <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={entryKey(item)}>
             <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted active:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
-              <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(item.address)}</span>
+              <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(entryAddress(item))}</span>
               <ArrowRightLeft aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             </button>
           </li>)}</ul>

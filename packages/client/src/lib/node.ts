@@ -1,8 +1,15 @@
-import { validEndpoint, validTarget } from './transport.ts'
+import { lanAddrs, validEndpoint, validTarget } from './transport.ts'
 import type { ChangedEvent } from './progress.ts'
 import { humanError } from './errors.ts'
 
-export type ConnectionEntry = { address: string; device_id: string; local?: boolean }
+/**
+ * How this device reaches a Node: through a Gateway's web address, over the cookie-bound local page of the computer
+ * it runs on, or straight to it on this LAN (the app only) at the `ip:port` it was last seen at.
+ */
+export type ConnectionEntry =
+  | { kind: 'gateway'; address: string; device_id: string }
+  | { kind: 'local'; address: string; device_id: string }
+  | { kind: 'lan'; addrs: string[]; device_id: string }
 export type PublicIdentity = { deviceId: string }
 export type ClientPrincipal = { network_id: string; device_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type EntryInfo = { device_id: string; name: string; version: string; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
@@ -79,16 +86,26 @@ export function boolean(value: unknown): boolean { if (typeof value !== 'boolean
 function integer(value: unknown): number { if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new Error('设备返回的编号或版本无效。'); return value }
 function strings(value: unknown): string[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value.map(item => text(item)) }
 export function array(value: unknown): unknown[] { if (!Array.isArray(value)) throw new Error('设备返回的列表格式无效。'); return value }
+/** An entry as Nodes send it and this device stores it: `{address, device_id}`, plus `local: true` for a local page, or `{device_id, addrs}` on the LAN. */
 export function parseEntry(value: unknown): ConnectionEntry {
   const v = record(value, '访问地址')
-  const entry = { address: validEndpoint(text(v.address)), device_id: validTarget(v.device_id) }
-  if (v.local === true) {
-    if (entry.address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这台电脑。')
-    return { ...entry, local: true }
+  const device_id = validTarget(v.device_id)
+  if (v.address === undefined) {
+    const addrs = lanAddrs(v.addrs)
+    if (!addrs.length) throw new Error('访问地址缺失或格式无效。')
+    return { kind: 'lan', addrs, device_id }
   }
-  return entry
+  const address = validEndpoint(text(v.address))
+  if (v.local !== true) return { kind: 'gateway', address, device_id }
+  if (address !== (globalThis as { location?: { origin: string } }).location?.origin) throw new Error('本机打开时只能连这台电脑。')
+  return { kind: 'local', address, device_id }
 }
-export const entryKey = (entry: ConnectionEntry) => `${entry.address}:${entry.device_id}:${entry.local === true}`
+export const entryJson = (entry: ConnectionEntry) => entry.kind === 'lan' ? { device_id: entry.device_id, addrs: entry.addrs }
+  : { address: entry.address, device_id: entry.device_id, ...entry.kind === 'local' ? { local: true } : {} }
+/** Where `entry` goes, as people read it: its web address, or on the LAN the `ip:port` it was last reached at. */
+export const entryAddress = (entry: ConnectionEntry) => entry.kind === 'lan' ? entry.addrs[0] : entry.address
+/** One key per way in; a Node has one LAN entry, whose addresses change. */
+export const entryKey = (entry: ConnectionEntry) => entry.kind === 'lan' ? `lan:${entry.device_id}` : `${entry.address}:${entry.device_id}:${entry.kind === 'local'}`
 export function parseInfo(value: unknown): EntryInfo {
   const v = record(value)
   const initialized = boolean(v.initialized)
@@ -156,7 +173,7 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
     }
   }
   else throw new Error('本机设置状态无效。')
-  if (setup.entry.address !== origin || setup.entry.local) throw new Error('本机设置和当前页面对不上。')
+  if (setup.entry.kind !== 'gateway' || setup.entry.address !== origin) throw new Error('本机设置和当前页面对不上。')
   return setup
 }
 /** The usual project folders the device found, each named as Settings shows paths, for adding with one tap. */

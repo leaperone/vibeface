@@ -40,7 +40,8 @@ const hint = (icon: LucideIcon, text: string, tone = 'text-muted-foreground') =>
 /** Find devices again with the recovery file: open it, connect to one of the devices, then pick what was lost. */
 export function RecoveryRestore() {
   const device = useDevice()
-  const target = device.entry ?? device.entries[0] ?? null
+  // The form takes a web address; a LAN entry has none to fill in.
+  const target = [device.entry, ...device.entries].flatMap(item => item && item.kind !== 'lan' ? [item] : [])[0] ?? null
   const { busy, error, run } = useRun()
   const [picked, setPicked] = useState<PickedFile | null>(null)
   const [password, setPassword] = useState('')

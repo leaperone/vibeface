@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
@@ -252,7 +252,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
         {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />在要连的电脑上打开本机页面再找回</p>}
         <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
-          <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
+          <Label label="访问地址"><Input type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
         <InlineError error={error || null} />
