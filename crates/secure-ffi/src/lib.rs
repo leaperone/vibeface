@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use vibeface_secure as secure;
 
+mod lan;
+
 uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]

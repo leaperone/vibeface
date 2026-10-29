@@ -5,12 +5,13 @@ import * as Notifications from 'expo-notifications'
 import * as SecureStore from 'expo-secure-store'
 import * as Sharing from 'expo-sharing'
 import { createMMKV } from 'react-native-mmkv'
-import { secure, type NativeIdentity } from '@vibeface/secure-native'
+import { lan as nativeLan, secure, type NativeIdentity } from '@vibeface/secure-native'
 import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
-import type { Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
+import type { Lan, Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import { sha256 } from '@vibeface/client/delivery/model.ts'
 import { lostKeyText } from '@vibeface/client/identity/copy.ts'
+import LanBrowser from '../../modules/lan-browser'
 
 const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
@@ -73,7 +74,22 @@ const notifier: Notifier = {
   },
 }
 
-const transport = createTransport(secure, phoneKeys)
+/** Nodes on this LAN over mDNS, browsed only while the app is in the foreground. */
+const lan: Lan = {
+  watch(listener) {
+    let browsing: { remove(): void } | null = null
+    const follow = (state: string | null | undefined) => {
+      if (state === 'active' && !browsing) browsing = LanBrowser.addListener('onChange', ({ services }) => listener(services))
+      if (state === 'background' && browsing) { browsing.remove(); browsing = null; listener([]) }
+    }
+    follow(AppState.currentState)
+    const app = AppState.addEventListener('change', follow)
+    return () => { app.remove(); browsing?.remove() }
+  },
+  names: nativeLan.names,
+}
+
+const transport = createTransport(secure, phoneKeys, nativeLan.dial)
 
 export const mobilePlatform: Platform = {
   secure,
@@ -118,6 +134,7 @@ export const mobilePlatform: Platform = {
     },
   },
   self,
+  lan,
   async erase() {
     await transport.forgetClient()
     store.clearAll()

@@ -7,6 +7,9 @@ import type {
 } from '@vibeface/client/secure-api.ts'
 import * as ffi from './generated/index'
 
+/** One client stream to a Node on the LAN, as the client's transport reads it; `recv` gives `null` once the Node ended it. */
+export type LanStream = { send(data: Uint8Array): void; recv(): Promise<{ text: boolean; data: Uint8Array } | null>; close(): void }
+
 /** Native identities also sign raw bytes, e.g. a Noise handshake's `signingBytes()`. */
 export interface NativeIdentity extends SecureIdentity {
   signMessage(message: Uint8Array): string
@@ -16,14 +19,15 @@ type NativeSecure = Omit<SecureApi, 'Identity'> & {
   Identity: { generate(): NativeIdentity; fromSecretHex(secret: string): NativeIdentity }
 }
 
+function reason(error: unknown): unknown {
+  return error instanceof Error && ffi.SecureError.instanceOf(error) ? new Error(error.inner.reason) : error
+}
+
 function call<T>(run: () => T): T {
   try {
     return run()
   } catch (error) {
-    if (error instanceof Error && ffi.SecureError.instanceOf(error)) {
-      throw new Error(error.inner.reason)
-    }
-    throw error
+    throw reason(error)
   }
 }
 
@@ -175,4 +179,21 @@ export const secure: NativeSecure = {
     call(() => ffi.verify(deviceId, domain, toBuffer(payload), signature)),
   verifyMembership: (stateJson, expectedNetwork) =>
     new Membership(call(() => ffi.verifyMembership(stateJson, expectedNetwork))),
+}
+
+/** The app's way to Nodes on its LAN: one QUIC stream to a Node, and the tags Nodes advertise there. */
+export const lan = {
+  async dial(deviceId: string, addrs: string[], timeoutMs: number): Promise<LanStream> {
+    const stream = await ffi.lanConnect(deviceId, addrs, timeoutMs).catch((error) => { throw reason(error) })
+    // Freed by the garbage collector: a manual free could race a `recv` still in flight.
+    return {
+      send: (data) => call(() => stream.send(toBuffer(data))),
+      async recv() {
+        const frame = await stream.recv().catch((error) => { throw reason(error) })
+        return frame ? { text: frame.text, data: new Uint8Array(frame.data) } : null
+      },
+      close: () => stream.close(),
+    }
+  },
+  names: (tag: string, networkId: string, deviceId: string) => ffi.lanTagMatches(tag, networkId, deviceId),
 }

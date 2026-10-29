@@ -31,6 +31,15 @@ export type LocalPage = {
   /** Opens the local launch address, reloading when only its hash differs. */
   open(url: string): void
 }
+/** A Node advertising itself on this LAN: its rotating tag and where it listens (`ip:port`). */
+export type LanSighting = { tag: string; addrs: string[] }
+/** How the app finds Nodes on its LAN; it reaches them with the transport's own LAN dial. */
+export type Lan = {
+  /** Calls `listener` with every Node in sight each time that changes, while the app is in the foreground. */
+  watch(listener: (seen: LanSighting[]) => void): () => void
+  /** Whether `tag` is what Node `deviceId` of network `networkId` advertises around now. */
+  names(tag: string, networkId: string, deviceId: string): boolean
+}
 /** Instances of the app on one device that share its storage; one leads and settles the outbox. */
 type JoinTabs = <T>(name: string, handlers: { lead(): void | (() => void); message(value: T): void }) => { post(value: T): void; close(): void }
 
@@ -56,4 +65,6 @@ export type Platform = {
   erase?(): Promise<void>
   page?: LocalPage
   joinTabs?: JoinTabs
+  /** The app's: a browser cannot reach Nodes on its LAN directly. */
+  lan?: Lan
 }

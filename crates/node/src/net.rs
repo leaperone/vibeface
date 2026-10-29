@@ -15,11 +15,12 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 mod discovery;
+mod lan;
 pub mod pkarr;
 
 pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
@@ -283,6 +284,7 @@ pub struct Net {
     pub endpoint: Endpoint,
     lookup: MemoryLookup,
     discovery: discovery::Discovery,
+    lan: OnceLock<lan::Lan>,
     relays: Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
 }
@@ -401,6 +403,7 @@ impl Net {
             endpoint,
             lookup,
             discovery,
+            lan: OnceLock::new(),
             relays: Mutex::new(known),
             connections: Mutex::new(HashMap::new()),
         })
@@ -422,6 +425,27 @@ impl Net {
                     .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
                     .await;
             }
+        }
+    }
+
+    /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
+    /// which one appeared. Without mDNS, dialing keeps the other addresses.
+    pub fn start_lan(&self, wake: impl Fn(&str) + Send + Sync + 'static) {
+        let Some(port) = self.endpoint.bound_sockets().first().map(SocketAddr::port) else {
+            return;
+        };
+        match lan::Lan::start(device_id(&self.endpoint.id()), port, Box::new(wake)) {
+            Ok(lan) => {
+                let _ = self.lan.set(lan);
+            }
+            Err(error) => tracing::warn!(%error, "LAN discovery is off"),
+        }
+    }
+
+    /// `members` are the other member Nodes of `network`; `None` stops advertising.
+    pub fn refresh_lan(&self, network: Option<&str>, members: &[String]) {
+        if let Some(lan) = self.lan.get() {
+            lan.refresh(network, members);
         }
     }
 
@@ -485,6 +509,8 @@ impl Net {
             if let Some(address) = hint {
                 addresses.push(iroh::TransportAddr::Ip(address));
             }
+            let lan = self.lan.get().map(|lan| lan.hints(device_id));
+            addresses.extend(lan.into_iter().flatten().map(iroh::TransportAddr::Ip));
             self.endpoint
                 .connect(EndpointAddr::from_parts(id, addresses), alpn)
                 .await

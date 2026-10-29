@@ -19,7 +19,7 @@ export async function localBrowserEntry(own: PublicIdentity, launch: LocalLaunch
   if (response.status === 404 || !response.ok && !launch) return null
   const info = record(await localResponse(response))
   const entry = parseEntry(info.entry)
-  if (entry.local !== true || entry.address !== location.origin) throw new Error('本机链接和当前网页对不上。')
+  if (entry.kind !== 'local' || entry.address !== location.origin) throw new Error('本机链接和当前网页对不上。')
   if (!launch) return boolean(info.enabled) && boolean(info.has_session) && info.device_id === own.deviceId ? entry : null
   if (!/^[a-f0-9]{64}$/.test(launch.token) || entry.device_id !== launch.deviceId) throw new Error('本机启动信息与目标设备不一致。')
   const exchanged = record(await localResponse(await fetch('/api/local/exchange', {

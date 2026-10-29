@@ -189,6 +189,16 @@ impl Runtime {
         if self.config.public_entry {
             return Ok(());
         }
+        let bind = self.config.network.bind;
+        // A Node bound to one address listens nowhere else.
+        if bind.is_none_or(|bind| bind.ip().is_unspecified()) {
+            let node = Arc::downgrade(self);
+            net.start_lan(move |peer| {
+                if let Some(node) = node.upgrade() {
+                    node.wake_sync(peer);
+                }
+            });
+        }
         if self.has_membership().await? {
             let network = self.membership_state().await?.genesis.network_id;
             let view = self.membership_state().await?.project()?;
@@ -684,6 +694,7 @@ impl Runtime {
     }
 
     async fn sync_loop(self: Arc<Self>) {
+        let Ok(net) = self.net().cloned() else { return };
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {},
@@ -695,6 +706,7 @@ impl Runtime {
             let Ok(view) = state.project() else { continue };
             let local = self.identity.device_id().unwrap_or_default();
             if view.revocation(&local).is_some() {
+                net.refresh_lan(None, &[]);
                 continue;
             }
             let network = view.network_id.clone();
@@ -715,6 +727,8 @@ impl Runtime {
                 })
                 .map(|member| member.device_id.clone())
                 .collect();
+            // The loop also rolls the LAN tag over each hour.
+            net.refresh_lan(Some(&network), &peers);
             for peer in peers {
                 {
                     let mut states = self.sync_peers.lock().expect("sync peers");

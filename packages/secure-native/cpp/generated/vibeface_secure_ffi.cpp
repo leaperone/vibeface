@@ -262,6 +262,26 @@ extern "C" {
         /*handle*/ uint64_t ptr, 
         RustCallStatus *uniffi_out_err
     );
+    /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_clone_lanstream(
+        /*handle*/ uint64_t handle, 
+        RustCallStatus *uniffi_out_err
+    );
+    void uniffi_vibeface_secure_ffi_fn_free_lanstream(
+        /*handle*/ uint64_t handle, 
+        RustCallStatus *uniffi_out_err
+    );
+    void uniffi_vibeface_secure_ffi_fn_method_lanstream_close(
+        /*handle*/ uint64_t ptr, 
+        RustCallStatus *uniffi_out_err
+    );
+    /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(
+        /*handle*/ uint64_t ptr
+    );
+    void uniffi_vibeface_secure_ffi_fn_method_lanstream_send(
+        /*handle*/ uint64_t ptr, 
+        RustBuffer data, 
+        RustCallStatus *uniffi_out_err
+    );
     RustBuffer uniffi_vibeface_secure_ffi_fn_func_attestation_payload(
         RustBuffer network_id, 
         RustBuffer scope_id, 
@@ -332,6 +352,17 @@ extern "C" {
     /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_verify_membership(
         RustBuffer state_json, 
         RustBuffer expected_network, 
+        RustCallStatus *uniffi_out_err
+    );
+    /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_lan_connect(
+        RustBuffer device_id, 
+        RustBuffer addrs, 
+        uint32_t timeout_ms
+    );
+    int8_t uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(
+        RustBuffer tag, 
+        RustBuffer network_id, 
+        RustBuffer device_id, 
         RustCallStatus *uniffi_out_err
     );
     RustBuffer ffi_vibeface_secure_ffi_rustbuffer_alloc(
@@ -557,6 +588,10 @@ extern "C" {
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_func_verify_membership(
     );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_func_lan_connect(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(
+    );
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_channel_open_record(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_channel_seal_message(
@@ -592,6 +627,12 @@ extern "C" {
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_membership_state_json(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_method_membership_view_json(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_method_lanstream_close(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_method_lanstream_send(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_constructor_handshake_new(
     );
@@ -2331,6 +2372,46 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
             return this->cpp_uniffi_vibeface_secure_ffi_fn_method_membership_view_json(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_clone_lanstream"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_clone_lanstream"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_clone_lanstream(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_free_lanstream"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_free_lanstream"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_free_lanstream(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_close"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_close"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_close(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_send"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_send"),
+        2,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_send(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_vibeface_secure_ffi_fn_func_attestation_payload"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_attestation_payload"),
@@ -2435,6 +2516,406 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
             return this->cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_connect"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_connect"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_func_lan_connect(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u8"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_u8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_u8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_u8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_u8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_u8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i8"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_i8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_i8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_i8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_i8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i8"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i8"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_i8(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u16"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_u16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_u16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_u16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_u16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_u16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i16"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_i16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_i16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_i16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_i16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i16"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i16"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_i16(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u32"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_u32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_u32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_u32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_u32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_u32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i32"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_i32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_i32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_i32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_i32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_i32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u64"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_u64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_u64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_u64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_u64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_u64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_i64"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_i64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_i64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_i64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_i64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_i64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_i64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_i64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_f32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_f32"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_f32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_f32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_f32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_f32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_f32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_f32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_f32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_f32"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_f32"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_f32(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_f64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_f64"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_f64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_f64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_f64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_f64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_f64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_f64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_f64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_f64"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_f64"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_f64(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_rust_buffer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_rust_buffer"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_rust_buffer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_poll_void"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_poll_void"),
+        3,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_poll_void(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_void"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_void"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_cancel_void(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_free_void"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_free_void"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_free_void(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_ffi_vibeface_secure_ffi_rust_future_complete_void"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_ffi_vibeface_secure_ffi_rust_future_complete_void"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_ffi_vibeface_secure_ffi_rust_future_complete_void(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_vibeface_secure_ffi_checksum_func_attestation_payload"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_func_attestation_payload"),
@@ -2537,6 +3018,22 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_checksum_func_verify_membership(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_channel_open_record"] = jsi::Function::createFromHostFunction(
@@ -2683,6 +3180,30 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
             return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_view_json(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_vibeface_secure_ffi_checksum_constructor_handshake_new"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_constructor_handshake_new"),
@@ -2745,6 +3266,14 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
         1,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_internal_fn_method_membership_ffi__bless_pointer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_internal_fn_method_lanstream_ffi__bless_pointer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_internal_fn_method_lanstream_ffi__bless_pointer"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_internal_fn_method_lanstream_ffi__bless_pointer(rt, thisVal, args, count);
         }
     );
 
@@ -2932,6 +3461,15 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_internal_fn_func_ffi__read_string
     auto static destructor = [](uint64_t p) {
         RustCallStatus status = {0};
         uniffi_vibeface_secure_ffi_fn_free_membership(p, &status);
+    };
+    auto ptrObj = std::make_shared<uniffi_jsi::DestructibleObject>(pointer, destructor);
+    auto obj = jsi::Object::createFromHostObject(rt, ptrObj);
+    return jsi::Value(rt, obj);
+}jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_internal_fn_method_lanstream_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+    auto pointer = uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[0]);
+    auto static destructor = [](uint64_t p) {
+        RustCallStatus status = {0};
+        uniffi_vibeface_secure_ffi_fn_free_lanstream(p, &status);
     };
     auto ptrObj = std::make_shared<uniffi_jsi::DestructibleObject>(pointer, destructor);
     auto obj = jsi::Object::createFromHostObject(rt, ptrObj);
@@ -3228,6 +3766,53 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_mem
         
         return uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
 }
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_clone_lanstream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = uniffi_vibeface_secure_ffi_fn_clone_lanstream(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_free_lanstream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        uniffi_vibeface_secure_ffi_fn_free_lanstream(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_close(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        uniffi_vibeface_secure_ffi_fn_method_lanstream_close(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_method_lanstream_send(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        uniffi_vibeface_secure_ffi_fn_method_lanstream_send(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return jsi::Value::undefined();
+}
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_attestation_payload(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_vibeface_secure_ffi_fn_func_attestation_payload(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
@@ -3358,6 +3943,395 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_verif
         
         return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
 }
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_lan_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_fn_func_lan_connect(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging<uint32_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_u8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_u8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_u8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_u8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<uint8_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_i8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_i8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_i8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_i8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_i8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_i8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_i8(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_u16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_u16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_u16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_u16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_u16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_u16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_u16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_i16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_i16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_i16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_i16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_i16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_i16(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_i16(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<int16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_u32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_u32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_u32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_u32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_u32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_u32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_u32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<uint32_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_i32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_i32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_i32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_i32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_i32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_i32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_i32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<int32_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_u64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_u64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_u64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_u64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_u64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_u64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_u64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_i64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_i64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_i64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_i64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_i64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_i64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_i64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_i64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<int64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_f32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_f32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_f32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_f32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_f32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_f32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_f32(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_f32(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<float>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_f64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_f64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_f64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_f64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_f64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_f64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_f64(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_f64(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi_jsi::Bridging<double>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_rust_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_rust_buffer(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_poll_void(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_poll_void(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<UniffiRustFutureContinuationCallback>::fromJs(rt, callInvoker, args[1]), uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[2])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_cancel_void(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_cancel_void(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_free_void(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        ffi_vibeface_secure_ffi_rust_future_free_void(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0])
+        );
+
+        
+        return jsi::Value::undefined();
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_ffi_vibeface_secure_ffi_rust_future_complete_void(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        ffi_vibeface_secure_ffi_rust_future_complete_void(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), 
+            &status
+        );
+        uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+        
+        return jsi::Value::undefined();
+}
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_attestation_payload(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_vibeface_secure_ffi_checksum_func_attestation_payload(
         );
@@ -3444,6 +4418,20 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_verify_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_vibeface_secure_ffi_checksum_func_verify_membership(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_func_lan_connect(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(
         );
 
         
@@ -3570,6 +4558,27 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_meth
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_membership_view_json(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_vibeface_secure_ffi_checksum_method_membership_view_json(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_method_lanstream_close(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_method_lanstream_send(
         );
 
         
