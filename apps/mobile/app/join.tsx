@@ -1,4 +1,3 @@
-import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
 import { ArchiveRestore, Camera, CircleCheck, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
@@ -12,6 +11,7 @@ import Svg, { Path, Rect } from 'react-native-svg'
 import { useCSSVariable } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
+import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { ErrorText } from '@/components/action'
 import { Panel, SafetyCode, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -20,6 +20,7 @@ import { Input } from '@/components/ui/input'
 import { Text } from '@/components/ui/text'
 import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
+import { Scanner } from '@/features/devices/scanner'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
 import { openedLink } from '@/lib/join-link'
 import { move } from '@/lib/motion'
@@ -30,7 +31,10 @@ export default function JoinScreen() {
   const workspace = useWorkspace()
   const device = useDevice()
   const session = workspace.session
+  const url = useLinkingURL()
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
+  // A recovery link the camera opened goes straight to finding devices again, with its computer filled in.
+  useEffect(() => { if (url && recoveryTarget(url)) setLane('recovery') }, [url])
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
   // The request is out, so the Node has spent the link.
   useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
@@ -47,7 +51,7 @@ export default function JoinScreen() {
         : device.recovery ? <RecoveryWaiting />
         : device.review?.kind === 'recovery' ? <RecoveryReview />
         : session.phase === 'joining' ? <Waiting code={session.code} onCancel={workspace.actions.cancelJoin} />
-        : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore /></Panel>
+        : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm />}
       {choosing ? <View className="border-t border-border pt-4">
         {lane === 'recovery'
@@ -106,7 +110,7 @@ function JoinForm() {
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
-  if (scanning) return <Scanner onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
+  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
   const ready = invitation.trim() !== ''
   // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
   const failure = error || device.error
@@ -122,38 +126,20 @@ function JoinForm() {
       <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} value={name} onChangeText={setName} maxLength={64} />
     </View>
     <ErrorText error={failure} />
-    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
   </View>
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
     <ErrorText error={failure} />
-    <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
-      <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
+      <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
       <Button variant="ghost" className="-ms-3 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
     </View>
   </View>
-}
-
-function Scanner({ onScanned, onCancel }: { onScanned: (link: string) => void; onCancel: () => void }) {
-  const [permission, request] = useCameraPermissions()
-  if (!permission) return null
-  if (!permission.granted) return <Panel icon={Camera} title="扫码加入">
-    <Text className="text-muted-foreground">需要相机权限才能扫码，也可以粘贴链接</Text>
-    <View className="flex-row gap-2">
-      <Button variant="ghost" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
-      <Button onPress={request}><Text>允许使用相机</Text></Button>
-    </View>
-  </Panel>
-  return <Panel icon={Camera} title="扫码加入">
-    <View className="aspect-square overflow-hidden rounded-xl bg-muted">
-      <CameraView style={{ flex: 1 }} barcodeScannerSettings={{ barcodeTypes: ['qr'] }} onBarcodeScanned={({ data }) => onScanned(data)} />
-    </View>
-    <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
-  </Panel>
 }
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {

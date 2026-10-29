@@ -34,8 +34,8 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 const SESSION_SEED: &str = "claude-session:";
 const MESSAGE_SEED: &str = "claude-user:";
 
-/// The process groups of running `claude` processes. The pidfile lists them, so a Node that
-/// could not end them ends them when it starts again.
+/// The process groups of running agent processes, by the program each one runs. The pidfile
+/// lists them, so a Node that could not end them ends them when it starts again.
 pub struct Processes {
     pidfile: PathBuf,
     running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
@@ -49,21 +49,36 @@ impl Processes {
         }
     }
 
-    fn track(&self, group: u32, bin: &Path) -> Result<()> {
+    /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
+    pub(super) fn open(pidfile: PathBuf) -> Self {
+        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
+        Self::new(pidfile)
+    }
+
+    /// Ends every recorded process; the Node calls this before it exits.
+    pub(super) async fn stop(&self) {
+        let pidfile = self.pidfile.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
+        })
+        .await;
+    }
+
+    pub(super) fn track(&self, group: u32, bin: &Path) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.insert(group, bin.to_owned());
         self.save(&running)
-            .context("record the Claude Code process group")
+            .context("record the agent process group")
     }
 
-    fn forget(&self, group: u32) {
+    pub(super) fn forget(&self, group: u32) {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if running.remove(&group).is_some() {
             let _ = self.save(&running);
         }
     }
 
-    fn tracked(&self, group: u32) -> bool {
+    pub(super) fn tracked(&self, group: u32) -> bool {
         self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -768,8 +783,8 @@ where
     match ending.status {
         TurnStatus::Completed => {}
         TurnStatus::Interrupted => {
-            let failure = own("Claude Code turn was interrupted");
-            return Err(error(ManagerFailure::Cancelled, native, failure));
+            let (outcome, failure) = manager::interrupted(&cancel, Provider::Claude);
+            return Err(error(outcome, native, failure));
         }
         _ => {
             let failure = ending
@@ -824,10 +839,8 @@ struct Live {
 impl Claude {
     /// Ends the processes an earlier Node run left, so their turns are read back as they are.
     pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
-        let pidfile = dir.join(PIDFILE);
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
         Self {
-            processes: Arc::new(Processes::new(pidfile)),
+            processes: Arc::new(Processes::open(dir.join(PIDFILE))),
             live: Default::default(),
             starting: Default::default(),
             projects: std::sync::Mutex::new(projects_dir(env)),
@@ -840,11 +853,7 @@ impl Claude {
 
     /// Ends every running Claude Code process; the Node calls this before it exits.
     pub(super) async fn stop(&self) {
-        let pidfile = self.processes.pidfile.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
-        })
-        .await;
+        self.processes.stop().await;
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
@@ -988,21 +997,7 @@ impl Executor for Claude {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let work_id = work.work_id.as_str();
-            let reject = |failure: ExecFailure| async move {
-                node.signal_work(network, work_id, Signal::StartRejected(failure))
-                    .await
-                    .map(|_| false)
-            };
-            if args["images"]
-                .as_array()
-                .is_some_and(|images| !images.is_empty())
-            {
-                return reject(ExecFailure::new(
-                    FailureKind::Rejected,
-                    "Claude Code work takes no images yet",
-                ))
-                .await;
-            }
+            let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let env = node.provider_env(Provider::Claude);
             let projects = projects_dir(&env);
             *self.projects.lock().unwrap_or_else(PoisonError::into_inner) = projects.clone();
@@ -1018,8 +1013,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::WriterBusy,
                     "Claude Code still runs another work in this session",
-                ))
-                .await;
+                ));
             }
             let _claim = Claim(self, session.clone());
             // A session is resumed where it ran; Claude Code files it under that directory.
@@ -1031,8 +1025,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::Rejected,
                     format!("the work directory {} does not exist", cwd.display()),
-                ))
-                .await;
+                ));
             }
             if work.thread.is_none() {
                 node.signal_work(network, work_id, Signal::ThreadCreated(session.clone()))
@@ -1055,7 +1048,7 @@ impl Executor for Claude {
             };
             let mut process = match launch.spawn() {
                 Ok(process) => process,
-                Err(failure) => return reject(failure).await,
+                Err(failure) => return reject(failure),
             };
             let sent = async {
                 self.processes.track(process.group, &bin)?;
@@ -1067,8 +1060,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::Lost,
                     format!("Claude Code did not take the prompt: {e}"),
-                ))
-                .await;
+                ));
             }
             let interrupted = Arc::new(AtomicBool::new(false));
             self.live().insert(
@@ -1705,6 +1697,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bot_turn_claude_code_aborts_on_its_own_fails_instead_of_reading_as_stopped()
+    -> Result<()> {
+        let place = Place::new()?;
+        let (record, _) = recorder();
+        let (_, never) = tokio::sync::watch::channel(false);
+        let (result, _, _) = bot_turn(
+            &place,
+            &bot_config(&place, record),
+            "abort now",
+            None,
+            never,
+        )
+        .await;
+        let Err(error) = result else {
+            bail!("an aborted turn has no reply");
+        };
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("a manager error")?;
+        assert_eq!(error.outcome, ManagerFailure::Failed, "{error}");
+        assert!(error.to_string().contains("without being asked"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_bot_turn_shows_no_provider_key() -> Result<()> {
         let place = Place::new()?;
         let (record, _) = recorder();
@@ -1820,8 +1837,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, network, spec.clone(), now_ms())?;
-        node.executor(Provider::Claude)?
-            .start(node, network, spec, None, &json!({}))
+        let claude = node.executor(Provider::Claude)?;
+        node.start_work(claude, network, spec, None, &json!({}))
             .await
     }
 
@@ -1982,11 +1999,16 @@ mod tests {
         }
         let (claude, args) = (node.executor(Provider::Claude)?, json!({}));
         let (a, b) = tokio::join!(
-            claude.start(&node, &network, &specs[0], Some(&session), &args),
-            claude.start(&node, &network, &specs[1], Some(&session), &args),
+            node.start_work(claude, &network, &specs[0], Some(&session), &args),
+            node.start_work(claude, &network, &specs[1], Some(&session), &args),
         );
-        a?;
-        b?;
+        let refused: Vec<_> = [a, b].into_iter().filter_map(Result::err).collect();
+        assert_eq!(refused.len(), 1, "the start of the other one says why");
+        assert!(
+            format!("{:#}", refused[0]).contains("still runs another work in this session"),
+            "{:#}",
+            refused[0]
+        );
         let mut rejected = 0;
         for spec in &specs {
             let state = until(&node, &spec.work_id, |state| {

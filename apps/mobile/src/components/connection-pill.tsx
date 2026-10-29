@@ -14,7 +14,9 @@ const looks: Record<Connection['state'], { label: string; icon: LucideIcon; tone
   online: { label: '在线', icon: ShieldCheck, tone: 'success' },
 }
 
-const describe = (connection: Connection) => [connection.entry, connection.state === 'online' ? '已加密' : null, looks[connection.state].label].filter(Boolean).join(' · ')
+/** Online straight to the device on the LAN says so; otherwise the state alone. */
+const label = (connection: Connection) => connection.state === 'online' && connection.direct ? '局域网直连' : looks[connection.state].label
+const describe = (connection: Connection) => [connection.entry, connection.state === 'online' ? '已加密' : null, label(connection)].filter(Boolean).join(' · ')
 
 /** As the web's connection capsule: the entry device by name, a shield once the encrypted link is up. */
 export function ConnectionPill({ connection }: { connection: Connection }) {
@@ -22,7 +24,7 @@ export function ConnectionPill({ connection }: { connection: Connection }) {
   return <View accessible accessibilityLabel={describe(connection)} className="min-h-11 flex-row items-center gap-2 px-2 py-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />
     <Text className="min-w-0 flex-1 text-meta">{connection.entry}</Text>
-    <Text className="text-meta text-muted-foreground">{look.label}</Text>
+    <Text className="text-meta text-muted-foreground">{label(connection)}</Text>
   </View>
 }
 

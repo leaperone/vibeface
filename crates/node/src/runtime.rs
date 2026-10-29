@@ -509,13 +509,14 @@ impl Runtime {
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
-    /// Stops the managed App Server, Claude Code processes and Cursor bridge; the Node calls this
-    /// on SIGTERM before exiting.
+    /// Stops the managed App Server, the Claude Code, pi and opencode processes and the Cursor
+    /// bridge; the Node calls this on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.delivery.shutdown().await;
         self.stop_network().await;
         self.codex.stop().await;
         self.claude.stop().await;
+        self.pi.stop().await;
         self.opencode.stop().await;
         if let Some(bridge) = self.cursor.get() {
             bridge.stop().await;

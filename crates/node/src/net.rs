@@ -15,11 +15,12 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 mod discovery;
+mod lan;
 pub mod pkarr;
 
 pub const DISCOVERY: &[u8] = b"vibeface/discovery/1";
@@ -36,6 +37,29 @@ pub const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
 const RELAY_TOKEN_DOMAIN: &[u8] = b"vibeface:relay:v1";
+
+/// A peer that was not reached in time or did not answer before the timeout. A request it may
+/// have received is reconciled before it is sent again.
+#[derive(Debug)]
+pub struct Unanswered(String);
+
+impl Unanswered {
+    pub fn error(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unanswered {}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -283,6 +307,7 @@ pub struct Net {
     pub endpoint: Endpoint,
     lookup: MemoryLookup,
     discovery: discovery::Discovery,
+    lan: OnceLock<lan::Lan>,
     relays: Mutex<HashSet<RelayUrl>>,
     connections: Mutex<HashMap<(EndpointId, &'static [u8]), Connection>>,
 }
@@ -401,6 +426,7 @@ impl Net {
             endpoint,
             lookup,
             discovery,
+            lan: OnceLock::new(),
             relays: Mutex::new(known),
             connections: Mutex::new(HashMap::new()),
         })
@@ -422,6 +448,50 @@ impl Net {
                     .insert_relay(url.clone(), Arc::new(relay_config(url.clone(), None)))
                     .await;
             }
+        }
+    }
+
+    /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
+    /// which one appeared. Without mDNS, dialing keeps the other addresses.
+    pub fn start_lan(&self, wake: impl Fn(&str) + Send + Sync + 'static) {
+        let sockets = self.endpoint.bound_sockets();
+        let Some(port) = sockets.first().map(SocketAddr::port) else {
+            return;
+        };
+        // An address family listening on another port, or not at all, would be advertised
+        // with a port that does not answer.
+        let listens = |v6: bool| {
+            sockets
+                .iter()
+                .any(|s| s.is_ipv6() == v6 && s.port() == port)
+        };
+        let off = [
+            (false, mdns_sd::IfKind::IPv4),
+            (true, mdns_sd::IfKind::IPv6),
+        ]
+        .into_iter()
+        .filter(|(v6, _)| !listens(*v6))
+        .map(|(_, kind)| kind)
+        .collect();
+        match lan::Lan::start(device_id(&self.endpoint.id()), port, off, Box::new(wake)) {
+            Ok(lan) => {
+                let _ = self.lan.set(lan);
+            }
+            Err(error) => tracing::warn!(event = "lan.off", %error, "LAN discovery is off"),
+        }
+    }
+
+    /// Withdraws this Node's LAN advert before it exits.
+    pub async fn stop_lan(&self) {
+        if let Some(lan) = self.lan.get() {
+            lan.stop().await;
+        }
+    }
+
+    /// `members` are the other member Nodes of `network`; `None` stops advertising.
+    pub fn refresh_lan(&self, network: Option<&str>, members: &[String]) {
+        if let Some(lan) = self.lan.get() {
+            lan.refresh(network, members);
         }
     }
 
@@ -485,13 +555,15 @@ impl Net {
             if let Some(address) = hint {
                 addresses.push(iroh::TransportAddr::Ip(address));
             }
+            let lan = self.lan.get().map(|lan| lan.hints(device_id));
+            addresses.extend(lan.into_iter().flatten().map(iroh::TransportAddr::Ip));
             self.endpoint
                 .connect(EndpointAddr::from_parts(id, addresses), alpn)
                 .await
         })
         .await
-        .context("peer did not answer in time")?
-        .map_err(|error| anyhow!("peer is unreachable: {error}"))?;
+        .map_err(|_| Unanswered::error("peer did not answer in time".into()))?
+        .map_err(|error| Unanswered::error(format!("peer is unreachable: {error}")))?;
         self.connections
             .lock()
             .expect("connection cache")
@@ -543,7 +615,9 @@ impl Net {
         let connection = self.connect(device_id, alpn).await?;
         let result = tokio::time::timeout(timeout, call(&connection, request))
             .await
-            .context("peer response timed out; outcome may be unknown")
+            .map_err(|_| {
+                Unanswered::error("peer response timed out; outcome may be unknown".into())
+            })
             .flatten();
         if result.is_err() && connection.close_reason().is_none() {
             // The peer may have restarted behind a connection QUIC still thinks is open.

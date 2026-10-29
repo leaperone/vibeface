@@ -163,36 +163,25 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,"avatar":bot.shown_avatar(),
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
                 Ok(json!({ "bots": bots }))
             }
-            Tool::ReadBot => {
-                let now = now_ms();
-                let store = self.store.lock().await;
-                let bot = store.find_bot(network, field(&args, "bot")?)?;
-                let schedules: Vec<_> = store
-                    .schedules(network, &bot.conversation_id)?
-                    .iter()
-                    .map(|entry| crate::scheduler::schedule_row(entry, now))
-                    .collect();
-                let memory = store.memories(network, &bot.conversation_id)?;
-                let library = store.skills(network)?;
-                let skills = bot.skills.as_ref().map(|set| {
-                    library
-                        .iter()
-                        .filter(|entry| set.contains(&entry.skill_id))
-                        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
-                        .collect::<Vec<_>>()
-                });
-                Ok(
-                    json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
-                    "instructions":bot.instructions,"project":bot.project,
-                    "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
-                    "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
-                )
+            Tool::ReadBot => read_bot(
+                &*self.store.lock().await,
+                network,
+                field(&args, "bot")?,
+                now_ms(),
+            ),
+            Tool::ListSessions => {
+                let sessions = self
+                    .store
+                    .lock()
+                    .await
+                    .attributed_sessions(network, &scope)?;
+                list_sessions(&sessions, &args)
             }
             Tool::DeleteBot => {
                 let manager = access
@@ -534,9 +523,9 @@ impl Runtime {
                 bail!("agent picks a provider of this device; another device's bot picks its own")
             }
         };
-        // The Codex App Server runs every turn of its threads itself. Another provider's session
-        // may be open in a program the Node does not see, so it takes work only in a session one
-        // of its works on this device ran in.
+        if let WorkKind::Agent(provider) = kind {
+            provider.check_work(args)?;
+        }
         if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
             match self.ran_on(network, thread).await? {
                 Some(ran) if ran != provider => bail!(
@@ -544,7 +533,7 @@ impl Runtime {
                     ran.label(),
                     ran.name()
                 ),
-                None if provider != Provider::Codex => bail!(
+                None if !provider.work().any_thread => bail!(
                     "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
                     provider.label()
                 ),
@@ -611,24 +600,27 @@ impl Runtime {
     /// connection is up when that is Codex; `None` when none would, as `track_work` then says.
     async fn ready_for(&self, network: &str, args: &Value) -> Option<Provider> {
         let provider = self.executing(network, args).await.ok()?;
-        if provider == Provider::Codex {
+        if provider.on_app_server() {
             self.codex.ready().await;
         }
         Some(provider)
     }
 
     /// The provider a work on this device runs on: `agent`; else the one its thread's works ran
-    /// on, a thread none ran in being a Codex one; else the one the work it continues ran on;
-    /// else the bot's own provider when it executes work here, else the first one that does.
+    /// on, a thread none ran in going to the provider that takes work in any thread; else the
+    /// one the work it continues ran on; else the bot's own provider when it executes work
+    /// here, else the first one that does.
     async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let earlier = match (agent, args["thread"].as_str(), args["continues"].as_str()) {
             (Some(_), _, _) => None,
-            (None, Some(thread), _) => {
-                Some((self.ran_on(network, thread).await?).unwrap_or(Provider::Codex))
-            }
+            (None, Some(thread), _) => (self.ran_on(network, thread).await?).or_else(|| {
+                Provider::ALL
+                    .into_iter()
+                    .find(|provider| provider.work().any_thread)
+            }),
             (None, None, Some(original)) => (self.store.lock().await.work_record(original)?)
                 .and_then(|run| match run.kind {
                     WorkKind::Agent(provider) => Some(provider),
@@ -783,6 +775,74 @@ pub(crate) fn blob_page(
     Ok(page)
 }
 
+/// `read_bot`: one bot's whole configuration, every skill it uses included, the whole library
+/// when it uses all of them.
+pub(crate) fn read_bot(
+    store: &crate::store::Store,
+    network: &str,
+    wanted: &str,
+    now: i64,
+) -> Result<Value> {
+    let bot = store.find_bot(network, wanted)?;
+    let schedules: Vec<_> = store
+        .schedules(network, &bot.conversation_id)?
+        .iter()
+        .map(|entry| crate::scheduler::schedule_row(entry, now))
+        .collect();
+    let memory = store.memories(network, &bot.conversation_id)?;
+    let skills: Vec<_> = store
+        .skills(network)?
+        .into_iter()
+        .filter(|entry| {
+            bot.skills
+                .as_ref()
+                .is_none_or(|set| set.contains(&entry.skill_id))
+        })
+        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
+        .collect();
+    Ok(
+        json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
+        "instructions":bot.instructions,"project":bot.project,
+        "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+        "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
+    )
+}
+
+/// `list_sessions`: a page of the sessions this bot follows, newest first, older than the
+/// `before` a previous page returned as `next`. The cursor is a session's rank, so a session
+/// handed over or muted between pages neither breaks the next page nor hides another.
+pub(crate) fn list_sessions(sessions: &[Value], args: &Value) -> Result<Value> {
+    let before = args["before"].as_str();
+    let older: Vec<&Value> = sessions
+        .iter()
+        .rev()
+        .filter(|row| before.is_none_or(|before| row["rank"].as_str() < Some(before)))
+        .collect();
+    let rows: Vec<Value> = older
+        .iter()
+        .map(|row| crate::scheduler::session_row(row))
+        .collect();
+    let (page, more) = page(&rows, 0, args);
+    let next = more.then(|| older[page.len() - 1]["rank"].clone());
+    Ok(json!({"sessions":page,"more":more,"next":next}))
+}
+
+/// Up to `limit` rows from `start` within `PAGE_BYTES`, and whether more follow.
+fn page(rows: &[Value], start: usize, args: &Value) -> (Vec<Value>, bool) {
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+    let mut page = Vec::new();
+    let mut used = 0;
+    for row in rows.iter().skip(start).take(limit) {
+        used += row.to_string().len();
+        if !page.is_empty() && used > PAGE_BYTES {
+            break;
+        }
+        page.push(row.clone());
+    }
+    let more = start + page.len() < rows.len();
+    (page, more)
+}
+
 /// `work_status`: one work by `work_id` in full, or a page of this conversation's works newest
 /// first, after the work `before` names, within `PAGE_BYTES`.
 pub(crate) fn work_status(
@@ -821,16 +881,6 @@ pub(crate) fn work_status(
         }
         None => 0,
     };
-    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
-    let mut page = Vec::new();
-    let mut used = 0;
-    for row in rows.iter().skip(start).take(limit) {
-        used += row.to_string().len();
-        if !page.is_empty() && used > PAGE_BYTES {
-            break;
-        }
-        page.push(row.clone());
-    }
-    let more = start + page.len() < rows.len();
+    let (page, more) = page(&rows, start, args);
     Ok(json!({"works":page,"more":more}))
 }

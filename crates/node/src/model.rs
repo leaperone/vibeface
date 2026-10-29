@@ -810,6 +810,7 @@ pub enum EventBody {
         agent: crate::providers::Provider,
         session_id: String,
         cwd: String,
+        /// What the session last said when it first came to a bot; a hand-over keeps it.
         summary: String,
     },
     /// Written by the device running the session, in its owner's conversation: that bot stopped

@@ -9,6 +9,7 @@ the turn goes:
   vanish  records the finished turn in the transcript, then sleeps without reporting it
   die     records the prompt, then exits before the turn ends
   fail    ends the turn with an API error
+  abort   ends the turn as aborted though nobody asked it to stop
   other   replies, runs one Bash tool, and answers "done: <prompt>"
 
 Every argument list and stdin frame is appended to `$FAKE_CLAUDE_LOG` as one JSON line.
@@ -138,6 +139,9 @@ def turn(frame):
         result("success", True, text, "completed")
         return
     assistant("msg_1", {"type": "text", "text": "Looking."}, "tool_use")
+    if mode == "abort":
+        result("error_during_execution", True, "", "aborted_tools")
+        return
     if mode == "hang":
         for line in sys.stdin:
             control = json.loads(line)

@@ -7,8 +7,12 @@ export const joinCopy = {
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
+  scan: '扫码加入',
+  paste: '或粘贴加入链接',
   linkFilled: '已填入加入链接',
   deviceName: '这台设备的名字',
+  join: '加入',
+  joining: '加入中',
 }
 
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
@@ -49,6 +53,15 @@ export const recoveryCopy = {
   cancelLate: '如果已经提交，取消不会撤回。',
   connectTo: '连接到哪台电脑',
   manual: '手动填写',
+  byPhone: '用手机找回',
+  qr: '找回二维码',
+  scanHint: '在手机 App 的“用恢复文件找回”里扫码',
+  unreachable: '手机连不到这台电脑，先连同一个 Wi-Fi 再看',
+  scan: '扫电脑上的找回二维码',
+  paste: '或粘贴找回链接',
+  pasteLabel: '找回链接',
+  notRecoveryLink: '这不是找回链接，到电脑网页的设置 → 找回 → 用手机找回里复制',
+  target: '要连的电脑',
   replaceHint: '需要现在的恢复文件和旧密码，旧文件会作废',
   replaced: '已换密码，旧恢复文件已失效',
   waiting: '找回等待生效',
@@ -59,8 +72,7 @@ export const recoveryCopy = {
   stoppedNote: '新恢复文件用不了，旧文件仍然有效',
   saveNew: '保存新的恢复文件',
   recovered: '已找回，旧文件已作废',
-  why: '设备都丢了时，靠它找回',
-  needsPassword: '没有恢复密码，这个文件打不开',
+  why: '设备都丢了时，用它和恢复密码找回',
   onlyCopy: '只有这一份，丢了不能补',
   keptApart: '已把文件和密码分开保存',
   pending: '有人正在用恢复文件找回',
@@ -76,6 +88,9 @@ export const recoveryCopy = {
   leakedNote: '对方还能再试，换密码让旧文件作废',
   later: '以后再说',
   rotate: '换恢复密码',
+  file: '恢复文件',
+  codeLabel: '识别码',
+  day: (at: number) => new Date(at).toLocaleDateString('zh-CN'),
 }
 
 /** What a pending recovery would change: the devices it brings in, then the ones here it would remove. */

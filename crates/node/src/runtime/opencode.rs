@@ -1037,11 +1037,8 @@ impl Opencode {
                 return Err(failed(native, failure));
             }
             Some(reply) if reply["error"]["type"] == "aborted" => {
-                return Err(error(
-                    ManagerFailure::Cancelled,
-                    native,
-                    own("the opencode run was aborted"),
-                ));
+                let (outcome, failure) = manager::interrupted(&cancel, Provider::Opencode);
+                return Err(error(outcome, native, failure));
             }
             Some(reply) if !reply["error"].is_null() => {
                 return Err(failed(native, failure_of(&reply["error"])));
@@ -1434,27 +1431,22 @@ impl Executor for Opencode {
         Box::pin(async move {
             let id = work.work_id.as_str();
             let sending = Claim::take(&self.sending, id);
-            let reject = |failure: ExecFailure| async move {
-                (node
-                    .signal_work(network, id, Signal::StartRejected(failure))
-                    .await)
-                    .map(|_| false)
-            };
+            let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let mut files = Vec::new();
             for image in args["images"].as_array().into_iter().flatten() {
                 match image_part(image) {
                     Ok(file) => files.push(file),
-                    Err(failure) => return reject(failure).await,
+                    Err(failure) => return reject(failure),
                 }
             }
             // ponytail: opencode takes no effort per message; a model variant would carry it.
             let model = match parse_model(args["model"].as_str().unwrap_or_default()) {
                 Ok(model) => model,
-                Err(failure) => return reject(failure).await,
+                Err(failure) => return reject(failure),
             };
             let (conn, serving) = match self.conn().await {
                 Ok(conn) => conn,
-                Err(error) => return reject(launch_failure(&error)).await,
+                Err(error) => return reject(launch_failure(&error)),
             };
             let (session, model_change) = match thread {
                 Some(session) => match self.session(&conn, session).await? {
@@ -1470,7 +1462,7 @@ impl Executor for Opencode {
                             FailureKind::Rejected,
                             format!("opencode has no session {session}"),
                         );
-                        return reject(failure).await;
+                        return reject(failure);
                     }
                 },
                 None => {
@@ -1480,11 +1472,11 @@ impl Executor for Opencode {
                             FailureKind::Rejected,
                             "the work directory must be an existing absolute path",
                         );
-                        return reject(failure).await;
+                        return reject(failure);
                     }
                     match self.create(&conn, &work.cwd, model.as_ref()).await {
                         Ok(session) => (session, None),
-                        Err(failure) => return reject(failure).await,
+                        Err(failure) => return reject(failure),
                     }
                 }
             };
@@ -1521,7 +1513,7 @@ impl Executor for Opencode {
                         _ => None,
                     };
                     if let Some(busy) = busy {
-                        return reject(ExecFailure::new(FailureKind::WriterBusy, busy)).await;
+                        return reject(ExecFailure::new(FailureKind::WriterBusy, busy));
                     }
                     claim
                 }
@@ -1552,8 +1544,7 @@ impl Executor for Opencode {
                 return reject(ExecFailure::new(
                     FailureKind::Transport,
                     format!("opencode: {error:#}"),
-                ))
-                .await;
+                ));
             }
             match self.send(&conn, &session, &body).await {
                 Sent::Taken => {
@@ -1567,7 +1558,7 @@ impl Executor for Opencode {
                         tracing::warn!(event = "opencode.work_update_pending", %error, work_id = id, "the opencode work waits for its probe");
                     }
                 }
-                Sent::Refused(failure) => return reject(failure).await,
+                Sent::Refused(failure) => return reject(failure),
                 Sent::Unknown(detail) => {
                     tracing::warn!(
                         event = "opencode.send_unknown",
@@ -1603,7 +1594,8 @@ impl Executor for Opencode {
                 });
             }
             let session = work.state.thread().context("the work has no session")?;
-            let (conn, _serving) = self.conn().await?;
+            let conn = (self.running().await)
+                .context("no opencode serve runs; the next one reads this work back")?;
             let Some(found) = self.session(&conn, session).await? else {
                 return Ok(Probe::Missing);
             };
@@ -2395,10 +2387,8 @@ mod tests {
         let at = now_ms();
         (node.store.lock().await).accept_work(&node.identity, network, spec.clone(), at)?;
         let args = json!({"model":"fake/m"});
-        let sends = node
-            .opencode
-            .start(node, network, spec, None, &args)
-            .await?;
+        let opencode = node.opencode.clone();
+        let sends = (node.start_work(opencode.as_ref(), network, spec, None, &args)).await?;
         ensure!(!sends, "the Node sends an opencode work itself");
         Ok(())
     }
@@ -2542,6 +2532,41 @@ mod tests {
             server.steer(&into, "m-3", "late").await,
             SteerAck::Refused("the reply already ended".into())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_turn_aborted_by_opencode_is_not_a_requested_stop() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let config = bot(&place, &server, "attempt-1", &turns);
+        let interrupted = async {
+            let (session, _) = started(&turns).await;
+            let mut fake = place.fake.lock().unwrap();
+            let held = fake.held.remove(&session).context("held reply")?;
+            let reply = fake
+                .messages(&session)
+                .iter_mut()
+                .find(|reply| reply["id"] == held)
+                .context("reply")?;
+            reply["error"] = json!({"type":"aborted","message":"The operation was aborted."});
+            reply["time"]["completed"] = json!(now_ms());
+            fake.sessions.get_mut(&session).unwrap().busy = false;
+            anyhow::Ok(())
+        };
+        let ((result, _, _), ended) = tokio::join!(
+            turn(&place, &config, "HOLD", None, watch::channel(false).1),
+            interrupted
+        );
+        ended?;
+        let error = result.err().context("an aborted turn has no reply")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("manager error")?;
+        assert_eq!(error.outcome, ManagerFailure::Failed, "{error}");
+        assert!(error.to_string().contains("without being asked"), "{error}");
+        assert_eq!(place.fake.lock().unwrap().aborts, 0);
         Ok(())
     }
 
@@ -2899,6 +2924,13 @@ mod tests {
         until(&node, |state| matches!(state, WorkState::Running { .. })).await?;
         drop(node);
         let node = Arc::new(Runtime::reopen(&place.dir.join("node")).await?);
+        assert!(node.probe_work(&network, "w-1", true).await.is_err());
+        assert_eq!(
+            place.recorded("argv").lines().count(),
+            1,
+            "a probe started no serve"
+        );
+        drop(node.opencode.conn().await?);
         node.probe_work(&network, "w-1", true).await?;
         let record = until(&node, WorkState::finished).await?;
         assert_eq!(
@@ -2926,8 +2958,13 @@ mod tests {
             crate::work::transition(&mut work, Signal::ThreadCreated(session.into()));
             work
         };
-        assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
+        assert!(server.probe(&on("ses_gone")).await.is_err());
+        assert!(
+            place.recorded("argv").is_empty(),
+            "a probe started no serve"
+        );
         let (conn, _serving) = server.conn().await?;
+        assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
         let cwd = place.dir.join("work").display().to_string();
         let created = server.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
@@ -2964,10 +3001,14 @@ mod tests {
         )?;
         let args = json!({"model":"fake/other"});
         let opencode = node.opencode.clone();
-        let sends = opencode
-            .start(&node, &network, &second, Some(&session), &args)
-            .await?;
-        assert!(!sends);
+        let busy = node
+            .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
+            .await
+            .expect_err("the session runs another work");
+        assert!(
+            format!("{busy:#}").contains("still holds this opencode session"),
+            "the dispatch says why: {busy:#}"
+        );
         assert_eq!(
             place.fake.lock().unwrap().sessions[&session].model,
             json!({"providerID":"fake","id":"m"}),
@@ -3011,9 +3052,11 @@ mod tests {
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
-        opencode
-            .start(&node, &network, &second, Some(&session), &args)
-            .await?;
+        let busy = node
+            .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
+            .await
+            .expect_err("the unsure work holds the session");
+        assert!(format!("{busy:#}").contains("still holds"), "{busy:#}");
         let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
         assert_eq!(
             refused.state,
@@ -3049,11 +3092,14 @@ mod tests {
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let (one, two) = tokio::join!(
-            opencode.start(&node, &network, &first, Some(&session), &args),
-            opencode.start(&node, &network, &second, Some(&session), &args)
+            node.start_work(opencode.as_ref(), &network, &first, Some(&session), &args),
+            node.start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
         );
-        one?;
-        two?;
+        assert_eq!(
+            [one, two].iter().filter(|start| start.is_err()).count(),
+            1,
+            "the refused start says so"
+        );
         assert_eq!(
             place.prompts().len(),
             1,

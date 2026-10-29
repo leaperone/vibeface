@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Monitor, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -11,8 +11,8 @@ import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import type { Member } from "@vibeface/client/lib/node.ts"
-import { AiSettings, docs } from "./ai-settings"
+import { entryAddress, type Member } from "@vibeface/client/lib/node.ts"
+import { AiSettings } from "./ai-settings"
 import { JoinRequests } from "./join"
 
 type DeviceRow = {
@@ -39,8 +39,9 @@ export function useDeviceRows(): DeviceRow[] {
   }).sort((a, b) => rank(a) - rank(b))
 }
 
-export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): LucideIcon {
-  if (row.kind === "node") return row.entry ? Laptop : Server
+/** One icon per kind of device; which computer this browser goes through is a tag, not another icon. */
+export function deviceIcon(row: Pick<DeviceRow, "kind" | "name">): LucideIcon {
+  if (row.kind === "node") return terms.thisComputer.icon
   const form = deviceForm(row.kind, row.name)
   return form === "tablet" ? Tablet : form === "phone" ? Smartphone : Monitor
 }
@@ -59,7 +60,7 @@ function Online({ online, compact = false }: { online: boolean; compact?: boolea
 function useEntryLabel() {
   const { ready } = useDevice()
   const { connectionOnline } = useWorkspace()
-  if (ready && isLoopback(ready.entry.address)) return terms.thisComputer.label
+  if (ready && isLoopback(entryAddress(ready.entry))) return terms.thisComputer.label
   return connectionOnline ? "当前连接" : "重连中"
 }
 
@@ -117,7 +118,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const localSession = ready?.principal.source === "local_session"
   if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
-  const address = row.entry ? ready?.entry.address ?? "" : ""
+  const address = row.entry && ready ? entryAddress(ready.entry) : ""
   const saved = device.entries.find((item) => item.device_id === row.id)
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
@@ -147,12 +148,10 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
       </div>
     </Section> : null}
 
-    {row.entry ? <Section title={terms.address.label}>
-      <p className="break-all font-mono text-meta">{address}</p>
-      {isLoopback(address) || !address.startsWith("https:") ? <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-meta">
-        <span className="flex items-center gap-1.5 text-muted-foreground"><Monitor aria-hidden="true" className="size-4 shrink-0" />只能在本机打开</span>
-        <a className="hit-area relative font-medium underline underline-offset-4" href={`${docs}node.md#%E9%85%8D%E7%BD%AE%E5%85%AC%E5%85%B1%E5%85%A5%E5%8F%A3`} target="_blank" rel="noopener noreferrer">怎么设置</a>
-      </p> : null}
+    {row.entry ? <Section title="在哪能打开">
+      {isLoopback(address) || !address.startsWith("https:")
+        ? <p className="flex items-center gap-2"><terms.thisComputer.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />只能在{isLoopback(address) ? "这" : "那"}台电脑上打开</p>
+        : <p className="flex items-center gap-2"><terms.address.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />在哪都能打开</p>}
       {canManage || localSession ? <div className="grid gap-2 border-t pt-3">
         <label className="flex min-h-11 items-center justify-between gap-3">
           <span className="grid gap-0.5"><span>{isLoopback(address) ? "在这台电脑上直接打开" : "在那台电脑上直接打开"}</span><span className="text-meta text-muted-foreground">不用加入链接</span></span>
@@ -170,8 +169,8 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     <SettingsGroup>
       <SettingsDisclosure icon={Info} label="详细信息">
         <div className="grid gap-3 text-meta text-muted-foreground">
+          {address ? <DetailRow label={terms.address.label} value={address} mono /> : null}
           <DetailRow label="设备编号" value={row.id} mono />
-          {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
       {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label} description={deviceCopy.manageHint}>

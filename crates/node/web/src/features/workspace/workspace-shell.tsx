@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -25,6 +25,7 @@ import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
+import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
 import { LocalSession } from "./local-session"
 
 /** `landing`: the title takes the focus when the shell replaces the page the person was on. */
@@ -211,12 +212,12 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
   const workspace = useWorkspace()
   const device = useDevice()
   const { link, entrances } = device
-  const address = device.ready?.entry.address ?? ""
+  const address = device.ready ? entryAddress(device.ready.entry) : ""
   const entryId = device.ready?.entry.device_id
   const entryName = device.directory?.members.find((member) => member.device_id === entryId)?.name || workspace.info?.name
   const name = entryName || addressName(address)
   // Devices of another network this browser opened before; the current network fails over by itself.
-  const others = device.entries.filter((item) => !item.local && !device.directory?.members.some((member) => member.device_id === item.device_id))
+  const others = device.entries.filter((item) => item.kind !== "local" && !device.directory?.members.some((member) => member.device_id === item.device_id))
   const state: { label: string; icon: LucideIcon; tone: string; encrypted?: boolean } = link.kind === "connecting"
     ? { label: entrances.length > 1 ? "切换中" : "连接中", icon: ArrowRightLeft, tone: "text-info" }
     : !workspace.connectionOnline || link.kind === "offline"
@@ -227,7 +228,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
-        : { label: "在线", icon: terms.encrypted.icon, tone: "text-success", encrypted: true }
+        : { label: "在线", icon: Wifi, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
       <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
@@ -246,14 +247,14 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}
         {others.length ? <>
           <p className="mt-1 font-medium">换一台设备</p>
-          <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={`${item.address}:${item.device_id}`}>
+          <ul className="grid gap-1" aria-label="换一台设备">{others.map((item) => <li key={entryKey(item)}>
             <button type="button" className="flex min-h-9 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-muted active:bg-muted" onClick={() => { void device.connect(item).catch(() => {}) }}>
-              <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(item.address)}</span>
+              <span className="min-w-0 flex-1 truncate">{device.entryName(item) || addressName(entryAddress(item))}</span>
               <ArrowRightLeft aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             </button>
           </li>)}</ul>
         </> : null}
-        {entrances.length > 1 ? <>
+        {entrances.length > 1 && device.ready?.principal.can_manage ? <>
           <p className="mt-1 font-medium">可切换的访问地址</p>
           <ul className="grid gap-1" aria-label="可切换的访问地址">{entrances.map((item) => <li key={item.device_id} className="flex min-w-0 items-center gap-2">
             <span className="min-w-0 flex-1 truncate" title={item.gateway_url}>{device.directory?.members.find((member) => member.device_id === item.device_id)?.name || addressName(item.gateway_url)}</span>

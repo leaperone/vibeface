@@ -2,8 +2,8 @@
 //! process idles between turns, and each turn starts with its own environment and instructions.
 //! Before a prompt is sent the Node keeps where pi writes the session, so after a restart it
 //! reads the turn back from that file and never sends it again.
+use super::claude::Processes;
 use super::executor::{Executor, SteerAck, SteerTrace};
-use super::manager_control::group_alive;
 use super::*;
 use crate::manager::{CodexTurn, ManagerConfig, ManagerError, ManagerFailure};
 use crate::scheduling::{SteerOutcome, SteerTarget};
@@ -19,6 +19,8 @@ use vibeface_bridge::agent::{self, AgentResult};
 use vibeface_bridge::failure::{ExecFailure, FailureKind};
 use vibeface_bridge::turn::TurnStatus;
 
+/// Process groups of the running pi processes, with the program each one runs.
+const PIDFILE: &str = "pi.pid";
 /// Set in every pi process the Node starts; the vibeface extension stays out of those.
 const RUN_ENV: &str = "VIBEFACE_PI_RUN";
 /// How long pi may take to start, or to answer a command.
@@ -37,6 +39,7 @@ const STEER_LEAD: &str =
 pub struct Pi {
     /// Per session: its pointer (`<session>.json`) and the bot's instructions (`<session>.md`).
     dir: PathBuf,
+    processes: Arc<Processes>,
     live: std::sync::Mutex<HashMap<String, Live>>,
     /// Sessions a work resumes, from its start until its pi has ended.
     resuming: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -65,8 +68,8 @@ struct Live {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Pointer {
     file: PathBuf,
-    /// The process group of the session's latest pi; while it lives, so may the turn.
-    /// ponytail: a reused group ID reads as alive until that process ends.
+    /// The process group of the session's latest pi; while this Node run tracks it, the turn
+    /// may go on.
     group: u32,
     /// The session's last entry before that prompt; `None` when it had none.
     after: Option<String>,
@@ -101,6 +104,7 @@ struct Launch {
 struct Process {
     child: Child,
     group: u32,
+    _tracked: Tracked,
     rpc: Arc<Rpc>,
     /// Everything pi writes but the responses.
     events: mpsc::UnboundedReceiver<Value>,
@@ -383,8 +387,17 @@ async fn read_output(stdout: ChildStdout, rpc: Arc<Rpc>, events: mpsc::Unbounded
     *lock(&rpc.waiting) = None;
 }
 
+/// A pi process group recorded in the pidfile until its process is done.
+struct Tracked(Arc<Processes>, u32);
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.0.forget(self.1);
+    }
+}
+
 impl Process {
-    fn spawn(launch: &Launch) -> Result<Self, ExecFailure> {
+    fn spawn(launch: &Launch, processes: &Arc<Processes>) -> Result<Self, ExecFailure> {
         if !launch.cwd.is_dir() {
             return Err(ExecFailure::new(
                 FailureKind::Rejected,
@@ -416,6 +429,10 @@ impl Process {
         let group = child
             .id()
             .ok_or_else(|| ExecFailure::new(FailureKind::Lost, "pi exited as it started"))?;
+        processes
+            .track(group, &launch.bin)
+            .map_err(|error| ExecFailure::new(FailureKind::Unknown, format!("{error:#}")))?;
+        let tracked = Tracked(processes.clone(), group);
         let (Some(stdin), Some(stdout), Some(mut stderr)) =
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
@@ -440,6 +457,7 @@ impl Process {
         Ok(Self {
             child,
             group,
+            _tracked: tracked,
             rpc,
             events,
             stderr,
@@ -568,12 +586,19 @@ impl Process {
 }
 
 impl Pi {
+    /// Ends the pi processes an earlier Node run left, so their turns are read back as they are.
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
             dir: data_dir.join("pi"),
+            processes: Arc::new(Processes::open(data_dir.join(PIDFILE))),
             live: Default::default(),
             resuming: Default::default(),
         }
+    }
+
+    /// Ends every running pi; the Node calls this before it exits.
+    pub(super) async fn stop(&self) {
+        self.processes.stop().await;
     }
 
     fn pointer_path(&self, session: &str) -> Result<PathBuf> {
@@ -619,7 +644,7 @@ impl Pi {
         launch: &Launch,
         session: &str,
     ) -> Result<(Process, Option<String>), ExecFailure> {
-        let process = Process::spawn(launch)?;
+        let process = Process::spawn(launch, &self.processes)?;
         let opened = async {
             let state = match process.rpc.call(json!({"type":"get_state"}), ANSWER).await {
                 Reply::Done(state) => state,
@@ -869,11 +894,11 @@ impl Pi {
                 if event["type"] == "agent_settled" {
                     break match seen.ending(false) {
                         (TurnStatus::Completed, _) => Ok(seen.text()),
-                        (TurnStatus::Interrupted, _) => Err(error(
-                            ManagerFailure::Cancelled,
-                            native,
-                            own("pi turn was interrupted".into()),
-                        )),
+                        (TurnStatus::Interrupted, _) => {
+                            let (outcome, failure) =
+                                crate::manager::interrupted(&cancel, Provider::Pi);
+                            Err(error(outcome, native, failure))
+                        }
                         (_, failure) => Err(error(
                             ManagerFailure::Failed,
                             native,
@@ -1058,9 +1083,7 @@ impl Executor for Pi {
                         FailureKind::WriterBusy,
                         "pi still runs another work in this session",
                     );
-                    node.signal_work(network, &work.work_id, Signal::StartRejected(failure))
-                        .await?;
-                    bail!("pi still runs another work in this session");
+                    return Err(failure.into());
                 }
                 None => None,
             };
@@ -1075,7 +1098,7 @@ impl Executor for Pi {
                     (Some(session), _) => {
                         let (file, group) = file(session, "the pi session of this thread is gone")?;
                         ensure!(
-                            !group_alive(group),
+                            !self.processes.tracked(group),
                             "a pi started earlier still runs in this session"
                         );
                         // A restart before pi takes the prompt reads the session from here on.
@@ -1102,17 +1125,9 @@ impl Executor for Pi {
                     }
                     prompt["images"] = json!(images);
                 }
-                Ok((origin, prompt))
+                anyhow::Ok((origin, prompt))
             };
-            let (origin, prompt) = match prepared.await {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    let failure = ExecFailure::new(FailureKind::Rejected, format!("{e:#}"));
-                    node.signal_work(network, &work.work_id, Signal::StartRejected(failure))
-                        .await?;
-                    return Err(e);
-                }
-            };
+            let (origin, prompt) = prepared.await?;
             let (session, mut launch_args) = match &origin {
                 Origin::Resume { session, file } => (
                     session.clone(),
@@ -1197,7 +1212,7 @@ impl Executor for Pi {
                                 .position(|entry| is_message(entry, "user"))
                             {
                                 Some(at) => Some(start + at),
-                                None if group_alive(pointer.group) => {
+                                None if self.processes.tracked(pointer.group) => {
                                     bail!("pi may still take the prompt")
                                 }
                                 None => return Ok(Probe::NotStarted),
@@ -1211,7 +1226,7 @@ impl Executor for Pi {
                 return Ok(Probe::Missing);
             };
             let turn_id = entries[turn]["id"].as_str().unwrap_or_default().to_owned();
-            if group_alive(pointer.group) {
+            if self.processes.tracked(pointer.group) {
                 return Ok(Probe::Running { turn_id, epoch: 0 });
             }
             let last = run(&entries, turn)
@@ -1287,7 +1302,7 @@ impl Executor for Pi {
         Box::pin(async move {
             let pointer = self.pointer(&into.thread_id).ok()??;
             if self.live_turn(&into.thread_id, &into.turn_id).is_some()
-                || group_alive(pointer.group)
+                || self.processes.tracked(pointer.group)
             {
                 return Some(SteerTrace::Pending);
             }
@@ -1317,6 +1332,7 @@ impl Executor for Pi {
 
 #[cfg(test)]
 mod tests {
+    use super::super::manager_control::group_alive;
     use super::*;
     use crate::crypto::LocalIdentity;
     use crate::identity::{Genesis, Member, NetworkState};
@@ -1553,10 +1569,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, network, spec.clone(), now_ms())?;
-        let sends = node
-            .pi
-            .start(node, network, &spec, None, &Value::Null)
-            .await?;
+        let pi = node.pi.clone();
+        let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
         ensure!(!sends, "the Node sends a pi work itself");
         Ok(())
     }
@@ -1866,9 +1880,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
-        node.pi
-            .start(&node, &network, &spec, Some(&session), &Value::Null)
-            .await?;
+        let pi = node.pi.clone();
+        (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {
             let record = node.store.lock().await.work_record("w-2")?.context("w-2")?;
@@ -1927,6 +1940,83 @@ mod tests {
             }
         );
         assert_eq!(prompts(&dir), ["do it"]);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    async fn ended(group: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while group_alive(group) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn a_restart_ends_the_pi_its_last_run_left_and_reads_the_work_back() -> Result<()> {
+        use std::os::unix::process::CommandExt as _;
+        let dir = scratch("restart");
+        let pi = Arc::new(Pi::new(&dir));
+        let (sender, mut reports) = mpsc::unbounded_channel();
+        let prompt = json!({"type":"prompt","message":"do it"});
+        tokio::spawn(pi.clone().run_work(
+            launch(&dir, "wait", "s-1"),
+            "s-1".into(),
+            prompt,
+            sender,
+        ));
+        while !matches!(
+            reports.recv().await,
+            Some(Report::Signal(Signal::TurnStarted { .. })) | None
+        ) {}
+        let left = pi.pointer("s-1")?.context("pointer")?.group;
+        let mut stranger = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        let pidfile = dir.join(PIDFILE);
+        let mut recorded = std::fs::read_to_string(&pidfile).unwrap_or_default();
+        recorded.push_str(&format!("{} {}\n", stranger.id(), fake().display()));
+        std::fs::write(&pidfile, recorded)?;
+        let restarted = Pi::new(&dir);
+        assert!(ended(left).await, "the restart ended the pi it left");
+        assert!(!pidfile.exists());
+        assert!(
+            stranger.try_wait()?.is_none(),
+            "a process the Node did not start is left alone"
+        );
+        let mut pointer = restarted.pointer("s-1")?.context("pointer")?;
+        pointer.group = stranger.id();
+        config::private_write(
+            &restarted.pointer_path("s-1")?,
+            &serde_json::to_vec(&pointer)?,
+        )?;
+        let (mut work, _) = crate::work::accept(spec("w-1", "t", &dir), 0);
+        crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
+        let probe = restarted.probe(&work).await?;
+        assert!(
+            matches!(probe, Probe::Terminal { .. }),
+            "a reused group is not the work's pi: {probe:?}"
+        );
+        assert_eq!(prompts(&dir), ["do it"]);
+        stranger.kill()?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutting_the_node_down_ends_its_running_pi() -> Result<()> {
+        let dir = scratch("shutdown");
+        let (node, network) = node(&dir, "wait").await?;
+        dispatch(&node, &network, &dir).await?;
+        let running = work(&node, |state| state.handle().is_some()).await?;
+        let session = running.state.thread().context("thread")?;
+        let group = node.pi.pointer(session)?.context("pointer")?.group;
+        node.shutdown().await;
+        assert!(ended(group).await, "the shutdown ended the running pi");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

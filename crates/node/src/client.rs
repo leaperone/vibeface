@@ -824,7 +824,7 @@ async fn dispatch(
             let entry = node.net().ok().map(|net| {
                 let addr = net.addr();
                 json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
-                    "direct_addrs":addr.ip_addrs().take(8).collect::<Vec<_>>()})
+                    "direct_addrs":invite_addrs(addr.ip_addrs().copied())})
             });
             Ok(
                 json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry,"gateway_url":node.gateway_url()}),
@@ -1389,15 +1389,53 @@ fn client_url(origin: &str) -> Result<String> {
     Ok(url.into())
 }
 
-/// Splits `https://origin/join#vibeface1…` into the Gateway origin and the ticket.
-pub fn parse_join_link(link: &str) -> Result<(String, Ticket)> {
-    let url = reqwest::Url::parse(link.trim()).context("invite link must be a URL")?;
+/// The ticket holds at most 8 addresses; a phone on the LAN needs the private IPv4 ones, which a
+/// computer with many interfaces could otherwise push out. Link-local IPv6 cannot be dialed without
+/// its interface; loopback goes last, for Nodes on one machine.
+fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut addrs: Vec<_> = addrs
+        .filter(|addr| !matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
+        .collect();
+    // Home LANs are mostly 192.168/16; container bridges and VPNs take 172.16/12 and 10/8.
+    addrs.sort_by_key(|addr| match addr.ip() {
+        ip if ip.is_loopback() => 5,
+        std::net::IpAddr::V4(ip) if ip.octets()[..2] == [192, 168] => 0,
+        std::net::IpAddr::V4(ip) if ip.octets()[0] == 10 => 1,
+        std::net::IpAddr::V4(ip) if ip.is_private() => 2,
+        std::net::IpAddr::V4(_) => 3,
+        std::net::IpAddr::V6(_) => 4,
+    });
+    addrs.truncate(8);
+    addrs
+}
+
+/// The ticket in an invite: `https://origin/join#vibeface1…`, the app's
+/// `vibeface://join?link=…` around either form, or `vibeface1…` alone. A Node joins over iroh,
+/// so the Gateway origin is not needed.
+pub fn parse_join_link(link: &str) -> Result<Ticket> {
+    parse_join_link_within(link.trim(), true)
+}
+
+fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
+    const SHAPE: &str = "invite link must look like https://host/join#vibeface1…";
+    if link.starts_with("vibeface1") {
+        return Ok(Ticket::decode(link)?);
+    }
+    let url = reqwest::Url::parse(link).context(SHAPE)?;
+    if nest && url.scheme() == "vibeface" && url.host_str() == Some("join") {
+        let (_, inner) = url
+            .query_pairs()
+            .find(|(key, _)| key == "link")
+            .context(SHAPE)?;
+        return parse_join_link_within(&inner, false);
+    }
     ensure!(
         matches!(url.scheme(), "http" | "https") && url.path() == "/join",
-        "invite link must look like https://host/join#vibeface1…"
+        SHAPE
     );
-    let ticket = Ticket::decode(url.fragment().context("invite link has no ticket")?)?;
-    Ok((url.origin().ascii_serialization(), ticket))
+    Ok(Ticket::decode(
+        url.fragment().context("invite link has no ticket")?,
+    )?)
 }
 
 /// Saved so an interrupted `vibeface join` resumes with the same commitment.
@@ -1528,7 +1566,8 @@ pub(crate) struct NodeJoinTask {
 /// unfinished join; its commitment was never revealed for the new invite.
 async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
     let capability = text(params, "capability")?.to_owned();
-    let link = text(params, "link")?.trim().to_owned();
+    // Every form of one invite is the same join.
+    let link = parse_join_link(text(params, "link")?)?.encode()?;
     let name = text(params, "name")?.to_owned();
     ensure!(name.chars().count() <= 128, "device name is too long");
     {
@@ -1564,7 +1603,6 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
     }
-    parse_join_link(&link)?;
     let runner = node.clone();
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
@@ -1636,7 +1674,7 @@ async fn join_as_node(
     report: impl Fn(NodeJoin),
     cancel: &tokio::sync::Notify,
 ) -> Result<NetworkState> {
-    let (_, ticket) = parse_join_link(link)?;
+    let ticket = parse_join_link(link)?;
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
@@ -1653,7 +1691,8 @@ async fn join_as_node(
         Err(error) => return Err(error.into()),
     };
     ensure!(
-        pending.link == link.trim() && pending.name == name,
+        parse_join_link(&pending.link).is_ok_and(|pending| pending == ticket)
+            && pending.name == name,
         "another join is in progress; delete join.json to abandon it"
     );
     crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
@@ -1849,6 +1888,47 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    #[test]
+    fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
+        let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
+        let text = ticket.encode().unwrap();
+        let web = format!("http://192.168.1.10:4790/join#{text}");
+        let app = |link: &str| {
+            reqwest::Url::parse_with_params("vibeface://join", [("link", link)])
+                .unwrap()
+                .to_string()
+        };
+        for link in [web.clone(), text.clone(), app(&text), app(&web)] {
+            assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
+        }
+        assert!(parse_join_link(&app(&app(&text))).is_err());
+        assert!(parse_join_link(&format!("http://h/other#{text}")).is_err());
+    }
+
+    #[test]
+    fn invites_keep_private_ipv4_within_the_ticket_limit() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let mut many: Vec<_> = (0..8)
+            .map(|i| addr(&format!("[2001:db8::{i}]:4790")))
+            .collect();
+        many.extend([addr("[fe80::1]:4790"), addr("127.0.0.1:4790")]);
+        many.extend((17..27).map(|i| addr(&format!("172.{i}.0.1:4790"))));
+        many.push(addr("192.168.1.10:4790"));
+        let kept = invite_addrs(many.into_iter());
+        assert_eq!(kept.len(), 8);
+        assert_eq!(
+            kept[0],
+            addr("192.168.1.10:4790"),
+            "container bridges do not crowd out the home LAN"
+        );
+        assert!(!kept.contains(&addr("[fe80::1]:4790")));
+        assert_eq!(
+            invite_addrs([addr("127.0.0.1:9")].into_iter()),
+            [addr("127.0.0.1:9")],
+            "Nodes on one machine still join over loopback"
+        );
+    }
 
     /// The payload of the next push this client receives.
     async fn next_push(client: &mut Client) -> Result<Value> {

@@ -25,8 +25,8 @@ test('one saved entry connects itself, and several entries stay listed', () => {
 })
 
 const target = 'a'.repeat(64), network = 'b'.repeat(64), subject = 'c'.repeat(64)
-const entry: ConnectionEntry = { address: 'https://node.example', device_id: target }
-const localEntry: ConnectionEntry = { address: 'http://localhost:4790', device_id: target }
+const entry = { kind: 'gateway', address: 'https://node.example', device_id: target } satisfies ConnectionEntry
+const localEntry = { kind: 'gateway', address: 'http://localhost:4790', device_id: target } satisfies ConnectionEntry
 const localCapability = 'f'.repeat(64)
 const localInvitation = { url: localEntry.address, device_id: target, capability: localCapability }
 const localLaunch = { url: 'http://127.0.0.1:49781', device_id: target, token: 'e'.repeat(64) }
@@ -60,7 +60,8 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const managed = { value: [] as Record<string, unknown>[] }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
-  const sessionEntry: ConnectionEntry = { address: 'https://node.example', device_id: target, local: true }
+  // As the Node sends it.
+  const sessionEntry = { address: 'https://node.example', device_id: target, local: true }
   const localState: { enabled: boolean; setup?: unknown } = { enabled: true }
   const pageOrigin = local ? localEntry.address : entry.address
   const hash = invitation ? `#${invitation}` : fragment, pathname = invitation ? '/join' : '/'
@@ -132,7 +133,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const secure = {
     verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, device_id: subject, epoch: 1, can_manage: management }, view: membership } },
     verifyRemoval: () => false,
-    verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] }),
+    verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] }),
     openPackage: async () => ({ networkId: network, material: { genesis, checkpoints: [], events: [] }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
@@ -215,7 +216,7 @@ test('fresh localhost discovers its one-time capability and creates the network 
     assert.equal(app.calls.includes('recover'), false)
     await app.render().downloadBackup()
     await app.render().confirmBootstrap(true)
-    assert.equal(app.render().ready?.entry.address, localEntry.address)
+    assert.deepEqual(plain(app.render().ready?.entry), localEntry)
     assert.equal(app.render().localSetup?.kind, 'initialized')
     const recover = app.requests.filter(request => request.method === 'recover')
     assert.equal(recover.length, 1)
@@ -258,9 +259,8 @@ test('initialized localhost authenticates the signed manager on its original ent
     app.render(); await settle()
     assert.equal(app.render().ready?.principal.source, 'membership')
     assert.equal(app.render().ready?.principal.can_manage, true)
-    assert.equal(app.render().ready?.entry.address, localEntry.address)
-    assert.equal(app.render().ready?.entry.local, undefined)
-    assert.equal(app.sockets[0]?.entry.address, localEntry.address)
+    assert.deepEqual(plain(app.render().ready?.entry), localEntry)
+    assert.deepEqual(plain(app.sockets[0]?.entry), localEntry)
     assert.equal(app.calls.includes('local-exchange'), false)
     assert.equal(app.navigations.length, 0)
     assert.equal(app.location.origin, localEntry.address)
@@ -551,6 +551,16 @@ test('recovering onto a remote fresh Node needs that Node\'s own page', async ()
   } finally { app.close() }
 })
 
+test('a recovery link naming a computer outside the network is refused before anything is signed', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    await assert.rejects(app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: { ...entry, device_id: remote } }), /不在你的网络里/)
+    assert.equal(app.render().review, null)
+    assert.equal(app.calls.includes('recover'), false)
+  } finally { app.close() }
+})
+
 test('recovering an initialized network reads its state with a short-lived root proof', async () => {
   const app = deviceHarness()
   try {
@@ -628,9 +638,7 @@ test('a local browser reuses its cookie-bound identity and can disable its own a
     assert.equal(app.render().ready?.principal.source, 'local_session')
     assert.equal(app.render().ready?.principal.can_manage, false)
     assert.equal(app.render().localAutoAccess, true)
-    assert.equal(app.sockets[0]?.entry.address, 'https://node.example')
-    assert.equal(app.sockets[0]?.entry.device_id, target)
-    assert.equal(app.sockets[0]?.entry.local, true)
+    assert.deepEqual(plain(app.sockets[0]?.entry), { kind: 'local', address: 'https://node.example', device_id: target })
     await app.render().setLocalAutoAccess(false)
     assert.equal(app.render().ready, null)
     assert.equal(app.stored.get('vibeface.last-authenticated'), 'null')
@@ -711,16 +719,16 @@ test('a signed management browser keeps its permissions through the local cookie
     const app = deviceHarness({ localSession: true, management: true, storage })
     try {
       app.render(); await settle()
-      assert.equal(app.sockets[0]?.entry.local, true)
+      assert.equal(app.sockets[0]?.entry.kind, 'local')
       assert.equal(app.render().ready?.principal.source, 'membership')
       assert.equal(app.render().ready?.principal.can_manage, true)
-      assert.equal(app.render().ready?.entry.local, false)
-      assert.equal(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').entry.local, false)
+      assert.equal(app.render().ready?.entry.kind, 'gateway')
+      assert.deepEqual(JSON.parse(app.stored.get('vibeface.last-authenticated') ?? 'null').entry, { address: 'https://node.example', device_id: target })
       app.sockets[0]?.drop()
       // The newest timer is the reconnect; a manager's directory poll was set before it.
       const [id, retry] = [...app.timers.entries()].at(-1)!
       app.timers.delete(id); retry(); await settle()
-      assert.equal(app.sockets[1]?.entry.local, undefined)
+      assert.equal(app.sockets[1]?.entry.kind, 'gateway')
       assert.equal(app.render().ready?.principal.source, 'membership')
       assert.equal(app.render().ready?.principal.can_manage, true)
       assert.equal(app.verifications(), 2)
@@ -893,7 +901,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     const rejected = assert.rejects(work, /切换|取消/)
     for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
     assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
-    hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] } })
+    hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] } })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()
     assert.equal(app.render().phase, 'disconnected')
@@ -937,7 +945,7 @@ test('unexpected closure reconnects the same target with fresh authentication an
 })
 
 test('a reload resumes the last network through its entrances even with several saved addresses', async () => {
-  const other: ConnectionEntry = { address: 'https://other.example', device_id: remote }
+  const other: ConnectionEntry = { kind: 'gateway', address: 'https://other.example', device_id: remote }
   const storage = new Map([['vibeface.connections', JSON.stringify([other, entry])], ['vibeface.last-authenticated', JSON.stringify({ entry, networkId: network })]])
   const app = deviceHarness({ storage })
   try {

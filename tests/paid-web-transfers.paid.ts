@@ -13,12 +13,14 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await browser.goto(`${environment.nodes.web.url}/join`);
     await screen.getByLabel('加入链接', { exact: true }).fill(secrets.get('paidWebInvitation'), { timeout: 30000 });
     await screen.getByLabel('这个浏览器叫什么？', { exact: true }).fill('VDP paid web sender');
-    await screen.getByRole('button', '继续', { exact: true }).click();
+    await screen.getByRole('button', '加入', { exact: true }).click();
     await expect.poll(async () => (await pairing('web')) !== null, { timeout: 45000, message: 'The real Web member reveals its pairing nonce' }).toBe(true);
     const joined = await pairing('web');
     assert(joined);
     await expect(screen.getByLabel(`安全码 ${joined.code.split('').join(' ')}`, { exact: true })).toBeVisible();
     await request('/approve', { role: 'web', peer: joined.peer, code: joined.code });
+    await browser.goto(`${environment.nodes.web.url}/settings`);
+    await screen.getByRole('switch', '实验功能', { exact: true }).check({ timeout: 30000 });
     await browser.goto(`${environment.nodes.web.url}/transfers`);
     await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
     await expect(screen.getByRole('switch', '付费交付（本地测试）')).toBeChecked();

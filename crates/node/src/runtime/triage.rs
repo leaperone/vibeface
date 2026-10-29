@@ -26,6 +26,9 @@ use vibeface_bridge::codex::ServerRequest;
 const WAKE_EVERY: Duration = Duration::from_secs(20);
 pub const TRIAGE_URL_ENV: &str = "VIBEFACE_TRIAGE_URL";
 const BATCH: usize = 20;
+/// A batch can name up to `BATCH` bots, so each one's part of the prompt stays small.
+const BOT_INSTRUCTIONS_BYTES: usize = 1000;
+const BOT_NOTES_BYTES: usize = 1000;
 const SCAN_EVERY: Duration = Duration::from_secs(300);
 const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
@@ -325,6 +328,27 @@ fn own_turn(store: &crate::store::Store, event: &AgentEvent) -> Result<bool> {
             && store
                 .native_thread_conversation(&event.session_id)?
                 .is_some()))
+}
+
+/// What the coordination Agent knows of a bot: the start of its instructions and its newest
+/// notes that fit, each within its own byte budget.
+fn bot_context(bot: &crate::model::Bot, notes: &[crate::model::MemoryEntry]) -> Value {
+    let mut left = BOT_NOTES_BYTES;
+    let kept: Vec<&str> = notes
+        .iter()
+        .rev()
+        .map(|note| note.text.as_str())
+        .filter(|text| {
+            let fits = text.len() <= left;
+            if fits {
+                left -= text.len();
+            }
+            fits
+        })
+        .collect();
+    json!({"conversation_id":bot.conversation_id,"name":bot.name,
+        "instructions":crate::scheduler::prefix(&bot.instructions, BOT_INSTRUCTIONS_BYTES),
+        "memory":kept,"memory_omitted":notes.len() - kept.len()})
 }
 
 fn dequeue(connection: &Connection, event: &AgentEvent) -> Result<()> {
@@ -1002,27 +1026,48 @@ impl Runtime {
         }
         let network = self.network_id().await?;
         let mut offered = Vec::new();
-        {
-            let store = self.store.lock().await;
+        let mut bots = Vec::new();
+        let reserved = {
+            let mut store = self.store.lock().await;
+            let mut seen = HashSet::new();
             for event in &fresh {
                 let owner = owner(&store, &network, event)?;
-                let name = match &owner {
-                    Some(scope) => match store.bot_for_conversation(&network, scope)? {
-                        Some(bot) => Some(bot.name),
-                        None => store.conversation(&network, scope)?.map(|c| c.title),
-                    },
+                let bot = match &owner {
+                    Some(scope) => store.bot_for_conversation(&network, scope)?,
                     None => None,
                 };
+                let name = match (&owner, &bot) {
+                    (_, Some(bot)) => Some(bot.name.clone()),
+                    (Some(scope), None) => store.conversation(&network, scope)?.map(|c| c.title),
+                    (None, None) => None,
+                };
+                if let Some(bot) = bot
+                    && seen.insert(bot.conversation_id.clone())
+                {
+                    let notes = store.memories(&network, &bot.conversation_id)?;
+                    bots.push(bot_context(&bot, &notes));
+                }
                 offered.push((
                     shared_event(event, &self.settings_snapshot().roots),
                     json!({"conversation_id":owner,"name":name}),
                 ));
             }
+            // A count of its own under the same daily limit, so triage never starves bot turns.
+            store.reserve_budget(
+                &format!("triage:{network}"),
+                1,
+                self.config.daily_decision_limit,
+            )
+        };
+        if let Err(error) = reserved {
+            self.settle_offered(&fresh).await?;
+            return Err(error.context("no coordination turn"));
         }
         let turn = self
             .coordination_turn(|cli| {
                 triage::wake_prompt(
                     &offered,
+                    &bots,
                     cli,
                     AGENT_ANSWER_WITHIN.as_secs(),
                     HOOK_ANSWER_WITHIN.as_secs(),
@@ -1857,6 +1902,17 @@ pub(super) mod tests {
         name: &str,
         threads: &[&str],
     ) -> Result<()> {
+        instructed_bot(node, admin, scope, name, "", threads).await
+    }
+
+    async fn instructed_bot(
+        node: &Runtime,
+        admin: &LocalIdentity,
+        scope: &str,
+        name: &str,
+        instructions: &str,
+        threads: &[&str],
+    ) -> Result<()> {
         let network = node.network_id().await?;
         let local = node.identity.device_id()?;
         let owner = admin.attest(
@@ -1879,7 +1935,7 @@ pub(super) mod tests {
             EventBody::BotCreated {
                 bot_id: scope.into(),
                 name: name.into(),
-                instructions: String::new(),
+                instructions: instructions.into(),
                 project: None,
                 attestation: None,
                 cause: None,
@@ -3372,7 +3428,7 @@ pub(super) mod tests {
         result
     }
 
-    async fn delete_bot(node: &Runtime, admin: &LocalIdentity, scope: &str) -> Result<()> {
+    async fn delete_bot(node: &Runtime, admin: &LocalIdentity, scope: &str) -> Result<String> {
         let network = node.network_id().await?;
         let deleted = admin.attest(
             &network,
@@ -3383,12 +3439,13 @@ pub(super) mod tests {
             },
         )?;
         let signed = deleted.attestation().cloned().context("signed")?;
-        node.store
+        let written = node
+            .store
             .lock()
             .await
             .delete_bot(&node.identity, &network, scope, signed, now_ms())?
             .context("deleted")?;
-        Ok(())
+        Ok(written.hash)
     }
 
     #[tokio::test]
@@ -3499,6 +3556,73 @@ pub(super) mod tests {
             assert_eq!(next["status"], "accepted");
             assert_eq!(owner_of(&node, "wt").await?.as_deref(), Some("c"));
             assert_eq!(attributions(&node, "c").await?, 1, "the thread goes to the primary bot once");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn deleting_a_bot_stops_the_works_it_dispatched() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let spec = |work_id: &str, conversation: &str| crate::work::WorkSpec {
+                work_id: work_id.into(),
+                conversation: conversation.into(),
+                trigger: "message:m1".into(),
+                target: local.clone(),
+                dispatcher: local.clone(),
+                call_ref: "r".into(),
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                cwd: "/w".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some(format!("t-{work_id}")),
+            };
+            for (work_id, conversation) in [("w-d", "d"), ("w-c", "c")] {
+                node.store.lock().await.accept_work(
+                    &node.identity,
+                    &network,
+                    spec(work_id, conversation),
+                    now_ms(),
+                )?;
+            }
+            let hash = delete_bot(&node, &admin, "d").await?;
+            node.bot_deleted(&network, "d", &hash);
+            let late = node.store.lock().await.accept_work(
+                &node.identity,
+                &network,
+                spec("w-late", "d"),
+                now_ms(),
+            );
+            assert!(
+                late.is_err(),
+                "a dispatch that arrives after the deletion does not start"
+            );
+            let stopping = |requests: &[crate::work::StopRequest], work: &str| {
+                requests.iter().any(|request| request.work_id == work)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let held = loop {
+                let held = node.store.lock().await.stop_requests()?;
+                if stopping(&held, "w-d") || tokio::time::Instant::now() > deadline {
+                    break held;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert!(
+                stopping(&held, "w-d"),
+                "the deleted bot's work is being stopped"
+            );
+            assert!(!stopping(&held, "w-c"), "another bot's work keeps running");
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -3785,7 +3909,7 @@ pub(super) mod tests {
             let access = Access {
                 manager: Some(crate::runtime::ManagerAccess {
                     attempt_id: attempt.clone(),
-                    trigger,
+                    trigger: trigger.clone(),
                 }),
                 ..access
             };
@@ -3863,15 +3987,119 @@ pub(super) mod tests {
             let crossed = format!("{:#}", crossed.expect_err("Codex into a Claude Code session"));
             assert!(crossed.contains("set agent to claude"), "{crossed}");
             // It goes on to Claude Code, which finds no directory for a session without one.
-            let own = own?;
-            assert_eq!(own["may_send"], false);
-            assert_eq!(
-                own["state"],
-                serde_json::to_value(crate::work::WorkState::Finished {
-                    outcome: crate::model::WorkOutcome::Rejected
-                })?,
-                "the Agent sees the start it was refused"
+            let own = format!("{:#}", own.expect_err("Claude Code refuses the start"));
+            assert!(
+                own.contains("does not exist") && own.contains("new call_ref"),
+                "the Agent reads why its start was refused: {own}"
             );
+            let refused = crate::work::WorkSpec::id("c", &trigger, "r5");
+            let refused = (node.store.lock().await.work_record(&refused)?)
+                .context("the refused work")?;
+            assert_eq!(
+                refused.state,
+                crate::work::WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Rejected
+                }
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_work_asking_what_its_agent_cannot_do_is_refused_before_it_is_registered()
+    -> Result<()> {
+        use crate::providers::Provider;
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            node.settings.lock().unwrap().roots = vec![dir.clone()];
+            {
+                let mut providers = node.providers.lock().unwrap();
+                for provider in [Provider::Claude, Provider::Opencode] {
+                    providers.switches.execution.insert(provider);
+                    let bin = format!("/nonexistent/{}", provider.name());
+                    (providers.bins).insert(provider, bin.into());
+                }
+            }
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                Provider::Codex,
+            )
+            .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger: trigger.clone(),
+                }),
+                ..access
+            };
+            let asks = |call_ref: &str, agent: &str, extra: Value| {
+                let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call_ref,
+                    "title":"t","prompt":"p","agent":agent});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                args
+            };
+            let images = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r1", "claude", json!({"images":["/a.png"]})),
+                )
+                .await;
+            let effort = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r2", "opencode", json!({"effort":"high"})),
+                )
+                .await;
+            let plain = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r3", "claude", json!({"images":[]})),
+                )
+                .await;
+            node.finish_manager_attempt(&attempt).await;
+            let images = format!("{:#}", images.expect_err("Claude Code takes no images"));
+            assert!(
+                images.contains("takes no images") && images.contains("\"pi\""),
+                "{images}"
+            );
+            let effort = format!("{:#}", effort.expect_err("opencode takes no effort"));
+            assert!(effort.contains("takes no effort"), "{effort}");
+            let plain = format!(
+                "{:#}",
+                plain.expect_err("the start fails on the missing program")
+            );
+            assert!(
+                !plain.contains("takes no"),
+                "an empty image list asks for nothing: {plain}"
+            );
+            for call_ref in ["r1", "r2"] {
+                let work_id = crate::work::WorkSpec::id("c", &trigger, call_ref);
+                assert!(
+                    node.store.lock().await.work_record(&work_id)?.is_none(),
+                    "{call_ref} left no work behind"
+                );
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -4031,47 +4259,158 @@ pub(super) mod tests {
         result
     }
 
-    #[tokio::test]
-    async fn the_coordination_agents_thread_is_not_triaged() -> Result<()> {
+    /// An App Server fixture whose turns complete at once; it passes on every request it gets.
+    fn coordination_app_server(
+        node: &Runtime,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Value>> {
         use futures_util::{SinkExt as _, StreamExt as _};
+        let listener = tokio::net::UnixListener::bind(named_socket(node))?;
+        let (sent, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let sent = sent.clone();
+                tokio::spawn(async move {
+                    let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = server.next().await {
+                        let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                        else {
+                            continue;
+                        };
+                        if request.get("id").is_none() {
+                            continue;
+                        }
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => json!({"userAgent":"codex/fixture"}),
+                            Some("thread/start") => json!({"thread":{"id":"coord-thread"}}),
+                            Some("turn/start") => json!({"turn":{"id":"coord-turn"}}),
+                            _ => json!({}),
+                        };
+                        let mut replies = vec![json!({"id":request["id"],"result":result})];
+                        if request["method"] == "turn/start" {
+                            replies.push(json!({"method":"turn/completed","params":{
+                                "threadId":"coord-thread",
+                                "turn":{"id":"coord-turn","status":"completed"}}}));
+                        }
+                        for reply in replies {
+                            let _ = server.send(reply.to_string().into()).await;
+                        }
+                        let _ = sent.send(request);
+                    }
+                });
+            }
+        });
+        Ok(received)
+    }
+
+    fn turn_starts(requests: &mut tokio::sync::mpsc::UnboundedReceiver<Value>) -> Vec<String> {
+        std::iter::from_fn(|| requests.try_recv().ok())
+            .filter(|request| request["method"] == "turn/start")
+            .map(|request| request["params"].to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_coordination_agent_sees_the_owning_bots_instructions_and_notes() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            let instructions = format!("只管前端仓库，发版前先问用户。{}截断之后", "很".repeat(3000));
+            instructed_bot(&node, &admin, "c", "前端", &instructions, &[]).await?;
+            let network = node.network_id().await?;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
+                params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms()],
+            )?;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
+                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1],
+            )?;
+            let mut requests = coordination_app_server(&node)?;
+            node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
+            node.wake_agent().await?;
+            let prompt = turn_starts(&mut requests).concat();
+            assert!(prompt.contains("只管前端仓库，发版前先问用户。"), "the bot's instructions");
+            assert!(
+                prompt.contains("用户每周五才发版"),
+                "older notes stay when the newest is too long"
+            );
+            assert!(!prompt.contains("长长长"), "a note too long to fit is left out");
+            assert!(!prompt.contains("截断之后"), "only the start of long instructions");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn coordination_turns_have_their_own_daily_budget() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
-            let listener = tokio::net::UnixListener::bind(named_socket(&node))?;
-            tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    tokio::spawn(async move {
-                        let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
-                            return;
-                        };
-                        while let Some(Ok(message)) = server.next().await {
-                            let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
-                            else {
-                                continue;
-                            };
-                            if request.get("id").is_none() {
-                                continue;
-                            }
-                            let result = match request["method"].as_str() {
-                                Some("initialize") => json!({"userAgent":"codex/fixture"}),
-                                Some("thread/start") => json!({"thread":{"id":"coord-thread"}}),
-                                Some("turn/start") => json!({"turn":{"id":"coord-turn"}}),
-                                _ => json!({}),
-                            };
-                            let mut replies = vec![json!({"id":request["id"],"result":result})];
-                            if request["method"] == "turn/start" {
-                                replies.push(json!({"method":"turn/completed","params":{
-                                    "threadId":"coord-thread",
-                                    "turn":{"id":"coord-turn","status":"completed"}}}));
-                            }
-                            for reply in replies {
-                                let _ = server.send(reply.to_string().into()).await;
-                            }
-                        }
-                    });
-                }
-            });
+            let network = node.network_id().await?;
+            let limit = node.config.daily_decision_limit;
+            let triage = format!("triage:{network}");
+            node.store
+                .lock()
+                .await
+                .reserve_budget(&triage, limit - 1, limit)?;
+            let mut requests = coordination_app_server(&node)?;
+
+            node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
+            node.wake_agent().await?;
+            assert_eq!(
+                turn_starts(&mut requests).len(),
+                1,
+                "the last turn of the day runs"
+            );
+
+            let held = node.ingest_agent_event(asks_permission("s2")).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let refused = node.wake_agent().await.expect_err("no budget is left");
+            assert!(format!("{refused:#}").contains("budget"), "{refused:#}");
+            assert!(
+                turn_starts(&mut requests).is_empty(),
+                "no turn past the budget"
+            );
+            assert!(
+                !node
+                    .triage
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .contains_key(&request_id),
+                "a held request gets the fallback answer at once"
+            );
+            node.store
+                .lock()
+                .await
+                .reserve_budget(&network, limit, limit)
+                .context("the bots' own turns keep their whole budget")?;
+            assert!(
+                node.pending_events().await?.is_empty(),
+                "its events are dropped"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn the_coordination_agents_thread_is_not_triaged() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            coordination_app_server(&node)?;
             node.coordination_turn(|_| Ok("triage".into())).await?;
             *node.triage.config.lock().unwrap() = TriageConfig {
                 scan_codex_sessions: false,

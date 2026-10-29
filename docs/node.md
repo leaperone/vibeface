@@ -148,15 +148,17 @@ Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端
 
 每个 Node 和每个浏览器有独立密钥，设备编号就是设备公钥。本人设备列表来自已签名的成员目录，设备名称、IP 和中继返回的地址不证明所有权。
 
-在管理设备选择**添加设备**并点**生成链接**，得到一条 `https://<gateway>/join#vibeface1…` 加入链接。入口有公网 HTTPS 地址时同时显示二维码；只有本机或局域网地址时不出二维码，提示“手机打不开本机地址”，按下文“配置公共入口”设置。链接含一次性 secret，只交给自己的设备。新浏览器打开链接，确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
+在管理设备选择**添加设备**并点**生成链接**，得到一条 `https://<gateway>/join#vibeface1…` 加入链接和一个二维码。入口有公网 HTTPS 地址时，二维码就是这条链接，手机相机扫码即可打开；只有本机或局域网地址时，二维码是 `vibeface://join?link=vibeface1…`，下方提示“用手机 App 扫码”，用 Vibeface App 扫码加入。链接含一次性 secret，只交给自己的设备。新浏览器打开链接，确认名称后显示 6 位安全码和“等待批准”。管理设备上出现“X 想加入”和同一个安全码：一致就点**一致，允许**，浏览器可同时勾选**设为管理员**；不一致或不认识的请求点**拒绝**，该请求随即作废。只有发出链接的面板会自动开始比对，其他管理页面需先点**显示安全码**。新设备伪造或替换随机数时请求也会作废。
 
-没有任何可公网访问的 HTTPS 入口时，邀请界面不显示二维码，提示手机打不开并给出“设置访问地址”，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
+App 扫这种二维码后，按邀请里写的局域网地址直接连发出邀请的 Node，手机要和这台电脑在同一局域网，见 [手机 App 局域网直连](#手机-app-局域网直连)。手机浏览器打不开本机或局域网地址；要在外网用手机浏览器加入，见 [配置公共入口](#配置公共入口)。`localhost` 与 `127.0.0.1` 仅指向各自本机。
 
 添加另一台 Node 时，在新机器上先用 `vibeface init` 初始化（不要在它的本机网页上建网），再执行：
 
 ```sh
 ./vibeface join --data-dir "$VIBEFACE_DATA_DIR" --name "<设备显示名称>" "https://gateway.example/join#vibeface1…"
 ```
+
+链接也可以是手机 App 复制的 `vibeface://join?link=…` 或单独的 `vibeface1…`：Node 按邀请里的地址经 iroh 加入，不需要网页入口。
 
 命令显示 6 位安全码并等待批准；在管理设备上比对安全码一致后点**一致，允许**，命令完成加入，再启动新 Node。`--name` 必须明确指定设备名，不读取系统主机名。连接中断时用同一链接和目录重试，结果未知时先核对原请求状态，不重新创建请求。
 
@@ -182,6 +184,20 @@ Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端
 所有 origin 必须是完整的 HTTP 或 HTTPS 地址，不含路径、查询参数或凭证。同一主机和端口不能同时配置 HTTP 与 HTTPS。Node 检查请求 Host 和 Origin，允许一个地址不会自动开放端口或防火墙。
 
 局域网 HTTP 页面能打开，不代表它能安全保存客户端私钥。浏览器不把普通 LAN HTTP 当作安全上下文。使用自己的可信 HTTPS 客户端或本机 localhost 页面连接 Node，不降低设备认证。HTTPS 页面访问远端时需要 HTTPS/WSS 入口，可通过可信的 HTTPS 中继建立该路径。端到端 Noise 保护业务通道，HTTPS 还保护网页代码的下载来源。
+
+## 手机 App 局域网直连
+
+手机 App 和 Node 在同一局域网时，不经网页入口，直接用 iroh QUIC 连这台 Node，再在这条连接上做和网页入口相同的 Noise 握手，由设备密钥证明对方就是要连的 Node。App 每次启动换一个临时的 QUIC 密钥，不用 relay。网页没有这条路径。
+
+- App 在前台时收听 Node 的 mDNS 广播；iOS 每分钟重新解析一次地址，Android 14 及以上跟随地址变化，更早的 Android 等 Node 整点换标签时更新（见 [Node 之间的连接](#node-之间的连接) 的“局域网发现”），用个人网络编号和已知 Node 的设备编号比对标签，认出本人的 Node 和它当前的地址；退到后台就停止。
+- 重连顺序：当前 Node 的局域网直连、当前网页入口、局域网里看到的其他本人 Node、其他网页入口。局域网直连每次最多等 2 秒，只剩一种可试时等 10 秒。拨号会在 TLS 里明文带上对方的设备编号，所以 App 不盲拨没看到的地址；只有没有任何网页入口可试时，才按上次连上或 Node 签名记录里的地址试一次。
+- 已经经网页入口在线时，一发现当前连着的这台 Node 出现在局域网，就先试连一次；退出网络或恢复出厂时，试连随即取消。成功后最多等 30 秒让进行中的请求返回，再切到直连；仍有请求未返回、正在做需要确认的操作或试连失败时，保持当前连接。
+- 扫码加入时，App 先按邀请里 Node 的直连地址（局域网地址在前）连，连不上再试邀请里的网页入口。
+- 直连时连接状态显示“局域网直连”。
+
+Node 不需要额外配置，只要已加入个人网络、不是公共入口、`bind` 不是具体地址，防火墙放行局域网内 UDP 5353 组播和 iroh 的 UDP 端口。
+
+iOS 第一次在局域网里查找或连接电脑时，会询问是否允许 Vibeface 访问本地网络。不允许时 App 只能走网页入口；之后可在 iOS **设置 > 隐私与安全性 > 本地网络**里打开。
 
 ## 配置公共入口
 
@@ -268,7 +284,7 @@ Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端
 
    `init` 把令牌复制进 Node 的数据目录，之后可以删掉 `$VIBEFACE_RELAY_TOKEN_FILE` 指向的临时文件。relay 不在入口同一个 origin 上时，用 `--entry-relay URL` 另外指定。
 
-6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码**扫描**添加设备**里的二维码。
+6. 在个人电脑上打开 `http://localhost:4790` 建网。之后**添加设备**生成的链接和二维码都指向 `https://vb.example.com/join#…`。手机扫码打开后确认名字，在个人电脑上核对 6 位安全码并点**一致，允许**。也可以在手机上打开 `https://vb.example.com`，点**扫码加入**扫描**添加设备**里的二维码。
 
 默认公共入口只搬运浏览器与个人电脑上的 Node 之间的 Noise 密文，看不到对话内容，也不保存个人网络事件或附件。另行启用文件交付服务时，它还会独立暂存交付密文，见[可选文件传输](#启用可选文件传输)。它的 relay 只接纳持有令牌的设备，持错误令牌的 Node 连不上。一台公共入口可以同时服务多台带令牌的 Node，各人的个人网络互不相通。令牌泄露时，停掉入口和使用它的 Node，用同一份新令牌（`openssl rand -hex 32` 生成的 64 个十六进制字符）替换它们数据目录里的 `entry-token`，再依次启动。
 
@@ -283,7 +299,7 @@ Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端
 3. 在这台 Node 的 `config.json` 设置 `"public_url": "https://vibe.example.com"`，重启。
 4. 用 `vibeface join` 让这台 Node 加入个人网络，之后管理设备生成邀请时会使用它的公网地址并显示二维码。
 
-成员 Gateway 保存个人网络的完整副本。反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。网页中的**怎么设置**链接指向本节。
+成员 Gateway 保存个人网络的完整副本。反代只转发公开 listener，不要转发本机会话的 `local_listen`。浏览器只经 `/api/client` 跨源连接，其他路径仍要求同源。
 
 ## 不提供网页
 
@@ -295,9 +311,13 @@ Bot 须在 30 秒内回答。超时后请求交回原程序，由本人在终端
 
 ## Node 之间的连接
 
-Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。没有局域网发现，也不使用 n0 的 DNS 和 pkarr 地址发布：成员 Node 的持久地址来自邀请和个人网络内部交换的签名地址记录。显式配置发现服务后，还可查询临时直连地址。
+Node 之间经 [iroh](https://www.iroh.computer/) QUIC 互连，设备编号就是 iroh 的 `EndpointId`，连接由 QUIC TLS 证明对端身份，再按成员目录授权。非成员的连接被拒绝。不使用 n0 的 DNS 和 pkarr 地址发布，成员 Node 的持久地址来自邀请和个人网络内部交换的签名地址记录。同一局域网内的 Node 还经 mDNS 互相找到当前地址，见下文“局域网发现”。显式配置发现服务后，还可查询临时直连地址。
 
 每台 Node 定期为自己签一条地址记录，内容是 iroh 地址（relay URL 和直连 IP）以及网页入口 `gateway_url`。同步时双方交换记录，地址变化后几秒内传到其他成员。浏览器从当前入口读取这些记录，自己验签后作为可切换的访问地址，见下文“多个访问地址”。
+
+**局域网发现**。路由器给 Node 换了 IP 后，其他 Node 手里的地址记录要等下一次同步才更新，没有 relay 时双方可能再也连不上。所以成员 Node 在局域网用 mDNS 广播 `_vibeface._udp` 服务，同时收听其他 Node 的广播。广播的实例名、主机名和 TXT 记录 `t` 都是同一个标签，由个人网络编号、设备编号和当前小时算出，每小时更换，不含设备名称、设备编号或网络编号。成员 Node 用自己的成员目录比对标签，前后一小时的标签也算数，以容忍时钟误差。比对上的广播地址只作为拨号提示，和地址簿里的地址一起交给 iroh，并让这台 Node 立即和对方同步一次，同一 Node 10 秒内最多触发一次。对端身份仍由 QUIC TLS 证明。旁人可以重放标签，所以提示只收私网地址，同一 Node 只用最新一条广播的最多 4 个地址，广播表满时先删不属于成员的，再删最早收到的。只广播 iroh 在同一端口上监听的地址族。本机网卡地址变化后几秒内重新广播，Node 正常退出时发出 mDNS 告别；对方发出告别或约两分钟不再应答后，提示随即删除。
+
+公共入口和把 `bind` 设为具体地址（例如 `127.0.0.1`）的 Node 不启用局域网发现，尚未加入或已被移出个人网络的 Node 不广播。mDNS 无法启动时只记一条警告，Node 照常用其他地址连接。防火墙需放行局域网内 UDP 5353 端口的组播（IPv4 `224.0.0.251`、IPv6 `ff02::fb`）和 iroh 的 UDP 端口。
 
 两台 Node 不能直连时经 relay 转发。relay 只转发 QUIC 密文，只接纳当前成员 Node 和持有本 Node 所发邀请的加入者，默认不使用 n0 公共 relay。网络设置只在 `init` 或首次直接启动时写入 `config.json`，修改后重启生效：
 
@@ -445,7 +465,7 @@ Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool
 
 协调 Agent 的 Shell 完全访问本机，可以改文件、跑 git 和 gh。它用 `vibeface codex call <method> [json]` 调用 App Server 的读取和线程管理方法，开始、引导或停止回合的方法（`turn/start`、`turn/steer`、`turn/interrupt`、`thread/start`、`thread/fork`、`thread/compact/start`、`thread/shellCommand`、`thread/revert`、`thread/inject_items`、`review/start`）一律拒绝，改用 `dispatch_work`、`codex send` 和 `interrupt_work`，让每个回合都是 Node 登记过的工作；`vibeface codex send <thread> <text> --id <id>` 给已有会话插话（回合进行中时 steer，否则开新回合）。这条消息是本轮的一项工作，与 `dispatch_work` 相同：发送前向 Node 登记，`--id` 即 `call_ref`，Node 观察它所在的回合，结束后结果作为 `work_result` 轮回到 Bot；同一轮同一 `--id` 再次执行只回读、绝不重发，换了内容或会话则拒绝。会话的目录取自线程，不受 `roots` 限制。它只能在 Bot 的一轮里运行，因为它要用这一轮的工具令牌；Cursor 的 Shell 没有这个令牌，Cursor 回合用带 `thread` 的 `dispatch_work` 工具做同样的事。`vibeface codex watch <thread>` 查看事件，`vibeface log <level> <message> --conversation <id>` 把它遇到的问题写进 Node 日志（经本机监听器的 `/api/log`，边界与 `/api/hooks` 相同）。Socket 路径在 `VIBEFACE_CODEX_SOCKET`。
 
-Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
+Codex 默认 bypass，正常不会发起请求。仍发起的请求（审批、提问、登录等）由 Node 挂起并立即唤醒协调 Agent：它用 `vibeface requests` 查看，`vibeface respond <request_id> '<result-json>'` 回答，同一请求只回答一次。需要本人拍板时，它用 `vibeface triage raise --event-id <ID> --request-id <请求> --question <问题> --choice 批准 --choice 拒绝` 在拥有该会话的 Bot 聊天里提问，按项目设置也经 webhook 转发 Grok Bot。提问挂住请求直到有回答；回答作为一轮交给该 Bot，它在 120 秒内用 `vibeface respond <请求> '<result-json>' --node <设备>` 应答。没有协调 Agent，或它 120 秒内既没回答也没提问时，Node 按方法拒绝并记录。等待回答的 hook 挂起的请求同样经 `vibeface requests` 和 `vibeface respond` 处理，30 秒内没有回答时交回会话自己决定。没有协调 Agent 时分诊事件直接丢弃。协调 Agent 每次被唤醒分诊都计数，上限同为 `daily_decision_limit`，但与 Bot 的自动轮次分开记账，不占它们的额度；用完时不唤醒，挂起的请求立即兜底，分诊事件丢弃。协调 Agent 能看到拥有该会话的 Bot 的说明开头和最新记忆，各有长度上限。hook 挂起的 `continue` 只在执行本人已要求的事时代发；下一步需要本人决定、难以撤销或需要本人未给的授权时，改为提问。不是 Bot 发起的交互会话由运行它的设备归给主 Bot；Bot 每轮能看到名下的会话，自己判断后用 `hand_over_session` 转给其他 Bot 或不再关注；`codex exec`、子代理等后台会话不处理，见 [聊天里的提问与回答](design/questions-in-chat.md)。
 
 Node 默认不启用 Codex。启用 Codex Bot 或任务执行时，缺的路径由 Node 从本机找出并写进配置，设备设置里显示并可修改；Bot 也能用 `propose_provider_config` 提议路径、打开执行或添加可用文件夹（`roots`），经聊天里的「允许 / 不允许」卡片同意后由 Node 写入。首次设置时打开 Codex 运行 Bot 会同时打开执行任务，并可一键添加家目录下常见的项目文件夹（`node_settings.suggested_roots`）。`providers.codex_app_server.mode` 为 `system` 时只连接配置的 socket，不启动也不结束服务，见 [Agent 直连 App Server](design/agent-direct-app-server.md#21a-用哪个-app-server)。设为 `spawn` 时 Node 托管自己的 `codex app-server`：用 `bins.codex` 启动它，Socket 位于私有的 `/tmp/vibeface-<identity>/` 目录，以避免 macOS Unix Socket 路径长度限制。App Server 运行在独立进程组，进程组号写入数据目录的 `codex-app-server.pid`。Node 启动时先结束上次遗留的进程组，正常退出时一并停止它，异常退出则退避重启。要指定系统 App Server 的 socket，设置 `providers.codex_app_server.socket`。启动网页成功不等于程序已安装、已登录或模型可用，应查看聊天中工作的实际状态。
 
@@ -453,7 +473,7 @@ App Server 重启或重连后，Node 只读复查未结束的工作，不重发�
 
 普通执行的终态结果自动送回原聊天，协调 Agent 以完整权限汇报，可以继续派发工作。
 
-普通进度和通知不调用管理模型。`daily_decision_limit` 只限制当前 Node、当前个人网络在 UTC 当天非本人触发的管理调用，本人主动聊天不消耗这个额度。失败的调用也可能消耗已预留次数。各 Node 分别记账，不构成全网 token 或费用硬上限。额度耗尽时，原始结果和通知仍保留。
+普通进度和通知不调用管理模型。`daily_decision_limit` 只限制当前 Node、当前个人网络在 UTC 当天非本人触发的管理调用，本人主动聊天不消耗这个额度。协调 Agent 的分诊唤醒按同一上限另行计数。失败的调用也可能消耗已预留次数。各 Node 分别记账，不构成全网 token 或费用硬上限。额度耗尽时，原始结果和通知仍保留。
 
 Codex 结束一轮不等于交付目标已经达成，由本人核对产物后确认。停止回复不会自动停止已经运行的进程，仍需核对后台工作的实际状态。
 

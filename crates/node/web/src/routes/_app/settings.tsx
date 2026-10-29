@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
@@ -11,7 +11,9 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
-import { CurrentRecoveryFile, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
+import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
+import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
+import { webPlatform } from '@/lib/platform'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -28,6 +30,7 @@ function SettingsPage() {
   const [leaving, setLeaving] = useState(false)
   const [range, setRange] = useState(86_400_000)
   const [exported, setExported] = useState<'idle' | 'busy' | 'done'>('idle')
+  const [experiments, setExperiments] = useExperiments(webPlatform.storage)
   useEffect(() => {
     if (exported !== 'done') return
     const timer = setTimeout(() => setExported('idle'), 2000)
@@ -54,10 +57,16 @@ function SettingsPage() {
     <SettingsGroup title="文件传输">
       <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="发送和接收文件"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
     </SettingsGroup>
-    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer={device.unsavedRecovery ? undefined : '恢复文件只有一份有效，丢了不能补'}>
+    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回">
       <CurrentRecoveryFile />
+      <PhoneRecovery />
       <RecoveryControls />
     </SettingsGroup> : null}
+    <SettingsGroup>
+      <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experimentsCopy.hint}>
+        <input type="checkbox" role="switch" className="switch" aria-label={experimentsCopy.label} checked={experiments} onChange={(event) => setExperiments(event.target.checked)} />
+      </SettingsRow>
+    </SettingsGroup>
     {operator ? <SettingsGroup title="问题排查" footer="诊断包不含登录信息和加入链接">
       <Link to="/settings/logs" className="interactive-row block">
         <SettingsRow icon={ScrollText} label="日志"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>

@@ -1,15 +1,17 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Copy, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ScanLine, ShieldAlert, ShieldX, Smartphone, WifiOff, type LucideIcon } from 'lucide-react'
+import qrcode from 'qrcode-generator'
 import { cn } from '@/lib/utils'
-import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
+import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsDisclosure, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { recoveryEntry, recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
 import { deviceIcon } from '@/features/devices/devices'
 
 /** Where the reminder to change the recovery password leads: settings with that form open. */
@@ -50,9 +52,35 @@ export function CurrentRecoveryFile() {
   const { directory, recoverySince } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   if (!code) return null
-  return <SettingsRow icon={FileKey} label="恢复文件" description={<span title={recoveryFileStem(code)}>识别码 <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
-    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN')}</time> : null}
+  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={<span title={recoveryFileStem(code)}>{recoveryCopy.codeLabel} <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
+    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{recoveryCopy.day(recoverySince)}</time> : null}
   </SettingsRow>
+}
+
+/** What a phone scans in its 用恢复文件找回 to know which computer to go through; it holds no key and lets no one in. */
+export function PhoneRecovery() {
+  const device = useDevice()
+  const entry = recoveryEntry(device.entrances, device.ready?.entry ?? null)
+  const link = entry ? recoveryLink(entry) : null
+  const image = useMemo(() => {
+    if (!link) return null
+    try { const code = qrcode(0, 'M'); code.addData(link); code.make(); return code.createDataURL(4, 16) } catch { return null }
+  }, [link])
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
+  return <SettingsDisclosure icon={Smartphone} label={recoveryCopy.byPhone}>
+    {link ? <>
+      {image ? <img src={image} alt={recoveryCopy.qr} className="size-48 rounded-lg bg-white p-2 ring-1 ring-border" /> : null}
+      <p className="flex items-center gap-2 text-meta text-muted-foreground"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
+      <Button type="button" variant="outline" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
+        {copied ? <CircleCheck aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制链接'}
+      </Button>
+    </> : <p className="flex items-center gap-2 text-meta text-muted-foreground"><WifiOff aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.unreachable}</p>}
+  </SettingsDisclosure>
 }
 
 /** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
@@ -81,7 +109,7 @@ export function RecoveryPendingCard() {
       <p className="text-meta text-muted-foreground">{recoveryCopy.stopNote}</p>
     </div> : changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
-      const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
+      const Icon = deviceIcon(member)
       const Change = added ? CirclePlus : CircleMinus
       return <li key={member.device_id} className="flex min-w-0 items-center gap-2">
         <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
@@ -134,7 +162,6 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
     <p className="flex items-center gap-2 text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.why}</p>
-    <p className="flex items-center gap-2 text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.needsPassword}</p>
     <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
@@ -214,7 +241,7 @@ export function RecoveryReview() {
     <fieldset disabled={busy} className="grid gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
-        const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: required })
+        const Icon = deviceIcon(member)
         const gone = lost.includes(member.device_id)
         return <div key={member.device_id} className="flex min-h-12 items-center gap-2 rounded-lg bg-muted/60 px-3">
           <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -278,7 +305,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         {/* With no address yet, opening this computer's own page fills it in; typing it is the fallback. */}
         {target ? null : <p className="flex items-center gap-2 text-meta text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />在要连的电脑上打开本机页面再找回</p>}
         <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual}>
-          <Label label="访问地址"><Input type="url" name="address" required defaultValue={target?.address || ''} /></Label>
+          <Label label="访问地址"><Input type="url" name="address" required defaultValue={target ? entryAddress(target) : ''} /></Label>
           <Label label="设备编号"><Input className="font-mono" name="device_id" required pattern="[a-f0-9]{64}" defaultValue={target?.device_id || ''} autoComplete="off" spellCheck={false} /></Label>
         </Details>
         <InlineError error={error || null} />
