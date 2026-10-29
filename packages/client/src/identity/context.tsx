@@ -175,13 +175,8 @@ function absorb(seen: Vector, vector: unknown) {
   for (const [author, seq] of Object.entries(vector as Vector)) if (typeof seq === 'number' && !(seen[author] >= seq)) seen[author] = seq
 }
 
-export function DeviceProvider(props: { platform: Platform; children: ReactNode }) {
-  // A factory reset starts over from a fresh mount, as on first launch.
-  const [run, setRun] = useState(0)
-  return <DeviceState key={run} {...props} restart={() => setRun(count => count + 1)} />
-}
-
-function DeviceState({ platform, children, restart }: { platform: Platform; children: ReactNode; restart(): void }) {
+/** `restart` mounts a fresh provider after a factory reset, so the app starts over as on first launch. */
+export function DeviceProvider({ platform, children, restart }: { platform: Platform; children: ReactNode; restart?(): void }) {
   const { self, page } = platform
   const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadWait } = deviceStore(platform.storage, self)
   const { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } = secureKit(platform.secure)
@@ -707,7 +702,7 @@ function DeviceState({ platform, children, restart }: { platform: Platform; chil
    */
   async function factoryReset() {
     const { erase } = platform
-    if (!erase) throw new Error(`${self}不能恢复出厂设置。`)
+    if (!erase || !restart) throw new Error(`${self}不能恢复出厂设置。`)
     if (ready?.isCurrent()) await leave().catch(() => {})
     disconnect()
     await erase()
