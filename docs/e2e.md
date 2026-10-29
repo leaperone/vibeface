@@ -148,7 +148,7 @@ AGENT_DEVICE_STATE_DIR="$PWD/.artifacts/native/agent-device" \
 pnpm exec e2e run --config e2e.native.config.ts
 ```
 
-原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。邀请码仅通过 e2e SecretProvider 从私有任务文件读取。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
+原生测试通过真实邀请码加入接收网络，检查手机与管理员的安全码相同，再授予管理权限。测试从私有任务文件读取一次性邀请码，像扫码一样以 `vibeface://join?link=` 打开应用。发送方经真实 Node 发出公益订单，原生界面接受并保存文件。测试只读该专用应用的 `Documents/transfers/`，以独立 SHA-256 核对实际保存的字节。没有安装新构建、执行原生界面或读取实际文件时，不能把入口准备完成或 Web 通过作为原生验收成功。
 
 ## 让编码代理使用 e2e
 

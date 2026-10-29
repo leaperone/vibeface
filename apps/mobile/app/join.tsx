@@ -123,7 +123,7 @@ function JoinForm() {
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
-      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} value={name} onChangeText={setName} maxLength={64} />
+      <Input accessibilityLabel={joinCopy.deviceName} value={name} onChangeText={setName} maxLength={64} />
     </View>
     <ErrorText error={failure} />
     <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>

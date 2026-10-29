@@ -1,5 +1,5 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router'
-import { Crown, MonitorSmartphone, Sparkles, Trash2 } from 'lucide-react-native'
+import { ArrowRightLeft, Bot, Crown, MonitorSmartphone, Sparkles, Trash2 } from 'lucide-react-native'
 import { useState } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -23,10 +23,12 @@ export default function DeviceDetail() {
   const { members } = useWorkspace()
   const member = members.find((item) => item.device_id === deviceId)
   const { busy, error, run } = useRun()
+  const switching = useRun()
   const [removing, setRemoving] = useState(false)
   if (!member) return <EmptyState icon={MonitorSmartphone} title="找不到这个设备" className="flex-1 justify-center" />
   const manageable = device.ready?.principal.can_manage === true && member.kind === 'client' && !member.current
   const removable = device.ready?.principal.can_manage === true && !member.admin && !member.current && !member.entry
+  const saved = device.entries.find((item) => item.device_id === member.device_id)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: '' }} />
     <View className="flex-row items-center gap-4">
@@ -41,8 +43,14 @@ export default function DeviceDetail() {
         {member.online === false ? <Text className="text-meta text-muted-foreground">{deviceCopy.offline}</Text> : null}
       </View>
     </View>
-    {/* The AI page sets up the computer this phone connects through, so its detail leads there instead of ending. */}
-    {member.entry && device.ready?.principal.can_manage ? <SettingsGroup><SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" /></SettingsGroup> : null}
+    {/* The AI page sets up the computer this phone connects through; any other computer shows how its bot stands, as on the web. */}
+    {member.kind === 'node' ? <SettingsGroup>
+      {member.entry && device.ready?.principal.can_manage ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" />
+        : <SettingsRow icon={Bot} label={deviceCopy.botStatus[member.bot ?? 'none']} />}
+      {!member.entry && device.ready?.principal.can_manage && saved ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', () => device.connect(saved))}>
+        {switching.error ? <View className="basis-full ps-11"><ErrorText error={switching.error} /></View> : null}
+      </SettingsRow> : null}
+    </SettingsGroup> : null}
     {manageable || removable ? <SettingsGroup>
       {manageable ? <SettingsRow icon={Crown} label="管理设备" description={deviceCopy.manageHint}>
         <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
@@ -51,7 +59,7 @@ export default function DeviceDetail() {
       </SettingsRow> : null}
       {removable ? <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => setRemoving(true)}>
         {removing ? <View className="basis-full gap-3 ps-11">
-          <Text>{deviceCopy.removeNotice(member.bot)}</Text>
+          <Text>{deviceCopy.removeNotice(member.bot !== null)}</Text>
           <ErrorText error={error} />
           <View className="flex-row flex-wrap justify-end gap-2">
             <Button variant="ghost" onPress={() => setRemoving(false)}><Text>取消</Text></Button>

@@ -9,7 +9,7 @@ import { createInterface } from 'node:readline';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { test as base } from '@e2e-dev/mobile';
-import { expect, secrets } from 'e2e';
+import { expect } from 'e2e';
 
 const root = resolve(import.meta.dirname, '..');
 const execute = promisify(execFile);
@@ -19,7 +19,7 @@ function record(value: unknown): Record<string, unknown> {
   return value;
 }
 function text(value: unknown): string { assert(typeof value === 'string' && value.length > 0); return value; }
-type NativeNetwork = { call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
+type NativeNetwork = { invitation: string; call(request: Record<string, unknown>): Promise<Record<string, unknown>> };
 const test = base.extend<{ network: NativeNetwork }>({
   network: async ({}, use) => {
     const binary = process.env.VIBEFACE_E2E_BINARY, crypto = process.env.VIBEFACE_E2E_CRYPTO_MODULE;
@@ -68,7 +68,7 @@ const test = base.extend<{ network: NativeNetwork }>({
     try {
       await ready;
       await call({ op: 'native_setup', invitation_file: invitation });
-      await use({ call });
+      await use({ invitation: (await readFile(invitation, 'utf8')).trim(), call });
     } finally {
       cancelPending();
       child.stdin.end();
@@ -88,8 +88,9 @@ test('receives a charity file through a real native pairing and verifies the sav
   await device.installApp(undefined, { reinstall: true });
   await device.clearKeychain();
   await app.open();
-  await screen.getByRole('textbox', /^加入链接/).fill(secrets.get('nativeInvitation'), { timeout: 30000 });
-  await screen.getByRole('textbox', /^这台手机叫什么/).fill('VDP native receiver');
+  await device.openLink(`vibeface://join?link=${encodeURIComponent(network.invitation)}`);
+  await expect(screen.getByText('已填入加入链接', { exact: true })).toBeVisible({ timeout: 30000 });
+  await screen.getByRole('textbox', '这台设备的名字').fill('VDP native receiver');
   await device.dismissKeyboard();
   await screen.getByRole('button', '加入', { exact: true }).click();
   const pairing = await network.call({ op: 'native_join' });
