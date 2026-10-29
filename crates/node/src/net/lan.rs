@@ -54,8 +54,8 @@ struct Advert {
     addrs: Vec<SocketAddr>,
     /// When it was last heard, Unix ms.
     at: u64,
-    /// Whether it named a member Node when heard; a full table drops the others first without
-    /// matching every advert again.
+    /// Whether it names a member Node, marked when heard and again when the network or its
+    /// members change; a full table drops the others first without matching every advert again.
     member: bool,
 }
 

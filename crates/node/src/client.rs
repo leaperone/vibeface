@@ -1566,7 +1566,8 @@ pub(crate) struct NodeJoinTask {
 /// unfinished join; its commitment was never revealed for the new invite.
 async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
     let capability = text(params, "capability")?.to_owned();
-    let link = text(params, "link")?.trim().to_owned();
+    // Every form of one invite is the same join.
+    let link = parse_join_link(text(params, "link")?)?.encode()?;
     let name = text(params, "name")?.to_owned();
     ensure!(name.chars().count() <= 128, "device name is too long");
     {
@@ -1602,7 +1603,6 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
     }
-    parse_join_link(&link)?;
     let runner = node.clone();
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
