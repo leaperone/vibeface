@@ -106,6 +106,8 @@ export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
   manageHint: '能添加、移除设备，改设置，拦下找回',
+  /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
+  botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot' },
   removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
   /** A provider's two switches on a device; `hint` says what each turns on, named for the provider's row. */
   roles: {
