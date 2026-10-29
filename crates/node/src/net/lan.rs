@@ -36,6 +36,8 @@ struct State {
     seen: HashMap<String, Advert>,
     /// When each member Node was last woken, Unix ms.
     woken: HashMap<String, u64>,
+    /// Set once this Node withdrew for good; nothing advertises it again.
+    stopped: bool,
 }
 
 /// The network this Node is in and the advert naming it there; `advertised` is false until
@@ -86,8 +88,13 @@ impl Lan {
 
     /// Advertises this Node in `network` under the current hour's tag; `None` withdraws it.
     pub(super) fn refresh(&self, network: Option<&str>, members: &[String]) {
-        let hour = hour(now_ms());
+        let now = now_ms();
+        let hour = hour(now);
         let mut state = self.state.lock().expect("LAN state");
+        if state.stopped {
+            return;
+        }
+        let rematch = state.members != members;
         state.members = members.to_vec();
         let current = state
             .own
@@ -95,12 +102,18 @@ impl Lan {
             .filter(|own| own.advertised)
             .map(|own| (own.network.as_str(), own.hour));
         if current == network.map(|network| (network, hour)) {
+            if rematch {
+                state.rematch(now);
+            }
             return;
         }
         if let Some(own) = state.own.take() {
             let _ = self.daemon.unregister(&own.fullname);
         }
-        let Some(network) = network else { return };
+        let Some(network) = network else {
+            state.rematch(now);
+            return;
+        };
         let tag = lan_tag(network, &self.device, hour);
         // The host name is the tag too, so the advert does not carry the machine's name.
         let advert = ServiceInfo::new(
@@ -121,12 +134,17 @@ impl Lan {
             fullname: format!("{tag}.{}", self.service),
             advertised: advert.is_ok(),
         });
+        state.rematch(now);
     }
 
     /// Withdraws the advert, waiting a moment for the goodbye to go out, so the other devices
     /// drop it now rather than when it expires.
     pub(super) async fn stop(&self) {
-        let own = self.state.lock().expect("LAN state").own.take();
+        let own = {
+            let mut state = self.state.lock().expect("LAN state");
+            state.stopped = true;
+            state.own.take()
+        };
         if let Some(own) = own.filter(|own| own.advertised)
             && let Ok(done) = self.daemon.unregister(&own.fullname)
         {
@@ -233,6 +251,16 @@ impl State {
         due.then_some(member)
     }
 
+    /// Marks again which adverts name a member, after the network or its members changed;
+    /// adverts heard before this Node knew either would otherwise go first when the table fills.
+    fn rematch(&mut self, now_ms: u64) {
+        for advert in self.seen.values_mut() {
+            advert.member = self.own.as_ref().is_some_and(|own| {
+                matching_member(&self.members, &own.network, &advert.tag, now_ms).is_some()
+            });
+        }
+    }
+
     /// The addresses of the latest advert naming `device`, so one dial tries at most
     /// `MAX_ADDRS` of them however many adverts repeat its tag. A tag stops matching an hour
     /// after its own, which retires adverts nobody withdrew.
@@ -294,6 +322,11 @@ mod tests {
             advertised: true,
         });
         state.members = vec!["b".into(), "c".into()];
+        state.rematch(now);
+        assert!(
+            state.seen["b0"].member,
+            "an advert heard before the network was known is kept as a member's"
+        );
         assert_eq!(
             state.hints("b", now),
             [SocketAddr::from(([192, 168, 1, 20], 1))],

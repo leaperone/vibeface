@@ -1691,7 +1691,8 @@ async fn join_as_node(
         Err(error) => return Err(error.into()),
     };
     ensure!(
-        pending.link == link.trim() && pending.name == name,
+        parse_join_link(&pending.link).is_ok_and(|pending| pending == ticket)
+            && pending.name == name,
         "another join is in progress; delete join.json to abandon it"
     );
     crate::config::private_write(&path, &serde_json::to_vec(&pending)?)?;
