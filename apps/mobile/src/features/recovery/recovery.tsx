@@ -1,8 +1,8 @@
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
-import { Alert, View } from 'react-native'
+import { Alert, Pressable, View } from 'react-native'
 import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
@@ -113,6 +113,7 @@ export function RecoveryReview() {
 function SaveRecoveryFile({ code, saved, onSaved, save }: { code: string; saved: boolean; onSaved(saved: boolean): void; save?: { done: boolean; run(): void } }) {
   const done = !save || save.done
   return <>
+    {hint(LifeBuoy, recoveryCopy.why)}
     {hint(KeyRound, recoveryCopy.needsPassword)}
     {hint(FileWarning, recoveryCopy.onlyCopy)}
     {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
@@ -179,6 +180,23 @@ export function RecoveryPendingCard() {
     })}
     <ErrorText error={error} />
   </ActionCard>
+}
+
+/** Above the chat while a recovery waits, as on the web: a managing phone sees it without opening 待处理, and one tap leads there. */
+export function RecoveryAlert({ top }: { top: number }) {
+  const device = useDevice()
+  const pending = device.pendingRecovery
+  if (!pending) return null
+  return <View pointerEvents="box-none" className="absolute inset-x-0 w-full max-w-3xl self-center px-4" style={{ top: top + 8 }}>
+    <Link href="/inbox" asChild>
+      <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs active:opacity-70">
+        <View className="size-8 items-center justify-center rounded-lg bg-danger-soft"><Icon as={ShieldAlert} className="size-4 text-danger" /></View>
+        <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{recoveryCopy.pending}</Text>
+        <Text className="text-meta text-danger" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</Text>
+        <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
+      </Pressable>
+    </Link>
+  </View>
 }
 
 /** Left after stopping a recovery: whoever started it holds the file, so a new password retires it. */

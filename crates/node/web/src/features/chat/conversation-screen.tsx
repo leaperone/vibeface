@@ -19,6 +19,7 @@ import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/wo
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
+import { RecoveryAlert } from '@/features/identity/recovery-controls'
 import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
@@ -235,6 +236,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   return (
     <section className="conversation-screen" aria-label="对话">
+      <RecoveryAlert />
       <Chat
         key={conversationId}
         entries={entries}

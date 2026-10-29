@@ -23,11 +23,12 @@ function share(invitation: Invitation): Share {
 }
 
 /** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
-export function AddDevice({ opening = false, onOpened }: { opening?: boolean; onOpened?(): void }) {
+export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
+  useEffect(() => onOpenChange?.(open), [open])
   const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
