@@ -23,7 +23,7 @@ const STOP_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_RETRY_MS: i64 = 3_000;
 const STOP_RETRY_MAX_MS: i64 = 60_000;
 
-fn live(record: &WorkRecord) -> bool {
+pub(super) fn live(record: &WorkRecord) -> bool {
     !matches!(
         record.state,
         WorkState::Finished { .. } | WorkState::Unverified { probe: false, .. }

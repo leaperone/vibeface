@@ -1306,6 +1306,65 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
 }
 
 #[test]
+fn many_small_events_condense_into_a_checkpoint() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m0", "修一下登录"),
+        vec![],
+        2,
+    )?;
+    let node = net.a.device_id()?;
+    let attribute = |store: &mut Store, i: i64| {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            EventBody::SessionAttributed {
+                node: node.clone(),
+                agent: crate::providers::Provider::Codex,
+                session_id: format!("s{i}"),
+                cwd: "/w".into(),
+                summary: "在跑".into(),
+            },
+            vec![],
+            10 + i,
+        )
+    };
+    for i in 0..600 {
+        attribute(&mut store, i)?;
+    }
+    let works = store.works(&net.network, "c")?;
+    let context = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+    let checkpoint = crate::scheduler::checkpoint(&context, &works)
+        .context("a long run of events is condensed though its messages are short")?;
+    let EventBody::ContextCheckpoint {
+        recent_user_requests,
+        ..
+    } = &checkpoint
+    else {
+        unreachable!()
+    };
+    assert_eq!(recent_user_requests, &["修一下登录".to_owned()]);
+    store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 1_000)?;
+    let recent = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+    assert!(
+        recent.events.len() <= 300,
+        "a turn reads only the newest events, not {}",
+        recent.events.len()
+    );
+    assert!(
+        crate::scheduler::checkpoint(&recent, &works).is_none(),
+        "the next turn writes no checkpoint of its own"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
@@ -2802,6 +2861,51 @@ fn configure(
         avatar: None,
         default_avatar: None,
     }
+}
+
+#[test]
+fn a_removed_skill_leaves_the_bots_that_used_it() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let mut change = |call_ref: &str, request: ChangeRequest| {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            request,
+            Provider::Codex,
+            5,
+        )
+    };
+    let mut ids = Vec::new();
+    for (call_ref, name) in [("s1", "Digest"), ("s2", "Review")] {
+        let (saved, _) = change(call_ref, save_skill(None, name, "Steps."))?;
+        let BotChange::Skill { skill_id, .. } = saved.change else {
+            panic!("skill change")
+        };
+        ids.push(skill_id);
+    }
+    let both = [ids[0].as_str(), ids[1].as_str()];
+    change("k1", configure("Helper", None, Some(&both), None))?;
+    change(
+        "r1",
+        ChangeRequest::RemoveSkill {
+            skill_id: ids[1].clone(),
+        },
+    )?;
+    let helper = store
+        .bot_for_conversation(&net.network, "c")?
+        .context("helper")?;
+    assert_eq!(
+        helper.skills,
+        Some([ids[0].clone()].into()),
+        "the bot lists only skills that still exist"
+    );
+    let listed = crate::runtime::agent_tools::read_bot(&store, &net.network, "Helper", 100)?;
+    assert_eq!(listed["skills"].as_array().map(Vec::len), Some(1));
+    Ok(())
 }
 
 #[test]

@@ -746,6 +746,9 @@ const CHECKPOINT_BUDGET: usize = 8_000;
 const WORK_BUDGET: usize = 8_000;
 const SUMMARY_LIMIT: usize = 6_000;
 const RECENT_REQUESTS_LIMIT: usize = 20;
+/// Events a turn reads past the newest checkpoint before the next one is written, whatever
+/// their kind; a checkpoint leaves the newest half of them.
+const EVENT_LIMIT: usize = 400;
 /// The newest decisions a checkpoint carries on; older ones are left to `context`.
 const DECISION_LIMIT: usize = 200;
 
@@ -859,7 +862,10 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
             ))
         })
         .collect::<Vec<_>>();
-    if sizes.iter().map(|(_, size)| size).sum::<usize>() <= MESSAGE_BUDGET {
+    let uncovered = events.iter().filter(open).count();
+    if sizes.iter().map(|(_, size)| size).sum::<usize>() <= MESSAGE_BUDGET
+        && uncovered <= EVENT_LIMIT
+    {
         return None;
     }
     let mut kept = 0;
@@ -871,6 +877,7 @@ pub(crate) fn checkpoint(context: &Context, works: &[WorkProjection]) -> Option<
         kept += size;
         cut = *offset;
     }
+    let cut = cut.max(events.len().saturating_sub(EVENT_LIMIT / 2));
     let mut covers = since.clone();
     let (mut lines, mut requests, mut decisions) = match previous {
         Some((summary, requests, decisions)) => {
