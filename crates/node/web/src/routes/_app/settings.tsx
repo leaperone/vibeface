@@ -36,7 +36,7 @@ function SettingsPage() {
   const operator = principal?.can_manage || principal?.source === 'local_session'
   // A local session only disconnects, so only a member browser can be the one manager left.
   const sole = principal?.source !== 'local_session' && soleManager(device.directory?.members ?? [], device.identity?.deviceId)
-  return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <SettingsGroup title="提醒">
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
         <NotificationValue />
@@ -79,19 +79,19 @@ function SettingsPage() {
     <Sheet open={leaving} onOpenChange={setLeaving}>
       <SheetContent side="bottom" showCloseButton={false} className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
         {sole ? <>
-          <SheetHeader className="px-5 pt-5">
-            <SheetTitle className="flex items-start gap-2 text-base font-normal leading-normal"><Crown aria-hidden="true" className="mt-1 size-4 shrink-0 text-warning" />{onlyManagerText('这个浏览器')}</SheetTitle>
+          <SheetHeader className="px-4 pt-4">
+            <SheetTitle className="flex items-start gap-2 text-body font-normal"><Crown aria-hidden="true" className="mt-1 size-4 shrink-0 text-warning" />{onlyManagerText('这个浏览器')}</SheetTitle>
             <SheetDescription className="sr-only">不能断开</SheetDescription>
           </SheetHeader>
-          <div className="flex justify-end px-5 pt-2 pb-5">
+          <div className="flex justify-end px-4 pt-2 pb-4">
             <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>知道了</Button>
           </div>
         </> : <>
-          <SheetHeader className="gap-1.5 px-5 pt-5">
+          <SheetHeader className="gap-1.5 px-4 pt-4">
             <SheetTitle className="flex items-center gap-2"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
             <SheetDescription>要回来，得重新打开本机页面或用加入链接</SheetDescription>
           </SheetHeader>
-          <div className="flex justify-end gap-2 px-5 pt-2 pb-5">
+          <div className="flex justify-end gap-2 px-4 pt-2 pb-4">
             <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
             <Button type="button" variant="destructive" onClick={() => { void workspace.run(async () => { setLeaving(false); await device.leave() }, '断开这个浏览器') }}>断开</Button>
           </div>

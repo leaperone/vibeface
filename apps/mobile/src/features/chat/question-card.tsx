@@ -3,6 +3,7 @@ import { humanError } from '@vibeface/client/lib/errors.ts'
 import { ArrowUp, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
+import { ErrorText } from '@/components/action'
 import { ActionCard, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
@@ -76,7 +77,7 @@ export function QuestionCard({ question }: { question: Question }) {
         </Button>
       </View>
     </View>
-    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+    <ErrorText error={error} />
   </ActionCard>
 }
 

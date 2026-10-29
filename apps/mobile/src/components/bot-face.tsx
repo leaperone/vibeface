@@ -1,4 +1,3 @@
-import { Star } from 'lucide-react-native'
 import { useFocusEffect } from 'expo-router'
 import { createContext, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, AppState, View } from 'react-native'
@@ -10,10 +9,8 @@ import { ASLEEP, faceMotion, type Frame } from '@vibeface/client/avatar/motion.t
 import { moodOf } from '@vibeface/client/avatar/mood.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import type { BotRecord } from '@vibeface/client/workspace/types.ts'
-import { Icon } from '@/components/ui/icon'
 import type { useLive } from '@/data/live'
 import type { Workspace } from '@/data/types'
-import { cn } from '@/lib/utils'
 
 const AnimatedPath = Animated.createAnimatedComponent(Path)
 const AnimatedCircle = Animated.createAnimatedComponent(Circle)
@@ -55,7 +52,8 @@ export function ScreenFaces({ children }: { children: ReactNode }) {
 }
 
 /** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the row says the mood. */
-export function BotFace({ botId, mood, size, primary }: { botId: string; mood: Mood; size: 44 | 80; primary?: boolean }) {
+/** `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. */
+export function BotFace({ botId, mood, size, halo }: { botId: string; mood: Mood; size: number; halo?: string }) {
   const { theme } = useUniwind()
   const dark = theme === 'dark'
   const face = useMemo(() => faceOf(botId), [botId])
@@ -95,6 +93,15 @@ export function BotFace({ botId, mood, size, primary }: { botId: string; mood: M
   const ink = mood === 'asleep' ? palette.asleep.ink : palette.awake.ink
 
   return <View importantForAccessibility="no-hide-descendants" accessibilityElementsHidden style={{ width: size, height: size }}>
+    {halo ? <Svg width={size * 1.8} height={size * 1.8} style={{ position: 'absolute', left: -size * 0.4, top: -size * 0.4 }}>
+      <Defs>
+        <RadialGradient id={`${gradient}halo`}>
+          <Stop offset={0.5} stopColor={halo} stopOpacity={dark ? 0.18 : 0.14} />
+          <Stop offset={1} stopColor={halo} stopOpacity={0} />
+        </RadialGradient>
+      </Defs>
+      <Circle cx="50%" cy="50%" r="50%" fill={`url(#${gradient}halo)`} />
+    </Svg> : null}
     <Animated.View style={[{ position: 'absolute', inset: 0 }, bodyStyle]}>
       <Svg viewBox="0 0 100 100" width={size} height={size}>
         <Defs>
@@ -114,9 +121,6 @@ export function BotFace({ botId, mood, size, primary }: { botId: string; mood: M
     <Svg viewBox="0 0 100 100" width={size} height={size} style={{ position: 'absolute' }}>
       {[dot0, dot1, dot2].map((props, i) => <AnimatedCircle key={i} animatedProps={props} cx={dots[i].x} cy={dots[i].y} r={dots[i].r} fill={palette.awake.thought} />)}
     </Svg>
-    {primary ? <View className={cn('absolute items-center justify-center rounded-full bg-background', size === 80 ? '-right-0.5 -bottom-0.5 size-6' : '-right-1 -bottom-1 size-4')}>
-      <Icon as={Star} className={cn('fill-amber-500 text-amber-500', size === 80 ? 'size-4' : 'size-3')} />
-    </View> : null}
   </View>
 }
 

@@ -3,6 +3,7 @@ import { Check, CircleCheck, Copy, Link2, Plus, Share2, ShieldAlert } from 'luci
 import { useEffect, useState } from 'react'
 import { ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
+import { ErrorText } from '@/components/action'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -45,28 +46,28 @@ export default function AddDevice() {
       if (connection.isCurrent()) setResult(invitation)
     })
   }
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-5 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {added && !requests ? <View className="gap-3">
       <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>
-      <Button variant="outline" className="min-h-11 self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
-    </View> : !result || used && !requests ? requests ? <Button variant="outline" className="min-h-11 self-start" disabled={busy !== null} onPress={generate}>
+      <Button variant="outline" className="self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
+    </View> : !result || used && !requests ? requests ? <Button variant="outline" className="self-start" disabled={busy !== null} onPress={generate}>
       <Icon as={Link2} /><Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
-    </Button> : <EmptyState icon={Link2} title="让新设备扫码加入" action={<Button className="min-h-11" disabled={busy !== null} onPress={generate}>
+    </Button> : <EmptyState icon={Link2} title="让新设备扫码加入" action={<Button disabled={busy !== null} onPress={generate}>
       <Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button>} /> : null}
     <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
     {result && !used ? <View className="gap-4">
       <QrCode value={result.publicEntry ? result.link : result.ticket} label={result.publicEntry ? '用手机相机扫码打开' : '在新设备的 Vibeface 里扫码'} />
       <View className="flex-row flex-wrap justify-center gap-2">
-        <Button variant={requests ? 'outline' : 'default'} className="min-h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
+        <Button variant={requests ? 'outline' : 'default'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
           <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>
         </Button>
-        <Button variant="outline" className="min-h-11" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
+        <Button variant="outline" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
           <Icon as={Share2} /><Text>分享</Text>
         </Button>
       </View>
       <Text className="text-center text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</Text>
     </View> : null}
-    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+    <ErrorText error={error} />
   </ScrollView>
 }

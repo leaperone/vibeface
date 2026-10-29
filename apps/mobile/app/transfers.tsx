@@ -22,7 +22,7 @@ const roleIcons = { sender: ArrowUpRight, receiver: ArrowDownLeft, provider: Arr
 
 export default function TransfersScreen() {
   const { ready } = useDevice()
-  return ready ? <Transfers key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title={`设备暂时离线。${transferCopy.offline}`} />
+  return ready ? <Transfers key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={ArrowRightLeft} title={`设备暂时离线。${transferCopy.offline}`} className="flex-1 justify-center" />
 }
 
 function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
@@ -41,10 +41,10 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
   const unusable = working || !file || status?.max_file_bytes === 0 || draft.mode === 'charity' && !status?.charity_enabled || draft.mode === 'paid' && !status?.paid_enabled
   const prepare = (restart?: string) => { if (file) { setOrigin('form'); void delivery.prepare(draft, file, restart) } }
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-6 p-4 pb-10">
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {feedback('page')}
     {!status ? <Text role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</Text> : <>
-      <View className="gap-3 rounded-xl border border-border bg-card p-4">
+      <View className="gap-3 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
         <Text role="heading" className="text-heading font-semibold">传输设置</Text>
         <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
         {status.enabled ? <>
@@ -61,7 +61,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
           <Text className="text-meta text-muted-foreground">{transferCopy.walletDetails}</Text>
         </Details>
       </View>
-      {status.enabled && delivery.canManage ? <View className="gap-4 rounded-xl border border-border bg-card p-4">
+      {status.enabled && delivery.canManage ? <View className="gap-4 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
         <Text role="heading" className="text-heading font-semibold">发送文件</Text>
         <InputField label={transferCopy.receiver} value={draft.receiver_peer} disabled={working} onChange={receiver_peer => setDraft({ ...draft, receiver_peer })} peer />
         <InputField label={transferCopy.provider} hint={transferCopy.providerHint} value={draft.provider_peer} disabled={working} onChange={provider_peer => setDraft({ ...draft, provider_peer })} peer />
@@ -73,15 +73,15 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
           <InputField label="链费上限（测试链原生币最小单位）" value={draft.max_gas_amount} disabled={working} onChange={max_gas_amount => setDraft({ ...draft, max_gas_amount })} numeric />
         </> : <IconLine icon={ShieldCheck} tone="text-success" text={transferCopy.free} />}
         <View className="flex-row flex-wrap items-center gap-x-3 gap-y-2">
-          <Button variant="outline" className="min-h-11" disabled={working} onPress={() => void picker.run('pick', async () => { const picked = await mobilePlatform.files?.pick(); if (picked) setFile(picked) })}><Icon as={picker.busy === 'pick' ? LoaderCircle : File} /><Text>选择文件</Text></Button>
+          <Button variant="outline" disabled={working} onPress={() => void picker.run('pick', async () => { const picked = await mobilePlatform.files?.pick(); if (picked) setFile(picked) })}><Icon as={picker.busy === 'pick' ? LoaderCircle : File} /><Text>选择文件</Text></Button>
           <Text className="min-w-0 shrink text-meta text-muted-foreground">{file ? <><Text className="text-meta text-foreground">{file.name}</Text> · {sizeLabel(file.size)}</> : transferCopy.maxSize(status.max_file_bytes)}</Text>
         </View>
         <ErrorText error={picker.error} />
         {file && file.size > status.max_file_bytes ? <ErrorText error={transferCopy.tooLarge(status.max_file_bytes)} /> : null}
         {feedback('form')}
         <View className="flex-row flex-wrap gap-2">
-          <Button className="min-h-11" disabled={unusable} onPress={() => prepare()}>{delivery.busy === 'prepare' ? <Icon as={LoaderCircle} /> : null}<Text>{transferCopy.prepare(draft.mode)}</Text></Button>
-          {selected && canRestart(selected) ? <Button variant="outline" className="min-h-11" disabled={unusable} onPress={() => prepare(selected.intent_id)}><Text>作为新订单再次发送</Text></Button> : null}
+          <Button disabled={unusable} onPress={() => prepare()}>{delivery.busy === 'prepare' ? <Icon as={LoaderCircle} /> : null}<Text>{transferCopy.prepare(draft.mode)}</Text></Button>
+          {selected && canRestart(selected) ? <Button variant="outline" disabled={unusable} onPress={() => prepare(selected.intent_id)}><Text>作为新订单再次发送</Text></Button> : null}
         </View>
         <Details><Text className="text-meta text-muted-foreground">{transferCopy.prepareDetails}</Text></Details>
       </View> : null}
@@ -89,9 +89,9 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
     <View className="gap-3">
       <View className="flex-row items-center justify-between gap-3">
         <Text role="heading" className="text-heading font-semibold">传输记录</Text>
-        <Button variant="ghost" className="min-h-11" disabled={working} onPress={() => { setOrigin('page'); void delivery.refresh() }}><Icon as={delivery.busy === 'refresh' ? LoaderCircle : RefreshCw} /><Text>刷新</Text></Button>
+        <Button variant="ghost" disabled={working} onPress={() => { setOrigin('page'); void delivery.refresh() }}><Icon as={delivery.busy === 'refresh' ? LoaderCircle : RefreshCw} /><Text>刷新</Text></Button>
       </View>
-      {delivery.orders.length ? <View className="overflow-hidden rounded-xl border border-border bg-card">{delivery.orders.map((order, index) => <Pressable key={order.order_id} accessibilityRole="button" accessibilityState={{ selected: selected?.order_id === order.order_id }}
+      {delivery.orders.length ? <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{delivery.orders.map((order, index) => <Pressable key={order.order_id} accessibilityRole="button" accessibilityState={{ selected: selected?.order_id === order.order_id }}
         className={cn('min-h-16 flex-row items-center gap-3 px-4 py-3 active:bg-muted/60', index > 0 && 'border-t border-border', selected?.order_id === order.order_id && 'bg-muted/60')} onPress={() => delivery.select(order.order_id)}>
         <Icon as={roleIcons[order.role]} className="size-4 text-muted-foreground" />
         <View className="min-w-0 flex-1 gap-0.5">
@@ -109,7 +109,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
 function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; walletReady: boolean; feedback: ReactNode; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
   const paid = order.mode === 'paid'
   const can = orderActions(order)
-  return <View className="gap-4 rounded-xl border border-border bg-card p-4">
+  return <View className="gap-4 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
     <Text role="heading" className="text-heading font-semibold">{orderHeading(order)}</Text>
     <Text>{orderStatus(order)}</Text>
     {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
@@ -122,10 +122,10 @@ function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, 
     <ErrorText error={order.error ?? ''} />
     {feedback}
     <View className="flex-row flex-wrap gap-2">
-      {can.confirm ? <Button className="min-h-11" disabled={busy || !canManage || paid && !walletReady} onPress={confirm}><Text>{transferCopy.confirm(order.mode)}</Text></Button> : null}
-      {can.accept ? <Button className="min-h-11" disabled={busy || !canManage} onPress={accept}><Text>接收文件</Text></Button> : null}
-      {can.save ? <Button variant={order.role === 'receiver' ? 'default' : 'outline'} className="min-h-11" disabled={busy} onPress={save}><Icon as={ArrowDownToLine} /><Text>保存文件</Text></Button> : null}
-      <Button variant="outline" className="min-h-11" disabled={busy || !canManage} onPress={reconcile}><Text>检查进度</Text></Button>
+      {can.confirm ? <Button disabled={busy || !canManage || paid && !walletReady} onPress={confirm}><Text>{transferCopy.confirm(order.mode)}</Text></Button> : null}
+      {can.accept ? <Button disabled={busy || !canManage} onPress={accept}><Text>接收文件</Text></Button> : null}
+      {can.save ? <Button variant={order.role === 'receiver' ? 'default' : 'outline'} disabled={busy} onPress={save}><Icon as={ArrowDownToLine} /><Text>保存文件</Text></Button> : null}
+      <Button variant="outline" disabled={busy || !canManage} onPress={reconcile}><Text>检查进度</Text></Button>
     </View>
     {paid && order.phase === 'prepared' && !walletReady ? <Text className="text-meta text-warning">{transferCopy.walletFirst}</Text> : null}
     {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <Text className="text-meta text-warning">{transferCopy.unknownPayment}</Text> : null}
@@ -163,7 +163,7 @@ function Toggle({ label, checked, disabled, change }: { label: string; checked: 
 function InputField({ label, hint, value, disabled, onChange, peer, numeric }: { label: string; hint?: string; value: string; disabled: boolean; onChange(value: string): void; peer?: boolean; numeric?: boolean }) {
   return <View className="gap-2">
     <Text className="text-meta font-medium">{label}</Text>
-    <Input accessibilityLabel={label} value={value} editable={!disabled} onChangeText={onChange} autoCapitalize="none" autoCorrect={false} maxLength={peer ? 64 : 78} keyboardType={numeric ? 'number-pad' : 'default'} className="min-h-11 font-mono" />
+    <Input accessibilityLabel={label} value={value} editable={!disabled} onChangeText={onChange} autoCapitalize="none" autoCorrect={false} maxLength={peer ? 64 : 78} keyboardType={numeric ? 'number-pad' : 'default'} className="font-mono" />
     {hint ? <Text className="text-meta text-muted-foreground">{hint}</Text> : null}
   </View>
 }

@@ -24,7 +24,7 @@ export default function Home() {
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
   if (wide) return <>
     <Stack.Screen options={{ headerShown: false }} />
-    <View className="flex-1 justify-center"><EmptyState icon={MessageSquare} title="选一个 Bot 开始聊天" /></View>
+    <EmptyState icon={MessageSquare} title="选一个 Bot 开始聊天" className="flex-1 justify-center" />
   </>
   return <>
     <Stack.Screen options={{
@@ -32,7 +32,7 @@ export default function Home() {
       headerLeft: () => <ConnectionMenu connection={workspace.connection} />,
       headerRight: () => <View className="flex-row">
         <Link href="/new-bot" asChild><Button variant="ghost" size="icon" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
-        <Link href="/settings" asChild><Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button></Link>
+        <Link href="/settings" asChild><Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} className="size-5" /></Button></Link>
       </View>,
     }} />
     <ScreenFaces><HomeList minHeight={Math.max(0, frame.height - bar - insets.bottom)} /></ScreenFaces>

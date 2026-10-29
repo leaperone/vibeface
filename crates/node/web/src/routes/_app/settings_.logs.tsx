@@ -172,7 +172,7 @@ function LogRow({ record, chat, task, open, onToggle, onCopyAll }: { record: Log
           <span className="shrink-0">{sourceLabel[record.source]}</span>
         </span>
       </span>
-      <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />
+      <ChevronDown aria-hidden="true" className={cn('mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform duration-200', open && 'rotate-180')} />
     </button>
     {open ? <div className="grid gap-3 px-4 pb-4 ps-11 text-meta">
       {names.some(([, name]) => name) ? <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
@@ -180,9 +180,9 @@ function LogRow({ record, chat, task, open, onToggle, onCopyAll }: { record: Log
       </dl> : null}
       <Details label="技术详情">
         <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
-          {ids.map(([label, id]) => id ? <div key={label} className="contents"><dt>{label}</dt><dd className="min-w-0 break-all font-mono text-xs leading-5 text-foreground">{id}</dd></div> : null)}
+          {ids.map(([label, id]) => id ? <div key={label} className="contents"><dt>{label}</dt><dd className="min-w-0 break-all font-mono text-meta text-foreground">{id}</dd></div> : null)}
         </dl>
-        {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 font-mono text-xs whitespace-pre-wrap break-all text-foreground">{JSON.stringify(record.fields, null, 2)}</pre> : null}
+        {record.fields && Object.keys(record.fields).length ? <pre className="max-h-64 overflow-auto rounded-lg bg-muted p-3 font-mono text-meta whitespace-pre-wrap break-all text-foreground">{JSON.stringify(record.fields, null, 2)}</pre> : null}
       </Details>
       <div className="flex flex-wrap gap-2">
         <Button type="button" size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(record)).then(() => toast('已复制这条记录', { tone: 'success' })) }}><Copy aria-hidden="true" />复制这条</Button>

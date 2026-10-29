@@ -231,7 +231,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   }
   if (device.review?.kind === 'recovery') return <RecoveryReview />
   // In settings the password is a row that folds its form out below itself; alone, a form stands as a card.
-  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
+  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-4 sm:ps-15">{body}</section>
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
       <p className="text-meta text-muted-foreground">{recoveryCopy.scope}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {

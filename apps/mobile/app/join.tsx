@@ -1,16 +1,19 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { ArchiveRestore, Camera, CircleCheck, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
-import Animated, { LinearTransition, ReduceMotion } from 'react-native-reanimated'
+import Animated from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
+import Svg, { Path, Rect } from 'react-native-svg'
+import { useCSSVariable } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
-import { Panel, SafetyCode } from '@/components/kit'
+import { ErrorText } from '@/components/action'
+import { Panel, SafetyCode, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -18,6 +21,7 @@ import { Text } from '@/components/ui/text'
 import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
+import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
 
@@ -32,12 +36,10 @@ export default function JoinScreen() {
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-8 self-center px-6 py-10" keyboardShouldPersistTaps="handled">
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-6 self-center px-4 py-12" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
-        <Animated.View layout={LinearTransition.reduceMotion(ReduceMotion.System)}>
-          <Text role="heading" className="text-[40px] leading-[44px] font-bold tracking-tighter">Vibeface</Text>
-        </Animated.View>
+        <Animated.View layout={move}><Wordmark /></Animated.View>
       </View>
       {device.phase === 'key_lost' ? <LostKey />
         : device.ready && device.recovered ? <RecoveredStep />
@@ -48,11 +50,23 @@ export default function JoinScreen() {
         : <JoinForm />}
       {choosing ? <View className="border-t border-border pt-4">
         {lane === 'recovery'
-          ? <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>{joinCopy.byLink}</Text></Button>
-          : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
+          ? <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>{joinCopy.byLink}</Text></Button>
+          : <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
       </View> : null}
     </KeyboardAwareScrollView>
   </SafeAreaView>
+}
+
+/** The app icon's "V" on its tile beside the name, as on the web's join page. */
+function Wordmark() {
+  const [background, foreground] = useCSSVariable(['--background', '--foreground']) as [string, string]
+  return <View className="flex-row items-center gap-2">
+    <Svg width={32} height={32} viewBox="0 0 64 64">
+      <Rect width={64} height={64} rx={16} fill={foreground} />
+      <Path d="M19 21l13 24 13-24" fill="none" stroke={background} strokeWidth={6.5} strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+    <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
+  </View>
 }
 
 /** The phone's device key is gone; starting over makes a new one, then it joins again by link or recovery file. */
@@ -61,8 +75,8 @@ function LostKey() {
   const { busy, error, run } = useRun()
   return <Panel icon={ShieldAlert} title="需要重新加入">
     <Text className="text-muted-foreground">{self}保存的登录信息不见了。</Text>
-    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-    <Button className="min-h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
+    <ErrorText error={error} />
+    <Button className="self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
   </Panel>
 }
 
@@ -97,26 +111,26 @@ function JoinForm() {
   const failure = error || device.error
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
-    <View className="min-h-12 flex-row items-center gap-3 rounded-xl bg-muted/60 ps-4">
-      <Icon as={Link2} className="text-success" />
+    <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+      <Icon as={CircleCheck} className="text-success" />
       <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
-      <Button variant="ghost" size="icon" className="size-12" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
-      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
+      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} value={name} onChangeText={setName} maxLength={64} />
     </View>
-    {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
-    <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+    <ErrorText error={failure} />
+    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
   </View>
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
-    {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
-    <Button className="min-h-12" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    <ErrorText error={failure} />
+    <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
+      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
     </View>
@@ -129,22 +143,22 @@ function Scanner({ onScanned, onCancel }: { onScanned: (link: string) => void; o
   if (!permission.granted) return <Panel icon={Camera} title="扫码加入">
     <Text className="text-muted-foreground">需要相机权限才能扫码，也可以粘贴链接</Text>
     <View className="flex-row gap-2">
-      <Button variant="ghost" className="min-h-11" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
-      <Button className="min-h-11" onPress={request}><Text>允许使用相机</Text></Button>
+      <Button variant="ghost" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
+      <Button onPress={request}><Text>允许使用相机</Text></Button>
     </View>
   </Panel>
   return <Panel icon={Camera} title="扫码加入">
     <View className="aspect-square overflow-hidden rounded-xl bg-muted">
       <CameraView style={{ flex: 1 }} barcodeScannerSettings={{ barcodeTypes: ['qr'] }} onBarcodeScanned={({ data }) => onScanned(data)} />
     </View>
-    <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
+    <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>不扫了，粘贴链接</Text></Button>
   </Panel>
 }
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {
   return <Panel icon={Hourglass} title={joinCopy.waiting}>
     <Text role="status" className="text-muted-foreground">{code ? joinCopy.compareCode : joinCopy.showCode}</Text>
-    {code ? <SafetyCode code={code} /> : <View className="h-8 w-40 rounded-md bg-muted" />}
-    <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={onCancel}><Text>取消</Text></Button>
+    {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
+    <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>
   </Panel>
 }

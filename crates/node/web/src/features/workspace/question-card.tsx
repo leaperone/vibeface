@@ -111,7 +111,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
         void (numbered ? send(`choice:${numbered.label}`, numbered.label) : send("text", text))
       }}>
         <span aria-hidden="true" className={`${badge} bg-muted text-muted-foreground`}><PencilLine className="size-4" /></span>
-        <input aria-label="其他回答" placeholder={shown.length ? "其他回答" : "输入回答"} className="h-11 min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed md:text-sm" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
+        <input aria-label="其他回答" placeholder={shown.length ? "其他回答" : "输入回答"} className="h-11 min-w-0 flex-1 bg-transparent text-body outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed" value={text} maxLength={4000} disabled={disabled} onChange={(event) => setText(event.target.value)} />
         <Button type="submit" variant="ghost" size="icon" className="size-10 max-md:size-11" aria-label="发送回答" title="发送回答" disabled={disabled || !text.trim()} aria-busy={action.busy === "text" || undefined}><BusyIcon busy={action.busy === "text"} icon={SendHorizontal} /></Button>
       </form>
     </div>}
@@ -143,7 +143,7 @@ function Settled({ ask, lines, mark, focus = false, role, children }: { ask: str
   if (!lines.length) return <p ref={focus ? claimFocus : undefined} tabIndex={-1} className={cn("-mx-2 text-meta text-muted-foreground", settled)}>{mark}{line}</p>
   return <details className="group -mx-2 text-meta text-muted-foreground">
     <summary ref={focus ? claimFocus : undefined} className={cn(settled, "cursor-pointer list-none rounded-md hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden")}>
-      {mark}{line}<ChevronRight aria-hidden="true" className="mt-0.5 size-4 shrink-0 transition-transform duration-150 group-open:rotate-90" />
+      {mark}{line}<ChevronRight aria-hidden="true" className="mt-0.5 size-4 shrink-0 transition-transform duration-200 group-open:rotate-90" />
     </summary>
     <Lines lines={lines} className="ps-8 pe-2 pb-2" />
   </details>

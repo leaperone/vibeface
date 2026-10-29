@@ -2,16 +2,15 @@ import * as Haptics from 'expo-haptics'
 import type { LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { useWindowDimensions, type LayoutRectangle } from 'react-native'
-import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring, type SharedValue } from 'react-native-reanimated'
+import Animated, { useAnimatedStyle, useSharedValue, withTiming, type SharedValue } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { cssEaseOut, glide, quick } from '@/lib/motion'
 import { cn } from '@/lib/utils'
 
 const AnimatedView = withUniwind(Animated.View)
-// Critically damped: the thumb travels to the choice and settles without overshoot.
-const slide = { dampingRatio: 1, duration: 350, reduceMotion: ReduceMotion.System }
 
 type Option<T> = { value: T; label: string; icon?: LucideIcon }
 
@@ -31,22 +30,22 @@ export function Segmented<T extends string>({ options, value, onChange, disabled
   const move = (next: LayoutRectangle) => {
     const at = placed.current
     if (at && at.x === next.x && at.y === next.y && at.width === next.width && at.height === next.height) return
-    const to = (shared: SharedValue<number>, value: number) => { shared.value = at && !snap ? withSpring(value, slide) : value }
+    const to = (shared: SharedValue<number>, value: number) => { shared.value = at && !snap ? withTiming(value, glide) : value }
     to(x, next.x); to(y, next.y); to(width, next.width); to(height, next.height)
     placed.current = next
   }
   useEffect(() => { if (frame) move(frame) }, [frame?.x, frame?.y, frame?.width, frame?.height])
   const thumb = useAnimatedStyle(() => ({ width: width.value, height: height.value, transform: [{ translateX: x.value }, { translateY: y.value }] }))
   // A quick save never dims the group; only a wait long enough to notice does.
-  const dim = { transitionProperty: 'opacity', transitionDuration: 150, transitionDelay: disabled ? 300 : 0 } as const
-  return <AnimatedView accessibilityRole="radiogroup" style={dim} className={cn('gap-1 rounded-lg bg-muted p-1', stacked ? 'self-stretch' : 'flex-row self-start', disabled && 'opacity-50')}>
-    <AnimatedView pointerEvents="none" style={thumb} className={cn('absolute top-0 left-0 rounded-md border border-border bg-background shadow-sm shadow-black/5 dark:border-input dark:bg-input/30', !frame && 'opacity-0')} />
+  const dim = { transitionProperty: 'opacity', transitionDuration: quick, transitionTimingFunction: cssEaseOut, transitionDelay: disabled ? 300 : 0 } as const
+  return <AnimatedView accessibilityRole="radiogroup" style={dim} className={cn('gap-0.5 rounded-lg bg-muted p-0.5', stacked ? 'self-stretch' : 'flex-row self-start', disabled && 'opacity-50')}>
+    <AnimatedView pointerEvents="none" style={thumb} className={cn('absolute top-0 left-0 rounded-lg bg-card shadow-xs ring-1 ring-border dark:bg-accent', !frame && 'opacity-0')} />
     {options.map((option) => <Button key={option.value} variant="ghost" accessibilityRole="radio" accessibilityState={{ checked: option.value === shown }} disabled={disabled}
-      className={cn('min-h-11 opacity-100 active:bg-transparent dark:active:bg-transparent', stacked && 'justify-start')}
+      className={cn('opacity-100 active:bg-transparent dark:active:bg-transparent', stacked && 'justify-start')}
       onLayout={(event) => { const next = event.nativeEvent.layout; setFrames((all) => ({ ...all, [option.value]: next })) }}
       // The thumb starts on the tap itself, not after a render that a theme repaint can hold up.
       onPress={() => { if (option.value === shown) return; void Haptics.selectionAsync(); const next = frames[option.value]; if (next) move(next); setShown(option.value); onChange(option.value) }}>
-      {option.icon ? <Icon as={option.icon} /> : null}<Text>{option.label}</Text>
+      {option.icon ? <Icon as={option.icon} className={cn(option.value !== shown && 'text-muted-foreground')} /> : null}<Text className={cn(option.value !== shown && 'text-muted-foreground')}>{option.label}</Text>
     </Button>)}
   </AnimatedView>
 }
