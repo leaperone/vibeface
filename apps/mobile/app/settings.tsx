@@ -31,6 +31,7 @@ export default function Settings() {
   const scroll = useRef<ScrollViewInstance>(null)
   const reveal = useRef(false)
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
+  const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   // The confirmation opens at the foot of the page, below the fold on a phone.
   return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
@@ -57,7 +58,11 @@ export default function Settings() {
     <View className="border-t border-border pt-6">
       {leaving && sole ? <View className="gap-3">
         <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-0.5 size-4 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
-        <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+        <View className="flex-row gap-2">
+          <Button variant="ghost" className="-ms-3 min-h-11" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+          {/* With no other device to promote, the next manager has to join first. */}
+          {otherClient ? null : <Link href="/add-device" asChild><Button className="min-h-11"><Icon as={Plus} /><Text>添加设备</Text></Button></Link>}
+        </View>
       </View> : leaving ? <View className="gap-3">
         <Text>断开后，要用加入链接才能回来。</Text>
         {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}

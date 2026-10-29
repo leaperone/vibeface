@@ -52,7 +52,7 @@ export default function DeviceDetail() {
     </Link> : null}
     {manageable ? <View className="gap-2">
       <View className="min-h-11 flex-row items-center justify-between gap-3">
-        <View className="min-w-0 flex-1 flex-row items-center gap-2"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text>管理设备</Text></View>
+        <View className="min-w-0 flex-1 flex-row items-center gap-2"><Icon as={Crown} className="size-4 text-muted-foreground" /><View className="min-w-0 flex-1"><Text>管理设备</Text><Text className="text-meta text-muted-foreground">{deviceCopy.manageHint}</Text></View></View>
         <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
           onValueChange={(manage) => void run('manage', () => device.setManage(member.device_id, manage))} />
       </View>

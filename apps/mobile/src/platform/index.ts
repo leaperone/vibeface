@@ -10,6 +10,7 @@ import type { OutboxItem } from '@vibeface/client/lib/outbox.ts'
 import type { Notifier, Permission, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport, type DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import { sha256 } from '@vibeface/client/delivery/model.ts'
+import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 
 const store = createMMKV({ id: 'vibeface' })
 const secretKey = 'vibeface.device-secret'
@@ -19,7 +20,7 @@ const outboxPrefix = 'outbox:'
 export const tablet = Native.OS === 'ios' && Native.isPad
 export const self = tablet ? '这台平板' : '这台手机'
 export const defaultName = tablet ? '我的 iPad' : '我的手机'
-const lostKeyMessage = `${self}的设备密钥不见了。请用管理设备生成的加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。`
+const lostKeyMessage = lostKeyText(self)
 
 let identity: NativeIdentity | undefined
 /** The device secret lives in the Keychain / Keystore, readable only by this app on this device. */
@@ -42,7 +43,7 @@ const phoneKeys: DeviceKeys = {
     identity = undefined
   },
   async sign(message) {
-    if (!identity) throw new Error('设备密钥还没准备好。')
+    if (!identity) throw new Error(`${self}还没准备好。请重新打开 Vibeface。`)
     return identity.signMessage(message)
   },
 }
