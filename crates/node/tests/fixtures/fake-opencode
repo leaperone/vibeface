@@ -4,7 +4,6 @@
 dir=$FAKE_OPENCODE_DIR
 printf %s "$OPENCODE_SERVER_PASSWORD" > "$dir/password"
 printf %s "$OPENCODE_CONFIG_CONTENT" > "$dir/config.json"
-printf %s "$VIBEFACE_OPENCODE_ENV" > "$dir/env-dir"
 printf '%s\n' "$*" >> "$dir/argv"
 echo "opencode server listening on http://127.0.0.1:$FAKE_OPENCODE_PORT"
 exec sleep 120

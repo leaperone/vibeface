@@ -3,7 +3,7 @@
 //! as its own `work:` trigger, so nothing waits on background work here.
 use crate::{
     crypto::digest,
-    manager::{self, ManagerConfig, ManagerError},
+    manager::{self, CursorInstance, ManagerConfig, ManagerError},
     model::{
         Bot, Context, Event, EventBody, HashedEvent, MAX_INSTRUCTIONS_BYTES,
         MAX_SCHEDULE_PROMPT_BYTES, OpenWork, Role, ScheduleEntry, VersionVector, WorkProjection,
@@ -19,6 +19,7 @@ use futures_util::FutureExt;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
 };
 use vibeface_bridge::{
@@ -70,12 +71,17 @@ pub(crate) fn thread_instructions() -> String {
 pub(crate) fn session_key(
     settings: &crate::config::ManagerSettings,
     thread: Option<(&str, &str, &str)>,
+    cursor_store_root: Option<PathBuf>,
 ) -> Result<String> {
     let mut settings = settings.clone();
     if thread.is_some() {
         settings.model.clear();
     }
-    Ok(digest(&serde_json::to_vec(&(&settings, thread))?))
+    let native = match cursor_store_root {
+        Some(root) => serde_json::to_vec(&(&settings, thread, ("jsonl", root)))?,
+        None => serde_json::to_vec(&(&settings, thread))?,
+    };
+    Ok(digest(&native))
 }
 
 /// The model the bot set for this device's provider; `None` runs the device's default.
@@ -243,6 +249,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     let sdk_config = session_key(
         &settings,
         thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
+        (provider == crate::providers::Provider::Cursor).then(|| {
+            node.cursor_store_root(&CursorInstance::Bot {
+                network: network.clone(),
+                conversation: conversation.clone(),
+            })
+        }),
     )?;
     let claimed = {
         let mut store = node.store.lock().await;
@@ -274,10 +286,14 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
-    let token = claimed
-        .previous_token
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let token = if provider == crate::providers::Provider::Cursor {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        claimed
+            .previous_token
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    };
     let partial = Arc::new(Mutex::new(PartialText::default()));
     let mut started = false;
     let mut tools_fenced = false;
@@ -335,6 +351,18 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
             ..node.manager_config(settings)?
         };
+        if provider == crate::providers::Provider::Cursor {
+            config = config.for_cursor_instance(
+                CursorInstance::Bot {
+                    network: network.clone(),
+                    conversation: conversation.clone(),
+                },
+                node.cursor_store_root(&CursorInstance::Bot {
+                    network: network.clone(),
+                    conversation: conversation.clone(),
+                }),
+            );
+        }
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),
             ("VIBEFACE_NODE_CONVERSATION".into(), conversation.clone()),
@@ -1279,13 +1307,35 @@ mod tests {
             session_key(
                 &settings(model, crate::providers::Provider::Codex),
                 Some(("http://127.0.0.1:1", "system", guide)),
+                None,
             )
         };
         assert_eq!(codex("gpt-a", "guide")?, codex("gpt-b", "guide")?);
         assert_ne!(codex("gpt-a", "guide")?, codex("gpt-a", "new guide")?);
-        let cursor =
-            |model| session_key(&settings(model, crate::providers::Provider::Cursor), None);
+        let cursor = |model| {
+            session_key(
+                &settings(model, crate::providers::Provider::Cursor),
+                None,
+                None,
+            )
+        };
         assert_ne!(cursor("a")?, cursor("b")?);
+        let private_cursor = |root| {
+            session_key(
+                &settings("a", crate::providers::Provider::Cursor),
+                None,
+                Some(PathBuf::from(root)),
+            )
+        };
+        assert_ne!(cursor("a")?, private_cursor("/node/cursor/bot-a")?);
+        assert_ne!(
+            private_cursor("/node/cursor/bot-a")?,
+            private_cursor("/node/cursor/bot-b")?
+        );
+        assert_eq!(
+            private_cursor("/node/cursor/bot-a")?,
+            private_cursor("/node/cursor/bot-a")?
+        );
         Ok(())
     }
 

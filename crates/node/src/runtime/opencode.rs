@@ -1,9 +1,8 @@
 //! opencode on this device: one `opencode serve` on loopback that the Node starts when a bot turn
 //! or a work first needs it, and starts again when it died or its program or variables changed.
 //! Sessions live in opencode's own store, so a work is read back from there after a restart and
-//! never sent again. opencode keeps no shell environment per session, so the serve loads the
-//! Node's plugin (`extensions/opencode.ts`): it gives each session's tool shells the tool
-//! environment of its turn from a private file and blanks what looks like a key.
+//! never sent again. v2 keeps a shell environment per session; each turn replaces it before
+//! prompting, blanks model keys and injects only that turn's Node tool credentials.
 use super::executor::{Executor, SteerAck, SteerTrace};
 use super::*;
 use crate::manager::{self, ManagerConfig, ManagerError, ManagerFailure};
@@ -21,10 +20,8 @@ use vibeface_bridge::{
 
 /// The server reply turns record for opencode: its store keeps the sessions across serves.
 pub(crate) const SERVER: &str = "opencode";
-/// The plugin; the Node's serve loads a copy without the hook.
+/// The user's opencode hook plugin.
 pub(crate) const PLUGIN: &str = include_str!("../../extensions/opencode.ts");
-/// Set only in the Node's serve: the directory of the tool environment files.
-const ENV_MARKER: &str = "VIBEFACE_OPENCODE_ENV";
 const PIDFILE: &str = "serve.pid";
 const READY_WAIT: Duration = Duration::from_secs(30);
 const REQUEST_WAIT: Duration = Duration::from_secs(30);
@@ -55,6 +52,7 @@ pub struct Opencode {
     starting: std::sync::Mutex<BTreeSet<String>>,
     /// Works whose start runs in this process and has yet to claim its session.
     sending: std::sync::Mutex<BTreeSet<String>>,
+    cancelled_inputs: std::sync::Mutex<BTreeSet<String>>,
 }
 
 /// One entry of a claim set, released when dropped.
@@ -177,14 +175,12 @@ struct Live {
 struct TurnGuard<'a> {
     owner: &'a Opencode,
     session: String,
-    env_file: PathBuf,
     events: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
         self.events.abort();
-        let _ = std::fs::remove_file(&self.env_file);
         self.owner.live.lock().expect("live").remove(&self.session);
     }
 }
@@ -205,8 +201,6 @@ impl Opencode {
     ) -> Result<Self> {
         let dir = data_dir.join("opencode");
         kill_orphan(&dir.join(PIDFILE));
-        // The tool environments of an earlier run's turns hold tokens that act no more.
-        let _ = std::fs::remove_dir_all(dir.join("env"));
         Ok(Self {
             dir,
             launch: std::sync::Mutex::new(Launch { bin, env }),
@@ -220,6 +214,7 @@ impl Opencode {
             users: Default::default(),
             starting: Default::default(),
             sending: Default::default(),
+            cancelled_inputs: Default::default(),
         })
     }
 
@@ -272,50 +267,21 @@ impl Opencode {
     async fn spawn(&self, launch: Launch) -> Result<Serve> {
         config::private_dir(&self.dir)?;
         let dir = self.dir.canonicalize()?;
-        let env_dir = dir.join("env");
-        config::private_dir(&env_dir)?;
-        // Not named like the copy `vibeface hooks install` puts where opencode finds it as well.
-        let plugin = dir.join("vibeface-serve.ts");
-        config::private_write(
-            &plugin,
-            PLUGIN.replace("__VIBEFACE_HOOK__", "null").as_bytes(),
-        )?;
-        // Tool shells inherit the serve's variables: keys and the serve's own are blanked.
-        let blank: BTreeMap<String, String> = std::env::vars_os()
-            .filter_map(|(name, _)| name.into_string().ok())
-            .chain(launch.env.keys().cloned())
-            .filter(|name| secret_name(name))
-            .chain(
-                [
-                    "OPENCODE_SERVER_USERNAME",
-                    "OPENCODE_SERVER_PASSWORD",
-                    "OPENCODE_CONFIG_CONTENT",
-                    ENV_MARKER,
-                ]
-                .map(String::from),
-            )
-            .map(|name| (name, String::new()))
-            .collect();
-        config::private_write(&env_dir.join("default.json"), &serde_json::to_vec(&blank)?)?;
         let password = crate::crypto::random_hex(32);
         crate::logging::add_secret(&password);
         // ponytail: the port may be taken before the serve binds it; the next use starts again.
         let port = std::net::TcpListener::bind("127.0.0.1:0")?
             .local_addr()?
             .port();
-        let plugin = reqwest::Url::from_file_path(&plugin)
-            .map_err(|()| anyhow::anyhow!("the opencode plugin path is not absolute"))?;
         let permission = json!({"*":"allow","question":"deny"});
         let settings = json!({"$schema":"https://opencode.ai/config.json","autoupdate":false,
-            "share":"disabled","permission":permission,"agent":{"build":{"permission":permission}},
-            "plugin":[plugin.as_str()]});
+            "share":"disabled","permission":permission,"agent":{"build":{"permission":permission}}});
         let mut command = std::process::Command::new(&launch.bin);
         command
             .envs(&launch.env)
             .env("OPENCODE_SERVER_USERNAME", "opencode")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CONFIG_CONTENT", settings.to_string())
-            .env(ENV_MARKER, &env_dir)
             .args([
                 "serve",
                 "--hostname",
@@ -429,57 +395,70 @@ impl Opencode {
     /// The session as opencode keeps it; `None` when it has none by that ID.
     async fn session(&self, conn: &Conn, id: &str) -> Result<Option<Value>> {
         match self
-            .call(conn, Method::GET, &format!("/session/{id}"), &[], None)
+            .call(conn, Method::GET, &format!("/api/session/{id}"), &[], None)
             .await?
         {
-            (200, session) => Ok(Some(session)),
+            (200, envelope) => envelope
+                .get("data")
+                .cloned()
+                .filter(|data| !data.is_null())
+                .context("opencode sent a session response without data")
+                .map(Some),
             (404, _) => Ok(None),
             (status, body) => bail!("opencode answered {status} reading session {id}: {body}"),
         }
     }
 
     async fn message(&self, conn: &Conn, session: &str, id: &str) -> Result<Option<Value>> {
-        let path = format!("/session/{session}/message/{id}");
+        let path = format!("/api/session/{session}/message/{id}");
         match self.call(conn, Method::GET, &path, &[], None).await? {
-            (200, message) => Ok(Some(message)),
+            (200, envelope) => envelope
+                .get("data")
+                .cloned()
+                .filter(|data| !data.is_null())
+                .context("opencode sent a message response without data")
+                .map(Some),
             (404, _) => Ok(None),
             (status, body) => bail!("opencode answered {status} reading message {id}: {body}"),
         }
     }
 
-    /// Whether a run goes on in the session; opencode keeps the status by directory.
-    async fn busy(&self, conn: &Conn, session: &str, directory: &str) -> Result<bool> {
-        let query = [("directory", directory)];
+    /// Whether a run goes on in the session, as v2's active-session map reports it.
+    async fn busy(&self, conn: &Conn, session: &str) -> Result<bool> {
         let (status, body) = self
-            .call(conn, Method::GET, "/session/status", &query, None)
+            .call(conn, Method::GET, "/api/session/active", &[], None)
             .await?;
         ensure!(
             status == 200,
-            "opencode answered {status} reading the session status"
+            "opencode answered {status} reading active sessions"
         );
-        Ok(body[session]["type"]
-            .as_str()
-            .is_some_and(|kind| kind != "idle"))
+        Ok(body["data"]
+            .as_object()
+            .context("opencode sent no active session map")?
+            .contains_key(session))
     }
 
     /// The session's messages from `first` on, oldest first; `None` when it has no `first`.
     async fn tail(&self, conn: &Conn, session: &str, first: &str) -> Result<Option<Vec<Value>>> {
-        let path = format!("/session/{session}/message");
+        let path = format!("/api/session/{session}/message");
         for limit in [64, 512, 4096] {
-            let query = [("limit", limit.to_string())];
+            let query = [("limit", limit.to_string()), ("order", "desc".to_owned())];
             let query = query.each_ref().map(|(key, value)| (*key, value.as_str()));
             let (status, body) = self.call(conn, Method::GET, &path, &query, None).await?;
             ensure!(
                 status == 200,
                 "opencode answered {status} reading session {session}"
             );
-            let Value::Array(mut messages) = body else {
-                bail!("opencode sent no message list")
-            };
-            if let Some(at) = messages.iter().position(|m| m["info"]["id"] == first) {
+            let mut messages = body
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .context("opencode sent no message list")?;
+            messages.reverse();
+            if let Some(at) = messages.iter().position(|m| m["id"] == first) {
                 return Ok(Some(messages.split_off(at)));
             }
-            if messages.len() < limit {
+            if messages.len() < limit as usize {
                 return Ok(None);
             }
         }
@@ -487,18 +466,146 @@ impl Opencode {
         Ok(None)
     }
 
+    async fn inbox(&self, conn: &Conn, session: &str) -> Result<Vec<Value>> {
+        let (status, body) = self
+            .call(
+                conn,
+                Method::GET,
+                &format!("/api/session/{session}/inbox"),
+                &[],
+                None,
+            )
+            .await?;
+        ensure!(
+            status == 200,
+            "opencode answered {status} reading session inbox"
+        );
+        Ok(body["data"]
+            .as_array()
+            .context("opencode sent no inbox list")?
+            .to_owned())
+    }
+
+    async fn inbox_contains(&self, conn: &Conn, session: &str, id: &str) -> Result<bool> {
+        Ok(self
+            .inbox(conn, session)
+            .await?
+            .iter()
+            .any(|item| item["id"] == id))
+    }
+
+    async fn cancel_inbox_message(&self, conn: &Conn, session: &str, id: &str) -> Result<bool> {
+        if !self.inbox_contains(conn, session, id).await? {
+            return Ok(false);
+        }
+        let (status, body) = self
+            .call(
+                conn,
+                Method::DELETE,
+                &format!("/api/session/{session}/inbox/{id}"),
+                &[],
+                None,
+            )
+            .await?;
+        ensure!(
+            status == 204,
+            "opencode refused the inbox cancellation ({status}): {body}"
+        );
+        Ok(!self.inbox_contains(conn, session, id).await?
+            && self.message(conn, session, id).await?.is_none())
+    }
+
+    async fn received(&self, conn: &Conn, session: &str, id: &str) -> Result<bool> {
+        if self.message(conn, session, id).await?.is_some() {
+            return Ok(true);
+        }
+        self.inbox_contains(conn, session, id).await
+    }
+
+    async fn switch_model(&self, conn: &Conn, session: &str, model: &Value) -> Result<()> {
+        let (status, body) = self
+            .call(
+                conn,
+                Method::POST,
+                &format!("/api/session/{session}/model"),
+                &[],
+                Some(&json!({"model":model})),
+            )
+            .await?;
+        ensure!(
+            status == 204,
+            "opencode refused the model switch ({status}): {body}"
+        );
+        Ok(())
+    }
+
+    /// v2 replaces the complete shell environment, so no key from the serve reaches a tool.
+    async fn environment(
+        &self,
+        conn: &Conn,
+        session: &str,
+        tool_env: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let launch = self.launch.lock().expect("launch").clone();
+        let mut variables: BTreeMap<String, String> = std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .chain(launch.env)
+            .map(|(name, value)| {
+                let value = if secret_name(&name)
+                    || matches!(
+                        name.as_str(),
+                        "OPENCODE_SERVER_USERNAME" | "OPENCODE_CONFIG_CONTENT"
+                    ) {
+                    String::new()
+                } else {
+                    value
+                };
+                (name, value)
+            })
+            .collect();
+        variables.insert("OPENCODE_SERVER_PASSWORD".into(), String::new());
+        variables.extend(tool_env.clone());
+        let (status, body) = self
+            .call(
+                conn,
+                Method::PUT,
+                &format!("/api/session/{session}/environment"),
+                &[],
+                Some(&json!({"variables":variables})),
+            )
+            .await?;
+        ensure!(
+            status == 204,
+            "opencode refused the tool environment ({status}): {body}"
+        );
+        Ok(())
+    }
+
     /// Creates a session in `directory`; its ID. The session's own rules allow every tool but
     /// questions, which nobody answers: they come after the agent's and the user's configured
     /// rules, and the last that matches wins. A subagent's session does not take them.
-    async fn create(&self, conn: &Conn, directory: &str) -> Result<String, ExecFailure> {
-        let body = json!({"permission":[{"permission":"*","pattern":"*","action":"allow"},
-            {"permission":"question","pattern":"*","action":"deny"}]});
-        let query = [("directory", directory)];
+    async fn create(
+        &self,
+        conn: &Conn,
+        directory: &str,
+        model: Option<&Value>,
+    ) -> Result<String, ExecFailure> {
+        let mut body = json!({
+            "agent":"build",
+            "location":{"directory":directory},
+            "permissions":[
+                {"action":"*","resource":"*","effect":"allow"},
+                {"action":"question","resource":"*","effect":"deny"}
+            ]
+        });
+        if let Some(model) = model {
+            body["model"] = model.clone();
+        }
         match self
-            .call(conn, Method::POST, "/session", &query, Some(&body))
+            .call(conn, Method::POST, "/api/session", &[], Some(&body))
             .await
         {
-            Ok((200..=299, session)) => match session["id"].as_str() {
+            Ok((200..=299, envelope)) => match envelope["data"]["id"].as_str() {
                 Some(id) if vibeface_protocol::validate_id(id).is_ok() => Ok(id.to_owned()),
                 _ => Err(ExecFailure::new(
                     FailureKind::Unknown,
@@ -514,37 +621,49 @@ impl Opencode {
     }
 
     /// Sends a message; opencode runs it, or takes it into the run going on.
-    async fn send(&self, conn: &Conn, session: &str, directory: &str, body: &Value) -> Sent {
-        let path = format!("/session/{session}/prompt_async");
-        let query = [("directory", directory)];
-        match self
-            .call(conn, Method::POST, &path, &query, Some(body))
-            .await
-        {
-            Ok((200..=299, _)) => Sent::Taken,
+    async fn send(&self, conn: &Conn, session: &str, body: &Value) -> Sent {
+        let path = format!("/api/session/{session}/prompt");
+        match self.call(conn, Method::POST, &path, &[], Some(body)).await {
+            Ok((200, response))
+                if response["data"]["id"] == body["id"]
+                    && response["data"]["sessionID"] == session =>
+            {
+                Sent::Taken
+            }
             Ok((status @ 400..=499, body)) => Sent::Refused(http_failure(status, &body)),
             Ok((status, body)) => Sent::Unknown(format!("opencode answered {status}: {body}")),
             Err(error) => Sent::Unknown(format!("opencode: {error:#}")),
         }
     }
 
-    async fn abort(&self, conn: &Conn, session: &str, directory: &str) -> Result<(u16, Value)> {
-        let path = format!("/session/{session}/abort");
-        let query = [("directory", directory)];
+    async fn abort(&self, conn: &Conn, session: &str) -> Result<(u16, Value)> {
+        let path = format!("/api/session/{session}/interrupt");
+        let query = [("resume", "false")];
         self.call(conn, Method::POST, &path, &query, None).await
     }
 
-    /// Aborts the session's run; `true` once opencode shows `last`, our last message, and no
-    /// run. The abort repeats, as one that came before the run started stops nothing.
-    async fn stop_run(&self, conn: &Conn, session: &str, directory: &str, last: &str) -> bool {
+    /// An interrupt leaves queued input intact, so remove this turn's queued messages first.
+    async fn stop_run(&self, conn: &Conn, session: &str, last: &str) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let (mut sent, _) = self.posted(session);
+        if !sent.iter().any(|id| id == last) {
+            sent.push(last.to_owned());
+        }
+        let mut cancelled = BTreeSet::new();
         loop {
-            let _ = self.abort(conn, session, directory).await;
+            for id in &sent {
+                if matches!(self.cancel_inbox_message(conn, session, id).await, Ok(true)) {
+                    cancelled.insert(id.clone());
+                }
+            }
+            let _ = self.abort(conn, session).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            if let (Ok(Some(_)), Ok(false)) = (
-                self.message(conn, session, last).await,
-                self.busy(conn, session, directory).await,
-            ) {
+            let mut ended = matches!(self.busy(conn, session).await, Ok(false));
+            for id in &sent {
+                ended &= cancelled.contains(id)
+                    || matches!(self.message(conn, session, id).await, Ok(Some(_)));
+            }
+            if ended {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -586,14 +705,13 @@ impl Opencode {
         &self,
         conn: &Conn,
         session: &str,
-        directory: &str,
         errored: bool,
     ) -> Result<Option<Vec<Value>>> {
         let (sent, last_post) = self.posted(session);
         let Some(first) = sent.first() else {
             return Ok(None);
         };
-        if self.busy(conn, session, directory).await? {
+        if self.busy(conn, session).await? {
             return Ok(None);
         }
         let messages = self.tail(conn, session, first).await?.unwrap_or_default();
@@ -616,21 +734,25 @@ impl Opencode {
         Ok(Some(messages))
     }
 
-    /// Whether no run goes on in a reply's session any more; one still going is aborted. Runs
+    /// Whether no run or queued input remains in a reply's session; a running turn is aborted. Runs
     /// end with their serve, and the Node stops the serve of an earlier run when it opens.
     pub(crate) async fn run_ended(&self, session: &str) -> bool {
         let Some(conn) = self.running().await else {
             return true;
         };
-        let directory = match self.session(&conn, session).await {
-            Ok(Some(found)) => found["directory"].as_str().unwrap_or_default().to_owned(),
+        match self.session(&conn, session).await {
+            Ok(Some(_)) => {}
             Ok(None) => return true,
             Err(_) => return false,
+        }
+        let pending = match self.inbox(&conn, session).await {
+            Ok(items) => !items.is_empty(),
+            Err(_) => return false,
         };
-        match self.busy(&conn, session, &directory).await {
-            Ok(false) => true,
+        match self.busy(&conn, session).await {
+            Ok(false) => !pending,
             Ok(true) => {
-                let _ = self.abort(&conn, session, &directory).await;
+                let _ = self.abort(&conn, session).await;
                 false
             }
             Err(_) => false,
@@ -701,11 +823,39 @@ impl Opencode {
         };
         let (session, directory, prompt) = match (resumed, previous) {
             (Some(found), Some(id)) => {
-                let directory = found["directory"].as_str().unwrap_or(workspace);
+                let busy = self
+                    .busy(&conn, id)
+                    .await
+                    .map_err(|e| failed(previous, own(&format!("read opencode status: {e}"))))?;
+                let pending = self
+                    .inbox(&conn, id)
+                    .await
+                    .map_err(|e| failed(previous, own(&format!("read opencode inbox: {e}"))))?;
+                if busy || !pending.is_empty() {
+                    return Err(failed(
+                        previous,
+                        ExecFailure::new(
+                            FailureKind::WriterBusy,
+                            "opencode still has a run or pending input in this session",
+                        ),
+                    ));
+                }
+                let directory = found["location"]["directory"].as_str().unwrap_or(workspace);
+                if let Some(model) = model.as_ref()
+                    && found["model"] != *model
+                {
+                    self.switch_model(&conn, id, model).await.map_err(|e| {
+                        failed(
+                            previous,
+                            ExecFailure::new(FailureKind::Transport, format!("opencode: {e:#}")),
+                        )
+                    })?;
+                }
                 (id.to_owned(), directory.to_owned(), prompt)
             }
             _ => {
-                let id = (self.create(&conn, workspace).await).map_err(|f| failed(previous, f))?;
+                let id = (self.create(&conn, workspace, model.as_ref()).await)
+                    .map_err(|f| failed(previous, f))?;
                 // A session opencode no longer has is replaced by a new one, which needs it all.
                 let fresh = previous
                     .and(config.codex_turn.as_ref())
@@ -735,15 +885,14 @@ impl Opencode {
         if let Some(token) = &config.tool_token {
             env.insert("VIBEFACE_TOOL_TOKEN".into(), token.clone());
         }
-        let env_file = self.dir.join("env").join(format!("{session}.json"));
-        config::private_write(&env_file, &serde_json::to_vec(&env)?)
-            .map_err(|e| failed(native, own(&format!("write the tool environment: {e}"))))?;
+        self.environment(&conn, &session, &env)
+            .await
+            .map_err(|e| failed(native, own(&format!("set the tool environment: {e}"))))?;
         let (events_tx, mut events) = mpsc::unbounded_channel();
         let (up, ready) = tokio::sync::oneshot::channel();
         let follow = follow_events(
             self.http.clone(),
             conn.clone(),
-            directory.clone(),
             session.clone(),
             events_tx,
             up,
@@ -751,7 +900,6 @@ impl Opencode {
         let _guard = TurnGuard {
             owner: self,
             session: session.clone(),
-            env_file,
             events: tokio::spawn(follow),
         };
         // Progress is best effort: the turn goes on without the stream after a while.
@@ -761,16 +909,12 @@ impl Opencode {
             &config.custom_tools,
             &config.instructions,
         );
-        let mut body = json!({"agent":"build"});
-        if !instructions.is_empty() {
-            body["system"] = json!(instructions);
-        }
-        if let Some(model) = model {
-            body["model"] = model;
-        }
-        let mut first = body.clone();
-        first["messageID"] = json!(message);
-        first["parts"] = json!([{"type":"text","text":prompt}]);
+        let body = json!({"id":message,"text":if instructions.is_empty() {
+            prompt.to_owned()
+        } else {
+            format!("{instructions}\n\n{prompt}")
+        }});
+        let first = body.clone();
         let live = Live {
             turn: message.clone(),
             conn: conn.clone(),
@@ -787,20 +931,19 @@ impl Opencode {
         if *cancel.borrow() {
             return Err(stopped(native));
         }
-        match self.send(&conn, &session, &directory, &first).await {
+        match self.send(&conn, &session, &first).await {
             Sent::Taken => {}
             Sent::Refused(failure) => return Err(failed(native, failure)),
-            Sent::Unknown(detail) => {
-                if !matches!(self.message(&conn, &session, &message).await, Ok(Some(_))) {
-                    return Err(unknown(native, &detail));
-                }
-            }
+            Sent::Unknown(detail) => match self.received(&conn, &session, &message).await {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return Err(unknown(native, &detail)),
+            },
         }
         self.touch(&session);
         if let Some(turn) = &config.codex_turn
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
         {
-            let kind = if self.stop_run(&conn, &session, &directory, &message).await {
+            let kind = if self.stop_run(&conn, &session, &message).await {
                 ManagerFailure::Failed
             } else {
                 ManagerFailure::Unknown
@@ -820,7 +963,7 @@ impl Opencode {
                 biased;
                 _ = agent::wait_for_cancel(&mut cancel) => {
                     let last = self.close(&session);
-                    break if self.stop_run(&conn, &session, &directory, &last).await {
+                    break if self.stop_run(&conn, &session, &last).await {
                         Err(error(ManagerFailure::Cancelled, native, own("opencode run stopped")))
                     } else {
                         Err(unknown(native, "opencode did not confirm the stop"))
@@ -828,7 +971,7 @@ impl Opencode {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let last = self.close(&session);
-                    let kind = if self.stop_run(&conn, &session, &directory, &last).await {
+                    let kind = if self.stop_run(&conn, &session, &last).await {
                         ManagerFailure::Failed
                     } else {
                         ManagerFailure::Unknown
@@ -841,7 +984,15 @@ impl Opencode {
                         if let Some(update) = seen.apply(&event) {
                             progress(update).await.map_err(|e| unknown(native, &e.to_string()))?;
                         }
-                        event["type"] == "session.idle"
+                        matches!(
+                            event["type"].as_str(),
+                            Some(
+                                "session.idle"
+                                    | "session.execution.succeeded"
+                                    | "session.execution.failed"
+                                    | "session.execution.interrupted"
+                            )
+                        )
                     }
                     None => {
                         streaming = false;
@@ -862,7 +1013,7 @@ impl Opencode {
                 break Err(failed(native, lost));
             }
             let errored = seen.error.is_some();
-            if let Ok(Some(messages)) = self.settled(&conn, &session, &directory, errored).await {
+            if let Ok(Some(messages)) = self.settled(&conn, &session, errored).await {
                 break Ok(messages);
             }
         }?;
@@ -875,6 +1026,9 @@ impl Opencode {
                 None => unknown(native, "opencode never showed the message it was sent"),
             });
         };
+        if let Some(failure) = seen.error.take() {
+            return Err(failed(native, failure));
+        }
         let reply = match &last.reply {
             None => {
                 let failure = seen.error.take().unwrap_or_else(|| {
@@ -882,7 +1036,7 @@ impl Opencode {
                 });
                 return Err(failed(native, failure));
             }
-            Some(reply) if reply["error"]["name"] == "MessageAbortedError" => {
+            Some(reply) if reply["error"]["type"] == "aborted" => {
                 let (outcome, failure) = manager::interrupted(&cancel, Provider::Opencode);
                 return Err(error(outcome, native, failure));
             }
@@ -912,8 +1066,8 @@ impl Opencode {
         // An empty model is opencode's choice, which the turn records.
         let model = format!(
             "{}/{}",
-            reply["providerID"].as_str().unwrap_or("?"),
-            reply["modelID"].as_str().unwrap_or("?")
+            reply["model"]["providerID"].as_str().unwrap_or("?"),
+            reply["model"]["id"].as_str().unwrap_or("?")
         );
         tracing::info!(event = "agent.turn.model", session_id = %session, %model, "opencode answered");
         Ok(AgentResult {
@@ -929,15 +1083,13 @@ impl Opencode {
 async fn follow_events(
     http: reqwest::Client,
     conn: Conn,
-    directory: String,
     session: String,
     events: mpsc::UnboundedSender<Value>,
     up: tokio::sync::oneshot::Sender<()>,
 ) {
     let response = http
-        .get(format!("{}/event", conn.base))
+        .get(format!("{}/api/event", conn.base))
         .basic_auth("opencode", Some(&conn.password))
-        .query(&[("directory", &directory)])
         .send()
         .await;
     let Ok(mut response) = response else {
@@ -948,21 +1100,33 @@ async fn follow_events(
     }
     let mut up = Some(up);
     let mut buffer = Vec::new();
+    let mut data = Vec::new();
+    let mut dispatch = |bytes: &[u8]| {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(event) = serde_json::from_slice::<Value>(bytes) else {
+            return;
+        };
+        if let Some(up) = up.take() {
+            let _ = up.send(());
+        }
+        if session_of(&event) == Some(session.as_str()) {
+            let _ = events.send(event);
+        }
+    };
     while let Ok(Some(chunk)) = response.chunk().await {
         buffer.extend_from_slice(&chunk);
         while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = buffer.drain(..=end).collect();
-            let Some(data) = line.strip_prefix(b"data:") else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Value>(data.trim_ascii()) else {
-                continue;
-            };
-            if let Some(up) = up.take() {
-                let _ = up.send(());
-            }
-            if session_of(&event) == Some(session.as_str()) && events.send(event).is_err() {
-                return;
+            let line = line.strip_suffix(b"\n").unwrap_or(&line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() {
+                dispatch(&data);
+                data.clear();
+            } else if let Some(value) = line.strip_prefix(b"data:") {
+                let value = value.strip_prefix(b" ").unwrap_or(value);
+                data.extend_from_slice(value);
             }
         }
         // ponytail: a line this long is no event the turn needs.
@@ -970,72 +1134,77 @@ async fn follow_events(
             return;
         }
     }
+    dispatch(&data);
 }
 
 fn session_of(event: &Value) -> Option<&str> {
-    let properties = &event["properties"];
-    (properties["sessionID"].as_str())
-        .or_else(|| properties["info"]["sessionID"].as_str())
-        .or_else(|| properties["part"]["sessionID"].as_str())
+    event["data"]["sessionID"].as_str()
 }
 
 /// What the event stream showed of a turn: its answers as neutral progress, and the first error
 /// opencode reported.
 #[derive(Default)]
 struct Seen {
-    replies: BTreeSet<String>,
     texts: BTreeSet<String>,
     tools: HashMap<String, &'static str>,
+    tool_names: HashMap<String, &'static str>,
     error: Option<ExecFailure>,
 }
 
 impl Seen {
     /// The progress an event shows; the user's own messages, reasoning and tool details stay out.
     fn apply(&mut self, event: &Value) -> Option<Value> {
-        let properties = &event["properties"];
-        let part = &properties["part"];
         match event["type"].as_str()? {
-            "message.updated" if properties["info"]["role"] == "assistant" => {
-                self.replies
-                    .insert(properties["info"]["id"].as_str()?.to_owned());
-                None
-            }
-            "message.part.updated" if self.replies.contains(part["messageID"].as_str()?) => {
-                match part["type"].as_str()? {
-                    "text" if part["synthetic"] != true => {
-                        let id = part["id"].as_str()?;
-                        self.texts.insert(id.to_owned());
-                        let text = part["text"].as_str()?;
-                        (part["time"]["end"].is_number()).then(|| {
-                            json!({"type":"text_snapshot","item_id":bounded(id, 128),"text":bounded(text, 8000)})
-                        })
-                    }
-                    "tool" => {
-                        let call = part["callID"].as_str()?;
-                        let status = match part["state"]["status"].as_str()? {
-                            "completed" | "error" => "completed",
-                            _ => "running",
-                        };
-                        let name = tool_name(part["tool"].as_str().unwrap_or_default());
-                        (self.tools.insert(call.to_owned(), status) != Some(status)).then(|| {
-                            json!({"type":"tool","item_id":bounded(call, 128),"name":name,"status":status})
-                        })
-                    }
-                    _ => None,
-                }
-            }
-            "message.part.delta"
-                if properties["field"] == "text"
-                    && self.texts.contains(properties["partID"].as_str()?) =>
-            {
-                let id = properties["partID"].as_str()?;
-                let delta = properties["delta"].as_str()?;
+            "session.text.delta" => {
+                let data = &event["data"];
+                let id = format!(
+                    "{}:{}",
+                    data["assistantMessageID"].as_str()?,
+                    data["ordinal"].as_u64().unwrap_or_default()
+                );
+                self.texts.insert(id.clone());
                 Some(
-                    json!({"type":"text_delta","item_id":bounded(id, 128),"text":bounded(delta, 8000)}),
+                    json!({"type":"text_delta","item_id":bounded(&id, 128),"text":bounded(data["delta"].as_str()?, 8000)}),
                 )
             }
-            "session.error" if self.error.is_none() => {
-                self.error = Some(failure_of(&properties["error"]));
+            "session.text.ended" => {
+                let data = &event["data"];
+                let id = format!(
+                    "{}:{}",
+                    data["assistantMessageID"].as_str()?,
+                    data["ordinal"].as_u64().unwrap_or_default()
+                );
+                Some(
+                    json!({"type":"text_snapshot","item_id":bounded(&id, 128),"text":bounded(data["text"].as_str()?, 8000)}),
+                )
+            }
+            "session.tool.input.started" => {
+                let data = &event["data"];
+                let call = data["id"].as_str()?;
+                let name = data["name"].as_str().unwrap_or("tool");
+                let name = tool_name(name);
+                self.tool_names.insert(call.to_owned(), name);
+                (self.tools.insert(call.to_owned(), "running") != Some("running")).then(|| {
+                    json!({"type":"tool","item_id":bounded(call, 128),"name":name,"status":"running"})
+                })
+            }
+            "session.tool.success" | "session.tool.failed" => {
+                let data = &event["data"];
+                let call = data["id"].as_str()?;
+                let name = self.tool_names.get(call).copied().unwrap_or("tool");
+                (self.tools.insert(call.to_owned(), "completed") != Some("completed")).then(|| {
+                    json!({"type":"tool","item_id":bounded(call, 128),"name":name,"status":"completed"})
+                })
+            }
+            "session.execution.failed" if self.error.is_none() => {
+                self.error = Some(failure_of(&event["data"]["error"]));
+                None
+            }
+            "session.execution.interrupted" if self.error.is_none() => {
+                self.error = Some(ExecFailure::new(
+                    FailureKind::Unknown,
+                    "opencode execution interrupted",
+                ));
                 None
             }
             _ => None,
@@ -1077,18 +1246,21 @@ impl Chain {
     }
 }
 
-/// Each message opencode answers gets its own assistant messages, one per step.
+/// Each v2 user message owns the assistant messages until the next user message.
 fn chain(messages: &[Value], id: &str) -> Chain {
-    let user = messages.iter().find(|message| message["info"]["id"] == id);
-    let replies: Vec<&Value> = messages
-        .iter()
-        .filter(|m| m["info"]["role"] == "assistant" && m["info"]["parentID"] == id)
+    let user_at = messages.iter().position(|message| message["id"] == id);
+    let user = user_at.map(|at| &messages[at]);
+    let replies: Vec<&Value> = user_at
+        .into_iter()
+        .flat_map(|at| messages.iter().skip(at + 1))
+        .take_while(|message| message["type"] != "user")
+        .filter(|message| message["type"] == "assistant")
         .collect();
     Chain {
         visible: user.is_some(),
-        created_ms: (user.and_then(|message| message["info"]["time"]["created"].as_i64()))
+        created_ms: (user.and_then(|message| message["time"]["created"].as_i64()))
             .unwrap_or_default(),
-        reply: replies.last().map(|message| message["info"].clone()),
+        reply: replies.last().map(|message| (*message).clone()),
         text: (replies.iter().rev().map(|message| text_of(message)))
             .find(|text| !text.trim().is_empty())
             .unwrap_or_default(),
@@ -1097,8 +1269,8 @@ fn chain(messages: &[Value], id: &str) -> Chain {
 
 /// The text an assistant message shows: its own text parts, not the ones opencode adds.
 fn text_of(message: &Value) -> String {
-    (message["parts"].as_array().into_iter().flatten())
-        .filter(|part| part["type"] == "text" && part["synthetic"] != true)
+    (message["content"].as_array().into_iter().flatten())
+        .filter(|part| part["type"] == "text")
         .filter_map(|part| part["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -1106,11 +1278,15 @@ fn text_of(message: &Value) -> String {
 
 /// What an error opencode recorded means.
 fn failure_of(error: &Value) -> ExecFailure {
-    let name = error["name"].as_str().unwrap_or("opencode error");
-    let detail = (error["data"]["message"].as_str())
+    let name = error["type"]
+        .as_str()
+        .or_else(|| error["_tag"].as_str())
+        .unwrap_or("opencode error");
+    let detail = error["message"]
+        .as_str()
         .map_or_else(|| format!("opencode: {name}"), str::to_owned);
-    match (name, error["data"]["statusCode"].as_u64()) {
-        ("ProviderAuthError", _) | (_, Some(401 | 403)) => {
+    match (name, error["status"].as_u64()) {
+        (_, Some(401 | 403)) | ("provider.auth", _) => {
             ExecFailure::new(FailureKind::AuthFailed, detail)
         }
         (_, Some(429)) => ExecFailure::new(FailureKind::Quota, detail),
@@ -1121,7 +1297,7 @@ fn failure_of(error: &Value) -> ExecFailure {
 }
 
 fn http_failure(status: u16, body: &Value) -> ExecFailure {
-    let detail = body["data"]["message"]
+    let detail = body["message"]
         .as_str()
         .map_or_else(|| body.to_string(), str::to_owned);
     ExecFailure::upstream(
@@ -1149,7 +1325,7 @@ fn parse_model(model: &str) -> Result<Option<Value>, ExecFailure> {
     }
     match model.split_once('/') {
         Some((provider, id)) if !provider.is_empty() && !id.is_empty() => {
-            Ok(Some(json!({"providerID":provider,"modelID":id})))
+            Ok(Some(json!({"providerID":provider,"id":id})))
         }
         _ => Err(ExecFailure::new(
             FailureKind::NoModel,
@@ -1193,13 +1369,10 @@ fn image_part(image: &Value) -> Result<Value, ExecFailure> {
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase);
-    let mime = match extension.as_deref() {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
+    match extension.as_deref() {
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp") => {}
         _ => return Err(refuse("it takes png, jpeg, gif and webp files")),
-    };
+    }
     if !(path.is_absolute() && path.is_file()) {
         return Err(refuse("not an existing absolute path"));
     }
@@ -1208,7 +1381,7 @@ fn image_part(image: &Value) -> Result<Value, ExecFailure> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("image");
-    Ok(json!({"type":"file","mime":mime,"filename":name,"url":url.as_str()}))
+    Ok(json!({"uri":url.as_str(),"name":name}))
 }
 
 /// Follows a started work until it ends. Probes only read, so nothing is ever sent again; the
@@ -1259,10 +1432,10 @@ impl Executor for Opencode {
             let id = work.work_id.as_str();
             let sending = Claim::take(&self.sending, id);
             let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
-            let mut parts = vec![json!({"type":"text","text":work.prompt})];
+            let mut files = Vec::new();
             for image in args["images"].as_array().into_iter().flatten() {
                 match image_part(image) {
-                    Ok(part) => parts.push(part),
+                    Ok(file) => files.push(file),
                     Err(failure) => return reject(failure),
                 }
             }
@@ -1275,11 +1448,14 @@ impl Executor for Opencode {
                 Ok(conn) => conn,
                 Err(error) => return reject(launch_failure(&error)),
             };
-            let (session, directory) = match thread {
+            let (session, model_change) = match thread {
                 Some(session) => match self.session(&conn, session).await? {
                     Some(found) => {
-                        let directory = found["directory"].as_str().unwrap_or(&work.cwd);
-                        (session.to_owned(), directory.to_owned())
+                        let change = model
+                            .as_ref()
+                            .filter(|selected| &found["model"] != *selected)
+                            .cloned();
+                        (session.to_owned(), change)
                     }
                     None => {
                         let failure = ExecFailure::new(
@@ -1298,8 +1474,8 @@ impl Executor for Opencode {
                         );
                         return reject(failure);
                     }
-                    match self.create(&conn, &work.cwd).await {
-                        Ok(session) => (session, work.cwd.clone()),
+                    match self.create(&conn, &work.cwd, model.as_ref()).await {
+                        Ok(session) => (session, None),
                         Err(failure) => return reject(failure),
                     }
                 }
@@ -1328,7 +1504,10 @@ impl Executor for Opencode {
                             run.work_id,
                             run.state.name()
                         )),
-                        _ if self.busy(&conn, &session, &directory).await? => {
+                        _ if !self.inbox(&conn, &session).await?.is_empty() => {
+                            Some("opencode still has pending input in this session".to_owned())
+                        }
+                        _ if self.busy(&conn, &session).await? => {
                             Some("opencode still runs a turn in this session".to_owned())
                         }
                         _ => None,
@@ -1353,12 +1532,21 @@ impl Executor for Opencode {
             {
                 return Ok(false);
             }
-            let message = work_message(id);
-            let mut body = json!({"messageID":message,"agent":"build","parts":parts});
-            if let Some(model) = model {
-                body["model"] = model;
+            if let Some(model) = model_change {
+                self.switch_model(&conn, &session, &model).await?;
             }
-            match self.send(&conn, &session, &directory, &body).await {
+            let message = work_message(id);
+            let mut body = json!({"id":message,"text":work.prompt});
+            if !files.is_empty() {
+                body["files"] = json!(files);
+            }
+            if let Err(error) = self.environment(&conn, &session, &BTreeMap::new()).await {
+                return reject(ExecFailure::new(
+                    FailureKind::Transport,
+                    format!("opencode: {error:#}"),
+                ));
+            }
+            match self.send(&conn, &session, &body).await {
                 Sent::Taken => {
                     let epoch = conn.started_ms as u64;
                     let signal = Signal::TurnStarted {
@@ -1391,23 +1579,38 @@ impl Executor for Opencode {
 
     fn probe<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<Probe>> {
         Box::pin(async move {
-            let session = work.state.thread().context("the work has no session")?;
             let id = work_message(&work.work_id);
+            if self
+                .cancelled_inputs
+                .lock()
+                .expect("cancelled inputs")
+                .remove(&id)
+            {
+                return Ok(Probe::Terminal {
+                    turn_id: id,
+                    status: TurnStatus::Interrupted,
+                    text: String::new(),
+                    error: None,
+                });
+            }
+            let session = work.state.thread().context("the work has no session")?;
             let conn = (self.running().await)
                 .context("no opencode serve runs; the next one reads this work back")?;
             let Some(found) = self.session(&conn, session).await? else {
                 return Ok(Probe::Missing);
             };
+            let epoch = conn.started_ms as u64;
             let Some(messages) = self.tail(&conn, session, &id).await? else {
+                if self.inbox_contains(&conn, session, &id).await? {
+                    return Ok(Probe::Running { turn_id: id, epoch });
+                }
                 return Ok(Probe::NotStarted);
             };
-            let directory = found["directory"]
+            found["location"]["directory"]
                 .as_str()
                 .context("opencode sent a session without its directory")?;
-            let epoch = conn.started_ms as u64;
-            // A later message joins the run; ours ends with its reply.
-            let later = messages.iter().skip(1).any(|m| m["info"]["role"] == "user");
-            let busy = self.busy(&conn, session, directory).await?;
+            let later = messages.iter().skip(1).any(|m| m["type"] == "user");
+            let busy = self.busy(&conn, session).await?;
             if !later && busy {
                 return Ok(Probe::Running { turn_id: id, epoch });
             }
@@ -1425,7 +1628,7 @@ impl Executor for Opencode {
                         || !matches!(reply["finish"].as_str(), Some("tool-calls" | "unknown")))
             };
             Ok(match &chain.reply {
-                Some(reply) if reply["error"]["name"] == "MessageAbortedError" => {
+                Some(reply) if reply["error"]["type"] == "aborted" => {
                     done(TurnStatus::Interrupted, None)
                 }
                 Some(reply) if !reply["error"].is_null() => {
@@ -1458,10 +1661,16 @@ impl Executor for Opencode {
         Box::pin(async move {
             let session = work.state.thread().context("the work has no session")?;
             let (conn, _serving) = self.conn().await?;
-            let found = (self.session(&conn, session).await?)
-                .context("opencode no longer has the session")?;
-            let directory = found["directory"].as_str().unwrap_or_default();
-            let (status, body) = self.abort(&conn, session, directory).await?;
+            (self.session(&conn, session).await?).context("opencode no longer has the session")?;
+            let id = work_message(&work.work_id);
+            if self.cancel_inbox_message(&conn, session, &id).await? {
+                self.cancelled_inputs
+                    .lock()
+                    .expect("cancelled inputs")
+                    .insert(id);
+                return Ok(());
+            }
+            let (status, body) = self.abort(&conn, session).await?;
             ensure!(
                 (200..300).contains(&status),
                 "opencode refused the stop ({status}): {body}"
@@ -1488,15 +1697,16 @@ impl Executor for Opencode {
                         (turn.conn.clone(), turn.directory.clone(), turn.body.clone())
                     })
             };
-            let Some((conn, directory, mut body)) = joined else {
+            let Some((conn, _directory, mut body)) = joined else {
                 return SteerAck::Refused("the reply already ended".into());
             };
             let message = json!({"message_id":message_id,"text":text});
-            body["messageID"] = json!(id);
-            body["parts"] = json!([{"type":"text","text":format!(
+            body["id"] = json!(id);
+            body["text"] = json!(format!(
                 "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
-            )}]);
-            match self.send(&conn, &into.thread_id, &directory, &body).await {
+            ));
+            body["delivery"] = json!("steer");
+            match self.send(&conn, &into.thread_id, &body).await {
                 Sent::Taken => {
                     self.touch(&into.thread_id);
                     SteerAck::Accepted
@@ -1527,9 +1737,9 @@ impl Executor for Opencode {
                 return Some(SteerTrace::TargetUnseen);
             }
             Some(
-                match self.message(&conn, &into.thread_id, &id).await.ok()? {
-                    None => SteerTrace::NotArrived,
-                    Some(_) => SteerTrace::Ended(SteerOutcome::Unfinished),
+                match self.received(&conn, &into.thread_id, &id).await.ok()? {
+                    false => SteerTrace::NotArrived,
+                    true => SteerTrace::Ended(SteerOutcome::Unfinished),
                 },
             )
         })
@@ -1557,9 +1767,6 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-opencode")
     }
 
-    /// opencode's HTTP API as the Node uses it. A message is answered 50 ms after it is sent with
-    /// a command and "re:<text>"; "HOLD" starts a reply that goes on until it is aborted or the
-    /// next message ends it with "first".
     #[derive(Default)]
     struct Fake {
         /// A new password is a new serve: the runs of the one before died with it.
@@ -1568,8 +1775,10 @@ mod tests {
         /// Every message sent: its session, body and the tool environment its shells get.
         prompts: Vec<Value>,
         aborts: usize,
-        /// The reply "HOLD" started: its session and message.
-        held: Option<(String, String)>,
+        held: BTreeMap<String, String>,
+        peak_active: usize,
+        interrupted: Vec<String>,
+        environment_failure: bool,
         ids: usize,
     }
 
@@ -1578,8 +1787,11 @@ mod tests {
         directory: String,
         /// The session's own permission rules.
         permission: Value,
+        model: Value,
+        environment: Value,
         busy: bool,
         messages: Vec<Value>,
+        inbox: Vec<Value>,
     }
 
     impl Fake {
@@ -1606,48 +1818,79 @@ mod tests {
             let _ = self.events.send(event);
         }
 
-        /// Starts an assistant reply to `parent`.
-        fn begin(&self, fake: &mut Fake, session: &str, parent: &str) -> String {
+        fn event(&self, event_type: &str, data: Value) -> Value {
+            json!({"id":format!("evt_{}", uuid::Uuid::new_v4().simple()),"created":now_ms(),
+                "type":event_type,"data":data})
+        }
+
+        fn begin(&self, fake: &mut Fake, session: &str) -> String {
             let id = fake.id("msg");
-            let info = json!({"id":id,"sessionID":session,"role":"assistant","parentID":parent,
-                "providerID":"fake","modelID":"m","time":{"created":now_ms()}});
-            self.emit(json!({"type":"message.updated","properties":{"info":info}}));
-            fake.messages(session).push(json!({"info":info,"parts":[]}));
+            let model = fake.sessions[session].model.clone();
+            let info = json!({"id":id,"type":"assistant","agent":"build",
+                "model":model,"time":{"created":now_ms()},"content":[]});
+            self.emit(self.event(
+                "session.step.started",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"agent":"build","model":{"providerID":"fake","id":"m"}}),
+            ));
+            fake.messages(session).push(info);
             id
         }
 
-        /// Ends reply `id` with a command and `text`, streamed as opencode streams it.
         fn finish(&self, fake: &mut Fake, session: &str, id: &str, text: &str) {
-            let (call, words) = (fake.id("call"), fake.id("prt"));
-            let updated =
-                |part: &Value| json!({"type":"message.part.updated","properties":{"part":part}});
-            let mut tool = json!({"id":call,"sessionID":session,"messageID":id,"type":"tool",
-                "callID":call,"tool":"bash","state":{"status":"running"}});
-            self.emit(updated(&tool));
-            tool["state"]["status"] = json!("completed");
-            self.emit(updated(&tool));
-            let mut part = json!({"id":words,"sessionID":session,"messageID":id,"type":"text",
-                "text":"","time":{"start":now_ms()}});
-            self.emit(updated(&part));
-            self.emit(
-                json!({"type":"message.part.delta","properties":{"sessionID":session,
-                "messageID":id,"partID":words,"field":"text","delta":text}}),
-            );
-            part["text"] = json!(text);
-            part["time"]["end"] = json!(now_ms());
-            self.emit(updated(&part));
+            let call = fake.id("call");
+            let at = now_ms();
+            self.emit(self.event(
+                "session.tool.input.started",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"id":call,"name":"bash"}),
+            ));
+            self.emit(self.event(
+                "session.tool.called",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"id":call,"input":{},"executed":true}),
+            ));
+            self.emit(self.event(
+                "session.tool.success",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"id":call,"content":[{"type":"text","text":"done"}],"metadata":{},"executed":true}),
+            ));
+            self.emit(self.event(
+                "session.text.started",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"ordinal":0}),
+            ));
+            self.emit(self.event(
+                "session.text.delta",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"ordinal":0,"delta":text}),
+            ));
+            self.emit(self.event(
+                "session.text.ended",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"ordinal":0,"text":text}),
+            ));
+            let tool = json!({"type":"tool","id":call,"name":"bash","executed":true,
+                "state":{"status":"completed","input":{},"metadata":{},"content":[{"type":"text","text":"done"}]},
+                "time":{"created":at,"ran":at,"completed":now_ms()}});
+            let part = json!({"type":"text","text":text});
             let reply = (fake.messages(session).iter_mut())
-                .find(|message| message["info"]["id"] == id)
+                .find(|message| message["id"] == id)
                 .expect("reply");
-            reply["info"]["time"]["completed"] = json!(now_ms());
-            reply["info"]["finish"] = json!("stop");
-            reply["parts"] = json!([tool, part]);
-            self.emit(json!({"type":"message.updated","properties":{"info":reply["info"]}}));
+            reply["time"]["completed"] = json!(now_ms());
+            reply["finish"] = json!("stop");
+            reply["content"] = json!([tool, part]);
+            self.emit(self.event(
+                "session.step.ended",
+                json!({"sessionID":session,
+                "assistantMessageID":id,"finish":"stop"}),
+            ));
         }
 
         fn idle(&self, fake: &mut Fake, session: &str) {
             fake.sessions.get_mut(session).expect("session").busy = false;
-            self.emit(json!({"type":"session.idle","properties":{"sessionID":session}}));
+            self.emit(self.event("session.execution.succeeded", json!({"sessionID":session})));
+            self.emit(self.event("session.idle", json!({"sessionID":session})));
         }
     }
 
@@ -1669,7 +1912,7 @@ mod tests {
             let mut fake = api.fake.lock().unwrap();
             if fake.password != password {
                 fake.password = password;
-                fake.held = None;
+                fake.held.clear();
                 fake.sessions
                     .values_mut()
                     .for_each(|session| session.busy = false);
@@ -1679,45 +1922,49 @@ mod tests {
     }
 
     fn missing() -> Response {
-        let body = json!({"name":"NotFoundError","data":{"message":"not found"}});
+        let body =
+            json!({"_tag":"SessionNotFoundError","sessionID":"ses_missing","message":"not found"});
         (StatusCode::NOT_FOUND, Json(body)).into_response()
     }
 
-    async fn create(
-        State(api): State<Api>,
-        Query(query): Query<HashMap<String, String>>,
-        Json(body): Json<Value>,
-    ) -> Json<Value> {
-        let directory = query.get("directory").cloned().unwrap_or_default();
+    async fn create(State(api): State<Api>, Json(body): Json<Value>) -> Json<Value> {
+        let directory = body["location"]["directory"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         let mut fake = api.fake.lock().unwrap();
         let id = format!("ses_fake{}", fake.sessions.len() + 1);
         let session = FakeSession {
             directory,
-            permission: body["permission"].clone(),
+            permission: body["permissions"].clone(),
+            model: body["model"].clone(),
             ..Default::default()
         };
-        let created =
-            json!({"id":id,"directory":session.directory,"permission":session.permission});
+        let created = json!({"id":id,"projectID":"project_fake","cost":0,
+            "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},
+            "time":{"created":now_ms(),"updated":now_ms()},"agent":"build",
+            "model":session.model,"permissions":session.permission,
+            "location":{"directory":session.directory}});
         fake.sessions.insert(id, session);
-        Json(created)
+        Json(json!({"data":created}))
     }
 
-    async fn status(
-        State(api): State<Api>,
-        Query(query): Query<HashMap<String, String>>,
-    ) -> Json<Value> {
+    async fn active(State(api): State<Api>) -> Json<Value> {
         let fake = api.fake.lock().unwrap();
-        let directory = query.get("directory").map(String::as_str);
         let busy = (fake.sessions.iter())
-            .filter(|(_, session)| session.busy && Some(session.directory.as_str()) == directory)
-            .map(|(id, _)| (id.clone(), json!({"type":"busy"})));
-        Json(Value::Object(busy.collect()))
+            .filter(|(_, session)| session.busy)
+            .map(|(id, _)| (id.clone(), json!({"type":"running"})));
+        Json(json!({"data":Value::Object(busy.collect())}))
     }
 
     async fn session(State(api): State<Api>, UrlPath(id): UrlPath<String>) -> Response {
         let fake = api.fake.lock().unwrap();
         match fake.sessions.get(&id) {
-            Some(found) => Json(json!({"id":id,"directory":found.directory})).into_response(),
+            Some(found) => Json(json!({"data":{"id":id,"projectID":"project_fake","cost":0,
+                    "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},
+                    "time":{"created":0,"updated":0},"model":found.model,
+                    "location":{"directory":found.directory}}}))
+            .into_response(),
             None => missing(),
         }
     }
@@ -1734,8 +1981,12 @@ mod tests {
         let limit = (query.get("limit"))
             .and_then(|limit| limit.parse().ok())
             .unwrap_or(usize::MAX);
-        let from = found.messages.len().saturating_sub(limit);
-        Json(json!(found.messages[from..])).into_response()
+        let mut messages = found.messages.clone();
+        if query.get("order").is_some_and(|order| order == "desc") {
+            messages.reverse();
+        }
+        messages.truncate(limit);
+        Json(json!({"data":messages,"cursor":{}})).into_response()
     }
 
     async fn message(
@@ -1743,79 +1994,182 @@ mod tests {
         UrlPath((id, message)): UrlPath<(String, String)>,
     ) -> Response {
         let fake = api.fake.lock().unwrap();
-        let found = (fake.sessions.get(&id)).and_then(|session| {
-            (session.messages.iter()).find(|m| m["info"]["id"] == message.as_str())
-        });
-        found.map_or_else(missing, |found| Json(found.clone()).into_response())
+        let found = (fake.sessions.get(&id))
+            .and_then(|session| (session.messages.iter()).find(|m| m["id"] == message.as_str()));
+        found.map_or_else(missing, |found| Json(json!({"data":found})).into_response())
+    }
+
+    async fn inbox(State(api): State<Api>, UrlPath(id): UrlPath<String>) -> Response {
+        let fake = api.fake.lock().unwrap();
+        let Some(session) = fake.sessions.get(&id) else {
+            return missing();
+        };
+        Json(json!({"data":session.inbox})).into_response()
+    }
+
+    async fn cancel_inbox(
+        State(api): State<Api>,
+        UrlPath((session, id)): UrlPath<(String, String)>,
+    ) -> StatusCode {
+        let mut fake = api.fake.lock().unwrap();
+        let Some(session) = fake.sessions.get_mut(&session) else {
+            return StatusCode::NOT_FOUND;
+        };
+        session.inbox.retain(|item| item["id"] != id);
+        StatusCode::NO_CONTENT
+    }
+
+    async fn switch_model(
+        State(api): State<Api>,
+        UrlPath(id): UrlPath<String>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        let mut fake = api.fake.lock().unwrap();
+        let Some(session) = fake.sessions.get_mut(&id) else {
+            return StatusCode::NOT_FOUND;
+        };
+        session.model = body["model"].clone();
+        StatusCode::NO_CONTENT
+    }
+
+    async fn environment(
+        State(api): State<Api>,
+        UrlPath(id): UrlPath<String>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        let mut fake = api.fake.lock().unwrap();
+        if fake.environment_failure {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+        let Some(session) = fake.sessions.get_mut(&id) else {
+            return StatusCode::NOT_FOUND;
+        };
+        session.environment = body["variables"].clone();
+        StatusCode::NO_CONTENT
     }
 
     async fn prompt(
         State(api): State<Api>,
         UrlPath(session): UrlPath<String>,
         Json(body): Json<Value>,
-    ) -> StatusCode {
-        // What the serve's plugin gives this session's tool shells.
-        let env_dir = std::fs::read_to_string(api.dir.join("env-dir")).unwrap_or_default();
-        let env = std::fs::read(Path::new(&env_dir).join(format!("{session}.json")))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or(Value::Null);
-        let id = body["messageID"].as_str().unwrap_or_default().to_owned();
-        let text = body["parts"][0]["text"]
-            .as_str()
-            .unwrap_or_default()
+    ) -> (StatusCode, Json<Value>) {
+        let id = body["id"].as_str().unwrap_or_default().to_owned();
+        let text = body["text"].as_str().unwrap_or_default().to_owned();
+        let text = text
+            .strip_prefix("Answer briefly.\n\n")
+            .unwrap_or(&text)
             .to_owned();
         let mut fake = api.fake.lock().unwrap();
+        let env = fake
+            .sessions
+            .get(&session)
+            .map(|session| session.environment.clone())
+            .unwrap_or_default();
         fake.prompts
             .push(json!({"session":session,"body":body,"env":env}));
         let Some(found) = fake.sessions.get_mut(&session) else {
-            return StatusCode::NOT_FOUND;
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"_tag":"SessionNotFoundError","message":"not found"})),
+            );
         };
         found
             .messages
-            .push(json!({"info":{"id":id,"sessionID":session,"role":"user",
-            "time":{"created":now_ms()}},"parts":body["parts"]}));
+            .push(json!({"id":id,"type":"user","time":{"created":now_ms()},"text":text}));
+        found.inbox.retain(|item| item["id"] != id);
         found.busy = true;
-        if text == "HOLD" {
-            let reply = api.begin(&mut fake, &session, &id);
-            fake.held = Some((session, reply));
-            return StatusCode::NO_CONTENT;
+        let active = fake
+            .sessions
+            .values()
+            .filter(|session| session.busy)
+            .count();
+        fake.peak_active = fake.peak_active.max(active);
+        if text == "INBOX" {
+            let accepted = json!({"id":id,"sessionID":session,"time":{"created":now_ms()},
+                "type":"user","payload":{"text":text},"delivery":"queue"});
+            let session = fake.sessions.get_mut(&session).unwrap();
+            session.messages.retain(|message| message["id"] != id);
+            session.inbox.push(accepted.clone());
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"_tag":"UnknownError","message":"accepted then lost response"})),
+            );
         }
+        if text == "HOLD" {
+            let reply = api.begin(&mut fake, &session);
+            fake.held.insert(session.clone(), reply);
+            return (
+                StatusCode::OK,
+                Json(json!({"data":{"id":id,"sessionID":session,
+                "time":{"created":now_ms()},"type":"user","payload":{"text":text},"delivery":"steer"}})),
+            );
+        }
+        let accepted = json!({"id":id,"sessionID":session,"time":{"created":now_ms()},
+            "type":"user","payload":{"text":text},"delivery":"steer"});
+        fake.sessions
+            .get_mut(&session)
+            .unwrap()
+            .inbox
+            .push(accepted.clone());
         drop(fake);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let mut fake = api.fake.lock().unwrap();
-            if let Some((_, held)) = fake.held.take_if(|(held, _)| *held == session) {
+            let queued = &mut fake.sessions.get_mut(&session).unwrap().inbox;
+            if !queued.iter().any(|input| input["id"] == id) {
+                api.idle(&mut fake, &session);
+                return;
+            }
+            queued.retain(|input| input["id"] != id);
+            if let Some(held) = fake.held.remove(&session) {
                 api.finish(&mut fake, &session, &held, "first");
             }
-            let reply = api.begin(&mut fake, &session, &id);
+            let reply = api.begin(&mut fake, &session);
+            if text == "FAIL" {
+                let error = json!({"type":"provider.auth","message":"fixture denied","status":401});
+                let message = fake
+                    .messages(&session)
+                    .iter_mut()
+                    .find(|message| message["id"] == reply)
+                    .unwrap();
+                message["time"]["completed"] = json!(now_ms());
+                message["error"] = error.clone();
+                fake.sessions.get_mut(&session).unwrap().busy = false;
+                api.emit(api.event(
+                    "session.execution.failed",
+                    json!({"sessionID":session,"error":error}),
+                ));
+                return;
+            }
             api.finish(&mut fake, &session, &reply, &format!("re:{text}"));
             api.idle(&mut fake, &session);
         });
-        StatusCode::NO_CONTENT
+        (StatusCode::OK, Json(json!({"data":accepted})))
     }
 
     async fn abort(State(api): State<Api>, UrlPath(session): UrlPath<String>) -> Json<Value> {
         let mut fake = api.fake.lock().unwrap();
         fake.aborts += 1;
-        if let Some((_, held)) = fake.held.take_if(|(held, _)| *held == session) {
+        fake.interrupted.push(session.clone());
+        if let Some(held) = fake.held.remove(&session) {
             let reply = (fake.messages(&session).iter_mut())
-                .find(|message| message["info"]["id"] == held.as_str())
+                .find(|message| message["id"] == held.as_str())
                 .expect("reply");
-            reply["info"]["error"] = json!({"name":"MessageAbortedError",
-                "data":{"message":"The operation was aborted."}});
-            reply["info"]["time"]["completed"] = json!(now_ms());
-            let info = reply["info"].clone();
-            api.emit(json!({"type":"message.updated","properties":{"info":info}}));
+            reply["error"] = json!({"type":"aborted","message":"The operation was aborted."});
+            reply["time"]["completed"] = json!(now_ms());
+            api.emit(api.event(
+                "session.execution.interrupted",
+                json!({"sessionID":session,"reason":"user"}),
+            ));
             api.idle(&mut fake, &session);
         }
-        Json(json!(true))
+        Json(json!({"interrupted":true}))
     }
 
     async fn events(
         State(api): State<Api>,
     ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
-        let connected = json!({"type":"server.connected","properties":{}});
+        let connected = json!({"id":"evt_connected","type":"server.connected","data":{}});
         let start = (Some(connected), api.events.subscribe());
         Sse::new(futures_util::stream::unfold(
             start,
@@ -1850,14 +2204,24 @@ mod tests {
                 events: tokio::sync::broadcast::channel(1024).0,
             };
             let app = Router::new()
-                .route("/session", post(create))
-                .route("/session/status", get(status))
-                .route("/session/{id}", get(session))
-                .route("/session/{id}/message", get(messages))
-                .route("/session/{id}/message/{message}", get(message))
-                .route("/session/{id}/prompt_async", post(prompt))
-                .route("/session/{id}/abort", post(abort))
-                .route("/event", get(events))
+                .route("/api/session", post(create))
+                .route("/api/session/active", get(active))
+                .route("/api/session/{id}", get(session))
+                .route("/api/session/{id}/message", get(messages))
+                .route("/api/session/{id}/message/{message}", get(message))
+                .route("/api/session/{id}/inbox", get(inbox))
+                .route(
+                    "/api/session/{id}/inbox/{input}",
+                    axum::routing::delete(cancel_inbox),
+                )
+                .route("/api/session/{id}/model", post(switch_model))
+                .route(
+                    "/api/session/{id}/environment",
+                    axum::routing::put(environment),
+                )
+                .route("/api/session/{id}/prompt", post(prompt))
+                .route("/api/session/{id}/interrupt", post(abort))
+                .route("/api/event", get(events))
                 .layer(axum::middleware::from_fn_with_state(api.clone(), auth))
                 .with_state(api);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2068,8 +2432,8 @@ mod tests {
             [
                 json!({"type":"tool","item_id":"call_2","name":"command","status":"running"}),
                 json!({"type":"tool","item_id":"call_2","name":"command","status":"completed"}),
-                json!({"type":"text_delta","item_id":"prt_3","text":"re:hello"}),
-                json!({"type":"text_snapshot","item_id":"prt_3","text":"re:hello"}),
+                json!({"type":"text_delta","item_id":"msg_1:0","text":"re:hello"}),
+                json!({"type":"text_snapshot","item_id":"msg_1:0","text":"re:hello"}),
             ]
         );
         let message = hashed("msg_", "vibeface-turn:attempt-1", 24);
@@ -2082,31 +2446,20 @@ mod tests {
         );
         assert_eq!(
             place.fake.lock().unwrap().sessions[&session].permission,
-            json!([{"permission":"*","pattern":"*","action":"allow"},
-                {"permission":"question","pattern":"*","action":"deny"}]),
+            json!([{"action":"*","resource":"*","effect":"allow"},
+                {"action":"question","resource":"*","effect":"deny"}]),
             "the session's own rules win over the user's opencode permission"
         );
         let sent = &place.prompts()[0];
         assert_eq!(sent["session"], session.as_str());
         assert_eq!(
             sent["body"],
-            json!({"agent":"build","system":"Answer briefly.",
-                "model":{"providerID":"fake","modelID":"m"},"messageID":message,
-                "parts":[{"type":"text","text":"hello"}]})
+            json!({"id":message,"text":"Answer briefly.\n\nhello"})
         );
-        assert_eq!(
-            sent["env"],
-            json!({"VIBEFACE_NODE_URL":"http://127.0.0.1:9",
-                "VIBEFACE_TOOL_TOKEN":"tool-token-fixture"})
-        );
-        let env_dir = PathBuf::from(place.recorded("env-dir"));
-        assert!(
-            !env_dir.join(format!("{session}.json")).exists(),
-            "the tool environment ends with the turn"
-        );
-        let blank: Value = serde_json::from_slice(&std::fs::read(env_dir.join("default.json"))?)?;
-        assert_eq!(blank["FAKE_API_KEY"], "");
-        assert_eq!(blank["OPENCODE_SERVER_PASSWORD"], "");
+        assert_eq!(sent["env"]["VIBEFACE_NODE_URL"], "http://127.0.0.1:9");
+        assert_eq!(sent["env"]["VIBEFACE_TOOL_TOKEN"], "tool-token-fixture");
+        assert_eq!(sent["env"]["FAKE_API_KEY"], "");
+        assert_eq!(sent["env"]["OPENCODE_SERVER_PASSWORD"], "");
         assert!(
             place
                 .recorded("argv")
@@ -2117,13 +2470,19 @@ mod tests {
             settings["permission"],
             json!({"*":"allow","question":"deny"})
         );
-        let plugin = reqwest::Url::parse(settings["plugin"][0].as_str().context("plugin")?)?;
-        let plugin = (plugin.to_file_path()).map_err(|()| anyhow::anyhow!("a plugin file"))?;
-        assert!(std::fs::read_to_string(plugin)?.contains("const HOOK = null;"));
+        assert!(
+            settings["plugin"].is_null(),
+            "session environments do not use a plugin"
+        );
 
-        let config = bot(&place, &server, "attempt-2", &turns);
+        let mut config = bot(&place, &server, "attempt-2", &turns);
+        config.model = "fake/next".into();
         let (next, saved, _) = turn(&place, &config, "more", Some(&session), never).await;
         assert_eq!(next?.output, "re:more");
+        assert_eq!(
+            place.fake.lock().unwrap().sessions[&session].model,
+            json!({"providerID":"fake","id":"next"})
+        );
         assert_eq!(saved.map(|(saved, _)| saved), Some(session.clone()));
         assert_eq!(place.prompts()[1]["session"], session.as_str());
         assert_eq!(
@@ -2177,6 +2536,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bot_turn_aborted_by_opencode_is_not_a_requested_stop() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let config = bot(&place, &server, "attempt-1", &turns);
+        let interrupted = async {
+            let (session, _) = started(&turns).await;
+            let mut fake = place.fake.lock().unwrap();
+            let held = fake.held.remove(&session).context("held reply")?;
+            let reply = fake
+                .messages(&session)
+                .iter_mut()
+                .find(|reply| reply["id"] == held)
+                .context("reply")?;
+            reply["error"] = json!({"type":"aborted","message":"The operation was aborted."});
+            reply["time"]["completed"] = json!(now_ms());
+            fake.sessions.get_mut(&session).unwrap().busy = false;
+            anyhow::Ok(())
+        };
+        let ((result, _, _), ended) = tokio::join!(
+            turn(&place, &config, "HOLD", None, watch::channel(false).1),
+            interrupted
+        );
+        ended?;
+        let error = result.err().context("an aborted turn has no reply")?;
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("manager error")?;
+        assert_eq!(error.outcome, ManagerFailure::Failed, "{error}");
+        assert!(error.to_string().contains("without being asked"), "{error}");
+        assert_eq!(place.fake.lock().unwrap().aborts, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stopping_a_bot_turn_aborts_its_opencode_run() -> Result<()> {
         let place = Place::new().await?;
         let server = place.opencode()?;
@@ -2197,6 +2591,294 @@ mod tests {
             .context("a manager error")?;
         assert!(error.cancelled(), "{error}");
         assert!(place.fake.lock().unwrap().aborts >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sixteen_bot_sessions_keep_outputs_environments_and_cancellation_apart() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = (0..16).map(|_| Turns::default()).collect::<Vec<_>>();
+        let channels = (0..16).map(|_| watch::channel(false)).collect::<Vec<_>>();
+        let configs = (0..16)
+            .map(|index| {
+                let mut config = bot(&place, &server, &format!("attempt-{index}"), &turns[index]);
+                config.tool_token = Some(format!("token-{index}"));
+                config
+            })
+            .collect::<Vec<_>>();
+        let running =
+            futures_util::future::join_all(configs.iter().enumerate().map(|(index, config)| {
+                turn(&place, config, "HOLD", None, channels[index].1.clone())
+            }));
+        let control = async {
+            let started = futures_util::future::join_all(turns.iter().map(started)).await;
+            channels[0].0.send(true).unwrap();
+            for (index, (session, turn)) in started.iter().enumerate().skip(1) {
+                let target = SteerTarget {
+                    provider: Provider::Opencode,
+                    attempt_id: format!("attempt-{index}"),
+                    thread_id: session.clone(),
+                    turn_id: turn.clone(),
+                };
+                assert_eq!(
+                    server
+                        .steer(&target, &format!("m-{index}"), &format!("only-{index}"))
+                        .await,
+                    SteerAck::Accepted
+                );
+            }
+            started
+        };
+        let (results, started) = tokio::join!(running, control);
+        assert!(
+            results[0]
+                .0
+                .as_ref()
+                .err()
+                .expect("failed turn")
+                .downcast_ref::<ManagerError>()
+                .unwrap()
+                .cancelled()
+        );
+        for (index, (result, saved, _)) in results.into_iter().enumerate().skip(1) {
+            let result = result?;
+            assert_eq!(
+                result.session_id.as_deref(),
+                Some(started[index].0.as_str())
+            );
+            assert!(
+                result.output.contains(&format!("only-{index}")),
+                "{}",
+                result.output
+            );
+            for other in 1..16 {
+                if other != index {
+                    assert!(
+                        !result
+                            .output
+                            .contains(&format!("\"text\":\"only-{other}\"")),
+                        "{}",
+                        result.output
+                    );
+                }
+            }
+            assert_eq!(saved.unwrap().0, started[index].0);
+        }
+        let fake = place.fake.lock().unwrap();
+        assert_eq!(fake.sessions.len(), 16);
+        assert_eq!(fake.peak_active, 16);
+        assert!(
+            fake.interrupted
+                .iter()
+                .all(|session| session == &started[0].0)
+        );
+        for prompt in &fake.prompts {
+            let session = prompt["session"].as_str().unwrap();
+            let index = started.iter().position(|(id, _)| id == session).unwrap();
+            assert_eq!(
+                prompt["env"]["VIBEFACE_TOOL_TOKEN"],
+                format!("token-{index}")
+            );
+            assert_eq!(prompt["env"]["FAKE_API_KEY"], "");
+            assert_eq!(prompt["env"]["OPENCODE_SERVER_PASSWORD"], "");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_failed_bot_session_does_not_fail_the_others() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = (0..4).map(|_| Turns::default()).collect::<Vec<_>>();
+        let configs = (0..4)
+            .map(|index| bot(&place, &server, &format!("attempt-{index}"), &turns[index]))
+            .collect::<Vec<_>>();
+        let (_, never) = watch::channel(false);
+        let results =
+            futures_util::future::join_all(configs.iter().enumerate().map(|(index, config)| {
+                turn(
+                    &place,
+                    config,
+                    if index == 0 { "FAIL" } else { "hello" },
+                    None,
+                    never.clone(),
+                )
+            }))
+            .await;
+        assert_eq!(
+            results[0]
+                .0
+                .as_ref()
+                .err()
+                .expect("failed turn")
+                .downcast_ref::<ManagerError>()
+                .unwrap()
+                .failure
+                .kind,
+            FailureKind::AuthFailed
+        );
+        for (result, _, _) in results.into_iter().skip(1) {
+            assert_eq!(result?.output, "re:hello");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_tool_environment_never_starts_the_prompt() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        place.fake.lock().unwrap().environment_failure = true;
+        let config = bot(&place, &server, "attempt-1", &Turns::default());
+        let (_, never) = watch::channel(false);
+        let (result, _, _) = turn(&place, &config, "hello", None, never).await;
+        assert!(result.is_err());
+        assert!(place.prompts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_inbox_input_is_not_reported_as_not_started_or_replayed() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let cwd = place.dir.join("work").display().to_string();
+        let session = server
+            .create(&conn, &cwd, None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        let id = work_message("w-1");
+        assert!(matches!(
+            server
+                .send(&conn, &session, &json!({"id":id,"text":"INBOX"}))
+                .await,
+            Sent::Unknown(_)
+        ));
+        assert!(server.message(&conn, &session, &id).await?.is_none());
+        assert!(server.received(&conn, &session, &id).await?);
+        let (mut work, _) = crate::work::accept(spec("t", &place, "INBOX"), 0);
+        crate::work::transition(&mut work, Signal::ThreadCreated(session));
+        assert!(matches!(server.probe(&work).await?, Probe::Running { .. }));
+        assert_eq!(place.prompts().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_idle_inbox_removes_input_before_another_turn_can_run() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let session = server
+            .create(&conn, &place.dir.join("work").to_string_lossy(), None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        let id = work_message("queued-work");
+        server
+            .send(&conn, &session, &json!({"id":id,"text":"INBOX"}))
+            .await;
+        place
+            .fake
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session)
+            .unwrap()
+            .busy = false;
+        assert!(!server.run_ended(&session).await);
+        let recorded = Turns::default();
+        let config = bot(&place, &server, "next", &recorded);
+        let (blocked, _, _) = turn(
+            &place,
+            &config,
+            "next",
+            Some(&session),
+            watch::channel(false).1,
+        )
+        .await;
+        assert_eq!(
+            blocked
+                .err()
+                .expect("pending input blocks a new turn")
+                .downcast_ref::<ManagerError>()
+                .unwrap()
+                .failure
+                .kind,
+            FailureKind::WriterBusy
+        );
+        assert_eq!(place.prompts().len(), 1);
+        assert!(server.stop_run(&conn, &session, &id).await);
+        assert!(!server.received(&conn, &session, &id).await?);
+        assert!(server.run_ended(&session).await);
+        let (result, _, _) = turn(
+            &place,
+            &config,
+            "next",
+            Some(&session),
+            watch::channel(false).1,
+        )
+        .await;
+        assert_eq!(result?.output, "re:next");
+        assert_eq!(place.prompts().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopping_a_queued_work_removes_its_input_and_finishes_the_work() -> Result<()> {
+        let place = Place::new().await?;
+        let (node, network) = node(&place).await?;
+        let work = spec(&node.identity.device_id()?, &place, "INBOX");
+        dispatch(&node, &network, &work).await?;
+        let running = until(&node, |state| matches!(state, WorkState::Running { .. })).await?;
+        let session = running.state.thread().unwrap().to_owned();
+        place
+            .fake
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut(&session)
+            .unwrap()
+            .busy = false;
+        node.interrupt_work(&network, &work.work_id).await?;
+        let stopped = until(&node, WorkState::finished).await?;
+        assert_eq!(
+            stopped.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Interrupted
+            }
+        );
+        assert!(
+            place.fake.lock().unwrap().sessions[&session]
+                .inbox
+                .is_empty()
+        );
+        assert_eq!(place.prompts().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_input_does_not_prevent_reconciliation_from_stopping_a_running_session()
+    -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let session = server
+            .create(&conn, &place.dir.join("work").to_string_lossy(), None)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        server
+            .send(&conn, &session, &json!({"id":"msg_active","text":"HOLD"}))
+            .await;
+        server
+            .send(&conn, &session, &json!({"id":"msg_pending","text":"INBOX"}))
+            .await;
+        assert!(!server.run_ended(&session).await);
+        assert!(!place.fake.lock().unwrap().sessions[&session].busy);
+        assert!(
+            server
+                .inbox_contains(&conn, &session, "msg_pending")
+                .await?
+        );
+        assert_eq!(place.fake.lock().unwrap().aborts, 1);
         Ok(())
     }
 
@@ -2223,15 +2905,12 @@ mod tests {
             .clone();
         assert_eq!(
             rules[0],
-            json!({"permission":"*","pattern":"*","action":"allow"})
+            json!({"action":"*","resource":"*","effect":"allow"})
         );
+        assert_eq!(prompts[0]["body"]["id"], work_message("w-1").as_str());
         assert_eq!(
-            prompts[0]["body"]["messageID"],
-            work_message("w-1").as_str()
-        );
-        assert_eq!(
-            prompts[0]["body"]["model"],
-            json!({"providerID":"fake","modelID":"m"})
+            place.fake.lock().unwrap().sessions[session].model,
+            json!({"providerID":"fake","id":"m"})
         );
         Ok(())
     }
@@ -2287,7 +2966,7 @@ mod tests {
         let (conn, _serving) = server.conn().await?;
         assert_eq!(server.probe(&on("ses_gone")).await?, Probe::Missing);
         let cwd = place.dir.join("work").display().to_string();
-        let created = server.create(&conn, &cwd).await;
+        let created = server.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         assert_eq!(server.probe(&on(&session)).await?, Probe::NotStarted);
         assert!(place.prompts().is_empty());
@@ -2320,7 +2999,7 @@ mod tests {
             second.clone(),
             now_ms(),
         )?;
-        let args = json!({"model":"fake/m"});
+        let args = json!({"model":"fake/other"});
         let opencode = node.opencode.clone();
         let busy = node
             .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
@@ -2329,6 +3008,11 @@ mod tests {
         assert!(
             format!("{busy:#}").contains("still holds this opencode session"),
             "the dispatch says why: {busy:#}"
+        );
+        assert_eq!(
+            place.fake.lock().unwrap().sessions[&session].model,
+            json!({"providerID":"fake","id":"m"}),
+            "a refused work must not change the running session's model"
         );
         let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
         assert_eq!(
@@ -2351,7 +3035,7 @@ mod tests {
         let (node, network) = node(&place).await?;
         let (conn, _serving) = node.opencode.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
-        let created = node.opencode.create(&conn, &cwd).await;
+        let created = node.opencode.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         let unsure = WorkSpec {
             thread: Some(session.clone()),
@@ -2390,7 +3074,7 @@ mod tests {
         let (node, network) = node(&place).await?;
         let (conn, _serving) = node.opencode.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
-        let created = node.opencode.create(&conn, &cwd).await;
+        let created = node.opencode.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         let first = WorkSpec {
             thread: Some(session.clone()),
@@ -2442,7 +3126,7 @@ mod tests {
         let server = place.opencode()?;
         let (conn, _serving) = server.conn().await?;
         let cwd = place.dir.join("work").display().to_string();
-        let created = server.create(&conn, &cwd).await;
+        let created = server.create(&conn, &cwd, None).await;
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         (server.serve.lock().await.as_mut())
             .context("the serve")?
@@ -2455,11 +3139,9 @@ mod tests {
             let found = fake.sessions.get_mut(&session).context("session")?;
             found.busy = true;
             found.messages = vec![
-                json!({"info":{"id":id,"sessionID":session,"role":"user","time":{"created":sent}}}),
-                json!({"info":{"id":"msg_1","sessionID":session,"role":"assistant","parentID":id,
-                    "time":{"created":sent}}}),
-                json!({"info":{"id":"msg_2","sessionID":session,"role":"user",
-                    "time":{"created":sent + 1}}}),
+                json!({"id":id,"type":"user","time":{"created":sent}}),
+                json!({"id":"msg_1","type":"assistant","time":{"created":sent},"content":[]}),
+                json!({"id":"msg_2","type":"user","time":{"created":sent+1}}),
             ];
         }
         let (mut work, _) = crate::work::accept(spec("t", &place, "do it"), 0);
@@ -2497,34 +3179,22 @@ mod tests {
     #[test]
     fn opencode_errors_and_model_names_read_as_failures() {
         let kind = |error: Value| failure_of(&error).kind;
-        let auth = json!({"name":"ProviderAuthError","data":{"message":"sign in"}});
+        let auth = json!({"type":"provider.auth","message":"sign in"});
         assert_eq!(kind(auth), FailureKind::AuthFailed);
-        let quota = json!({"name":"APIError","data":{"message":"slow","statusCode":429}});
+        let quota = json!({"type":"api","message":"slow","status":429});
         assert_eq!(kind(quota), FailureKind::Quota);
-        let busy = json!({"name":"APIError","data":{"message":"busy","statusCode":503}});
+        let busy = json!({"type":"api","message":"busy","status":503});
         assert_eq!(kind(busy), FailureKind::Transport);
-        let other = json!({"name":"UnknownError","data":{"message":"boom"}});
+        let other = json!({"type":"unknown","message":"boom"});
         assert_eq!(kind(other), FailureKind::Unknown);
         assert_eq!(parse_model(" auto "), Ok(None));
         assert_eq!(
             parse_model("deepseek/deepseek-flash"),
-            Ok(Some(
-                json!({"providerID":"deepseek","modelID":"deepseek-flash"})
-            ))
+            Ok(Some(json!({"providerID":"deepseek","id":"deepseek-flash"})))
         );
         assert_eq!(
             parse_model("flash").map_err(|failure| failure.kind),
             Err(FailureKind::NoModel)
         );
-    }
-
-    #[test]
-    fn the_installed_opencode_plugin_watches_nothing_in_the_nodes_serve() {
-        let Some(crate::providers::Watch::Extension { source, .. }) = Provider::Opencode.watch()
-        else {
-            panic!("opencode is watched through its plugin");
-        };
-        assert!(source.contains(&format!("const ENV_DIR = process.env.{ENV_MARKER};")));
-        assert!(source.contains("if (ENV_DIR) return HOOK ? {} : { \"shell.env\": shellEnv };"));
     }
 }

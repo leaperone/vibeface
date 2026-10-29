@@ -124,10 +124,6 @@ impl Runtime {
 
     pub(super) async fn revoke_tool_token(&self, token: &str) {
         self.agent_tokens.lock().await.remove(token);
-        self.cursor_agents
-            .lock()
-            .await
-            .retain(|_, attempt| attempt != token);
     }
 
     pub(super) async fn manager_tool_lease(

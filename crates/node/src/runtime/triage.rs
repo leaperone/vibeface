@@ -5,7 +5,7 @@
 use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
-    manager::{self, ManagerConfig},
+    manager::{self, CursorInstance, ManagerConfig},
     model::{Choice, EventBody, Subject},
     net,
     providers::Provider,
@@ -985,7 +985,11 @@ impl Runtime {
         let config = ManagerConfig {
             tool_cli: Some(program),
             ..self.manager_config(settings)?
-        };
+        }
+        .for_cursor_instance(
+            CursorInstance::Coordination,
+            self.cursor_store_root(&CursorInstance::Coordination),
+        );
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
         let record = |thread: String| async move {

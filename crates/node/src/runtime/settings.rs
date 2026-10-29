@@ -163,7 +163,8 @@ impl Runtime {
             Provider::Cursor => Sdk::Cursor {
                 bridge: self.cursor.get().cloned(),
                 sdk_bin: self.providers().bin(Provider::Cursor),
-                agents: self.cursor_agents.clone(),
+                owner: None,
+                local_store_root: None,
             },
             Provider::Codex => Sdk::Codex {
                 socket: self.codex.socket(),

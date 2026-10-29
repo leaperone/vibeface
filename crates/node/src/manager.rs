@@ -2,14 +2,14 @@
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
 use vibeface_bridge::{
     agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
@@ -21,15 +21,42 @@ use vibeface_bridge::{
 /// Codex accepts 65536 bytes of user input per message.
 const MAX_PROMPT: usize = 65_536;
 
+/// Stable owner of a resident Cursor bridge process and its private native store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CursorInstance {
+    Bot {
+        network: String,
+        conversation: String,
+    },
+    Coordination,
+}
+
+impl CursorInstance {
+    pub fn key(&self) -> String {
+        match self {
+            Self::Bot {
+                network,
+                conversation,
+            } => format!(
+                "bot:{}:{network}:{}:{conversation}",
+                network.len(),
+                conversation.len()
+            ),
+            Self::Coordination => "coordination".into(),
+        }
+    }
+}
+
 /// The SDK a turn runs in, with only what that SDK needs.
 #[derive(Clone)]
 pub enum Sdk {
-    /// Turns share the Node's resident bridge. A tool callback names its agent, so the turn's
-    /// tool token is filed under the agent's ID in `agents` once the SDK reports it.
+    /// Each stable owner runs on its private resident bridge; the active attempt supplies the
+    /// process-wide custom-tool callback bearer before Send.
     Cursor {
         bridge: Option<Arc<SdkBridge>>,
         sdk_bin: PathBuf,
-        agents: Arc<Mutex<HashMap<String, String>>>,
+        owner: Option<String>,
+        local_store_root: Option<PathBuf>,
     },
     /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
     /// from the Shell environment the thread was created with.
@@ -100,6 +127,25 @@ pub struct ManagerConfig {
     pub codex_turn: Option<CodexTurn>,
 }
 
+impl ManagerConfig {
+    pub fn for_cursor_instance(
+        mut self,
+        instance: CursorInstance,
+        local_store_root: PathBuf,
+    ) -> Self {
+        if let Sdk::Cursor {
+            owner,
+            local_store_root: root,
+            ..
+        } = &mut self.sdk
+        {
+            *owner = Some(instance.key());
+            *root = Some(local_store_root);
+        }
+        self
+    }
+}
+
 /// `outcome` is how certain the end is; `failure` why the turn failed.
 #[derive(Debug)]
 pub struct ManagerError {
@@ -158,7 +204,8 @@ where
         Sdk::Cursor {
             bridge,
             sdk_bin,
-            agents,
+            owner,
+            local_store_root,
         } => {
             let not_started = |kind, detail: &str| ManagerError {
                 outcome: ManagerFailure::Failed,
@@ -178,23 +225,30 @@ where
                     "CURSOR_API_KEY is required for the Cursor SDK manager",
                 )
             })?;
+            let owner = owner.as_deref().ok_or_else(|| {
+                not_started(
+                    FailureKind::Unknown,
+                    "Cursor SDK manager has no stable process owner",
+                )
+            })?;
+            let local_store_root = local_store_root.as_ref().ok_or_else(|| {
+                not_started(
+                    FailureKind::Unknown,
+                    "Cursor SDK manager has no private native store",
+                )
+            })?;
             let turn = SdkTurn {
+                owner: owner.into(),
                 executable: sdk_bin.clone(),
                 workspace: config.workspace.clone(),
+                local_store_root: local_store_root.clone(),
                 api_key,
                 env,
                 model: config.model.clone(),
                 timeout_secs: config.timeout_secs,
                 custom_tools: config.custom_tools.clone(),
+                callback_token: config.tool_token.clone(),
                 process_started: config.process_started.clone(),
-            };
-            let (agents, token) = (agents.clone(), config.tool_token.clone());
-            let persist_session = move |id: String| async move {
-                persist_session(id.clone()).await?;
-                if let Some(token) = token {
-                    agents.lock().await.insert(id, token);
-                }
-                Ok(())
             };
             bridge
                 .run(
@@ -940,6 +994,250 @@ mod tests {
         }
     }
 
+    struct ConcurrentGate {
+        expected: usize,
+        entered: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        released: std::sync::atomic::AtomicBool,
+        all_entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ConcurrentGate {
+        fn new(expected: usize) -> Arc<Self> {
+            Arc::new(Self {
+                expected,
+                entered: Default::default(),
+                peak: Default::default(),
+                released: Default::default(),
+                all_entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn enter(&self) {
+            let count = self
+                .entered
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                + 1;
+            self.peak
+                .fetch_max(count, std::sync::atomic::Ordering::AcqRel);
+            if count == self.expected {
+                self.all_entered.notify_waiters();
+            }
+        }
+
+        async fn wait_all(&self) {
+            while self.entered.load(std::sync::atomic::Ordering::Acquire) < self.expected {
+                let notified = self.all_entered.notified();
+                if self.entered.load(std::sync::atomic::Ordering::Acquire) >= self.expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        async fn wait_release(&self) {
+            while !self.released.load(std::sync::atomic::Ordering::Acquire) {
+                let notified = self.release.notified();
+                if self.released.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release(&self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.release.notify_waiters();
+        }
+    }
+
+    struct ConcurrentFake {
+        socket: PathBuf,
+        requests: Arc<std::sync::Mutex<Vec<Value>>>,
+        gate: Arc<ConcurrentGate>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ConcurrentFake {
+        fn new(expected: usize) -> Self {
+            let socket = std::env::temp_dir().join(format!(
+                "vf-manager-concurrent-{}.sock",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            ));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let gate = ConcurrentGate::new(expected);
+            let seen = requests.clone();
+            let shared_gate = gate.clone();
+            let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let server = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    let gate = shared_gate.clone();
+                    let next = next.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        let mut pending: Option<(String, String, String)> = None;
+                        loop {
+                            let message = if pending.is_some() {
+                                tokio::select! {
+                                    _ = gate.wait_release() => {
+                                        let (thread, turn, prompt) = pending.take().unwrap();
+                                        let status = if prompt.starts_with("fail ") {
+                                            "failed"
+                                        } else {
+                                            "completed"
+                                        };
+                                        let item = json!({"type":"agentMessage","id":format!("item-{turn}"),
+                                            "text":format!("done: {prompt}")});
+                                        let mut notes = Vec::new();
+                                        if status == "completed" {
+                                            notes.push(json!({"method":"item/completed","params":{
+                                                "threadId":thread,"turnId":turn,"item":item}}));
+                                        }
+                                        notes.push(json!({"method":"turn/completed","params":{
+                                            "threadId":thread,"turnId":turn,
+                                            "turn":{"id":turn,"status":status}}}));
+                                        for note in notes {
+                                            let _ = server.send(Message::Text(note.to_string().into())).await;
+                                        }
+                                        continue;
+                                    }
+                                    message = server.next() => match message {
+                                        Some(Ok(message)) => message,
+                                        _ => return,
+                                    },
+                                }
+                            } else {
+                                match server.next().await {
+                                    Some(Ok(message)) => message,
+                                    _ => return,
+                                }
+                            };
+                            let Ok(request) = serde_json::from_slice::<Value>(&message.into_data())
+                            else {
+                                continue;
+                            };
+                            seen.lock().unwrap().push(request.clone());
+                            let method = request["method"].as_str().unwrap_or_default();
+                            let reply = |result: Value| json!({"id":request["id"],"result":result});
+                            match method {
+                                "initialized" => continue,
+                                "thread/start" => {
+                                    let id = format!(
+                                        "thread-{}",
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    );
+                                    let response = reply(json!({"thread":{"id":id}}));
+                                    let _ = server
+                                        .send(Message::Text(response.to_string().into()))
+                                        .await;
+                                }
+                                "turn/start" => {
+                                    let thread = request["params"]["threadId"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    let turn = format!(
+                                        "turn-{}",
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    );
+                                    let prompt = request["params"]["input"][0]["text"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    let response = reply(json!({"turn":{"id":turn}}));
+                                    let _ = server
+                                        .send(Message::Text(response.to_string().into()))
+                                        .await;
+                                    gate.enter();
+                                    pending = Some((thread, turn, prompt));
+                                }
+                                "turn/interrupt" => {
+                                    let response = reply(json!({}));
+                                    let _ = server
+                                        .send(Message::Text(response.to_string().into()))
+                                        .await;
+                                    let Some((thread, turn, _)) = pending.take() else {
+                                        continue;
+                                    };
+                                    let note = json!({"method":"turn/completed","params":{
+                                        "threadId":thread,"turnId":turn,
+                                        "turn":{"id":turn,"status":"interrupted"}}});
+                                    let _ =
+                                        server.send(Message::Text(note.to_string().into())).await;
+                                }
+                                "thread/read" => {
+                                    let response = reply(json!({"thread":{"turns":[]}}));
+                                    let _ = server
+                                        .send(Message::Text(response.to_string().into()))
+                                        .await;
+                                }
+                                _ => {
+                                    let response = reply(json!({}));
+                                    let _ = server
+                                        .send(Message::Text(response.to_string().into()))
+                                        .await;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                socket,
+                requests,
+                gate,
+                server,
+            }
+        }
+
+        async fn wait_all(&self) {
+            self.gate.wait_all().await;
+        }
+
+        fn release(&self) {
+            self.gate.release();
+        }
+
+        fn peak(&self) -> usize {
+            self.gate.peak.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        async fn wait_for(&self, method: &str, count: usize) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if self
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|request| request["method"] == method)
+                        .count()
+                        >= count
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    impl Drop for ConcurrentFake {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
     fn workspace() -> PathBuf {
         let directory = std::env::temp_dir().join(format!("vf-manager-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -1140,6 +1438,150 @@ mod tests {
         .unwrap();
         assert!(error.downcast_ref::<ManagerError>().unwrap().uncertain());
         assert_eq!(fake.calls("turn/start").len(), 1);
+    }
+
+    fn concurrent_codex(fake: &ConcurrentFake, client: &str) -> ManagerConfig {
+        let mut config = codex(workspace(), fake.socket.clone());
+        config.timeout_secs = 30;
+        config.codex_turn = Some(CodexTurn {
+            client_id: client.into(),
+            record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            fresh_prompt: None,
+        });
+        config
+    }
+
+    fn concurrent_codex_turns(
+        fake: &ConcurrentFake,
+        prompts: Vec<String>,
+    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
+        let mut tasks = Vec::with_capacity(prompts.len());
+        for (index, prompt) in prompts.into_iter().enumerate() {
+            let config = concurrent_codex(fake, &format!("client-{index}"));
+            let cancel = watch::channel(false).1;
+            tasks.push(tokio::spawn(async move {
+                run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        tasks
+    }
+
+    #[tokio::test]
+    async fn sixteen_codex_turns_overlap_and_keep_their_outputs() -> Result<()> {
+        let fake = ConcurrentFake::new(16);
+        let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
+        let tasks = concurrent_codex_turns(&fake, prompts.clone());
+        tokio::time::timeout(Duration::from_secs(10), fake.wait_all())
+            .await
+            .context("all Codex turns reached the fixture gate")?;
+        assert_eq!(fake.peak(), 16);
+        fake.release();
+        let mut sessions = std::collections::HashSet::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await??;
+            sessions.insert(result.session_id.context("Codex thread")?);
+            assert_eq!(result.output, format!("done: marker-{index}"));
+        }
+        assert_eq!(sessions.len(), 16);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_of_sixteen_codex_turns_leaves_the_others_running() -> Result<()> {
+        let fake = ConcurrentFake::new(16);
+        let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let config = concurrent_codex(&fake, &format!("client-{index}"));
+            let prompt = prompt.clone();
+            let (stop, cancel) = watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(10), fake.wait_all())
+            .await
+            .context("all Codex turns reached the fixture gate")?;
+        stops[0].send(true)?;
+        fake.wait_for("turn/interrupt", 1).await;
+        fake.release();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("cancelled Codex turn")?;
+                assert!(
+                    error
+                        .downcast_ref::<ManagerError>()
+                        .context("manager error")?
+                        .cancelled()
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
+        assert_eq!(
+            fake.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "turn/interrupt")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_failed_codex_turn_does_not_stop_the_other_fifteen() -> Result<()> {
+        let fake = ConcurrentFake::new(16);
+        let prompts: Vec<_> = (0..16)
+            .map(|i| {
+                if i == 0 {
+                    "fail marker-0".into()
+                } else {
+                    format!("marker-{i}")
+                }
+            })
+            .collect();
+        let tasks = concurrent_codex_turns(&fake, prompts);
+        tokio::time::timeout(Duration::from_secs(10), fake.wait_all())
+            .await
+            .context("all Codex turns reached the fixture gate")?;
+        fake.release();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("failed Codex turn")?;
+                assert_eq!(
+                    error
+                        .downcast_ref::<ManagerError>()
+                        .context("manager error")?
+                        .outcome,
+                    ManagerFailure::Failed
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -33,22 +33,30 @@ const AGENT_SERVICE: &str = "SdkAgentService";
 const CONTROL_SERVICE: &str = "SdkBridgeControlService";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+const OWNER_IDLE_RETIRE: Duration = Duration::from_secs(10 * 60);
 
 /// Durably records an SDK process group before the agent can act.
 pub type ProcessStarted = std::sync::Arc<
     dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
-/// One Cursor SDK turn on the Node's resident bridge.
+/// One Cursor SDK turn on an owner-specific resident bridge.
+#[derive(Clone)]
 pub struct SdkTurn {
+    /// Stable process owner. Turns for different owners never share a bridge process.
+    pub owner: String,
     pub executable: PathBuf,
     pub workspace: PathBuf,
+    /// Private Node directory containing this owner's bridge state and JSONL store.
+    pub local_store_root: PathBuf,
     pub api_key: String,
     /// The engine's own variables for the bridge process; a different set starts a new bridge.
     pub env: BTreeMap<String, String>,
     pub model: String,
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
+    /// The attempt bearer used by this turn's custom-tool callback.
+    pub callback_token: Option<String>,
     pub process_started: Option<ProcessStarted>,
 }
 
@@ -160,15 +168,59 @@ fn signal_group_now(group: u32, signal: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The Node's one resident `cursor-sdk-bridge`. It starts on first use and serves every
-/// turn; a dead or unresponsive bridge is replaced with backoff, and a bridge left holding
-/// an agent of unknown state is retired so its process group ends.
+/// The Node's resident Cursor SDK bridges. Each stable owner has one process group and store;
+/// a dead or unresponsive bridge is replaced with backoff, and a bridge left holding an agent of
+/// unknown state is retired so only that owner's process group ends.
 pub struct SdkBridge {
     env: BTreeMap<String, String>,
     callback: ToolCallbackConfig,
     hasher: RandomState,
-    slot: Mutex<Slot>,
+    slots: Arc<Mutex<BTreeMap<String, Arc<OwnerSlot>>>>,
     processes: Arc<Processes>,
+}
+
+struct OwnerSlot {
+    slot: Mutex<Slot>,
+    /// Cursor's callback is process-wide. Serializing a bot's turns prevents a later callback
+    /// bearer from retagging an earlier stream.
+    turn: Arc<Semaphore>,
+    last_used: std::sync::Mutex<Instant>,
+}
+
+struct OwnerTurn {
+    owner: Arc<OwnerSlot>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for OwnerTurn {
+    fn drop(&mut self) {
+        self.owner.touch();
+    }
+}
+
+impl OwnerSlot {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::default(),
+            turn: Arc::new(Semaphore::new(1)),
+            last_used: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    fn idle_time(&self) -> bool {
+        self.last_used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+            >= OWNER_IDLE_RETIRE
+    }
 }
 
 #[derive(Default)]
@@ -319,7 +371,7 @@ impl SdkBridge {
             env,
             callback: tool_callback,
             hasher: RandomState::new(),
-            slot: Mutex::default(),
+            slots: Arc::new(Mutex::default()),
             processes: Arc::new(Processes {
                 pidfile,
                 running: Default::default(),
@@ -330,28 +382,59 @@ impl SdkBridge {
     /// Starts the bridge before the first turn needs it.
     pub async fn prewarm(
         &self,
+        owner: &str,
         executable: &Path,
         workspace: &Path,
+        local_store_root: &Path,
         api_key: &str,
         env: &BTreeMap<String, String>,
     ) -> Result<()> {
+        validate_owner(owner)?;
         validate_api_key(api_key)?;
         validate_launch_env(env)?;
-        self.admit(executable, workspace, api_key, env)
+        validate_private_directory(local_store_root)?;
+        let owner_slot = self.owner_slot(owner).await?;
+        let permit = owner_slot
+            .turn
+            .clone()
+            .acquire_owned()
             .await
-            .map(drop)
-            .map_err(|error| {
-                anyhow!(redact_text(
-                    format!("{error:#}"),
-                    &self.secrets(api_key, env, "")
-                ))
-            })
+            .context("Cursor SDK owner slot closed")?;
+        let _turn = OwnerTurn {
+            owner: owner_slot.clone(),
+            _permit: permit,
+        };
+        self.admit(
+            &owner_slot,
+            executable,
+            workspace,
+            local_store_root,
+            api_key,
+            env,
+        )
+        .await
+        .map(drop)
+        .map_err(|error| {
+            anyhow!(redact_text(
+                format!("{error:#}"),
+                &self.secrets(api_key, env, "")
+            ))
+        })
     }
 
-    /// Lets running turns finish on the current bridge, then ends it; the next turn starts anew.
-    pub async fn retire(&self) {
-        if let Some(live) = self.slot.lock().await.live.take() {
-            live.retire();
+    /// Lets running turns finish on every owner bridge, then ends them; the next turn starts anew.
+    pub async fn retire_all(&self) {
+        let slots: Vec<_> = self.slots.lock().await.values().cloned().collect();
+        for owner_slot in slots {
+            let _turn = owner_slot
+                .turn
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("Cursor owner slot semaphore is never closed");
+            if let Some(live) = owner_slot.slot.lock().await.live.as_ref() {
+                live.retire();
+            }
         }
     }
 
@@ -424,13 +507,17 @@ impl SdkBridge {
         P: FnMut(Value) -> PF,
         PF: Future<Output = Result<()>>,
     {
-        let not_sent = |outcome, failure: ExecFailure| AgentRunError {
-            outcome,
-            session_id: previous_session_id.map(str::to_owned),
-            failure: ExecFailure {
-                detail: redact_text(failure.detail, &self.secrets(&turn.api_key, &turn.env, "")),
-                ..failure
-            },
+        let not_sent = |outcome, failure: ExecFailure| {
+            let mut secrets = self.secrets(&turn.api_key, &turn.env, "");
+            secrets.extend(turn.callback_token.as_deref());
+            AgentRunError {
+                outcome,
+                session_id: previous_session_id.map(str::to_owned),
+                failure: ExecFailure {
+                    detail: redact_text(failure.detail, &secrets),
+                    ..failure
+                },
+            }
         };
         let cancelled_before_send = || {
             not_sent(
@@ -447,8 +534,33 @@ impl SdkBridge {
         if *cancel.borrow() {
             return Err(cancelled_before_send());
         }
+        let owner_slot = match self.owner_slot(&turn.owner).await {
+            Ok(slot) => slot,
+            Err(error) => return Err(not_sent(AgentFailure::Failed, start_failure(&error))),
+        };
+        let _owner_turn = tokio::select! {
+            permit = owner_slot.turn.clone().acquire_owned() => permit.ok(),
+            _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
+        };
+        let Some(permit) = _owner_turn else {
+            return Err(not_sent(
+                AgentFailure::Failed,
+                ExecFailure::new(FailureKind::Unknown, "Cursor SDK owner slot closed"),
+            ));
+        };
+        let _owner_turn = OwnerTurn {
+            owner: owner_slot.clone(),
+            _permit: permit,
+        };
         let admission = tokio::select! {
-            admitted = self.admit(&turn.executable, &turn.workspace, &turn.api_key, &turn.env) => {
+            admitted = self.admit(
+                &owner_slot,
+                &turn.executable,
+                &turn.workspace,
+                &turn.local_store_root,
+                &turn.api_key,
+                &turn.env,
+            ) => {
                 admitted.map_err(|error| not_sent(AgentFailure::Failed, start_failure(&error)))?
             }
             _ = wait_for_cancel(&mut cancel) => return Err(cancelled_before_send()),
@@ -473,12 +585,22 @@ impl SdkBridge {
             ));
         }
         let rpc = &live.rpc;
-        let secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
+        let mut secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
+        secrets.extend(turn.callback_token.as_deref());
         let mut agent_id = previous_session_id.map(str::to_owned);
         let mut state = RunState::default();
         let mut send_started = false;
         let operation = async {
             let options = sdk_options(turn)?;
+            if let Some(token) = &turn.callback_token {
+                validate_callback_token(token)?;
+                rpc.unary(
+                    CONTROL_SERVICE,
+                    "SetToolCallback",
+                    json!({"url": self.callback.url, "authToken": token}),
+                )
+                .await?;
+            }
             let reply = if let Some(id) = previous_session_id {
                 rpc.unary(
                     AGENT_SERVICE,
@@ -602,34 +724,102 @@ impl SdkBridge {
         })
     }
 
-    /// The live bridge for this program, workspace and key, started if none answers.
+    async fn owner_slot(&self, owner: &str) -> Result<Arc<OwnerSlot>> {
+        validate_owner(owner)?;
+        let mut slots = self.slots.lock().await;
+        if let Some(slot) = slots.get(owner) {
+            slot.touch();
+            return Ok(slot.clone());
+        }
+        let slot = Arc::new(OwnerSlot::new());
+        slots.insert(owner.to_owned(), slot.clone());
+        let owner = owner.to_owned();
+        let all_slots = Arc::downgrade(&self.slots);
+        let weak = Arc::downgrade(&slot);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(OWNER_IDLE_RETIRE).await;
+                let Some(all_slots) = all_slots.upgrade() else {
+                    break;
+                };
+                let Some(slot) = weak.upgrade() else {
+                    break;
+                };
+                let Ok(_turn) = slot.turn.clone().try_acquire_owned() else {
+                    continue;
+                };
+                if Arc::strong_count(&slot) != 2 || !slot.idle_time() {
+                    continue;
+                }
+                let live = match slot.slot.try_lock() {
+                    Ok(mut state) => state.live.take(),
+                    Err(_) => continue,
+                };
+                if let Some(live) = live {
+                    live.retire();
+                    let mut exited = live.exited.clone();
+                    let _ = exited.wait_for(|exited| *exited).await;
+                }
+                let mut slots = all_slots.lock().await;
+                if slots
+                    .get(&owner)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &slot))
+                    && Arc::strong_count(&slot) == 2
+                {
+                    slots.remove(&owner);
+                    break;
+                }
+            }
+        });
+        Ok(slot)
+    }
+
     async fn admit(
         &self,
+        owner_slot: &OwnerSlot,
         executable: &Path,
         workspace: &Path,
+        local_store_root: &Path,
         api_key: &str,
         env: &BTreeMap<String, String>,
     ) -> Result<Admission> {
-        let key = self.hasher.hash_one((executable, workspace, api_key, env));
-        let mut slot = self.slot.lock().await;
-        if let Some(live) = slot.live.clone() {
-            // Counted before the retired check, so a concurrent retire cannot end it under this turn.
+        let key = self
+            .hasher
+            .hash_one((executable, workspace, local_store_root, api_key, env));
+        let existing = owner_slot.slot.lock().await.live.clone();
+        if let Some(live) = existing {
             let admission = live.admit();
             let current = live.key == key && !live.retired.load(SeqCst);
             if current && live.healthy().await {
                 return Ok(admission);
             }
-            slot.live = None;
-            if current {
-                slot.failed(live.started.elapsed());
-                live.kill.notify_one();
+            let mut slot = owner_slot.slot.lock().await;
+            if slot
+                .live
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &live))
+            {
+                slot.live = None;
+                if current {
+                    slot.failed(live.started.elapsed());
+                    live.kill.notify_one();
+                }
             }
             live.retire();
+            drop(admission);
+            if !live.exited() {
+                let mut exited = live.exited.clone();
+                let _ = exited.wait_for(|exited| *exited).await;
+            }
         }
+        let mut slot = owner_slot.slot.lock().await;
         if let Some(retry_at) = slot.retry_at {
             tokio::time::sleep_until(retry_at).await;
         }
-        match self.start(executable, workspace, api_key, env, key).await {
+        match self
+            .start(executable, workspace, local_store_root, api_key, env, key)
+            .await
+        {
             Ok(live) => {
                 let admission = live.admit();
                 slot.live = Some(live);
@@ -646,17 +836,23 @@ impl SdkBridge {
         &self,
         executable: &Path,
         workspace: &Path,
+        local_store_root: &Path,
         api_key: &str,
         env: &BTreeMap<String, String>,
         key: u64,
     ) -> Result<Arc<Live>> {
-        prepare_sdk_workspace(workspace).await?;
+        let bridge_state_root = local_store_root.join("bridge-state");
+        prepare_sdk_workspace(workspace, local_store_root, &bridge_state_root).await?;
         let mut command = Command::new(executable);
         command
             .arg("--workspace")
             .arg(workspace)
             .arg("--state-root")
-            .arg(workspace.join(".sdk"))
+            .arg(&bridge_state_root)
+            .arg("--local-store")
+            .arg(serde_json::to_string(&json!({
+                "type":"jsonl", "rootDir":local_store_root
+            }))?)
             .args(["--host", "127.0.0.1", "--port", "0"])
             .current_dir(workspace)
             .stdin(Stdio::null())
@@ -688,6 +884,7 @@ impl SdkBridge {
             .envs(env)
             .envs(&self.env)
             .env("CURSOR_API_KEY", api_key)
+            .env("CURSOR_DATA_DIR", bridge_state_root.join("cursor-data"))
             .env("CURSOR_SDK_CLIENT_LANGUAGE", "rust");
         let mut child = command.spawn().map_err(|error| {
             let kind = if error.kind() == std::io::ErrorKind::NotFound {
@@ -758,7 +955,8 @@ impl SdkBridge {
         }))
     }
 
-    /// Reads the discovery line, then sets the Node's tool callback once for the bridge's life.
+    /// Reads the discovery line and sets a callback that is unauthorized until a turn installs
+    /// its attempt bearer.
     async fn connect(
         &self,
         ready: oneshot::Receiver<Result<Discovery>>,
@@ -851,8 +1049,22 @@ async fn supervise(
     let _ = exited.send(true);
 }
 
-async fn prepare_sdk_workspace(workspace: &Path) -> Result<()> {
-    for directory in [workspace, &workspace.join(".sdk")] {
+async fn prepare_sdk_workspace(
+    workspace: &Path,
+    local_store_root: &Path,
+    bridge_state_root: &Path,
+) -> Result<()> {
+    tokio::fs::create_dir_all(workspace)
+        .await
+        .context("create Cursor SDK workspace")?;
+    let workspace_metadata = tokio::fs::symlink_metadata(workspace)
+        .await
+        .context("read Cursor SDK workspace")?;
+    ensure!(
+        workspace_metadata.is_dir() && !workspace_metadata.file_type().is_symlink(),
+        "Cursor SDK workspace must be a real directory"
+    );
+    for directory in [local_store_root, bridge_state_root] {
         tokio::fs::create_dir_all(directory)
             .await
             .context("create Cursor SDK workspace")?;
@@ -871,6 +1083,8 @@ fn validate_turn(
     prompt: &str,
     previous_session_id: Option<&str>,
 ) -> Result<(), ExecFailure> {
+    validate_owner(&turn.owner)
+        .map_err(|error| ExecFailure::new(FailureKind::Unknown, error.to_string()))?;
     if turn.model.trim().is_empty() {
         return Err(ExecFailure::new(
             FailureKind::NoModel,
@@ -886,6 +1100,10 @@ fn validate_turn(
             "invalid management prompt"
         );
         validate_launch_env(&turn.env)?;
+        validate_private_directory(&turn.local_store_root)?;
+        if let Some(token) = &turn.callback_token {
+            validate_callback_token(token)?;
+        }
         validate_tools(&turn.custom_tools)?;
         if let Some(id) = previous_session_id {
             validate_sdk_id(id)?;
@@ -911,6 +1129,38 @@ fn validate_api_key(api_key: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_owner(owner: &str) -> Result<()> {
+    ensure!(
+        !owner.is_empty()
+            && owner.len() <= 512
+            && owner
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte)),
+        "invalid Cursor SDK owner"
+    );
+    Ok(())
+}
+
+fn validate_callback_token(token: &str) -> Result<()> {
+    ensure!(
+        (32..=4096).contains(&token.len()) && !token.chars().any(char::is_control),
+        "invalid Cursor SDK callback token"
+    );
+    Ok(())
+}
+
+fn validate_private_directory(path: &Path) -> Result<()> {
+    ensure!(path.is_absolute(), "Cursor SDK store root must be absolute");
+    ensure!(
+        path.components().all(|component| !matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )),
+        "Cursor SDK store root must be normalized"
+    );
+    Ok(())
+}
+
 /// The engine's variables may name anything but what the bridge itself sets.
 fn validate_launch_env(env: &BTreeMap<String, String>) -> Result<()> {
     ensure!(env.len() <= 64, "too many Cursor environment entries");
@@ -924,6 +1174,7 @@ fn validate_launch_env(env: &BTreeMap<String, String>) -> Result<()> {
                         || (index > 0 && byte.is_ascii_digit())
                 })
                 && key != "CURSOR_API_KEY"
+                && key != "CURSOR_DATA_DIR"
                 && !key.starts_with("CURSOR_SDK_")
                 && !key.starts_with("VIBEFACE_")
                 && value.len() <= 4096
@@ -1017,8 +1268,13 @@ fn sdk_options(turn: &SdkTurn) -> Result<Value> {
         .workspace
         .to_str()
         .context("Cursor SDK workspace path must be UTF-8")?;
+    let store_root = turn
+        .local_store_root
+        .to_str()
+        .context("Cursor SDK store root must be UTF-8")?;
     Ok(json!({"apiKey":turn.api_key,"model":{"id":turn.model},
-        "local":{"cwd":[workspace],"settingSources":[],"customTools":turn.custom_tools},"mcpServers":{}}))
+        "local":{"cwd":[workspace],"settingSources":[],"customTools":turn.custom_tools,
+            "store":{"type":"jsonl","rootDir":store_root}},"mcpServers":{}}))
 }
 
 fn validate_sdk_id(id: &str) -> Result<()> {
@@ -1838,12 +2094,15 @@ mod tests {
     #[test]
     fn native_custom_tools_need_a_private_local_callback_and_no_mcp_server() {
         let turn = SdkTurn {
+            owner: "coordination".into(),
             executable: "/sdk".into(),
             workspace: "/manager".into(),
+            local_store_root: "/private/cursor/coordination".into(),
             api_key: "fixture-key".into(),
             env: BTreeMap::new(),
             timeout_secs: 5,
             model: "fixture-model".into(),
+            callback_token: Some("x".repeat(32)),
             process_started: None,
             custom_tools: BTreeMap::from([(
                 "context".into(),
@@ -1856,6 +2115,11 @@ mod tests {
         };
         let options = sdk_options(&turn).unwrap();
         assert_eq!(options["mcpServers"], json!({}));
+        assert_eq!(options["local"]["store"]["type"], "jsonl");
+        assert_eq!(
+            options["local"]["store"]["rootDir"],
+            "/private/cursor/coordination"
+        );
         assert!(options.get("tools").is_none());
         assert_eq!(
             options["local"]["customTools"]["context"]["inputSchema"],
