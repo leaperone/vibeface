@@ -99,7 +99,7 @@ function PickTarget({ onPicked }: { onPicked(entry: ConnectionEntry): void }) {
       <Textarea accessibilityLabel={recoveryCopy.pasteLabel} placeholder={recoveryCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={3}
         className="min-h-16 font-mono text-meta" value={text} submitBehavior="blurAndSubmit" returnKeyType="done"
         // A half-typed link can already parse to another port, so typed text is read once it is finished.
-        onChangeText={value => { setText(value); setWrong(false) }} onEndEditing={() => take(text)} />
+        onChangeText={value => { setText(value); setWrong(false) }} onEndEditing={event => take(event.nativeEvent.text)} />
       <Button variant="ghost" className="-ms-3 self-start" onPress={async () => take((await Clipboard.getStringAsync().catch(() => '')).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
