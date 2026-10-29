@@ -3905,18 +3905,53 @@ mod tests {
                 }
             }
             let target = l.store.lock().await.heads(&network)?;
-            // L's own Hello to C would also wake C; only C's schedule decides here.
+            let peer = device(&il);
+            // Anything that wakes C during its round would also start the next one at once: L's
+            // own Hello, or an address record C has not seen. Only C's schedule decides here.
             l.sync_peers
                 .lock()
                 .expect("sync peers")
                 .entry(device(&ic))
                 .or_default()
                 .running = true;
+            c.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.clone())
+                .or_default()
+                .running = true;
             for node in [&l, &c] {
                 node.start_network().await?;
             }
             c.net()?.learn(&l.net()?.addr()).await;
-            let peer = device(&il);
+            let book = async |node: &Runtime| -> Result<Vec<(String, u64)>> {
+                Ok(node
+                    .store
+                    .lock()
+                    .await
+                    .address_book()?
+                    .iter()
+                    .filter_map(|signed| signed.open(&network).ok())
+                    .map(|record| (record.device_id, record.seq))
+                    .collect())
+            };
+            let mut settled = Vec::new();
+            loop {
+                let now = vec![book(&l).await?, book(&c).await?];
+                if now.iter().all(|records| records.len() == 1) && now == settled {
+                    break;
+                }
+                settled = now;
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
+            let records = l.store.lock().await.address_book()?;
+            c.merge_addresses(&network, records).await?;
+            c.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.clone())
+                .or_default()
+                .running = false;
             c.wake_sync(&peer);
             let synced = || {
                 c.sync_peers
