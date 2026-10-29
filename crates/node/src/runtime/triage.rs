@@ -3871,6 +3871,108 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_work_without_agent_goes_on_where_its_thread_or_original_ran() -> Result<()> {
+        use crate::model::WorkKind;
+        use crate::providers::Provider;
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            if let Some(manager) = node.settings.lock().unwrap().manager.as_mut() {
+                manager.provider = Provider::Claude;
+            }
+            node.settings.lock().unwrap().roots = vec![dir.clone()];
+            {
+                let mut providers = node.providers.lock().unwrap();
+                providers.switches.execution.insert(Provider::Claude);
+                (providers.bins).insert(Provider::Claude, "/nonexistent/claude".into());
+            }
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                Provider::Claude,
+            )
+            .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let local = node.identity.device_id()?;
+            let original = crate::work::WorkSpec {
+                work_id: "w-codex".into(),
+                conversation: "c".into(),
+                trigger: "message:m0".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "w-codex".into(),
+                kind: WorkKind::Agent(Provider::Codex),
+                cwd: String::new(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t-done".into()),
+            };
+            (node.store.lock().await).accept_work(&node.identity, &network, original, now_ms())?;
+            let cwd = dir.display().to_string();
+            let call = |args: Value| node.tool(access.clone(), "track_work", args);
+            let answered = call(json!({"thread":"t-codex","call_ref":"a1","title":"t","prompt":"yes"})).await;
+            let followed = call(json!({"continues":"w-codex","cwd":cwd,"call_ref":"f1","title":"t","prompt":"more"})).await;
+            let crossed = call(json!({"continues":"w-codex","cwd":cwd,"call_ref":"f2","title":"t","prompt":"more","agent":"claude"})).await;
+            let foreign = call(json!({"thread":"t-codex","call_ref":"a2","title":"t","prompt":"yes","agent":"claude"})).await;
+            let ready = node.tool(access.clone(), "wait_work", json!({"thread":"t-codex"})).await;
+            {
+                let mut providers = node.providers.lock().unwrap();
+                providers.switches.execution = [Provider::Codex].into();
+            }
+            let fresh = call(json!({"cwd":cwd,"call_ref":"n1","title":"t","prompt":"new"})).await;
+            node.providers.lock().unwrap().switches.execution.insert(Provider::Claude);
+            let retried = call(json!({"cwd":cwd,"call_ref":"n1","title":"t","prompt":"new"})).await;
+            let changed = call(json!({"cwd":cwd,"call_ref":"n1","title":"t","prompt":"other"})).await;
+            node.finish_manager_attempt(&attempt).await;
+
+            let kind = |work_id: &Value| -> Result<WorkKind> {
+                let id = work_id.as_str().context("work_id")?;
+                Ok((node.store.try_lock()?.work_record(id)?).context("recorded")?.kind)
+            };
+            let answered = answered?;
+            assert_eq!(answered["may_send"], true, "the Codex CLI sends the answer");
+            assert_eq!(kind(&answered["work_id"])?, WorkKind::Agent(Provider::Codex));
+            let followed = followed?;
+            assert_eq!(kind(&followed["work_id"])?, WorkKind::Agent(Provider::Codex));
+            for (refused, what) in [(crossed, "continuation"), (foreign, "thread")] {
+                let refused = format!("{:#}", refused.expect_err(what));
+                assert!(refused.contains("agent") && refused.contains("Codex"), "{what}: {refused}");
+            }
+            assert_eq!(ready?["agent"], "codex", "the CLI reads a Codex thread first");
+            let fresh = fresh?;
+            assert_eq!(kind(&fresh["work_id"])?, WorkKind::Agent(Provider::Codex));
+            let retried = retried?;
+            assert_eq!(retried["work_id"], fresh["work_id"]);
+            assert_eq!(retried["may_send"], false, "a retry only reads back");
+            let changed = format!("{:#}", changed.expect_err("another prompt under one call_ref"));
+            assert!(changed.contains("prompt") && !changed.contains("kind"), "{changed}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
     async fn a_bad_call_ref_is_named_so_the_agent_fixes_it_at_once() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {

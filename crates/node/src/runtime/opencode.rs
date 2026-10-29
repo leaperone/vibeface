@@ -51,6 +51,19 @@ pub struct Opencode {
     answered: std::sync::Mutex<BTreeSet<String>>,
     /// Uses of the serve in progress; while any lasts, a changed launch waits.
     users: Arc<std::sync::atomic::AtomicUsize>,
+    /// Sessions a work is being sent into now.
+    starting: std::sync::Mutex<BTreeSet<String>>,
+}
+
+/// Releases a session claimed for a starting work; by then the work runs or never will.
+struct Claim<'a>(&'a Opencode, String);
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        (self.0.starting.lock())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.1);
+    }
 }
 
 /// One use of the serve, from taking its connection until the turn or call is over.
@@ -193,6 +206,7 @@ impl Opencode {
             live: Default::default(),
             answered: Default::default(),
             users: Default::default(),
+            starting: Default::default(),
         })
     }
 
@@ -1284,6 +1298,31 @@ impl Executor for Opencode {
                     }
                 }
             };
+            // Two runs in one session would end each other's turns.
+            let _claim = match thread {
+                Some(_) => {
+                    let claimed = (self.starting.lock())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(session.clone());
+                    let other = (node.store.lock().await.work_records_on_thread(&session)?)
+                        .into_iter()
+                        .any(|run| {
+                            run.work_id != id
+                                && !run.state.finished()
+                                && !matches!(run.state, WorkState::Starting { .. })
+                        });
+                    let claim = claimed.then(|| Claim(self, session.clone()));
+                    if claim.is_none() || other || self.busy(&conn, &session, &directory).await? {
+                        let failure = ExecFailure::new(
+                            FailureKind::WriterBusy,
+                            "opencode still runs another work in this session",
+                        );
+                        return reject(failure).await;
+                    }
+                    claim
+                }
+                None => None,
+            };
             // Journaled before the send: a restart reads the run back by the work's message.
             let signal = Signal::ThreadCreated(session.clone());
             let record = node.signal_work(network, id, signal).await?;
@@ -1345,9 +1384,10 @@ impl Executor for Opencode {
                 .as_str()
                 .context("opencode sent a session without its directory")?;
             let epoch = conn.started_ms as u64;
-            // A later message took the run over, so ours has ended.
+            // A later message joins the run; ours ends with its reply.
             let later = messages.iter().skip(1).any(|m| m["info"]["role"] == "user");
-            if !later && self.busy(&conn, session, directory).await? {
+            let busy = self.busy(&conn, session, directory).await?;
+            if !later && busy {
                 return Ok(Probe::Running { turn_id: id, epoch });
             }
             let chain = chain(&messages, &id);
@@ -1378,7 +1418,7 @@ impl Executor for Opencode {
                     );
                     done(TurnStatus::Interrupted, Some(failure))
                 }
-                _ if now_ms() - chain.created_ms < QUIET_MS => Probe::Running {
+                _ if busy || now_ms() - chain.created_ms < QUIET_MS => Probe::Running {
                     turn_id: id.clone(),
                     epoch,
                 },
@@ -2220,6 +2260,87 @@ mod tests {
         let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
         assert_eq!(server.probe(&on(&session)).await?, Probe::NotStarted);
         assert!(place.prompts().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_work_into_a_running_opencode_session_is_refused_and_never_sent() -> Result<()>
+    {
+        let place = Place::new().await?;
+        let (node, network) = node(&place).await?;
+        let first = spec(&node.identity.device_id()?, &place, "HOLD");
+        dispatch(&node, &network, &first).await?;
+        let running = until(&node, |state| matches!(state, WorkState::Running { .. })).await?;
+        let session = running
+            .state
+            .thread()
+            .context("the work's session")?
+            .to_owned();
+        let second = WorkSpec {
+            work_id: "w-2".into(),
+            call_ref: "w-2".into(),
+            prompt: "again".into(),
+            thread: Some(session.clone()),
+            ..first
+        };
+        (node.store.lock().await).accept_work(
+            &node.identity,
+            &network,
+            second.clone(),
+            now_ms(),
+        )?;
+        let args = json!({"model":"fake/m"});
+        let opencode = node.opencode.clone();
+        let sends = opencode
+            .start(&node, &network, &second, Some(&session), &args)
+            .await?;
+        assert!(!sends);
+        let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
+        assert_eq!(
+            refused.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected
+            }
+        );
+        assert_eq!(
+            place.prompts().len(),
+            1,
+            "the running session got nothing more"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_a_later_message_joined_reads_as_running_while_its_session_is_busy() -> Result<()>
+    {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let (conn, _serving) = server.conn().await?;
+        let cwd = place.dir.join("work").display().to_string();
+        let created = server.create(&conn, &cwd).await;
+        let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        (server.serve.lock().await.as_mut())
+            .context("the serve")?
+            .conn
+            .started_ms -= 3 * QUIET_MS;
+        let id = work_message("w-1");
+        let sent = now_ms() - 2 * QUIET_MS;
+        {
+            let mut fake = place.fake.lock().unwrap();
+            let found = fake.sessions.get_mut(&session).context("session")?;
+            found.busy = true;
+            found.messages = vec![
+                json!({"info":{"id":id,"sessionID":session,"role":"user","time":{"created":sent}}}),
+                json!({"info":{"id":"msg_1","sessionID":session,"role":"assistant","parentID":id,
+                    "time":{"created":sent}}}),
+                json!({"info":{"id":"msg_2","sessionID":session,"role":"user",
+                    "time":{"created":sent + 1}}}),
+            ];
+        }
+        let (mut work, _) = crate::work::accept(spec("t", &place, "do it"), 0);
+        crate::work::transition(&mut work, Signal::ThreadCreated(session));
+        let probe = server.probe(&work).await?;
+        assert!(matches!(probe, Probe::Running { .. }), "{probe:?}");
         Ok(())
     }
 
