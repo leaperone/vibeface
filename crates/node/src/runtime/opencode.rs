@@ -53,14 +53,26 @@ pub struct Opencode {
     users: Arc<std::sync::atomic::AtomicUsize>,
     /// Sessions a work is being sent into now.
     starting: std::sync::Mutex<BTreeSet<String>>,
+    /// Works whose start runs in this process now.
+    sending: std::sync::Mutex<BTreeSet<String>>,
 }
 
-/// Releases a session claimed for a starting work; by then the work runs or never will.
-struct Claim<'a>(&'a Opencode, String);
+/// One entry of a claim set, released when dropped.
+struct Claim<'a>(&'a std::sync::Mutex<BTreeSet<String>>, String);
+
+impl<'a> Claim<'a> {
+    fn take(set: &'a std::sync::Mutex<BTreeSet<String>>, key: &str) -> Option<Self> {
+        let mut held = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.insert(key.to_owned())
+            .then(|| Self(set, key.to_owned()))
+    }
+}
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        (self.0.starting.lock())
+        (self.0.lock())
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.1);
     }
@@ -207,6 +219,7 @@ impl Opencode {
             answered: Default::default(),
             users: Default::default(),
             starting: Default::default(),
+            sending: Default::default(),
         })
     }
 
@@ -1247,6 +1260,7 @@ impl Executor for Opencode {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let id = work.work_id.as_str();
+            let _sending = Claim::take(&self.sending, id);
             let reject = |failure: ExecFailure| async move {
                 (node
                     .signal_work(network, id, Signal::StartRejected(failure))
@@ -1298,22 +1312,36 @@ impl Executor for Opencode {
                     }
                 }
             };
-            // Two runs in one session would end each other's turns.
+            // Two runs in one session would end each other's turns. A work not known to be sent
+            // holds the session too, unless its own start is still on its way here.
             let _claim = match thread {
                 Some(_) => {
-                    let claimed = (self.starting.lock())
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(session.clone());
-                    let other = (node.store.lock().await.work_records_on_thread(&session)?)
-                        .into_iter()
-                        .any(|run| run.work_id != id && !run.state.finished());
-                    let claim = claimed.then(|| Claim(self, session.clone()));
-                    if claim.is_none() || other || self.busy(&conn, &session, &directory).await? {
-                        let failure = ExecFailure::new(
-                            FailureKind::WriterBusy,
-                            "opencode still runs another work in this session",
-                        );
-                        return reject(failure).await;
+                    let claim = Claim::take(&self.starting, &session);
+                    let runs = node.store.lock().await.work_records_on_thread(&session)?;
+                    let holder = runs.into_iter().find(|run| {
+                        run.work_id != id
+                            && !run.state.finished()
+                            && !(matches!(run.state, WorkState::Starting { .. })
+                                && (self.sending.lock())
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .contains(&run.work_id))
+                    });
+                    let busy = match (&claim, &holder) {
+                        (None, _) => {
+                            Some("opencode is starting another work in this session".to_owned())
+                        }
+                        (_, Some(run)) => Some(format!(
+                            "work {} still holds this opencode session ({}); it ends when that work finishes or the user settles it",
+                            run.work_id,
+                            run.state.name()
+                        )),
+                        _ if self.busy(&conn, &session, &directory).await? => {
+                            Some("opencode still runs a turn in this session".to_owned())
+                        }
+                        _ => None,
+                    };
+                    if let Some(busy) = busy {
+                        return reject(ExecFailure::new(FailureKind::WriterBusy, busy)).await;
                     }
                     claim
                 }
@@ -2340,6 +2368,53 @@ mod tests {
             }
         );
         assert!(place.prompts().is_empty(), "nothing went into the session");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn of_two_works_started_at_once_into_one_opencode_session_one_is_sent() -> Result<()> {
+        let place = Place::new().await?;
+        let (node, network) = node(&place).await?;
+        let (conn, _serving) = node.opencode.conn().await?;
+        let cwd = place.dir.join("work").display().to_string();
+        let created = node.opencode.create(&conn, &cwd).await;
+        let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        let first = WorkSpec {
+            thread: Some(session.clone()),
+            ..spec(&node.identity.device_id()?, &place, "HOLD")
+        };
+        let second = WorkSpec {
+            work_id: "w-2".into(),
+            call_ref: "w-2".into(),
+            ..first.clone()
+        };
+        for work in [&first, &second] {
+            let mut store = node.store.lock().await;
+            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+        }
+        let args = json!({"model":"fake/m"});
+        let opencode = node.opencode.clone();
+        let (one, two) = tokio::join!(
+            opencode.start(&node, &network, &first, Some(&session), &args),
+            opencode.start(&node, &network, &second, Some(&session), &args)
+        );
+        (one?, two?);
+        assert_eq!(
+            place.prompts().len(),
+            1,
+            "exactly one went into the session"
+        );
+        let mut rejected = 0;
+        for id in ["w-1", "w-2"] {
+            let run = (node.store.lock().await.work_record(id)?).context("recorded")?;
+            rejected += usize::from(
+                run.state
+                    == WorkState::Finished {
+                        outcome: WorkOutcome::Rejected,
+                    },
+            );
+        }
+        assert_eq!(rejected, 1, "the other was refused");
         Ok(())
     }
 
