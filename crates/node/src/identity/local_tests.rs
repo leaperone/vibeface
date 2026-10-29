@@ -363,7 +363,7 @@ fn a_name_already_in_the_network_gets_the_next_number_and_a_retry_keeps_it() -> 
     let long = format!("{}長", "a".repeat(125));
     let cut = format!("{} 2", "a".repeat(125));
     assert_eq!(
-        distinct_name(&long, &[long.clone()]),
+        distinct_name(&long, std::slice::from_ref(&long)),
         cut,
         "the number fits within 128 bytes on a character boundary"
     );
