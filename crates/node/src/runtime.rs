@@ -337,9 +337,9 @@ impl Runtime {
             log_intake: Default::default(),
         };
         if let Some(token) = &node.entry_token {
-            crate::logging::add_secret(token);
+            crate::logging::add_credential(token);
         }
-        crate::logging::add_secret(&node.cursor_callback_token);
+        crate::logging::add_credential(&node.cursor_callback_token);
         Ok(node)
     }
     /// Opens a data directory this process has just closed. On Linux a child that another test

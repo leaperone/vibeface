@@ -75,7 +75,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `codex.send`、`codex.call`、`codex.call_failed` | Agent 经命令行给 Codex 发的消息和请求 |
 | `codex.app_server.stderr`、`codex.sdk.stderr`、`cursor.stderr` | 子进程的标准错误 |
 
-写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、入口令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
+写入前每条记录统一脱敏：邀请链接片段替换为 `[invite]`，`Bearer` 后的令牌、入口令牌、Cursor 回调令牌和环境变量中名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾的值，以及设置页填写的 Provider 变量值替换为 `[redacted]`。日志不记录加入 secret、本机启动 token 或模型密钥。
 
 ## 导出诊断包
 
