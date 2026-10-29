@@ -79,10 +79,12 @@ export default function ChatScreen() {
   const ios = Platform.OS === 'ios'
   const barHeight = useHeaderHeight()
   const header = ios ? barHeight : 0
-  // A custom title is sized against the whole bar, back button included, so a long name would run under it; the screen's
-  // width less the sidebar and a back button's room on each side keeps it centred and truncated.
+  // iOS sizes a custom title against the whole bar, back button included, so a long name would run under it; the screen's
+  // width less the sidebar and a back button's room on each side keeps it centred and truncated. Android's title slot
+  // already ends where the bar's buttons begin.
   const frame = useSafeAreaFrame().width
-  const titleWidth = (useWide() ? frame - 320 : frame) - 120
+  const wide = useWide()
+  const titleWidth = ios ? (wide ? frame - 320 : frame) - 120 : undefined
   const { theme } = useUniwind()
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
