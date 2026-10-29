@@ -271,6 +271,52 @@ pub struct Avatar {
     pub hue: Hue,
 }
 
+/// In `face.ts` order: the ID derivation indexes these.
+const OUTLINES: [Outline; 5] = [
+    Outline::Round,
+    Outline::Squircle,
+    Outline::Drop,
+    Outline::Bean,
+    Outline::Cloud,
+];
+const EYES: [Eyes; 4] = [Eyes::Dot, Eyes::Pill, Eyes::Oval, Eyes::Wide];
+
+impl Avatar {
+    /// The face `faceOf` in `face.ts` gives a bot that has none picked; the two must agree, as
+    /// `packages/client/src/avatar/derived-faces.json` checks.
+    pub fn derived(bot_id: &str) -> Self {
+        let mut hash: u32 = 2_166_136_261;
+        for c in bot_id.chars() {
+            // `charCodeAt(0)` of each code point: the first UTF-16 unit.
+            let unit = c.encode_utf16(&mut [0; 2])[0];
+            hash = (hash ^ u32::from(unit)).wrapping_mul(16_777_619);
+        }
+        hash ^= hash >> 16;
+        let more = scramble(hash, 7);
+        Self {
+            outline: OUTLINES[(hash >> 3) as usize % OUTLINES.len()],
+            eyes: EYES[(more >> 4) as usize % EYES.len()],
+            hue: Hue(HUES[hash as usize % HUES.len()]),
+        }
+    }
+}
+
+/// `unit` in `face.ts` before it divides by 2^32.
+fn scramble(seed: u32, n: u32) -> u32 {
+    let mut h = (seed ^ n.wrapping_mul(0x9e37_79b1)).wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// The face a bot shows, and whether one was picked rather than given by its ID.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ShownAvatar {
+    #[serde(flatten)]
+    pub avatar: Avatar,
+    pub picked: bool,
+}
+
 /// `None` is the face the bot's ID gives.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -789,8 +835,10 @@ pub enum EventBody {
         cause: Option<Cause>,
     },
     /// In the bot's conversation: the user picks its face from the web, or `None` for the one
-    /// its ID gives. It and a chat change of the face win by rank alike.
+    /// its ID gives. It and a chat change of the face win by rank alike. `before` is the face
+    /// the user saw, so the signature covers it; the Node takes the write only while it stands.
     BotAvatarSet {
+        before: Option<Avatar>,
         avatar: Option<Avatar>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
@@ -990,6 +1038,13 @@ impl Bot {
     /// The model this bot runs on `provider`; `None` follows the device's default.
     pub fn model(&self, provider: Provider) -> Option<&str> {
         self.models.get(&provider).map(String::as_str)
+    }
+
+    pub fn shown_avatar(&self) -> ShownAvatar {
+        ShownAvatar {
+            avatar: self.avatar.unwrap_or_else(|| Avatar::derived(&self.bot_id)),
+            picked: self.avatar.is_some(),
+        }
     }
 }
 

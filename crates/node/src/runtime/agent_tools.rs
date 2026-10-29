@@ -156,7 +156,7 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,"avatar":bot.avatar,
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
@@ -184,7 +184,7 @@ impl Runtime {
                     json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
                     "instructions":bot.instructions,"project":bot.project,
                     "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
-                    "avatar":bot.avatar,"schedules":schedules,"memory":memory}),
+                    "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
                 )
             }
             Tool::DeleteBot => {

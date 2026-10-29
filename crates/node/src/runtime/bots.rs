@@ -267,42 +267,58 @@ impl Runtime {
         Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
     }
 
-    /// The user picks a bot's face, or `null` for the one its ID gives; asking for the current
-    /// one writes nothing.
+    /// The user picks a bot's face, or `null` for the one its ID gives. The write holds only
+    /// while the face is still `before`, the one the user saw, so a replayed request cannot undo
+    /// a later change; when the face is already `avatar` nothing is written.
     pub(super) async fn set_bot_avatar(&self, access: &Access, input: &Value) -> Result<Value> {
         ensure!(access.human, "only the user picks a bot's face here");
         let scope = id(input, "conversation_id")?;
         if let Some(allowed) = &access.conversation_id {
             ensure!(allowed == &scope, "outside this client's conversation");
         }
-        let avatar: Option<Avatar> = serde_json::from_value(input["avatar"].clone())
-            .context("avatar is an outline, eyes and hue, or null")?;
-        let bot = self
-            .store
-            .lock()
-            .await
+        let face = |key: &str| -> Result<Option<Avatar>> {
+            let value = input.get(key).context("before and avatar are required")?;
+            serde_json::from_value(value.clone())
+                .context("a face is an outline, eyes and hue, or null")
+        };
+        let (before, avatar) = (face("before")?, face("avatar")?);
+        let membership = self.membership_state().await?;
+        ensure!(
+            membership.genesis.network_id == access.network_id,
+            "wrong personal network"
+        );
+        let mut store = self.store.lock().await;
+        let bot = store
             .bot_for_conversation(&access.network_id, &scope)?
             .context("no such bot")?;
         if bot.avatar == avatar {
             return Ok(json!({"bot":bot}));
         }
-        let event = self
-            .append(
-                &access.network_id,
-                &scope,
-                EventBody::BotAvatarSet {
-                    avatar,
-                    attestation: Some(attestation(input)?),
-                },
-            )
-            .await?;
+        ensure!(
+            bot.avatar == before,
+            "the bot's face changed since you saw it; nothing was written"
+        );
+        let event = store.append_event(
+            &self.identity,
+            &access.network_id,
+            &scope,
+            EventBody::BotAvatarSet {
+                before,
+                avatar,
+                attestation: Some(attestation(input)?),
+            },
+            vec![],
+            now_ms(),
+        )?;
+        let bot = store.bot_for_conversation(&access.network_id, &scope)?;
+        drop(store);
         tracing::info!(
             event = "bot.avatar",
             conversation_id = scope,
             "bot face set"
         );
         self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
-        Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
+        Ok(json!({"bot":bot}))
     }
 
     pub(super) async fn validate_bot_project(
@@ -353,6 +369,161 @@ impl Runtime {
                 "Bot project is outside the execution Node's configured roots"
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Eyes, Hue, Outline};
+    use crate::runtime::triage::tests::{bot, node};
+
+    #[tokio::test]
+    async fn the_panel_writes_a_face_only_over_the_one_it_saw() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        bot(&node, &admin, "c", "Ops", &[]).await?;
+        bot(&node, &admin, "d", "Docs", &[]).await?;
+        let network = node.membership_state().await?.genesis.network_id;
+        let face = |outline, eyes, hue| -> Result<Avatar> {
+            Ok(Avatar {
+                outline,
+                eyes,
+                hue: Hue::try_from(hue).map_err(anyhow::Error::msg)?,
+            })
+        };
+        let (cloud, bean) = (
+            face(Outline::Cloud, Eyes::Wide, 285)?,
+            face(Outline::Bean, Eyes::Dot, 155)?,
+        );
+        let client = |scope: Option<&str>| Access {
+            network_id: network.clone(),
+            human: true,
+            conversation_id: scope.map(Into::into),
+            manager: None,
+        };
+        let request =
+            |scope: &str, before: Option<Avatar>, avatar: Option<Avatar>| -> Result<Value> {
+                let signed = admin.attest(
+                    &network,
+                    scope,
+                    EventBody::BotAvatarSet {
+                        before,
+                        avatar,
+                        attestation: None,
+                    },
+                )?;
+                Ok(
+                    json!({"method":"set_bot_avatar","conversation_id":scope,"before":before,
+                "avatar":avatar,"attestation":signed.attestation()}),
+                )
+            };
+        let events = |node: &Arc<Runtime>| {
+            let (node, network) = (node.clone(), network.clone());
+            async move {
+                let local = node.identity.device_id()?;
+                anyhow::Ok(
+                    node.store
+                        .lock()
+                        .await
+                        .events_from(&network, &local, 1, 1000)?
+                        .len(),
+                )
+            }
+        };
+        let shown = |node: &Arc<Runtime>| {
+            let (node, network) = (node.clone(), network.clone());
+            async move {
+                anyhow::Ok(
+                    node.store
+                        .lock()
+                        .await
+                        .bot_for_conversation(&network, "c")?
+                        .context("bot")?
+                        .avatar,
+                )
+            }
+        };
+
+        let pick = request("c", None, Some(cloud))?;
+        let agent = Access {
+            human: false,
+            ..client(None)
+        };
+        assert!(
+            node.rpc(agent, pick.clone()).await.is_err(),
+            "agents never pick a face"
+        );
+        let elsewhere = node.rpc(client(Some("d")), pick.clone()).await.unwrap_err();
+        assert!(elsewhere.to_string().contains("outside"), "{elsewhere}");
+        let mut missing = pick.clone();
+        missing.as_object_mut().unwrap().remove("before");
+        let missing = node.rpc(client(None), missing).await.unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("before and avatar are required"),
+            "{missing}"
+        );
+        let in_bots = node
+            .rpc(client(None), request("bots", None, Some(cloud))?)
+            .await;
+        assert!(in_bots.is_err(), "the bots scope has no face");
+        assert_eq!(shown(&node).await?, None);
+
+        let written = node.rpc(client(Some("c")), pick.clone()).await?;
+        assert_eq!(written["bot"]["avatar"], json!(cloud));
+        let count = events(&node).await?;
+        let again = node.rpc(client(None), pick.clone()).await?;
+        assert_eq!(again["bot"]["avatar"], json!(cloud));
+        assert_eq!(
+            events(&node).await?,
+            count,
+            "a replay over the same face writes nothing"
+        );
+
+        node.rpc(client(None), request("c", Some(cloud), Some(bean))?)
+            .await?;
+        let stale = node.rpc(client(None), pick).await.unwrap_err();
+        assert!(
+            stale.to_string().contains("changed since you saw it"),
+            "{stale}"
+        );
+        assert_eq!(
+            shown(&node).await?,
+            Some(bean),
+            "a stale replay cannot undo a later pick"
+        );
+        node.rpc(client(None), request("c", Some(bean), None)?)
+            .await?;
+        assert_eq!(shown(&node).await?, None, "back to the face the id gives");
+
+        let reader = Access {
+            human: false,
+            conversation_id: Some("d".into()),
+            ..client(None)
+        };
+        let listed = node.tool(reader.clone(), "list_bots", json!({})).await?;
+        let derived = Avatar::derived("c");
+        let c = listed["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|bot| bot["bot_id"] == "c")
+            .unwrap();
+        assert_eq!(
+            c["avatar"],
+            json!({"outline":derived.outline,"eyes":derived.eyes,"hue":derived.hue,"picked":false})
+        );
+        node.rpc(client(None), request("c", None, Some(bean))?)
+            .await?;
+        let read = node.tool(reader, "read_bot", json!({"bot":"Ops"})).await?;
+        assert_eq!(
+            read["avatar"],
+            json!({"outline":"bean","eyes":"dot","hue":155,"picked":true})
+        );
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
         Ok(())
     }
 }

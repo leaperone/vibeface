@@ -32,7 +32,7 @@ pub enum ChangeRequest {
     UpdateProfile {
         name: Option<String>,
         instructions: Option<String>,
-        avatar: Option<Avatar>,
+        avatar: Option<AvatarParts>,
         default_avatar: Option<bool>,
     },
     /// A bot's profile, this one's or another's; `bot` is its conversation ID, bot ID or name.
@@ -45,7 +45,7 @@ pub enum ChangeRequest {
         model: Option<String>,
         skills: Option<std::collections::BTreeSet<String>>,
         all_skills: Option<bool>,
-        avatar: Option<Avatar>,
+        avatar: Option<AvatarParts>,
         default_avatar: Option<bool>,
     },
     SaveSkill {
@@ -83,6 +83,31 @@ pub enum ChangeRequest {
     },
 }
 
+/// The parts of a face the chat names; the others stay as the bot shows them now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarParts {
+    pub outline: Option<Outline>,
+    pub eyes: Option<Eyes>,
+    pub hue: Option<Hue>,
+}
+
+impl AvatarParts {
+    fn over(self, shown: Avatar) -> Avatar {
+        Avatar {
+            outline: self.outline.unwrap_or(shown.outline),
+            eyes: self.eyes.unwrap_or(shown.eyes),
+            hue: self.hue.unwrap_or(shown.hue),
+        }
+    }
+
+    fn fits(self, avatar: Avatar) -> bool {
+        self.outline.is_none_or(|outline| outline == avatar.outline)
+            && self.eyes.is_none_or(|eyes| eyes == avatar.eyes)
+            && self.hue.is_none_or(|hue| hue == avatar.hue)
+    }
+}
+
 /// The profile fields one request sets; `skills` is `Some(None)` for every shared skill and
 /// `avatar` `Some(None)` for the face the bot's ID gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,14 +116,23 @@ struct ProfileRequest {
     instructions: Option<String>,
     model: Option<(Provider, String)>,
     skills: Option<SkillSet>,
-    avatar: Option<Option<Avatar>>,
+    avatar: Option<Option<AvatarParts>>,
 }
 
-fn avatar_request(avatar: Option<Avatar>, default: Option<bool>) -> Result<Option<Option<Avatar>>> {
+fn avatar_request(
+    avatar: Option<AvatarParts>,
+    default: Option<bool>,
+) -> Result<Option<Option<AvatarParts>>> {
     Ok(match (avatar, default) {
         (Some(_), Some(true)) => bail!("give avatar or default_avatar, not both"),
         (_, Some(true)) => Some(None),
-        (Some(avatar), _) => Some(Some(avatar)),
+        (Some(parts), _) => {
+            ensure!(
+                parts != AvatarParts::default(),
+                "avatar names an outline, eyes or hue"
+            );
+            Some(Some(parts))
+        }
         (None, _) => None,
     })
 }
@@ -156,12 +190,33 @@ impl ChangeRequest {
     fn matches(&self, change: &BotChange, provider: Provider) -> bool {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
         if let Ok(Some(wanted)) = self.profile(provider) {
-            return matches!(change, BotChange::Profile { name, instructions, model, skills, avatar }
-                if wanted.name == after(name)
-                    && wanted.instructions == after(instructions)
-                    && wanted.model == model.as_ref().map(|edit| (edit.provider, edit.after.clone()))
-                    && wanted.skills == skills.as_ref().map(|edit| edit.after.clone())
-                    && wanted.avatar == avatar.as_ref().map(|edit| edit.after));
+            let BotChange::Profile {
+                name,
+                instructions,
+                model,
+                skills,
+                avatar,
+            } = change
+            else {
+                return false;
+            };
+            let avatar = match (wanted.avatar, avatar) {
+                (None, None) => true,
+                (Some(parts), Some(edit)) => match (parts, edit.after) {
+                    (None, None) => true,
+                    (Some(parts), Some(after)) => parts.fits(after),
+                    _ => false,
+                },
+                _ => false,
+            };
+            return avatar
+                && wanted.name == after(name)
+                && wanted.instructions == after(instructions)
+                && wanted.model
+                    == model
+                        .as_ref()
+                        .map(|edit| (edit.provider, edit.after.clone()))
+                && wanted.skills == skills.as_ref().map(|edit| edit.after.clone());
         }
         match (self, change) {
             (
@@ -598,9 +653,11 @@ fn resolve(
                 "the bot already uses these skills; nothing to change"
             );
         }
-        if let Some(avatar) = &avatar {
+        let shown = bot.shown_avatar().avatar;
+        let avatar = avatar.map(|parts| parts.map(|parts| parts.over(shown)));
+        if let Some(after) = avatar {
             ensure!(
-                *avatar != bot.avatar,
+                after.map_or(bot.avatar.is_some(), |after| after != shown),
                 "the bot already has this face; nothing to change"
             );
         }

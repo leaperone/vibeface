@@ -548,10 +548,13 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             event.scope_id != BOTS_SCOPE,
             "a bot's project is set in its own conversation"
         ),
-        EventBody::BotAvatarSet { .. } => ensure!(
-            event.scope_id != BOTS_SCOPE,
-            "a bot's face is set in its own conversation"
-        ),
+        EventBody::BotAvatarSet { before, avatar, .. } => {
+            ensure!(
+                event.scope_id != BOTS_SCOPE,
+                "a bot's face is set in its own conversation"
+            );
+            ensure!(before != avatar, "the face is unchanged");
+        }
         EventBody::PrimaryBotSet {
             conversation_id, ..
         } => {
