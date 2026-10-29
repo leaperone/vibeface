@@ -129,7 +129,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 模型留空时用各自的默认模型；opencode 写成 `provider/model`。Claude Code 的进度按整条消息更新，Bot 回复中收到的新消息等这轮结束再处理。
 
-`dispatch_work` 的 `thread` 只接受本机任务跑过的 Claude Code、pi 或 opencode 会话；本人自己开的会话不接任务。opencode 会话里还有未结束的工作（在跑、发送结果未知或待确认）时，新工作以 `writer_busy` 被拒，不发送，错误里点名占用会话的工作。不给 `agent` 时沿用该会话里工作用过的产品。
+`dispatch_work` 的 `thread` 只接受本机任务跑过的 Claude Code、pi 或 opencode 会话；本人自己开的会话不接任务。opencode 会话里还有未结束的工作（在跑、发送结果未知或待确认）时，新工作以 `writer_busy` 被拒，不发送；能确定是哪项工作占用时，错误里点名它。不给 `agent` 时沿用该会话里工作用过的产品。
 
 ### 回答本人自己开的会话
 

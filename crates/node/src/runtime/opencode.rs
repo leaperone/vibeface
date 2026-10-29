@@ -53,7 +53,7 @@ pub struct Opencode {
     users: Arc<std::sync::atomic::AtomicUsize>,
     /// Sessions a work is being sent into now.
     starting: std::sync::Mutex<BTreeSet<String>>,
-    /// Works whose start runs in this process now.
+    /// Works whose start runs in this process and has yet to claim its session.
     sending: std::sync::Mutex<BTreeSet<String>>,
 }
 
@@ -1260,7 +1260,7 @@ impl Executor for Opencode {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let id = work.work_id.as_str();
-            let _sending = Claim::take(&self.sending, id);
+            let sending = Claim::take(&self.sending, id);
             let reject = |failure: ExecFailure| async move {
                 (node
                     .signal_work(network, id, Signal::StartRejected(failure))
@@ -1313,10 +1313,11 @@ impl Executor for Opencode {
                 }
             };
             // Two runs in one session would end each other's turns. A work not known to be sent
-            // holds the session too, unless its own start is still on its way here.
+            // holds the session too, unless its own start has yet to try for the session here.
             let _claim = match thread {
                 Some(_) => {
                     let claim = Claim::take(&self.starting, &session);
+                    drop(sending);
                     let runs = node.store.lock().await.work_records_on_thread(&session)?;
                     let holder = runs.into_iter().find(|run| {
                         run.work_id != id
@@ -1345,7 +1346,10 @@ impl Executor for Opencode {
                     }
                     claim
                 }
-                None => None,
+                None => {
+                    drop(sending);
+                    None
+                }
             };
             // Journaled before the send: a restart reads the run back by the work's message.
             let signal = Signal::ThreadCreated(session.clone());
