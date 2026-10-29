@@ -1,11 +1,11 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, Crown, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RotateCcw, Sparkles, Sun, WifiOff } from 'lucide-react-native'
+import { ArrowRightLeft, BellRing, Crown, FileKey, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RotateCcw, Sparkles, Sun, WifiOff } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
-import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { eraseSoleManagerText, onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
+import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
+import { eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
@@ -50,9 +50,12 @@ export default function Settings() {
     <SettingsGroup>
       {manager ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" /> : null}
       <SettingsRow href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
-      <SettingsRow href="/recovery" icon={KeyRound} label="换恢复密码" />
       {device.ready ? <Notifications /> : null}
     </SettingsGroup>
+    {manager ? <SettingsGroup title="找回">
+      <CurrentRecoveryFile />
+      <SettingsRow href="/recovery" icon={KeyRound} label={recoveryCopy.rotate} />
+    </SettingsGroup> : null}
     <SettingsGroup title="外观">
       <SettingsRow icon={Palette} label="主题">
         {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
@@ -96,6 +99,16 @@ export default function Settings() {
       </View> : null}
     </View>
   </ScrollView>
+}
+
+/** The file that still works, as on the web: the code its name carries, and the day it was made. */
+function CurrentRecoveryFile() {
+  const { directory, recoverySince } = useDevice()
+  const code = useRecoveryCode(directory?.recovery_key)
+  if (!code) return null
+  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={`${recoveryCopy.codeLabel} ${code}`}>
+    {recoverySince ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.day(recoverySince)}</Text> : null}
+  </SettingsRow>
 }
 
 /** Rendered only while connected: the shared workspace exists exactly then. */

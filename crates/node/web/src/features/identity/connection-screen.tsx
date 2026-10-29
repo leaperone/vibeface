@@ -70,7 +70,7 @@ function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCan
 
 function Removed({ busy, run }: { busy: boolean; run: Run }) {
   const device = useDevice()
-  const commands = <a href="https://github.com/leaperone/vibeface/blob/main/docs/deployment.md" target="_blank" rel="noreferrer" className="underline">按部署说明选择数据目录并重新加入</a>
+  const commands = <Details><a href="https://github.com/leaperone/vibeface/blob/main/docs/deployment.md" target="_blank" rel="noreferrer" className="underline">用命令行重新加入</a></Details>
   // On its own local page the rejoin first opens this computer, then carries on there.
   const setup = device.localSetup?.kind === 'initialized' && device.localSetup.removed ? device.localSetup : null
   const here = Boolean(setup)
@@ -80,10 +80,10 @@ function Removed({ busy, run }: { busy: boolean; run: Run }) {
       <p className="text-muted-foreground">点重新加入，再用已有设备的加入链接把它加回来</p>
       <p className="flex items-center gap-2 text-meta text-muted-foreground"><Archive aria-hidden="true" className="size-4 shrink-0" />旧数据改名保留，不会删除</p>
       <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.rejoin)}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <RotateCcw aria-hidden="true" />}重新加入</Button>
-      <Details label="用命令重新加入">{commands}</Details>
+      {commands}
     </> : <>
       {here ? null : <p className="text-muted-foreground">在它的本机页面点“重新加入”。</p>}
-      <Details label="用命令重新加入">{commands}</Details>
+      {commands}
     </>}
   </Panel>
 }
@@ -223,7 +223,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   let body: ReactNode
   // The join card holds its own failure, next to where a new link goes in.
   let alertInBody = false
-  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请用本机地址或 HTTPS 打开" />
+  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请在这台电脑上打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
@@ -269,22 +269,21 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
-          {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />扫码</Button> : null}
+          {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
-            <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? '或粘贴加入链接' : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
+            <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? joinCopy.paste : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
             {purpose === 'invalid' ? <InlineError error="这不是有效的加入链接" /> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
             <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
-            <span className="min-w-0 flex-1 truncate">{invitation.trim().startsWith('vibeface1') ? '已读取二维码' : '已读取加入链接'}</span>
+            <span className="min-w-0 flex-1 truncate">{joinCopy.linkFilled}</span>
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
           {thisComputer
             ? <Field label="这台电脑叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={defaultComputerName()} /></Field>
             : <Field label="这个浏览器叫什么？"><Input name="name" required maxLength={128} autoComplete="off" defaultValue={lastBrowserName() || defaultBrowserName()} /></Field>}
-          {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}继续</Button> : null}
+          {purpose === 'link' ? <Button type="submit" className="w-fit justify-self-end" aria-busy={linking || undefined}>{linking ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{linking ? joinCopy.joining : joinCopy.join}</Button> : null}
         </fieldset>
       </form>}
-      {publicEntry || thisComputer ? null : <Details label="加入一台电脑"><p className="text-meta text-muted-foreground">在那台电脑上运行 <code>vibeface join</code> 加这条链接。</p></Details>}
     </Panel>
   }
 
@@ -297,6 +296,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
     {device.identity && !focused ? <Details key={step ?? active}>
+      {alertInBody && !publicEntry && !thisComputer ? <p>另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p> : null}
       <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
       {usable ? <Details label="手动填写地址">
         <form className="grid gap-3" noValidate onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
@@ -340,7 +340,6 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const device = useDevice()
   const [short, setShort] = useState(false)
   return <Panel icon={KeyRound} title="设置恢复密码">
-    <p className="text-muted-foreground">设备都丢了时，用恢复文件和密码找回。</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
@@ -354,7 +353,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
       <fieldset disabled={busy || disabled} className="grid gap-4">
         <Field label="恢复密码">
           <PasswordInput name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符，忘了就无法找回</span>
+          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符</span>
         </Field>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>

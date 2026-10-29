@@ -50,8 +50,8 @@ export function CurrentRecoveryFile() {
   const { directory, recoverySince } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   if (!code) return null
-  return <SettingsRow icon={FileKey} label="恢复文件" description={<span title={recoveryFileStem(code)}>识别码 <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
-    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{new Date(recoverySince).toLocaleDateString('zh-CN')}</time> : null}
+  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={<span title={recoveryFileStem(code)}>{recoveryCopy.codeLabel} <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
+    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{recoveryCopy.day(recoverySince)}</time> : null}
   </SettingsRow>
 }
 
@@ -81,7 +81,7 @@ export function RecoveryPendingCard() {
       <p className="text-meta text-muted-foreground">{recoveryCopy.stopNote}</p>
     </div> : changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
-      const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
+      const Icon = deviceIcon(member)
       const Change = added ? CirclePlus : CircleMinus
       return <li key={member.device_id} className="flex min-w-0 items-center gap-2">
         <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
@@ -134,7 +134,6 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
     <p className="flex items-center gap-2 text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.why}</p>
-    <p className="flex items-center gap-2 text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.needsPassword}</p>
     <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" /><span className="sr-only">已下载 </span>
@@ -214,7 +213,7 @@ export function RecoveryReview() {
     <fieldset disabled={busy} className="grid gap-2">
       {[...review.members].sort((a, b) => Number(b.device_id === review.requiredNode) - Number(a.device_id === review.requiredNode)).map((member) => {
         const required = member.device_id === review.requiredNode
-        const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: required })
+        const Icon = deviceIcon(member)
         const gone = lost.includes(member.device_id)
         return <div key={member.device_id} className="flex min-h-12 items-center gap-2 rounded-lg bg-muted/60 px-3">
           <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
