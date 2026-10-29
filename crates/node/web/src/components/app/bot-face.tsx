@@ -59,13 +59,18 @@ function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body
 
 const transformOf = (frame: Frame) => `translate(${50 + frame.dx} ${50 + frame.dy}) rotate(${frame.rotate}) scale(${frame.scale}) translate(-50 -50)`
 
-/** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. */
-export function BotFace({ botId, mood, size, halo, className }: { botId: string; mood: Mood; size: number; halo?: string; className?: string }) {
+/** Who a face belongs to: its id gives what `avatar` leaves out. */
+export type FaceBot = Pick<BotRecord, "bot_id" | "avatar">
+
+/** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. `still` draws one frame and leaves the clock, for previews. */
+export function BotFace({ bot, mood, size, halo, still, className }: { bot: FaceBot; mood: Mood; size: number; halo?: string; still?: boolean; className?: string }) {
   const dark = useDark()
   const reduced = useSyncExternalStore(followReduced, () => reducedQuery?.matches ?? false, () => false)
-  const face = useMemo(() => faceOf(botId), [botId])
+  const { bot_id: botId, avatar } = bot
+  const look = avatar ? `${avatar.outline}:${avatar.eyes}:${avatar.hue}` : ""
+  const face = useMemo(() => faceOf(botId, avatar), [botId, look])
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
-  const motion = useMemo(() => faceMotion(botId, mood), [botId])
+  const motion = useMemo(() => faceMotion(botId, mood, avatar), [botId, look])
   // The first paint draws the still pose; after that only the clock writes these attributes, so React never resets them.
   const [first] = useState(() => motion.frame(null))
   const dots = useMemo(() => thinkingDots(pose(face, "thinking", 0), 0), [face])
@@ -78,14 +83,14 @@ export function BotFace({ botId, mood, size, halo, className }: { botId: string;
     const parts = { g, ring, body, grey, left, right, dots: [...svg.querySelectorAll("circle")] }
     const draw = (now: number | null) => apply(motion.frame(now), parts)
     motion.follow(mood)
-    if (reduced) { draw(null); return }
+    if (reduced || still) { draw(null); return }
     draw(performance.now())
     const observer = new IntersectionObserver(([entry]) => {
       if (entry.isIntersecting) { ticks.add(draw); kick() } else ticks.delete(draw)
     })
     observer.observe(svg)
     return () => { observer.disconnect(); ticks.delete(draw) }
-  }, [motion, mood, reduced])
+  }, [motion, mood, reduced, still])
 
   const ink = mood === "asleep" ? palette.asleep.ink : palette.awake.ink
   return <svg ref={root} aria-hidden="true" viewBox="0 0 100 100" width={size} height={size} overflow="visible" className={cn("shrink-0 select-none", className)}>

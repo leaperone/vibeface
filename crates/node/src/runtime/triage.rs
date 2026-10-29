@@ -1788,7 +1788,7 @@ fn rollouts(root: &Path, since_ms: i64) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         config::Config,
@@ -1826,7 +1826,7 @@ mod tests {
         Ok((Arc::new(Runtime::open(&dir).await?), dir))
     }
 
-    async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
+    pub(in crate::runtime) async fn node() -> Result<(Arc<Runtime>, LocalIdentity, PathBuf)> {
         let (node, dir) = bare_node().await?;
         let admin = LocalIdentity::generate();
         let state = NetworkState::new(Genesis::create(
@@ -1846,7 +1846,7 @@ mod tests {
         });
     }
 
-    async fn bot(
+    pub(in crate::runtime) async fn bot(
         node: &Runtime,
         admin: &LocalIdentity,
         scope: &str,
@@ -3534,7 +3534,7 @@ mod tests {
         result
     }
 
-    async fn start_reply(
+    pub(in crate::runtime) async fn start_reply(
         node: &Runtime,
         admin: &LocalIdentity,
         id: &str,

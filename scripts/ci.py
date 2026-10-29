@@ -26,6 +26,7 @@ PATH_RULES = (
     ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
+    ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
     ("protocol", ("crates/protocol/*",)),
     ("bridge", ("crates/bridge/*",)),
@@ -295,6 +296,9 @@ def self_test():
     assert make_plan(["crates/node/web/src/a.tsx", "crates/node/src/api.rs"])["rust_packages"] == ["vibeface"]
     assert make_plan(["crates/node/schema.hcl"])["node"]
     assert make_plan(["install.sh"])["node"]
+    for path in ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts"):
+        shared = make_plan([path])
+        assert shared["scopes"] == ["node"] and shared["rust_packages"] == ["vibeface"] and shared["web"]
     for event in ("schedule", "workflow_dispatch", "merge_group"):
         assert make_plan(["README.md"], event)["rust_packages"] == list(PACKAGES)
     assert make_plan(["README.md"], "push")["docs_only"]

@@ -108,17 +108,6 @@ pub(super) fn question_from(
 const OWNED: &str = "FROM session_owners s WHERE s.network_id=?1 AND s.node=?2 AND s.session_id=?3
     AND NOT EXISTS (SELECT 1 FROM bot_deletions d WHERE d.network_id=s.network_id AND d.conversation_id=s.conversation_id)";
 
-/// What a bot names to change a session: the start of the hash of the event that last set its
-/// row, which ends the row's rank. Any change to the session gives it a new version.
-fn session_version(rank: &str) -> String {
-    rank.rsplit(':')
-        .next()
-        .unwrap_or(rank)
-        .chars()
-        .take(16)
-        .collect()
-}
-
 pub(crate) fn session_owner_from(
     connection: &Connection,
     network: &str,
@@ -210,7 +199,7 @@ impl Store {
                 row["session_id"] = json!(session);
                 row["muted"] = json!(muted);
                 row["created_at_ms"] = json!(created_at_ms);
-                row["version"] = json!(session_version(&rank));
+                row["version"] = json!(super::version(&rank));
                 Ok(row)
             })
             .collect()
@@ -399,7 +388,7 @@ impl Store {
             )
             .optional()?
             .context("no bot follows this session on this device")?;
-        let version = session_version(&rank);
+        let version = super::version(&rank);
         match target {
             Some(target) if target == owner && !muted => return Ok((owner, version, None)),
             None if muted && owner == from => return Ok((owner, version, None)),
@@ -449,7 +438,7 @@ impl Store {
             created_at_ms,
         )?;
         tx.commit()?;
-        Ok((owner, session_version(&event.hash), Some(event)))
+        Ok((owner, super::version(&event.hash), Some(event)))
     }
 
     /// Posts the one answer to `question`. A retry with the same text returns it; a different

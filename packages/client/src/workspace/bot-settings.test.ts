@@ -118,6 +118,11 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: configured }] }, "chat").changes[0]?.change, configured)
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile", model: { before: "", after: "gpt-x" } } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "model" } }] }, "chat"))
+  const faceOnly = { kind: "profile", avatar: { before: null, after: { outline: "cloud", eyes: "wide", hue: 285 } } }
+  assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: faceOnly }] }, "chat").changes[0]?.change, faceOnly)
+  const backToDefault = { kind: "profile", avatar: { before: { outline: "cloud", eyes: "wide", hue: 285 }, after: null } }
+  assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: backToDefault }] }, "chat").changes[0]?.change, backToDefault)
+  assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile", avatar: { before: null, after: { outline: "cloud", eyes: "wide", hue: 70 } } } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
   assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
     [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])
@@ -134,4 +139,12 @@ test("a bot lists its model per provider and its skills, null meaning every skil
   const [all, some] = parseBots({ bots: [{ ...bot, models: {}, skills: null }, { ...bot, models: { cursor: "gpt-x" }, skills: ["s"] }] })
   assert.deepEqual([all?.models, all?.skills, some?.models, some?.skills], [{}, null, { cursor: "gpt-x" }, ["s"]])
   assert.throws(() => parseBots({ bots: [{ ...bot, models: { codex_sdk: "x" }, skills: null }] }))
+})
+
+test("a bot's picked face parses, none means the face its id gives, and a hue outside the set is refused", () => {
+  const bot = { bot_id: "b", conversation_id: "c", name: "Ops", instructions: "", event_hash: "h", last_message: null, models: {}, skills: null }
+  const avatar = { outline: "cloud", eyes: "wide", hue: 345 }
+  const [picked, plain] = parseBots({ bots: [{ ...bot, avatar }, { ...bot, avatar: null }] })
+  assert.deepEqual([picked?.avatar, plain?.avatar], [avatar, null])
+  assert.throws(() => parseBots({ bots: [{ ...bot, avatar: { ...avatar, hue: 70 } }] }))
 })

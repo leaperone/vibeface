@@ -3,7 +3,7 @@ import { View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { failureText, rawError, replyFailure } from '@vibeface/client/lib/errors.ts'
-import { BotFace } from '@/components/bot-face'
+import { BotFace, type FaceBot } from '@/components/bot-face'
 import { Details } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -28,7 +28,7 @@ function shortTime(at: number) {
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
  * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
  */
-export function Message({ message, botId, last, offline }: { message: ChatMessage; botId: string; last: boolean; offline: boolean }) {
+export function Message({ message, bot, last, offline }: { message: ChatMessage; bot: FaceBot; last: boolean; offline: boolean }) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
@@ -55,7 +55,7 @@ export function Message({ message, botId, last, offline }: { message: ChatMessag
   return <Rise entering={entering} className="gap-1">
     {message.text ? <Markdown text={message.text} /> : null}
     {message.state === 'streaming' ? <View accessible accessibilityRole="image" accessibilityLabel="正在回复" className="h-6 justify-center">
-      <BotFace botId={botId} mood={offline ? 'asleep' : 'replying'} size={24} />
+      <BotFace bot={bot} mood={offline ? 'asleep' : 'replying'} size={24} />
     </View> : null}
     {stopped ? <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
       <View className="flex-row items-center gap-1"><Icon as={failed ? CircleX : CirclePause} className={failed ? 'text-danger' : 'text-muted-foreground'} /><Text className={failed ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{stopped}</Text></View>

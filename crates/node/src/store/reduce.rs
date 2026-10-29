@@ -328,6 +328,7 @@ pub(crate) fn apply(
                     instructions,
                     model,
                     skills,
+                    avatar,
                 } => {
                     let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
                     if let Some(model) = model {
@@ -342,6 +343,13 @@ pub(crate) fn apply(
                         (
                             "skills",
                             skills
+                                .as_ref()
+                                .map(|edit| serde_json::to_string(&edit.after))
+                                .transpose()?,
+                        ),
+                        (
+                            "avatar",
+                            avatar
                                 .as_ref()
                                 .map(|edit| serde_json::to_string(&edit.after))
                                 .transpose()?,
@@ -409,6 +417,13 @@ pub(crate) fn apply(
             connection.execute(
                 "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,'project',?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
                 params![network, scope, serde_json::to_string(project)?, rank],
+            )?;
+        }
+        // The same row a chat change of the face writes, so the larger rank wins between them.
+        EventBody::BotAvatarSet { avatar, .. } => {
+            connection.execute(
+                "INSERT INTO bot_profiles(network_id,conversation_id,field,value,rank) VALUES(?,?,'avatar',?,?) ON CONFLICT(network_id,conversation_id,field) DO UPDATE SET value=excluded.value,rank=excluded.rank WHERE excluded.rank>rank",
+                params![network, scope, serde_json::to_string(avatar)?, rank],
             )?;
         }
         EventBody::BotDeleted { .. } => {

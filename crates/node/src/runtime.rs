@@ -748,6 +748,7 @@ impl Runtime {
             "delete_bot" => self.delete_bot(&access, &input).await,
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
             "set_bot_project" => self.set_bot_project(&access, &input).await,
+            "set_bot_avatar" => self.set_bot_avatar(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
