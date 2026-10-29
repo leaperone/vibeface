@@ -8,6 +8,7 @@ import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
+import { webhookTestResult } from '@vibeface/client/lib/errors.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -316,7 +317,7 @@ function Triage() {
         setTest(null)
         void call('test', 'test_webhook').then((result) => {
           const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-          if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
+          if (data) setTest(webhookTestResult(data))
         })
       }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
       {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}

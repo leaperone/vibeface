@@ -38,6 +38,29 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_RELAYS: usize = 16;
 const RELAY_TOKEN_DOMAIN: &[u8] = b"vibeface:relay:v1";
 
+/// A peer that was not reached in time or did not answer before the timeout. A request it may
+/// have received is reconciled before it is sent again.
+#[derive(Debug)]
+pub struct Unanswered(String);
+
+impl Unanswered {
+    pub fn error(message: String) -> anyhow::Error {
+        anyhow::Error::new(Self(message))
+    }
+
+    pub fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unanswered {}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
@@ -539,8 +562,8 @@ impl Net {
                 .await
         })
         .await
-        .context("peer did not answer in time")?
-        .map_err(|error| anyhow!("peer is unreachable: {error}"))?;
+        .map_err(|_| Unanswered::error("peer did not answer in time".into()))?
+        .map_err(|error| Unanswered::error(format!("peer is unreachable: {error}")))?;
         self.connections
             .lock()
             .expect("connection cache")
@@ -592,7 +615,9 @@ impl Net {
         let connection = self.connect(device_id, alpn).await?;
         let result = tokio::time::timeout(timeout, call(&connection, request))
             .await
-            .context("peer response timed out; outcome may be unknown")
+            .map_err(|_| {
+                Unanswered::error("peer response timed out; outcome may be unknown".into())
+            })
             .flatten();
         if result.is_err() && connection.close_reason().is_none() {
             // The peer may have restarted behind a connection QUIC still thinks is open.

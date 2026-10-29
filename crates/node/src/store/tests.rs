@@ -1306,6 +1306,65 @@ fn long_history_condenses_into_a_prefix_checkpoint() -> Result<()> {
 }
 
 #[test]
+fn many_small_events_condense_into_a_checkpoint() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m0", "修一下登录"),
+        vec![],
+        2,
+    )?;
+    let node = net.a.device_id()?;
+    let attribute = |store: &mut Store, i: i64| {
+        store.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            EventBody::SessionAttributed {
+                node: node.clone(),
+                agent: crate::providers::Provider::Codex,
+                session_id: format!("s{i}"),
+                cwd: "/w".into(),
+                summary: "在跑".into(),
+            },
+            vec![],
+            10 + i,
+        )
+    };
+    for i in 0..600 {
+        attribute(&mut store, i)?;
+    }
+    let works = store.works(&net.network, "c")?;
+    let context = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+    let checkpoint = crate::scheduler::checkpoint(&context, &works)
+        .context("a long run of events is condensed though its messages are short")?;
+    let EventBody::ContextCheckpoint {
+        recent_user_requests,
+        ..
+    } = &checkpoint
+    else {
+        unreachable!()
+    };
+    assert_eq!(recent_user_requests, &["修一下登录".to_owned()]);
+    store.append_event(&net.a, &net.network, "c", checkpoint, vec![], 1_000)?;
+    let recent = super::since_checkpoint_from(&store.connection, &net.network, "c")?;
+    assert!(
+        recent.events.len() <= 300,
+        "a turn reads only the newest events, not {}",
+        recent.events.len()
+    );
+    assert!(
+        crate::scheduler::checkpoint(&recent, &works).is_none(),
+        "the next turn writes no checkpoint of its own"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
@@ -2802,6 +2861,51 @@ fn configure(
         avatar: None,
         default_avatar: None,
     }
+}
+
+#[test]
+fn a_removed_skill_leaves_the_bots_that_used_it() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    let mut change = |call_ref: &str, request: ChangeRequest| {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            request,
+            Provider::Codex,
+            5,
+        )
+    };
+    let mut ids = Vec::new();
+    for (call_ref, name) in [("s1", "Digest"), ("s2", "Review")] {
+        let (saved, _) = change(call_ref, save_skill(None, name, "Steps."))?;
+        let BotChange::Skill { skill_id, .. } = saved.change else {
+            panic!("skill change")
+        };
+        ids.push(skill_id);
+    }
+    let both = [ids[0].as_str(), ids[1].as_str()];
+    change("k1", configure("Helper", None, Some(&both), None))?;
+    change(
+        "r1",
+        ChangeRequest::RemoveSkill {
+            skill_id: ids[1].clone(),
+        },
+    )?;
+    let helper = store
+        .bot_for_conversation(&net.network, "c")?
+        .context("helper")?;
+    assert_eq!(
+        helper.skills,
+        Some([ids[0].clone()].into()),
+        "the bot lists only skills that still exist"
+    );
+    let listed = crate::runtime::agent_tools::read_bot(&store, &net.network, "Helper", 100)?;
+    assert_eq!(listed["skills"].as_array().map(Vec::len), Some(1));
+    Ok(())
 }
 
 #[test]
@@ -6184,6 +6288,304 @@ fn the_node_derives_the_same_face_from_an_id_as_the_clients() -> Result<()> {
         (outlines.len(), eyes.len()),
         (5, 4),
         "the vectors reach every outline and eye shape, so both orders agree"
+    );
+    Ok(())
+}
+
+#[test]
+fn read_bot_lists_every_skill_the_prompt_index_leaves_out() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    for i in 0..40 {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            &format!("s{i}"),
+            save_skill(None, &format!("skill {i:02}"), "steps"),
+            Provider::Codex,
+            10 + i,
+        )?;
+    }
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    let omitted = bot["skills_omitted"].as_u64().context("omitted")?;
+    assert!(omitted > 0, "the prompt index stays within its budget");
+    let read = crate::runtime::agent_tools::read_bot(&store, &net.network, "Helper", 100)?;
+    assert_eq!(read["uses_all_skills"], json!(true));
+    let names = listed(&read, "/skills", "name");
+    let expected: Vec<Value> = (0..40).map(|i| json!(format!("skill {i:02}"))).collect();
+    assert_eq!(
+        names, expected,
+        "a bot using every skill reads the whole library"
+    );
+    let ids = listed(&read, "/skills", "skill_id");
+    assert!(
+        ids.iter().all(Value::is_string),
+        "each names the skill_id read_skill takes"
+    );
+    let chosen: std::collections::BTreeSet<String> = ids[..2]
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_owned))
+        .collect();
+    store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "pick",
+        ChangeRequest::ConfigureBot {
+            bot: "Helper".into(),
+            name: None,
+            instructions: None,
+            model: None,
+            skills: Some(chosen),
+            all_skills: None,
+            avatar: None,
+            default_avatar: None,
+        },
+        Provider::Codex,
+        60,
+    )?;
+    let read = crate::runtime::agent_tools::read_bot(&store, &net.network, "Helper", 100)?;
+    assert_eq!(read["uses_all_skills"], json!(false));
+    assert_eq!(
+        listed(&read, "/skills", "skill_id"),
+        ids[..2].to_vec(),
+        "only those it uses"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_bot_prompt_lists_the_newest_messages_it_sent_other_bots() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    second_bot(&mut store, &net, "Docs")?;
+    for i in 0..6 {
+        store.message_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            &format!("ask-{i}"),
+            "Docs",
+            &format!("Question {i}: {}", "please check the docs. ".repeat(40)),
+            10 + i * 3_600_001,
+        )?;
+    }
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    let texts: Vec<String> = listed(&bot, "/sent", "text")
+        .iter()
+        .filter_map(|text| Some(text.as_str()?[..10].to_owned()))
+        .collect();
+    let omitted = bot["sent_omitted"].as_u64().context("omitted")? as usize;
+    assert!(omitted > 0 && texts.len() + omitted == 6, "{texts:?}");
+    let expected: Vec<String> = (6 - texts.len()..6)
+        .map(|i| format!("Question {i}"))
+        .collect();
+    assert_eq!(texts, expected, "the newest sent messages, oldest first");
+    assert_eq!(bot["sent"][0]["to"]["name"], json!("Docs"));
+    assert_eq!(bot["sent"][0]["to"]["conversation_id"], json!("d"));
+    let theirs = crate::scheduler::bot_value(&store, &net.network, "d", 100)?;
+    assert_eq!(theirs["sent"], json!([]), "only what this bot sent");
+    Ok(())
+}
+
+#[test]
+fn list_sessions_pages_every_session_with_the_version_a_hand_over_needs() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    second_bot(&mut store, &net, "Other")?;
+    let node = net.a.device_id()?;
+    for i in 0..40 {
+        store.claim_session(
+            &net.a,
+            &net.network,
+            "c",
+            &Subject {
+                node: node.clone(),
+                agent: Some(Provider::Codex),
+                session_id: format!("s{i:02}"),
+                cwd: "/work/project".into(),
+                summary: "tests fail again. ".repeat(6),
+                request_id: None,
+            },
+            10 + i,
+        )?;
+    }
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    let shown = listed(&bot, "/sessions", "session_id");
+    assert!(
+        !shown.contains(&json!("s00")),
+        "the oldest falls out of the prompt"
+    );
+    store.claim_session(
+        &net.a,
+        &net.network,
+        "d",
+        &Subject {
+            node: node.clone(),
+            agent: Some(Provider::Codex),
+            session_id: "theirs".into(),
+            cwd: "/work/project".into(),
+            summary: String::new(),
+            request_id: None,
+        },
+        60,
+    )?;
+    let mut seen = Vec::new();
+    let mut before = Value::Null;
+    loop {
+        let sessions = store.attributed_sessions(&net.network, "c")?;
+        let page = crate::runtime::agent_tools::list_sessions(
+            &sessions,
+            &json!({"before":before,"limit":7}),
+        )?;
+        let rows = page["sessions"].as_array().context("sessions")?.clone();
+        if before.is_null() {
+            let last = rows.last().context("a page has rows")?;
+            let version = last["version"].as_str().context("version")?;
+            let session = last["session_id"].as_str().context("session")?;
+            store.hand_over_session(&net.a, &net.network, "c", session, version, Some("d"), 70)?;
+        }
+        seen.extend(rows);
+        if page["more"] != true {
+            break;
+        }
+        before = page["next"].clone();
+    }
+    let ids: Vec<Value> = seen.iter().map(|row| row["session_id"].clone()).collect();
+    let expected: Vec<Value> = (0..40).rev().map(|i| json!(format!("s{i:02}"))).collect();
+    assert_eq!(
+        ids, expected,
+        "every session once, newest first, though one moved between pages"
+    );
+    let oldest = seen.last().context("oldest")?;
+    let version = oldest["version"].as_str().context("version")?;
+    let (_, _, written) =
+        store.hand_over_session(&net.a, &net.network, "c", "s00", version, Some("d"), 80)?;
+    assert!(
+        written.is_some(),
+        "a session left out of the prompt is handed over"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_bot_prompt_lists_schedules_by_their_next_run() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    for (call_ref, name, at) in [
+        ("a", "alpha", 900_000),
+        ("b", "beta", 300_000),
+        ("g", "gamma", 600_000),
+    ] {
+        store.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            ChangeRequest::SaveSchedule {
+                schedule_id: None,
+                name: name.into(),
+                prompt: "Check the deploy and report what changed.".into(),
+                first_run_at_ms: at,
+                every_minutes: None,
+                enabled: None,
+            },
+            Provider::Codex,
+            10,
+        )?;
+    }
+    let bot = crate::scheduler::bot_value(&store, &net.network, "c", 100)?;
+    assert_eq!(
+        listed(&bot, "/schedules", "name"),
+        vec![json!("beta"), json!("gamma"), json!("alpha")],
+        "the soonest run first"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_oversized_bot_gives_way_instead_of_failing_the_turn() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m1", &"\n".repeat(4_000)),
+        vec![],
+        10,
+    )?;
+    let job = job_at(&store, &net, "m1")?;
+    let history = store.turn_history(&net.network, "c", &job, None)?;
+    let rows = |key: &str| {
+        (0..2)
+            .map(|i| json!({"id":format!("{key}{i}"),"text":"\"".repeat(700)}))
+            .collect::<Vec<_>>()
+    };
+    let mut bot = json!({"configured_bot":{"name":"Helper","instructions":"\"".repeat(MAX_INSTRUCTIONS_BYTES)},"now_ms":0});
+    for key in ["skills", "schedules", "memory", "sessions", "sent", "bots"] {
+        bot[key] = json!(rows(key));
+        bot[format!("{key}_omitted")] = json!(0);
+    }
+    let roots: Vec<std::path::PathBuf> = (0..16)
+        .map(|i| format!("/srv/{i}/{}", "deep/".repeat(100)).into())
+        .collect();
+    let (prompt, shown) =
+        crate::scheduler::materialize(&history, &job, &[], &[], bot, None, &roots, None)?;
+    assert!(prompt.len() <= crate::scheduler::PROMPT_LIMIT);
+    assert_eq!(shown.bot, None, "a bot cut short is shown whole next turn");
+    let data = prompt_data(&prompt)?;
+    let omitted: u64 = ["skills", "schedules", "memory", "sessions", "sent", "bots"]
+        .iter()
+        .map(|key| data["bot"][format!("{key}_omitted")].as_u64().unwrap_or(0))
+        .sum();
+    assert!(omitted > 0, "the bot's indexes give way");
+    assert_eq!(
+        data["bot"]["configured_bot"]["name"],
+        json!("Helper"),
+        "the bot itself stays"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_prompt_never_carries_the_users_device_signature() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    let message = user(&net, "m1", "deploy it");
+    let signature = message
+        .attestation()
+        .context("the user's message is signed")?
+        .signature
+        .clone();
+    store.append_event(&net.a, &net.network, "c", message, vec![], 10)?;
+    let job = job_at(&store, &net, "m1")?;
+    let history = store.turn_history(&net.network, "c", &job, None)?;
+    let (prompt, _) =
+        crate::scheduler::materialize(&history, &job, &[], &[], json!({}), None, &[], None)?;
+    let data = prompt_data(&prompt)?;
+    assert_eq!(data["trigger"]["event"]["body"]["text"], json!("deploy it"));
+    assert!(!prompt.contains(&signature), "no signature in the prompt");
+    assert!(!prompt.contains("attestation"));
+    let seq = message_seq(&store, &net, "m1")?;
+    let page = crate::runtime::agent_tools::event_page(
+        &store,
+        &net.network,
+        "c",
+        &net.a.device_id()?,
+        seq,
+        0,
+    )?;
+    assert!(
+        !page.to_string().contains(&signature),
+        "nor in what context reads"
     );
     Ok(())
 }

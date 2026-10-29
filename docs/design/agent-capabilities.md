@@ -82,13 +82,13 @@ BotMessaged {
 
 | 工具 | 类别 | 作用 |
 |---|---|---|
-| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
-| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的 skill、实际显示的长相、schedule、笔记；没有任何密钥 |
+| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill ID（启用全部时为 `null`，`uses_all_skills` 为真）、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
+| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的每个 skill 的 `{skill_id, name}`（启用全部时是整个库）、实际显示的长相、schedule、笔记；没有任何密钥 |
 | `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话，返回的 bot 同样给出实际显示的长相 |
 | `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
 
-- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
+- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，删除的 skill 从各 bot 的集合里去掉，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
 - 删除 bot：见第 5.1 节。不提供改本人或设备权限的工具。
 - 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `BotChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
 - `configure_bot` 写一条 `BotChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
@@ -97,7 +97,7 @@ BotMessaged {
 ### 5.1 删除 bot
 
 - 事件 `BotDeleted { attestation?, cause? }` 写在被删 bot 的会话里，是墓碑，写下后不可恢复。网页删除带本人设备签名（签 `{type:"bot_deleted"}`）；`delete_bot` 工具在本人消息的轮次里写，不带签名，带 `cause` 指向那条本人消息并把它列为父事件，入库时按 `authorize_cause` 核对。bot 不能用工具删除自己（`cause` 所在会话必须不是被删会话），删自己只能在网页上。
-- 删除后：bot 从列表消失；会话不再接受新消息；它的 schedule 不再列出也不再运行；排队的轮次在认领时取消，状态记为 `bot 已删除`；正在运行的轮次走停止回复的路径取消，结果未知的照常走待核对。聊天记录保留。
+- 删除后：bot 从列表消失；会话不再接受新消息；它的 schedule 不再列出也不再运行；排队的轮次在认领时取消，状态记为 `bot 已删除`；正在运行的轮次走停止回复的路径取消，结果未知的照常走待核对。它派出的工作由各执行设备在收到删除后走 `interrupt_work` 的停止路径中断，结果未知的同样先核对，不重发；删除之后才送到的派发不再接受。聊天记录保留。
 - 主 bot：删除主 bot 后，主 bot 自动变为剩下的 bot 中最早创建的那个；删掉最后一个 bot 后没有主 bot。
 - 幂等：重复删除不写新事件；`delete_bot` 指向已删除的 bot 返回原会话、`written: false`。
 
@@ -105,7 +105,7 @@ BotMessaged {
 
 | 工具类别 | 工具 | 本人 | 回答 | 工作结果 | schedule | bot 消息 | Agent 任务、路由 |
 |---|---|---|---|---|---|---|---|
-| 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` `list_sessions` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 工作 | `dispatch_work` `interrupt_work` `hand_over_session` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | |
@@ -126,10 +126,14 @@ BotMessaged {
 
 `bot` 增加：
 
-- `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的；
-- `memory`：`{memory_id, text}`，以及 `memory_omitted`；
-- `sessions`：它名下的外来会话 `{node, session_id, agent, cwd, summary, following}`，最新优先截在 3000 字节内，以及 `sessions_omitted`；
-- `bots`：其他 bot 的 `{conversation_id, name}`。
+- `skills`：启用的 skill `{skill_id, name, description}`，按名称排，以及 `skills_omitted`；`read_bot` 列出全部；
+- `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的，下次运行最早的在前，以及 `schedules_omitted`；`read_bot` 列出全部；
+- `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`recall` 列出全部；
+- `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，还有更早的时返回 `next`，下一页把它作为 `before`；翻页途中转走或不再关注某个会话，不影响下一页；
+- `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；更早的不经工具读回；
+- `bots`：其他 bot 的 `{conversation_id, name}`，以及 `bots_omitted`；`list_bots` 列出全部。
+
+每个索引最多 3000 字节。`memory`、`sessions` 和 `sent` 保留最新的，从旧到新展示；其余按上面的顺序保留前面的。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
 
 trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder}`，`reminder` 表示深度大于 0、由 bot 自己定的提醒。bot 消息时带那条消息和发送者。
 

@@ -34,7 +34,10 @@ PATH_RULES = (
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
-SLOW_TESTS = ("store::tests::append_100k_stays_flat",)
+SLOW_TESTS = (
+    "store::tests::append_100k_stays_flat",
+    "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
+)
 PLATFORMS = (
     {"runner": "ubuntu-24.04", "target": "x86_64-unknown-linux-gnu"},
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},

@@ -49,7 +49,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   const asking = request.status === 'pending' && !auto
   const allow = (manage: boolean) => run(manage ? 'admin' : 'allow', async () => { await device.approveJoin(request.join_id, manage); onAllowed?.(request.name || '新设备') })
-  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false, entry: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
+  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
     meta={formName[deviceForm(request.kind, request.name)]} actions={<>
     <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
     {asking ? <Button disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
