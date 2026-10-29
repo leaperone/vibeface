@@ -36,7 +36,7 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
   return <Card className="w-full min-w-0 gap-0 py-0">
     <CardContent className={opened ? 'space-y-3 p-3' : 'py-1 ps-3 pe-1'}>
       <div className="flex items-center gap-1">
-        <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5 text-sm">
+        <span className="mr-auto flex min-w-0 flex-1 items-center gap-1.5">
           <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
           <span className="min-w-0" title={name}><FileName name={name} /></span>
           <span className="shrink-0 text-meta text-muted-foreground">{formatSize(size)}</span>
@@ -66,8 +66,8 @@ export function Artifact({ file: { hash, size, name } }: { file: Attachment }) {
         }, '下载')}><Download aria-hidden="true" /></ActionButton>
       </div>
       {opened ? <>
-        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-sm">{content || '文件是空的'}</pre>
-        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-xs text-muted-foreground">已显示全部内容</p>}
+        <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words text-meta">{content || '文件是空的'}</pre>
+        {nextOffset !== null ? <ActionButton disabled={!workspace.connectionOnline || reading} action={() => workspace.run(readNext, '读取后续内容')}>读取后续内容</ActionButton> : <p className="text-meta text-muted-foreground">已显示全部内容</p>}
       </> : null}
     </CardContent>
   </Card>

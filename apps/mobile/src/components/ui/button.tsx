@@ -2,18 +2,17 @@ import { TextClassContext } from '@/components/ui/text';
 import { cn } from '@/lib/utils';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { Platform, Pressable } from 'react-native';
-import Animated, { ReduceMotion, useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 import { withUniwind } from 'uniwind';
+import { cssEaseOut, quick, tap } from '@/lib/motion';
 
 const AnimatedPressable = withUniwind(Animated.createAnimatedComponent(Pressable));
-// Critically damped and quick, so the press lands on touch-down and settles without a bounce.
-const press = { dampingRatio: 1, duration: 250, reduceMotion: ReduceMotion.System };
 // Disabling eases; fills change at once so a theme switch never leaves a stale colour behind.
-const fade = { transitionProperty: 'opacity', transitionDuration: 150 } as const;
+const fade = { transitionProperty: 'opacity', transitionDuration: quick, transitionTimingFunction: cssEaseOut } as const;
 
 const buttonVariants = cva(
   cn(
-    'group shrink-0 flex-row items-center justify-center gap-2 rounded-md shadow-none',
+    'group shrink-0 flex-row items-center justify-center gap-2 rounded-lg shadow-none',
     Platform.select({
       web: "focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive whitespace-nowrap outline-none transition-all focus-visible:ring-[3px] disabled:pointer-events-none [&_svg:not([class*='size-'])]:size-4 [&_svg]:pointer-events-none [&_svg]:shrink-0",
     })
@@ -22,23 +21,23 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default: cn(
-          'bg-primary active:bg-primary/90 shadow-sm shadow-black/5',
+          'bg-primary active:bg-primary/90 shadow-xs',
           Platform.select({ web: 'hover:bg-primary/90' })
         ),
         destructive: cn(
-          'bg-destructive active:bg-destructive/90 dark:bg-destructive/60 shadow-sm shadow-black/5',
+          'bg-destructive/10 active:bg-destructive/20 dark:bg-destructive/20 dark:active:bg-destructive/30',
           Platform.select({
-            web: 'hover:bg-destructive/90 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40',
+            web: 'hover:bg-destructive/20 focus-visible:ring-destructive/20 dark:focus-visible:ring-destructive/40',
           })
         ),
         outline: cn(
-          'border-border bg-background active:bg-accent dark:bg-input/30 dark:border-input dark:active:bg-input/50 border shadow-sm shadow-black/5',
+          'border-border bg-background active:bg-accent dark:bg-input/30 dark:border-input dark:active:bg-input/50 border shadow-xs',
           Platform.select({
             web: 'hover:bg-accent dark:hover:bg-input/50',
           })
         ),
         secondary: cn(
-          'bg-secondary active:bg-secondary/80 shadow-sm shadow-black/5',
+          'bg-secondary active:bg-secondary/80',
           Platform.select({ web: 'hover:bg-secondary/80' })
         ),
         ghost: cn(
@@ -48,11 +47,10 @@ const buttonVariants = cva(
         link: '',
       },
       size: {
-        default: cn('min-h-10 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
-        sm: cn('min-h-9 gap-1.5 rounded-md px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
-        lg: cn('min-h-11 rounded-md px-6', Platform.select({ web: 'has-[>svg]:px-4' })),
-        // No sm: steps; on iPad widths they would override a caller's size-11.
-        icon: 'min-h-10 w-10',
+        default: cn('min-h-11 px-4 py-2', Platform.select({ web: 'has-[>svg]:px-3' })),
+        sm: cn('min-h-9 gap-1.5 px-3', Platform.select({ web: 'has-[>svg]:px-2.5' })),
+        // No sm: steps; on iPad widths they would override a caller's size.
+        icon: 'size-11',
       },
     },
     defaultVariants: {
@@ -71,7 +69,7 @@ const buttonTextVariants = cva(
     variants: {
       variant: {
         default: 'text-primary-foreground',
-        destructive: 'text-white',
+        destructive: 'text-destructive',
         outline: cn(
           'group-active:text-accent-foreground',
           Platform.select({ web: 'group-hover:text-accent-foreground' })
@@ -87,7 +85,6 @@ const buttonTextVariants = cva(
       size: {
         default: '',
         sm: '',
-        lg: '',
         icon: '',
       },
     },
@@ -116,8 +113,8 @@ function Button({ className, variant, size, instant, style, onPressIn, onPressOu
         role="button"
         {...props}
         style={[typeof style === 'function' ? undefined : style, pressed, !instant && fade]}
-        onPressIn={(event) => { scale.value = withSpring(variant === 'link' ? 1 : 0.97, press); onPressIn?.(event); }}
-        onPressOut={(event) => { scale.value = withSpring(1, press); onPressOut?.(event); }}
+        onPressIn={(event) => { scale.value = withTiming(variant === 'link' ? 1 : 0.97, tap); onPressIn?.(event); }}
+        onPressOut={(event) => { scale.value = withTiming(1, tap); onPressOut?.(event); }}
       />
     </TextClassContext.Provider>
   );

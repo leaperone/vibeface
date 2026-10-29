@@ -83,7 +83,7 @@ export function BotPanelButton() {
         const composer = document.getElementById("message-text")
         if (composer) { event.preventDefault(); composer.focus() }
       }}>
-        <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
+        <SheetHeader className="flex-row items-center gap-3 px-4 pt-4 pb-6 pr-14">
           <BotFace botId={bot.bot_id} mood={mood} size={48} />
           <span className="grid min-w-0 gap-0.5">
             <SheetTitle className="text-title font-semibold break-words">{bot.name}</SheetTitle>

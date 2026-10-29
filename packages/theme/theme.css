@@ -50,6 +50,10 @@
       --info: oklch(0.52 0.15 255);
       --info-soft: oklch(0.982 0.015 255);
       --info-border: oklch(0.89 0.04 255);
+      --line-strong: oklch(0.86 0.008 270);
+      --elevation-xs: 0 1px 2px oklch(0.2 0.02 270 / 0.05);
+      --elevation-sm: 0 1px 2px oklch(0.2 0.02 270 / 0.05), 0 2px 8px -2px oklch(0.2 0.02 270 / 0.07);
+      --elevation-lg: 0 2px 4px oklch(0.2 0.02 270 / 0.04), 0 12px 32px -8px oklch(0.2 0.02 270 / 0.18);
     }
 
     @variant dark {
@@ -68,8 +72,10 @@
       --accent: oklch(0.265 0.01 270);
       --accent-foreground: oklch(0.955 0.004 270);
       --destructive: oklch(0.7 0.18 22);
-      --border: oklch(1 0 0 / 8%);
-      --input: oklch(1 0 0 / 13%);
+      /* A card's outline and a field's border reach 3:1 against the page; a divider inside a card stays soft so the card reads as one block. */
+      --border: oklch(0.86 0.016 270 / 20%);
+      --input: oklch(0.86 0.016 270 / 42%);
+      --line-strong: oklch(0.86 0.016 270 / 42%);
       --ring: oklch(0.7 0.15 280);
       --brand: oklch(0.72 0.15 280);
       --brand-foreground: oklch(0.18 0.02 280);
@@ -99,6 +105,10 @@
       --info: oklch(0.76 0.12 250);
       --info-soft: oklch(0.76 0.12 250 / 8%);
       --info-border: oklch(0.76 0.12 250 / 24%);
+      /* Dark surfaces separate by tone and outline, not shadow; only floating layers keep one. */
+      --elevation-xs: 0 0 #0000;
+      --elevation-sm: 0 0 #0000;
+      --elevation-lg: 0 2px 4px oklch(0 0 0 / 0.25), 0 16px 40px -8px oklch(0 0 0 / 0.55);
     }
   }
 }
@@ -150,6 +160,13 @@
   --color-info: var(--info);
   --color-info-soft: var(--info-soft);
   --color-info-border: var(--info-border);
+  --color-line-strong: var(--line-strong);
+  --shadow-xs: var(--elevation-xs);
+  --shadow-sm: var(--elevation-sm);
+  --shadow-lg: var(--elevation-lg);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --default-transition-duration: 150ms;
+  --default-transition-timing-function: var(--ease-out);
   --text-title: 20px;
   --text-title--line-height: 28px;
   --text-heading: 16px;

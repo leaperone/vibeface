@@ -1,12 +1,13 @@
 import * as Haptics from 'expo-haptics'
-import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, ChevronRight, Crown, KeyRound, LogOut, MonitorSmartphone, Palette, Plus, Sparkles, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Appearance, Platform, Pressable, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
+import { ArrowRightLeft, BellRing, Crown, KeyRound, LogOut, Monitor, Moon, Palette, Plus, Sparkles, Sun } from 'lucide-react-native'
+import { useEffect, useRef, useState } from 'react'
+import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
+import { ErrorText } from '@/components/action'
+import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Segmented } from '@/components/ui/segmented'
@@ -15,11 +16,10 @@ import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
-import { cn } from '@/lib/utils'
 import { self } from '@/platform'
 import { useRun } from '@/lib/use-run'
 
-const themes = [{ value: 'system', label: '跟随系统' }, { value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }] as const
+const themes = [{ value: 'system', label: '跟随系统', icon: Monitor }, { value: 'light', label: '浅色', icon: Sun }, { value: 'dark', label: '深色', icon: Moon }] as const
 
 export default function Settings() {
   const workspace = useWorkspace()
@@ -31,43 +31,47 @@ export default function Settings() {
   const scroll = useRef<ScrollViewInstance>(null)
   const reveal = useRef(false)
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
+  const manager = device.ready?.principal.can_manage === true
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   // The confirmation opens at the foot of the page, below the fold on a phone.
-  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {/* The home header already shows the connection, so settings starts with the devices. */}
-    <Section icon={MonitorSmartphone} title="我的设备">
-      <JoinRequests />
-      <View className="overflow-hidden rounded-xl border border-border">
-        {workspace.members.map((member, index) => <MemberRow key={member.device_id} member={member} first={index === 0} />)}
-        {device.ready?.principal.can_manage ? <LinkRow href="/add-device" icon={Plus} label="添加设备" /> : null}
-      </View>
-    </Section>
-    {/* One card of places to go, as a system settings group: each row names itself, so no header per row. */}
-    <View className="overflow-hidden rounded-xl border border-border">
-      {device.ready?.principal.can_manage ? <LinkRow first href="/ai" icon={Sparkles} label="Bot 与任务" /> : null}
-      <LinkRow first={!device.ready?.principal.can_manage} href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
-      <LinkRow href="/recovery" icon={KeyRound} label="换恢复密码" />
+    <JoinRequests />
+    <SettingsGroup title="我的设备">
+      {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}
+      {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" /> : null}
+    </SettingsGroup>
+    {/* One card of places to go, as a system settings group: each row names itself. */}
+    <SettingsGroup>
+      {manager ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" /> : null}
+      <SettingsRow href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
+      <SettingsRow href="/recovery" icon={KeyRound} label="换恢复密码" />
       {device.ready ? <Notifications /> : null}
-    </View>
-    <Section icon={Palette} title="外观">
-      {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
-          UIKit gets the same style, so native glass like the back button turns with the page instead of re-sampling it later. */}
-      <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
-    </Section>
-    <View className="border-t border-border pt-6">
-      {leaving && sole ? <View className="gap-3">
-        <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-0.5 size-4 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
-        <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
-      </View> : leaving ? <View className="gap-3">
-        <Text>断开后，要用加入链接才能回来。</Text>
-        {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-        <View className="flex-row gap-2">
-          <Button variant="ghost" className="min-h-11" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
-          <Button variant="destructive" className="min-h-11" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} className="text-white" /><Text>断开</Text></Button>
+    </SettingsGroup>
+    <SettingsGroup title="外观">
+      <SettingsRow icon={Palette} label="主题">
+        {/* A theme change repaints the whole app, which stalls any slide under it; like iOS's own appearance picker, it applies at once.
+            UIKit gets the same style, so native glass like the back button turns with the page instead of re-sampling it later. */}
+        <View className="basis-full ps-11">
+          <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
         </View>
-      </View> : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setLeaving(true) }}>
-        <Icon as={LogOut} className="text-muted-foreground" /><Text className="text-muted-foreground">断开{self}</Text>
-      </Button>}
+      </SettingsRow>
+    </SettingsGroup>
+    <View className="gap-3">
+      <SettingsGroup>
+        <SettingsRow icon={LogOut} tone="danger" label={`断开${self}`} onPress={() => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setLeaving(true) }} />
+      </SettingsGroup>
+      {leaving && sole ? <View className="gap-3 px-1">
+        <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
+        <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+      </View> : leaving ? <View className="gap-3 px-1">
+        <Text>断开后，要用加入链接才能回来。</Text>
+        <ErrorText error={error} />
+        <View className="flex-row justify-end gap-2">
+          <Button variant="ghost" onPress={() => setLeaving(false)}><Text>取消</Text></Button>
+          <Button variant="destructive" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} /><Text>断开</Text></Button>
+        </View>
+      </View> : null}
     </View>
   </ScrollView>
 }
@@ -77,51 +81,20 @@ function Notifications() {
   const shared = useShared()
   const { busy, error, run } = useRun()
   const button = shared.notificationButton
-  return <Pressable accessibilityRole="button" accessibilityState={{ disabled: button.disabled || busy !== null }} disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}
-    className="min-h-12 flex-row items-center gap-3 border-t border-border px-4 py-2 active:bg-muted">
-    <Icon as={BellRing} className="text-muted-foreground" />
-    <View className="min-w-0 flex-1">
-      <Text className={cn('font-medium', button.disabled && 'text-muted-foreground')}>{button.label}</Text>
-      {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-    </View>
-  </Pressable>
+  return <SettingsRow icon={BellRing} label={button.label} disabled={button.disabled || busy !== null} onPress={() => void run('notify', shared.enableNotifications)}>
+    {error ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
+  </SettingsRow>
 }
 
-function LinkRow({ href, icon, label, first }: { href: '/ai' | '/recovery' | '/transfers' | '/add-device'; icon: LucideIcon; label: string; first?: boolean }) {
-  return <Link href={href} asChild>
-    <Pressable className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
-      <Icon as={icon} className="text-muted-foreground" />
-      <Text className="min-w-0 flex-1 font-medium">{label}</Text>
-      <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
-    </Pressable>
-  </Link>
-}
-
-function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {
-  return <View className="gap-3">
-    <View className="flex-row items-center gap-2">
-      <Icon as={icon} />
-      <Text role="heading" className="min-w-0 flex-1 text-heading font-semibold">{title}</Text>
-    </View>
-    {children}
-  </View>
-}
-
-function MemberRow({ member, first }: { member: Member; first: boolean }) {
+function MemberRow({ member }: { member: Member }) {
   // iOS sits inline views on the line box, not the glyph baseline, so they sink as the line height grows with Dynamic Type.
   // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
   const fontScale = useWindowDimensions().fontScale
   const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 1
-  return <Link href={`/device/${member.device_id}`} asChild>
-    <Pressable className={cn('min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted', !first && 'border-t border-border')}>
-      <Icon as={deviceIcon(member)} className="text-muted-foreground" />
-      {/* Title and subtitle, as a system cell. The name wraps in full so the inline crown is never cut off with it. */}
-      <View className="min-w-0 flex-1">
-        <Text className="font-medium">{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</Text>
-        {member.current || member.entry ? <Text className="text-meta text-muted-foreground">{member.current ? self : '当前连接'}</Text> : null}
-      </View>
-      {member.online !== undefined ? <View accessibilityLabel={member.online ? '在线' : '离线'} className={cn('size-2 rounded-full', member.online ? 'bg-success' : 'bg-muted-foreground/40')} /> : null}
-      <Icon as={ChevronRight} className="size-4 text-muted-foreground" />
-    </Pressable>
-  </Link>
+  // The name wraps in full so the inline crown is never cut off with it.
+  return <SettingsRow href={`/device/${member.device_id}`} icon={deviceIcon(member)}
+    label={<>{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</>}
+    description={member.current ? self : member.entry ? '当前连接' : undefined}>
+    {member.online !== undefined ? <Online online={member.online} /> : null}
+  </SettingsRow>
 }

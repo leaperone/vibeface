@@ -1,6 +1,5 @@
 import { Link, Stack } from 'expo-router'
 import { MessageSquare, Settings } from 'lucide-react-native'
-import { View } from 'react-native'
 import { ConnectionMenu } from '@/components/connection-pill'
 import { ScreenFaces } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
@@ -16,14 +15,14 @@ export default function Home() {
   const workspace = useWorkspace()
   if (wide) return <>
     <Stack.Screen options={{ headerShown: false }} />
-    <View className="flex-1 justify-center"><EmptyState icon={MessageSquare} title="选一个 Bot 开始聊天" /></View>
+    <EmptyState icon={MessageSquare} title="选一个 Bot 开始聊天" className="flex-1 justify-center" />
   </>
   return <>
     <Stack.Screen options={{
       headerShown: true,
       headerLeft: () => <ConnectionMenu connection={workspace.connection} />,
       headerRight: () => <Link href="/settings" asChild>
-        <Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button>
+        <Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} className="size-5" /></Button>
       </Link>,
     }} />
     <ScreenFaces><HomeList /></ScreenFaces>

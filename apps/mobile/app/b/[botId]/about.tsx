@@ -24,7 +24,7 @@ export default function BotAbout() {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
-  if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
+  if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" className="flex-1 justify-center" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
   const empty = view && !bot.project && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
@@ -34,13 +34,13 @@ export default function BotAbout() {
   const place = bot.project ? projectPlace(bot.project, shared.data?.conversation?.owner, (id) => nodeName(id, lookup)) : ''
   const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
-  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
     <View className="items-start gap-3">
       <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, shared)} size={80} />
       {shared.primary === bot.conversation_id
-        ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 Bot</Text></View>
-        : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
+        ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
+        : <ActionButton variant="outline" className="self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
     </View>
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
     {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>
@@ -68,8 +68,8 @@ export default function BotAbout() {
           </View>
           <Text numberOfLines={2} className="text-meta text-muted-foreground">{scheduleDetail(schedule) || schedule.prompt}</Text>
           <View className="flex-row gap-2 pt-1">
-            <ActionButton variant="outline" size="sm" className="min-h-9" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
-            <Button variant="outline" size="sm" className="min-h-9" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
+            <ActionButton variant="outline" size="sm" icon={schedule.enabled ? Pause : Play} disabled={!shared.writable} action={() => shared.controlSchedule(schedule.schedule_id, schedule.enabled ? 'pause' : 'resume')}>{schedule.enabled ? '暂停' : '恢复'}</ActionButton>
+            <Button variant="outline" size="sm" disabled={!shared.writable} onPress={() => Alert.alert(`删除「${schedule.name}」？`, undefined, [
               { text: '取消', style: 'cancel' },
               { text: '删除', style: 'destructive', onPress: () => void shared.controlSchedule(schedule.schedule_id, 'delete').catch((error: unknown) => Alert.alert('删除失败', error instanceof Error ? error.message : String(error))) },
             ])}>
