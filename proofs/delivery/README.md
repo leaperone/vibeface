@@ -34,17 +34,18 @@ The Linux runtime archive is `https://github.com/risc0/risc0/releases/download/v
 
 ## Compile a new guest
 
-The canonical build is Linux x86_64. Bind-mount the repository at `/work`, its isolated Cargo cache at `/cargo`, its verified RISC0_HOME at `/risc0`, and its ignored artifact directory at `/artifacts`. Use real bind mounts rather than symlinks. Both the proof producer and CI use this layout.
+The canonical build is Linux x86_64. Bind-mount the repository at `/work`, its isolated Cargo cache at `/cargo` and the same cache at `/home/runner/.cargo`, its verified RISC0_HOME at `/risc0`, and its ignored artifact directory at `/artifacts`. Set `HOME=/home/runner` and use real bind mounts rather than symlinks. Both the proof producer and CI use this layout.
 
 ```sh
 cd /work
+export HOME=/home/runner
 export CARGO_HOME=/cargo
 export RISC0_HOME=/risc0
 bash proofs/delivery/build.sh
 /artifacts/proof-target/release/vibeface-delivery-prover info
 ```
 
-The methods build always compiles the guest and embeds its actual ELF and image ID. It does not use RISC0_SKIP_BUILD or a zero image. The guest compiler is selected from RISC0_HOME, independently of the host Rust toolchain. A Linux build needs the Linux host compiler and Linux guest toolchain archive. A Mac r0vm or Mac Rust toolchain cannot run inside a Linux container.
+The methods build always compiles the guest and embeds its actual ELF and image ID. It does not use RISC0_SKIP_BUILD or a zero image. The guest compiler is selected from RISC0_HOME, independently of the host Rust toolchain. `risc0-build` strips `CARGO_*` variables before starting the nested guest build, so that build resolves its dependency cache from `HOME/.cargo`; the local sandbox deliberately reproduces CI's `/home/runner` path while sharing the isolated cache at both `/cargo` and `/home/runner/.cargo`. The sandbox keeps the guest source, compiler flags, and registered image configuration unchanged. A Linux build needs the Linux host compiler and Linux guest toolchain archive. A Mac r0vm or Mac Rust toolchain cannot run inside a Linux container.
 
 `build.sh` rejects another OS, architecture, source path, cache path, dev mode or skipped guest build. It fixes host Rust 1.98.1 and output at `/artifacts/proof-target`, and sets RISC0_BUILD_LOCKED=1 so the nested guest build also respects its lockfile. Guest metadata remaps `/work` to `/src`, `/cargo` to `/deps`, `/risc0` to `/toolchain`, and `/artifacts` to `/build`. The Linux standard library comes from the fixed, checksum-verified Linux archive. Mac execution is development evidence only because the Mac prebuilt standard library embeds different source paths. Generate accepted fixtures with the canonical Linux build, then have CI independently rebuild and compare image and ELF hashes.
 
@@ -90,7 +91,7 @@ The profile's maxProverMemoryBytes is a signed limit. It is not OS enforcement. 
 
 ## Public proof fixtures
 
-Only add genuinely generated receipts under `fixtures/`. Missing fixtures are an incomplete proof gate.
+Only add genuinely generated receipts under `fixtures/`. When no fixtures are present, `scripts/check-delivery.py` skips receipt verification; a passing guest rebuild and contract or cross-language check does not fill that missing genuine-proof coverage. Missing fixtures are an incomplete proof gate.
 
 `manifest.json` has this shape.
 
