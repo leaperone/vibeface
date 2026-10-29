@@ -133,7 +133,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const secure = {
     verifyAuthentication: () => { verifications++; return { auth: { local_auto_access: true }, principal: { source: localSession && !management ? 'local_session' : 'membership', network_id: network, device_id: subject, epoch: 1, can_manage: management }, view: membership } },
     verifyRemoval: () => false,
-    verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] }),
+    verifiedView: () => ({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] }),
     openPackage: async () => ({ networkId: network, material: { genesis, checkpoints: [], events: [] }, root: { deviceId: () => network, sign: () => 'signature' }, release() { released++ } }),
     Identity: { generate: () => ({ deviceId: () => network, secretHex: () => 'private-test-key', sign: () => 'signature', free() { released++ } }) },
     createGenesis: () => JSON.stringify(genesis), joinCommit: () => 'd'.repeat(64), shortCode: () => '123456', ticketEncode: () => 'vibeface1test',
@@ -551,6 +551,16 @@ test('recovering onto a remote fresh Node needs that Node\'s own page', async ()
   } finally { app.close() }
 })
 
+test('a recovery link naming a computer outside the network is refused before anything is signed', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    await assert.rejects(app.render().beginRecovery({ file: new File(['fixture'], 'recovery.json'), password: 'test-only-passphrase', name: 'browser', entry: { ...entry, device_id: remote } }), /不在你的网络里/)
+    assert.equal(app.render().review, null)
+    assert.equal(app.calls.includes('recover'), false)
+  } finally { app.close() }
+})
+
 test('recovering an initialized network reads its state with a short-lived root proof', async () => {
   const app = deviceHarness()
   try {
@@ -891,7 +901,7 @@ for (const flow of ['directory', 'recovery']) test(`cancelling after ${flow} res
     const rejected = assert.rejects(work, /切换|取消/)
     for (let tries = 0; tries < 100 && !app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'); tries++) await new Promise(resolve => setTimeout(resolve, 1))
     assert.ok(app.calls.includes(flow === 'directory' ? 'directory' : 'recovery_state'))
-    hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }] } })
+    hold.resolve({ state: { genesis }, view: { ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: false }, { device_id: target, kind: 'node', name: 'node', manage: false }] } })
     queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => app.render().disconnect())))
     await rejected; await settle()
     assert.equal(app.render().phase, 'disconnected')
