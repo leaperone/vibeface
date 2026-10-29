@@ -131,6 +131,7 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot.bot_id, offline) : []
+  const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const tint = botTint(faceOf(bot.bot_id).hue, theme === 'dark')
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
@@ -144,8 +145,8 @@ export default function ChatScreen() {
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerTitle: () => <ScreenFaces><Link href={`/b/${bot.bot_id}/about`} asChild>
-        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 rounded-lg px-2 active:bg-muted">
-          <BotFace botId={bot.bot_id} mood={offline ? 'asleep' : botMood(bot, workspace, live)} size={28} />
+        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted">
+          <BotFace botId={bot.bot_id} mood={mood} size={28} />
           <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
         </Pressable>
@@ -170,7 +171,7 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={96} halo={tint.glow} />
+        <BotFace botId={bot.bot_id} mood={mood} size={96} halo={tint.glow} />
         <View className="items-center gap-1">
           <Text role="heading" className="text-center text-heading font-semibold">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <View className="flex-row items-center gap-1">
