@@ -824,7 +824,7 @@ async fn dispatch(
             let entry = node.net().ok().map(|net| {
                 let addr = net.addr();
                 json!({"relay_url":own_relay.or_else(|| addr.relay_urls().next().cloned()),
-                    "direct_addrs":addr.ip_addrs().take(8).collect::<Vec<_>>()})
+                    "direct_addrs":invite_addrs(addr.ip_addrs().copied())})
             });
             Ok(
                 json!({"join_id":join_id,"entry_id":node.identity.device_id()?,"entry":entry,"gateway_url":node.gateway_url()}),
@@ -1389,6 +1389,23 @@ fn client_url(origin: &str) -> Result<String> {
     Ok(url.into())
 }
 
+/// The ticket holds at most 8 addresses; a phone on the LAN needs the private IPv4 ones, which a
+/// computer with many interfaces could otherwise push out. Link-local IPv6 cannot be dialed without
+/// its interface; loopback goes last, for Nodes on one machine.
+fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut addrs: Vec<_> = addrs
+        .filter(|addr| !matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
+        .collect();
+    addrs.sort_by_key(|addr| match addr.ip() {
+        ip if ip.is_loopback() => 3,
+        std::net::IpAddr::V4(ip) if ip.is_private() => 0,
+        std::net::IpAddr::V4(_) => 1,
+        std::net::IpAddr::V6(_) => 2,
+    });
+    addrs.truncate(8);
+    addrs
+}
+
 /// Splits `https://origin/join#vibeface1…` into the Gateway origin and the ticket.
 pub fn parse_join_link(link: &str) -> Result<(String, Ticket)> {
     let url = reqwest::Url::parse(link.trim()).context("invite link must be a URL")?;
@@ -1849,6 +1866,28 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    #[test]
+    fn invites_keep_private_ipv4_within_the_ticket_limit() {
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let mut many: Vec<_> = (0..8)
+            .map(|i| addr(&format!("[2001:db8::{i}]:4790")))
+            .collect();
+        many.extend([
+            addr("[fe80::1]:4790"),
+            addr("127.0.0.1:4790"),
+            addr("192.168.1.10:4790"),
+        ]);
+        let kept = invite_addrs(many.into_iter());
+        assert_eq!(kept.len(), 8);
+        assert_eq!(kept[0], addr("192.168.1.10:4790"));
+        assert!(!kept.contains(&addr("[fe80::1]:4790")));
+        assert_eq!(
+            invite_addrs([addr("127.0.0.1:9")].into_iter()),
+            [addr("127.0.0.1:9")],
+            "Nodes on one machine still join over loopback"
+        );
+    }
 
     /// The payload of the next push this client receives.
     async fn next_push(client: &mut Client) -> Result<Value> {
