@@ -83,6 +83,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_func_invite_signing_payload(recordJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_join_commit(joiner: Uint8Array, joinerNonce: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_connect(deviceId: Uint8Array, addrs: Uint8Array, timeoutMs: number): bigint;
+    ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_prepare(): bigint;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(tag: Uint8Array, networkId: Uint8Array, deviceId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_recovery_open(envelope: Uint8Array, password: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_recovery_seal(payload: Uint8Array, password: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -123,6 +124,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_invite_signing_payload(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_join_commit(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_recovery_open(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_recovery_seal(): number;

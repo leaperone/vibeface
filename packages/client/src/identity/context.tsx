@@ -250,6 +250,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const switching = useRef(false)
   /** Nodes advertising on the app's LAN right now. */
   const lanSightings = useRef<LanSighting[]>([])
+  /** The direct channel `goDirect` is trying; leaving the network or erasing the phone stops it before it signs. */
+  const probing = useRef<AbortController | null>(null)
   const leaderRef = useRef(true)
   const tabChannel = useRef<{ post(message: TabMessage): void; close(): void } | null>(null)
   const tabListeners = useRef(new Set<(message: TabMessage) => void>())
@@ -276,6 +278,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     generation.current += 1
     releaseSensitive()
     connecting.current?.abort(); connecting.current = null
+    probing.current?.abort(); probing.current = null
     const previous = session.current; session.current = null
     previous?.channel.close()
     listeners.current.clear(); setReady(null); setDirectory(null); setJoins([]); setInfo(null); setEntry(null); setLocalAutoAccessState(null)
@@ -419,9 +422,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (!active?.networkId || active.entry.kind !== 'gateway') return
     const addrs = lanSeen(active.networkId, [active.entry.device_id], fresh)?.get(active.entry.device_id)
     if (!addrs) return
-    try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS })).close() } catch { return }
+    probing.current?.abort()
+    const probe = probing.current = new AbortController()
+    try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS, signal: probe.signal })).close() } catch { return }
     for (let waited = 0; !active.channel.idle(); waited += 500) {
-      if (waited >= 30000 || session.current !== active) return
+      if (waited >= 30000 || session.current !== active || probe.signal.aborted) return
       await new Promise(resolve => setTimeout(resolve, 500))
     }
     if (session.current !== active || !reconnect.current || switching.current || reconnectTimer.current !== null || sensitive.current) return

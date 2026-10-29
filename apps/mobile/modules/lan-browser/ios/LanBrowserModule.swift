@@ -7,7 +7,11 @@ public class LanBrowserModule: Module {
   private var browser: NWBrowser?
   /// Resolved services by instance name, as JS gets them.
   private var found: [String: [String: Any]] = [:]
+  /// What the browser sees now, by instance name.
+  private var seen: [String: (tag: String, endpoint: NWEndpoint)] = [:]
   private var resolving: [String: NWConnection] = [:]
+  /// Bonjour does not report a service whose address changed, so each one is resolved again on this beat.
+  private var refresh: DispatchSourceTimer?
 
   public func definition() -> ModuleDefinition {
     Name("LanBrowser")
@@ -23,27 +27,39 @@ public class LanBrowserModule: Module {
     browser.browseResultsChangedHandler = { [weak self] results, _ in self?.update(results) }
     self.browser = browser
     browser.start(queue: queue)
+    let refresh = DispatchSource.makeTimerSource(queue: queue)
+    refresh.schedule(deadline: .now() + 60, repeating: 60)
+    refresh.setEventHandler { [weak self] in
+      guard let self else { return }
+      for (name, service) in self.seen where self.resolving[name] == nil { self.resolve(name, service.tag, service.endpoint) }
+    }
+    refresh.resume()
+    self.refresh = refresh
   }
 
   private func stop() {
     browser?.cancel()
     browser = nil
+    refresh?.cancel()
+    refresh = nil
+    seen = [:]
     resolving.values.forEach(drop)
     resolving = [:]
     found = [:]
   }
 
   private func update(_ results: Set<NWBrowser.Result>) {
-    var tags: [String: String] = [:]
+    var now: [String: (tag: String, endpoint: NWEndpoint)] = [:]
     for result in results {
       guard case let .service(name, _, _, _) = result.endpoint, case let .bonjour(txt) = result.metadata, let tag = txt["t"] else { continue }
-      tags[name] = tag
+      now[name] = (tag, result.endpoint)
       if found[name]?["tag"] as? String != tag && resolving[name] == nil { resolve(name, tag, result.endpoint) }
     }
-    for name in Array(resolving.keys) where tags[name] == nil {
+    seen = now
+    for name in Array(resolving.keys) where now[name] == nil {
       if let connection = resolving.removeValue(forKey: name) { drop(connection) }
     }
-    let gone = found.keys.filter { tags[$0] == nil }
+    let gone = found.keys.filter { now[$0] == nil }
     gone.forEach { found[$0] = nil }
     if !gone.isEmpty { emit() }
   }
@@ -61,8 +77,11 @@ public class LanBrowserModule: Module {
       case .ready:
         if case let .hostPort(host, port) = connection.currentPath?.remoteEndpoint, case let .ipv4(address) = host {
           let ip = address.rawValue.map(String.init).joined(separator: ".")
-          self.found[name] = ["tag": tag, "addrs": ["\(ip):\(port.rawValue)"]]
-          self.emit()
+          let addrs = ["\(ip):\(port.rawValue)"]
+          if self.found[name]?["tag"] as? String != tag || self.found[name]?["addrs"] as? [String] != addrs {
+            self.found[name] = ["tag": tag, "addrs": addrs]
+            self.emit()
+          }
         }
         self.finish(name, connection)
       case .waiting, .failed:

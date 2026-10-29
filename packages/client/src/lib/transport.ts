@@ -259,6 +259,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     let carrier: Carrier | undefined, handshake: SecureHandshake | undefined
     try {
       carrier = await carry(entry, target, signal, closing, timeoutMs)
+      if (signal?.aborted) throw new Error('设备连接已取消。')
       handshake = new secure.Handshake(true, target, prologue)
       handshake.setProof(me.deviceId, await sign(handshake.signingBytes()))
       carrier.send(handshake.write(new Uint8Array()))

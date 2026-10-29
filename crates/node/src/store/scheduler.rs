@@ -741,6 +741,11 @@ const LATE_START_MS: i64 = 5 * 60_000;
 /// A due time found later than this (the device was off or asleep) is skipped, not run late.
 pub(crate) const MAX_LATE_MS: i64 = 10 * 60_000;
 
+/// How long a new owner leaves due times alone after the handover, so a former owner that has
+/// not seen it yet can still deliver the claim of a time it ran. Stays below `MAX_LATE_MS`, so
+/// a time due in this window still runs, only late.
+pub(crate) const TAKEOVER_GRACE_MS: i64 = 5 * 60_000;
+
 /// Which Node took a schedule's due time: of all claims the network holds, the one of the
 /// highest owner epoch, ties going to the smaller author.
 fn schedule_claim(
@@ -798,6 +803,8 @@ fn taken_over_at(
 /// claims a time in the network's log before it runs or, found more than `MAX_LATE_MS` late,
 /// skips it, so no other owner takes it again. A time due before the user handed this Node the
 /// conversation is the former owner's: its claim may still be on the way, so it is left alone.
+/// For `TAKEOVER_GRACE_MS` after the handover nothing is claimed yet, so a former owner that ran
+/// a later time before it saw the handover can still deliver its claim.
 /// A schedule waits while its previous run is still queued. Returns `(conversation, trigger)`
 /// per job.
 fn admit_due_schedules_from(
@@ -829,7 +836,7 @@ fn admit_due_schedules_from(
                 &local,
                 current.owner_epoch,
             )?
-            .is_some_and(|since| slot <= since)
+            .is_some_and(|since| slot <= since || now < since + TAKEOVER_GRACE_MS)
         {
             continue;
         }
