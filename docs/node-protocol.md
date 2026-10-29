@@ -37,7 +37,7 @@
 | `providers.codex_app_server` | `{mode, socket}`：`system` 要求 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境设置 `CODEX_HOME`。用到 Codex 而缺失时，`init`、启动和 `configure_provider` 从本机找出并写入，见[部署配置](deployment.md#配置-sdk-与-app-server) |
 | `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
-| `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制 |
+| `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制；协调 Agent 的分诊唤醒按同一上限另行计数 |
 
 `network` 的字段：
 
@@ -464,4 +464,4 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 协调 Agent 总是完全权限，没有自主度设置和只读汇报轮。
 
-`daily_decision_limit` 只限制每个 Node、每个个人网络的 UTC 每日结果汇报轮和其他非本人触发的轮次，预算先预留，失败调用不保证退回，不是 token 或账单上限。
+`daily_decision_limit` 只限制每个 Node、每个个人网络的 UTC 每日结果汇报轮和其他非本人触发的轮次；协调 Agent 的分诊唤醒按同一上限另行计数，用完时挂起的请求立即兜底、分诊事件丢弃；预算先预留，失败调用不保证退回，不是 token 或账单上限。
