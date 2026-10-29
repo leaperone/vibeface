@@ -60,12 +60,13 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 | 日志 | 含义 |
 |---|---|
-| `write state changed` | 写入状态变化，`state` 是新状态 |
-| `another copy of this device wrote different events; writes stopped` | 发现这台设备的数据被复制过，已停止写入 |
-| `write confirmed without a backup check` | 有人在网页上确认了“不是从备份恢复的” |
+| `sync.write_state`（`write state changed`） | 写入状态变化，`state` 是新状态 |
+| `sync.forked`（`another copy of this device wrote different events; writes stopped`） | 发现这台设备的数据被复制过，已停止写入 |
+| `sync.write_confirmed`（`write confirmed without a backup check`） | 有人在网页上确认了“不是从备份恢复的” |
 | `refused a connection from a non-member` | 非成员设备试图连接，debug 级别 |
 | `work changed a file outside its directory` | 工作改动了它目录之外的文件，只记录，不拦截 |
-| `relay started` | 本机 relay 已启动，`listen` 字段是它的地址 |
+| `relay.started`（`relay started`） | 本机 relay 已启动，`listen` 字段是它的地址 |
+| `app_server.start_failed`、`app_server.exited` | Node 启动的 Codex App Server 没能启动或已退出，`error`、`status` 是原因 |
 | `work.dispatched`、`work.dispatch_rejected` | 工作被接纳或派发被拒绝，带 `work_id` 和原因 |
 | `work.turn_started`、`work.start_failed`、`work.start_unknown` | Codex 回合开始、被拒绝或结果未知 |
 | `work.state` | 工作状态变化，结束时带 `outcome` |

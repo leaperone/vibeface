@@ -102,7 +102,9 @@ impl Runtime {
         {
             match Box::pin(self.interrupt_turn(network, &record)).await {
                 Ok(stopped) => return Ok(stopped),
-                Err(error) => tracing::warn!(%error, work_id, "stop waits for the next reconcile"),
+                Err(error) => {
+                    tracing::warn!(event = "work.stop_pending", %error, work_id, "stop waits for the next reconcile")
+                }
             }
         }
         // Only a state change can change which threads stay subscribed.
@@ -798,7 +800,7 @@ impl Runtime {
                             && Box::pin(self.interrupt_turn(network, &record))
                                 .await
                                 .inspect_err(|error| {
-                                    tracing::warn!(%error, work_id, "stop waits for the next reconcile")
+                                    tracing::warn!(event = "work.stop_pending", %error, work_id, "stop waits for the next reconcile")
                                 })
                                 .is_ok());
                     }
@@ -1055,7 +1057,7 @@ impl Runtime {
                     }
                 };
                 if let Err(error) = applied {
-                    tracing::warn!(%error, "could not apply an App Server event");
+                    tracing::warn!(event = "app_server.event_failed", %error, "could not apply an App Server event");
                 }
             }
         });

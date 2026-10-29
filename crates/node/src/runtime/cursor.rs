@@ -70,7 +70,7 @@ impl Runtime {
                     .prewarm(&bin, &manager.workspace, &api_key, &env)
                     .await
             {
-                tracing::warn!(%error, "Cursor SDK bridge did not start ahead of a reply");
+                tracing::warn!(event = "cursor.prewarm_failed", %error, "Cursor SDK bridge did not start ahead of a reply");
             }
         });
     }
