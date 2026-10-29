@@ -803,6 +803,8 @@ fn taken_over_at(
 /// claims a time in the network's log before it runs or, found more than `MAX_LATE_MS` late,
 /// skips it, so no other owner takes it again. A time due before the user handed this Node the
 /// conversation is the former owner's: its claim may still be on the way, so it is left alone.
+/// For `TAKEOVER_GRACE_MS` after the handover nothing is claimed yet, so a former owner that ran
+/// a later time before it saw the handover can still deliver its claim.
 /// A schedule waits while its previous run is still queued. Returns `(conversation, trigger)`
 /// per job.
 fn admit_due_schedules_from(
@@ -834,7 +836,7 @@ fn admit_due_schedules_from(
                 &local,
                 current.owner_epoch,
             )?
-            .is_some_and(|since| slot <= since)
+            .is_some_and(|since| slot <= since || now < since + TAKEOVER_GRACE_MS)
         {
             continue;
         }

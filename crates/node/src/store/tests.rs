@@ -2364,15 +2364,16 @@ fn a_new_owner_leaves_times_due_before_the_handover_to_the_former_owner() -> Res
     );
     assert!(b_side.scheduler_jobs("c")?.is_empty());
     let next = slot + every;
+    let grace_over = slot + 30 + crate::store::scheduler::TAKEOVER_GRACE_MS;
     assert_eq!(
-        b_side.admit_due_schedules(&net.b, &net.network, next + 10)?,
+        b_side.admit_due_schedules(&net.b, &net.network, grace_over + 10)?,
         vec![("c".to_owned(), schedule_trigger(&schedule_id, next))]
     );
 
     sync(&b_side, &mut a_side, &net)?;
     assert!(
         a_side
-            .admit_due_schedules(&net.a, &net.network, next + 20)?
+            .admit_due_schedules(&net.a, &net.network, grace_over + 20)?
             .is_empty(),
         "the former owner stops once it sees the newer epoch"
     );
