@@ -190,7 +190,7 @@ impl Provider {
     /// Name prefixes of the variables the Node sets itself for this provider's processes.
     fn reserved_env(self) -> &'static [&'static str] {
         match self {
-            Provider::Cursor => &["CURSOR_SDK_"],
+            Provider::Cursor => &["CURSOR_SDK_", "CURSOR_DATA_DIR"],
             Provider::Opencode => &["OPENCODE_SERVER_", "OPENCODE_CONFIG_CONTENT"],
             Provider::Codex | Provider::Claude | Provider::Pi => &[],
         }
@@ -230,7 +230,13 @@ impl Provider {
             },
             "cancel_request": true,
             "cancel_confirmation": true,
-            "cancel_confirmation_evidence": if codex { "app_server_turn_end" } else { "provider_terminal_or_managed_process_exit" },
+            "cancel_confirmation_evidence": if codex {
+                "app_server_turn_end"
+            } else if self == Provider::Cursor {
+                "provider_terminal"
+            } else {
+                "provider_terminal_or_managed_process_exit"
+            },
             "native_steer": self.supports_steer(),
             "run_reconcile": false,
         })
@@ -552,6 +558,7 @@ mod tests {
         for (provider, name) in [
             (Provider::Codex, "VIBEFACE_DATA_DIR"),
             (Provider::Cursor, "CURSOR_SDK_PORT"),
+            (Provider::Cursor, "CURSOR_DATA_DIR"),
             (Provider::Codex, "1KEY"),
             (Provider::Codex, "A-B"),
         ] {
@@ -585,6 +592,14 @@ mod tests {
         assert!(removed.get(Provider::Codex).is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn cursor_cancel_confirmation_requires_the_provider_terminal() {
+        assert_eq!(
+            Provider::Cursor.capabilities()["cancel_confirmation_evidence"],
+            "provider_terminal"
+        );
     }
 
     #[test]

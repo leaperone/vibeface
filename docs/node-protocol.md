@@ -65,7 +65,11 @@
 }
 ```
 
-`provider` 也可为 `codex`，此时 Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力：两种 Manager 均支持流式进度、取消请求和本机原生会话延续，只有 Codex 支持原生 steer，均不支持 Provider run 对账。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 以 Provider 终态或受管进程退出为证据。配置存在、进程可达和真实模型可用是不同状态。
+`provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、pi 与 opencode 支持 steer，Cursor 与 Claude Code 的消息继续排队。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
+
+Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
+
+Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工具进程环境。Node 不再通过插件修改 Shell 环境；发送提示前必须成功设置该轮的工具凭证。读取消息和待处理 inbox 后才判断发送结果，不重发结果未知的请求。取消会删除本轮仍在 inbox 中的输入；只有没有待处理输入时才结清待核对，新的回合也不能唤醒残留队列。外部 CLI 会话的 hook 插件不在此适配范围内。
 
 ## 数据目录
 
@@ -86,6 +90,7 @@
 | `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
+| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot 或 coordination Agent 的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 
@@ -105,7 +110,7 @@
 | `/api/info` | GET | `device_id`、`version` 和 `public_entry` |
 | `/api/local/setup` | POST | 本机网页读取一次性初始化邀请或已有网络的当前入口；公共入口回 404 |
 | `/api/client` | GET，WebSocket upgrade | 浏览器网关 |
-| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 回调带 Node 级令牌，按 `agentId` 找到所属管理轮 |
+| `/sdk.v1.SdkCustomToolCallbackService/CallCustomTool` | POST | 只在独立的随机回环端口上提供，是协调工具的唯一入口；Cursor SDK 回调和 `vibeface tool` 都发 `{toolName, args, agentId}`，回 `{result}`；Cursor 的 owner 进程在每轮发送前安装该 attempt 的 bearer，回调按 bearer 授权，`agentId` 不授予权限 |
 
 网站不提供用户名密码注册或明文业务 RPC。`/api/local/setup` 要求正文为 `{}`，实际 TCP 来源为 loopback，Host 为字面 localhost 或 loopback 地址，Origin 与该入口完整一致，且不带 `Forwarded`、`X-Forwarded-*` 或 `X-Real-IP`。未初始化时返回 `{ kind: "uninitialized", invitation: { url, device_id, capability } }`，已有网络时返回 `{ kind: "initialized", entry, removed, local_launch? }`，`removed` 表示这台电脑已被移出。该响应不授予成员资格。
 
@@ -233,12 +238,14 @@ job 状态为 `queued`、`steering`、`claimed`、`running`、`cancelling`、`co
 
 ```text
 queued → claimed → running ─→ completed | failed
-             │        └─ cancelling ─→ cancelled（SDK 确认受管进程已退出）
+             │        └─ cancelling ─→ cancelled（Provider 确认终态，或 CLI 进程确认已退出）
              │                     └─→ interrupted（进程退出未确认，登记待核对）
              └ 重启时 running / cancelling ─→ interrupted（登记待核对）
 ```
 
 Node 每隔几秒用 signal 0 检查待核对记下的进程组，Codex 回合则按记下的线程和回合 ID 复查 App Server，仍在运行就中断。都已结束时自动结清，相应的 agent 任务记为中断；仍有进程组存活时，`conversation.checks` 才列出这条，等本人一键确认。结果未知的工作由 `works[].state == "unverified"` 表示，卡片 ID 为 `work:<work_id>`。同一工作只显示一条：`kind=task` 的工作结果未知时，目标上那一轮管理进程的待核对不再单独显示，结清工作项时一并结清。模型不能结清待核对。
+
+Cursor 已发送的回合遇到 bridge 崩溃、断流或超时后记为 `interrupted` 并登记待核对，只退休该 Bot 的进程组。下轮等待旧进程组结束后才能启动新进程，其他 Bot 的回合继续。Node 不重发未知结果的提示，也不因本地进程结束把它改成成功或 Provider 已确认取消。
 
 负责人每轮结束后，会话消息超过 20000 字节时写一条 `ContextCheckpoint`。写检查点时只读取最新检查点之后、它的 `covers` 没有覆盖的事件，结果与读取整个会话相同。检查点是确定性摘录，不是模型写的总结。`decisions` 是不截断区，记本人对提问的回答和本人确认的工作结果，后续检查点原样继承，只在超过 200 条时为限制事件大小丢最早的；`summary` 是滚动区，只保留最新的 6000 字节。`recent_user_requests` 是被覆盖的最近 20 条本人消息摘录，只是历史，不代表需要长期遵守的指令。提示放不下时检查点依次让出滚动摘要、较早的本人消息摘录和未完成工作，`decisions` 最后才省略，并给出 `decisions_omitted`。
 

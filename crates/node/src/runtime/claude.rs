@@ -1329,6 +1329,89 @@ mod tests {
         (record, calls)
     }
 
+    fn gated_config(place: &Place, client: &str) -> ManagerConfig {
+        let (record, _) = recorder();
+        let mut config = bot_config(place, record);
+        config.timeout_secs = 30;
+        config.codex_turn = Some(CodexTurn {
+            client_id: client.into(),
+            record: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            fresh_prompt: None,
+        });
+        let gate = place.dir.join("concurrent-gate");
+        std::fs::create_dir_all(&gate).unwrap();
+        config
+            .provider_env
+            .insert("FAKE_CLAUDE_GATE_DIR".into(), gate.display().to_string());
+        config.provider_env.insert(
+            "FAKE_CLAUDE_GATE_RELEASE".into(),
+            place.dir.join("concurrent-release").display().to_string(),
+        );
+        config
+    }
+
+    async fn wait_for_gate(place: &Place) -> Result<()> {
+        let gate = place.dir.join("concurrent-gate");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let count = std::fs::read_dir(&gate)
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or_default();
+                if count >= 16 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("all Claude turns reached the fixture gate")
+    }
+
+    async fn wait_for_interrupt(place: &Place) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if place
+                    .log()
+                    .iter()
+                    .any(|entry| entry["subtype"] == "interrupt")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the cancelled Claude turn received an interrupt")
+    }
+
+    fn release(place: &Place) {
+        std::fs::File::create(place.dir.join("concurrent-release")).unwrap();
+    }
+
+    fn concurrent_claude_turns(
+        place: &Place,
+        prompts: Vec<String>,
+    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
+        prompts
+            .into_iter()
+            .enumerate()
+            .map(|(index, prompt)| {
+                let config = gated_config(place, &format!("client-{index}"));
+                tokio::spawn(async move {
+                    manager::run_manager(
+                        &config,
+                        &prompt,
+                        None,
+                        |_| async { Ok(()) },
+                        tokio::sync::watch::channel(false).1,
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                })
+            })
+            .collect()
+    }
+
     /// One bot turn; returns its result, the session saved first, and the progress shown.
     async fn bot_turn(
         place: &Place,
@@ -1516,6 +1599,108 @@ mod tests {
             (error.outcome, error.failure.kind),
             (ManagerFailure::Failed, FailureKind::AuthFailed)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sixteen_claude_turns_overlap_and_keep_their_outputs() -> Result<()> {
+        let place = Place::new()?;
+        let prompts: Vec<_> = (0..16).map(|i| format!("marker-{i}")).collect();
+        let tasks = concurrent_claude_turns(&place, prompts.clone());
+        wait_for_gate(&place).await?;
+        assert_eq!(place.user_frames(), 16);
+        release(&place);
+        let mut sessions = std::collections::HashSet::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await??;
+            sessions.insert(result.session_id.context("Claude session")?);
+            assert_eq!(result.output, format!("done: marker-{index}"));
+        }
+        assert_eq!(sessions.len(), 16);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_of_sixteen_claude_turns_leaves_the_others_running() -> Result<()> {
+        let place = Place::new()?;
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for index in 0..16 {
+            let config = gated_config(&place, &format!("client-{index}"));
+            let prompt = format!("marker-{index}");
+            let (stop, cancel) = tokio::sync::watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                manager::run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { Ok(()) },
+                    cancel,
+                    |_| async { Ok(()) },
+                )
+                .await
+            }));
+        }
+        wait_for_gate(&place).await?;
+        stops[0].send(true)?;
+        wait_for_interrupt(&place).await?;
+        release(&place);
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("cancelled Claude turn")?;
+                assert!(
+                    error
+                        .downcast_ref::<manager::ManagerError>()
+                        .context("manager error")?
+                        .cancelled()
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
+        assert_eq!(
+            place
+                .log()
+                .iter()
+                .filter(|entry| entry["subtype"] == "interrupt")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_failed_claude_turn_does_not_stop_the_other_fifteen() -> Result<()> {
+        let place = Place::new()?;
+        let prompts: Vec<_> = (0..16)
+            .map(|i| {
+                if i == 0 {
+                    "fail marker-0".into()
+                } else {
+                    format!("marker-{i}")
+                }
+            })
+            .collect();
+        let tasks = concurrent_claude_turns(&place, prompts);
+        wait_for_gate(&place).await?;
+        release(&place);
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("failed Claude turn")?;
+                assert_eq!(
+                    error
+                        .downcast_ref::<manager::ManagerError>()
+                        .context("manager error")?
+                        .outcome,
+                    ManagerFailure::Failed
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
         Ok(())
     }
 

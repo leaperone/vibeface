@@ -1,13 +1,18 @@
-//! The Node's resident Cursor SDK bridge. Every Cursor turn shares one process, so the
-//! process only carries what is the same for every turn: the Node-wide shell environment and
-//! one callback token. A tool callback names its agent, and the agent picks the attempt.
 use super::*;
+use crate::manager::CursorInstance;
 use vibeface_bridge::agent::{SdkBridge, ToolCallbackConfig};
 
 /// Process groups of the running bridges, with the program each one runs.
 pub(super) const PIDFILE: &str = "cursor-sdk-bridge.pid";
 
 impl Runtime {
+    pub(crate) fn cursor_store_root(&self, owner: &CursorInstance) -> PathBuf {
+        self.data_dir
+            .join("cursor")
+            .join("instances")
+            .join(crate::crypto::digest(owner.key().as_bytes()))
+    }
+
     /// What every coordination Agent shell gets, whatever the turn.
     pub(crate) fn agent_env(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -47,9 +52,6 @@ impl Runtime {
         Ok(())
     }
 
-    /// Retires the current bridge after its running turns, then starts one for the current
-    /// settings when Cursor is the bot and its key is set, so the next reply starts warm.
-    /// A Cursor that is off only retires.
     pub(super) fn refresh_cursor(&self) {
         let Some(bridge) = self.cursor.get().cloned() else {
             return;
@@ -63,11 +65,21 @@ impl Runtime {
                 Some((manager, key?, env))
             });
         let bin = self.providers().bin(Provider::Cursor);
+        let owner = CursorInstance::Coordination;
+        let owner_key = owner.key();
+        let store_root = self.cursor_store_root(&owner);
         tokio::spawn(async move {
-            bridge.retire().await;
+            bridge.retire_all().await;
             if let Some((manager, api_key, env)) = launch
                 && let Err(error) = bridge
-                    .prewarm(&bin, &manager.workspace, &api_key, &env)
+                    .prewarm(
+                        &owner_key,
+                        &bin,
+                        &manager.workspace,
+                        &store_root,
+                        &api_key,
+                        &env,
+                    )
                     .await
             {
                 tracing::warn!(event = "cursor.prewarm_failed", %error, "Cursor SDK bridge did not start ahead of a reply");
@@ -75,16 +87,10 @@ impl Runtime {
         });
     }
 
-    /// Access for a tool call. A Cursor callback's bearer is the bridge-wide token, so the
-    /// agent it names selects the attempt; the attempt's own token then decides, which keeps
-    /// fencing and sealing unchanged.
-    pub(crate) async fn tool_access(&self, bearer: &str, agent_id: &str) -> Option<Access> {
-        let token = if bearer == self.cursor_callback_token {
-            self.cursor_agents.lock().await.get(agent_id)?.clone()
-        } else {
-            bearer.to_owned()
-        };
-        self.authorize_bearer(&token).await
+    /// Access for a tool call. Cursor installs the active attempt bearer on its owner bridge;
+    /// the existing authorization and fence checks then decide whether the call is still valid.
+    pub(crate) async fn tool_access(&self, bearer: &str, _agent_id: &str) -> Option<Access> {
+        self.authorize_bearer(bearer).await
     }
 }
 
@@ -103,7 +109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_callbacks_act_as_the_attempt_that_owns_the_agent() -> Result<()> {
+    async fn cursor_callbacks_use_the_attempt_bearer() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("vibeface-cursor-{}", uuid::Uuid::new_v4()));
         config::private_dir(&dir)?;
         let mut configuration = Config::local("127.0.0.1:0".parse()?, vec![], false);
@@ -124,24 +130,18 @@ mod tests {
                 .await
                 .insert(token.into(), access(conversation));
         }
-        node.cursor_agents.lock().await.extend([
-            ("agent-a".to_owned(), "attempt-a".to_owned()),
-            ("agent-b".to_owned(), "attempt-b".to_owned()),
-        ]);
-        let cursor = node.cursor_callback_token.clone();
         let conversation =
             |access: Option<Access>| access.and_then(|access| access.conversation_id);
 
         assert_eq!(
-            conversation(node.tool_access(&cursor, "agent-a").await).as_deref(),
+            conversation(node.tool_access("attempt-a", "agent-a").await).as_deref(),
             Some("conversation-a")
         );
         assert_eq!(
-            conversation(node.tool_access(&cursor, "agent-b").await).as_deref(),
+            conversation(node.tool_access("attempt-b", "agent-b").await).as_deref(),
             Some("conversation-b")
         );
-        assert!(node.tool_access(&cursor, "unknown-agent").await.is_none());
-        assert!(node.tool_access("attempt-a", "cli").await.is_some());
+        assert!(node.tool_access("unknown", "agent-a").await.is_none());
         assert!(
             node.tool_access("attempt-a", "agent-b")
                 .await
@@ -149,8 +149,8 @@ mod tests {
         );
 
         node.revoke_tool_token("attempt-a").await;
-        assert!(node.tool_access(&cursor, "agent-a").await.is_none());
-        assert!(node.tool_access(&cursor, "agent-b").await.is_some());
+        assert!(node.tool_access("attempt-a", "agent-a").await.is_none());
+        assert!(node.tool_access("attempt-b", "agent-b").await.is_some());
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

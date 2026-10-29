@@ -1320,7 +1320,7 @@ mod tests {
     use super::*;
     use crate::crypto::LocalIdentity;
     use crate::identity::{Genesis, Member, NetworkState};
-    use crate::manager::{Sdk, run_manager};
+    use crate::manager::{CodexTurn, Sdk, run_manager};
     use crate::work::WorkState;
 
     type Turns = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
@@ -1345,6 +1345,19 @@ mod tests {
             ("FAKE_PI_LOG".into(), dir.join("log").display().to_string()),
             ("FAKE_PI_MODE".into(), mode.into()),
         ])
+    }
+
+    fn gated_env(dir: &Path, mode: &str) -> BTreeMap<String, String> {
+        let mut variables = env(dir, mode);
+        variables.insert(
+            "FAKE_PI_GATE_DIR".into(),
+            dir.join("concurrent-gate").display().to_string(),
+        );
+        variables.insert(
+            "FAKE_PI_GATE_RELEASE".into(),
+            dir.join("concurrent-release").display().to_string(),
+        );
+        variables
     }
 
     fn log(dir: &Path) -> Vec<Value> {
@@ -1391,6 +1404,83 @@ mod tests {
             process_started: None,
             codex_turn,
         }
+    }
+
+    fn gated_bot(dir: &Path, pi: &Arc<Pi>, mode: &str, client: &str) -> ManagerConfig {
+        let mut config = bot(dir, pi, mode, None);
+        config.timeout_secs = 30;
+        config.provider_env = gated_env(dir, mode);
+        config.codex_turn = Some(CodexTurn {
+            client_id: client.into(),
+            record: Arc::new(|_, _| Box::pin(async { anyhow::Ok(()) })),
+            fresh_prompt: None,
+        });
+        config
+    }
+
+    async fn wait_for_gate(dir: &Path) -> Result<()> {
+        let gate = dir.join("concurrent-gate");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let count = std::fs::read_dir(&gate)
+                    .map(|entries| entries.filter_map(Result::ok).count())
+                    .unwrap_or_default();
+                if count >= 16 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("all pi turns reached the fixture gate")
+    }
+
+    async fn wait_for_abort(dir: &Path) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let aborted = std::fs::read_to_string(dir.join("log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|entry| entry["abort"] == true);
+                if aborted {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("the cancelled pi turn received an abort")
+    }
+
+    fn release(dir: &Path) {
+        std::fs::File::create(dir.join("concurrent-release")).unwrap();
+    }
+
+    fn concurrent_pi_turns(
+        dir: &Path,
+        pi: &Arc<Pi>,
+        modes: impl IntoIterator<Item = String>,
+    ) -> Vec<tokio::task::JoinHandle<Result<AgentResult>>> {
+        modes
+            .into_iter()
+            .enumerate()
+            .map(|(index, mode)| {
+                let config = gated_bot(dir, pi, &mode, &format!("client-{index}"));
+                let prompt = format!("marker-{index}");
+                tokio::spawn(async move {
+                    run_manager(
+                        &config,
+                        &prompt,
+                        None,
+                        |_| async { anyhow::Ok(()) },
+                        tokio::sync::watch::channel(false).1,
+                        |_| async { anyhow::Ok(()) },
+                    )
+                    .await
+                })
+            })
+            .collect()
     }
 
     /// The turn the bot recorded once pi took its prompt.
@@ -1631,6 +1721,109 @@ mod tests {
         let file = pi.pointer(&session)?.context("pointer")?.file;
         let last = entries(&file)?.pop().context("entry")?;
         assert_eq!(last["message"]["stopReason"], "aborted");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sixteen_pi_turns_overlap_and_keep_their_outputs() -> Result<()> {
+        let dir = scratch("concurrent");
+        let pi = Arc::new(Pi::new(&dir));
+        let tasks = concurrent_pi_turns(&dir, &pi, (0..16).map(|_| String::from("reply")));
+        wait_for_gate(&dir).await?;
+        release(&dir);
+        let mut sessions = std::collections::HashSet::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await??;
+            sessions.insert(result.session_id.context("pi session")?);
+            assert_eq!(result.output, format!("done: marker-{index}"));
+        }
+        assert_eq!(sessions.len(), 16);
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_of_sixteen_pi_turns_leaves_the_others_running() -> Result<()> {
+        let dir = scratch("concurrent-cancel");
+        let pi = Arc::new(Pi::new(&dir));
+        let mut tasks = Vec::with_capacity(16);
+        let mut stops = Vec::with_capacity(16);
+        for index in 0..16 {
+            let config = gated_bot(&dir, &pi, "reply", &format!("client-{index}"));
+            let prompt = format!("marker-{index}");
+            let (stop, cancel) = tokio::sync::watch::channel(false);
+            stops.push(stop);
+            tasks.push(tokio::spawn(async move {
+                run_manager(
+                    &config,
+                    &prompt,
+                    None,
+                    |_| async { anyhow::Ok(()) },
+                    cancel,
+                    |_| async { anyhow::Ok(()) },
+                )
+                .await
+            }));
+        }
+        wait_for_gate(&dir).await?;
+        stops[0].send(true)?;
+        wait_for_abort(&dir).await?;
+        release(&dir);
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("cancelled pi turn")?;
+                assert!(
+                    error
+                        .downcast_ref::<ManagerError>()
+                        .context("manager error")?
+                        .cancelled()
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
+        assert_eq!(
+            log(&dir)
+                .iter()
+                .filter(|entry| entry["abort"] == true)
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn one_failed_pi_turn_does_not_stop_the_other_fifteen() -> Result<()> {
+        let dir = scratch("concurrent-failure");
+        let pi = Arc::new(Pi::new(&dir));
+        let modes = (0..16).map(|index| {
+            if index == 0 {
+                String::from("fail")
+            } else {
+                String::from("reply")
+            }
+        });
+        let tasks = concurrent_pi_turns(&dir, &pi, modes);
+        wait_for_gate(&dir).await?;
+        release(&dir);
+        for (index, task) in tasks.into_iter().enumerate() {
+            let result = task.await?;
+            if index == 0 {
+                let error = result.err().context("failed pi turn")?;
+                assert_eq!(
+                    error
+                        .downcast_ref::<ManagerError>()
+                        .context("manager error")?
+                        .outcome,
+                    ManagerFailure::Failed
+                );
+            } else {
+                assert_eq!(result?.output, format!("done: marker-{index}"));
+            }
+        }
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

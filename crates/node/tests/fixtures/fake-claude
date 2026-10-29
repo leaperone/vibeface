@@ -16,11 +16,14 @@ Every argument list and stdin frame is appended to `$FAKE_CLAUDE_LOG` as one JSO
 import json
 import os
 import re
+import select
 import sys
 import time
 import uuid
 
 LOG = os.environ.get("FAKE_CLAUDE_LOG")
+GATE_DIR = os.environ.get("FAKE_CLAUDE_GATE_DIR")
+GATE_RELEASE = os.environ.get("FAKE_CLAUDE_GATE_RELEASE")
 
 
 def log(entry):
@@ -94,12 +97,34 @@ def answer_control(frame):
           "response": {"still_queued": []}}})
 
 
+def gated():
+    if not GATE_DIR or not GATE_RELEASE:
+        return False
+    os.makedirs(GATE_DIR, exist_ok=True)
+    open(os.path.join(GATE_DIR, f"{session}.started"), "w").close()
+    while not os.path.exists(GATE_RELEASE):
+        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not ready:
+            continue
+        control = json.loads(sys.stdin.readline())
+        log({"stdin": control.get("type"), "subtype": (control.get("request") or {}).get("subtype")})
+        if (control.get("request") or {}).get("subtype") == "interrupt":
+            answer_control(control)
+            record({"type": "user", "interruptedMessageId": "msg_1",
+                    "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}})
+            result("error_during_execution", True, "", "aborted_streaming")
+            return True
+    return False
+
+
 def turn(frame):
     prompt = prompt_of(frame["message"]).strip()
     mode = prompt.split()[0] if prompt else ""
     record({"type": "user", "uuid": frame.get("uuid"), "message": frame["message"]})
     emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd(),
           "model": option("--model") or "fake", "permissionMode": option("--permission-mode"), "tools": ["Bash"]})
+    if gated():
+        return
     if mode == "vanish":
         record({"type": "assistant", "message": {"id": "msg_v", "role": "assistant",
                 "content": [{"type": "text", "text": "finished while unwatched"}], "stop_reason": "end_turn"}})
