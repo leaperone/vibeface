@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
+import { eraseSoleManagerText, onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
@@ -18,6 +18,7 @@ import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { self } from '@/platform'
+import { factoryReset } from '@/lib/factory-reset'
 import { useRun } from '@/lib/use-run'
 
 const themes = [{ value: 'system', label: '跟随系统', icon: Monitor }, { value: 'light', label: '浅色', icon: Sun }, { value: 'dark', label: '深色', icon: Moon }] as const
@@ -36,7 +37,7 @@ export default function Settings() {
   const manager = device.ready?.principal.can_manage === true
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   const open = (which: 'leave' | 'reset') => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setConfirming(which) }
-  const reset = async () => { await device.factoryReset(); Appearance.setColorScheme('unspecified'); Uniwind.setTheme('system') }
+  const reset = () => factoryReset(device)
   // The confirmation opens at the foot of the page, below the fold on a phone.
   return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {/* The home header already shows the connection, so settings starts with the devices. */}
@@ -85,7 +86,7 @@ export default function Settings() {
           <Button variant="destructive" disabled={busy !== null} onPress={() => void run('leave', workspace.actions.leave)}><Icon as={LogOut} /><Text>断开</Text></Button>
         </View>
       </View> : confirming === 'reset' ? <View className="gap-3 px-1">
-        {sole ? <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{`${self}是唯一的管理设备，清除后这个网络就没有管理设备了。`}</Text></View> : null}
+        {sole ? <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{eraseSoleManagerText(self)}</Text></View> : null}
         <Text>{`清除${self}上的所有 Vibeface 数据，回到欢迎页。`}</Text>
         <ErrorText error={error} />
         <View className="flex-row justify-end gap-2">

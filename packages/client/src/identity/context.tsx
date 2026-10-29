@@ -6,6 +6,7 @@ import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, pa
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
 import { onlyManagerText } from './copy.ts'
+import { linkTarget } from './switch-network.ts'
 import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
@@ -82,6 +83,8 @@ type DeviceContextValue = {
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
   connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
+  /** Whether a join link leads into this device's own network, reachable or not, or another one; null: no join link. */
+  linkTarget(link: string): 'current' | 'other' | null
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
   startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>
@@ -1290,6 +1293,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
+    linkTarget(link) {
+      const networkId = ready?.principal.network_id ?? loadAuthenticated()?.networkId
+      const known = [...directory?.members ?? [], ...networkId ? [...savedEntries().filter(item => load(`network-for.${item.device_id}`) === networkId), ...loadEntrances(networkId)] : []]
+      return linkTarget(link, ticket => platform.secure.ticketDecode(ticket), known.map(item => item.device_id))
+    },
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
