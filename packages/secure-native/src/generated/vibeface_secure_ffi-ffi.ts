@@ -73,6 +73,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_free_handshake(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_vibeface_secure_ffi_fn_clone_identity(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_vibeface_secure_ffi_fn_free_identity(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
+    ubrn_uniffi_vibeface_secure_ffi_fn_clone_lanstream(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
+    ubrn_uniffi_vibeface_secure_ffi_fn_free_lanstream(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_vibeface_secure_ffi_fn_clone_membership(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_vibeface_secure_ffi_fn_free_membership(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_attestation_payload(networkId: Uint8Array, scopeId: Uint8Array, bodyJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -80,6 +82,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_func_governance_payload(eventJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_invite_signing_payload(recordJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_join_commit(joiner: Uint8Array, joinerNonce: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_connect(deviceId: Uint8Array, addrs: Uint8Array, timeoutMs: number): bigint;
+    ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(tag: Uint8Array, networkId: Uint8Array, deviceId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_recovery_open(envelope: Uint8Array, password: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_recovery_seal(payload: Uint8Array, password: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_func_short_code(networkId: Uint8Array, inviteId: Uint8Array, joiner: Uint8Array, admin: Uint8Array, adminNonce: Uint8Array, joinerNonce: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -104,6 +108,9 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_secret_hex(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_sign(uniffiSelf: bigint, domain: Uint8Array, payload: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_identity_sign_message(uniffiSelf: bigint, message: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_close(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): void;
+    ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(uniffiSelf: bigint): bigint;
+    ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_send(uniffiSelf: bigint, data: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_key_rotation(uniffiSelf: bigint, root: bigint, next: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_create_recovery_checkpoint(uniffiSelf: bigint, root: bigint, next: Uint8Array, membersJson: Uint8Array, headsJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_vibeface_secure_ffi_fn_method_membership_governance_template(uniffiSelf: bigint, issuer: Uint8Array, actionJson: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -115,6 +122,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_governance_payload(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_invite_signing_payload(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_join_commit(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_recovery_open(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_recovery_seal(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_func_short_code(): number;
@@ -139,6 +148,9 @@ interface NativeModuleInterface {
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_secret_hex(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv(): number;
+    ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_recovery_checkpoint(): number;
     ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_governance_template(): number;
@@ -147,6 +159,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_internal_fn_method_channel_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     ubrn_uniffi_internal_fn_method_handshake_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     ubrn_uniffi_internal_fn_method_identity_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
+    ubrn_uniffi_internal_fn_method_lanstream_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     ubrn_uniffi_internal_fn_method_membership_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     // Codegen call sites use these via `nativeModule().rustbuffer_alloc(...)`
     // and `nativeModule().rustbuffer_free(...)`. The JSI host object exposes

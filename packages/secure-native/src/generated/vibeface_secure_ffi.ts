@@ -6,7 +6,7 @@
 import nativeModule from "./vibeface_secure_ffi-ffi";
 import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct,
 } from "./vibeface_secure_ffi-ffi";
-import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterObject, FfiConverterOptional, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiTypeNameSymbol, variantOrdinalSymbol,
+import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterObject, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiError, UniffiInternalError, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiRustCallAsync, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
 const uniffiCaller = new UniffiRustCaller(() => ({ code: 0 }));
 
@@ -107,6 +107,56 @@ export function joinCommit(joiner: string, joinerNonce: string): string /*throws
     } finally {
         nativeModule().rustbuffer_free(__rb);
     }
+    }
+
+/**
+ * Opens one client stream to the Node `device_id` at `addrs` (`ip:port`) within `timeout_ms`.
+ */
+export async function lanConnect(deviceId: string, addrs: Array<string>, timeoutMs: number, asyncOpts_?: { signal: AbortSignal }): Promise<LanStreamLike> /*throws*/ {
+    const __stack = uniffiIsDebug ? new Error().stack : undefined;
+    try {
+        return await uniffiRustCallAsync(
+            /*rustCaller:*/ uniffiCaller,
+            /*rustFutureFunc:*/ () => {
+                return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_connect(FfiConverterString.lower(deviceId, nativeModule().rustbuffer_alloc),FfiConverterSequenceString.lower(addrs, nativeModule().rustbuffer_alloc),FfiConverterUInt32.lower(timeoutMs, nativeModule().rustbuffer_alloc)
+                );
+            },
+            /*pollFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_poll_u64,
+            /*cancelFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_u64,
+            /*completeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_complete_u64,
+            /*freeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_free_u64,
+            // Async returns always go through the JS-side converter: the
+            // FFI symbol returns the future handle (u64), and the user-level
+            // RustBuffer comes back via the shared `rust_future_complete_*`
+            // export. The bytes the runtime hands back must be deserialized
+            // here using the per-callable return-type converter.
+            /*liftFunc:*/ FfiConverterTypeLanStream.lift.bind(FfiConverterTypeLanStream),
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+            /*asyncOpts:*/ asyncOpts_,
+            /*errorHandler:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError)
+        );
+    } catch (__error: any) {
+        if (uniffiIsDebug && __error instanceof Error) {
+            __error.stack = __stack;
+        }
+        throw __error;
+    }
+    }
+
+/**
+ * Whether an advertised mDNS `tag` names `device_id` of `network_id`, by this device's clock.
+ */
+export function lanTagMatches(tag: string, networkId: string, deviceId: string): boolean {
+    return FfiConverterBool.lift(uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => {
+                return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(
+        FfiConverterString.lower(tag, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(networkId, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(deviceId, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    ));
     }
 
 export function recoveryOpen(envelope: ArrayBuffer, password: string): ArrayBuffer /*throws*/ {
@@ -247,6 +297,52 @@ export function verifyMembership(stateJson: string, expectedNetwork: string): Me
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
     ));
     }
+
+/**
+ * A frame from the Node: binary frames carry Noise, a text frame is a refusal.
+ */
+export type LanFrame = {
+    text: boolean,
+    data: ArrayBuffer
+}
+
+/**
+ * Generated factory for {@link LanFrame} record objects.
+ */
+export const LanFrame = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<LanFrame, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<LanFrame>,
+    });
+})();
+
+const FfiConverterTypeLanFrame = (() => {
+    type TypeName = LanFrame;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        readFromCursor(c: Cursor): TypeName {
+            return {
+                text: FfiConverterBool.readFromCursor(c), 
+                data: FfiConverterArrayBuffer.readFromCursor(c)
+            };
+        }
+        writeIntoCursor(value: TypeName, c: Cursor): void {
+            FfiConverterBool.writeIntoCursor(value.text, c);
+            FfiConverterArrayBuffer.writeIntoCursor(value.data, c);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterBool.allocationSize(value.text) +
+             FfiConverterArrayBuffer.allocationSize(value.data);
+            
+        }
+    };
+    return new FFIConverter();
+})();
 
 // Hermes (React Native ≥ 0.74) ships TextEncoder and encodeInto, but not
 // TextDecoder. For single-string decode (bytesToString), we polyfill via the
@@ -906,6 +1002,164 @@ const uniffiTypeIdentityObjectFactory: UniffiObjectFactory<IdentityLike> = (() =
 }})();
 const FfiConverterTypeIdentity = new FfiConverterObject(uniffiTypeIdentityObjectFactory);
 
+export type LanStreamLike = LanStream;
+
+
+/**
+ * One client stream to a Node. Frames go out in call order; the Node's pings are answered here.
+ */
+export class LanStream extends UniffiAbstractObject {
+
+    readonly [uniffiTypeNameSymbol] = "LanStream";
+    readonly [destructorGuardSymbol]: UniffiGcObject;
+    readonly [pointerLiteralSymbol]: UniffiHandle;
+    // No primary constructor declared for this class.
+private constructor(pointer: UniffiHandle) {
+    super();
+    this[pointerLiteralSymbol] = pointer;
+    this[destructorGuardSymbol] = uniffiTypeLanStreamObjectFactory.bless(pointer);
+}
+
+    
+
+    
+    close(): void {uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_close(
+                uniffiTypeLanStreamObjectFactory.clonePointer(this),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    );
+    }
+    
+/**
+ * The next binary or text frame, `None` once the Node ended the stream.
+ */
+    async recv(asyncOpts_?: { signal: AbortSignal }): Promise<LanFrame | undefined> /*throws*/ {
+    const __stack = uniffiIsDebug ? new Error().stack : undefined;
+    try {
+        return await uniffiRustCallAsync(
+            /*rustCaller:*/ uniffiCaller,
+            /*rustFutureFunc:*/ () => {
+                return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_recv(
+                    uniffiTypeLanStreamObjectFactory.clonePointer(this)
+                );
+            },
+            /*pollFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_poll_rust_buffer,
+            /*cancelFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_rust_buffer,
+            /*completeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_complete_rust_buffer,
+            /*freeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_free_rust_buffer,
+            // Async returns always go through the JS-side converter: the
+            // FFI symbol returns the future handle (u64), and the user-level
+            // RustBuffer comes back via the shared `rust_future_complete_*`
+            // export. The bytes the runtime hands back must be deserialized
+            // here using the per-callable return-type converter.
+            // Borrowed view over foreign memory: the call site owns the free,
+            // as on the sync paths. Unconditional — a no-op where buffers are
+            // already JS-owned.
+            /*liftFunc:*/ (__rb) => {
+                try {
+                    return FfiConverterOptionalTypeLanFrame.lift(__rb);
+                } finally {
+                    nativeModule().rustbuffer_free(__rb);
+                }
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+            /*asyncOpts:*/ asyncOpts_,
+            /*errorHandler:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError)
+        );
+    } catch (__error: any) {
+        if (uniffiIsDebug && __error instanceof Error) {
+            __error.stack = __stack;
+        }
+        throw __error;
+    }
+    }
+    
+/**
+ * Queues one binary frame. A failed write closes the stream, which `recv` then reports.
+ */
+    send(data: ArrayBuffer): void /*throws*/ {uniffiCaller.rustCallWithError(
+            /*liftError:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError),
+            /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_method_lanstream_send(
+                uniffiTypeLanStreamObjectFactory.clonePointer(this),
+        FfiConverterArrayBuffer.lower(data, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    );
+    }
+    
+
+    uniffiDestroy(): void {
+        const ptr = (this as any)[destructorGuardSymbol];
+        if (ptr !== undefined) {
+            const pointer = uniffiTypeLanStreamObjectFactory.pointer(this);
+            uniffiTypeLanStreamObjectFactory.freePointer(pointer);
+            uniffiTypeLanStreamObjectFactory.unbless(ptr);
+            delete (this as any)[destructorGuardSymbol];
+        }
+    }
+
+    static instanceOf(obj_: any): obj_ is LanStream {
+        return uniffiTypeLanStreamObjectFactory.isConcreteType(obj_);
+    }
+
+    
+}
+
+const uniffiTypeLanStreamObjectFactory: UniffiObjectFactory<LanStreamLike> = (() => {
+    
+    return {
+    create(pointer: UniffiHandle): LanStreamLike {
+        const instance = Object.create(LanStream.prototype);
+        instance[pointerLiteralSymbol] = pointer;
+        instance[destructorGuardSymbol] = this.bless(pointer);
+        instance[uniffiTypeNameSymbol] = "LanStream";
+        return instance;
+    },
+
+    
+    bless(p: UniffiHandle): UniffiGcObject {
+        return uniffiCaller.rustCall(
+            /*caller:*/ (status) =>
+                nativeModule().ubrn_uniffi_internal_fn_method_lanstream_ffi__bless_pointer(p, status),
+            /*liftString:*/ FfiConverterString.lift
+        );
+    },
+
+    unbless(ptr_: UniffiGcObject) {
+        ptr_.markDestroyed();
+    },
+
+    pointer(obj_: LanStreamLike): UniffiHandle {
+        if ((obj_ as any)[destructorGuardSymbol] === undefined) {
+            throw new UniffiInternalError.UnexpectedNullPointer();
+        }
+        return (obj_ as any)[pointerLiteralSymbol];
+    },
+
+    clonePointer(obj_: LanStreamLike): UniffiHandle {
+        const pointer = this.pointer(obj_);
+        return uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_clone_lanstream(pointer, callStatus),
+            /*liftString:*/ FfiConverterString.lift
+        );
+    },
+
+    freePointer(pointer: UniffiHandle): void {
+        uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_free_lanstream(pointer, callStatus),
+            /*liftString:*/ FfiConverterString.lift
+        );
+    },
+
+    isConcreteType(obj_: any): obj_ is LanStreamLike {
+        return obj_[destructorGuardSymbol] && obj_[uniffiTypeNameSymbol] === "LanStream";
+    },
+}})();
+const FfiConverterTypeLanStream = new FfiConverterObject(uniffiTypeLanStreamObjectFactory);
+
 export type MembershipLike = Membership;
 
 
@@ -1096,6 +1350,9 @@ const FfiConverterSequenceBytes = new FfiConverterArray(FfiConverterArrayBuffer)
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
+// FfiConverter for LanFrame | undefined
+const FfiConverterOptionalTypeLanFrame = new FfiConverterOptional(FfiConverterTypeLanFrame);
+
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
@@ -1132,6 +1389,12 @@ function uniffiEnsureInitialized() {
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_join_commit() !== 48575) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_join_commit");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 62811) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_connect");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches() !== 57767) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_recovery_open() !== 37044) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_recovery_open");
@@ -1205,6 +1468,15 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message() !== 62757) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_identity_sign_message");
     }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_close() !== 18743) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_lanstream_close");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv() !== 53041) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_lanstream_recv");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_lanstream_send() !== 4501) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_lanstream_send");
+    }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation() !== 27762) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_method_membership_create_key_rotation");
     }
@@ -1229,6 +1501,8 @@ export default Object.freeze({
     FfiConverterTypeChannel,
     FfiConverterTypeHandshake,
     FfiConverterTypeIdentity,
+    FfiConverterTypeLanFrame,
+    FfiConverterTypeLanStream,
     FfiConverterTypeMembership,
     FfiConverterTypeSecureError,
   }
