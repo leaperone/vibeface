@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -228,7 +228,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
       ? { label: terms.readOnly.label, icon: terms.readOnly.icon, tone: "text-warning" }
       : link.kind === "online" && link.catchingUp || workspace.writeNotice || workspace.writeState.state === "aligning" || workspace.data && workspace.incomplete
         ? { label: terms.syncing.label, icon: terms.syncing.icon, tone: "text-info" }
-        : { label: "在线", icon: terms.encrypted.icon, tone: "text-success", encrypted: true }
+        : { label: "在线", icon: Wifi, tone: "text-success", encrypted: true }
   return <Popover.Root>
     <Popover.Trigger asChild>
       <button type="button" className="flex h-10 w-full items-center gap-2 rounded-md px-2 text-left text-meta hover:bg-sidebar-accent active:bg-sidebar-accent max-md:h-11" aria-label={`${name} · ${state.encrypted ? `${terms.encrypted.label} · ` : ""}${state.label}`}>
@@ -254,7 +254,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
             </button>
           </li>)}</ul>
         </> : null}
-        {entrances.length > 1 ? <>
+        {entrances.length > 1 && device.ready?.principal.can_manage ? <>
           <p className="mt-1 font-medium">可切换的访问地址</p>
           <ul className="grid gap-1" aria-label="可切换的访问地址">{entrances.map((item) => <li key={item.device_id} className="flex min-w-0 items-center gap-2">
             <span className="min-w-0 flex-1 truncate" title={item.gateway_url}>{device.directory?.members.find((member) => member.device_id === item.device_id)?.name || addressName(item.gateway_url)}</span>
