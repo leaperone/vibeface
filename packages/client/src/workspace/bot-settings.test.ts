@@ -133,5 +133,5 @@ test("a bot lists its model per provider and its skills, null meaning every skil
   const bot = { bot_id: "b", conversation_id: "c", name: "Ops", instructions: "", event_hash: "h", last_message: null }
   const [all, some] = parseBots({ bots: [{ ...bot, models: {}, skills: null }, { ...bot, models: { cursor: "gpt-x" }, skills: ["s"] }] })
   assert.deepEqual([all?.models, all?.skills, some?.models, some?.skills], [{}, null, { cursor: "gpt-x" }, ["s"]])
-  assert.throws(() => parseBots({ bots: [{ ...bot, models: { claude: "x" }, skills: null }] }))
+  assert.throws(() => parseBots({ bots: [{ ...bot, models: { codex_sdk: "x" }, skills: null }] }))
 })

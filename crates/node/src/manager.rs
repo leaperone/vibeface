@@ -34,6 +34,33 @@ pub enum Sdk {
     /// Turns run on this Node's Codex App Server at `socket`; `vibeface tool` reads the turn
     /// from the Shell environment the thread was created with.
     Codex { socket: PathBuf },
+    /// Each turn is one `claude -p` process; `processes` records its group.
+    Claude {
+        bin: PathBuf,
+        processes: Arc<crate::runtime::claude::Processes>,
+    },
+    /// Each turn runs its own `pi --mode rpc` process; see `runtime::pi`.
+    Pi {
+        bin: PathBuf,
+        pi: Arc<crate::runtime::pi::Pi>,
+    },
+    /// Turns run on this Node's opencode serve; `vibeface tool` reads the turn from the tool
+    /// environment the serve's plugin gives the session's shells.
+    Opencode {
+        server: Arc<crate::runtime::opencode::Opencode>,
+    },
+}
+
+impl Sdk {
+    pub fn provider(&self) -> crate::providers::Provider {
+        match self {
+            Sdk::Cursor { .. } => crate::providers::Provider::Cursor,
+            Sdk::Codex { .. } => crate::providers::Provider::Codex,
+            Sdk::Claude { .. } => crate::providers::Provider::Claude,
+            Sdk::Pi { .. } => crate::providers::Provider::Pi,
+            Sdk::Opencode { .. } => crate::providers::Provider::Opencode,
+        }
+    }
 }
 
 /// Records a turn's `(thread, turn)` on the App Server; the turn is `None` before `turn/start`.
@@ -62,7 +89,7 @@ pub struct ManagerConfig {
     pub timeout_secs: u64,
     pub custom_tools: BTreeMap<String, CustomToolConfig>,
     pub tool_cli: Option<PathBuf>,
-    /// Guidance that holds for the whole Codex thread; see `codex_instructions`.
+    /// Guidance that holds for the bot's whole thread; see `bot_instructions`.
     pub instructions: String,
     pub tool_env: BTreeMap<String, String>,
     /// Lets this turn's tool calls act as it; without one they are refused.
@@ -200,14 +227,51 @@ where
             )
             .await
         }
+        Sdk::Claude { bin, processes } => {
+            crate::runtime::claude::run_bot(
+                config,
+                bin,
+                processes,
+                prompt,
+                previous_session_id,
+                persist_session,
+                cancel,
+                progress,
+            )
+            .await
+        }
+        Sdk::Pi { bin, pi } => {
+            pi.run_bot(
+                config,
+                bin,
+                prompt,
+                previous_session_id,
+                persist_session,
+                cancel,
+                progress,
+            )
+            .await
+        }
+        Sdk::Opencode { server } => {
+            server
+                .run_turn(
+                    config,
+                    prompt,
+                    previous_session_id,
+                    persist_session,
+                    cancel,
+                    progress,
+                )
+                .await
+        }
     }
 }
 
-/// The developer instructions a Codex thread starts and resumes with: how to reach Node tools,
-/// their catalog, then `instructions`. Codex keeps them with the thread, so turns carry only
-/// their own prompt. Node tools go through the CLI in its Shell, whose environment carries the
-/// turn's scope.
-pub fn codex_instructions(
+/// The instructions a bot's thread runs with: how to reach Node tools, their catalog, then
+/// `instructions`. They stay out of each turn's prompt: Codex takes them as the thread's
+/// developer instructions, Claude Code, pi and opencode as a system prompt with every turn.
+/// Node tools go through the CLI in the bot's shell, whose environment carries the turn's scope.
+pub fn bot_instructions(
     tool_cli: Option<&Path>,
     tools: &BTreeMap<String, CustomToolConfig>,
     instructions: &str,
@@ -237,7 +301,7 @@ pub fn codex_instructions(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    let host = "Your shell has full access to this host: you can edit files, run git and gh, and call this device's Codex App Server with `vibeface codex`. When Codex asks something (an approval, a question, a login), `vibeface codex requests` lists the waiting requests and `vibeface codex respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
+    let host = "Your shell has full access to this host: you can edit files and run git and gh. When this device runs Codex, `vibeface codex` calls its App Server. When a session asks something (an approval, a question, a login), `vibeface requests` lists the waiting requests and `vibeface respond REQUEST_ID 'RESULT_JSON'` answers one; raise a decision card with `vibeface triage raise --request-id` only when the user must decide, explaining the decision in plain words without the command itself.";
     let text = format!(
         "Node tools are available through your command-execution tool. Run:\n{executable} tool TOOL_NAME --json 'JSON_OBJECT'\nFor {with_call_ref}, add --call-ref 'UNIQUE_INTENT_REFERENCE'. Choose the reference once before the first request and preserve it across CLI processes. Reuse that reference with identical arguments after a partial response. On a timeout, query call_lookup with {{\"call_ref\":\"THE_SAME_REFERENCE\"}}; never replace an uncertain call with a new reference. Different authorized intentions need different references.\nThe CLI uses its scoped loopback connection and prints JSON. Do not read or print credential variables. Report failed calls honestly. Conversation and network scope come from the CLI. {host}\n\nAvailable tools:\n{catalog}"
     );
@@ -426,7 +490,7 @@ where
         thread_params["model"] = json!(config.model);
     }
     // Resuming sends them again: a thread Codex reloads rebuilds its context from them.
-    let instructions = codex_instructions(
+    let instructions = bot_instructions(
         config.tool_cli.as_deref(),
         &config.custom_tools,
         &config.instructions,
@@ -589,7 +653,7 @@ where
         usage: None,
     })
 }
-fn secret_values(config: &ManagerConfig) -> Vec<String> {
+pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
         .tool_env
         .values()
@@ -609,9 +673,7 @@ fn secret_values(config: &ManagerConfig) -> Vec<String> {
             })
             .map(|(_, value)| value),
     );
-    if matches!(config.sdk, Sdk::Codex { .. })
-        && let Ok(keys) = provider_environment_keys(&config.provider_env)
-    {
+    if let Ok(keys) = config.sdk.provider().key_variables(&config.provider_env) {
         values.extend(
             keys.iter()
                 .filter_map(|key| std::env::var(key).ok())
@@ -683,13 +745,13 @@ fn provider_keys_from_config(source: &str) -> Result<Vec<String>> {
     keys.dedup();
     Ok(keys)
 }
-fn redact_string(mut text: String, secrets: &[String]) -> String {
+pub(crate) fn redact_string(mut text: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|value| !value.is_empty()) {
         text = text.replace(secret, "[redacted]");
     }
     text
 }
-fn redact(value: Value, secrets: &[String]) -> Value {
+pub(crate) fn redact(value: Value, secrets: &[String]) -> Value {
     match value {
         Value::String(text) => Value::String(redact_string(text, secrets)),
         Value::Array(items) => Value::Array(

@@ -1,7 +1,7 @@
 //! The owner's local scheduling state. A job is keyed by its trigger, and its reply is written
 //! in the same transaction that ends it, so nothing is published twice or lost.
 use super::{Store, authorize_node_from, conversation_from, log, message_from};
-use crate::{crypto::LocalIdentity, model::*, scheduling::*};
+use crate::{crypto::LocalIdentity, model::*, providers::Provider, scheduling::*};
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -389,13 +389,14 @@ fn holds_turn(
 }
 
 /// The turn a user message may join: the session's running reply to a user message, started by
-/// this process and still held by this Node, on an App Server turn.
+/// this process and still held by this Node, on a turn of `provider`.
 fn steer_target(
     connection: &Connection,
     network: &str,
     local: &str,
     boot: &str,
     session: &SchedulerSession,
+    provider: Provider,
 ) -> Result<Option<SteerTarget>> {
     let Some(trigger) = &session.active else {
         return Ok(None);
@@ -415,6 +416,7 @@ fn steer_target(
     }
     Ok(
         manager_turn(connection, &attempt.id)?.map(|(thread_id, turn_id)| SteerTarget {
+            provider,
             attempt_id: attempt.id.clone(),
             thread_id,
             turn_id,
@@ -1865,16 +1867,19 @@ impl Store {
     }
 
     /// Queued user messages that may join the running reply of their conversation: plain text
-    /// while a reply to a user message runs on an App Server turn this Node holds.
+    /// while a reply to a user message runs on a turn of `provider` this Node holds.
     pub fn steer_candidates(
         &self,
         network: &str,
         local: &str,
         boot: &str,
+        provider: Provider,
     ) -> Result<Vec<SteerCandidate>> {
         let mut candidates = Vec::new();
         for session in query_sessions(&self.connection, "active IS NOT NULL", [])? {
-            if let Some(target) = steer_target(&self.connection, network, local, boot, &session)? {
+            if let Some(target) =
+                steer_target(&self.connection, network, local, boot, &session, provider)?
+            {
                 for job in queued_jobs(&self.connection, &session.conversation_id)? {
                     if let Some(text) = steerable_text(&self.connection, network, &job)? {
                         candidates.push(SteerCandidate {
@@ -1911,7 +1916,8 @@ impl Store {
         };
         if job.state != JobState::Queued
             || steerable_text(&tx, network, &job)?.is_none()
-            || steer_target(&tx, network, local, boot, &session)?.as_ref() != Some(into)
+            || steer_target(&tx, network, local, boot, &session, into.provider)?.as_ref()
+                != Some(into)
         {
             return Ok(false);
         }

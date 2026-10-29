@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Result, bail};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -83,7 +83,16 @@ impl Host {
             .flat_map(std::env::split_paths)
             .filter(|dir| dir.is_absolute())
             .collect();
-        dirs.extend(self.home.iter().map(|home| home.join(".local/bin")));
+        let home = |dir: &str| self.home.as_ref().map(|home| home.join(dir));
+        dirs.extend(home(".local/bin"));
+        // Where Claude Code's and opencode's own installers put them.
+        // ponytail: pi comes from npm, found here only in Homebrew's or the official Node's
+        // global folder; another one (nvm, a custom prefix) needs PATH or a chosen path.
+        dirs.extend(match name {
+            "claude" => home(".claude/local"),
+            "opencode" => home(".opencode/bin"),
+            _ => None,
+        });
         dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
         if name == "codex" {
             dirs.push("/Applications/Codex.app/Contents/Resources".into());
@@ -194,22 +203,20 @@ pub fn sessions_dir(codex_home: &Path) -> Option<PathBuf> {
     sessions.is_dir().then_some(sessions)
 }
 
-/// Provider paths for this device, each `None` when it stays as it is. Only paths and the
-/// execution switch: variables with keys never pass through here.
+/// Provider paths for this device, each `None` when it stays as it is, and the providers to
+/// turn execution on for. Variables with keys never pass through here.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Paths {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution: Option<bool>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub execution: BTreeSet<Provider>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_server: Option<AppServer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_home: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codex_bin: Option<PathBuf>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bins: BTreeMap<Provider, PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_sessions: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor_sdk_bin: Option<PathBuf>,
 }
 
 /// The parts of this device's configuration that provider paths live in.
@@ -225,29 +232,36 @@ impl Paths {
     }
 
     /// Which settings this sets, for logs that must not hold the paths.
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<String> {
         [
-            ("execution", self.execution.is_some()),
+            ("execution", !self.execution.is_empty()),
             ("app_server", self.app_server.is_some()),
             ("codex_home", self.codex_home.is_some()),
-            ("codex_bin", self.codex_bin.is_some()),
             ("codex_sessions", self.codex_sessions.is_some()),
-            ("cursor_sdk_bin", self.cursor_sdk_bin.is_some()),
         ]
         .into_iter()
-        .filter_map(|(name, set)| set.then_some(name))
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| name.to_owned())
+        .chain(
+            self.bins
+                .keys()
+                .map(|provider| format!("{}_bin", provider.name())),
+        )
         .collect()
     }
 
     /// `other`'s values for what this leaves unset.
     pub fn or(self, other: Paths) -> Paths {
+        let mut bins = other.bins;
+        bins.extend(self.bins);
+        let mut execution = other.execution;
+        execution.extend(self.execution);
         Paths {
-            execution: self.execution.or(other.execution),
+            execution,
             app_server: self.app_server.or(other.app_server),
             codex_home: self.codex_home.or(other.codex_home),
-            codex_bin: self.codex_bin.or(other.codex_bin),
+            bins,
             codex_sessions: self.codex_sessions.or(other.codex_sessions),
-            cursor_sdk_bin: self.cursor_sdk_bin.or(other.cursor_sdk_bin),
         }
     }
 
@@ -259,7 +273,9 @@ impl Paths {
         Paths {
             execution: self
                 .execution
-                .filter(|on| *on != target.local.switches.execution),
+                .difference(&target.local.switches.execution)
+                .copied()
+                .collect(),
             app_server: self
                 .app_server
                 .filter(|server| *server != target.local.switches.codex_app_server),
@@ -267,19 +283,21 @@ impl Paths {
                 target.local.env.get(Provider::Codex).get(CODEX_HOME)
                     != Some(&home.to_string_lossy().into_owned())
             }),
-            codex_bin: differs(self.codex_bin, Some(&target.local.codex_bin)),
+            bins: self
+                .bins
+                .into_iter()
+                .filter(|(provider, bin)| *bin != target.local.bin(*provider))
+                .collect(),
             codex_sessions: differs(self.codex_sessions, target.triage.codex_sessions.as_ref()),
-            cursor_sdk_bin: differs(
-                self.cursor_sdk_bin,
-                target.manager.as_ref().map(|m| &m.cursor_sdk_bin),
-            ),
         }
     }
 
     pub fn apply(&self, target: Target) -> Result<()> {
-        if let Some(on) = self.execution {
-            target.local.switches.execution = on;
-        }
+        target
+            .local
+            .switches
+            .execution
+            .extend(self.execution.iter().copied());
         if let Some(server) = &self.app_server {
             target.local.switches.codex_app_server = server.clone();
         }
@@ -289,19 +307,9 @@ impl Paths {
                 BTreeMap::from([(CODEX_HOME.into(), Some(home.to_string_lossy().into_owned()))]),
             )?;
         }
-        if let Some(bin) = &self.codex_bin {
-            target.local.codex_bin = bin.clone();
-        }
+        target.local.bins.extend(self.bins.clone());
         if let Some(sessions) = &self.codex_sessions {
             target.triage.codex_sessions = Some(sessions.clone());
-        }
-        if let Some(bin) = &self.cursor_sdk_bin {
-            match target.manager {
-                Some(manager) if manager.provider == Provider::Cursor => {
-                    manager.cursor_sdk_bin = bin.clone()
-                }
-                _ => bail!("the Cursor program is set while Cursor runs the bot"),
-            }
         }
         Ok(())
     }
@@ -312,11 +320,12 @@ impl Paths {
 pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
     let local = &*target.local;
     let codex = codex
-        || local.switches.execution
-        || target
-            .manager
-            .as_ref()
-            .is_some_and(|m| m.provider.on_app_server());
+        || local.switches.app_server_used(
+            target
+                .manager
+                .as_ref()
+                .is_some_and(|m| m.provider.on_app_server()),
+        );
     let home_set = local.env.get(Provider::Codex).contains_key(CODEX_HOME);
     let mut paths = Paths::default();
     let server = &local.switches.codex_app_server;
@@ -345,9 +354,6 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
         } else if spawn && !home_set {
             paths.codex_home = Some(host.codex_home()?);
         }
-        if spawn && !runnable(&local.codex_bin, host.path.as_ref()) {
-            paths.codex_bin = bare(&local.codex_bin).and_then(|name| host.program(name));
-        }
     }
     if target.triage.codex_sessions.is_none() {
         if target.triage.scan_codex_sessions {
@@ -359,11 +365,19 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
             paths.codex_sessions = host.codex_home().ok().as_deref().and_then(sessions_dir);
         }
     }
-    if let Some(manager) = target.manager.as_ref()
-        && manager.provider == Provider::Cursor
-        && !runnable(&manager.cursor_sdk_bin, host.path.as_ref())
-    {
-        paths.cursor_sdk_bin = bare(&manager.cursor_sdk_bin).and_then(|name| host.program(name));
+    let bot = target.manager.as_ref().map(|manager| manager.provider);
+    for provider in Provider::ALL {
+        let launches = match provider.on_app_server() {
+            true => codex && spawn,
+            false => bot == Some(provider) || local.switches.execution.contains(&provider),
+        };
+        let bin = local.bin(provider);
+        if launches
+            && !runnable(&bin, host.path.as_ref())
+            && let Some(found) = bare(&bin).and_then(|name| host.program(name))
+        {
+            paths.bins.insert(provider, found);
+        }
     }
     Ok(paths)
 }
@@ -373,7 +387,7 @@ pub fn missing(target: &Target, codex: bool, host: &Host) -> Result<Paths> {
 pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Result<Paths> {
     let mut local = Local {
         switches: config.providers.clone(),
-        codex_bin: config.codex_bin.clone(),
+        bins: std::mem::take(&mut config.bins),
         env: std::mem::take(env),
     };
     let filled = missing(
@@ -393,7 +407,7 @@ pub fn complete(config: &mut Config, env: &mut ProviderEnv, host: &Host) -> Resu
         })?;
     }
     config.providers = local.switches;
-    config.codex_bin = local.codex_bin;
+    config.bins = local.bins;
     *env = local.env;
     filled
 }
@@ -445,7 +459,7 @@ mod tests {
     fn local() -> Local {
         Local {
             switches: Providers::default(),
-            codex_bin: "codex".into(),
+            bins: BTreeMap::new(),
             env: ProviderEnv::default(),
         }
     }
@@ -626,7 +640,7 @@ mod tests {
         // Saved by a Node before discovery: execution on, nothing to run it with.
         let mut config =
             serde_json::to_value(Config::local("127.0.0.1:0".parse()?, vec![], false))?;
-        config["providers"]["execution"] = true.into();
+        config["providers"]["execution"] = serde_json::json!(["codex"]);
         std::fs::write(dir.join("config.json"), serde_json::to_vec(&config)?)?;
         let host = Host {
             codex_home: None,
@@ -669,7 +683,6 @@ mod tests {
             provider: Provider::Cursor,
             workspace: root.clone(),
             model: "auto".into(),
-            cursor_sdk_bin: "cursor-sdk-bridge".into(),
         });
         let (mut local, mut triage) = (local(), TriageConfig::default());
         let found = missing(
@@ -681,8 +694,10 @@ mod tests {
             false,
             &host,
         )?;
-        assert_eq!(found.cursor_sdk_bin, Some(bridge));
-        manager.as_mut().unwrap().cursor_sdk_bin = root.join("chosen/cursor-sdk-bridge");
+        assert_eq!(found.bins, BTreeMap::from([(Provider::Cursor, bridge)]));
+        local
+            .bins
+            .insert(Provider::Cursor, root.join("chosen/cursor-sdk-bridge"));
         assert!(
             missing(
                 &Target {
@@ -703,5 +718,28 @@ mod tests {
         );
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn claude_code_and_opencode_are_found_where_their_installers_put_them() {
+        let root = scratch("installers");
+        let host = Host {
+            codex_home: None,
+            home: Some(root.clone()),
+            path: Some("/usr/bin:/bin".into()),
+        };
+        for path in [".claude/local/claude", ".opencode/bin/opencode"].map(|p| root.join(p)) {
+            program(&path);
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(host.program(name), Some(path.clone()));
+        }
+        let native = root.join(".local/bin/claude");
+        program(&native);
+        assert_eq!(
+            host.program("claude"),
+            Some(native),
+            "the native install comes first"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

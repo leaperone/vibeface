@@ -1,10 +1,12 @@
 //! The coordination runtime's App Server: the process, its socket and the Node's own client.
 //! A managed App Server runs in its own process group recorded in a pidfile, so a crash of
 //! this Node never leaves an unmanaged one behind: the next start kills the recorded group.
+use super::executor::{Executor, SteerAck, SteerTrace};
 use super::*;
 use crate::providers::{CodexLaunch, CodexTarget};
 use crate::scheduling::{SteerOutcome, SteerTarget};
-use crate::work::{Probe, Signal};
+use crate::work::{Probe, Signal, WorkRecord, WorkSpec};
+use futures_util::future::BoxFuture;
 use std::os::unix::process::CommandExt as _;
 use vibeface_bridge::{
     codex::{CodexClient, CodexError, ExecEvent},
@@ -48,29 +50,6 @@ fn plan_summary(params: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// How the App Server took a steer.
-#[derive(Debug, PartialEq)]
-pub(crate) enum SteerAck {
-    Accepted,
-    /// Nothing was sent, as when the turn had just ended.
-    Refused(String),
-    /// It may have been sent; only the thread tells.
-    Unknown,
-}
-
-/// Where a steered message went. Codex takes steered input only into a running turn.
-#[derive(Debug, PartialEq)]
-pub(crate) enum SteerTrace {
-    /// The thread does not show the target turn.
-    TargetUnseen,
-    /// It may still arrive: the turn holding it, or the target turn, still runs.
-    Pending,
-    /// The target turn ended without it: it never arrived.
-    NotArrived,
-    /// It is in a turn that ended: answered when that is the completed target turn.
-    Ended(SteerOutcome),
 }
 
 fn steer_trace(turns: &[Value], message_id: &str, target: &str) -> SteerTrace {
@@ -169,40 +148,6 @@ impl CodexServer {
             .await
             .map(|_| ())
     }
-    /// Sends the user's queued message into the running turn of `into`, keyed by its message ID.
-    pub(crate) async fn steer(&self, into: &SteerTarget, message_id: &str, text: &str) -> SteerAck {
-        let message = json!({"message_id":message_id,"text":text});
-        let text = format!(
-            "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
-        );
-        let params = json!({"threadId":into.thread_id,"expectedTurnId":into.turn_id,
-            "clientUserMessageId":message_id,
-            "input":[{"type":"text","text":text,"text_elements":[]}]});
-        match self.client.request("turn/steer", params).await {
-            Ok(_) => SteerAck::Accepted,
-            Err(error) if !error.uncertain => SteerAck::Refused(error.message),
-            Err(_) => SteerAck::Unknown,
-        }
-    }
-
-    /// Where a message steered into `into` went, as its thread shows it; `None` when the thread
-    /// could not be read. It only reads.
-    pub(crate) async fn read_back(
-        &self,
-        into: &SteerTarget,
-        message_id: &str,
-    ) -> Option<SteerTrace> {
-        let reply = self
-            .client
-            .request(
-                "thread/read",
-                json!({"threadId":into.thread_id,"includeTurns":true}),
-            )
-            .await
-            .ok()?;
-        let turns = reply["thread"]["turns"].as_array()?;
-        Some(steer_trace(turns, message_id, &into.turn_id))
-    }
 
     /// The connection the turns the Node reads now run under; see `Handle::epoch`.
     pub(crate) fn epoch(&self) -> u64 {
@@ -255,6 +200,81 @@ impl CodexServer {
                 error: snapshot.error,
             },
             None => Probe::Missing,
+        })
+    }
+}
+
+/// A Codex work is sent by the coordination Agent on its own App Server connection; the Node's
+/// client reads, stops and steers turns.
+impl Executor for CodexServer {
+    fn start<'a>(
+        &'a self,
+        _: &'a Arc<Runtime>,
+        _: &'a str,
+        _: &'a WorkSpec,
+        _: Option<&'a str>,
+        _: &'a Value,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+
+    fn probe<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<Probe>> {
+        Box::pin(async move {
+            let thread = work.state.thread().context("the work has no thread")?;
+            let turn = work.state.handle().map(|handle| handle.turn_id.as_str());
+            CodexServer::probe(self, thread, turn, &work.work_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("App Server probe failed: {error}"))
+        })
+    }
+
+    fn interrupt<'a>(&'a self, work: &'a WorkRecord) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let handle = work.state.handle().context("the work has no turn")?;
+            CodexServer::interrupt(self, &handle.thread_id, &handle.turn_id)
+                .await
+                .map_err(|error| anyhow::anyhow!("interrupt was not confirmed: {error}"))
+        })
+    }
+
+    fn steer<'a>(
+        &'a self,
+        into: &'a SteerTarget,
+        message_id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, SteerAck> {
+        let message = json!({"message_id":message_id,"text":text});
+        let text = format!(
+            "The user sent another message in this conversation while you were replying. Take it into account and answer it in this same reply.\n\n{message}"
+        );
+        let params = json!({"threadId":into.thread_id,"expectedTurnId":into.turn_id,
+            "clientUserMessageId":message_id,
+            "input":[{"type":"text","text":text,"text_elements":[]}]});
+        Box::pin(async move {
+            match self.client.request("turn/steer", params).await {
+                Ok(_) => SteerAck::Accepted,
+                Err(error) if !error.uncertain => SteerAck::Refused(error.message),
+                Err(_) => SteerAck::Unknown,
+            }
+        })
+    }
+
+    fn read_back<'a>(
+        &'a self,
+        into: &'a SteerTarget,
+        message_id: &'a str,
+    ) -> BoxFuture<'a, Option<SteerTrace>> {
+        Box::pin(async move {
+            let reply = self
+                .client
+                .request(
+                    "thread/read",
+                    json!({"threadId":into.thread_id,"includeTurns":true}),
+                )
+                .await
+                .ok()?;
+            let turns = reply["thread"]["turns"].as_array()?;
+            Some(steer_trace(turns, message_id, &into.turn_id))
         })
     }
 }
@@ -965,10 +985,10 @@ mod tests {
         )?;
         let mut local = Local {
             switches: Default::default(),
-            codex_bin: fixture.clone(),
+            bins: BTreeMap::from([(Provider::Codex, fixture.clone())]),
             env,
         };
-        local.switches.execution = true;
+        local.switches.execution.insert(Provider::Codex);
         local.switches.codex_app_server.mode = AppServerMode::Spawn;
         let identity = LocalIdentity::generate();
         let (events, _events) = mpsc::unbounded_channel();
@@ -990,7 +1010,7 @@ mod tests {
         assert!(second[1].ends_with(" fixture-replaced-key none"));
         assert!(ended(pid.parse()?).await, "the old App Server ends");
 
-        local.switches.execution = false;
+        local.switches.execution.clear();
         server.retarget(local.codex_target(false));
         let second_group: i32 = second[1].split_once(' ').unwrap().0.parse()?;
         assert!(
@@ -1069,13 +1089,13 @@ mod tests {
         std::os::unix::fs::symlink(&first, &control)?;
         let local = Local {
             switches: crate::providers::Providers {
-                execution: true,
+                execution: [Provider::Codex].into(),
                 codex_app_server: crate::providers::AppServer {
                     mode: AppServerMode::System,
                     socket: Some(control.clone()),
                 },
             },
-            codex_bin: program,
+            bins: BTreeMap::from([(Provider::Codex, program)]),
             env: ProviderEnv::default(),
         };
         assert_eq!(
@@ -1139,13 +1159,13 @@ mod tests {
         let candidate = sockets.join("control.sock");
         let local = Local {
             switches: crate::providers::Providers {
-                execution: true,
+                execution: [Provider::Codex].into(),
                 codex_app_server: crate::providers::AppServer {
                     mode: AppServerMode::System,
                     socket: Some(candidate.clone()),
                 },
             },
-            codex_bin: "codex".into(),
+            bins: BTreeMap::new(),
             env: ProviderEnv::default(),
         };
         let identity = LocalIdentity::generate();

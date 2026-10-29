@@ -27,8 +27,8 @@
 工作线程用 `approvalPolicy=never` 启动，正常不会收到审批。仍可能到达的请求（Node 订阅的线程上的，或不属于任何线程的）由 bridge 交给 Node，Node 不按方法自动回复：
 
 1. Node 给请求分配 `request_id`，挂起并记入 `node.log`（方法和线程，不含命令文本），然后作为 `needs_input` 事件（带 `request_id`）立即唤醒本机协调 Agent。事件只含方法、原因和问题，命令、补丁和路径不进事件。
-2. Agent 用 `vibeface codex requests` 查看挂起的请求（含完整参数），用 `vibeface codex respond <request_id> '<result-json>'` 回答。同一 `request_id` 只回答一次，重复调用返回第一次的结果。
-3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题> --choice 批准 --choice 拒绝` 在负责该线程的 Bot 聊天里提问。提问挂住请求直到有回答，不设超时；回答后该 Bot 有 120 秒用 `vibeface codex respond <ID> '<result-json>' --node <设备>` 应答。线程不属于任何 Bot 时立即兜底。
+2. Agent 用 `vibeface requests` 查看挂起的请求（含完整参数），用 `vibeface respond <request_id> '<result-json>'` 回答。同一 `request_id` 只回答一次，重复调用返回第一次的结果。
+3. 需要本人决定时，Agent 用 `vibeface triage raise --request-id <ID> --question <问题> --choice 批准 --choice 拒绝` 在负责该线程的 Bot 聊天里提问。提问挂住请求直到有回答，不设超时；回答后该 Bot 有 120 秒用 `vibeface respond <ID> '<result-json>' --node <设备>` 应答。线程不属于任何 Bot 时立即兜底。
 4. 没有配置协调 Agent、唤醒失败，或 Agent 120 秒内既没回答也没提问时，Node 按方法给出确定的拒绝并记录：
 
 | 请求 | 兜底回复 |
@@ -174,7 +174,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 - Agent 用 Shell 命令回答：
   - `vibeface triage events [--since <毫秒>]`：列出待处理事件（JSON）。
   - `vibeface triage raise --event-id <ID> --severity info|attention|urgent --question <问题> [--choice <标签>]... [--request-id <ID>]`：需要本人看，在拥有该会话的 Bot 聊天里提问。`--choice` 可重复，最多 8 个，文字回答总是可用；`--request-id` 让提问挂住该请求。
-  - `vibeface codex requests`、`vibeface codex respond <request_id> '<result-json>'`：查看和回答挂起的服务端请求（1.2），也走 `/api/triage`。
+  - `vibeface requests`、`vibeface respond <request_id> '<result-json>'`：查看和回答挂起的服务端请求（1.2），也走 `/api/triage`。
   - `vibeface triage dismiss --event-id <ID>`：静默处理。
 - 命令走本机监听器的 `/api/triage`，边界与 `/api/hooks` 相同。唤醒时 Node 把本机监听器地址放进 `VIBEFACE_TRIAGE_URL`。
 - 没有配置协调 Agent 时，事件直接丢弃，不排队也不过期；服务端请求立即按兜底回复。
@@ -206,7 +206,7 @@ Codex Bot 在 App Server 上的协调回合总是用 `sandboxMode=danger-full-ac
 
 ## 5. 回答回到会话
 
-回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，或用 `vibeface codex respond <请求> '<json>' --node <设备>` 应答挂起的请求，重试只回读。
+回答是 Bot 聊天里的一条消息 `a-<question_id>`，每个提问只有一个。网页、Grok Bot 和重试写的都是这一条，已有不同回答时返回已有回答。回答作为 `answer` 轮交给该 Bot，它用 `vibeface codex send <线程> <文字> --id a-<question_id>` 转达，或用 `vibeface respond <请求> '<json>' --node <设备>` 应答挂起的请求，重试只回读。
 
 Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Authorization: Bearer <决定令牌>`，正文 `{device_id, question_id, choice?, text?}`，`choice`（选项序号）与 `text` 二选一，返回 `{question_id, answer_id, status, text}`。公共入口不校验令牌，经 iroh 的 `vibeface/decision/1` 转给目标设备（目标设备通过 `--entry` 连在入口的 relay 上）。目标 Node 用本机保存的令牌哈希校验，令牌只能调用这一个接口，不能读会话、改设置或做别的操作。令牌在网页设置里生成，只显示一次，可撤销。成员 Node 自己有公网 HTTPS 时，同一路由直接处理本机的提问，其他设备的转给目标。令牌错误返回 401。
 
