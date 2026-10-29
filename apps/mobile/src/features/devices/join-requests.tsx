@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import type { JoinRequest } from '@vibeface/client/lib/node.ts'
 import { openJoins } from '@vibeface/client/workspace/inbox.ts'
 import { deviceForm, formName } from '@vibeface/client/workspace/labels.ts'
@@ -59,6 +60,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   </>}>
     <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的比对，不一致就拒绝' : '等新设备显示安全码'}</Text>
     {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
+    {request.kind === 'client' && !asking && !elsewhere ? <Text className="text-meta text-muted-foreground">管理设备{deviceCopy.manageHint}</Text> : null}
     <ErrorText error={error} />
   </ActionCard>
 }

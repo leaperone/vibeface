@@ -33,6 +33,9 @@ type ConnectOptions = {
   /** Connect and handshake must finish within this; entrance switching uses less. */
   timeoutMs?: number
 }
+/** A computer that does not answer at its address: off, or on another network. */
+export const unreachableText = '连不上这台电脑。请确认它开着，并且和这里网络互通。'
+
 export type Transport = ReturnType<typeof createTransport>
 /** What the Noise session runs over: binary frames each way; a text frame from the far side is a refusal. */
 type Carrier = {
@@ -143,7 +146,7 @@ async function socketCarrier(url: string, connect: string | null, signal: AbortS
     else frames.push(new Uint8Array(event.data as ArrayBuffer))
   })
   socket.addEventListener('close', () => frames.close())
-  socket.addEventListener('error', () => frames.close(new Error('连不上这台电脑。请确认它开着，并且和这里网络互通。')))
+  socket.addEventListener('error', () => frames.close(new Error(unreachableText)))
   await Promise.race([new Promise(resolve => socket.addEventListener('open', resolve, { once: true })), frames.failed])
   if (connect) socket.send(connect)
   return { send: bytes => socket.send(frame(bytes)), receive: frames.receive, ready: frames.ready, close: frames.close }

@@ -135,7 +135,7 @@ function Live({ children }: { children: ReactNode }) {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-      online: deviceOnline(member.kind, node, entry && (connection.state === 'online' || connection.state === 'syncing')),
+      online: deviceOnline(member.kind, node, entry, connection.state !== 'offline'),
       current: member.device_id === me, entry, bot: botReadiness(node),
     }
   })

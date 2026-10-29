@@ -27,6 +27,7 @@ export type LocalPage = {
   /** This computer's setup on localhost, `null` anywhere else. */
   discoverLocalSetup(signal: AbortSignal): Promise<LocalSetup | null>
   /** The cookie-bound local session of this page, exchanged from `launch` when given. */
+  /** Rejects when the computer does not answer; `null` when it answers without a session for this device. */
   localEntry(identity: PublicIdentity, launch: LocalLaunch | null): Promise<ConnectionEntry | null>
   /** Opens the local launch address, reloading when only its hash differs. */
   open(url: string): void

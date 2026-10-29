@@ -144,7 +144,7 @@ test('a browser in a local session is shown as 本机管理, sees the workspace 
   const html: string = renderToStaticMarkup(createElement(LocalSession, { onJoin() {} }))
   assert.match(html, /本机管理/)
   assert.doesNotMatch(html, /还没加入/)
-  assert.match(html, /<button[^>]*>.*用加入链接加入<\/button>/)
+  assert.match(html, /<button[^>]*>.*<\/svg>加入<\/button>/)
 })
 
 test('a browser that is not a member never sends a read receipt, so nothing retries on every refresh', async () => {

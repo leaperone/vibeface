@@ -4,7 +4,7 @@ import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, rawError, taskError } from '@vibeface/client/lib/errors.ts'
-import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
 import { CopyableId, EmptyState, toneText, type Tone } from '@/components/kit'
@@ -42,7 +42,7 @@ export default function TaskDetail() {
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="gap-1">
       <View className="flex-row flex-wrap items-center gap-x-2">
-        <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>
+        {taskStale(state, shared.connectionOnline) ? <Text className="font-medium text-muted-foreground">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
         {device ? <Text className="text-meta text-muted-foreground">在 {nodeName(device, lookup)} 上</Text> : null}
       </View>
       {progress?.status && active && progress.status !== 'awaiting_input' && progressLabel(progress.status) !== '进行中' ? <Text className="text-meta text-muted-foreground">{progressLabel(progress.status)}</Text> : null}

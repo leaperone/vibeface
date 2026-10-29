@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, Link2, LoaderCircle, LogIn, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, ShieldAlert, ShieldCheck, X } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,8 @@ import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrows
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy } from '@vibeface/client/identity/copy.ts'
+import { joinCopy, recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { localCopy } from '@/features/workspace/local-session'
 import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
@@ -153,7 +154,11 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
   const computerName = savedName || '这台电脑'
   const removed = device.error === BROWSER_REMOVED
-  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, hasLocalSetup: Boolean(device.localSetup), rejoined: device.rejoined, removed })
+  // A computer in use opens fully only for a browser already in; any other browser joins, or just manages it from here.
+  const localSetup = device.localSetup
+  const memberHere = localSetup?.kind === 'initialized' && device.entries.some((item) => entryKey(item) === entryKey(localSetup.entry))
+  const local = !localSetup ? 'none' : localSetup.kind === 'uninitialized' || memberHere ? 'open' : 'join'
+  const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, local, rejoined: device.rejoined, removed })
   const active = lane ?? suggested
   const purpose = purposeOf(invitation)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
@@ -213,7 +218,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 3 : null
   const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
-      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : computerName}</Button> : null}
+      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : local === 'open' ? computerName : localCopy.manage}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
@@ -240,12 +245,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这台电脑'}>
-    {device.localSetup.kind === 'initialized'
-      ? <>
-        <p className="text-muted-foreground">你正在这台电脑上，直接打开就能用</p>
-        <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><LogIn aria-hidden="true" />打开</Button>
-      </>
-      : <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>}
+    {device.localSetup.kind !== 'initialized' ? <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>
+      : local === 'open' ? <Button type="button" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><LogIn aria-hidden="true" />打开</Button>
+      : <>
+        <p className="flex items-center gap-2 text-muted-foreground"><MessageSquareLock aria-hidden="true" className="size-4 shrink-0" />{localCopy.note}</p>
+        {device.localSetup.local_launch ? <Button type="button" variant="outline" className="w-full sm:w-fit sm:justify-self-end" disabled={linking || !usable} onClick={() => void run(device.openLocalAccess)}><Settings2 aria-hidden="true" />{localCopy.manage}</Button> : null}
+      </>}
   </Panel>
   else if (active === 'saved') body = <Panel icon={MonitorSmartphone} title="用过的地址">
     <ul className="grid gap-1">{device.entries.map((entry) => {
@@ -295,7 +300,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     {alertInBody ? null : alert}
     {device.phase === 'initializing' ? <Skeleton className="h-48" /> : body}
     {other}
-    {device.identity && !focused ? <Details key={step ?? active}>
+    {device.identity && !focused && step !== 2 ? <Details key={step ?? active}>
       {alertInBody && !publicEntry && !thisComputer ? <p>另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p> : null}
       <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
       {usable ? <Details label="手动填写地址">
@@ -340,6 +345,7 @@ function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; d
   const device = useDevice()
   const [short, setShort] = useState(false)
   return <Panel icon={KeyRound} title="设置恢复密码">
+    <p className="-mt-2 flex items-center gap-2 text-meta text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget

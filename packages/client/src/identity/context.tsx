@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { joinTicket, validTarget } from '../lib/transport.ts'
+import { joinTicket, unreachableText, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
@@ -392,7 +392,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       try { done = await reconnectThrough(target) } finally { switching.current = false }
       if (done === 'next') { scheduleReconnect(true); return }
       if (done || reconnect.current !== target) return
-      step({ type: 'lost', reason: '所有访问地址都连不上。' })
+      step({ type: 'lost', reason: target.entry.kind === 'local' ? unreachableText : '所有访问地址都连不上。' })
       setPhase('reconnecting'); scheduleReconnect()
     }, delay)
   }
@@ -438,10 +438,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
     if (target.entry.kind === 'local') {
-      const local = identityRef.current && await localEntry(identityRef.current, null)
+      // A computer that does not answer is offline like any other address; only one that answers without this session ends it.
+      let local: ConnectionEntry | null
+      try { local = identityRef.current && await localEntry(identityRef.current, null) }
+      catch { return reconnect.current !== target }
       if (reconnect.current !== target) return true
       if (!local || entryKey(local) !== entryKey(target.entry)) {
-        resetConnection(); setPhase('unpaired'); setError('本机自动访问已关闭或会话已失效。请从原本机设置页重新打开本机访问，或用加入链接加入。')
+        resetConnection(); setPhase('unpaired'); setError(`${self}需要重新加入。`)
         return true
       }
     }
@@ -1189,7 +1192,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         if (!mounted || loadWait() || session.current) return
       }
       if (!invitation && (launch || !stay && load('local-origin') === true)) {
-        const local = await localEntry(me, launch)
+        const local = await localEntry(me, launch).catch((cause: unknown) => { if (launch) throw cause; return null })
         if (!mounted || version !== generation.current) return
         // Kept while the Node is down, so the next load on this origin still asks it.
         if (local) {

@@ -236,6 +236,12 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
   return <div className="grid gap-6">
+    <div className="grid gap-2">
+    <ul className="grid gap-1 px-1 text-meta text-muted-foreground" aria-label="两种用法">
+      {(["bot", "execution"] as const).map((role) => { const { label, note, icon: RoleIcon } = roles[role]; return <li key={role} className="flex min-w-0 items-start gap-1.5">
+        <RoleIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0" /><span className="min-w-0"><span className="font-medium text-foreground">{label}</span> · {note}</span>
+      </li> })}
+    </ul>
     <ul className={cn("divide-y overflow-hidden rounded-xl border", !onboarding && "bg-card shadow-xs")}>
       {shown.map(card)}
       {folded.length ? <li><details className="details" open={!shown.length || undefined}>
@@ -246,6 +252,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         <ul className="divide-y border-t">{folded.map(card)}</ul>
       </details></li> : null}
     </ul>
+    </div>
     {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
@@ -257,18 +264,22 @@ const roles = {
 }
 
 /**
- * A chip that turns one use of a provider on or off: its icon tells the two apart, a small switch says it is a control, not a status,
- * and on, the chip is also tinted so a phone without hover still reads it.
+ * A chip for one use of a provider: its icon tells the two apart, and on, the chip is tinted so a phone without hover still reads it.
+ * Only one provider runs the bot, so that chip is a radio dot, picking it moves the bot here; executing tasks is a switch any provider can have on.
  * Never solid, so the page's own next step stays the only filled button.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint, icon: Icon } = roles[role]
-  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
+  const one = role === "bot"
+  return <Button type="button" size="sm" variant="outline" role={one ? "radio" : undefined} aria-checked={one ? pressed : undefined} aria-pressed={one ? undefined : pressed}
+    aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
     className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
     {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
-    <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
+    {one ? <span aria-hidden="true" className={cn("grid size-3.5 shrink-0 place-items-center rounded-full border-[1.5px] transition-colors", pressed ? "border-brand" : "border-muted-foreground/75")}>
+      <span className={cn("size-1.5 rounded-full bg-brand transition-transform", !pressed && "scale-0")} />
+    </span> : <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span>{label}
+    </span>}{label}
   </Button>
 }
 
@@ -432,7 +443,7 @@ function KeyField({ name, working, busy, more, save }: { name: string; working: 
 /** Why setup cannot move on yet: no provider runs the bot. A bot that still needs setup can move on; its status pill says so. */
 function BotHint() {
   return <p role="status" className="flex items-center gap-1.5 text-meta text-muted-foreground">
-    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />打开<terms.bot.icon aria-hidden="true" className="size-4 shrink-0" />{deviceCopy.roles.bot.label}
+    <CircleAlert aria-hidden="true" className="size-4 shrink-0" />选一个<terms.bot.icon aria-hidden="true" className="size-4 shrink-0" />{deviceCopy.roles.bot.label}
   </p>
 }
 

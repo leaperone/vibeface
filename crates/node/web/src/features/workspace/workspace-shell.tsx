@@ -26,6 +26,7 @@ import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { backTo } from "@vibeface/client/workspace/home.ts"
 import { addressName, hostOf } from "@vibeface/client/workspace/labels.ts"
 import { entryAddress, entryKey } from "@vibeface/client/lib/node.ts"
+import { unreachableText } from "@vibeface/client/lib/transport.ts"
 import { LocalSession } from "./local-session"
 
 /** `landing`: the title takes the focus when the shell replaces the page the person was on. */
@@ -49,7 +50,6 @@ const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.la
 
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
-  const device = useDevice()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length
   const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
@@ -176,7 +176,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           </Button> : null}
           </div>
         </header>
-        {workspace.joined ? null : <LocalSession onJoin={() => { device.disconnect(); void navigate({ to: "/join" }) }} />}
+        {workspace.joined ? null : <LocalSession onJoin={() => void navigate({ to: "/join" })} />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
@@ -241,7 +241,7 @@ export function ConnectionCapsule({ side = "top" }: { side?: "top" | "bottom" })
       <Popover.Content side={side} align="start" sideOffset={6} className="z-50 grid w-72 gap-2 rounded-xl border bg-popover p-3 text-meta text-popover-foreground shadow-lg">
         <p className="font-medium">{terms.address.label}</p>
         <p className="break-all text-muted-foreground" title={address}>{hostOf(address) || address}</p>
-        {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">所有访问地址都连不上，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
+        {link.kind === "offline" ? <div className="grid gap-2"><p className="text-muted-foreground">{link.reason === unreachableText ? "连不上这台电脑" : "所有访问地址都连不上"}，{Math.ceil(link.retryInMs / 1000)} 秒后再试。</p>
           <Button type="button" size="sm" className="w-fit" onClick={device.retryNow}><RotateCw aria-hidden="true" />立即重连</Button></div>
           : workspace.connectionOnline ? <p className="flex items-center gap-1.5 text-success"><terms.encrypted.icon aria-hidden="true" className="size-4" />{terms.encrypted.label}，设备已验证</p> : null}
         {workspace.readOnlyNotice ? <p className="text-warning">{workspace.readOnlyNotice}</p> : null}

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
+import { ArrowDown, ArrowRightLeft, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, RotateCw, Send, Server, Unplug, WifiOff } from 'lucide-react'
 import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood, botTint, useDark } from '@/components/app/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
@@ -13,7 +13,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
-import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
@@ -48,7 +48,7 @@ function NoBot() {
 /** `missing`: the route names a bot this network does not have. */
 export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const workspace = useWorkspace()
-  const { directory, ready } = useDevice()
+  const { directory, ready, retryNow } = useDevice()
   const [drafts, setDrafts] = useState<Map<string, string>>(() => new Map())
   const [sendError, setSendError] = useState<unknown>(null)
   const [files, setFiles] = useState<File[]>([])
@@ -183,7 +183,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
-  const notice = !workspace.connectionOnline ? '离线，恢复后可发送'
+  const notice = !workspace.connectionOnline ? ''
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
     : messagePending && messageBusy ? '上一条消息还没确认送达' : ''
@@ -261,7 +261,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         </div> : workspace.synced ? <NoBot /> : null}
       />
       {bot ? <PromptInput
-        above={waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
+        above={!workspace.connectionOnline ? <p role="status" className="flex h-8 items-center gap-1.5 rounded-full border bg-card ps-2.5 pe-1 text-meta font-medium shadow-sm max-md:h-11">
+          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />连不上 {ready ? nodeName(ready.entry.device_id, lookup) : '设备'}
+          <Button type="button" variant="ghost" size="sm" className="h-7 rounded-full max-md:h-9" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
+        </p> : waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>
           <terms.inbox.icon aria-hidden="true" className="size-4 text-warning" />{waitingCount > 1 ? `${waitingCount} 项${terms.inbox.label}` : terms.inbox.label}<ArrowDown aria-hidden="true" className="size-3.5 text-muted-foreground" />
         </button> : null}
@@ -308,35 +311,37 @@ function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; bo
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
   const result = task.work.result_text ? firstLine(task.work.result_text) : workCause(task.work)
   const title = task.work.title || '任务'
+  const stale = taskStale(task.state, live)
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
   if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
     {task.state === 'dispatch_unverified' ? <CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} state={task.state} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
+    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
   return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
-      : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className={`size-5 shrink-0 text-info ${live ? 'animate-spin' : ''}`} /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} state={task.state} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} className="text-meta" /></span>
+      : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+      : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
-        : taskActive(task.state) && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
+        : taskActive(task.state) && !stale && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />
   </Link></div>
 }
 
 /** Device and state never yield to a long title: in a column narrower than `@sm` they take their own line. */
 /** Only another device is named on screen. `quiet`: the icon already says the state, so its word is only read out. `agent`: the provider doing the task. */
-function TaskMeta({ device, here, state, agent, quiet = false, className = '' }: { device: string; here: boolean; state: string; agent: ProviderId | null; quiet?: boolean; className?: string }) {
+function TaskMeta({ device, here, label, agent, quiet = false, className = '' }: { device: string; here: boolean; label: string; agent: ProviderId | null; quiet?: boolean; className?: string }) {
   const by = agent ? providerNames[agent] : ''
-  if (here && quiet && !agent) return <span className="sr-only">{device} · {taskLabel(state)}</span>
+  if (here && quiet && !agent) return <span className="sr-only">{device} · {label}</span>
   const Agent = agent ? providerIcons[agent] : null
   const dot = <span aria-hidden="true">·</span>
   return <span className={`flex min-w-0 shrink-0 items-center gap-1 text-muted-foreground ${className}`}>
     <span aria-hidden="true" className="hidden @sm:inline">·</span>
     {Agent ? <><Agent aria-hidden="true" className="size-3.5 shrink-0" /><span className="shrink-0">{by}</span>{here && quiet ? null : dot}</> : null}
     {here ? <span className="sr-only">{device}</span> : <><Server aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">{device}</span>{quiet ? null : dot}</>}
-    <span className={quiet ? 'sr-only' : 'shrink-0'}>{taskLabel(state)}</span>
+    <span className={quiet ? 'sr-only' : 'shrink-0'}>{label}</span>
   </span>
 }
 
