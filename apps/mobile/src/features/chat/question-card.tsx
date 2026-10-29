@@ -1,7 +1,10 @@
 import * as Haptics from 'expo-haptics'
+import { Link } from 'expo-router'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { ArrowUp, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
+import { projectName, questionMeta } from '@vibeface/client/workspace/questions.ts'
+import { ArrowUp, CircleCheck, CircleSlash, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, Server, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { ErrorText } from '@/components/action'
@@ -11,6 +14,8 @@ import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
+import { useLive } from '@/data/live'
+import { deviceIcon } from '@/features/devices/device-icon'
 import type { Question } from '@/data/types'
 import { cn } from '@/lib/utils'
 
@@ -20,18 +25,16 @@ const looks: Record<Question['severity'], { icon: LucideIcon; tone: Tone }> = {
   info: { icon: Info, tone: 'info' },
 }
 
-const projectName = (cwd: string) => cwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || cwd
-
-/** One numbered choice per row and a free answer as the last row; answered, it folds to one line. */
+/** One numbered choice per row and a free answer as the last row, as on the web; answered or closed, it folds to one line. */
 export function QuestionCard({ question }: { question: Question }) {
   const workspace = useWorkspace()
+  const shared = useLive()
+  const { ready } = useDevice()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
-  if (question.answer) return <View className="min-h-9 flex-row items-start gap-2 py-2">
-    <Icon as={CircleCheck} className="mt-0.5 size-4 text-success" />
-    <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{question.text}</Text>{' · '}<Text className="text-meta">{question.answer.text}</Text></Text>
-  </View>
+  if (question.answer) return <Settled icon={CircleCheck} className="text-success" ask={question.text}>{question.answer.text}</Settled>
+  if (question.closed) return <Settled icon={CircleSlash} ask={question.text}>已失效</Settled>
 
   const send = async (key: string, value: string) => {
     setBusy(key)
@@ -50,13 +53,20 @@ export function QuestionCard({ question }: { question: Question }) {
     const numbered = /^[1-9]$/.test(value) ? question.choices[Number(value) - 1] : undefined
     void (numbered ? send(`choice:${numbered.label}`, numbered.label) : send('text', value))
   }
-  const device = workspace.members.find((member) => member.device_id === question.about.node)?.name ?? '另一台设备'
+  const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
+  const member = workspace.members.find((item) => item.device_id === question.about.node)
   const { icon, tone } = looks[question.severity]
-  return <ActionCard icon={icon} tone={tone} title={question.text}>
+  return <ActionCard icon={approval ? Hand : icon} tone={tone} title={question.text}>
     <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+      {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
+        <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">
+          <Icon as={ListChecks} className="size-4 text-muted-foreground" />
+          <Text numberOfLines={1} className="text-meta text-muted-foreground underline">{task.title}</Text>
+        </Pressable>
+      </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自">{providerNames[question.about.agent]}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(question.about.cwd)}</Meta> : null}
-      <Meta icon={Laptop} label="设备">{device}</Meta>
+      {local ? null : <Meta icon={member ? deviceIcon(member) : Server} label="设备">{member?.name ?? '另一台设备'}</Meta>}
     </View>
     <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
       {question.choices.map((choice, index) => {
@@ -85,6 +95,13 @@ export function QuestionCard({ question }: { question: Question }) {
 
 const row = 'min-h-12 flex-row items-center gap-3 rounded-lg border border-border bg-card px-3 py-2'
 const badge = 'min-h-7 min-w-7 items-center justify-center rounded-md'
+
+function Settled({ icon, className, ask, children }: { icon: LucideIcon; className?: string; ask: string; children: string }) {
+  return <View className="min-h-9 flex-row items-start gap-2 py-2">
+    <Icon as={icon} className={cn('mt-0.5 size-4 text-muted-foreground', className)} />
+    <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta text-muted-foreground" numberOfLines={1}>{ask}</Text>{' · '}<Text className="text-meta">{children}</Text></Text>
+  </View>
+}
 
 function Meta({ icon, label, children }: { icon: LucideIcon; label: string; children: string }) {
   return <View accessible accessibilityLabel={`${label} ${children}`} className="min-w-0 flex-row items-center gap-1">
