@@ -81,13 +81,13 @@ BotMessaged {
 
 | 工具 | 类别 | 作用 |
 |---|---|---|
-| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill、活动 schedule 概要 |
-| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的 skill、schedule、笔记；没有任何密钥 |
+| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
+| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的 skill、实际显示的长相、schedule、笔记；没有任何密钥 |
 | `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话 |
-| `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型和启用的 skill |
+| `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
 
-- 可配项是名称、说明、模型、启用的 skill 和创建时的项目目录。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
+- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
 - 删除 bot：见第 5.1 节。不提供改本人或设备权限的工具。
 - 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `BotChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
 - `configure_bot` 写一条 `BotChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
