@@ -148,7 +148,7 @@ pub struct Runtime {
     /// Changes with every process start, so peers can tell a restart from a quiet link.
     boot: String,
     sync_wakeup: tokio::sync::Notify,
-    have_wakeup: tokio::sync::Notify,
+    have_wakeup: Arc<tokio::sync::Notify>,
     outbox_wakeup: tokio::sync::Notify,
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
@@ -247,6 +247,7 @@ impl Runtime {
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
+        let have_wakeup = Arc::new(tokio::sync::Notify::new());
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -300,7 +301,7 @@ impl Runtime {
             blob_fetch: Mutex::new(()),
             boot: uuid::Uuid::new_v4().simple().to_string(),
             sync_wakeup: tokio::sync::Notify::new(),
-            have_wakeup: tokio::sync::Notify::new(),
+            have_wakeup,
             outbox_wakeup: tokio::sync::Notify::new(),
             events,
             agent_tokens: Mutex::new(HashMap::new()),
