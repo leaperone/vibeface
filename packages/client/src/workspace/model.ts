@@ -360,7 +360,7 @@ export function parsePrimary(value: unknown): string | null {
 
 export function parsePendingBot(value: unknown): PendingBot {
   const data = record(value), submission = record(data.submission)
-  if (submission.state !== "unconfirmed" && submission.state !== "rejected") throw new Error("机器人创建记录的提交状态无效。")
+  if (submission.state !== "unconfirmed" && submission.state !== "rejected") throw new Error("Bot 创建记录的提交状态无效。")
   return { ...parseCreateBot(value), submission: { state: submission.state, entry_node: text(submission.entry_node) } }
 }
 

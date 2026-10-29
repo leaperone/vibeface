@@ -5,6 +5,7 @@ import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
+import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness } from '@vibeface/client/workspace/model.ts'
@@ -143,7 +144,7 @@ function Live({ children }: { children: ReactNode }) {
     const select = async (id: string) => {
       const workspace = latest.current
       const bot = workspace.bots.find((item) => item.conversation_id === id)
-      if (!bot) throw new Error('没有这个 Bot')
+      if (!bot) throw new Error(botCopy.notFound)
       if (workspace.conversationId !== id) await workspace.selectBot(bot)
     }
     return {

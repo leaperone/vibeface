@@ -2,7 +2,7 @@ import { Stack, useLocalSearchParams } from 'expo-router'
 import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, FolderOpen, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
-import { folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
 import { useAvatarPick } from '@vibeface/client/avatar/pick.ts'
@@ -27,7 +27,7 @@ export default function BotAbout() {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
-  if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" className="flex-1 justify-center" />
+  if (!shared || !bot) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
   const empty = view && !bot.project && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
@@ -42,10 +42,10 @@ export default function BotAbout() {
     <View className="items-start gap-3">
       <FacePicker bot={bot} mood={botMood(bot, workspace, shared)} writable={shared.writable} write={(version, avatar) => shared.setBotAvatar(bot.conversation_id, version, avatar)} />
       {shared.primary === bot.conversation_id
-        ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
-        : <ActionButton variant="outline" className="self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
+        ? <View accessible accessibilityHint={botCopy.primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
+        : <ActionButton variant="outline" className="self-start" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
     </View>
-    {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
+    {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{botCopy.empty}</Text></View> : null}
     {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>
       {shared.writable && choices.length ? <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
         {options.map((item, index) => {
@@ -85,7 +85,7 @@ export default function BotAbout() {
     {view?.memory.length ? <Section icon={NotebookPen} title="笔记" count={view.memory.length}>
       {view.memory.map((note) => <Text key={note.memory_id} selectable numberOfLines={2} className="text-meta">{note.text}</Text>)}
     </Section> : null}
-    {view?.skills.length ? <Section icon={BookOpen} title="共用 skill" count={view.skills.length}>
+    {view?.skills.length ? <Section icon={BookOpen} title={botCopy.skills(bot.skills, view.skills.length)}>
       {view.skills.map((skill) => <View key={skill.skill_id} className="gap-0.5">
         <Text className="font-medium">{skill.name}</Text>
         {skill.description ? <Text className="text-meta text-muted-foreground">{skill.description}</Text> : null}
@@ -95,7 +95,6 @@ export default function BotAbout() {
   </ScrollView>
 }
 
-const primaryHint = '没有 Bot 负责的会话，由主 Bot 分派'
 
 /** The face as it will look, with the picker under it; a pick shows before it is written and goes back if the write fails. Only the big face moves. */
 function FacePicker({ bot, mood, writable, write }: { bot: BotRecord; mood: Mood; writable: boolean; write: Parameters<typeof useAvatarPick>[1] }) {

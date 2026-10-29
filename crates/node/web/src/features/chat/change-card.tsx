@@ -7,19 +7,8 @@ import { BotFace } from '@/components/app/bot-face'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import { changeTitle, formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
-
-function cardTitle(changes: BotChange[]) {
-  const kind = changes[0]?.kind
-  if (changes.some((change) => change.kind !== kind)) return '已更新'
-  if (kind === 'profile') return '已更新 Bot'
-  const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
-  const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
-  if (kind === 'skill') return added ? '已存为 Skill' : removed ? '已删除 Skill' : '已更新 Skill'
-  if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
-  return added ? '已设定定时任务' : removed ? '已删除定时任务' : '已更新定时任务'
-}
 
 /** What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now. */
 export function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
@@ -28,7 +17,7 @@ export function ChangeCard({ records, schedules }: { records: BotChangeRecord[];
   return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card shadow-xs p-4">
     <header className="flex items-center gap-2">
       <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
-      <h3 id={id} className="text-meta font-medium text-muted-foreground">{cardTitle(changes)}</h3>
+      <h3 id={id} className="text-meta font-medium text-muted-foreground">{changeTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
       {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules} />)}

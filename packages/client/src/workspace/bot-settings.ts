@@ -1,9 +1,29 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import { projectName } from "./questions.ts"
-import type { BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+import type { BotChange, BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, ScheduleView, SkillSet } from "./types.ts"
 
 /** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
 export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const
+
+/** What a bot's own page says, the same on the web and the phone. `skills`: a bot with no list of its own uses them all. */
+export const botCopy = {
+  notFound: "找不到这个 Bot",
+  primaryHint: "接手没有 Bot 负责的会话",
+  empty: "还没有说明、定时任务和笔记",
+  skills: (skills: SkillSet, count: number) => skills === null ? "Skill · 全部可用" : `Skill · ${count}`,
+}
+
+/** The heading of the card that lists what one turn changed in the bot. */
+export function changeTitle(changes: readonly BotChange[]): string {
+  const kind = changes[0]?.kind
+  if (changes.some((change) => change.kind !== kind)) return "已更新"
+  if (kind === "profile") return "已更新 Bot"
+  const items = changes as Extract<BotChange, { kind: "skill" | "schedule" | "memory" }>[]
+  const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
+  if (kind === "skill") return added ? "已存为 Skill" : removed ? "已删除 Skill" : "已更新 Skill"
+  if (kind === "memory") return added ? "已记下" : removed ? "已忘记" : "已更新笔记"
+  return added ? "已设定定时任务" : removed ? "已删除定时任务" : "已更新定时任务"
+}
 
 /** A bot's project folder by its name; the device is named too when it is not the one running the bot. */
 export function projectPlace(project: BotProject, owner: string | null | undefined, deviceName: (deviceId: string) => string): string {

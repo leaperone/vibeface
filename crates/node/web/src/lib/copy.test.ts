@@ -14,6 +14,11 @@ const banned = [
   "密文", "链上", "收据", "意图", "对账", "证明", "落盘", "债权", "SHA-256", "Groth16", "窗口",
 ]
 const allowed = ["安全码", "核对码", "Node.js"]
+// Words the glossary replaced, with the word both apps use now; banned everywhere, folded or not.
+const retired: Record<string, string> = {
+  "自己启动": "由 Vibeface 启动", "只在网页": "只在待处理", "没有这个 Bot": "找不到这个 Bot", "skill": "Skill",
+  "机器人": "Bot 或外部聊天", "管理员": "管理设备", "邀请": "加入链接",
+}
 const cjk = /[一-鿿]/
 
 export function violations(source: string, file = "x.tsx") {
@@ -29,8 +34,11 @@ export function violations(source: string, file = "x.tsx") {
     if (!cjk.test(text) && !ts.isJsxText(node)) return
     let clean = text
     for (const word of allowed) clean = clean.split(word).join("")
+    const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
     const hit = banned.find((word) => clean.includes(word))
-    if (hit && !inDetails(node)) found.push(`${file}:${sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1} 「${hit}」 ${text.trim().slice(0, 40)}`)
+    if (hit && !inDetails(node)) found.push(`${file}:${line} 「${hit}」 ${text.trim().slice(0, 40)}`)
+    const old = Object.keys(retired).find((word) => text.includes(word))
+    if (old) found.push(`${file}:${line} 「${old}」→「${retired[old]}」 ${text.trim().slice(0, 40)}`)
   }
   const visit = (node: ts.Node) => {
     if (ts.isJsxText(node)) check(node, node.text)
@@ -56,6 +64,9 @@ test("copy check flags jargon outside Details only", () => {
   assert.equal(violations(`const a = <p>安全码一致</p>`).length, 0)
   assert.equal(violations(`throw new Error("请填写本人证据")`).length, 1)
   assert.equal(violations(`rpc("node_settings")`).length, 0)
+  assert.equal(violations(`const a = <Details><p>改为自己启动</p></Details>`).length, 1)
+  assert.equal(violations(`const a = "已存为 skill"`).length, 1)
+  assert.equal(violations(`const a = "已存为 Skill"`).length, 0)
 })
 
 test("user-facing copy avoids jargon outside Details", () => {
