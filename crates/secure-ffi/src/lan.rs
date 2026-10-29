@@ -110,8 +110,14 @@ impl LanStream {
     fn new(connection: Connection, mut send: SendStream, recv: RecvStream) -> Arc<Self> {
         let (outgoing, mut queue) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
         let writer = connection.clone();
+        // Ends with the connection too: the app's handle, which holds the queue, lives until GC.
         tokio::spawn(async move {
-            while let Some((tag, data)) = queue.recv().await {
+            loop {
+                let next = tokio::select! {
+                    next = queue.recv() => next,
+                    _ = writer.closed() => return,
+                };
+                let Some((tag, data)) = next else { break };
                 if send.write_all(&frame(tag, &data)).await.is_err() {
                     writer.close(1u32.into(), b"write failed");
                     return;
@@ -168,6 +174,12 @@ impl LanStream {
     pub fn close(&self) {
         self.connection.close(0u32.into(), b"closed");
     }
+}
+
+/// Binds this device's endpoint ahead of the first dial, which then spends its time dialing.
+#[uniffi::export]
+pub async fn lan_prepare() -> Result<()> {
+    on_runtime(async { endpoint().await.map(|_| ()) }).await
 }
 
 /// Opens one client stream to the Node `device_id` at `addrs` (`ip:port`); dialing it, not

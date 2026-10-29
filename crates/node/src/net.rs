@@ -454,14 +454,37 @@ impl Net {
     /// Advertises this Node on the LAN and finds the other member Nodes there; `wake` hears
     /// which one appeared. Without mDNS, dialing keeps the other addresses.
     pub fn start_lan(&self, wake: impl Fn(&str) + Send + Sync + 'static) {
-        let Some(port) = self.endpoint.bound_sockets().first().map(SocketAddr::port) else {
+        let sockets = self.endpoint.bound_sockets();
+        let Some(port) = sockets.first().map(SocketAddr::port) else {
             return;
         };
-        match lan::Lan::start(device_id(&self.endpoint.id()), port, Box::new(wake)) {
+        // An address family listening on another port, or not at all, would be advertised
+        // with a port that does not answer.
+        let listens = |v6: bool| {
+            sockets
+                .iter()
+                .any(|s| s.is_ipv6() == v6 && s.port() == port)
+        };
+        let off = [
+            (false, mdns_sd::IfKind::IPv4),
+            (true, mdns_sd::IfKind::IPv6),
+        ]
+        .into_iter()
+        .filter(|(v6, _)| !listens(*v6))
+        .map(|(_, kind)| kind)
+        .collect();
+        match lan::Lan::start(device_id(&self.endpoint.id()), port, off, Box::new(wake)) {
             Ok(lan) => {
                 let _ = self.lan.set(lan);
             }
-            Err(error) => tracing::warn!(%error, "LAN discovery is off"),
+            Err(error) => tracing::warn!(event = "lan.off", %error, "LAN discovery is off"),
+        }
+    }
+
+    /// Withdraws this Node's LAN advert before it exits.
+    pub async fn stop_lan(&self) {
+        if let Some(lan) = self.lan.get() {
+            lan.stop().await;
         }
     }
 
