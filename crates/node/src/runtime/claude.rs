@@ -783,7 +783,7 @@ where
     if let Some(turn) = &config.codex_turn
         && let Err(e) = (turn.record)(session.clone(), Some(message)).await
     {
-        tracing::warn!(error = %e, "the next Claude Code turn repeats what this one was shown");
+        tracing::warn!(event = "claude.turn_unrecorded", error = %e, "the next Claude Code turn repeats what this one was shown");
     }
     Ok(AgentResult {
         session_id: Some(session),
@@ -909,7 +909,7 @@ async fn follow(
             if let Some(signal) = signal
                 && let Err(error) = node.signal_work(&network, &work_id, signal).await
             {
-                tracing::warn!(%error, work_id, "a Claude Code work update was not recorded");
+                tracing::warn!(event = "claude.work_update_pending", %error, work_id, "a Claude Code work update was not recorded");
             }
         }
         if turn.ending.is_some() {
@@ -968,7 +968,7 @@ async fn follow(
             Ok(record) if record.state.finished() => break,
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(%error, work_id, "the end of a Claude Code work waits for its probe")
+                tracing::warn!(event = "claude.work_end_pending", %error, work_id, "the end of a Claude Code work waits for its probe")
             }
         }
     }

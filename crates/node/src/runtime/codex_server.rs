@@ -450,7 +450,7 @@ impl Inner {
             if let Err(error) = std::os::unix::fs::symlink(socket, &next)
                 .and_then(|()| std::fs::rename(&next, &self.agent_socket))
             {
-                tracing::warn!(%error, "the Agent's App Server link was not updated");
+                tracing::warn!(event = "app_server.link_failed", %error, "the Agent's App Server link was not updated");
             }
         }
         self.endpoint.send_replace(socket);
@@ -483,7 +483,11 @@ impl Inner {
         if command.contains("app-server")
             && command.contains(&self.spawn_socket.display().to_string())
         {
-            tracing::info!(group, "stopping App Server left by an earlier run");
+            tracing::info!(
+                event = "app_server.leftover_stopped",
+                group,
+                "stopping App Server left by an earlier run"
+            );
             kill_group(group);
         }
         let _ = std::fs::remove_file(&self.pidfile);
@@ -540,7 +544,7 @@ impl Inner {
         let mut child = match self.spawn(launch) {
             Ok(child) => child,
             Err(error) => {
-                tracing::warn!(%error, "App Server could not start");
+                tracing::warn!(event = "app_server.start_failed", %error, "App Server could not start");
                 self.set_link(Link::LaunchFailed {
                     reason: format!("App Server could not start: {error}"),
                 });
@@ -571,7 +575,7 @@ impl Inner {
                     // Tools the App Server started share its group and die with it.
                     signal_group(group, libc::SIGKILL);
                 }
-                tracing::warn!(?status, "App Server exited");
+                tracing::warn!(event = "app_server.exited", ?status, "App Server exited");
                 if !self.stopping() {
                     self.set_link(Link::LaunchFailed {
                         reason: match status {
@@ -589,7 +593,10 @@ impl Inner {
                     signal_group(group, libc::SIGKILL);
                 }
                 let _ = child.wait().await;
-                tracing::info!("App Server restarts with new provider settings");
+                tracing::info!(
+                    event = "app_server.restarted",
+                    "App Server restarts with new provider settings"
+                );
                 true
             }
         };
