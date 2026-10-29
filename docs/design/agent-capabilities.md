@@ -120,7 +120,7 @@ BotMessaged {
 
 - 每个 bot 最多 20 个活动 schedule；
 - 每个 bot 每小时最多发 10 条消息给其他 bot；
-- schedule 轮与 bot 消息轮和工作结果轮一样计入每日自动轮次预算（`daily_decision_limit`，默认 20）。
+- schedule 轮与 bot 消息轮和工作结果轮一样计入每日自动轮次预算（`daily_decision_limit`，默认 20）。协调 Agent 的分诊唤醒按同一上限另行计数，不占这份预算。
 
 ## 7. 提示词
 
