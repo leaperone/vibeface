@@ -1,8 +1,9 @@
 import { Bot, CirclePause, CircleX, Clock } from 'lucide-react-native'
 import { View } from 'react-native'
-import Animated, { FadeInDown, ReduceMotion, useReducedMotion } from 'react-native-reanimated'
+import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { failureText, rawError, replyFailure } from '@vibeface/client/lib/errors.ts'
+import { BotFace } from '@/components/bot-face'
 import { Details } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -23,24 +24,11 @@ function shortTime(at: number) {
   return when.toDateString() === new Date().toDateString() ? clock : `${when.getMonth() + 1}/${when.getDate()} ${clock}`
 }
 
-const breathe = {
-  animationName: { '0%': { opacity: 0.3, transform: [{ translateY: 0 }] }, '30%': { opacity: 1, transform: [{ translateY: -2 }] }, '60%': { opacity: 0.3, transform: [{ translateY: 0 }] }, '100%': { opacity: 0.3, transform: [{ translateY: 0 }] } },
-  animationDuration: '1.2s', animationIterationCount: 'infinite', animationTimingFunction: 'ease-in-out',
-} as const
-
-/** A reply still streaming, as the web's typing dots: they breathe one after another, and hold still and dim while offline. */
-function TypingDots({ paused }: { paused: boolean }) {
-  const still = useReducedMotion() || paused
-  return <View accessible accessibilityRole="image" accessibilityLabel="正在回复" className="h-6 flex-row items-center gap-1">
-    {[0, 150, 300].map((delay) => <Rise key={delay} className="size-1.5 rounded-full bg-muted-foreground" style={still ? { opacity: 0.5 } : { ...breathe, animationDelay: `${delay}ms` }} />)}
-  </View>
-}
-
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
- * bubble under its name, as on the web. `offline` pauses a streaming reply's dots.
+ * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
  */
-export function Message({ message, last, offline }: { message: ChatMessage; last: boolean; offline: boolean }) {
+export function Message({ message, botId, last, offline }: { message: ChatMessage; botId: string; last: boolean; offline: boolean }) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
@@ -66,7 +54,9 @@ export function Message({ message, last, offline }: { message: ChatMessage; last
   </Rise>
   return <Rise entering={entering} className="gap-1">
     {message.text ? <Markdown text={message.text} /> : null}
-    {message.state === 'streaming' ? <TypingDots paused={offline} /> : null}
+    {message.state === 'streaming' ? <View accessible accessibilityRole="image" accessibilityLabel="正在回复" className="h-6 justify-center">
+      <BotFace botId={botId} mood={offline ? 'asleep' : 'replying'} size={24} />
+    </View> : null}
     {stopped ? <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
       <View className="flex-row items-center gap-1"><Icon as={failed ? CircleX : CirclePause} className={failed ? 'text-danger' : 'text-muted-foreground'} /><Text className={failed ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{stopped}</Text></View>
       {cause ? <Text className="shrink text-meta text-muted-foreground">{cause}</Text> : null}
