@@ -325,3 +325,48 @@ fn bootstrap_capability_is_one_time_and_requires_a_manager_session() -> Result<(
     fs::remove_dir_all(dir)?;
     Ok(())
 }
+
+#[test]
+fn a_name_already_in_the_network_gets_the_next_number_and_a_retry_keeps_it() -> Result<()> {
+    let fixture = fixture()?;
+    let (first, second) = (LocalIdentity::generate(), LocalIdentity::generate());
+    invite(&fixture, [7; 32])?;
+    invite(&fixture, [8; 32])?;
+    let ask = |device: &LocalIdentity, secret, nonce: &str| -> Result<JoinRequest> {
+        let mut join = request(device, secret, nonce)?;
+        join.name = "admin".into();
+        fixture.store.join(&join, &device.device_id()?)
+    };
+    let (nonce1, nonce2) = (random_hex(32), random_hex(32));
+    assert_eq!(
+        ask(&first, [7; 32], &nonce1)?.name,
+        "admin 2",
+        "a member already has the asked name"
+    );
+    assert_eq!(
+        ask(&second, [8; 32], &nonce2)?.name,
+        "admin 3",
+        "an open request holds the next number"
+    );
+    assert_eq!(
+        ask(&first, [7; 32], &nonce1)?.name,
+        "admin 2",
+        "the retried request keeps its name"
+    );
+    let mut renamed = request(&first, [7; 32], &nonce1)?;
+    renamed.name = "admin x".into();
+    assert!(
+        fixture.store.join(&renamed, &first.device_id()?).is_err(),
+        "another name is another request"
+    );
+
+    let long = format!("{}長", "a".repeat(125));
+    let cut = format!("{} 2", "a".repeat(125));
+    assert_eq!(
+        distinct_name(&long, &[long.clone()]),
+        cut,
+        "the number fits within 128 bytes on a character boundary"
+    );
+    assert!(numbered_from(&cut, &long));
+    Ok(())
+}

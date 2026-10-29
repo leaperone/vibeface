@@ -1,23 +1,29 @@
 import * as Clipboard from 'expo-clipboard'
-import { Check, CircleCheck, Copy, Link2, Plus, Share2, ShieldAlert } from 'lucide-react-native'
+import { Check, CircleCheck, Clock, Copy, Link2, Monitor, Plus, ScanEye, Share2, ShieldAlert, Smartphone, SquareTerminal } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
 import { ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
+import { addDeviceCopy } from '@vibeface/client/identity/copy.ts'
 import { ErrorText } from '@/components/action'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
+import { Segmented } from '@/components/ui/segmented'
 import { Text } from '@/components/ui/text'
 import { JoinRequests, useOpenJoins } from '@/features/devices/join-requests'
 import { QrCode } from '@/features/devices/qr-code'
 import { useRun } from '@/lib/use-run'
 
-/** "添加设备": one single-use link (QR for phones) the new device opens, then both sides compare the safety code. */
+const kinds = [{ value: 'phone', label: addDeviceCopy.phone, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.computer, icon: Monitor }] as const
+type Kind = (typeof kinds)[number]['value']
+
+/** "添加设备": one single-use link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code. */
 export default function AddDevice() {
   const device = useDevice()
   const { ready } = device
   const { busy, error, run } = useRun()
   const [copied, setCopied] = useState(false)
+  const [kind, setKind] = useState<Kind>('phone')
   useEffect(() => {
     if (!copied) return
     const timer = setTimeout(() => setCopied(false), 2000)
@@ -57,17 +63,35 @@ export default function AddDevice() {
     </Button>} /> : null}
     <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
     {result && !used ? <View className="gap-4">
-      <QrCode value={result.qr} label={result.publicEntry ? '用手机相机扫码打开' : '用手机 App 扫码'} />
-      <View className="flex-row flex-wrap justify-center gap-2">
-        <Button variant={requests ? 'outline' : 'default'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
-          <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>
-        </Button>
-        <Button variant="outline" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
-          <Icon as={Share2} /><Text>分享</Text>
-        </Button>
+      <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(false) }} />
+      {kind === 'phone' ? <>
+        <QrCode value={result.qr} label={result.publicEntry ? '用手机相机扫码打开' : '用手机 App 扫码'} />
+        <View className="flex-row flex-wrap justify-center gap-2">
+          <Button variant={requests ? 'outline' : 'default'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
+            <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>
+          </Button>
+          <Button variant="outline" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}>
+            <Icon as={Share2} /><Text>分享</Text>
+          </Button>
+        </View>
+      </> : <View className="gap-3">
+        <View className="flex-row items-center gap-3"><Step n={1} />
+          <Button variant={requests ? 'outline' : 'default'} disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(addDeviceCopy.command(result.link)).then(() => setCopied(true)))}>
+            <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : addDeviceCopy.copyCommand}</Text>
+          </Button>
+          <Button variant="ghost" size="icon" accessibilityLabel="分享命令" onPress={() => { void Share.share({ message: addDeviceCopy.command(result.link) }).catch(() => {}) }}><Icon as={Share2} /></Button>
+        </View>
+        <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={SquareTerminal} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.runThere}</Text></View>
+      </View>}
+      <View className="gap-1.5">
+        <View className="flex-row items-center gap-1.5"><Icon as={ScanEye} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">{addDeviceCopy.compare}</Text></View>
+        <View className="flex-row items-center gap-1.5"><Icon as={Clock} className="size-4 text-muted-foreground" /><Text className="shrink text-meta text-muted-foreground">只发给自己的设备，10 分钟内有效</Text></View>
       </View>
-      <Text className="text-center text-meta text-muted-foreground">只发给自己的设备，10 分钟内有效</Text>
     </View> : null}
     <ErrorText error={error} />
   </ScrollView>
+}
+
+function Step({ n }: { n: number }) {
+  return <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants" className="size-6 items-center justify-center rounded-full bg-muted"><Text className="text-meta font-medium text-muted-foreground">{n}</Text></View>
 }

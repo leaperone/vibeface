@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { CircleCheck, CircleX, Clock, Copy, FolderTree, Inbox, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, X, Zap, type LucideIcon } from "lucide-react"
+import { CircleCheck, CircleHelp, CircleX, Clock, Copy, FolderTree, Inbox, Layers, MessageCircleQuestionMark, Plus, Send, Trash2, X, Zap, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, SettingsDisclosure, SettingsRow, Skeleton, toast } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -73,10 +73,15 @@ export function TriageSettings() {
   const connected = Boolean(settings.webhook_url)
 
   const webhookForm = <form className="grid gap-2" onSubmit={(event) => { event.preventDefault(); void save("webhook", { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret("")) }}>
-    <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}</p>
-    <label htmlFor="webhook-url" className={fieldLabel}>地址</label>
+    <div className="grid gap-0.5">
+      <p className="flex items-center gap-2 text-meta font-medium text-foreground"><Send aria-hidden="true" className="size-4" />把提醒发给{chat}
+        <a href={waitingCopy.forwardHelp} target="_blank" rel="noopener noreferrer" aria-label="怎么接" title="怎么接" className="hit-area relative ms-auto text-muted-foreground hover:text-foreground"><CircleHelp aria-hidden="true" className="size-4" /></a>
+      </p>
+      <p className="text-meta text-muted-foreground">{waitingCopy.forwardHint}</p>
+    </div>
+    <label htmlFor="webhook-url" className={fieldLabel}>地址<span className="font-normal"> · {waitingCopy.urlHint}</span></label>
     <Input id="webhook-url" type="url" className="font-mono" placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
-    <label htmlFor="webhook-secret" className={fieldLabel}>密钥</label>
+    <label htmlFor="webhook-secret" className={fieldLabel}>密钥<span className="font-normal"> · {waitingCopy.secretHint}</span></label>
     {confirming === "secret" ? <p className="text-meta text-foreground">清除后提醒发不出去</p> : null}
     <div className="flex min-w-0 gap-2">
       <Input id="webhook-secret" type="password" autoComplete="new-password" minLength={16} maxLength={512} className="min-w-0" placeholder={settings.webhook_secret_set ? "已设置" : "至少 16 个字符"} value={secret} onChange={(event) => setSecret(event.target.value)} />

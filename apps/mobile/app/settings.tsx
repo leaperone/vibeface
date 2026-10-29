@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { addOnManager, eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
@@ -47,7 +47,8 @@ export default function Settings() {
     <JoinRequests />
     {workspace.members.length || manager ? <SettingsGroup title="我的设备">
       {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}
-      {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" /> : null}
+      {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" />
+        : device.ready ? <SettingsRow disabled icon={Crown} label={addOnManager(workspace.members.filter((member) => member.admin).map((member) => member.name))} /> : null}
     </SettingsGroup> : null}
     {/* As on the web: a computer's bots live in its detail above, and a session that waits for you reaches you here. */}
     {device.ready ? <SettingsGroup title={waitingCopy.title}>

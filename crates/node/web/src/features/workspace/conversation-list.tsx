@@ -5,6 +5,7 @@ import { CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { moodLabel } from "@vibeface/client/avatar/mood.ts"
 import { Button } from "@/components/ui/button"
+import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
@@ -43,7 +44,7 @@ export function ConversationList() {
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
     </div>
     {list}
-    <footer className="relative mt-6 grid gap-1 px-1 pt-2 before:absolute before:inset-x-3 before:top-0 before:border-t before:border-border md:hidden"><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
+    <footer className="relative mt-6 grid gap-1 px-1 pt-2 before:absolute before:inset-x-3 before:top-0 before:border-t before:border-border md:hidden"><AiOffHint /><SecondDeviceHint /><ConnectionCapsule side="bottom" /></footer>
   </div>
 }
 
