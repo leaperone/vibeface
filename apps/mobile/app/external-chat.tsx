@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
-import { CircleCheck, CircleX, Copy, Inbox, Layers, LoaderCircle, MessageSquareShare, Plus, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { CircleCheck, CircleHelp, CircleX, Copy, Inbox, Layers, LoaderCircle, MessageSquareShare, Plus, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useState } from 'react'
-import { View } from 'react-native'
+import { Linking, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { waitingCopy } from '@vibeface/client/identity/copy.ts'
@@ -52,8 +52,12 @@ function Triage() {
   // Until a chat is connected there is nothing to forward, so only connecting shows.
   const connected = Boolean(settings.webhook_url)
   const connect = <>
-    <Field label="地址"><Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} /></Field>
-    <Field label="密钥"><View className="flex-row gap-2">
+    <View className="flex-row items-center gap-2">
+      <Text className="min-w-0 flex-1 text-meta text-muted-foreground">{waitingCopy.forwardHint}</Text>
+      <Button variant="ghost" size="icon" accessibilityLabel="怎么接" onPress={() => { void Linking.openURL(waitingCopy.forwardHelp).catch(() => {}) }}><Icon as={CircleHelp} className="text-muted-foreground" /></Button>
+    </View>
+    <Field label={`地址 · ${waitingCopy.urlHint}`}><Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} /></Field>
+    <Field label={`密钥 · ${waitingCopy.secretHint}`}><View className="flex-row gap-2">
       <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '已设置' : '至少 16 个字符'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
       {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
     </View></Field>

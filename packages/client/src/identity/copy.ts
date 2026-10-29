@@ -15,6 +15,19 @@ export const joinCopy = {
   joining: '加入中',
 }
 
+/** 添加设备: a phone scans the code; another computer runs one command, so both ways show without opening the raw link. */
+export const addDeviceCopy = {
+  phone: '手机',
+  computer: '电脑',
+  copyCommand: '复制命令',
+  runThere: '在另一台电脑的终端里运行',
+  compare: '新设备出现安全码后，回这里比对',
+  /** The Node numbers a name another device already has, so one suggested name is enough. */
+  command: (link: string) => `vibeface join '${link}' --name '我的电脑'`,
+}
+/** Where a device without management goes to add one; `managers`: the names of the management devices. */
+export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
+
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
 /** An erase takes this device's management with it; the phone warns before clearing itself. */
@@ -109,6 +122,8 @@ export const deviceCopy = {
   manageHint: '能添加、移除设备，改设置，拦下找回',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
   botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot' },
+  /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
+  aiOff: '这台电脑的 AI 还没开',
   removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
   /**
    * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
@@ -126,5 +141,10 @@ export const deviceCopy = {
 export const waitingCopy = {
   title: '会话等你时',
   forward: '转发到外部聊天',
+  /** One line under the two fields: what can receive it and where the two values come from. */
+  forwardHint: '支持能收 HTTPS 消息的外部聊天，如 Grok Bot',
+  urlHint: '外部聊天收消息的地址',
+  secretHint: '自己设一串，外部聊天那边填同一串',
+  forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/docs/node.md#转发到外部聊天',
   outlets: { record: '只在待处理', both: '也发给外部聊天' },
 }

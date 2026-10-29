@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { deviceCopy } from "@vibeface/client/identity/copy.ts"
+import { addOnManager, deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
@@ -91,6 +91,9 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
+    {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-meta text-muted-foreground">
+      <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>
+    </p> : null}
   </div>
 }
 

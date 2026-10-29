@@ -238,7 +238,7 @@ impl Store {
                 ensure!(
                     row.device_id.as_deref() == Some(device)
                         && row.kind.as_deref() == Some(kind)
-                        && row.name.as_deref() == Some(join.name.as_str())
+                        && row.name.as_deref().is_some_and(|name| numbered_from(name, &join.name))
                         && row.commit.as_deref() == Some(join.commit.as_str()),
                     "ticket has already been used"
                 );
@@ -249,9 +249,15 @@ impl Store {
                 view.cutoff(device).is_none() && view.member(device).is_err(),
                 "device is already a member or was revoked"
             );
+            let mut taken: Vec<String> = view.members.iter().map(|member| member.name.clone()).collect();
+            let mut open = tx.prepare(
+                "SELECT name FROM invites WHERE status IN ('pending','confirming') AND expires_at_ms>? AND name IS NOT NULL",
+            )?;
+            taken.extend(open.query_map([now], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+            let name = distinct_name(&join.name, &taken);
             tx.execute(
                 "UPDATE invites SET device_id=?,kind=?,name=?,commit_hash=?,status='pending',expires_at_ms=? WHERE join_id=?",
-                params![device, kind, join.name, join.commit, now + TICKET_LIFETIME_MS, row.join_id],
+                params![device, kind, name, join.commit, now + TICKET_LIFETIME_MS, row.join_id],
             )?;
             load_request(tx, "join_id", &row.join_id)?
                 .context("join request vanished")?
@@ -507,6 +513,36 @@ impl Row {
             expires_at_ms: self.expires_at_ms,
         })
     }
+}
+
+/// `asked`, or the first `asked N` from 2 up that no device in `taken` already has, so two
+/// devices that kept their suggested name stay apart in the approval card and the device list.
+fn distinct_name(asked: &str, taken: &[String]) -> String {
+    let free = |name: &str| !taken.iter().any(|other| other == name);
+    if free(asked) {
+        return asked.to_owned();
+    }
+    (2..)
+        .map(|n| {
+            let suffix = format!(" {n}");
+            let mut end = asked.len().min(128 - suffix.len());
+            while !asked.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}{suffix}", &asked[..end])
+        })
+        .find(|name| free(name))
+        .expect("numbers outlast the taken names")
+}
+
+/// Whether `stored` is what [`distinct_name`] made of `asked`, so a retried join still matches.
+fn numbered_from(stored: &str, asked: &str) -> bool {
+    stored == asked
+        || stored.rsplit_once(' ').is_some_and(|(base, n)| {
+            let cut = asked.len() + 1 + n.len() > 128;
+            n.parse::<u32>().is_ok_and(|n| n >= 2)
+                && (base == asked || cut && !base.is_empty() && asked.starts_with(base))
+        })
 }
 
 fn load_request(conn: &Connection, column: &str, value: &str) -> Result<Option<Row>> {

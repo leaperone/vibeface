@@ -10,6 +10,7 @@ import { claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, 
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { moodLabel } from "@vibeface/client/avatar/mood.ts"
 import { useOpenJoins } from "@/features/devices/join"
+import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
@@ -135,6 +136,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           </SidebarGroup>
         </SidebarContent>
         <SidebarFooter className="shrink-0 gap-1 px-2 py-3">
+          <AiOffHint />
           <SecondDeviceHint />
           <ConnectionCapsule />
           <SidebarMenu>
