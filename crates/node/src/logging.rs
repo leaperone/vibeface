@@ -128,12 +128,18 @@ pub fn redact(text: &str, secrets: &[String]) -> String {
             text = text.replace(path, "[local-path]");
         }
     }
-    for secret in secrets.iter().filter(|secret| secret.len() >= 8) {
-        text = text.replace(secret.as_str(), "[redacted]");
-    }
+    let mut text = blank_credentials(&text, secrets);
     blank_after(&mut text, "vibeface1", false, "[invite]", |c| {
         c.is_ascii_alphanumeric()
     });
+    text
+}
+
+fn blank_credentials(text: &str, credentials: &[String]) -> String {
+    let mut text = text.to_owned();
+    for credential in credentials.iter().filter(|value| value.len() >= 8) {
+        text = text.replace(credential.as_str(), "[redacted]");
+    }
     blank_after(&mut text, "Bearer ", true, "[redacted]", |c| {
         c.is_ascii_alphanumeric() || "-._~+/=".contains(c)
     });
@@ -248,17 +254,57 @@ impl Sink {
     }
 }
 
+/// Whether a variable of this name holds a key, token or password.
+pub fn credential_name(name: &str) -> bool {
+    ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
 /// Model keys and other credentials the Node process was started with.
 fn environment_secrets() -> Vec<String> {
     std::env::vars()
-        .filter(|(key, value)| {
-            value.len() >= 8
-                && ["_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
-                    .iter()
-                    .any(|suffix| key.ends_with(suffix))
-        })
+        .filter(|(key, value)| value.len() >= 8 && credential_name(key))
         .map(|(_, value)| value)
         .collect()
+}
+
+/// Keys and tokens that stay on this device: out of its logs and out of every record it signs.
+static CREDENTIALS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn credentials() -> std::sync::MutexGuard<'static, Vec<String>> {
+    CREDENTIALS
+        .get_or_init(|| Mutex::new(environment_secrets()))
+        .lock()
+        .expect("credentials")
+}
+
+/// Keeps `credential` out of node.log and out of every event this Node writes from now on.
+pub fn add_credential(credential: &str) {
+    add_secret(credential);
+    let mut known = credentials();
+    if credential.len() >= 8 && !known.iter().any(|value| value == credential) {
+        known.push(credential.to_owned());
+    }
+}
+
+/// Blanks known credentials and bearer tokens in every string of `value`; whether any was.
+pub fn blank_credentials_in(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            let blanked = blank_credentials(text, &credentials());
+            let found = blanked != *text;
+            *text = blanked;
+            found
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |found, item| blank_credentials_in(item) | found),
+        Value::Object(items) => items
+            .values_mut()
+            .fold(false, |found, item| blank_credentials_in(item) | found),
+        _ => false,
+    }
 }
 
 static SINK: OnceLock<Arc<Sink>> = OnceLock::new();

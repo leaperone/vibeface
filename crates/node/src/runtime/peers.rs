@@ -1208,45 +1208,39 @@ impl Runtime {
     }
 
     async fn ingest(self: &Arc<Self>, network: &str, events: &[SignedEvent]) -> Result<()> {
-        let (statuses, rebuilt) = {
+        let ingested = {
             let mut store = self.store.lock().await;
             let ingested = store.ingest_events(network, events)?;
             store.settle_local_works(network)?;
             ingested
         };
-        if rebuilt {
+        if ingested.rebuilt {
             self.publish_reread(network);
         }
-        let mut scopes = BTreeSet::new();
-        for (event, status) in events.iter().zip(&statuses) {
+        for (event, status) in events.iter().zip(&ingested.statuses) {
             match status {
-                IngestStatus::Accepted | IngestStatus::Pending => {
-                    if let Ok(body) = serde_json::from_str::<Event>(&event.canonical_body) {
-                        if *status == IngestStatus::Accepted
-                            && matches!(body.body, EventBody::BotDeleted { .. })
-                        {
-                            self.bot_deleted(network, &body.scope_id, &event.hash);
-                        }
-                        // A move stops this Node's turn in that conversation without delay.
-                        if matches!(body.body, EventBody::ConversationOwner { .. }) {
-                            self.schedule_wakeup.notify_one();
-                        }
-                        scopes.insert((body.scope_id, event.hash.clone()));
-                    }
-                }
                 IngestStatus::Rejected(reason) => {
                     tracing::debug!(hash = %event.hash, reason, "peer event rejected")
                 }
                 IngestStatus::Conflict => {
                     tracing::warn!(event = "sync.fork_evidence", hash = %event.hash, "forked event stored as evidence")
                 }
-                IngestStatus::Duplicate => {}
+                IngestStatus::Accepted | IngestStatus::Pending | IngestStatus::Duplicate => {}
             }
         }
-        for (scope, hash) in scopes {
+        for HashedEvent { hash, event } in ingested.stored {
+            match event.body {
+                EventBody::BotDeleted { .. } => {
+                    self.bot_deleted(network, &event.scope_id, &hash);
+                    continue;
+                }
+                // A move stops this Node's turn in that conversation without delay.
+                EventBody::ConversationOwner { .. } => self.schedule_wakeup.notify_one(),
+                _ => {}
+            }
             let _ = self.events.send(Update {
                 network_id: network.into(),
-                payload: json!({"type":"changed","conversation_id":scope,"event_hash":hash}),
+                payload: json!({"type":"changed","conversation_id":event.scope_id,"event_hash":hash}),
             });
         }
         Ok(())
@@ -3266,6 +3260,227 @@ mod tests {
         for dir in [dir_a, dir_b, dir_c] {
             let _ = std::fs::remove_dir_all(dir);
         }
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_that_wait_for_an_ancestor_are_pushed_and_acted_on_once_stored() -> Result<()> {
+        let [il, ih, ic] = [
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        ];
+        let admin = il.fixture_admin();
+        let device = |id: &LocalIdentity| id.device_id().unwrap();
+        let state = il.sign_network_fixture(1, vec![device(&il), device(&ih), device(&ic)])?;
+        let network = il.fixture_network_id()?;
+        let (l, dir_l) = node(&il).await?;
+        let (h, dir_h) = node(&ih).await?;
+        let (c, dir_c) = node(&ic).await?;
+        let message = |scope: &str, id: &str| -> Result<Attestation> {
+            admin
+                .attest(
+                    &network,
+                    scope,
+                    EventBody::MessagePosted {
+                        message_id: id.into(),
+                        role: Role::User,
+                        text: id.into(),
+                        attachments: vec![],
+                        report_results: Some(true),
+                        in_reply_to: None,
+                        status: None,
+                        answers: None,
+                        attestation: None,
+                        failure: None,
+                    },
+                )?
+                .attestation()
+                .cloned()
+                .context("signed message")
+        };
+        let result = async {
+            for node in [&l, &h, &c] {
+                node.install_membership(state.clone()).await?;
+            }
+            let trigger = {
+                let mut store = c.store.lock().await;
+                let owner = il.owner_fixture(&network, "bot", &device(&ic))?;
+                store.create_conversation(&ic, &network, "bot", "Bot", owner, now_ms())?;
+                let bot = admin.attest(
+                    &network,
+                    "bot",
+                    EventBody::BotCreated {
+                        bot_id: "bot".into(),
+                        name: "Bot".into(),
+                        instructions: String::new(),
+                        project: None,
+                        attestation: None,
+                        cause: None,
+                    },
+                )?;
+                store.append_event(&ic, &network, "bot", bot, vec![], now_ms())?;
+                store.accept_message(
+                    &ic,
+                    &network,
+                    "bot",
+                    "m1",
+                    "m1",
+                    vec![],
+                    true,
+                    message("bot", "m1")?,
+                    now_ms(),
+                )?;
+                let claimed = store
+                    .claim_next(&ic, &network, "bot", "boot", "cfg")?
+                    .context("job")?;
+                let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+                store.mark_started("bot", &claimed.job.trigger, &attempt)?;
+                claimed.job.trigger
+            };
+            let log_of = async |node: &Runtime, id: &LocalIdentity| {
+                node.store
+                    .lock()
+                    .await
+                    .events_from(&network, &device(id), 1, 1024)
+            };
+            l.store
+                .lock()
+                .await
+                .ingest_events(&network, &log_of(&c, &ic).await?)?;
+            let owner = il.owner_fixture(&network, "s", &device(&il))?;
+            h.store
+                .lock()
+                .await
+                .create_conversation(&ih, &network, "s", "S", owner, now_ms())?;
+            let from_h = log_of(&h, &ih).await?;
+            l.store.lock().await.ingest_events(&network, &from_h)?;
+            let deleted = admin
+                .attest(
+                    &network,
+                    "bot",
+                    EventBody::BotDeleted {
+                        attestation: None,
+                        cause: None,
+                    },
+                )?
+                .attestation()
+                .cloned()
+                .context("signed deletion")?;
+            let (posted, deletion) = {
+                let mut store = l.store.lock().await;
+                let (posted, _) = store.accept_message(
+                    &il,
+                    &network,
+                    "s",
+                    "l1",
+                    "l1",
+                    vec![],
+                    true,
+                    message("s", "l1")?,
+                    now_ms(),
+                )?;
+                let deletion = store
+                    .delete_bot(&il, &network, "bot", deleted, now_ms())?
+                    .context("deleted")?;
+                (posted.event_hash, deletion.hash)
+            };
+
+            let mut updates = c.events.subscribe();
+            let pushed = |updates: &mut broadcast::Receiver<Update>| {
+                std::iter::from_fn(|| updates.try_recv().ok())
+                    .filter_map(|update| {
+                        Some((
+                            update.payload["conversation_id"].as_str()?.to_owned(),
+                            update.payload["event_hash"].as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            c.ingest(&network, &log_of(&l, &il).await?).await?;
+            assert_eq!(
+                c.store.lock().await.event(&network, &posted)?,
+                None,
+                "L's events wait for H's"
+            );
+            assert!(
+                pushed(&mut updates).is_empty(),
+                "nothing is pushed for an event still waiting"
+            );
+
+            c.ingest(&network, &from_h).await?;
+            let after = pushed(&mut updates);
+            assert!(
+                after.contains(&("s".into(), posted.clone())),
+                "the message stored with its ancestor is pushed: {after:?}"
+            );
+            assert!(
+                after.contains(&("bot".into(), deletion.clone())),
+                "the deletion stored with its ancestor is pushed"
+            );
+            let stopped = async {
+                loop {
+                    let job = c
+                        .store
+                        .lock()
+                        .await
+                        .scheduler_job("bot", &trigger)?
+                        .context("job")?;
+                    if !matches!(job.state, crate::scheduling::JobState::Running { .. }) {
+                        return Ok::<_, anyhow::Error>(job.state);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let state = tokio::time::timeout(Duration::from_secs(10), stopped)
+                .await
+                .context("the deleted bot's running turn is stopped")??;
+            assert!(
+                matches!(
+                    state,
+                    crate::scheduling::JobState::Cancelling { .. }
+                        | crate::scheduling::JobState::Cancelled { .. }
+                ),
+                "{state:?}"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop((l, h, c));
+        for dir in [dir_l, dir_h, dir_c] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn every_local_append_wakes_the_have_notice() -> Result<()> {
+        let identity = LocalIdentity::generate();
+        let state = identity.sign_network_fixture(1, vec![identity.device_id()?])?;
+        let network = identity.fixture_network_id()?;
+        let (node, dir) = node(&identity).await?;
+        let result = async {
+            node.install_membership(state).await?;
+            let owner = identity.owner_fixture(&network, "c", &identity.device_id()?)?;
+            let woken = node.have_wakeup.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            node.store.lock().await.create_conversation(
+                &identity,
+                &network,
+                "c",
+                "C",
+                owner,
+                now_ms(),
+            )?;
+            tokio::time::timeout(Duration::from_secs(1), woken)
+                .await
+                .context("an append that publishes nothing still announces the new head")?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        let _ = std::fs::remove_dir_all(dir);
         result
     }
 

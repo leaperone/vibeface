@@ -662,6 +662,21 @@ fn unanswered_from(
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Whether a completed reply to `reply_to` is in the shared record, written by any device.
+fn replied_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    reply_to: &str,
+) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=?
+            AND in_reply_to=? AND status='completed')",
+        params![network, conversation, reply_to],
+        |r| r.get(0),
+    )?)
+}
+
 /// The enabled schedule a schedule job runs, if it still belongs to the job's conversation.
 pub(crate) fn live_schedule(
     connection: &Connection,
@@ -1450,6 +1465,16 @@ impl Store {
                 }
                 TriggerKind::AgentTask if super::work::run_finished(&tx, &job.reply_to)? => {
                     Some("任务结果已由你确认")
+                }
+                // A restored backup, or a new owner retrying a delivery, may queue a trigger
+                // some device already answered: its turn's effects happened once already.
+                TriggerKind::Human
+                | TriggerKind::Answer
+                | TriggerKind::BotMessage
+                | TriggerKind::Schedule
+                    if replied_from(&tx, network, conversation, &job.reply_to)? =>
+                {
+                    Some("已在别处回复")
                 }
                 _ => None,
             };

@@ -27,7 +27,7 @@ iroh-relay.workspace = true
 mdns-sd = { version = "=0.21.6", default-features = false, features = ["async"] }
 rand.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
