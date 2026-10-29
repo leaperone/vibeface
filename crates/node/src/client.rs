@@ -1396,11 +1396,14 @@ fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let mut addrs: Vec<_> = addrs
         .filter(|addr| !matches!(addr.ip(), std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
         .collect();
+    // Home LANs are mostly 192.168/16; container bridges and VPNs take 172.16/12 and 10/8.
     addrs.sort_by_key(|addr| match addr.ip() {
-        ip if ip.is_loopback() => 3,
-        std::net::IpAddr::V4(ip) if ip.is_private() => 0,
-        std::net::IpAddr::V4(_) => 1,
-        std::net::IpAddr::V6(_) => 2,
+        ip if ip.is_loopback() => 5,
+        std::net::IpAddr::V4(ip) if ip.octets()[..2] == [192, 168] => 0,
+        std::net::IpAddr::V4(ip) if ip.octets()[0] == 10 => 1,
+        std::net::IpAddr::V4(ip) if ip.is_private() => 2,
+        std::net::IpAddr::V4(_) => 3,
+        std::net::IpAddr::V6(_) => 4,
     });
     addrs.truncate(8);
     addrs
@@ -1873,14 +1876,16 @@ mod tests {
         let mut many: Vec<_> = (0..8)
             .map(|i| addr(&format!("[2001:db8::{i}]:4790")))
             .collect();
-        many.extend([
-            addr("[fe80::1]:4790"),
-            addr("127.0.0.1:4790"),
-            addr("192.168.1.10:4790"),
-        ]);
+        many.extend([addr("[fe80::1]:4790"), addr("127.0.0.1:4790")]);
+        many.extend((17..27).map(|i| addr(&format!("172.{i}.0.1:4790"))));
+        many.push(addr("192.168.1.10:4790"));
         let kept = invite_addrs(many.into_iter());
         assert_eq!(kept.len(), 8);
-        assert_eq!(kept[0], addr("192.168.1.10:4790"));
+        assert_eq!(
+            kept[0],
+            addr("192.168.1.10:4790"),
+            "container bridges do not crowd out the home LAN"
+        );
         assert!(!kept.contains(&addr("[fe80::1]:4790")));
         assert_eq!(
             invite_addrs([addr("127.0.0.1:9")].into_iter()),

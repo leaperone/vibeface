@@ -344,7 +344,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `vibeface/sync/1` | `hello`、`membership`、`pull`、`forks`、`have` | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
-| `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
+| `vibeface/client/1` | 网关转发的浏览器 Noise 会话，或手机 App 在局域网用临时密钥直接拨入的会话；每条流一个会话，帧为 `tag ‖ u32 BE 长度 ‖ 内容` | 任意设备，会话本身由 Noise 认证 |
 | `vibeface/join/1` | 只开放 `join`、`join_status` 和 `join_withdraw` | 任意设备 |
 | `vibeface/service/1` | 可选的公益和付费文件对象交付 | 已认证 PeerID，另验服务开关、条款、证明及对象授权，不要求成为私人成员 |
 
