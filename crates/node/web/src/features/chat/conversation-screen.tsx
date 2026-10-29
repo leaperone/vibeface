@@ -262,7 +262,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       />
       {bot ? <PromptInput
         above={!workspace.connectionOnline ? <p role="status" className="flex h-8 items-center gap-1.5 rounded-full border bg-card ps-2.5 pe-1 text-meta font-medium shadow-sm max-md:h-11">
-          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />连不上 {ready ? nodeName(ready.entry.device_id, lookup) : '设备'}
+          <WifiOff aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />连不上{ready ? nodeName(ready.entry.device_id, lookup) : '设备'}
           <Button type="button" variant="ghost" size="sm" className="h-7 rounded-full max-md:h-9" onClick={retryNow}><RotateCw aria-hidden="true" />重试连接</Button>
         </p> : waitingTarget && targetHidden ? <button type="button" className="flex h-8 items-center gap-1.5 rounded-full border border-warning-border bg-card ps-2.5 pe-3 text-meta font-medium shadow-sm transition-colors hover:bg-warning-soft active:bg-warning-soft animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out max-md:h-11 max-md:ps-3"
           onClick={() => document.getElementById(waitingTarget)?.scrollIntoView({ block: asked ? 'center' : 'end', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}>

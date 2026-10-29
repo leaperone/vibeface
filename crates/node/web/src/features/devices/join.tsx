@@ -88,7 +88,8 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
   >
     <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? "和新设备上的比对，不一致就拒绝" : "等新设备显示安全码"}</p>
     {request.code ? <SafetyCode code={request.code} /> : request.status === "pending" && !auto ? null : <Skeleton className="h-8 w-40" />}
-    {request.kind === "client" ? <label className="flex min-h-11 w-fit items-center gap-2 text-meta md:min-h-9"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为{terms.admin.label}<span className="text-muted-foreground">· {deviceCopy.manageHint}</span></label> : null}
+    {request.kind === "client" ? <div><label className="flex min-h-11 w-fit items-center gap-2 text-meta md:min-h-9"><input type="checkbox" className="size-4" checked={manage} disabled={busy} onChange={(event) => setManage(event.target.checked)} />设为{terms.admin.label}</label>
+      <p className="ps-6 text-meta text-muted-foreground">{deviceCopy.manageHint}</p></div> : null}
     <InlineError error={action.error} />
     <Details>
       <DetailRow label="设备编号" value={request.device_id} mono />
