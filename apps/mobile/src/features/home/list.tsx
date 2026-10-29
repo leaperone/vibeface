@@ -1,5 +1,5 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, Settings, Star } from 'lucide-react-native'
+import { Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
@@ -58,8 +58,8 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     </View> : null}
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
-        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border border-warning-border bg-warning-soft px-3 py-2.5 active:opacity-70', active('/inbox') && 'border-warning')}>
-          <View className="size-11 items-center justify-center rounded-full bg-warning/15"><Icon as={Inbox} className="text-warning" /></View>
+        <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
+          <View className={cn('size-11 items-center justify-center rounded-full', device.pendingRecovery ? 'bg-danger/15' : 'bg-warning/15')}><Icon as={device.pendingRecovery ? ShieldAlert : Inbox} className={device.pendingRecovery ? 'text-danger' : 'text-warning'} /></View>
           <Text numberOfLines={1} className="min-w-0 flex-1 font-semibold">{device.pendingRecovery ? recoveryCopy.pending : `${waiting} 件事等你决定`}</Text>
           <Icon as={ChevronRight} className="text-muted-foreground" />
         </Pressable>

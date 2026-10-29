@@ -22,6 +22,7 @@ import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
+import { RecoveryAlert } from '@/features/recovery/recovery'
 import { fadeIn } from '@/lib/motion'
 
 /** One row of the chat: a message, or a question or status line between them. */
@@ -188,6 +189,7 @@ export default function ChatScreen() {
         </>}
       </View>
     </Animated.View>}
+    <RecoveryAlert top={header} />
     </View></ScreenFaces>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>

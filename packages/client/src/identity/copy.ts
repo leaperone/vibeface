@@ -50,6 +50,7 @@ export const recoveryCopy = {
   stoppedNote: '新恢复文件用不了，旧文件仍然有效',
   saveNew: '保存新的恢复文件',
   recovered: '已找回，旧文件已作废',
+  why: '设备都丢了时，靠它找回',
   needsPassword: '没有恢复密码，这个文件打不开',
   onlyCopy: '只有这一份，丢了不能补',
   keptApart: '已把文件和密码分开保存',
