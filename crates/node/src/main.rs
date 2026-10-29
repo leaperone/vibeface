@@ -427,7 +427,8 @@ struct LocalEntry {
 
 #[derive(Args)]
 struct Join {
-    /// Invite link, `https://<gateway>/join#vibeface1…`.
+    /// Invite link: `https://<gateway>/join#vibeface1…`, the app's `vibeface://join?link=…`, or
+    /// the ticket alone.
     link: String,
     #[command(flatten)]
     data: DataDir,
