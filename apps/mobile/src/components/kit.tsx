@@ -1,11 +1,12 @@
 import * as Clipboard from 'expo-clipboard'
 import { Link, type Href } from 'expo-router'
-import { Check, ChevronDown, ChevronRight, Copy, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { Asterisk, Braces, Check, ChevronDown, ChevronRight, Copy, MousePointer2, Pi, SquareTerminal, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { Children, Fragment, isValidElement, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AccessibilityInfo, Pressable, View } from 'react-native'
 import Animated, { useReducedMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { oklch } from '@vibeface/client/avatar/face.ts'
+import type { ProviderId } from '@vibeface/client/lib/node.ts'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -143,6 +144,8 @@ export function CopyableId({ value, label }: { value: string; label: string }) {
     }}><Icon as={copied ? Check : Copy} className={cn('size-4', copied && 'text-success')} /></Button>
   </View>
 }
+
+export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 
 /** Technical detail folded away by default, as the web's <Details>. */
 export function Details({ children, label = '详细信息', open: initial = false }: { children: ReactNode; label?: string; open?: boolean }) {

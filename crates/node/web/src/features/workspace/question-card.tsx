@@ -12,6 +12,8 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { providerNames } from "@vibeface/client/lib/node.ts"
+import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
 
 const looks: Record<Severity, { icon: LucideIcon; tone: Tone; label?: string }> = {
@@ -75,6 +77,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
       {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} search={inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
       </Link> : null}
+      {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自" compact={Boolean(task)}>{providerNames[question.about.agent]}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
       {/* As on task rows, only another device is named on screen. */}
       {question.about.node === ready?.entry.device_id ? <span className="sr-only">设备 {node}</span>
