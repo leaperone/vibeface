@@ -52,6 +52,7 @@ pub enum Tool {
     ConfigureBot,
     DeleteBot,
     HandOverSession,
+    ListSessions,
     ProposeProviderConfig,
     ApplyProviderConfig,
     TrackWork,
@@ -83,7 +84,7 @@ impl Effect {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 29] = [
+    pub const ALL: [Tool; 30] = [
         Tool::Nodes,
         Tool::Context,
         Tool::DispatchWork,
@@ -108,6 +109,7 @@ impl Tool {
         Tool::ConfigureBot,
         Tool::DeleteBot,
         Tool::HandOverSession,
+        Tool::ListSessions,
         Tool::ProposeProviderConfig,
         Tool::ApplyProviderConfig,
         Tool::TrackWork,
@@ -145,6 +147,7 @@ impl Tool {
             Tool::ConfigureBot => "configure_bot",
             Tool::DeleteBot => "delete_bot",
             Tool::HandOverSession => "hand_over_session",
+            Tool::ListSessions => "list_sessions",
             Tool::ProposeProviderConfig => "propose_provider_config",
             Tool::ApplyProviderConfig => "apply_provider_config",
             Tool::TrackWork => "track_work",
@@ -164,6 +167,7 @@ impl Tool {
             | Tool::FetchUrl
             | Tool::ListBots
             | Tool::ReadBot
+            | Tool::ListSessions
             | Tool::WaitWork => Effect::Read,
             Tool::DispatchWork
             | Tool::InterruptWork
@@ -316,12 +320,12 @@ impl Tool {
                 &["call_ref", "bot", "text"],
             ),
             Tool::ListBots => (
-                "List the user's bots: name, the start of their instructions, project folder and device, and their active schedules.",
+                "List the user's bots: name, the start of their instructions, project folder and device, model, the skill_ids they use (null with uses_all_skills when every shared skill), face and their active schedules.",
                 json!({}),
                 &[],
             ),
             Tool::ReadBot => (
-                "Read one bot's full configuration: name, instructions, project, schedules and notes. bot is its conversation_id, bot_id or name.",
+                "Read one bot's full configuration: name, instructions, project, model, every skill it uses by skill_id and name (the whole shared library when uses_all_skills), face, schedules and notes. bot is its conversation_id, bot_id or name.",
                 json!({"bot":string()}),
                 &["bot"],
             ),
@@ -346,10 +350,17 @@ impl Tool {
                 &["bot"],
             ),
             Tool::HandOverSession => (
-                "Hand a coding session you follow (node, session_id and version from bot.sessions) to another bot, or stop following it. to is the other bot's conversation_id or name from bots, or your own bot.configured_bot.name to take back a session you stopped following. stop_following=true instead stops following it: its events drop until you take it back or hand it on. Agree with the other bot through message_bot first. The device running the session records the change only at the version you name, and returns the new version; calling again with the same arguments only reads back what stands. If the session changed since that version, nothing is written and the error names the version it is at now.",
+                "Hand a coding session you follow (node, session_id and version from bot.sessions or list_sessions) to another bot, or stop following it. to is the other bot's conversation_id or name from bots, or your own bot.configured_bot.name to take back a session you stopped following. stop_following=true instead stops following it: its events drop until you take it back or hand it on. Agree with the other bot through message_bot first. The device running the session records the change only at the version you name, and returns the new version; calling again with the same arguments only reads back what stands. If the session changed since that version, nothing is written and the error names the version it is at now.",
                 json!({"node":string(),"session_id":string(),"version":string(),"to":string(),
                 "stop_following":{"type":"boolean","const":true}}),
                 &["node", "session_id", "version"],
+            ),
+            Tool::ListSessions => (
+                "List the user's coding sessions you follow, newest first, with the version hand_over_session takes; bot.sessions shows only the newest. before continues after the node and session_id of the previous page's last row; more says older ones remain.",
+                json!({"before":{"type":"object","properties":{"node":string(),"session_id":string()},
+                "required":["node","session_id"],"additionalProperties":false},
+                "limit":{"type":"integer","minimum":1,"maximum":50}}),
+                &[],
             ),
             Tool::ProposeProviderConfig => (
                 "Ask the user in this chat to allow paths this device's providers use. Give the paths you found with your Shell, or none to have the Node look on this device: CODEX_HOME of the Node's environment, else ~/.codex, its app-server-control/app-server-control.sock and sessions folder, and the program of each provider in use. bins sets a provider's program, by provider. execution also turns on executing work here for the providers it lists; roots adds folders work may run in, such as the user's projects folder you found. Only absolute paths that exist; never keys, tokens or other variables. Nothing changes now: the chat shows an allow/deny card and the user's answer comes back to you as a new turn. Calling again in the same turn with the same values returns the same card. If nothing differs from the current settings, status is unchanged.",

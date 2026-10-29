@@ -82,8 +82,8 @@ BotMessaged {
 
 | 工具 | 类别 | 作用 |
 |---|---|---|
-| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
-| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的 skill、实际显示的长相、schedule、笔记；没有任何密钥 |
+| `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill ID（启用全部时为 `null`，`uses_all_skills` 为真）、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
+| `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的每个 skill 的 `{skill_id, name}`（启用全部时是整个库）、实际显示的长相、schedule、笔记；没有任何密钥 |
 | `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话，返回的 bot 同样给出实际显示的长相 |
 | `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
@@ -105,7 +105,7 @@ BotMessaged {
 
 | 工具类别 | 工具 | 本人 | 回答 | 工作结果 | schedule | bot 消息 | Agent 任务、路由 |
 |---|---|---|---|---|---|---|---|
-| 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| 读 | `nodes` `context` `work_status` `call_lookup` `read_skill` `recall` `fetch_url` `list_bots` `read_bot` `list_sessions` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 工作 | `dispatch_work` `interrupt_work` `hand_over_session` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | 唤醒 | `remind` `message_bot` | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | 设置 | `update_profile` `configure_bot` `create_bot` `delete_bot` `save_skill` `remove_skill` `save_schedule` `remove_schedule` `remember` `forget` | ✓ | | | | | |
@@ -126,10 +126,14 @@ BotMessaged {
 
 `bot` 增加：
 
-- `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的；
-- `memory`：`{memory_id, text}`，以及 `memory_omitted`；
-- `sessions`：它名下的外来会话 `{node, session_id, agent, cwd, summary, following}`，最新优先截在 3000 字节内，以及 `sessions_omitted`；
-- `bots`：其他 bot 的 `{conversation_id, name}`。
+- `skills`：启用的 skill `{skill_id, name, description}`，按名称排，以及 `skills_omitted`；`read_bot` 列出全部；
+- `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的，下次运行最早的在前，以及 `schedules_omitted`；`read_bot` 列出全部；
+- `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`recall` 列出全部；
+- `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，`before` 给上一页最后一行的 `{node, session_id}`；
+- `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；
+- `bots`：其他 bot 的 `{conversation_id, name}`，以及 `bots_omitted`；`list_bots` 列出全部。
+
+每个索引最多 3000 字节，展示时从旧到新。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
 
 trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder}`，`reminder` 表示深度大于 0、由 bot 自己定的提醒。bot 消息时带那条消息和发送者。
 

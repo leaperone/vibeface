@@ -163,36 +163,25 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,"avatar":bot.shown_avatar(),
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,"uses_all_skills":bot.skills.is_none(),"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
                 Ok(json!({ "bots": bots }))
             }
-            Tool::ReadBot => {
-                let now = now_ms();
-                let store = self.store.lock().await;
-                let bot = store.find_bot(network, field(&args, "bot")?)?;
-                let schedules: Vec<_> = store
-                    .schedules(network, &bot.conversation_id)?
-                    .iter()
-                    .map(|entry| crate::scheduler::schedule_row(entry, now))
-                    .collect();
-                let memory = store.memories(network, &bot.conversation_id)?;
-                let library = store.skills(network)?;
-                let skills = bot.skills.as_ref().map(|set| {
-                    library
-                        .iter()
-                        .filter(|entry| set.contains(&entry.skill_id))
-                        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
-                        .collect::<Vec<_>>()
-                });
-                Ok(
-                    json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
-                    "instructions":bot.instructions,"project":bot.project,
-                    "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
-                    "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
-                )
+            Tool::ReadBot => read_bot(
+                &*self.store.lock().await,
+                network,
+                field(&args, "bot")?,
+                now_ms(),
+            ),
+            Tool::ListSessions => {
+                let sessions = self
+                    .store
+                    .lock()
+                    .await
+                    .attributed_sessions(network, &scope)?;
+                list_sessions(&sessions, &args)
             }
             Tool::DeleteBot => {
                 let manager = access
@@ -748,6 +737,79 @@ pub(crate) fn blob_page(
     Ok(page)
 }
 
+/// `read_bot`: one bot's whole configuration, every skill it uses included, the whole library
+/// when it uses all of them.
+pub(crate) fn read_bot(
+    store: &crate::store::Store,
+    network: &str,
+    wanted: &str,
+    now: i64,
+) -> Result<Value> {
+    let bot = store.find_bot(network, wanted)?;
+    let schedules: Vec<_> = store
+        .schedules(network, &bot.conversation_id)?
+        .iter()
+        .map(|entry| crate::scheduler::schedule_row(entry, now))
+        .collect();
+    let memory = store.memories(network, &bot.conversation_id)?;
+    let skills: Vec<_> = store
+        .skills(network)?
+        .into_iter()
+        .filter(|entry| {
+            bot.skills
+                .as_ref()
+                .is_none_or(|set| set.contains(&entry.skill_id))
+        })
+        .map(|entry| json!({"skill_id":entry.skill_id,"name":entry.skill.name}))
+        .collect();
+    Ok(
+        json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
+        "instructions":bot.instructions,"project":bot.project,
+        "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
+        "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
+    )
+}
+
+/// `list_sessions`: a page of the sessions this bot follows, newest first, after the one
+/// `before` names by node and session_id.
+pub(crate) fn list_sessions(sessions: &[Value], args: &Value) -> Result<Value> {
+    let rows: Vec<Value> = sessions
+        .iter()
+        .rev()
+        .map(crate::scheduler::session_row)
+        .collect();
+    let start = match args["before"].as_object() {
+        Some(before) => {
+            rows.iter()
+                .position(|row| {
+                    Some(&row["node"]) == before.get("node")
+                        && Some(&row["session_id"]) == before.get("session_id")
+                })
+                .context("before names no session this bot follows")?
+                + 1
+        }
+        None => 0,
+    };
+    let (page, more) = page(&rows, start, args);
+    Ok(json!({"sessions":page,"more":more}))
+}
+
+/// Up to `limit` rows from `start` within `PAGE_BYTES`, and whether more follow.
+fn page(rows: &[Value], start: usize, args: &Value) -> (Vec<Value>, bool) {
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+    let mut page = Vec::new();
+    let mut used = 0;
+    for row in rows.iter().skip(start).take(limit) {
+        used += row.to_string().len();
+        if !page.is_empty() && used > PAGE_BYTES {
+            break;
+        }
+        page.push(row.clone());
+    }
+    let more = start + page.len() < rows.len();
+    (page, more)
+}
+
 /// `work_status`: one work by `work_id` in full, or a page of this conversation's works newest
 /// first, after the work `before` names, within `PAGE_BYTES`.
 pub(crate) fn work_status(
@@ -786,16 +848,6 @@ pub(crate) fn work_status(
         }
         None => 0,
     };
-    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
-    let mut page = Vec::new();
-    let mut used = 0;
-    for row in rows.iter().skip(start).take(limit) {
-        used += row.to_string().len();
-        if !page.is_empty() && used > PAGE_BYTES {
-            break;
-        }
-        page.push(row.clone());
-    }
-    let more = start + page.len() < rows.len();
+    let (page, more) = page(&rows, start, args);
     Ok(json!({"works":page,"more":more}))
 }
