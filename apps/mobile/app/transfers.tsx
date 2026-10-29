@@ -43,7 +43,9 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
     if (status) void delivery.configure({ enabled: status.enabled, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled, ...patch })
   }
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
-  const sending = draftFor(draft, experiments)
+  // Paid already on at this Node stays visible, so it can be seen and turned off.
+  const paid = experiments || !!status?.paid_enabled
+  const sending = draftFor(draft, paid)
   const unusable = working || !file || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
   const prepare = (restart?: string) => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, restart) } }
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
@@ -54,11 +56,11 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
         {status.enabled ? <>
           <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-          {experiments ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
+          {paid ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
           <View className="gap-1"><Text className="text-meta text-muted-foreground">{transferCopy.connectionId}</Text>{experiments ? <CopyableId value={status.node_peer} label="连接 ID" /> : <CopyConnectionId value={status.node_peer} />}</View>
         </> : <Text className="text-meta text-muted-foreground">{transferCopy.off}</Text>}
         {!delivery.canManage ? <IconLine icon={Crown} text={transferCopy.adminOnly} /> : null}
-        {experiments ? <>
+        {paid ? <>
           {status.paid_enabled || status.wallet.state !== 'absent' ? <Text className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</Text> : null}
           {status.wallet.state === 'unavailable' ? <Text role="alert" className="text-meta text-warning">{status.wallet.reason}</Text> : null}
           <Details>
@@ -72,7 +74,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <Text role="heading" className="text-heading font-semibold">发送文件</Text>
         <InputField label={transferCopy.receiver} value={draft.receiver_peer} disabled={working} onChange={receiver_peer => setDraft({ ...draft, receiver_peer })} peer />
         <InputField label={transferCopy.provider} hint={transferCopy.providerHint} value={draft.provider_peer} disabled={working} onChange={provider_peer => setDraft({ ...draft, provider_peer })} peer />
-        {experiments ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
+        {paid ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
         {sending.mode === 'paid' ? <>
           <Text className="text-meta text-muted-foreground">什么时候付款</Text>
           <Segmented options={acceptanceOptions} value={draft.acceptance} disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
@@ -88,7 +90,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         {feedback('form')}
         <View className="flex-row flex-wrap gap-2">
           <Button disabled={unusable} onPress={() => prepare()}>{delivery.busy === 'prepare' ? <Icon as={LoaderCircle} /> : null}<Text>{transferCopy.prepare(sending.mode)}</Text></Button>
-          {selected && canRestart(selected) ? <Button variant="outline" disabled={unusable} onPress={() => prepare(selected.intent_id)}><Text>作为新订单再次发送</Text></Button> : null}
+          {selected && canRestart(selected) && (paid || selected.mode === 'charity') ? <Button variant="outline" disabled={unusable} onPress={() => prepare(selected.intent_id)}><Text>作为新订单再次发送</Text></Button> : null}
         </View>
         <Details><Text className="text-meta text-muted-foreground">{transferCopy.prepareDetails}</Text></Details>
       </View> : null}

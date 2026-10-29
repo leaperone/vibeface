@@ -37,7 +37,9 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
     if (status) void delivery.configure({ enabled: status.enabled, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled, ...patch })
   }
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
-  const sending = draftFor(draft, experiments)
+  // Paid already on at this Node stays visible, so it can be seen and turned off.
+  const paid = experiments || !!status?.paid_enabled
+  const sending = draftFor(draft, paid)
   const unusable = working || !file || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
@@ -48,12 +50,12 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
           {status.enabled ? <>
             <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-            {experiments ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
+            {paid ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
           </> : null}
         </div>
         {status.enabled ? <ConnectionId value={status.node_peer} shown={experiments} /> : <p className="text-meta text-muted-foreground">{transferCopy.off}</p>}
         {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />{transferCopy.adminOnly}</p> : null}
-        {experiments ? <>
+        {paid ? <>
           {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
           {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
           <Details>
@@ -67,7 +69,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         <h2 className="text-heading font-semibold">发送文件</h2>
         <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
         <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
-        {experiments ? <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
+        {paid ? <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
         {sending.mode === 'paid' ? <>
           <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
           <Field><FieldLabel htmlFor="transfer-service-cap">服务费上限（测试代币最小单位）</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
@@ -82,7 +84,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         {feedback('form')}
         <div className="flex flex-wrap gap-2">
           <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(sending.mode)}</Button>
-          {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
+          {selected && canRestart(selected) && (paid || selected.mode === 'charity') ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
         </div>
         <Details><p>{transferCopy.prepareDetails}</p></Details>
       </form> : null}

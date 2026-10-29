@@ -27,6 +27,7 @@ test('only a recovery link fills in the computer: join links, broken ids and oth
   assert.equal(recoveryTarget(`vibeface://join?recover=${mac}&address=https%3A%2F%2Fhome.example.com%2Fpath`), null)
   assert.equal(recoveryTarget(`vibeface://join?recover=${mac}`), null, 'a computer with nowhere to reach it is no target')
   assert.equal(recoveryTarget('设备编号'), null)
+  assert.equal(recoveryTarget(`vibeface://join?link=vibeface1test&recover=${mac}&address=https%3A%2F%2Fhome.example.com`), null, 'a link that is also an invitation means one thing only')
 })
 
 test('the phone is sent to a public entrance first, never to this computer\'s own loopback', () => {
@@ -42,4 +43,5 @@ test('with no public entrance a LAN web address, then where the computer listens
   const local: ConnectionEntry = { kind: 'local', address: 'http://localhost:4790', device_id: mac }
   assert.deepEqual(recoveryEntry([entrance(mac, 'http://localhost:4790', { direct: ['192.168.1.4:7001'] })], local), { kind: 'lan', addrs: ['192.168.1.4:7001'], device_id: mac })
   assert.equal(recoveryEntry([entrance(mac, 'http://localhost:4790')], local), null, 'nothing a phone can reach gives no QR code')
+  assert.equal(recoveryEntry([entrance(mac, 'http://0.0.0.0:4790'), entrance(pi, 'http://[::]:4790')], local), null, 'an any-address listener is no address either')
 })

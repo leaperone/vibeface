@@ -1,7 +1,7 @@
 import { openEntrances, type Entrance } from '../lib/entrances.ts'
 import { parseEntry, type ConnectionEntry } from '../lib/node.ts'
 
-const loopback = /^https?:\/\/(localhost|127\.|\[::1\])/i
+const loopback = /^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1?\])/i
 
 /**
  * What a phone scans or pastes to know which computer to recover through, in the shape of a join link:
@@ -20,7 +20,7 @@ export function recoveryTarget(value: string): ConnectionEntry | null {
   try {
     const url = new URL(value.trim())
     const device_id = url.searchParams.get('recover')
-    if (url.protocol !== 'vibeface:' || url.host !== 'join' || !device_id) return null
+    if (url.protocol !== 'vibeface:' || url.host !== 'join' || !device_id || url.searchParams.has('link')) return null
     const address = url.searchParams.get('address')
     return parseEntry(address ? { device_id, address } : { device_id, addrs: url.searchParams.getAll('lan') })
   } catch { return null }

@@ -1012,7 +1012,11 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       const chain = array(record(state).checkpoints), events = array(record(state).events)
       const revoked = new Set(view.revoked.map(item => item.device_id))
       const members = view.members.filter(member => !revoked.has(member.device_id) && member.device_id !== me)
-      if (!members.some(member => member.device_id === active.entry.device_id)) members.push({ device_id: active.entry.device_id, kind: 'node', name: active.info.name, manage: false })
+      // A computer already in some network must be one of this network's own; a link could name anyone's.
+      if (!members.some(member => member.device_id === active.entry.device_id)) {
+        if (!fresh) throw new Error('这台电脑不在你的网络里。换一台你自己的电脑，再扫它网页上的找回二维码。')
+        members.push({ device_id: active.entry.device_id, kind: 'node', name: active.info.name, manage: false })
+      }
       const newManager: Member = { device_id: me, kind: 'client', name, manage: true }
       const allowed = new Map(members.map(member => [member.device_id, member]))
       let prepared: { checkpoints: unknown[]; checkpoint: unknown } | null = null
