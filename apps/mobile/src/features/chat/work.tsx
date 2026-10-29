@@ -8,6 +8,7 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
+import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
 import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
@@ -226,13 +227,13 @@ function ChangeRows({ change, conversationId, schedules }: { change: BotChange; 
   </ChangeRow>
 }
 
-/** The face before and after, drawn; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
+/** The face before and after, drawn and read out in words; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
 function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversationId: string }) {
   const botId = useLive()?.bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
-  return <View className="flex-row items-center gap-2">
-    <View accessible accessibilityRole="image" accessibilityLabel="原来的长相"><BotFace bot={{ bot_id: botId, avatar: edit.before }} mood="idle" size={28} /></View>
-    <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted-foreground" />
-    <View accessible accessibilityRole="image" accessibilityLabel={edit.after ? '新的长相' : '默认长相'}><BotFace bot={{ bot_id: botId, avatar: edit.after }} mood="idle" size={28} /></View>
+  return <View accessible accessibilityRole="image" accessibilityLabel={avatarChangeWords(botId, edit.before, edit.after)} className="flex-row items-center gap-2">
+    <BotFace bot={{ bot_id: botId, avatar: edit.before }} mood="idle" size={28} still />
+    <Icon as={ArrowRight} className="size-4 text-muted-foreground" />
+    <BotFace bot={{ bot_id: botId, avatar: edit.after }} mood="idle" size={28} still />
   </View>
 }
 

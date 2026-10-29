@@ -118,6 +118,11 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: configured }] }, "chat").changes[0]?.change, configured)
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile", model: { before: "", after: "gpt-x" } } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "model" } }] }, "chat"))
+  const faceOnly = { kind: "profile", avatar: { before: null, after: { outline: "cloud", eyes: "wide", hue: 285 } } }
+  assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: faceOnly }] }, "chat").changes[0]?.change, faceOnly)
+  const backToDefault = { kind: "profile", avatar: { before: { outline: "cloud", eyes: "wide", hue: 285 }, after: null } }
+  assert.deepEqual(parseConversation({ ...base, changes: [{ ...base.changes[0], change: backToDefault }] }, "chat").changes[0]?.change, backToDefault)
+  assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[0], change: { kind: "profile", avatar: { before: null, after: { outline: "cloud", eyes: "wide", hue: 70 } } } }] }, "chat"))
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
   assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
     [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])

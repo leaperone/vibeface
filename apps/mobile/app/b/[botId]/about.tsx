@@ -40,7 +40,7 @@ export default function BotAbout() {
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
     <View className="items-start gap-3">
-      <FacePicker bot={bot} mood={botMood(bot, workspace, shared)} writable={shared.writable} write={(avatar) => shared.setBotAvatar(bot.conversation_id, avatar)} />
+      <FacePicker bot={bot} mood={botMood(bot, workspace, shared)} writable={shared.writable} write={(before, avatar) => shared.setBotAvatar(bot.conversation_id, before, avatar)} />
       {shared.primary === bot.conversation_id
         ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
         : <ActionButton variant="outline" className="self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
@@ -97,12 +97,12 @@ export default function BotAbout() {
 
 const primaryHint = '没有 Bot 负责的会话，由主 Bot 分派'
 
-/** The face as it will look, with the picker under it; a pick shows before it is written and goes back if the write fails. */
+/** The face as it will look, with the picker under it; a pick shows before it is written and goes back if the write fails. Only the big face moves. */
 function FacePicker({ bot, mood, writable, write }: { bot: BotRecord; mood: Mood; writable: boolean; write: Parameters<typeof useAvatarPick>[1] }) {
   const look = useAvatarPick(bot, write, (error) => Alert.alert('没换成', messageOf(error)))
   return <>
     <BotFace bot={{ bot_id: bot.bot_id, avatar: look.avatar }} mood={mood} size={80} />
-    <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!writable} pick={look.pick} />
+    <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!writable} busy={look.pending} pick={look.pick} />
   </>
 }
 

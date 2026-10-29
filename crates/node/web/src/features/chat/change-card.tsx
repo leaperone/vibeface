@@ -6,6 +6,7 @@ import { Details } from '@/components/app/kit'
 import { BotFace } from '@/components/app/bot-face'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
+import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
 import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
@@ -73,13 +74,13 @@ function BeforeAfter({ before, after, className }: { before: string; after: stri
   </p>
 }
 
-/** The face before and after, drawn; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
+/** The face before and after, drawn and read out in words; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
 function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversationId: string }) {
   const botId = useWorkspace().bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
-  return <p className='flex items-center gap-2'>
-    <span role='img' aria-label='原来的长相'><BotFace bot={{ bot_id: botId, avatar: edit.before }} mood='idle' size={28} /></span>
+  return <p role='img' aria-label={avatarChangeWords(botId, edit.before, edit.after)} className='flex items-center gap-2'>
+    <BotFace bot={{ bot_id: botId, avatar: edit.before }} mood='idle' size={28} still />
     <ArrowRight aria-hidden='true' className='size-4 shrink-0 text-muted-foreground' />
-    <span role='img' aria-label={edit.after ? '新的长相' : '默认长相'}><BotFace bot={{ bot_id: botId, avatar: edit.after }} mood='idle' size={28} /></span>
+    <BotFace bot={{ bot_id: botId, avatar: edit.after }} mood='idle' size={28} still />
   </p>
 }
 

@@ -45,7 +45,8 @@ export function BotPanelButton() {
   const view = workspace.data?.bot_settings
   const owner = workspace.data?.conversation?.owner
   const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
-  const look = useAvatarPick(bot ?? { bot_id: "", avatar: null }, (avatar) => workspace.setBotAvatar(bot!.conversation_id, avatar),
+  // The pick on show belongs to one bot: switching bots drops it (useAvatarPick compares bot_id).
+  const look = useAvatarPick(bot ?? { bot_id: "", avatar: null }, (before, avatar) => workspace.setBotAvatar(bot!.conversation_id, before, avatar),
     (caught) => toast(messageOf(caught, "换长相"), { tone: "danger" }))
   if (!bot) return null
   const shown = { bot_id: bot.bot_id, avatar: look.avatar }
@@ -99,7 +100,7 @@ export function BotPanelButton() {
         </SheetHeader>
         {view ? <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <SettingsGroup>
-            <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} pick={look.pick} />
+            <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>
           <SettingsGroup>
             {owner ? <SettingsRow icon={owner === ready?.entry.device_id ? Laptop : Server} label="运行设备">

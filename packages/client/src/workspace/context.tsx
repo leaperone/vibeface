@@ -13,7 +13,8 @@ import {
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder, attachmentLimit,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
-import { sameAvatar, type Avatar } from "../avatar/face.ts"
+import type { Avatar } from "../avatar/face.ts"
+import { avatarWrite } from "../avatar/pick.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -35,6 +36,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 /** `label` is a full sentence for a lone button; `state` lets a settings row word it shorter. */
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
+const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 
 function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
@@ -329,9 +331,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const wanted = item.params.project as BotProject | null
       return project?.target_node === wanted?.target_node && project?.cwd === wanted?.cwd
     }
+    // A bot missing from the list goes again like a project move does: the Node, not a stale list, says whether it is gone.
     if (item.method === "set_bot_avatar") {
       const bot = parseBots(await connection.rpc("bots")).find((entry) => entry.conversation_id === item.params.conversation_id)
-      return !bot || sameAvatar(bot.avatar, item.params.avatar as Avatar | null)
+      if (!bot) return false
+      const state = avatarWrite(bot.avatar, item.params.before as Avatar | null, item.params.avatar as Avatar | null)
+      if (state === "superseded" && current()) setNoticeText(faceSuperseded)
+      return state !== "unsent"
     }
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
@@ -624,13 +630,19 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       await refreshRef.current()
     }),
-    /** `null` goes back to the face the bot's id gives. */
-    setBotAvatar: (id: string, avatar: Avatar | null) => withMutation(`bot-avatar:${id}`, async () => {
-      const attestation = await attest(id, { type: "bot_avatar_set", avatar })
-      try { await signedWrite("bot-avatar", `${id}:${avatar ? `${avatar.outline}:${avatar.eyes}:${avatar.hue}` : ""}`, "set_bot_avatar", { conversation_id: id, avatar, attestation }) }
+    /**
+     * `before` is the face the user saw and `avatar` the new one, `null` being the face the bot's id gives. One write per
+     * bot waits in the outbox; the Node refuses it once the face has changed from `before`. Resolves once the Node has
+     * it: a failed refresh after that is not a failed pick.
+     */
+    setBotAvatar: (id: string, before: Avatar | null, avatar: Avatar | null) => withMutation(`bot-avatar:${id}`, async () => {
+      const key = outboxKey("bot-avatar", id)
+      if ((await outbox.all()).some((entry) => entry.key === key && entry.rejected !== undefined)) await outbox.delete(key)
+      const attestation = await attest(id, { type: "bot_avatar_set", before, avatar })
+      try { await signedWrite("bot-avatar", id, "set_bot_avatar", { conversation_id: id, before, avatar, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
-      await refreshRef.current()
+      void refreshRef.current().catch(showRefreshError)
     }),
     deleteBot: (id: string) => withMutation(`bot-delete:${id}`, async () => {
       const attestation = await attest(id, { type: "bot_deleted" })
