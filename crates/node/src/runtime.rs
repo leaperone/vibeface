@@ -747,6 +747,7 @@ impl Runtime {
             "create_bot" => self.create_bot(&access, &input).await,
             "delete_bot" => self.delete_bot(&access, &input).await,
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
+            "set_bot_project" => self.set_bot_project(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
@@ -792,7 +793,7 @@ impl Runtime {
                 .iter()
                 .filter_map(|r| std::fs::canonicalize(r).ok())
                 .any(|r| path.starts_with(r)),
-            "execution path is outside configured roots"
+            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
         );
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)

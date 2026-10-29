@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowDownToLine, ArrowRightLeft, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
 import { BotFace, botMood } from '@/components/app/bot-face'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -117,13 +117,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     const start = entries.length
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
     const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
+    const detail = jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail
     if (schedule) {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
-      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
+      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined))
-    const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail
-    if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
+    } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
@@ -243,7 +242,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
           </div>
           {needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
-            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
@@ -272,7 +271,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )
@@ -351,11 +350,6 @@ function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot
     </p>
     <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
   </div>
-}
-
-/** The provider's own words behind a failed reply, folded under it. */
-function ReplyCause({ raw }: { raw: string }) {
-  return <Details className="-mt-2">{raw}</Details>
 }
 
 /** `retry`: sends the message again as a new one; only offered while it is the newest. */

@@ -9,7 +9,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -237,7 +237,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
         change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
         saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
     </ul>
-    {onboarding ? botOn ? null : <BotHint /> : <Folders roots={roots} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -249,17 +249,17 @@ const roles = {
 
 /**
  * A chip that turns one use of a provider on or off: its icon tells the two apart, a small switch says it is a control, not a status,
- * and on, the chip is also tinted so a phone without hover still reads it. A phone shows the icon and switch alone; the words stay in the name.
+ * and on, the chip is also tinted so a phone without hover still reads it.
  * Never solid, so the page's own next step stays the only filled button.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint, icon: Icon } = roles[role]
   return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
-    className={cn("rounded-full max-sm:px-2.5", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
+    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
     {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
     <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span><span className="max-sm:sr-only">{label}</span>
+    </span>{label}
   </Button>
 }
 
@@ -270,7 +270,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
   const display = response.display_paths
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
-  const botable = item.supports.includes("agent"), executable = item.supports.includes("execution") && !onboarding
+  const botable = item.supports.includes("agent"), executable = item.supports.includes("execution")
   const manager = bot ? response.settings.manager : null
   const state = states[item.state]
   const [editing, setEditing] = useState<string | null>(null)
@@ -286,7 +286,7 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   // The use last asked for: when the device found no Codex folder, the folder typed in turns it on in the same write.
   const [asked, setAsked] = useState<"bot" | "execution" | null>(null)
   const notFound = (error as { code?: unknown } | null)?.code === "codex_missing"
-  const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, { [role]: true }).then((ok) => { if (!ok) void reconcile() }) }
+  const turnOn = (role: "bot" | "execution") => { setAsked(role); void change(role, role === "bot" ? botOnChange(response, item) : { execution: true }).then((ok) => { if (!ok) void reconcile() }) }
   const saveKey = (name: string, value: string) => change(`env:${name}`, { env: { [name]: value } })
     .then((ok) => { if (ok) toast(`${keyName(name)} 已保存`, { tone: "success" }); return ok })
   const manual = (key: string, value: Omit<Change, "provider">) => change(key, { ...value, ...(asked ? { [asked]: true } : {}) })
@@ -450,7 +450,7 @@ function BotDetails({ manager, display, working, busy, save }: { manager: Manage
   </form>
 }
 
-function Folders({ roots, display, busy, save }: { roots: string[]; display: Display; busy: boolean; save(roots: string[]): void }) {
+function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
@@ -461,8 +461,11 @@ function Folders({ roots, display, busy, save }: { roots: string[]; display: Dis
       <FolderPath path={root} shown={display[root]} />
       <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
+    {suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
+      <Plus aria-hidden="true" />{label}
+    </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">
-      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
     </div>

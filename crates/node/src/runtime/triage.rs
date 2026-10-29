@@ -604,10 +604,26 @@ impl Runtime {
             thread = ?handed.thread_id, "App Server request received");
         let session_id = request.session_id.clone();
         lock(&self.triage.requests).insert(request_id.clone(), request);
-        let cwd = lock(&self.triage.threads)
+        // The observer only resumes work threads, so their folder comes from the dispatch.
+        let mut cwd = lock(&self.triage.threads)
             .get(&session_id)
             .map(|thread| thread.0.clone())
             .unwrap_or_default();
+        if cwd.is_empty()
+            && let Some(thread) = &handed.thread_id
+        {
+            cwd = self
+                .store
+                .lock()
+                .await
+                .work_cwd_on_thread(thread)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        }
+        if cwd.is_empty() {
+            cwd = handed.params["cwd"].as_str().unwrap_or_default().to_owned();
+        }
         let event = AgentEvent {
             source: triage::Source::AppServer,
             agent: Provider::Codex,
@@ -4167,6 +4183,30 @@ mod tests {
                 .await
                 .is_err(),
                 "only absolute paths that exist are proposed"
+            );
+
+            let projects = dir.join("projects");
+            std::fs::create_dir_all(&projects)?;
+            let projects = projects.canonicalize()?;
+            let asked = node
+                .propose_provider_config(&network, "c", "m-5", json!({"roots": [projects]}))
+                .await?;
+            let question = asked["question_id"].as_str().unwrap().to_owned();
+            assert!(!node.settings_snapshot().roots.contains(&projects));
+            answer(&node, &question, "允许").await?;
+            assert_eq!(
+                node.apply_provider_config(&network, "c", &question).await?["roots_added"],
+                1
+            );
+            assert!(node.settings_snapshot().roots.contains(&projects));
+            assert!(
+                Config::load(&dir)?.roots.contains(&projects),
+                "the folder is saved"
+            );
+            assert_eq!(
+                node.propose_provider_config(&network, "c", "m-6", json!({"roots": [projects]}))
+                    .await?["status"],
+                "unchanged"
             );
             Ok::<_, anyhow::Error>(())
         }

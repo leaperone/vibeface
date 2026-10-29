@@ -9,7 +9,9 @@ import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
-import { folderLabels, formatIn, formatWhen, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { messageOf } from "@vibeface/client/lib/node.ts"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -62,6 +64,12 @@ export function BotPanelButton() {
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   const mood = botMood(bot, workspace)
+  const lookup = { nodes: workspace.nodes, directory }
+  const choices = projectChoices(workspace.nodes, (node, index) => nodeName(node.device_id, lookup, node.local ? "这台电脑" : `设备 ${index + 1}`))
+  const projectNow = bot.project ? projectKey(bot.project) : ""
+  const projectLabel = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : "不选"
+  const moveProject = (key: string) => void workspace.setBotProject(bot.conversation_id, choices.find((item) => item.key === key)?.project ?? null)
+    .catch((caught: unknown) => toast(messageOf(caught, "换文件夹"), { tone: "danger" }))
   return <>
     <button type="button" className="-ms-1.5 flex min-h-11 min-w-0 items-center gap-2 rounded-lg ps-1 pe-1.5 outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 enabled:hover:bg-muted enabled:active:bg-muted md:min-h-10 dark:enabled:hover:bg-muted/50" aria-haspopup="dialog" title={bot.name} disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
       <BotFace botId={bot.bot_id} mood={mood} size={32} />
@@ -88,8 +96,12 @@ export function BotPanelButton() {
               {ownerNode && !ownerNode.online ? <span className="inline-flex items-center gap-1 text-warning"><WifiOff aria-hidden="true" className="size-4" />离线</span> : null}
               <span className="max-w-48 truncate" title={deviceName}>{deviceName}</span>
             </SettingsRow> : null}
-            {bot.project ? <SettingsRow icon={FolderOpen} label={folderLabels.project}>
-              <span className="max-w-48 truncate" title={bot.project.cwd}>{projectPlace(bot.project, owner, (id) => nodeName(id, { nodes: workspace.nodes, directory }))}</span>
+            {bot.project || choices.length ? <SettingsRow icon={FolderOpen} label={folderLabels.project}>
+              {workspace.writable && choices.length ? <NativeSelect size="sm" aria-label={folderLabels.project} className="max-w-48" value={projectNow} onChange={(event) => moveProject(event.currentTarget.value)}>
+                <NativeSelectOption value="">不选</NativeSelectOption>
+                {bot.project && !choices.some((item) => item.key === projectNow) ? <NativeSelectOption value={projectNow}>{projectLabel}</NativeSelectOption> : null}
+                {choices.map((item) => <NativeSelectOption key={item.key} value={item.key}>{item.label}</NativeSelectOption>)}
+              </NativeSelect> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
             </SettingsRow> : null}
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
               <span className="max-w-48 truncate font-mono" title={model}>{model}</span>

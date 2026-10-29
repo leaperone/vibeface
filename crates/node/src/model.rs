@@ -715,6 +715,12 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<Cause>,
     },
+    /// In the bot's conversation: the user moves its project folder, or clears it, from the web.
+    BotProjectSet {
+        project: Option<BotProject>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// The user pauses, resumes or deletes a schedule of this conversation from the web.
     ScheduleControlled {
         schedule_id: String,
@@ -766,6 +772,7 @@ impl EventBody {
             | Self::WorkFinished { attestation, .. }
             | Self::NotificationAcked { attestation, .. }
             | Self::PrimaryBotSet { attestation, .. }
+            | Self::BotProjectSet { attestation, .. }
             | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
@@ -786,6 +793,7 @@ impl EventBody {
             Self::SessionAttributed { .. } => "session_attributed",
             Self::SessionMuted { .. } => "session_muted",
             Self::PrimaryBotSet { .. } => "primary_bot_set",
+            Self::BotProjectSet { .. } => "bot_project_set",
             Self::BotChanged { .. } => "bot_changed",
             Self::BotDeleted { .. } => "bot_deleted",
             Self::ScheduleControlled { .. } => "schedule_controlled",

@@ -27,11 +27,18 @@ export function listTime(at: number, now: number): string {
 }
 
 /** On a phone every page but the list goes back one level; null on the list itself. */
-export function backTo(pathname: string): string | null {
+export function backTo(pathname: string, bot?: string): string | null {
   if (pathname === "/") return null
+  // A device page opened from a chat goes back to that chat.
+  if (bot && pathname.startsWith("/devices")) return `/b/${encodeURIComponent(bot)}`
   const work = /^(\/b\/[^/]+)\/work\//.exec(pathname)
   if (work) return work[1]
   if (/^\/devices\/[^/]+/.test(pathname)) return "/devices"
   if (pathname.startsWith("/settings/")) return "/settings"
   return "/"
+}
+
+/** `?bot=`: the chat a device page was opened from. */
+export function botSearch(search: Record<string, unknown>): { bot?: string } {
+  return typeof search.bot === "string" && search.bot ? { bot: search.bot } : {}
 }

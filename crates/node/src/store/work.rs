@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use anyhow::{Context as _, Result, bail, ensure};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use std::path::Path;
 
 /// Why a removed device's work or dispatch can only be settled by the user.
@@ -421,6 +421,20 @@ impl Store {
     /// The runs on one App Server thread, by index: a streamed event reads only these.
     pub fn work_records_on_thread(&self, thread: &str) -> Result<Vec<WorkRecord>> {
         query_runs(&self.connection, "thread_id=?", [thread])
+    }
+
+    /// The folder a dispatched work runs in, found by its App Server thread.
+    pub fn work_cwd_on_thread(&self, thread: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT json_extract(w.dispatch,'$.cwd') FROM work_runs r JOIN works w ON w.work_id=r.work_id
+                 WHERE r.thread_id=? AND w.dispatch IS NOT NULL LIMIT 1",
+                [thread],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 }
 

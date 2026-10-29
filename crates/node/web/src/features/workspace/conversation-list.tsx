@@ -37,7 +37,7 @@ export function ConversationList() {
   else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? (workspace.synced ? "没有待处理" : "")} />
+    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? ""} />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
@@ -57,10 +57,10 @@ function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }:
         <span className="flex min-w-0 flex-1 items-center gap-1.5"><span className="min-w-0 truncate font-medium">{name}</span>{mark}</span>
         {time ? <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{time}</span> : null}
       </span>
-      <span className="flex min-w-0 items-center gap-2">
+      {preview || unread ? <span className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-meta text-muted-foreground">{preview}</span>
         {unread ? <CountBadge count={unread} label={`${unread} 条未读`} /> : null}
-      </span>
+      </span> : null}
     </span>
   </Link>
 }

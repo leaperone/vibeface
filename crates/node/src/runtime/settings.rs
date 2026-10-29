@@ -325,8 +325,15 @@ impl Runtime {
         for provider in Provider::ALL {
             providers.push(self.provider_status(provider, &local, &settings).await);
         }
+        let suggested: Vec<PathBuf> = self
+            .host
+            .project_folders()
+            .into_iter()
+            .filter(|folder| !settings.roots.contains(folder))
+            .collect();
         let mut response = json!({"settings":settings,"defaults":defaults,
-            "readiness":{"manager":readiness,"missing":missing},"providers":providers});
+            "readiness":{"manager":readiness,"missing":missing},"providers":providers,
+            "suggested_roots":suggested});
         response["display_paths"] = json!(self.host.display_paths(&response));
         Ok(response)
     }
@@ -464,6 +471,24 @@ impl Runtime {
         Ok(filled)
     }
 
+    /// Adds folders work may run in; the caller holds `config_save`.
+    fn add_roots(&self, roots: &[PathBuf]) -> Result<()> {
+        let mut next = self.settings_snapshot().roots;
+        next.extend(roots.iter().cloned());
+        next.sort();
+        next.dedup();
+        ensure!(next.len() <= 128, "at most 128 project roots are allowed");
+        let mut configuration = Config::load(&self.data_dir)?;
+        configuration.roots = next.clone();
+        configuration.save(&self.data_dir)?;
+        self.settings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .roots = next;
+        self.schedule_wakeup.notify_one();
+        Ok(())
+    }
+
     /// Saves the folders and the current bot's details. Whether the bot runs, and on
     /// which provider, is chosen only through `configure_provider`.
     pub(crate) async fn configure_node(
@@ -542,6 +567,8 @@ const MAX_PROPOSALS: usize = 64;
 pub(crate) struct Proposal {
     conversation: String,
     paths: Paths,
+    /// Folders to add to the ones work may run in.
+    roots: Vec<PathBuf>,
     outcome: Option<Value>,
 }
 
@@ -556,9 +583,29 @@ struct ProposalInput {
     codex_sessions: Option<PathBuf>,
     #[serde(default)]
     bins: BTreeMap<Provider, PathBuf>,
+    #[serde(default)]
+    roots: Vec<PathBuf>,
 }
 
 impl ProposalInput {
+    /// Existing folders, as `configure_node` stores them.
+    fn roots(&mut self) -> Result<Vec<PathBuf>> {
+        ensure!(self.roots.len() <= 16, "propose at most 16 roots at once");
+        let mut roots = std::mem::take(&mut self.roots)
+            .into_iter()
+            .map(|root| {
+                ensure!(
+                    root.is_absolute() && root.as_os_str().len() <= 1024 && root.is_dir(),
+                    "roots must be absolute folders that exist on this device"
+                );
+                Ok(root.canonicalize()?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
     fn paths(self) -> Result<Paths> {
         let existing = |path: Option<PathBuf>, what: &str, kind: fn(&Path) -> bool| {
             path.map(|path| {
@@ -616,10 +663,17 @@ impl Runtime {
         trigger: &str,
         input: Value,
     ) -> Result<Value> {
-        let given = serde_json::from_value::<ProposalInput>(input)
-            .context("invalid provider proposal")?
-            .paths()?;
-        let codex = given.is_empty()
+        let mut input =
+            serde_json::from_value::<ProposalInput>(input).context("invalid provider proposal")?;
+        let current = self.settings_snapshot().roots;
+        let asked_roots = !input.roots.is_empty();
+        let roots: Vec<PathBuf> = input
+            .roots()?
+            .into_iter()
+            .filter(|root| !current.contains(root))
+            .collect();
+        let given = input.paths()?;
+        let codex = (given.is_empty() && !asked_roots)
             || given
                 .execution
                 .iter()
@@ -660,7 +714,7 @@ impl Runtime {
             manager: &mut manager,
             triage: &mut triage,
         });
-        if paths.is_empty() {
+        if paths.is_empty() && roots.is_empty() {
             return Ok(json!({"status":"unchanged"}));
         }
         let device = self.identity.device_id()?;
@@ -671,7 +725,7 @@ impl Runtime {
                     device.as_str(),
                     scope,
                     trigger,
-                    &serde_json::to_string(&paths)?
+                    &serde_json::to_string(&(&paths, &roots))?
                 ]
                 .join("\0")
                 .as_bytes()
@@ -680,7 +734,7 @@ impl Runtime {
         let body = crate::model::EventBody::QuestionAsked {
             question_id: question_id.clone(),
             severity: crate::model::Severity::Attention,
-            text: self.proposal_text(&paths),
+            text: self.proposal_text(&paths, &roots),
             choices: [ALLOW, DENY]
                 .map(|label| crate::model::Choice {
                     label: label.into(),
@@ -702,7 +756,7 @@ impl Runtime {
                 .await
                 .ask(&self.identity, network, scope, body, super::now_ms())?;
         if let Some(event) = &written {
-            tracing::info!(event = "question.asked", conversation_id = scope, question_id, filled = ?paths.names(), "provider paths proposed");
+            tracing::info!(event = "question.asked", conversation_id = scope, question_id, filled = ?paths.names(), roots = roots.len(), "provider paths proposed");
             self.publish_changed(network, scope, super::Changed::Event(&event.hash));
         }
         if proposals.len() >= MAX_PROPOSALS && !proposals.contains_key(&question_id) {
@@ -713,14 +767,16 @@ impl Runtime {
             .or_insert_with(|| Proposal {
                 conversation: scope.into(),
                 paths: paths.clone(),
+                roots: roots.clone(),
                 outcome: None,
             });
-        Ok(json!({"status":"asked","question_id":question_id,"proposed":paths}))
+        let shown: Vec<String> = roots.iter().map(|root| self.host.display(root)).collect();
+        Ok(json!({"status":"asked","question_id":question_id,"proposed":paths,"roots":shown}))
     }
 
     /// One line per setting the card asks about. Paths are shortened so the full ones stay on
     /// this computer; the card is a shared record.
-    fn proposal_text(&self, paths: &Paths) -> String {
+    fn proposal_text(&self, paths: &Paths, roots: &[PathBuf]) -> String {
         let shown = |path: &PathBuf| self.host.display(path);
         let mut lines = vec!["要把这台电脑的 AI 设置改成这样吗？".to_owned()];
         for provider in &paths.execution {
@@ -745,6 +801,9 @@ impl Runtime {
         }
         for (provider, bin) in &paths.bins {
             lines.push(format!("{} 程序：{}", provider.label(), shown(bin)));
+        }
+        for root in roots {
+            lines.push(format!("可用文件夹：{}", shown(root)));
         }
         let mut text = crate::logging::scrub(&lines.join("\n"));
         while text.len() > 1024 {
@@ -787,9 +846,16 @@ impl Runtime {
             let _save = self.config_save.lock().await;
             let _work = self.maintenance.enter()?;
             let paths = proposal.paths.clone();
-            let filled = self.write_providers(|target| paths.apply(target)).await?;
-            tracing::info!(event = "providers.applied", question_id, applied = ?paths.names(), "provider paths the user allowed were written");
-            json!({"status":"applied","question_id":question_id,"applied":paths.names(),"also_filled":filled.names()})
+            let filled = if paths.is_empty() {
+                Paths::default()
+            } else {
+                self.write_providers(|target| paths.apply(target)).await?
+            };
+            if !proposal.roots.is_empty() {
+                self.add_roots(&proposal.roots)?;
+            }
+            tracing::info!(event = "providers.applied", question_id, applied = ?paths.names(), roots = proposal.roots.len(), "provider paths the user allowed were written");
+            json!({"status":"applied","question_id":question_id,"applied":paths.names(),"roots_added":proposal.roots.len(),"also_filled":filled.names()})
         } else {
             json!({"status":"declined","question_id":question_id,"answer":answer})
         };

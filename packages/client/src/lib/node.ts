@@ -62,6 +62,8 @@ export type NodeSettingsResponse = {
   providers: ProviderStatus[]
   /** How Settings shows each path under the home folder (`~/…`); edits still use the full path. */
   display_paths: Record<string, string>
+  /** Usual project folders on that device not yet among its folders, offered with one click. */
+  suggested_roots: string[]
 }
 
 export function record(value: unknown, label = '设备响应'): Record<string, unknown> {
@@ -157,6 +159,20 @@ export function parseLocalSetup(value: unknown, origin: string): LocalSetup {
   if (setup.entry.address !== origin || setup.entry.local) throw new Error('本机设置和当前页面对不上。')
   return setup
 }
+/** The usual project folders the device found, each named as Settings shows paths, for adding with one tap. */
+export function folderSuggestions(response: NodeSettingsResponse): { path: string; label: string }[] {
+  return response.suggested_roots.filter((path) => !response.settings.roots.includes(path)).map((path) => ({ path, label: response.display_paths[path] ?? path }))
+}
+
+/**
+ * Turning a bot on. On a device not set up yet (no bot, no tasks, no folders) it also runs its tasks, so the first work
+ * request does not stop at a switch; once someone has set it up, their choice stands.
+ */
+export function botOnChange(response: NodeSettingsResponse, provider: ProviderStatus): { bot: true; execution?: true } {
+  const first = response.settings.manager === null && !response.settings.roots.length && !response.providers.some((item) => item.roles.includes('execution'))
+  return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
+}
+
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   const v = record(value, '设备设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
   let manager: ManagerSettings | null = null
@@ -172,6 +188,7 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
     readiness: { manager: readiness.manager, missing: array(readiness.missing).map(value => oneOf(value, providerIds)) },
     providers: array(v.providers).map(parseProvider),
     display_paths: Object.fromEntries(Object.entries(record(v.display_paths)).map(([path, shown]) => [path, text(shown)])),
+    suggested_roots: strings(v.suggested_roots),
   }
 }
 export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']

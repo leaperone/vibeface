@@ -616,12 +616,15 @@ impl Runtime {
         match agent {
             Some(agent) if execution.contains(&agent) => Ok(agent),
             Some(agent) => Err(off(format!(
-                "{} execution is turned off on this device",
-                agent.label()
+                "{} execution is turned off on this device; ask the user to turn it on with propose_provider_config execution=[\"{}\"]",
+                agent.label(),
+                agent.name()
             ))),
             None => match Vec::from_iter(&execution)[..] {
                 [only] => Ok(*only),
-                [] => Err(off("execution is turned off on this device".into())),
+                [] => Err(off(
+                    "execution is turned off on this device; ask the user to turn it on with propose_provider_config execution".into(),
+                )),
                 _ => bail!(
                     "this device executes work on {}; name one as agent",
                     Vec::from_iter(execution.iter().map(|provider| provider.name())).join(", ")

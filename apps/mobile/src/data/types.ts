@@ -15,8 +15,8 @@ export type Session =
   | { phase: 'joining'; code: string | null }
   | { phase: 'ready' }
 
-/** A transcript message, or one this phone shows before the network holds it. */
-export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted' }
+/** A transcript message, or one this phone shows before the network holds it. `detail`: a failed reply's original error from the device. */
+export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted'; detail?: string }
 
 /**
  * One bot's chat as the screen draws it. `status`: the live progress word while a reply runs.

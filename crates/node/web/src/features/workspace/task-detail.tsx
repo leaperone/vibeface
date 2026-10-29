@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, CircleQuestionMark, CircleStop, Laptop, Link2, ListChecks, RotateCw, Server, X } from "lucide-react"
+import { ChevronLeft, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, RotateCw, Server, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
@@ -12,7 +12,8 @@ import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from "@vibeface/client/workspace/labels.ts"
-import { questionOpen } from "@vibeface/client/workspace/questions.ts"
+import { projectName, questionOpen } from "@vibeface/client/workspace/questions.ts"
+import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 
 const tone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
@@ -100,7 +101,10 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      {device ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></p> : null}
+      {device || work.cwd ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
+        {device ? <span className="flex min-w-0 items-center gap-1.5">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
+        {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
+      </p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
       {!progress?.text && work.summary && taskActive(state) ? <p className="whitespace-pre-wrap break-words">{work.summary}</p> : null}
       {progress?.text ? <pre className="max-h-[50dvh] overflow-auto rounded-xl bg-muted p-3 font-mono text-meta whitespace-pre-wrap">{progress.text}</pre> : null}

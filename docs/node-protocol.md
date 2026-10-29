@@ -171,6 +171,7 @@
 | `nodes` | 无 | 成员 Node、角色、在线状态、`max_seq`、`head_hash` 和能力，已撤销的 Node 给出撤销上限；同步正在失败的 Node 直接记为离线，不等待探测。离线 Node 的 `capabilities` 是它最后一次回答的能力，只存在本 Node 自己的存储里，不进共享记录，重启后仍在；从没回答过的为 `null` |
 | `bots` | 无 | 当前网络的机器人定义，名称和说明已合并聊天中的修改；`primary` 为主 Bot 的会话 ID |
 | `set_primary_bot` | `conversation_id`、`attestation` | 本人选定主 Bot，写入 `bots` scope |
+| `set_bot_project` | `conversation_id`、`project`（`{ target_node, cwd }` 或 `null`）、`attestation` | 本人换掉或清空机器人的项目文件夹，在它的会话写 `BotProjectSet`（签名事件体 `{"type":"bot_project_set", project}`），投影进 `bot_profiles` 的 `project` 字段，不建表、不改数据纪元；与当前相同时不写 |
 | `create_bot` | `bot_id`、`conversation_id`、`name`、`instructions`、可选 `project`、`attestation` | 创建机器人和它的会话，完整请求精确去重 |
 | `control_schedule` | `conversation_id`、`schedule_id`、`action`（`pause`、`resume` 或 `delete`）、`attestation` | 本人暂停、恢复或删除一个 schedule，写 `ScheduleControlled`；已是该状态时不写，返回 `{ written }` |
 | `conversations` | 无 | 本地已知会话 |
