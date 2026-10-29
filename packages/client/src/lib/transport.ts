@@ -4,6 +4,8 @@ import type { ConnectionEntry } from './node.ts'
 export type DeviceChannel = {
   deviceId: string
   request(method: string, params?: Record<string, unknown>): Promise<unknown>
+  /** No request is waiting for its answer, so closing now leaves no outcome unknown. */
+  idle(): boolean
   close(): void
 }
 /** `direct`: the `ip:port` the entry Node listened on when it made the ticket, for the app to dial on the LAN. */
@@ -296,6 +298,7 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
           catch (error) { wire.close(error as Error) }
         })
       },
+      idle: () => pending.size === 0,
       close() { wire.close(new Error('已断开设备连接。')) },
     }
   }

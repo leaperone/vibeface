@@ -88,22 +88,24 @@ export function markReached(list: Entrance[], entry: ConnectionEntry, at = Date.
 
 /**
  * Where to go next, in order: the entry that just failed first, then every other web entrance from most to least
- * recently reached. With `seen`, the member Nodes this app sees on its LAN with where, each of those is tried directly
- * before any web address, the one that failed first, also at the addresses it last signed; a Node without a web
- * address, not seen, is tried directly last.
+ * recently reached. With `seen`, the member Nodes this app sees on its LAN right now with where, the current Node is
+ * tried directly first and the others before the other web entrances. Only addresses seen now are dialed: a dial names
+ * the Node to whoever holds that address, which on another LAN is a stranger. When no web address is left, the current
+ * Node is tried where it was last reached or last signed it listens, as a last resort.
  */
 export function candidates(list: Entrance[], current: ConnectionEntry, seen?: Map<string, string[]>): ConnectionEntry[] {
   const web: ConnectionEntry[] = openEntrances(list)
     .filter(item => current.kind === 'lan' || item.device_id !== current.device_id || item.gateway_url !== current.address)
     .sort((a, b) => b.last_ok_ms - a.last_ok_ms)
     .map(item => ({ kind: 'gateway', address: item.gateway_url, device_id: item.device_id }))
-  if (current.kind !== 'lan') web.unshift(current)
-  if (!seen) return web
-  const direct = new Map<string, string[]>()
-  const add = (device: string, addrs: string[]) => { const all = lanAddrs([...direct.get(device) ?? [], ...addrs]); if (all.length) direct.set(device, all) }
-  add(current.device_id, [...seen.get(current.device_id) ?? [], ...current.kind === 'lan' ? current.addrs : [], ...list.find(item => item.device_id === current.device_id)?.direct ?? []])
-  for (const [device, addrs] of seen) add(device, addrs)
+  const own = current.kind === 'lan' ? [] : [current]
+  if (!seen) return [...own, ...web]
   const lan = (device_id: string, addrs: string[]): ConnectionEntry => ({ kind: 'lan', addrs, device_id })
-  const unseen = list.filter(item => item.gateway_url === null && !direct.has(item.device_id) && item.direct.length).map(item => lan(item.device_id, item.direct))
-  return [...[...direct].map(([device, addrs]) => lan(device, addrs)), ...web, ...unseen]
+  const here = lanAddrs(seen.get(current.device_id))
+  const others = [...seen].filter(([device]) => device !== current.device_id).map(([device, addrs]) => lan(device, lanAddrs(addrs))).filter(entry => entry.kind === 'lan' && entry.addrs.length)
+  const ways = [...here.length ? [lan(current.device_id, here)] : [], ...own, ...others, ...web]
+  if (ways.some(entry => entry.kind !== 'lan')) return ways
+  const last = lanAddrs([...current.kind === 'lan' ? current.addrs : [], ...list.find(item => item.device_id === current.device_id)?.direct ?? []])
+    .filter(addr => !here.includes(addr))
+  return last.length ? [...ways, lan(current.device_id, last)] : ways
 }

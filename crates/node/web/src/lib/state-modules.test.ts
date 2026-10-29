@@ -116,7 +116,7 @@ test('after a reload an older address record never replaces a newer one, withdra
   assert.equal(newer.find(item => item.device_id === b)?.gateway_url, 'https://back.example.com')
 })
 
-test('the app tries a Node on its LAN before any web address, and one with no web address last', () => {
+test('the app dials only the Nodes it sees on its LAN, and an unseen one only when no web address is left', () => {
   const a = 'a'.repeat(64), b = 'b'.repeat(64)
   const record = (id: string, gateway: string | null, ips: string[]) => ({ payload: JSON.stringify({ version: 1, network_id: view.network_id, device_id: id.repeat(64), seq: 1, endpoint: { id: id.repeat(64), addrs: [...ips.map(ip => ({ Ip: ip })), { Relay: 'https://relay.example.com/' }] }, gateway_url: gateway }), signature: `signed-by-${id}` })
   const list = verifiedEntrances([record('a', 'https://a.example.com/', ['192.168.1.4:7001', 'junk']), record('b', null, ['192.168.1.5:7002'])], view, signedBySelf)
@@ -126,11 +126,13 @@ test('the app tries a Node on its LAN before any web address, and one with no we
   const ways = (...args: Parameters<typeof candidates>) => candidates(...args).map(entry => `${entry.kind} ${entryAddress(entry)}`)
   const web = { kind: 'gateway' as const, address: 'https://a.example.com', device_id: a }
   assert.deepEqual(ways(list, web), ['gateway https://a.example.com'], 'a browser has no LAN')
-  assert.deepEqual(ways(list, web, new Map()), ['lan 192.168.1.4:7001', 'gateway https://a.example.com', 'lan 192.168.1.5:7002'], 'seen nowhere yet: where the Node signed it listens')
-  assert.deepEqual(ways(list, web, new Map([[b, ['192.168.1.9:7002']]])), ['lan 192.168.1.4:7001', 'lan 192.168.1.9:7002', 'gateway https://a.example.com'])
-  const lan = { kind: 'lan' as const, addrs: ['192.168.1.8:7001'], device_id: a }
+  assert.deepEqual(ways(list, web, new Map()), ['gateway https://a.example.com'], 'an address not seen now is not dialed while a web address remains')
+  assert.deepEqual(ways(list, web, new Map([[a, ['192.168.1.8:7001']], [b, ['192.168.1.9:7002']]])), ['lan 192.168.1.8:7001', 'gateway https://a.example.com', 'lan 192.168.1.9:7002'])
+  const lan = { kind: 'lan' as const, addrs: ['192.168.1.8:7002'], device_id: b }
   assert.equal(markReached(list, lan, 5), list, 'only web entrances keep a last success')
-  assert.deepEqual(candidates(list, lan, new Map())[0], { kind: 'lan', addrs: ['192.168.1.8:7001', '192.168.1.4:7001'], device_id: a })
+  const lanOnly = list.filter(item => item.device_id === b)
+  assert.deepEqual(candidates(lanOnly, lan, new Map()), [{ kind: 'lan', addrs: ['192.168.1.8:7002', '192.168.1.5:7002'], device_id: b }], 'with no web address left, where it was last reached or signed')
+  assert.deepEqual(ways(lanOnly, lan, new Map([[b, ['192.168.1.5:7002']]])), ['lan 192.168.1.5:7002', 'lan 192.168.1.8:7002'])
 })
 
 test('backend English and gateway refusal codes reach the page as plain Chinese', () => {

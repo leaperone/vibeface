@@ -407,7 +407,8 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   }
   /**
    * On a Gateway while a new LAN advert names the same Node: once a direct channel to it opens, this one is dropped and
-   * the reconnect, LAN first, takes over. One that does not open leaves this channel alone.
+   * the reconnect, LAN first, takes over. One that does not open leaves this channel alone, and so does one that never
+   * goes idle: dropping a request in flight would leave its outcome unknown.
    */
   async function goDirect(fresh: LanSighting[]) {
     const active = session.current
@@ -415,9 +416,14 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const addrs = lanSeen(active.networkId, [active.entry.device_id], fresh)?.get(active.entry.device_id)
     if (!addrs) return
     try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS })).close() } catch { return }
+    for (let waited = 0; !active.channel.idle(); waited += 500) {
+      if (waited >= 30000 || session.current !== active) return
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
     if (session.current !== active || !reconnect.current || switching.current || reconnectTimer.current !== null || sensitive.current) return
     generation.current += 1; session.current = null; listeners.current.clear()
     active.channel.close()
+    step({ type: 'lost', reason: '正在改用局域网直连。' })
     setPhase('reconnecting'); scheduleReconnect(true)
   }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {

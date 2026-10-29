@@ -170,7 +170,8 @@ impl LanStream {
     }
 }
 
-/// Opens one client stream to the Node `device_id` at `addrs` (`ip:port`) within `timeout_ms`.
+/// Opens one client stream to the Node `device_id` at `addrs` (`ip:port`); dialing it, not
+/// binding this device's endpoint the first time, must finish within `timeout_ms`.
 #[uniffi::export]
 pub async fn lan_connect(
     device_id: String,
@@ -188,9 +189,9 @@ pub async fn lan_connect(
         if addrs.is_empty() {
             return Err(failed("no LAN address"));
         }
+        let endpoint = endpoint().await?;
         let dial = async {
-            let connection = endpoint()
-                .await?
+            let connection = endpoint
                 .connect(EndpointAddr::from_parts(id, addrs), ALPN)
                 .await
                 .map_err(failed)?;

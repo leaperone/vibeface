@@ -12,7 +12,7 @@ use vibeface_secure::lan::{SERVICE, TXT_KEY, hour, lan_tag, lan_tag_matches};
 
 /// Anyone on the LAN can advertise; these bound what each dial checks and tries.
 const MAX_ADVERTS: usize = 64;
-const MAX_ADDRS: usize = 8;
+const MAX_ADDRS: usize = 4;
 
 pub(super) type Wake = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -34,16 +34,20 @@ struct State {
     seen: HashMap<String, Advert>,
 }
 
-/// The network this Node is in and the advert naming it there.
+/// The network this Node is in and the advert naming it there; `advertised` is false until
+/// registering it succeeds, so a failed one is retried on the next refresh.
 struct Own {
     network: String,
     hour: u64,
     fullname: String,
+    advertised: bool,
 }
 
 struct Advert {
     tag: String,
     addrs: Vec<SocketAddr>,
+    /// When it was last heard, Unix ms.
+    at: u64,
 }
 
 impl Lan {
@@ -71,6 +75,7 @@ impl Lan {
         let current = state
             .own
             .as_ref()
+            .filter(|own| own.advertised)
             .map(|own| (own.network.as_str(), own.hour));
         if current == network.map(|network| (network, hour)) {
             return;
@@ -90,13 +95,14 @@ impl Lan {
             &[(TXT_KEY, tag.as_str())][..],
         )
         .and_then(|info| self.daemon.register(info.enable_addr_auto()));
-        if let Err(error) = advert {
-            tracing::debug!(%error, "this Node is not advertised on the LAN this hour");
+        if let Err(error) = &advert {
+            tracing::debug!(%error, "this Node is not advertised on the LAN yet");
         }
         state.own = Some(Own {
             network: network.to_owned(),
             hour,
             fullname: format!("{tag}.{}", self.service),
+            advertised: advert.is_ok(),
         });
     }
 
@@ -118,10 +124,10 @@ async fn watch(events: mdns_sd::Receiver<ServiceEvent>, state: Arc<Mutex<State>>
     while let Ok(event) = events.recv_async().await {
         match event {
             ServiceEvent::ServiceResolved(service) => {
-                let Some(advert) = Advert::parse(&service) else {
+                let now = now_ms();
+                let Some(advert) = Advert::parse(&service, now) else {
                     continue;
                 };
-                let now = now_ms();
                 let member = state
                     .lock()
                     .expect("LAN state")
@@ -140,19 +146,27 @@ async fn watch(events: mdns_sd::Receiver<ServiceEvent>, state: Arc<Mutex<State>>
 }
 
 impl Advert {
-    fn parse(service: &ResolvedService) -> Option<Self> {
-        let addrs = service
+    fn parse(service: &ResolvedService, at: u64) -> Option<Self> {
+        let mut ips: Vec<IpAddr> = service
             .addresses
             .iter()
             .map(ScopedIp::to_ip_addr)
-            // Dialing a link-local IPv6 address needs its interface, which a hint does not keep.
-            .filter(|ip| !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local()))
-            .take(MAX_ADDRS)
-            .map(|ip| SocketAddr::new(ip, service.port))
+            // A hint only ever points within the LAN; link-local IPv6 also needs its interface,
+            // which a hint does not keep.
+            .filter(|ip| match ip {
+                IpAddr::V4(ip) => ip.is_private(),
+                IpAddr::V6(ip) => ip.is_unique_local(),
+            })
             .collect();
+        ips.sort_by_key(IpAddr::is_ipv6);
         Some(Self {
             tag: service.get_property_val_str(TXT_KEY)?.to_owned(),
-            addrs,
+            addrs: ips
+                .into_iter()
+                .take(MAX_ADDRS)
+                .map(|ip| SocketAddr::new(ip, service.port))
+                .collect(),
+            at,
         })
     }
 }
@@ -161,14 +175,20 @@ impl State {
     /// Keeps `advert`; returns the member Node it names, if any.
     fn learn(&mut self, fullname: String, advert: Advert, now_ms: u64) -> Option<String> {
         if self.seen.len() >= MAX_ADVERTS && !self.seen.contains_key(&fullname) {
-            // Strangers' adverts must not crowd out a member's.
+            // Strangers' adverts go first, so they cannot crowd out a member's; then the oldest.
             self.seen.retain(|_, seen| {
                 self.own.as_ref().is_some_and(|own| {
                     matching_member(&self.members, &own.network, &seen.tag, now_ms).is_some()
                 })
             });
-            if self.seen.len() >= MAX_ADVERTS {
-                return None;
+            if self.seen.len() >= MAX_ADVERTS
+                && let Some(oldest) = self
+                    .seen
+                    .iter()
+                    .min_by_key(|(_, seen)| seen.at)
+                    .map(|(name, _)| name.clone())
+            {
+                self.seen.remove(&oldest);
             }
         }
         let member = self
@@ -179,7 +199,9 @@ impl State {
         member
     }
 
-    /// A tag stops matching an hour after its own, which retires adverts nobody withdrew.
+    /// The addresses of the latest advert naming `device`, so one dial tries at most
+    /// `MAX_ADDRS` of them however many adverts repeat its tag. A tag stops matching an hour
+    /// after its own, which retires adverts nobody withdrew.
     fn hints(&self, device: &str, now_ms: u64) -> Vec<SocketAddr> {
         let Some(own) = &self.own else {
             return Vec::new();
@@ -187,8 +209,9 @@ impl State {
         self.seen
             .values()
             .filter(|advert| lan_tag_matches(&advert.tag, &own.network, device, now_ms))
-            .flat_map(|advert| advert.addrs.iter().copied())
-            .collect()
+            .max_by_key(|advert| advert.at)
+            .map(|advert| advert.addrs.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -216,6 +239,7 @@ mod tests {
         Advert {
             tag: lan_tag(network, device, hour),
             addrs: vec![SocketAddr::from(([192, 168, 1, 20], port))],
+            at: u64::from(port),
         }
     }
 
@@ -232,6 +256,7 @@ mod tests {
             network: "net".into(),
             hour: 100,
             fullname: String::new(),
+            advertised: true,
         });
         state.members = vec!["b".into(), "c".into()];
         assert_eq!(
@@ -268,6 +293,19 @@ mod tests {
             state.learn("c".into(), advert("net", "c", 100, 6), now),
             Some("c".into()),
             "strangers filling the table do not keep a member out"
+        );
+
+        for i in 0..MAX_ADVERTS as u16 {
+            state.learn(format!("r{i}"), advert("net", "c", 100, 100 + i), now);
+        }
+        assert_eq!(state.seen.len(), MAX_ADVERTS);
+        assert_eq!(
+            state.hints("c", now),
+            [SocketAddr::from((
+                [192, 168, 1, 20],
+                100 + MAX_ADVERTS as u16 - 1
+            ))],
+            "replayed tags fill the table oldest-first and a dial tries only the latest advert"
         );
     }
 }
