@@ -8,6 +8,7 @@ import type {
 import { answerId } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
+import { EYES, HUES, OUTLINES, type Avatar } from "../avatar/face.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
   const normalized = value.trim()
@@ -234,6 +235,13 @@ function modelEdit(value: unknown): ModelEdit | undefined {
 function botModels(value: unknown): BotModels {
   return Object.fromEntries(Object.entries(record(value)).map(([key, model]) => [provider(key), text(model)]))
 }
+function avatar(value: unknown): Avatar | null {
+  if (value == null) return null
+  const data = record(value)
+  const outline = OUTLINES.find((item) => item === data.outline), eyes = EYES.find((item) => item === data.eyes), hue = HUES.find((item) => item === data.hue)
+  if (!outline || !eyes || hue === undefined) throw new Error("Bot 头像无法识别。")
+  return { outline, eyes, hue }
+}
 function skillSet(value: unknown): SkillSet {
   return value == null ? null : list(value).map(text)
 }
@@ -255,8 +263,9 @@ function botChange(value: unknown): BotChange {
   if (data.kind === "profile") {
     const name = edit(data.name), instructions = edit(data.instructions), model = modelEdit(data.model)
     const skills = data.skills == null ? undefined : { before: skillSet(record(data.skills).before), after: skillSet(record(data.skills).after) }
-    if (!name && !instructions && !model && !skills) throw new Error("Bot 修改记录是空的。")
-    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(skills ? { skills } : {}) }
+    const face = data.avatar == null ? undefined : { before: avatar(record(data.avatar).before), after: avatar(record(data.avatar).after) }
+    if (!name && !instructions && !model && !skills && !face) throw new Error("Bot 修改记录是空的。")
+    return { kind: "profile", ...(name ? { name } : {}), ...(instructions ? { instructions } : {}), ...(model ? { model } : {}), ...(skills ? { skills } : {}), ...(face ? { avatar: face } : {}) }
   }
   if (data.before == null && data.after == null) throw new Error("Bot 修改记录是空的。")
   switch (data.kind) {
@@ -337,7 +346,7 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
 }
 export function parseBot(value: unknown): BotRecord {
   const data = record(value), last = data.last_message == null ? null : record(data.last_message)
-  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
+  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
 }
 const busy = (value: unknown): Busy => value === "thinking" || value === "replying" ? value : null
 export function parseBots(value: unknown): BotRecord[] {

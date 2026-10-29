@@ -24,7 +24,7 @@ const ticks = new Set<(now: number) => void>()
 let raf = 0
 let active = AppState.currentState === 'active'
 let reduced = false
-const still = new Set<(reduced: boolean) => void>()
+const reducedListeners = new Set<(reduced: boolean) => void>()
 function loop(now: number) {
   for (const tick of ticks) tick(now)
   raf = ticks.size && active && !reduced ? requestAnimationFrame(loop) : 0
@@ -33,13 +33,13 @@ function kick() {
   if (!raf && ticks.size && active && !reduced) raf = requestAnimationFrame(loop)
 }
 AppState.addEventListener('change', (state) => { active = state === 'active'; kick() })
-const setReduced = (next: boolean) => { reduced = next; for (const listener of still) listener(next); kick() }
+const setReduced = (next: boolean) => { reduced = next; for (const listener of reducedListeners) listener(next); kick() }
 void AccessibilityInfo.isReduceMotionEnabled().then(setReduced)
 AccessibilityInfo.addEventListener('reduceMotionChanged', setReduced)
 
 function useReduced() {
   const [value, setValue] = useState(reduced)
-  useEffect(() => { still.add(setValue); setValue(reduced); return () => { still.delete(setValue) } }, [])
+  useEffect(() => { reducedListeners.add(setValue); setValue(reduced); return () => { reducedListeners.delete(setValue) } }, [])
   return value
 }
 
@@ -51,17 +51,22 @@ export function ScreenFaces({ children }: { children: ReactNode }) {
   return <Covered.Provider value={covered}>{children}</Covered.Provider>
 }
 
-/** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the row says the mood. */
-/** `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. */
-export function BotFace({ botId, mood, size, halo }: { botId: string; mood: Mood; size: number; halo?: string }) {
+/** Who a face belongs to: its id gives what `avatar` leaves out. */
+export type FaceBot = Pick<BotRecord, 'bot_id' | 'avatar'>
+
+/** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the row says the mood. */
+/** `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. `still` draws one frame and leaves the clock, for previews. */
+export function BotFace({ bot, mood, size, halo, still }: { bot: FaceBot; mood: Mood; size: number; halo?: string; still?: boolean }) {
   const { theme } = useUniwind()
   const dark = theme === 'dark'
-  const face = useMemo(() => faceOf(botId), [botId])
+  const { bot_id: botId, avatar } = bot
+  const look = avatar ? `${avatar.outline}:${avatar.eyes}:${avatar.hue}` : ''
+  const face = useMemo(() => faceOf(botId, avatar), [botId, look])
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
   const reducedMotion = useReduced()
-  const motionOff = useContext(Covered) || reducedMotion
+  const motionOff = useContext(Covered) || reducedMotion || still === true
   const gradient = `face${useId().replace(/[^a-zA-Z0-9]/g, '')}`
-  const motion = useMemo(() => faceMotion(botId, mood), [botId])
+  const motion = useMemo(() => faceMotion(botId, mood, avatar), [botId, look])
   const frame = useSharedValue<Frame>(useState(() => motion.frame(null))[0])
 
   useEffect(() => {

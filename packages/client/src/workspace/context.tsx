@@ -13,6 +13,8 @@ import {
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder, attachmentLimit,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
+import type { Avatar } from "../avatar/face.ts"
+import { avatarWrite } from "../avatar/pick.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -34,6 +36,7 @@ type AttachmentFile = { name: string; arrayBuffer(): Promise<ArrayBuffer> }
 /** `label` is a full sentence for a lone button; `state` lets a settings row word it shorter. */
 type NotificationButton = { label: string; disabled: boolean; state: "off" | "on" | "unsupported" | "denied" }
 const soleTab: Tabs = { leader: () => true, post() {}, listen: () => () => {} }
+const faceSuperseded = "Bot 的长相刚在别处改过，之前没确认的那次修改没有再发送。"
 const responded = (caught: unknown) => caught instanceof Error && "responded" in caught && caught.responded === true
 
 function useWorkspaceState(platform: Platform, connection: ReadyConnection, openConversation: (conversationId: string) => void = () => {}, tabs: Tabs = soleTab, initialBot: string | null = null) {
@@ -328,6 +331,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const wanted = item.params.project as BotProject | null
       return project?.target_node === wanted?.target_node && project?.cwd === wanted?.cwd
     }
+    // A deleted bot has no face to set, so its write is dropped.
+    if (item.method === "set_bot_avatar") {
+      const bot = parseBots(await connection.rpc("bots")).find((entry) => entry.conversation_id === item.params.conversation_id)
+      if (!bot) return true
+      const state = avatarWrite(bot, item.params.version as string | null, item.params.avatar as Avatar | null)
+      if (state === "superseded" && current()) setNoticeText(faceSuperseded)
+      return state !== "unsent"
+    }
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -353,6 +364,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       submit: async (item) => { requireCurrent(); await connection.rpc(item.method, item.params) },
     })
     if (!alive.current) return
+    // A refused face write cannot go again: the face it was signed over has changed.
+    const refusedFaces = result.rejected.filter((key) => key.startsWith(outboxKey("bot-avatar", "")))
+    for (const key of refusedFaces) await outbox.delete(key)
+    if (refusedFaces.length && current()) setNoticeText("之前没确认的那次长相修改被拒绝，没有生效。")
     await outboxChanged()
     if (result.confirmed.length || result.resubmitted.length || result.rejected.length) scheduleRefresh()
   }
@@ -421,11 +436,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       showError(caught, label)
     }
   }
-  const requireControlRefresh = () => {
+  /** After a failed write: a refusal only rereads; an unknown outcome also pauses writes until the reread. */
+  const requireControlRefresh = (caught: unknown) => {
     if (!current()) return
-    readConnection.current = null
-    readSequence.current += 1
-    setNoticeText("还没确认结果，正在重新查。")
+    if (!responded(caught)) {
+      readConnection.current = null
+      readSequence.current += 1
+      setNoticeText("还没确认结果，正在重新查。")
+    }
     scheduleRefresh()
   }
   /** A retry, here or through another entrance, sends the same signed request; nothing is re-signed. */
@@ -600,14 +618,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const id = activeId.current
       requireBotContext(id)
       try { await connection.rpc(`${choice}_unanswered`, { conversation_id: id, message_ids: messageIds }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
       const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
       try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       await refreshRef.current()
     }),
@@ -615,14 +633,29 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setBotProject: (id: string, project: BotProject | null) => withMutation(`bot-project:${id}`, async () => {
       const attestation = await attest(id, { type: "bot_project_set", project })
       try { await signedWrite("bot-project", `${id}:${project?.target_node ?? ""}:${project?.cwd ?? ""}`, "set_bot_project", { conversation_id: id, project, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       await refreshRef.current()
+    }),
+    /**
+     * `version` names the face the user saw and `avatar` is the new one, `null` being the face the bot's id gives. One
+     * write per bot waits in the outbox, and a new pick replaces one whose outcome is unknown: the Node takes at most one
+     * write signed over a version, so the two cannot both land. The bot the Node returns joins the list at once.
+     */
+    setBotAvatar: (id: string, version: string | null, avatar: Avatar | null) => withMutation(`bot-avatar:${id}`, async () => {
+      await outbox.delete(outboxKey("bot-avatar", id))
+      const attestation = await attest(id, { type: "bot_avatar_set", version, avatar })
+      let result: unknown
+      try { result = await signedWrite("bot-avatar", id, "set_bot_avatar", { conversation_id: id, version, avatar, attestation }) }
+      catch (caught) { requireControlRefresh(caught); throw caught }
+      requireCurrent()
+      const written = parseBot(record(result).bot)
+      setBots((previous) => previous.map((bot) => bot.conversation_id === id ? { ...bot, avatar: written.avatar, avatar_version: written.avatar_version } : bot))
     }),
     deleteBot: (id: string) => withMutation(`bot-delete:${id}`, async () => {
       const attestation = await attest(id, { type: "bot_deleted" })
       try { await signedWrite("bot-delete", id, "delete_bot", { conversation_id: id, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       await reloadScope(id)
     }),
@@ -630,7 +663,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const id = activeId.current
       const attestation = await attest(id, { type: "schedule_controlled", schedule_id: scheduleId, action })
       try { await signedWrite("schedule", `${scheduleId}:${action}`, "control_schedule", { conversation_id: id, schedule_id: scheduleId, action, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       if (activeId.current === id) await refreshRef.current()
     }),
@@ -640,7 +673,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const scheduler = context.local_node, epoch = context.conversation.owner_epoch + 1
       const attestation = await attest(id, { type: "conversation_owner", scheduler_node: scheduler, epoch })
       try { await signedWrite("owner", `${id}:${epoch}`, "set_owner", { conversation_id: id, scheduler_node: scheduler, epoch, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一台电脑"}`)
       if (activeId.current === id) await refreshRef.current()
@@ -651,7 +684,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (!work || work.outcome || !["accepted", "running"].includes(work.state)) throw new Error("这个任务现在停不了，请再查一次。")
       let receipt: Record<string, unknown>
       try { receipt = record(await connection.rpc("interrupt_work", { conversation_id: id, work_id: workId })) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       setNoticeText(receipt.waiting_for_device === true ? "已请求、等待设备确认。" : "已请求停止任务。")
       if (activeId.current === id) await refreshRef.current()
@@ -690,7 +723,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (new TextEncoder().encode(text).length > 4096) throw new Error("备注太长了。")
       const attestation = await attest(id, { type: "work_finished", work_id: check.work_id, outcome: choice, result_text: text })
       try { await signedWrite("resolve", check.check_id, "resolve", { conversation_id: id, check_id: check.check_id, outcome: choice, note: text, attestation }) }
-      catch (caught) { requireControlRefresh(); throw caught }
+      catch (caught) { requireControlRefresh(caught); throw caught }
       requireCurrent()
       await refreshRef.current()
     }),
