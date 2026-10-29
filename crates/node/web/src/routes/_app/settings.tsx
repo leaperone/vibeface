@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
+import { onlyManagerText, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
 import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
@@ -42,7 +42,7 @@ function SettingsPage() {
   const sole = principal?.source !== 'local_session' && soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <SettingsGroup title="提醒">
+    <SettingsGroup title={waitingCopy.title}>
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
         <NotificationValue />
       </SettingsRow>

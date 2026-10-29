@@ -152,7 +152,7 @@ export function parseJoinRequest(value: unknown): JoinRequest {
   const v = record(value, '加入请求')
   if (!['pending', 'confirming', 'joined', 'rejected', 'withdrawn', 'expired'].includes(v.status as string)) throw new Error('加入状态无效。')
   if (v.kind !== 'node' && v.kind !== 'client') throw new Error('设备类型无效。')
-  if (typeof v.invite_id !== 'string' || !/^[a-f0-9]{32}$/.test(v.invite_id)) throw new Error('邀请编号无效。')
+  if (typeof v.invite_id !== 'string' || !/^[a-f0-9]{32}$/.test(v.invite_id)) throw new Error('加入请求无效。')
   return {
     join_id: text(v.join_id), status: v.status as JoinStatus, network_id: validTarget(v.network_id), invite_id: v.invite_id, device_id: validTarget(v.device_id),
     kind: v.kind, name: text(v.name), commit: validTarget(v.commit), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),

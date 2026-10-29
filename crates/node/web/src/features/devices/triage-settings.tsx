@@ -7,17 +7,18 @@ import { Input } from "@/components/ui/input"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
+import { waitingCopy } from "@vibeface/client/identity/copy.ts"
 import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
 import { webhookTestResult } from "@vibeface/client/lib/errors.ts"
 import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
 const chat = terms.externalChat.label
-const outlets: [Outlet, string, LucideIcon][] = [["record", "只在网页", Inbox], ["both", `也发给${chat}`, Layers]]
+const outlets: [Outlet, string, LucideIcon][] = [["record", waitingCopy.outlets.record, Inbox], ["both", waitingCopy.outlets.both, Layers]]
 const outletOptions = outlets.map(([value, label, icon]) => ({ value, label, icon }))
 const fieldLabel = "-mb-1 text-meta font-medium text-muted-foreground"
 type Config = Pick<Settings, "default_outlet" | "projects" | "webhook_url" | "scan_codex_sessions" | "codex_sessions">
 
-/** One folded row: where this device sends sessions that need the person, plus the external chat (Grok Bot) channel both ways. Saves on each change. */
+/** Settings → 会话等你时, one folded row: where this device sends sessions that need the person, plus the external chat (Grok Bot) channel both ways. Saves on each change. */
 export function TriageSettings() {
   const { ready } = useDevice()
   const [settings, setSettings] = useState<Settings | null>(null)
@@ -53,7 +54,7 @@ export function TriageSettings() {
   }
   useEffect(() => { setSettings(null); void call("load", "triage_settings"); return () => { sequence.current += 1 } }, [ready])
 
-  const header = <SettingsRow icon={terms.externalChat.icon} label={`转发到${chat}`} expanded={open} onClick={() => setOpen(!open)}>{settings && !open ? settings.webhook_url ? "已连接" : "未连接" : null}</SettingsRow>
+  const header = <SettingsRow icon={terms.externalChat.icon} label={waitingCopy.forward} expanded={open} onClick={() => setOpen(!open)}>{settings && !open ? settings.webhook_url ? "已连接" : "未连接" : null}</SettingsRow>
   if (!open) return header
   if (!settings) return <>{header}<div className="px-4 py-3">{error ? <InlineError error={error} action={{ label: "重试", onClick: () => void call("load", "triage_settings") }} /> : <Skeleton className="h-8" />}</div></>
   const config: Config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
@@ -104,8 +105,8 @@ export function TriageSettings() {
   return <>
     {header}
     {connected ? <>
-    <SettingsRow icon={MessageCircleQuestionMark} label="会话等你时" stacked>
-      <Segmented label="会话等你时" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
+    <SettingsRow icon={MessageCircleQuestionMark} label="默认去向" stacked>
+      <Segmented label="默认去向" labels fill value={config.default_outlet} disabled={Boolean(busy)} options={outletOptions} onChange={(value) => void save("default", { default_outlet: value })} />
     </SettingsRow>
 
     <SettingsDisclosure icon={FolderTree} label="按文件夹另设" value={config.projects.length || undefined} open={config.projects.length > 0}>

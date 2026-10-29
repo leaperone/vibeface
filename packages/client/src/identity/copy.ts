@@ -112,4 +112,13 @@ export const deviceCopy = {
     bot: { label: '运行 Bot', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
     execution: { label: '执行任务', hint: (provider: string) => `Bot 派的任务用这台设备的 ${provider} 来做` },
   },
+  /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
+  appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
+}
+
+/** Settings → 会话等你时: how a session that needs the person reaches them. `outlets`: where it shows by default. */
+export const waitingCopy = {
+  title: '会话等你时',
+  forward: '转发到外部聊天',
+  outlets: { record: '只在待处理', both: '也发给外部聊天' },
 }

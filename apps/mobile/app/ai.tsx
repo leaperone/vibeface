@@ -1,29 +1,25 @@
-import * as Clipboard from 'expo-clipboard'
-import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, Pencil, Play, PlugZap, Plus, Sparkles, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, ListChecks, LoaderCircle, Monitor, Pencil, Play, PlugZap, Plus, Sparkles, Trash2, X, type LucideIcon } from 'lucide-react-native'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
-import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
-import { webhookTestResult } from '@vibeface/client/lib/errors.ts'
-import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
-import { Segmented } from '@/components/ui/segmented'
 import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
+import { Field, PathList, Retry, useCall } from '@/features/devices/remote-settings'
 import { cn } from '@/lib/utils'
 
 /**
- * The AI and reminders of the device this phone connects through, as on the web's device and settings pages. Both go over
- * the encrypted connection, so an admin phone can set them up remotely. Variable values are write-only.
+ * The AI of the device this phone connects through, as on the web's device page. It goes over the encrypted connection,
+ * so an admin phone can set it up remotely. Variable values are write-only.
  */
 export default function AiScreen() {
   const { ready } = useDevice()
@@ -31,34 +27,7 @@ export default function AiScreen() {
   if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理设备能修改" className="flex-1 justify-center" />
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
-    <Section icon={Bell} title="会话等你时"><Triage /></Section>
   </KeyboardAwareScrollView>
-}
-
-/** Calls the connected device; a newer call or a new connection makes an older answer stale. */
-function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
-  const { ready } = useDevice()
-  const [value, setValue] = useState<T | null>(null)
-  const [busy, setBusy] = useState('')
-  const [error, setError] = useState<{ at: string; text: string } | null>(null)
-  const sequence = useRef(0)
-  const call = async (key: string, method: string, params?: Record<string, unknown>, at = '') => {
-    if (!ready?.isCurrent()) return null
-    const connection = ready, owner = ++sequence.current
-    setBusy(key); setError(null)
-    try {
-      const result = await connection.request(method, params)
-      if (owner !== sequence.current || !connection.isCurrent()) return null
-      setValue(parse(method === loadMethod || method.startsWith('configure') ? result : await connection.request(loadMethod)))
-      return result
-    } catch (cause) {
-      if (owner === sequence.current) setError({ at, text: messageOf(cause) })
-      return null
-    } finally { if (owner === sequence.current) setBusy('') }
-  }
-  const load = () => call('load', loadMethod)
-  useEffect(() => { setValue(null); void load(); return () => { sequence.current += 1 } }, [ready])
-  return { value, busy, error, call, load, setError }
 }
 
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
@@ -149,7 +118,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
-        ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
+        ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>{deviceCopy.appServer.useSpawn}</Text></Button>
         : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-4 active:bg-muted/60" onPress={() => setOpen(!open)}>
@@ -185,7 +154,7 @@ function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof 
   </View>
 }
 
-const modes: [AppServerMode, string, LucideIcon][] = [['system', '用已在运行的', Monitor], ['spawn', '自己启动', Play]]
+const modes: [AppServerMode, string, LucideIcon][] = [['system', deviceCopy.appServer.system, Monitor], ['spawn', deviceCopy.appServer.spawn, Play]]
 const links: Record<AppServerLink['state'], [string, LucideIcon, string]> = {
   connected: ['text-success', CircleCheck, '已连接'],
   starting: ['text-muted-foreground', LoaderCircle, '连接中'],
@@ -281,140 +250,11 @@ function Variables({ item, working, change }: { item: ProviderStatus; working: b
   </Field>
 }
 
-const outlets: [Outlet, string, LucideIcon][] = [['record', '只在待处理', Inbox], ['both', '也发给外部聊天', Layers]]
-
-/** Where that device sends sessions that need the person, plus the chat bot channel both ways. Saves on each change. */
-function Triage() {
-  const { value: settings, busy, error, call, load } = useCall(parseTriageSettings, 'triage_settings')
-  const [url, setUrl] = useState('')
-  const [secret, setSecret] = useState('')
-  const [label, setLabel] = useState('')
-  const [token, setToken] = useState('')
-  const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
-  useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
-  if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-24 rounded-xl" />
-  const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
-  const save = (key: string, patch: Partial<typeof config>, extra: Record<string, unknown> = {}) => {
-    const next = { ...config, ...patch }
-    return call(key, 'configure_triage', { ...next, webhook_url: next.webhook_url.trim() || null, ...extra })
-  }
-  const other = (outlet: Outlet): Outlet => outlet === 'both' ? 'record' : 'both'
-  const { pending, delivered, dead } = settings.outbox
-  // Until a chat is connected there is nothing to forward, so only connecting shows.
-  const connected = Boolean(settings.webhook_url)
-  const connect = <>
-    <Field label="地址"><Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} /></Field>
-    <Field label="密钥"><View className="flex-row gap-2">
-      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '已设置' : '至少 16 个字符'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
-      {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
-    </View></Field>
-    <View className="flex-row flex-wrap items-center gap-2">
-      <Button variant="outline" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
-        onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
-        {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
-      </Button>
-      <Button variant="ghost" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
-        setTest(null)
-        void call('test', 'test_webhook').then((result) => {
-          const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-          if (data) setTest(webhookTestResult(data))
-        })
-      }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
-      {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
-    </View>
-    {pending + delivered + dead ? <View className="flex-row items-center gap-3">
-      {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
-        count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
-    </View> : null}
-  </>
-  return <View className="gap-6">
-    {connected ? <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
-      onChange={(value) => void save('default', { default_outlet: value })} /> : null}
-    {/* The two folds sit together as one list of extras under the choice above. */}
-    <View>
-      {connected ? <Details label="按文件夹另设" open={config.projects.length > 0}>
-        <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
-          trailing={(prefix) => {
-            const project = config.projects.find((item) => item.prefix === prefix)!
-            const [, text] = outlets.find(([value]) => value === project.outlet)!
-            return <Button variant="ghost" className="px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
-              onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
-          }}
-          onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
-      </Details> : null}
-      {/* Folded as on the web once connected; until then connecting shows on its own. */}
-      {connected ? <Details label="外部聊天 · 已连接">
-        {connect}
-        <Details label="让外部聊天代你回答">
-          <Field label="地址"><Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text></Field>
-          {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
-            <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
-            <Button variant="ghost" size="icon" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
-            <Button variant="ghost" size="icon" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
-          </View> : null}
-          {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-            <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
-            <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
-            <Button variant="ghost" size="icon" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
-          </View>)}
-          <View className="flex-row gap-2">
-            <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-            <Button variant="outline" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
-              const value = (result as { token?: unknown } | null)?.token
-              if (typeof value === 'string') { setToken(value); setLabel('') }
-            })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
-          </View>
-        </Details>
-      </Details> : <Field label="外部聊天">{connect}</Field>}
-    </View>
-    {error ? <ErrorText error={error.text} /> : null}
-  </View>
-}
-
-/**
- * Folder paths with a remove button each, one-tap folders the device found (`suggested`) and a field to add one; a long
- * path keeps its last folder readable. `shown`: a path's `~/…` form.
- */
-function PathList({ label, items, shown = {}, suggested = [], busy, trailing, onChange }: {
-  label: string; items: string[]; shown?: Record<string, string>; suggested?: { path: string; label: string }[]; busy: boolean; trailing?: (item: string) => ReactNode; onChange(next: string[]): void
-}) {
-  const [path, setPath] = useState('')
-  const add = () => { const next = path.trim(); setPath(''); if (next && !items.includes(next)) onChange([...items, next]) }
-  const body = <>
-    {items.map((item) => <View key={item} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-      <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
-      <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{shown[item] ?? item}</Text>
-      {trailing?.(item)}
-      <Button variant="ghost" size="icon" accessibilityLabel={`移除 ${shown[item] ?? item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
-    </View>)}
-    {suggested.length ? <View className="flex-row flex-wrap gap-2">{suggested.map((folder) => <Button key={folder.path} variant="outline" accessibilityLabel={`添加 ${folder.label}`} disabled={busy} onPress={() => onChange([...items, folder.path])}>
-      <Icon as={Plus} /><Text className="font-mono text-meta">{folder.label}</Text>
-    </Button>)}</View> : null}
-    <View className="flex-row gap-2">
-      <Input accessibilityLabel="文件夹路径" placeholder={items.length || suggested.length ? '其他文件夹' : '~/projects'} autoCapitalize="none" autoCorrect={false} className="min-w-0 flex-1 font-mono" value={path} editable={!busy}
-        returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />
-      <Button variant="outline" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
-    </View>
-  </>
-  return label ? <Field label={label}>{body}</Field> : <View className="gap-2">{body}</View>
-}
-
 function SaveRow({ value, saved, placeholder, mono, working, onChange, onSave }: { value: string; saved: string; placeholder: string; mono?: boolean; working: boolean; onChange(value: string): void; onSave(): void }) {
   return <View className="flex-row gap-2">
     <Input accessibilityLabel={placeholder} placeholder={placeholder} autoCapitalize="none" autoCorrect={false} className={cn('min-w-0 flex-1', mono && 'font-mono')} value={value} editable={!working} onChangeText={onChange} />
     {value.trim() !== saved ? <Button variant="outline" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
   </View>
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return <View className="gap-2">
-    <Text className="text-meta font-medium text-muted-foreground">{label}</Text>
-    {children}
-  </View>
-}
-
-function Retry({ error, onRetry }: { error: string; onRetry(): void }) {
-  return <View className="gap-2"><ErrorText error={error} /><Button variant="outline" className="self-start" onPress={onRetry}><Text>重试</Text></Button></View>
 }
 
 function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {

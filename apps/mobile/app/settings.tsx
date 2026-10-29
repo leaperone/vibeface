@@ -1,11 +1,11 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, Crown, FileKey, FlaskConical, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RotateCcw, Sparkles, Sun, WifiOff } from 'lucide-react-native'
+import { ArrowRightLeft, BellRing, Bot, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, Sun, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager } from '@vibeface/client/identity/copy.ts'
+import { eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
@@ -49,11 +49,13 @@ export default function Settings() {
       {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}
       {manager ? <SettingsRow href="/add-device" icon={Plus} label="添加设备" /> : null}
     </SettingsGroup> : null}
-    {/* One card of places to go, as a system settings group: each row names itself. */}
+    {/* As on the web: a computer's bots live in its detail above, and a session that waits for you reaches you here. */}
+    {device.ready ? <SettingsGroup title={waitingCopy.title}>
+      <Notifications />
+      {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
+    </SettingsGroup> : null}
     <SettingsGroup>
-      {manager ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" /> : null}
       <SettingsRow href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
-      {device.ready ? <Notifications /> : null}
     </SettingsGroup>
     {manager ? <SettingsGroup title="找回">
       <CurrentRecoveryFile />
@@ -134,9 +136,10 @@ function MemberRow({ member }: { member: Member }) {
   // Measured: 1.5pt at the default size, about 11.5pt at the 2x cap. Android centres it on the line, about 1dp high at every size.
   const fontScale = useWindowDimensions().fontScale
   const crownLift = Platform.OS === 'ios' ? -(1.5 + 10 * (Math.min(fontScale, 2) - 1)) : 1
-  // The name wraps in full so the inline crown is never cut off with it.
+  const mark = (icon: LucideIcon, label: string) => <>{'\u00a0'}<Icon as={icon} accessibilityLabel={label} className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></>
+  // The name wraps in full so the inline marks are never cut off with it. As in the web's device list, the bot mark leads to the computer whose detail holds Bot 与任务.
   return <SettingsRow href={`/device/${member.device_id}`} icon={deviceIcon(member)}
-    label={<>{member.name}{member.admin ? <>{'\u00a0'}<Icon as={Crown} accessibilityLabel="管理设备" className="size-3.5 text-muted-foreground" style={{ transform: [{ translateY: crownLift }] }} /></> : null}</>}
+    label={<>{member.name}{member.admin ? mark(Crown, '管理设备') : null}{member.kind === 'node' && member.bot ? mark(Bot, '能运行 Bot') : null}</>}
     description={member.current ? self : member.entry ? '当前连接' : undefined}>
     {member.online !== undefined ? <Online online={member.online} /> : null}
   </SettingsRow>
