@@ -15,6 +15,8 @@ Pod::Spec.new do |s|
 
   s.source_files = "ios/**/*.{h,m,mm,swift}", "ios/generated/**/*.{h,m,mm}", "cpp/**/*.{hpp,cpp,c,h}", "cpp/generated/**/*.{hpp,cpp,c,h}"
   s.vendored_frameworks = "build/VibefaceSecureFramework.xcframework"
+  # iroh, for the LAN dial, reads network interfaces and routes through SystemConfiguration.
+  s.frameworks = "SystemConfiguration"
   s.dependency    "uniffi-bindgen-react-native", "0.31.0-6"
 
   install_modules_dependencies(s)
