@@ -5,7 +5,7 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import { parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
+import { entryAddress, entryJson, entryKey, parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
 import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
@@ -210,7 +210,7 @@ test("workspace preserves bot and message requests while routing native decision
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
   const connection: ReadyConnection = {
-    generation: 1, entry: { device_id: "gateway", address: "https://node.example" },
+    generation: 1, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
@@ -726,11 +726,11 @@ test("an old action completion cannot clear a new generation's busy state", asyn
 test("connection form keeps current errors and busy ownership when an earlier connection is cancelled", async () => {
   let generation = 1, work = pendingResult(), synchronousFailure = false
   const device = {
-    connectionGeneration: () => generation, entries: [{ address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
+    connectionGeneration: () => generation, entries: [{ kind: 'gateway', address: 'https://node.example', device_id: 'target' }], initialInvitation: '',
     identity: { deviceId: 'browser' }, phase: 'disconnected', error: '', entryName: () => '',
     connect() { if (synchronousFailure) throw new Error('current invalid input'); generation++; return work.promise },
   }
-  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
+  const app = componentHarness('../identity/connection-screen.tsx', { '@vibeface/client/identity/context.tsx': { useDevice: () => device, notJoined: (self: string) => `${self}还没加入`, removedText: (self: string) => `${self}已被移除` }, '@/lib/platform': { webPlatform: { self: '这个浏览器', transport: { connectDevice: async () => { throw new Error('offline') } } } }, '@vibeface/client/identity/connection-lane.ts': { primaryLane }, '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message, entryAddress, entryKey }, '@vibeface/client/workspace/labels.ts': { addressName: (address: string) => address, hostOf: () => '' } })
   const render = () => app.render('ConnectionScreen')
   const connect = () => render().find(({ type, props }) => type === 'Button' && props.title === 'https://node.example')?.props
   try {
@@ -929,12 +929,12 @@ test("a closed question neither waits on the person nor hides 思考中", () => 
 
 test("an outstanding clipboard permission cannot keep the add-device sheet busy or release another action", async () => {
   let generation = 1, creation = pendingResult()
-  const invitation = { link: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
+  const invitation = { link: 'https://node.example/join#vibeface1test', qr: 'https://node.example/join#vibeface1test', publicEntry: true, expiresAt: Date.now() + 600_000 }
   const clipboard = pendingResult()
-  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'https://node.example', device_id: 'target' } } }
+  const ready = () => { const owner = generation; return { isCurrent: () => owner === generation, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'https://node.example', device_id: 'target' } } }
   const device = { connectionGeneration: () => generation, ready: ready(), joins: [], createInvitation: () => creation.promise, refreshDirectory: async () => {} }
   const app = componentHarness('../devices/add-device.tsx', {
-    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: () => false }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
     '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message },
   }, { navigator: { clipboard: { writeText: () => clipboard.promise } }, setInterval: () => 0, clearInterval: () => {} })
   const render = () => app.render('AddDevice')
@@ -955,23 +955,34 @@ test("an outstanding clipboard permission cannot keep the add-device sheet busy 
   } finally { app.close() }
 })
 
-test("a link no phone can open shows no QR code", async () => {
-  const shown = async (link: string, publicEntry: boolean) => {
-    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
+test("a link a phone's browser cannot open still gets a QR code, for the app", async () => {
+  const shown = async (link: string, qr: string, publicEntry: boolean) => {
+    const encoded: string[] = []
+    const device = { connectionGeneration: () => 1, ready: { isCurrent: () => true, principal: { can_manage: true, network_id: 'network' }, entry: { kind: 'gateway', address: 'http://127.0.0.1:4790', device_id: 'target' } }, joins: [], createInvitation: async () => ({ link, qr, publicEntry, expiresAt: Date.now() + 600_000 }), refreshDirectory: async () => {} }
     const app = componentHarness('../devices/add-device.tsx', {
-      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/workspace/labels.ts': { isLoopback: (value: string) => value.startsWith('http://127.') }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
-      '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData() {}, make() {}, createDataURL: () => 'data:qr' }),
+      '@vibeface/client/identity/context.tsx': { useDevice: () => device }, './join': { JoinRequests: () => null, useOpenJoins: () => [] }, '@/lib/glossary': { terms: { safetyCode: { label: '安全码', icon: 'ScanEye' } } },
+      '@vibeface/client/lib/node.ts': { messageOf: (cause: Error) => cause.message }, 'qrcode-generator': () => ({ addData(value: string) { encoded.push(value) }, make() {}, createDataURL: () => 'data:qr' }),
     }, { setInterval: () => 0, clearInterval: () => {} })
     try {
       app.render('AddDevice'); app.render('AddDevice').find(({ props }) => [props.children].flat().includes('生成链接'))?.props.onClick?.(); await settleComponent()
-      return app.render('AddDevice')
+      return { tree: app.render('AddDevice'), encoded }
     } finally { app.close() }
   }
-  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', false)
-  assert.equal(local.some(({ type }) => type === 'img'), false)
-  assert.ok(local.some(({ props }) => [props.children].flat().includes('手机打不开本机地址')))
-  const open = await shown('https://node.example/join#vibeface1test', true)
-  assert.equal(open.find(({ type }) => type === 'img')?.props.src, 'data:qr')
+  const local = await shown('http://127.0.0.1:4790/join#vibeface1test', 'vibeface://join?link=vibeface1test', false)
+  assert.deepEqual(local.encoded, ['vibeface://join?link=vibeface1test'])
+  assert.equal(local.tree.find(({ type }) => type === 'img')?.props.alt, '用手机 App 扫码')
+  assert.ok(local.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')))
+  const open = await shown('https://node.example/join#vibeface1test', 'https://node.example/join#vibeface1test', true)
+  assert.deepEqual(open.encoded, ['https://node.example/join#vibeface1test'])
+  assert.equal(open.tree.find(({ type }) => type === 'img')?.props.alt, '用手机相机扫码打开')
+  assert.equal(open.tree.some(({ type, props }) => type === 'p' && [props.children].flat().includes('用手机 App 扫码')), false)
+})
+
+test("an entry is stored in the one form Nodes send it in, and a LAN entry as its device id and addresses", () => {
+  const id = "ab".repeat(32)
+  for (const value of [{ address: "https://node.example", device_id: id }, { device_id: id, addrs: ["192.168.1.4:7001", "[fd00::4]:7001"] }]) assert.deepEqual(entryJson(parseEntry(value)), value)
+  assert.deepEqual(parseEntry({ device_id: id, addrs: ["192.168.1.4:7001", "node.example:7001"] }), { kind: "lan", addrs: ["192.168.1.4:7001"], device_id: id })
+  assert.throws(() => parseEntry({ device_id: id, addrs: ["node.example:7001"] }), /访问地址缺失或格式无效/)
 })
 
 test("device id boundaries require the device_id field", () => {

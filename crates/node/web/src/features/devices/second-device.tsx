@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { isLoopback } from "@vibeface/client/workspace/labels.ts"
+import { entryAddress } from "@vibeface/client/lib/node.ts"
 import { useDeviceRows } from "./devices"
 
 const key = "vibeface.second-device-hint"
@@ -30,7 +31,7 @@ export function SecondDeviceHint({ className }: { className?: string }) {
   const dismissed = useSyncExternalStore(subscribe, dismissedBefore, () => false)
   if (!replied || dismissed || onDevices || !ready?.principal.can_manage || !directory || directory.revoked.length || rows.length > 2) return null
   // A loopback-only link opens on no phone; another computer still joins it with `vibeface join`.
-  const localOnly = isLoopback(ready.entry.address) && !entrances.some((entrance) => entrance.public)
+  const localOnly = isLoopback(entryAddress(ready.entry)) && !entrances.some((entrance) => entrance.public)
   const Icon = localOnly ? Monitor : Smartphone
   function dismiss() {
     closed = true

@@ -11,7 +11,7 @@ import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
-import type { Member } from "@vibeface/client/lib/node.ts"
+import { entryAddress, type Member } from "@vibeface/client/lib/node.ts"
 import { AiSettings, docs } from "./ai-settings"
 import { JoinRequests } from "./join"
 
@@ -59,7 +59,7 @@ function Online({ online, compact = false }: { online: boolean; compact?: boolea
 function useEntryLabel() {
   const { ready } = useDevice()
   const { connectionOnline } = useWorkspace()
-  if (ready && isLoopback(ready.entry.address)) return terms.thisComputer.label
+  if (ready && isLoopback(entryAddress(ready.entry))) return terms.thisComputer.label
   return connectionOnline ? "当前连接" : "重连中"
 }
 
@@ -117,7 +117,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const localSession = ready?.principal.source === "local_session"
   if (!row) return device.directory ? <EmptyState icon={terms.myDevices.icon} title="找不到这个设备" action={<Button asChild variant="outline"><Link to="/devices">回到设备列表</Link></Button>} /> : <div className="mx-auto grid w-full max-w-(--page-width) gap-4"><Skeleton className="h-16" /><Skeleton className="h-40" /></div>
   const Icon = deviceIcon(row)
-  const address = row.entry ? ready?.entry.address ?? "" : ""
+  const address = row.entry && ready ? entryAddress(ready.entry) : ""
   const saved = device.entries.find((item) => item.device_id === row.id)
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">

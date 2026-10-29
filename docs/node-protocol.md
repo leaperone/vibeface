@@ -335,7 +335,9 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 
 ### iroh Endpoint
 
-每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS、pkarr 或局域网发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
+每台 Node 运行一个 iroh 1.3 `Endpoint`，`SecretKey` 就是设备密钥。Endpoint 用 Minimal 预设、`MemoryLookup` 和 `RelayMode::Custom`：relay 来自 `network.relays`、本 Node 自己的 relay、公共入口的 relay，以及可选的 n0 公共 relay。默认不向 n0 DNS 或 pkarr 发布地址，持久对端地址来自 ticket 和个人网络内部交换的签名地址记录。显式启用 `network.pkarr` 后，还可向指定 pkarr 目录发布或解析地址。配置的发现服务可提供临时 IP 提示，和已有 relay 路径合并后由 iroh 自动选择连接路径。连接优先直连，失败时经普通 relay 转发 QUIC 密文。
+
+成员 Node 另在局域网用 mDNS 广播 `_vibeface._udp.local.`。实例名和 TXT 记录 `t` 都是标签 `hex(HMAC-SHA256(network_id, "vibeface:lan:v1\0" ‖ device_id ‖ hour)[..16])`，`hour` 是 Unix 毫秒除以 3600000 的 u64 大端字节；主机名为 `<标签>.local.`，SRV 端口是 iroh 实际监听的 UDP 端口，A 和 AAAA 是本机非回环网卡地址，网卡变化时自动更新。每到整点，同步循环在几秒内改用新标签重新登记，旧实例发出 mDNS 告别。收到的广播在拨号时才比对，用前一、当前和后一小时的标签匹配要拨的成员 Node，过了时间窗的标签自然失效。比对上的地址在 `connect` 中与地址簿和发现服务提示合并；新出现或变化的广播只要属于当前成员 Node（不含自己），就立即唤醒与它的同步。只收私网 IPv4 和 ULA IPv6 地址，IPv4 在前，每条最多 4 个；拨号只用比对上的最新一条广播。最多保留 64 条广播，满时先删不属于成员 Node 的，再删最早收到的；收到告别或 SRV 记录过期后删除。公共入口和 `bind` 为具体地址的 Node 不启用 mDNS，尚未加入或已被移出网络的 Node 不广播；mDNS 失败只记录日志，不影响 Node 运行。
 
 `Router` 按 ALPN 分发连接。私人 Node 请求每次占一条 QUIC 双向流，帧为 4 字节大端长度前缀加 JSON，单帧最多 16 MiB。`service` 的独立 Noise 帧和容量见[服务传输](#服务传输)。
 
@@ -345,7 +347,7 @@ Node 的写入状态为 `aligning`、`read_only`、`writable` 或 `forked`。只
 | `vibeface/sync/1` | `hello`、`membership`、`pull`、`forks`、`have` | 未撤销的成员 Node |
 | `vibeface/blob/1` | 按哈希和偏移读取附件 | 未撤销的成员 Node |
 | `vibeface/rpc/1` | 投递、派发、中断、App Server 操作转发、进度读取、地址簿交换、加入请求汇总 | 未撤销的成员 Node |
-| `vibeface/client/1` | 网关转发的浏览器 Noise 会话，每条流一个会话 | 任意设备，会话本身由 Noise 认证 |
+| `vibeface/client/1` | 网关转发的浏览器 Noise 会话，或手机 App 在局域网用临时密钥直接拨入的会话；每条流一个会话，帧为 `tag ‖ u32 BE 长度 ‖ 内容` | 任意设备，会话本身由 Noise 认证 |
 | `vibeface/join/1` | 只开放 `join`、`join_status` 和 `join_withdraw` | 任意设备 |
 | `vibeface/service/1` | 可选的公益和付费文件对象交付 | 已认证 PeerID，另验服务开关、条款、证明及对象授权，不要求成为私人成员 |
 

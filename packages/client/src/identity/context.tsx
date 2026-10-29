@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import type { ReactNode } from 'react'
 import { joinTicket, validTarget } from '../lib/transport.ts'
 import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
-import { array, boolean, deviceName, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
+import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
 import { onlyManagerText } from './copy.ts'
@@ -14,9 +14,9 @@ import { recoveryCode, recoveryFileName, secureKit } from '../lib/secure.ts'
 import type { AuthenticationTrust, RecoveryFile } from '../lib/secure.ts'
 import { nextLink } from '../lib/link.ts'
 import type { Link, LinkEvent } from '../lib/link.ts'
-import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, verifiedEntrances } from '../lib/entrances.ts'
+import { candidates, isPublicUrl, markReached, mergeEntrances, openEntrances, storedEntrances, verifiedEntrances } from '../lib/entrances.ts'
 import type { Entrance, OpenEntrance } from '../lib/entrances.ts'
-import type { KeyValue, LocalLaunch, Platform } from '../lib/platform.ts'
+import type { KeyValue, LanSighting, LocalLaunch, Platform } from '../lib/platform.ts'
 import { connectLogSink, reportLog } from '../lib/web-log.ts'
 
 type Phase = 'initializing' | 'blocked' | 'key_lost' | 'disconnected' | 'connecting' | 'reconnecting' | 'unpaired' | 'removed' | 'restarting' | 'ready'
@@ -42,8 +42,11 @@ type JoinPin = { network_id: string; admin_id: string; admin_nonce: string }
 type NodeJoining = { status: 'waiting' | 'confirming' | 'joined'; code?: string }
 /** What a manager fixed when it sent its nonce: the request it saw, so a later answer of the entry cannot change it. */
 type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit: string }
-/** A fresh invitation; `publicEntry`: a phone's camera can open `link`, otherwise the Vibeface app scans `ticket`. */
-export type Invitation = { link: string; ticket: string; publicEntry: boolean; expiresAt: number }
+/**
+ * A fresh invitation; `qr` is what a phone scans: `link` itself when its camera can open it (`publicEntry`),
+ * otherwise `vibeface://join?link=<ticket>` for the Vibeface app, which joins over the LAN.
+ */
+export type Invitation = { link: string; qr: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
 type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
 export type Tabs = { leader(): boolean; post(message: TabMessage): void; listen(listener: (message: TabMessage) => void): () => void }
@@ -108,6 +111,8 @@ function loadKept(): KeptRecovery | null {
 class AuthenticationError extends Error {}
 const sinceOf = (response: Record<string, unknown>) => typeof response.recovery_since_ms === 'number' ? response.recovery_since_ms : null
 const INVITE_TTL_MS = 10 * 60 * 1000
+/** A Node on the LAN answers at once; one away must not hold up the way through a Gateway. */
+const LAN_MS = 2000
 /** Not an error: the entry buttons below it are the way in. */
 export const notJoined = (self: string) => `${self}还没加入`
 export const removedText = (self: string) => `${self}已被移除，请在管理设备上重新添加`
@@ -138,10 +143,10 @@ function deviceStore(storage: KeyValue, self: string) {
   function resumeTargets(): Reconnect[] {
     if (load('stay-disconnected') === true) return []
     const last = loadAuthenticated()
-    const targets: Reconnect[] = last && !last.entry.local ? [{ ...last, attempt: 0 }] : []
+    const targets: Reconnect[] = last && last.entry.kind !== 'local' ? [{ ...last, attempt: 0 }] : []
     for (const entry of savedEntries().reverse()) {
       const networkId = load(`network-for.${entry.device_id}`)
-      if (entry.local || typeof networkId !== 'string' || targets.some(item => entryKey(item.entry) === entryKey(entry))) continue
+      if (entry.kind === 'local' || typeof networkId !== 'string' || targets.some(item => entryKey(item.entry) === entryKey(entry))) continue
       try { targets.push({ entry, networkId: validTarget(networkId), attempt: 0 }) } catch {}
     }
     return targets
@@ -155,7 +160,7 @@ function deviceStore(storage: KeyValue, self: string) {
     } catch { return null }
   }
   function approvalPins(): Record<string, ApprovalPin> { const value = load('approval-pins'); return value && typeof value === 'object' ? value as Record<string, ApprovalPin> : {} }
-  const loadEntrances = (networkId: string): Entrance[] => { const value = load(`entrances.${networkId}`); return Array.isArray(value) ? value as Entrance[] : [] }
+  const loadEntrances = (networkId: string): Entrance[] => storedEntrances(load(`entrances.${networkId}`))
   function loadWait(): WaitRecord | null {
     try {
       const v = record(load('recovery-wait'))
@@ -243,6 +248,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const [entrances, setEntrances] = useState<OpenEntrance[]>([])
   const seen = useRef<Vector>({})
   const switching = useRef(false)
+  /** Nodes advertising on the app's LAN right now. */
+  const lanSightings = useRef<LanSighting[]>([])
   const leaderRef = useRef(true)
   const tabChannel = useRef<{ post(message: TabMessage): void; close(): void } | null>(null)
   const tabListeners = useRef(new Set<(message: TabMessage) => void>())
@@ -259,7 +266,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const releaseSensitive = useCallback(() => { sensitive.current?.cancel(); sensitive.current = null; setReview(null) }, [])
   const setJoin = useCallback((next: Joining | null) => {
     joiningRef.current = next; setJoining(next)
-    store('pending-join', next && { entry: next.entry, join_id: next.join_id, invite_id: next.invite_id, nonce: next.nonce, name: next.name, pinned: next.pinned })
+    store('pending-join', next && { entry: entryJson(next.entry), join_id: next.join_id, invite_id: next.invite_id, nonce: next.nonce, name: next.name, pinned: next.pinned })
   }, [])
   const resetConnection = useCallback(() => {
     reconnect.current = null
@@ -281,13 +288,12 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }, [resetConnection])
   const cancelSensitive = disconnect
   const saveEntry = useCallback((candidate: ConnectionEntry) => {
-    const parsed = parseEntry(candidate)
-    const next = [...savedEntries().filter(item => entryKey(item) !== entryKey(parsed)), parsed]
-    store('connections', next); setEntries(next)
+    const next = [...savedEntries().filter(item => entryKey(item) !== entryKey(candidate)), candidate]
+    store('connections', next.map(entryJson)); setEntries(next)
   }, [])
   const removeEntry = useCallback((candidate: ConnectionEntry) => {
     const next = savedEntries().filter(item => entryKey(item) !== entryKey(candidate))
-    store('connections', next)
+    store('connections', next.map(entryJson))
     const previous = loadAuthenticated()
     if (previous && entryKey(previous.entry) === entryKey(candidate)) store('last-authenticated', null)
     setEntries(next)
@@ -315,7 +321,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const request = scoped(active)
     let verified: ReturnType<typeof verifyAuthentication>
     try {
-      const trust: AuthenticationTrust | null = active.entry.local === true
+      const trust: AuthenticationTrust | null = active.entry.kind === 'local'
         ? { kind: 'local', networkId: expected?.networkId ?? validTarget(record(record(authValue).principal).network_id), nodeId: active.entry.device_id }
         : expected
       verified = verifyAuthentication(authValue, own(), trust)
@@ -331,13 +337,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (session.current !== active || active.generation !== generation.current) throw changed()
     const lagging = behind(seen.current, subscribed.vector)
     absorb(seen.current, subscribed.vector)
-    if (principal.source === 'membership' && active.entry.local) active.entry = { ...active.entry, local: false }
+    if (principal.source === 'membership' && active.entry.kind === 'local') active.entry = { kind: 'gateway', address: active.entry.address, device_id: active.entry.device_id }
     setLocalAutoAccessState(typeof verified.auth.local_auto_access === 'boolean' ? verified.auth.local_auto_access : null)
     store(`network-for.${active.entry.device_id}`, principal.network_id)
     store(`name-for.${active.entry.device_id}`, active.info.name)
     resumeQueue.current = []
     saveEntry(active.entry)
-    store('last-authenticated', { entry: active.entry, networkId: principal.network_id } satisfies AuthenticatedEntry)
+    store('last-authenticated', { entry: entryJson(active.entry), networkId: principal.network_id })
     store('pending-join', null); store('stay-disconnected', null)
     active.networkId = principal.network_id
     reconnect.current = { entry: active.entry, networkId: principal.network_id, attempt: 0 }
@@ -392,8 +398,40 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     clearTimeout(reconnectTimer.current); reconnectTimer.current = null
     scheduleReconnect(true)
   }
+  /** Which of `nodes`, members of `networkId`, advertise in `sightings` and where they listen; none without a LAN. */
+  function lanSeen(networkId: string, nodes: string[], sightings = lanSightings.current): Map<string, string[]> | undefined {
+    const { lan } = platform
+    if (!lan) return undefined
+    const seen = new Map<string, string[]>()
+    for (const { tag, addrs } of sightings) {
+      const node = nodes.find(id => lan.names(tag, networkId, id))
+      if (node) seen.set(node, [...seen.get(node) ?? [], ...addrs])
+    }
+    return seen
+  }
+  /**
+   * On a Gateway while a new LAN advert names the same Node: once a direct channel to it opens, this one is dropped and
+   * the reconnect, LAN first, takes over. One that does not open leaves this channel alone, and so does one that never
+   * goes idle: dropping a request in flight would leave its outcome unknown.
+   */
+  async function goDirect(fresh: LanSighting[]) {
+    const active = session.current
+    if (!active?.networkId || active.entry.kind !== 'gateway') return
+    const addrs = lanSeen(active.networkId, [active.entry.device_id], fresh)?.get(active.entry.device_id)
+    if (!addrs) return
+    try { (await connectDevice({ kind: 'lan', addrs, device_id: active.entry.device_id }, { timeoutMs: LAN_MS })).close() } catch { return }
+    for (let waited = 0; !active.channel.idle(); waited += 500) {
+      if (waited >= 30000 || session.current !== active) return
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    if (session.current !== active || !reconnect.current || switching.current || reconnectTimer.current !== null || sensitive.current) return
+    generation.current += 1; session.current = null; listeners.current.clear()
+    active.channel.close()
+    step({ type: 'lost', reason: '正在改用局域网直连。' })
+    setPhase('reconnecting'); scheduleReconnect(true)
+  }
   async function reconnectThrough(target: Reconnect): Promise<boolean | 'next'> {
-    if (target.entry.local) {
+    if (target.entry.kind === 'local') {
       const local = identityRef.current && await localEntry(identityRef.current, null)
       if (reconnect.current !== target) return true
       if (!local || entryKey(local) !== entryKey(target.entry)) {
@@ -401,15 +439,18 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
         return true
       }
     }
-    const list = target.entry.local ? [target.entry] : candidates(loadEntrances(target.networkId), target.entry)
+    const entrances = loadEntrances(target.networkId)
+    const list = target.entry.kind === 'local' ? [target.entry] : candidates(entrances, target.entry, lanSeen(target.networkId, [target.entry.device_id, ...entrances.map(item => item.device_id)]))
     for (const candidate of list) {
       let active: Session | null = null
+      // The Node it was on answers for this device whichever way it is reached; another may not have synced yet.
+      const own = candidate.device_id === target.entry.device_id
       try {
-        active = await open(candidate, true, list.length > 1 ? 5000 : 10000)
-        if (candidate === target.entry && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台电脑已属于另一组设备。')
+        active = await open(candidate, true, list.length === 1 ? 10000 : candidate.kind === 'lan' ? LAN_MS : 5000)
+        if (own && active.info.network_id && active.info.network_id !== target.networkId) throw new AuthenticationError('这台电脑已属于另一组设备。')
         const auth = record(await callSession(active, 'authenticate', { network_id: target.networkId }))
-        if (candidate === target.entry && removed(auth, active, target.networkId)) return true
-        if (auth.principal === null && (auth.revoked === true || candidate === target.entry)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
+        if (own && removed(auth, active, target.networkId)) return true
+        if (auth.principal === null && (auth.revoked === true || own)) throw new AuthenticationError(auth.revoked === true ? removedText(self) : `${self}已不在我的设备里。`)
         if (auth.principal === null) throw new Error(`这个访问地址还没同步到${self}。`)
         await authenticate(auth, active, { kind: 'network', networkId: target.networkId })
         if (candidate !== target.entry) tabs.post({ type: 'entrance', networkId: target.networkId, entry: candidate })
@@ -417,7 +458,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       } catch (cause) {
         if (reconnect.current !== target) return true
         // Only a definite answer about this browser's identity ends the resume; a Node error, timeout or drop is retried.
-        if (candidate === target.entry && cause instanceof AuthenticationError) {
+        if (own && cause instanceof AuthenticationError) {
           const next = resumeQueue.current.shift()
           if (next) {
             // A saved target this browser can no longer use, such as an old device at the same address, is dropped.
@@ -438,8 +479,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     return false
   }
-  async function open(entryValue: ConnectionEntry, resuming = false, timeoutMs = 10000) {
-    const parsed = parseEntry(entryValue)
+  async function open(parsed: ConnectionEntry, resuming = false, timeoutMs = 10000) {
     if (!resuming) { resetConnection(); setPhase('connecting'); setEntry(parsed) }
     const version = generation.current
     const controller = new AbortController(); connecting.current = controller
@@ -509,8 +549,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   /** Sets this removed computer's data aside and waits for it to come back fresh, then offers the join. */
   async function rejoin(entry = removedFrom) {
     // Without a local session yet, open one first; the launched page carries on with the rejoin.
-    if (!entry?.local && localSetup?.kind === 'initialized' && localSetup.removed) return openLocalAccess(true)
-    if (!entry?.local) throw new Error('请在这台电脑上打开它的本机页面，再重新加入。')
+    if (entry?.kind !== 'local' && localSetup?.kind === 'initialized' && localSetup.removed) return openLocalAccess(true)
+    if (entry?.kind !== 'local') throw new Error('请在这台电脑上打开它的本机页面，再重新加入。')
     try { await callSession(await open(entry, true), 'rejoin') }
     catch (cause) { resetConnection(); setPhase('removed'); throw cause }
     resetConnection(); setPhase('restarting')
@@ -604,13 +644,17 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const reachable = known.filter(item => item.public).sort((a, b) => b.last_ok_ms - a.last_ok_ms)[0] ?? known.find(item => item.device_id === entryId)
     // The Node's own public entry, when it has one, is what a phone's camera can open.
     const configured = typeof result.gateway_url === 'string' && isPublicUrl(result.gateway_url) ? result.gateway_url : undefined
-    const origin = configured ?? reachable?.gateway_url ?? (route.device_id === entryId ? route.address : connection.entry.address)
+    const used = route.kind !== 'lan' && route.device_id === entryId ? route : connection.entry
+    const origin = configured ?? reachable?.gateway_url ?? (used.kind === 'lan' ? null : used.address)
     const entry = result.entry && typeof result.entry === 'object' ? record(result.entry) : {}
     const relay = typeof entry.relay_url === 'string' ? entry.relay_url : undefined
+    // Where the entry Node listens, so the app can join it on the LAN.
     const direct = array(entry.direct_addrs).filter((value): value is string => typeof value === 'string')
     const ticket = ticketEncode(entryId, hex(secret), relay, direct)
     secret.fill(0)
-    return { link: `${origin}/join#${ticket}`, ticket, publicEntry: isPublicUrl(origin), expiresAt }
+    const app = `vibeface://join?link=${encodeURIComponent(ticket)}`
+    const link = origin ? `${origin}/join#${ticket}` : app, publicEntry = origin !== null && isPublicUrl(origin)
+    return { link, qr: publicEntry ? link : app, publicEntry, expiresAt }
   }
   async function startApproval(joinId: string) {
     managing()
@@ -768,12 +812,18 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const link: JoinLink = await parseJoinLink(linkText)
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
-      // This page's own entry first: a scanned code's address is only a hint, the device key is the check.
+      // The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a
+      // scanned code's address is only a hint, the device key is the check.
       const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
+      const ways: ConnectionEntry[] = [
+        ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
+        ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
+      ]
       let active: Session | null = null
-      for (const [index, address] of addresses.entries()) {
-        try { active = await open({ address, device_id: link.entryId }) }
-        catch (cause) { if (index === addresses.length - 1 || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
+      for (const [index, way] of ways.entries()) {
+        const last = index === ways.length - 1
+        try { active = await open(way, false, way.kind === 'lan' && !last ? LAN_MS : 10000) }
+        catch (cause) { if (last || cause instanceof AuthenticationError) { link.secret = ''; throw cause } }
         if (active) break
       }
       if (!active) throw new Error('连不上这台电脑。')
@@ -992,7 +1042,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
             password = ''
           }
           const wait: WaitRecord = { entry: active.entry, networkId: opened.networkId, genesis, rootKey: view.recovery_key, checkpoint: prepared.checkpoint }
-          store('recovery-wait', wait)
+          store('recovery-wait', { ...wait, entry: entryJson(wait.entry) })
           let auth: Record<string, unknown>
           try { auth = record(await request('recover', { genesis, checkpoints: prepared.checkpoints, events, ...(fresh ? { capability } : {}) })) }
           catch (cause) { throw new Error(`${messageOf(cause)} 再点一次“找回”会重试同一次找回，不会再下载文件。`) }
@@ -1028,7 +1078,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       } catch {}
     }
     if (session.current !== active) throw changed()
-    store('recovery-wait', { entry: active.entry, networkId: opened.networkId, genesis: opened.material.genesis, rootKey: opened.root.deviceId(), checkpoint } satisfies WaitRecord)
+    store('recovery-wait', { entry: entryJson(active.entry), networkId: opened.networkId, genesis: opened.material.genesis, rootKey: opened.root.deviceId(), checkpoint })
     resetConnection(); noteRecovery(auth)
     return true
   }
@@ -1093,6 +1143,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
   useEffect(() => page?.watchInvitation(invitation => { if (!spentLinks.current.has(invitation)) { setInitialInvitation(invitation); setError('') } }), [])
+  useEffect(() => platform.lan?.watch(seen => {
+    const key = ({ tag, addrs }: LanSighting) => `${tag} ${addrs.join(' ')}`
+    const before = new Set(lanSightings.current.map(key))
+    lanSightings.current = seen
+    const fresh = seen.filter(item => !before.has(key(item)))
+    if (fresh.length) void goDirect(fresh)
+  }), [])
   useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
   useEffect(() => {
     let mounted = true
@@ -1233,7 +1290,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
-    removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
+    removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
     linkTarget(link) {

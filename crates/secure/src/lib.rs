@@ -12,6 +12,7 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 pub mod join;
+pub mod lan;
 pub mod membership;
 
 mod recovery;
