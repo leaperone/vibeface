@@ -92,17 +92,17 @@ export default function ChatScreen() {
   // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
   const reach = live ? botReach(live.nodes) : 'ready'
   const canSetUp = device.ready?.principal.can_manage === true
-  // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s.
+  // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s, or every 2s while it starts.
   const latestLive = useRef(live)
   latestLive.current = live
-  const awaiting = live ? awaitsDevice(botReach(live.nodes)) : false
+  const awaiting = live ? awaitsDevice(reach) : false, starting = reach === 'starting'
   useFocusEffect(useCallback(() => {
     if (!awaiting) return
-    const read = () => void latestLive.current?.refresh().catch(() => {})
+    const read = () => { if (latestLive.current && !latestLive.current.refreshing) void latestLive.current.refresh().catch(() => {}) }
     read()
-    const timer = setInterval(read, 10000)
+    const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)
-  }, [awaiting]))
+  }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is
@@ -174,7 +174,7 @@ export default function ChatScreen() {
         </View>
         {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text className="text-muted-foreground">{example}</Text></Button>)}
-        </View> : <>
+        </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
           <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
           {reach === 'offline' ? null : canSetUp ? <Link href="/ai" asChild>
             <Button><Icon as={Bot} /><Text>设置运行 Bot 的设备</Text></Button>

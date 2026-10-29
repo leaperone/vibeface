@@ -8,8 +8,10 @@ export type NodeInfo = {
   local: boolean
   online: boolean
   revoked: boolean
-  capabilities?: { manager: string | null; manager_ready: boolean; relay: boolean; roots: string[]; codex_connected?: boolean }
+  capabilities?: { manager: string | null; manager_state: BotReadiness | null; relay: boolean; roots: string[]; codex_connected?: boolean }
 }
+/** `ready` only when the bot's switch is on and its provider works; `starting` while it comes up; anything else needs the user. */
+export type BotReadiness = "ready" | "starting" | "needs_setup"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
@@ -34,8 +36,8 @@ export type WorkRecord = {
   failure_reason: string | null
   /** Why it failed, as a kind; `failure_reason` keeps the original text. */
   failure?: FailureKind
-  /** `codex`: a Codex turn its device watches; `task`: a task run by its device's coordination Agent. */
-  kind?: "codex" | "task"
+  /** A provider: a turn on it that its device watches; `task`: a task run by its device's coordination Agent. */
+  kind?: ProviderId | "task"
   /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
   turn_id?: string
@@ -172,8 +174,8 @@ export type PendingBot = CreateBotRequest & {
 }
 
 export type Severity = "info" | "attention" | "urgent"
-/** The device, project and session a question is about. `agent` is "codex" or "claude". */
-export type QuestionSubject = { node: string; agent: string; session_id: string; cwd: string; summary: string; request_id?: string }
+/** The device, project and session a question is about. `agent` is null when the question is about the device's own settings. */
+export type QuestionSubject = { node: string; agent: ProviderId | null; session_id: string; cwd: string; summary: string; request_id?: string }
 type QuestionChoice = { label: string }
 type QuestionAnswer = { message_id: string; text: string; author: string; created_at_ms: number }
 /** Why the device that asked closed a question unanswered: the App Server request it held is gone. */
@@ -198,7 +200,7 @@ export type AnswerResult = { status: "answered" | "already_answered"; text: stri
 /** An answer this browser sent whose outcome it has not seen; trying again sends the same signed request. */
 export type PendingAnswer = { question_id: string; text: string }
 /** A session no bot started that this bot looks after; `muted`: the person stopped following it here. */
-export type SessionHandoff = { node: string; agent: string; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
+export type SessionHandoff = { node: string; agent: ProviderId; session_id: string; cwd: string; summary: string; muted: boolean; created_at_ms: number }
 /** Where questions go besides the web: "both" also sends them to Grok Bot. */
 export type Outlet = "record" | "both"
 export type TriageSettings = {

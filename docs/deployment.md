@@ -41,9 +41,11 @@ vibeface join '<加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFA
 
 ```json
 {
-	"codex_bin": "<Codex 程序的绝对路径>",
+	"bins": {
+		"codex": "<Codex 程序的绝对路径>"
+	},
 	"providers": {
-		"execution": true,
+		"execution": ["codex"],
 		"codex_app_server": {
 			"mode": "system",
 			"socket": "<App Server socket 的绝对路径>"
@@ -60,8 +62,7 @@ Node 只连接这个 socket，不搜索其他正在运行的会话，也不启�
 {
 	"codex": {
 		"CODEX_HOME": "<该 Codex 实例的数据目录绝对路径>"
-	},
-	"cursor": {}
+	}
 }
 ```
 
@@ -81,10 +82,10 @@ Provider 的其他认证环境通过设备设置或服务配置填写。不要�
 }
 ```
 
-安装 hooks 时也必须明确选择被修改的配置所在 home：
+安装 hooks 时也必须明确选择被修改的配置所在 home，写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
-vibeface hooks install --data-dir "$VIBEFACE_DATA_DIR" --home '<包含 .codex 和 .claude 的目录>'
+vibeface hooks install --data-dir "$VIBEFACE_DATA_DIR" --home '<包含各 Agent 配置的目录>'
 vibeface hooks status --data-dir "$VIBEFACE_DATA_DIR" --home '<同一个目录>'
 ```
 

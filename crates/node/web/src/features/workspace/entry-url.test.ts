@@ -5,13 +5,13 @@ import test from "node:test"
 import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
-import { parseEntry, parseInfo } from "@vibeface/client/lib/node.ts"
+import { parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
 import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
 import { folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
-import { agentName, foldAnswers, placeByTime, projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { agentName, foldAnswers, placeByTime, projectName, questionOpen, settledAnswer } from "@vibeface/client/workspace/questions.ts"
 import { awaitsDevice, botReach, canSend, composerHint, starters, threadReplies } from "@vibeface/client/chat/protocol.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 
@@ -169,7 +169,7 @@ test("workspace preserves bot and message requests while routing native decision
     const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
     const require = (specifier: string) => {
       if (specifier === "react") return react
-      if (specifier.endsWith("/lib/node.ts")) return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause) }
+      if (specifier.endsWith("/lib/node.ts")) return { messageOf: (cause: unknown) => cause instanceof Error ? cause.message : String(cause), providerIds, providerNames }
       if (specifier === "react/jsx-runtime") return { jsx: () => null }
       return load(resolve(dirname(filename), specifier))
     }
@@ -569,7 +569,7 @@ test("any entrance stops an unfinished task once, after a confirming second tap,
   const data = { local_node: 'worker', works: [] as unknown[], questions: [] }
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data, interruptWork: async (work: string) => { stopped.push(work) } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => true, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state }, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: () => ({ matches: true }) } })
   const stop = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'destructive')
   const ask = (elements: { props: Record<string, unknown> }[]) => elements.find(({ props }) => props.variant === 'outline' && [props.children].flat().some((child) => typeof child === 'string' && child.includes('停止')))
   try {
@@ -602,7 +602,7 @@ test("below lg the task panel is a modal dialog that makes the rest of the page 
   const workspace = { generation: 1, nodes: [], liveProgress: [], writable: true, data: { local_node: 'worker', questions: [], works: [{ work_id: 'work', target_node: 'worker', cwd: '/p', title: '整理日志', prompt: '', state: 'completed', summary: '', outcome: 'completed', result_text: '好了', failure_reason: null }] } }
   const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: () => Promise.resolve() }) }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   let wide = false
-  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => false, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
+  const app = componentHarness('./task-detail.tsx', { '@tanstack/react-router': { useNavigate: () => () => {}, Link: 'Link' }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@/components/app/kit': kit, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备', taskActive: () => false, taskLabel: () => '', progressLabel: () => '', shownState: (work: { state: string }) => work.state }, '@vibeface/client/workspace/questions.ts': { projectName, questionOpen } }, { window: { addEventListener() {}, removeEventListener() {}, matchMedia: (query: string) => ({ matches: query === '(min-width: 1024px)' && wide }) } })
   // A page shaped like the shell: the panel's layer beside the chat, a header above, a sidebar and the toast region outside.
   type Node = { name: string; attributes: Set<string>; parentElement: Node | null; children: Node[]; hasAttribute(name: string): boolean; setAttribute(name: string): void; removeAttribute(name: string): void }
   const node = (name: string, children: Node[] = [], attributes: string[] = []): Node => {
@@ -683,7 +683,7 @@ test("conversation keeps unknown and newly edited drafts across connection chang
   let generation = 1, work = pendingResult()
   const workspace = () => { const owner = generation; return {
     generation: owner, isCurrent: () => owner === generation, conversationId: 'chat', data: context, messagePending: null, messageBusy: false,
-    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
+    chatSlot: { conversationId: 'chat', missing: false }, nodes: [{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }], liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: () => work.promise, run: async (action: () => Promise<void>) => { try { await action() } catch {} },
   } }
   let currentWorkspace = workspace()
@@ -870,7 +870,7 @@ test("conversation blocks sending until an online node can run the manager Agent
     chatSlot: { conversationId: 'chat', missing: false }, nodes, liveProgress: [], interrupted: [], writable: true, selectedBot: { name: 'bot' }, connectionOnline: true,
     info: { device_id: 'gateway' }, sendMessage: async () => { sent++; return true }, run: async (action: () => Promise<void>) => { await action() },
   })
-  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
+  let currentWorkspace = workspace([{ device_id: 'gateway', online: false, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
   const app = componentHarness('../chat/conversation-screen.tsx', { '@/components/app/bot-face': { BotFace: 'BotFace', botMood: () => 'idle', useDark: () => false, botTint: () => ({}) }, '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/context.tsx': { useWorkspace: () => currentWorkspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/chat/protocol.ts': { awaitsDevice, botReach, canSend, composerHint, starters, threadReplies }, '@vibeface/client/workspace/bot-settings.ts': { placeChanges, scheduleName, scheduleTrigger }, '@vibeface/client/workspace/model.ts': { botReadiness, pendingChecks }, '@vibeface/client/workspace/questions.ts': { agentName, foldAnswers, placeByTime, projectName } }, { setInterval: () => 1, clearInterval() {} })
   const composer = () => app.render('ConversationScreen').find(({ type }) => type === 'PromptInput')?.props
   try {
@@ -879,11 +879,11 @@ test("conversation blocks sending until an online node can run the manager Agent
     assert.match(String(composer()?.reason), /运行 Bot/)
     assert.equal(sent, 0)
     assert.ok(refreshed > 0, "a bot no device can reply for reads readiness again")
-    currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex_sdk', manager_ready: false, roots: [] } }])
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'needs_setup', roots: [] } }])
     assert.equal(composer()?.disabled, true, "a bot switch without a working provider cannot send")
     assert.equal(composer()?.hint, '', "an empty chat offers setup in its middle, not again under the box")
     assert.equal(composer()?.reason, '运行 Bot 的设备需设置', "the greyed box still says why")
-    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex_sdk', manager_ready: true, roots: [] } }])
+    currentWorkspace = workspace([{ device_id: 'gateway', online: true, capabilities: { manager: 'codex', manager_state: 'ready', roots: [] } }])
     assert.equal(composer()?.disabled, false)
     composer()?.onSubmit?.()
     assert.equal(sent, 1)

@@ -636,7 +636,7 @@ mod tests {
                 target: "t".into(),
                 dispatcher: "t".into(),
                 call_ref: "r".into(),
-                kind: WorkKind::Codex,
+                kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "do".into(),
                 prompt: "do".into(),

@@ -4,6 +4,7 @@ use crate::{
     model::{
         MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS, SCHEDULE_MINUTES,
     },
+    providers::{Provider, Role},
     scheduling::TriggerKind,
 };
 use serde_json::{Value, json};
@@ -54,7 +55,7 @@ pub enum Tool {
     ApplyProviderConfig,
     TrackWork,
     BindWork,
-    WaitCodex,
+    WaitWork,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +111,7 @@ impl Tool {
         Tool::ApplyProviderConfig,
         Tool::TrackWork,
         Tool::BindWork,
-        Tool::WaitCodex,
+        Tool::WaitWork,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -147,7 +148,7 @@ impl Tool {
             Tool::ApplyProviderConfig => "apply_provider_config",
             Tool::TrackWork => "track_work",
             Tool::BindWork => "bind_work",
-            Tool::WaitCodex => "wait_codex",
+            Tool::WaitWork => "wait_work",
         }
     }
 
@@ -162,7 +163,7 @@ impl Tool {
             | Tool::FetchUrl
             | Tool::ListBots
             | Tool::ReadBot
-            | Tool::WaitCodex => Effect::Read,
+            | Tool::WaitWork => Effect::Read,
             Tool::DispatchWork
             | Tool::InterruptWork
             | Tool::HandOverSession
@@ -185,12 +186,21 @@ impl Tool {
     }
 
     /// Description, properties and required fields the agent sees. `track_work`, `bind_work` and
-    /// `wait_codex` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
+    /// `wait_work` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
         let string = || json!({"type":"string","minLength":1});
         let position = || {
             json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1}},
             "required":["author","seq"],"additionalProperties":false})
+        };
+        let executors = || {
+            json!(
+                Provider::ALL
+                    .into_iter()
+                    .filter(|provider| provider.supports().contains(&Role::Execution))
+                    .map(Provider::name)
+                    .collect::<Vec<_>>()
+            )
         };
         Some(match self {
             Tool::Nodes => (
@@ -207,12 +217,13 @@ impl Tool {
                 &[],
             ),
             Tool::DispatchWork => (
-                "Start work in cwd on target_node (default: this device). On this device the CLI registers the work with the Node, then starts one Codex turn with full access through the App Server; on another device that device's bot gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up. thread sends the prompt into an existing Codex thread on this device instead, steering its running turn or starting one. model, effort and images (local image paths) pass to the turn.",
+                "Start work in cwd on target_node (default: this device). On this device the Node registers the work, then agent runs it as one turn with full access; agent is a provider this device executes work on, by default the only one. On another device that device's bot gets the task. Reuse call_ref to retry the same dispatch; it never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up, going on from its session. thread sends the prompt into an existing session on this device instead. model, effort and images (local image paths) pass to the turn.",
                 json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
-                "prompt":{"type":"string","minLength":1,"description":"The task as Codex should read it: goal, where, limits, what done means; a required result format with a short example. Not a relay of the chat"},
+                "prompt":{"type":"string","minLength":1,"description":"The task as the coding agent should read it: goal, where, limits, what done means; a required result format with a short example. Not a relay of the chat"},
+                "agent":{"type":"string","enum":executors()},
                 "cwd":string(),"call_ref":string(),"target_node":string(),
                 "parent":string(),"continues":string(),
-                "thread":{"type":"string","minLength":1,"description":"An existing Codex thread on this device: prompt goes into it, steering its running turn or starting one; cwd is taken from the thread"},
+                "thread":{"type":"string","minLength":1,"description":"An existing session on this device for prompt; cwd is taken from it. Any Codex thread, steering its running turn or starting one; for another agent only a session one of this device's works ran in"},
                 "model":string(),
                 "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]},
                 "images":{"type":"array","items":string(),"maxItems":8}}),
@@ -224,7 +235,7 @@ impl Tool {
                 &[],
             ),
             Tool::InterruptWork => (
-                "Ask the App Server to stop a work and the works it started. It counts as stopped only when the App Server confirms.",
+                "Ask a work's provider to stop it and the works it started. It counts as stopped only when the provider confirms.",
                 json!({"work_id":string()}),
                 &["work_id"],
             ),
@@ -331,9 +342,11 @@ impl Tool {
                 &["node", "session_id", "version"],
             ),
             Tool::ProposeProviderConfig => (
-                "Ask the user in this chat to allow paths this device's providers use. Give the paths you found with your Shell, or none to have the Node look on this device: CODEX_HOME of the Node's environment, else ~/.codex, its app-server-control/app-server-control.sock and sessions folder, and the Cursor SDK Bridge program while Cursor runs the bot. execution=true also turns on Codex executing work here; roots adds folders work may run in, such as the user's projects folder you found. Only absolute paths that exist; never keys, tokens or other variables. Nothing changes now: the chat shows an allow/deny card and the user's answer comes back to you as a new turn. Calling again in the same turn with the same values returns the same card. If nothing differs from the current settings, status is unchanged.",
-                json!({"execution":{"type":"boolean","const":true},"codex_home":string(),"app_server_socket":string(),
-                "codex_sessions":string(),"cursor_sdk_bin":string(),
+                "Ask the user in this chat to allow paths this device's providers use. Give the paths you found with your Shell, or none to have the Node look on this device: CODEX_HOME of the Node's environment, else ~/.codex, its app-server-control/app-server-control.sock and sessions folder, and the program of each provider in use. bins sets a provider's program, by provider. execution also turns on executing work here for the providers it lists; roots adds folders work may run in, such as the user's projects folder you found. Only absolute paths that exist; never keys, tokens or other variables. Nothing changes now: the chat shows an allow/deny card and the user's answer comes back to you as a new turn. Calling again in the same turn with the same values returns the same card. If nothing differs from the current settings, status is unchanged.",
+                json!({"execution":{"type":"array","items":{"type":"string","enum":executors()},"minItems":1,"uniqueItems":true},
+                "codex_home":string(),"app_server_socket":string(),
+                "codex_sessions":string(),"bins":{"type":"object","additionalProperties":false,
+                "properties":Provider::ALL.map(|provider| (provider.name().to_owned(), string())).into_iter().collect::<serde_json::Map<_, _>>()},
                 "roots":{"type":"array","items":string(),"maxItems":16,"uniqueItems":true}}),
                 &[],
             ),
@@ -347,7 +360,7 @@ impl Tool {
                 json!({"url":string()}),
                 &["url"],
             ),
-            Tool::TrackWork | Tool::BindWork | Tool::WaitCodex => return None,
+            Tool::TrackWork | Tool::BindWork | Tool::WaitWork => return None,
         })
     }
 

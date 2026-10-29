@@ -2,6 +2,7 @@
 //! A job is keyed by `(conversation, message_id | work_id)`, so retries and sync never add a second one.
 use crate::{
     model::{Schedule, VersionVector, WorkOutcome},
+    providers::Provider,
     work::Signal,
 };
 use serde::{Deserialize, Serialize};
@@ -151,9 +152,10 @@ pub struct ManagerAttempt {
     pub permission_version: u64,
 }
 
-/// The running Codex turn a user message was steered into.
+/// The running turn a user message was steered into, and the provider running it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SteerTarget {
+    pub provider: Provider,
     /// The attempt of the reply the message joined.
     pub attempt_id: String,
     pub thread_id: String,

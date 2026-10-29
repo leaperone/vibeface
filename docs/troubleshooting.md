@@ -125,7 +125,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 
 **任务停在“待核对”。** Node 无法确认一项工作是否执行过时不会自己重做，见 [待核对](node.md#待核对)。
 
-**设置页提示 Codex 后台服务没启动。** Node 托管的 `codex app-server` 退出后会按 1 到 30 秒退避重启。持续失败时检查 `codex_bin` 是否可执行、Codex 是否已登录，然后重启 Node。它的 socket 在私有的 `/tmp/vibeface-<编号>/` 目录，进程组号在数据目录的 `codex-app-server.pid`。
+**设置页提示 Codex 后台服务没启动。** Node 托管的 `codex app-server` 退出后会按 1 到 30 秒退避重启。持续失败时检查 `bins.codex` 是否可执行、Codex 是否已登录，然后重启 Node。它的 socket 在私有的 `/tmp/vibeface-<编号>/` 目录，进程组号在数据目录的 `codex-app-server.pid`。
 
 **连接页提示网关忙或加入的设备太多。** 一台 Gateway 同时最多转发 256 个会话，超出时回 `gateway_busy`；一台 Node 同时最多接待 32 个还没加入的设备，每个最多 15 分钟。正常使用碰不到这两个上限，碰到时多半有大量陌生连接，查看 `node.log` 和反向代理的访问日志，稍后再试。
 

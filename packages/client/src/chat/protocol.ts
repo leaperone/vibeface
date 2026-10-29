@@ -19,19 +19,21 @@ export function roleLabel(role: string): string {
 export function canSend(input: SendGate): boolean {
   return Boolean(input.hasConversation && input.loaded && !input.busy)
 }
-/** Whether any device can run the bot now: `offline` when the only ones that could are away, `none` when none is set up to. */
-export type BotReach = 'ready' | 'needs_setup' | 'offline' | 'none'
+/** Whether any device can run the bot now: `starting` while one comes up, `offline` when the only ones that could are away, `none` when none is set up to. */
+export type BotReach = 'ready' | 'starting' | 'needs_setup' | 'offline' | 'none'
 /** A device that only needs setup is fixable now, so it comes before one that is offline. */
 export function botReach(nodes: NodeInfo[]): BotReach {
   if (nodes.some((node) => botReadiness(node) === 'ready')) return 'ready'
+  if (nodes.some((node) => botReadiness(node) === 'starting')) return 'starting'
   if (nodes.some((node) => botReadiness(node) === 'needs_setup')) return 'needs_setup'
   return nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
 }
 /** A device that exists but is not ready yet may become ready on its own; with none, setting one up rereads it. */
-export const awaitsDevice = (reach: BotReach) => reach === 'offline' || reach === 'needs_setup'
+export const awaitsDevice = (reach: BotReach) => reach === 'starting' || reach === 'offline' || reach === 'needs_setup'
 /** Why the box cannot send yet, short enough to stand in for its placeholder. */
 export function composerHint(input: Omit<SendGate, 'busy'> & { bot: BotReach }): string {
   if (!input.hasConversation) return ''
+  if (input.bot === 'starting') return 'Bot 正在启动'
   if (input.bot === 'offline') return '能运行 Bot 的设备离线了'
   if (input.bot === 'needs_setup') return '运行 Bot 的设备需设置'
   if (input.bot === 'none') return '还没设置运行 Bot 的设备'

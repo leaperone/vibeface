@@ -4,7 +4,7 @@
 
 # Vibeface
 
-**把自己的每台 Mac 和 Linux 设备连成一张私有网络，在聊天里指挥本机的 Codex 与 Cursor Agent 干活。**
+**把自己的每台 Mac 和 Linux 设备连成一张私有网络，在聊天里指挥本机的 Codex、Claude Code、pi、opencode 与 Cursor Agent 干活。**
 
 [![CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml/badge.svg)](https://github.com/leaperone/vibeface/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leaperone/vibeface?include_prereleases&label=release)](https://github.com/leaperone/vibeface/releases)
@@ -18,7 +18,7 @@
 
 ## ✨ 核心特性
 
-- 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用宿主 SDK 的 Shell 和文件工具读写本机，用 Codex App Server 改代码。
+- 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用自己的 Shell 和文件工具读写本机，把改代码的任务派给本机或其他设备的 Agent。
 - 🌐 **个人设备网络**。所有设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
 - 🔁 **换设备接着干**。任务、进度、审批和结果写进签名事件日志并同步到每台 Node。A 离线时，在 C 打开同一会话就能接手，已执行的副作用不会重放。
 - 🔐 **端到端加密入口**。浏览器用不可导出的设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入网络、不存数据。
@@ -44,8 +44,8 @@ flowchart LR
 | 层 | 职责 |
 |---|---|
 | **Node**（Rust） | 认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。 |
-| **协调 Agent** | Cursor SDK 或 Codex SDK 驱动。通过原生自定义工具回调 Node，不需要 MCP。 |
-| **执行** | 宿主命令和文件操作直接用 SDK 工具。Codex 经薄原生客户端连接本机 App Server。 |
+| **协调 Agent** | Codex、Claude Code、pi、opencode 或 Cursor SDK 驱动。Cursor 用 SDK 原生自定义工具，其余经本机 `vibeface tool` 命令回调 Node，不需要 MCP。 |
+| **执行** | 宿主命令和文件操作直接用 Agent 自己的工具。任务在本机 Codex App Server、Claude Code、pi 或 opencode 的会话里运行。 |
 | **网页** | 内嵌静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
 
 几条设计约束值得先知道：
@@ -63,7 +63,10 @@ flowchart LR
 |---|---|---|
 | macOS Apple Silicon、Linux x64 或 Linux ARM64（glibc） | | 运行平台 |
 | Node.js | 22+ | 仅 npm 安装入口需要 |
-| Codex CLI | 已安装并登录 | Codex bot 与执行任务 |
+| Codex CLI | 已安装并登录 | 可选，Codex bot 与执行任务 |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装并登录 | 可选，Claude Code bot 与执行任务 |
+| [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 已安装并登录 | 可选，pi bot 与执行任务 |
+| [opencode](https://opencode.ai) | 已安装并登录 | 可选，opencode bot 与执行任务 |
 | [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.0.37) | v1.0.37 | 可选，用 Cursor 作为协调 Agent 时需要 |
 
 ### 安装
@@ -90,7 +93,7 @@ vibeface --data-dir "$VIBEFACE_DATA_DIR"
 
 1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
 2. 填写浏览器名称和恢复包口令，下载并保存加密恢复包，创建个人网络。
-3. 在设备页的 **AI** 中打开 Codex 或 Cursor 的 Bot 开关，在 **可用文件夹** 里添加项目目录。
+3. 在设备页的 **AI** 中打开某个服务的 Bot 开关，在 **可用文件夹** 里添加项目目录。
 4. 创建 bot，进入它的聊天开始提要求。
 
 ### 配置
@@ -101,7 +104,7 @@ vibeface --data-dir "$VIBEFACE_DATA_DIR"
 vibeface init \
 	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
-	--manager codex_sdk \
+	--manager codex \
 	--codex-socket '<App Server socket 的绝对路径>' \
 	--workspace /absolute/path/to/manager-workspace
 ```
@@ -109,9 +112,9 @@ vibeface init \
 | 参数 | 说明 |
 |---|---|
 | `--root` | 允许 Agent 访问的项目目录，可重复。 |
-| `--manager` | 协调 Agent 的 SDK，取值 `codex_sdk` 或 `cursor_sdk`。 |
+| `--manager` | 运行协调 Agent 的产品，取值 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。 |
 | `--workspace` | 协调 Agent 的工作目录，须与项目目录分开。 |
-| `--model` | 模型名。省略时 Codex 用自身默认配置，Cursor 默认 `auto`。 |
+| `--model` | 模型名。省略时用该产品的默认模型，Cursor 默认 `auto`。 |
 | `--listen` | 监听地址，默认 `127.0.0.1:4790`。 |
 | `--no-web` | 启动时关闭网页和浏览器访问，保留节点传输及本地工具。 |
 | `--relay` / `--relay-listen` | 连接其他 Node 的 relay，或在本机运行 relay。 |
@@ -119,7 +122,7 @@ vibeface init \
 | `--discovery` | 配置钉住身份的公共发现服务，Node 自动选择连接路径。 |
 | `--public-entry` | 不加入个人网络的公共入口或发现服务。 |
 
-使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。全部字段见 [本机配置](docs/node-protocol.md#本机配置)。
+使用 Cursor SDK 时，在运行 Node 的环境中设置 `CURSOR_API_KEY`。不要把密钥写进命令行、URL、Git 或聊天记录。Claude Code、pi 和 opencode 见 [使用 Claude Code、pi 或 opencode](docs/node.md#使用-claude-codepi-或-opencode)。全部字段见 [本机配置](docs/node-protocol.md#本机配置)。
 
 ## 📖 使用指南
 
@@ -139,7 +142,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 - 在 A 的 bot 聊天里让它把任务交给 B。进度和结果会回到原聊天，协调 Agent 汇报后可继续派发。
 - A 离线时，在已同步的 C 打开同一会话，点 **交给这台设备处理**，由 C 的协调 Agent 接着回复。
 - 普通进度和通知不调用模型。客户端离线时保留未读通知，重连后补发。
-- Codex 默认 bypass。它发起的请求由协调 Agent 处理，需要本人拍板时才在 bot 聊天里提问，也可经 webhook 转发给 Grok Bot。
+- 执行任务的 Agent 默认 bypass。会话发起的请求由协调 Agent 处理，需要本人拍板时才在 bot 聊天里提问，也可经 webhook 转发给 Grok Bot。
 
 ### 常用命令
 
@@ -151,7 +154,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 | `vibeface access` | 显示本机浏览器入口。 |
 | `vibeface service` | 管理后台服务与更新定时器。 |
 | `vibeface update` | 选择更新渠道、检查或应用受管更新。 |
-| `vibeface hooks` | 安装、移除或测试 Codex 与 Claude Code hooks。 |
+| `vibeface hooks` | 安装、移除或测试 Codex、Claude Code hooks 与 pi、opencode 扩展。 |
 | `vibeface logs` | 读取本机 Node 日志。 |
 
 完整说明运行 `vibeface --help`，或见 [安装与 CLI 管理](docs/install.md)。

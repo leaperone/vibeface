@@ -207,17 +207,18 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     })
   }, [conversationId, data, messagePending])
   useEffect(() => { setSendError(null) }, [conversationId])
-  // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s.
+  // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
-  const awaiting = Boolean(bot) && awaitsDevice(reach)
+  const awaiting = Boolean(bot) && awaitsDevice(reach), starting = reach === 'starting'
   useEffect(() => {
     if (!awaiting) return
-    const read = () => { if (latest.current.isCurrent()) void latest.current.refresh().catch(() => {}) }
+    // A read still running is left to finish, so a slow one never queues a follow-up that reports its failure.
+    const read = () => { if (latest.current.isCurrent() && !latest.current.refreshing) void latest.current.refresh().catch(() => {}) }
     read()
-    const timer = setInterval(read, 10000)
+    const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)
-  }, [awaiting])
+  }, [awaiting, starting])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {
@@ -243,7 +244,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {needsSetup ? <>
+          {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
+            : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
             {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
@@ -275,7 +277,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )
