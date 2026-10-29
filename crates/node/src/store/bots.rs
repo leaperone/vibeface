@@ -156,6 +156,10 @@ fn select_bots(
          LEFT JOIN bot_profiles a ON a.network_id=b.network_id AND a.conversation_id=b.conversation_id AND a.field='avatar'
          WHERE b.network_id=?1 {filter} ORDER BY b.bot_id"
     ))?;
+    let library = connection
+        .prepare("SELECT skill_id FROM skills WHERE network_id=? AND skill IS NOT NULL")?
+        .query_map([network], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     let rows = statement.query_map(params![network, value], bot_row)?;
     rows.map(|row| {
         let (mut bot, project, models, skills, avatar) = row?;
@@ -164,10 +168,12 @@ fn select_bots(
             .transpose()?
             .flatten();
         bot.models = serde_json::from_str(&models)?;
+        // A removed skill leaves every bot that listed it.
         bot.skills = skills
-            .map(|s| serde_json::from_str(&s))
+            .map(|s| serde_json::from_str::<SkillSet>(&s))
             .transpose()?
-            .flatten();
+            .flatten()
+            .map(|set| set.intersection(&library).cloned().collect());
         bot.avatar = super::optional_json::<Option<Avatar>>(avatar)?.flatten();
         Ok(bot)
     })

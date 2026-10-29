@@ -143,7 +143,9 @@ impl Runtime {
 
     /// Stops what a deleted bot was doing here, apart from the caller, which may be another
     /// bot's tool call: its running turn ends as a stopped reply (an unknown outcome goes to
-    /// the pending check) and its queued turns are cancelled when claimed.
+    /// the pending check), its queued turns are cancelled when claimed, and the works it
+    /// dispatched to this device are interrupted. Every device stops its own works when the
+    /// deletion reaches it.
     pub(crate) fn bot_deleted(self: &Arc<Self>, network: &str, scope: &str, hash: &str) {
         tracing::info!(
             event = "bot.deleted",
@@ -160,7 +162,7 @@ impl Runtime {
         });
     }
 
-    async fn stop_bot_turns(&self, network: &str, scope: &str) -> Result<()> {
+    async fn stop_bot_turns(self: &Arc<Self>, network: &str, scope: &str) -> Result<()> {
         let running: Vec<String> = self
             .store
             .lock()
@@ -189,6 +191,24 @@ impl Runtime {
                 self.fence_manager_attempt(&attempt.id).await?;
             }
             self.publish_changed(network, scope, Changed::Job(&trigger));
+        }
+        let works: Vec<String> = {
+            let store = self.store.lock().await;
+            let mut works = Vec::new();
+            for work in store.works(network, scope)? {
+                if store
+                    .work_record(&work.work_id)?
+                    .is_some_and(|record| super::work::live(&record))
+                {
+                    works.push(work.work_id);
+                }
+            }
+            works
+        };
+        for work_id in works {
+            if let Err(error) = self.interrupt_work(network, &work_id).await {
+                tracing::warn!(event = "bot.work_stop_failed", conversation_id = scope, work_id, error = %format!("{error:#}"), "a deleted bot's work could not be stopped");
+            }
         }
         Ok(())
     }
