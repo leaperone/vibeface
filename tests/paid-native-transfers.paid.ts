@@ -43,7 +43,10 @@ test('accepts a paid file in the release Android app, disconnects, resumes and s
       await request('/approve', { role: 'android', peer: joined.peer, code: joined.code });
       await expect(screen.getByRole('link', '设置', { exact: true })).toBeVisible({ timeout: 30000 });
       await screen.getByRole('link', '设置', { exact: true }).click();
-      await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'down' });
+      await screen.scrollUntilVisible(screen.getByRole('switch', '实验功能', { exact: true }), { direction: 'down' });
+      await screen.getByRole('switch', '实验功能', { exact: true }).click();
+      await expect(screen.getByRole('switch', '实验功能', { exact: true })).toBeChecked();
+      await screen.scrollUntilVisible(screen.getByRole('link', '发送和接收文件', { exact: true }), { direction: 'up' });
       await screen.getByRole('link', '发送和接收文件', { exact: true }).click();
       await expect(screen.getByText('传输设置', { exact: true }).first()).toBeVisible();
       await event('observer-ready', { role: 'android' });

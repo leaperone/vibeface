@@ -1,11 +1,13 @@
-import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Crown, File, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react-native'
+import * as Clipboard from 'expo-clipboard'
+import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, Check, CircleCheck, Copy, Crown, File, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { acceptanceOptions, canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
+import { useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -27,6 +29,8 @@ export default function TransfersScreen() {
 
 function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
   const delivery = useDelivery(connection, mobilePlatform)
+  // Paid delivery, its test chain and the raw connection ID stay out of sight unless 实验功能 is on in settings.
+  const [experiments] = useExperiments(mobilePlatform.storage)
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
   const [file, setFile] = useState<TransferFile | null>(null)
   // Feedback shows next to the control that caused it, not at the top of a long page.
@@ -39,8 +43,9 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
     if (status) void delivery.configure({ enabled: status.enabled, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled, ...patch })
   }
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
-  const unusable = working || !file || status?.max_file_bytes === 0 || draft.mode === 'charity' && !status?.charity_enabled || draft.mode === 'paid' && !status?.paid_enabled
-  const prepare = (restart?: string) => { if (file) { setOrigin('form'); void delivery.prepare(draft, file, restart) } }
+  const sending = draftFor(draft, experiments)
+  const unusable = working || !file || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
+  const prepare = (restart?: string) => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, restart) } }
   return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {feedback('page')}
     {!status ? <Text role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</Text> : <>
@@ -49,24 +54,26 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
         {status.enabled ? <>
           <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-          <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} />
-          <View className="gap-1"><Text className="text-meta text-muted-foreground">{transferCopy.connectionId}</Text><CopyableId value={status.node_peer} label="连接 ID" /></View>
+          {experiments ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
+          <View className="gap-1"><Text className="text-meta text-muted-foreground">{transferCopy.connectionId}</Text>{experiments ? <CopyableId value={status.node_peer} label="连接 ID" /> : <CopyConnectionId value={status.node_peer} />}</View>
         </> : <Text className="text-meta text-muted-foreground">{transferCopy.off}</Text>}
         {!delivery.canManage ? <IconLine icon={Crown} text={transferCopy.adminOnly} /> : null}
-        {status.paid_enabled || status.wallet.state !== 'absent' ? <Text className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</Text> : null}
-        {status.wallet.state === 'unavailable' ? <Text role="alert" className="text-meta text-warning">{status.wallet.reason}</Text> : null}
-        <Details>
-          {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
-          {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
-          <Text className="text-meta text-muted-foreground">{transferCopy.walletDetails}</Text>
-        </Details>
+        {experiments ? <>
+          {status.paid_enabled || status.wallet.state !== 'absent' ? <Text className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</Text> : null}
+          {status.wallet.state === 'unavailable' ? <Text role="alert" className="text-meta text-warning">{status.wallet.reason}</Text> : null}
+          <Details>
+            {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
+            {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
+            <Text className="text-meta text-muted-foreground">{transferCopy.walletDetails}</Text>
+          </Details>
+        </> : null}
       </View>
       {status.enabled && delivery.canManage ? <View className="gap-4 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
         <Text role="heading" className="text-heading font-semibold">发送文件</Text>
         <InputField label={transferCopy.receiver} value={draft.receiver_peer} disabled={working} onChange={receiver_peer => setDraft({ ...draft, receiver_peer })} peer />
         <InputField label={transferCopy.provider} hint={transferCopy.providerHint} value={draft.provider_peer} disabled={working} onChange={provider_peer => setDraft({ ...draft, provider_peer })} peer />
-        <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
-        {draft.mode === 'paid' ? <>
+        {experiments ? <Segmented options={modeOptions} value={draft.mode} disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
+        {sending.mode === 'paid' ? <>
           <Text className="text-meta text-muted-foreground">什么时候付款</Text>
           <Segmented options={acceptanceOptions} value={draft.acceptance} disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
           <InputField label="服务费上限（测试代币最小单位）" value={draft.max_service_amount} disabled={working} onChange={max_service_amount => setDraft({ ...draft, max_service_amount })} numeric />
@@ -80,7 +87,7 @@ function Transfers({ connection }: { connection: NonNullable<ReturnType<typeof u
         {file && file.size > status.max_file_bytes ? <ErrorText error={transferCopy.tooLarge(status.max_file_bytes)} /> : null}
         {feedback('form')}
         <View className="flex-row flex-wrap gap-2">
-          <Button disabled={unusable} onPress={() => prepare()}>{delivery.busy === 'prepare' ? <Icon as={LoaderCircle} /> : null}<Text>{transferCopy.prepare(draft.mode)}</Text></Button>
+          <Button disabled={unusable} onPress={() => prepare()}>{delivery.busy === 'prepare' ? <Icon as={LoaderCircle} /> : null}<Text>{transferCopy.prepare(sending.mode)}</Text></Button>
           {selected && canRestart(selected) ? <Button variant="outline" disabled={unusable} onPress={() => prepare(selected.intent_id)}><Text>作为新订单再次发送</Text></Button> : null}
         </View>
         <Details><Text className="text-meta text-muted-foreground">{transferCopy.prepareDetails}</Text></Details>
@@ -166,4 +173,12 @@ function InputField({ label, hint, value, disabled, onChange, peer, numeric }: {
     <Input accessibilityLabel={label} value={value} editable={!disabled} onChangeText={onChange} autoCapitalize="none" autoCorrect={false} maxLength={peer ? 64 : 78} keyboardType={numeric ? 'number-pad' : 'default'} className="font-mono" />
     {hint ? <Text className="text-meta text-muted-foreground">{hint}</Text> : null}
   </View>
+}
+
+/** Without 实验功能 the 64-character ID stays unseen; this copies it to send to whoever sends a file. */
+function CopyConnectionId({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false)
+  return <Button variant="outline" className="self-start" onPress={() => { void Clipboard.setStringAsync(value).then(() => setCopied(true), () => {}) }}>
+    <Icon as={copied ? Check : Copy} className={copied ? 'text-success' : undefined} /><Text>{copied ? '已复制' : '复制连接 ID'}</Text>
+  </Button>
 }

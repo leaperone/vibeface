@@ -7,6 +7,7 @@ import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, Membe
 import { shouldAutoConnect } from './connection-lane.ts'
 import { onlyManagerText } from './copy.ts'
 import { linkTarget } from './switch-network.ts'
+import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
 import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
@@ -58,7 +59,7 @@ type DeviceContextValue = {
   entry: ConnectionEntry | null; info: EntryInfo | null; directory: MembershipView | null
   /** When the Node first saw the current recovery key, if it knows. */
   recoverySince: number | null
-  /** A recovery waiting to replace this directory, unless this manager said it was them. */
+  /** A recovery waiting to replace this directory, unless this manager said it was them since the app or page opened. */
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
@@ -1283,10 +1284,9 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, Math.max(due + 1000, 5000))
     return () => clearTimeout(timer)
   }, [joins, nodeClockOffset])
-  const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
   function setRotateHint(network: string, recoveryKey: string | null) { try { store(`rotate-hint.${network}`, recoveryKey) } catch {} setDismissals(count => count + 1) }
   const rotateHint = !!ready?.principal.can_manage && !!directory && load(`rotate-hint.${ready.principal.network_id}`) === directory.recovery_key
-  const pendingRecovery = ready?.principal.can_manage && directory?.pending && directory.pending.checkpoint !== recoveryOk ? directory.pending : null
+  const pendingRecovery = ready?.principal.can_manage && directory?.pending && !recoveryHidden(ready.principal.network_id, directory.pending.checkpoint) ? directory.pending : null
   const value: DeviceContextValue = {
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
@@ -1304,7 +1304,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     cancelSensitive,
     pendingRecovery, vetoRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
-    dismissPendingRecovery() { if (!ready || !pendingRecovery) return; try { store(`recovery-ok.${ready.principal.network_id}`, pendingRecovery.checkpoint) } catch {} setDismissals(count => count + 1) },
+    dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,
     forgetUnsavedRecovery() { setKept(null) },
     finishRecovered() { try { store('recovered', null) } catch {} setRecovered(false) },

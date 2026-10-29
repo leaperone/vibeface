@@ -19,6 +19,8 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     assert(joined);
     await expect(screen.getByLabel(`安全码 ${joined.code.split('').join(' ')}`, { exact: true })).toBeVisible();
     await request('/approve', { role: 'web', peer: joined.peer, code: joined.code });
+    await browser.goto(`${environment.nodes.web.url}/settings`);
+    await screen.getByRole('switch', '实验功能', { exact: true }).check({ timeout: 30000 });
     await browser.goto(`${environment.nodes.web.url}/transfers`);
     await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
     await expect(screen.getByRole('switch', '付费交付（本地测试）')).toBeChecked();

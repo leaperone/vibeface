@@ -1,21 +1,25 @@
+import * as Clipboard from 'expo-clipboard'
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
-import { useState } from 'react'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, ClipboardPaste, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, Laptop, LifeBuoy, QrCode, ShieldAlert, ShieldX, X, type LucideIcon } from 'lucide-react-native'
+import { useEffect, useState } from 'react'
 import { Alert, Pressable, View } from 'react-native'
 import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
-import { messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
+import { entryAddress, messageOf, type ConnectionEntry } from '@vibeface/client/lib/node.ts'
+import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
 import { passphrase, recoveryFileStem, type RecoveryFile } from '@vibeface/client/lib/secure.ts'
 import { ErrorText } from '@/components/action'
-import { ActionCard, Details, Panel } from '@/components/kit'
+import { ActionCard, Panel } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
+import { Textarea } from '@/components/ui/textarea'
 import { deviceIcon } from '@/features/devices/device-icon'
+import { Scanner } from '@/features/devices/scanner'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
 
@@ -37,38 +41,68 @@ function FilePick({ picked, onPick, disabled }: { picked: PickedFile | null; onP
 const passwordProps = { secureTextEntry: true, autoCapitalize: 'none', autoCorrect: false } as const
 const hint = (icon: LucideIcon, text: string, tone = 'text-muted-foreground') => <View className="flex-row items-center gap-2"><Icon as={icon} className={`size-4 ${tone}`} /><Text className={`min-w-0 flex-1 text-meta ${tone}`}>{text}</Text></View>
 
-/** Find devices again with the recovery file: open it, connect to one of the devices, then pick what was lost. */
-export function RecoveryRestore() {
+/** Find devices again with the recovery file: the computer to go through from its QR code or link, then the file and its password. */
+export function RecoveryRestore({ link }: { link?: string | null }) {
   const device = useDevice()
-  // The form takes a web address; a LAN entry has none to fill in.
-  const target = [device.entry, ...device.entries].flatMap(item => item && item.kind !== 'lan' ? [item] : [])[0] ?? null
+  const known = [device.entry, ...device.entries].flatMap(item => item && item.kind !== 'lan' ? [item] : [])[0] ?? null
   const { busy, error, run } = useRun()
+  const [target, setTarget] = useState<ConnectionEntry | null>(() => (link && recoveryTarget(link)) || known)
+  // Every recovery link the camera opens again fills in its computer.
+  useEffect(() => { const found = link ? recoveryTarget(link) : null; if (found) setTarget(found) }, [link])
   const [picked, setPicked] = useState<PickedFile | null>(null)
   const [password, setPassword] = useState('')
   const [name, setName] = useState(defaultName)
-  const [address, setAddress] = useState(target?.address ?? '')
-  const [deviceId, setDeviceId] = useState(target?.device_id ?? '')
   const submit = () => void run('restore', async () => {
-    if (!picked) throw new Error('请选择恢复文件。')
+    if (!picked || !target) throw new Error('请选择恢复文件。')
     const typed = password
     // A failed try keeps the chosen file and name; only the typed password leaves the screen.
     setPassword('')
-    await device.beginRecovery({ file: picked.file, password: typed, name: name.trim(), entry: parseEntry({ address: address.trim(), device_id: deviceId.trim() }) })
+    await device.beginRecovery({ file: picked.file, password: typed, name: name.trim(), entry: target })
   })
   const locked = busy !== null || Boolean(device.review)
+  if (!target) return <PickTarget onPicked={setTarget} />
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{recoveryCopy.scope}</Text>
+    <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+      <Icon as={Laptop} className="size-4 text-muted-foreground" />
+      <View className="min-w-0 flex-1 py-1.5">
+        <Text className="text-meta text-muted-foreground">{recoveryCopy.target}</Text>
+        <Text numberOfLines={1} ellipsizeMode="middle">{entryAddress(target)}</Text>
+      </View>
+      <Button variant="ghost" size="icon" accessibilityLabel="换一台电脑" disabled={locked} onPress={() => setTarget(null)}><Icon as={X} /></Button>
+    </View>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />
     <Input accessibilityLabel={`${self}叫什么？`} placeholder={`${self}叫什么？`} value={name} onChangeText={setName} maxLength={128} editable={!locked} />
-    <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual} open={!target}>
-      <Input accessibilityLabel="访问地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} value={address} onChangeText={setAddress} editable={!locked} />
-      <Input accessibilityLabel="设备编号" placeholder="设备编号" className="font-mono" autoCapitalize="none" autoCorrect={false} value={deviceId} onChangeText={setDeviceId} editable={!locked} />
-    </Details>
     <ErrorText error={error} />
-    <Button disabled={locked || !picked || !password || !name.trim() || !address.trim() || !deviceId.trim()} onPress={submit}>
+    <Button disabled={locked || !picked || !password || !name.trim()} onPress={submit}>
       <Text>{busy ? '打开中' : '下一步'}</Text>
     </Button>
+  </View>
+}
+
+/** Which computer to recover through: scanned from the QR code its web page shows under 用手机找回, or pasted as that link. */
+function PickTarget({ onPicked }: { onPicked(entry: ConnectionEntry): void }) {
+  const [scanning, setScanning] = useState(false)
+  const [text, setText] = useState('')
+  const [wrong, setWrong] = useState(false)
+  const take = (value: string) => {
+    const found = recoveryTarget(value)
+    setText(value); setWrong(!found && value.trim() !== '')
+    if (found) onPicked(found)
+  }
+  if (scanning) return <Scanner title={recoveryCopy.scan} onCancel={() => setScanning(false)} onScanned={(value) => { setScanning(false); take(value) }} />
+  return <View className="gap-4">
+    <Text className="text-meta text-muted-foreground">{recoveryCopy.scope}</Text>
+    <Button onPress={() => setScanning(true)}><Icon as={QrCode} /><Text>{recoveryCopy.scan}</Text></Button>
+    <View className="gap-2">
+      <Textarea accessibilityLabel={recoveryCopy.pasteLabel} placeholder={recoveryCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={3}
+        className="min-h-16 font-mono text-meta" value={text} onChangeText={take} />
+      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => take((await Clipboard.getStringAsync()).trim())}>
+        <Icon as={ClipboardPaste} /><Text>粘贴</Text>
+      </Button>
+    </View>
+    {wrong ? <ErrorText error={recoveryCopy.notRecoveryLink} /> : null}
   </View>
 }
 
