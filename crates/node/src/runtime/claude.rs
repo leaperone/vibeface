@@ -34,8 +34,8 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 const SESSION_SEED: &str = "claude-session:";
 const MESSAGE_SEED: &str = "claude-user:";
 
-/// The process groups of running `claude` processes. The pidfile lists them, so a Node that
-/// could not end them ends them when it starts again.
+/// The process groups of running agent processes, by the program each one runs. The pidfile
+/// lists them, so a Node that could not end them ends them when it starts again.
 pub struct Processes {
     pidfile: PathBuf,
     running: std::sync::Mutex<BTreeMap<u32, PathBuf>>,
@@ -49,21 +49,36 @@ impl Processes {
         }
     }
 
-    fn track(&self, group: u32, bin: &Path) -> Result<()> {
+    /// Ends the processes an earlier Node run left in `pidfile` before tracking this run's.
+    pub(super) fn open(pidfile: PathBuf) -> Self {
+        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
+        Self::new(pidfile)
+    }
+
+    /// Ends every recorded process; the Node calls this before it exits.
+    pub(super) async fn stop(&self) {
+        let pidfile = self.pidfile.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
+        })
+        .await;
+    }
+
+    pub(super) fn track(&self, group: u32, bin: &Path) -> Result<()> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.insert(group, bin.to_owned());
         self.save(&running)
-            .context("record the Claude Code process group")
+            .context("record the agent process group")
     }
 
-    fn forget(&self, group: u32) {
+    pub(super) fn forget(&self, group: u32) {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         if running.remove(&group).is_some() {
             let _ = self.save(&running);
         }
     }
 
-    fn tracked(&self, group: u32) -> bool {
+    pub(super) fn tracked(&self, group: u32) -> bool {
         self.running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -824,10 +839,8 @@ struct Live {
 impl Claude {
     /// Ends the processes an earlier Node run left, so their turns are read back as they are.
     pub(super) fn open(dir: &Path, env: &BTreeMap<String, String>) -> Self {
-        let pidfile = dir.join(PIDFILE);
-        vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile);
         Self {
-            processes: Arc::new(Processes::new(pidfile)),
+            processes: Arc::new(Processes::open(dir.join(PIDFILE))),
             live: Default::default(),
             starting: Default::default(),
             projects: std::sync::Mutex::new(projects_dir(env)),
@@ -840,11 +853,7 @@ impl Claude {
 
     /// Ends every running Claude Code process; the Node calls this before it exits.
     pub(super) async fn stop(&self) {
-        let pidfile = self.processes.pidfile.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            vibeface_bridge::agent::SdkBridge::kill_orphan(&pidfile)
-        })
-        .await;
+        self.processes.stop().await;
     }
 
     fn live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
