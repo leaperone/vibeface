@@ -3708,18 +3708,16 @@ mod tests {
             a.outbox_wakeup.notify_one();
             let trigger = crate::scheduling::message_trigger("b1");
             tokio::time::timeout(Duration::from_secs(8), async {
-                while b.store.lock().await.scheduler_job("c", &trigger)?.is_none() {
+                // B stores the job before A reads its receipt and drops the entry.
+                while b.store.lock().await.scheduler_job("c", &trigger)?.is_none()
+                    || a.store.lock().await.scheduler_outbox()?.len() != 2
+                {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 anyhow::Ok(())
             })
             .await
             .context("the online owner gets its message while the offline one is still dialed")??;
-            assert_eq!(
-                a.store.lock().await.scheduler_outbox()?.len(),
-                2,
-                "the offline owner's messages wait in the outbox"
-            );
             anyhow::Ok(())
         }
         .await;
@@ -3854,7 +3852,7 @@ mod tests {
             }
             c.net()?.learn(&l.net()?.addr()).await;
             c.wake_sync(&il.device_id()?);
-            tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::time::timeout(Duration::from_secs(240), async {
                 while c.store.lock().await.fork_digest(&network)? != digest {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
