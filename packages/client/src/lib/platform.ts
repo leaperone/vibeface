@@ -52,6 +52,8 @@ export type Platform = {
   }
   /** How messages name this device: 这个浏览器, 这台手机. */
   self: string
+  /** Deletes this device's key and everything it stored, for a factory reset. */
+  erase?(): Promise<void>
   page?: LocalPage
   joinTabs?: JoinTabs
 }
