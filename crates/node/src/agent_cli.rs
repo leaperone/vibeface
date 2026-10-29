@@ -15,7 +15,7 @@ use vibeface_protocol::now_ms;
 /// a new thread (or the one it continues); with `thread` it goes into that existing thread,
 /// steering its running turn or starting one, and the thread's directory is read first. Only
 /// the registration that created the work sends, and only inside its window. `ready` names the
-/// provider the Node runs a work naming `agent` on, after waiting for the Node's own App Server
+/// provider the Node runs the work on, after waiting for the Node's own App Server
 /// connection when that is Codex, so a send right after the Node starts is not refused while
 /// the App Server comes up.
 pub async fn dispatch<T, TF, B, BF, R, RF>(
@@ -38,7 +38,7 @@ where
     // A Codex send reads its thread before registering, so a missing thread leaves nothing
     // behind. The Node checks the session another provider would take the work in.
     let readied = match &existing {
-        Some(_) => Some(ready(args["agent"].clone()).await),
+        Some(_) => Some(ready(args.clone()).await),
         None => None,
     };
     if let (Some(thread), Some(Some("codex"))) = (&existing, readied.as_ref().map(Option::as_deref))
@@ -89,7 +89,7 @@ where
     let report = |report| bind(work_id.clone(), report);
     let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
     if readied.is_none() {
-        ready(args["agent"].clone()).await;
+        ready(args.clone()).await;
     }
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,

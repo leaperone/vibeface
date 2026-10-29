@@ -218,21 +218,31 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = load_run(&tx, &spec.work_id)? {
-            let same = reduce::work_from(&tx, network, &spec.work_id)?.is_some_and(|work| {
-                work.conversation_id == spec.conversation
-                    && work.trigger == spec.trigger
-                    && work.target_node == spec.target
-                    && work.dispatcher == spec.dispatcher
-                    && work.call_ref == spec.call_ref
-                    && work.kind == spec.kind
-                    && work.cwd == spec.cwd
-                    && work.title == spec.title
-                    && work.prompt == spec.prompt
-                    && work.continues == spec.continues
-                    && work.parent == spec.parent
-                    && work.thread == spec.thread
-            });
-            ensure!(same, "work ID reused with a different request");
+            let work = reduce::work_from(&tx, network, &spec.work_id)?
+                .context("work ID reused with a different request")?;
+            let fields = [
+                ("conversation", work.conversation_id == spec.conversation),
+                ("trigger", work.trigger == spec.trigger),
+                ("target_node", work.target_node == spec.target),
+                ("dispatcher", work.dispatcher == spec.dispatcher),
+                ("call_ref", work.call_ref == spec.call_ref),
+                ("agent", work.kind == spec.kind),
+                ("cwd", work.cwd == spec.cwd),
+                ("title", work.title == spec.title),
+                ("prompt", work.prompt == spec.prompt),
+                ("continues", work.continues == spec.continues),
+                ("parent", work.parent == spec.parent),
+                ("thread", work.thread == spec.thread),
+            ];
+            let differ: Vec<&str> = (fields.iter())
+                .filter(|(_, same)| !same)
+                .map(|(field, _)| *field)
+                .collect();
+            ensure!(
+                differ.is_empty(),
+                "work ID reused with a different request; changed: {}. Retry with the same values or use a new call_ref",
+                differ.join(", ")
+            );
             return Ok((existing, false));
         }
         let busy = spec.kind == WorkKind::Task
