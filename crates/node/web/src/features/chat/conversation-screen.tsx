@@ -15,7 +15,7 @@ import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
 import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
-import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
+import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, awaitsAnswer, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
@@ -41,7 +41,7 @@ function NoBot() {
   const { bots } = useWorkspace()
   const create = useCreateBot()
   return bots.length
-    ? <EmptyState icon={Bot} title="找不到这个 Bot" className="my-auto" action={<Button asChild variant="outline"><Link to="/">查看 Bot</Link></Button>} />
+    ? <EmptyState icon={Bot} title={botCopy.notFound} className="my-auto" action={<Button asChild variant="outline"><Link to="/">查看 Bot</Link></Button>} />
     : <EmptyState icon={Bot} title="还没有 Bot" className="my-auto" action={<Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 

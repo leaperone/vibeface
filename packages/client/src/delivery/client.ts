@@ -23,7 +23,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
   }
   const manage = () => {
     current()
-    if (connection.principal.source !== 'membership' || !connection.principal.can_manage) throw new Error('只有已加入的管理员能确认传输和付款。')
+    if (connection.principal.source !== 'membership' || !connection.principal.can_manage) throw new Error('只有管理设备能确认传输和付款。')
   }
   async function request(op: string, params: Record<string, unknown> = {}): Promise<unknown> {
     current()

@@ -9,7 +9,7 @@ import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { asProvider, providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
-import { folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
+import { botCopy, folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -117,12 +117,12 @@ export function BotPanelButton() {
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
               {model ? <span className="max-w-48 truncate font-mono" title={model}>{model}</span> : <span>设备默认</span>}
             </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><span>设备默认</span></SettingsRow>}
-            <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={primaryHint}>
+            <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={botCopy.primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
             </SettingsRow>
           </SettingsGroup>
-          {empty ? <EmptyState icon={NotebookPen} className="py-4" title="还没有说明、定时任务和笔记"
+          {empty ? <EmptyState icon={NotebookPen} className="py-4" title={botCopy.empty}
             action={<Button type="button" size="sm" variant="outline" onClick={() => { toComposer.current = true; setOpen(false) }}><MessageCircle aria-hidden="true" />去聊天里说</Button>} /> : null}
           {bot.instructions.trim() ? <SettingsGroup title="说明">
             <p className="px-4 py-3 whitespace-pre-wrap [overflow-wrap:anywhere]">{bot.instructions}</p>
@@ -158,7 +158,7 @@ export function BotPanelButton() {
           {view.memory.length ? <SettingsGroup title={`笔记 · ${view.memory.length}`}>
             {view.memory.map((note) => <p key={note.memory_id} className="line-clamp-3 px-4 py-3 [overflow-wrap:anywhere]" title={note.text}>{note.text}</p>)}
           </SettingsGroup> : null}
-          {view.skills.length ? <SettingsGroup title={bot.skills === null ? "Skill · 全部可用" : `Skill · ${view.skills.length}`}>
+          {view.skills.length ? <SettingsGroup title={botCopy.skills(bot.skills, view.skills.length)}>
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}
           <SettingsGroup>
@@ -175,4 +175,3 @@ export function BotPanelButton() {
   </>
 }
 
-const primaryHint = "接手没有 Bot 负责的会话"

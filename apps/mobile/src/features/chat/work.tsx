@@ -5,7 +5,7 @@ import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
+import { changeTitle, formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
@@ -171,17 +171,6 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   </ActionCard>
 }
 
-function changeTitle(changes: BotChange[]) {
-  const kind = changes[0]?.kind
-  if (changes.some((change) => change.kind !== kind)) return '已更新'
-  if (kind === 'profile') return '已更新 Bot'
-  const items = changes as Extract<BotChange, { kind: 'skill' | 'schedule' | 'memory' }>[]
-  const added = items.every((item) => !item.before), removed = items.every((item) => !item.after)
-  if (kind === 'skill') return added ? '已存为 skill' : removed ? '已删除 skill' : '已更新 skill'
-  if (kind === 'memory') return added ? '已记下' : removed ? '已忘记' : '已更新笔记'
-  return added ? '已设定定时任务' : removed ? '已删除定时任务' : '已更新定时任务'
-}
-
 /** What one turn changed in the bot, item by item. */
 function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
   return <View className="gap-3 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
@@ -204,7 +193,7 @@ function ChangeRows({ change, conversationId, schedules }: { change: BotChange; 
   </>
   if (change.kind === 'skill') {
     const skill = change.after ?? change.before!
-    return <ChangeRow icon={BookOpen} label={skill.name} tag={!change.before ? '新 skill' : !change.after ? '已删除' : '已更新'} removed={!change.after}>
+    return <ChangeRow icon={BookOpen} label={skill.name} tag={!change.before ? '新 Skill' : !change.after ? '已删除' : '已更新'} removed={!change.after}>
       {change.after?.description ? <Text className="text-meta text-muted-foreground">{change.after.description}</Text> : null}
     </ChangeRow>
   }

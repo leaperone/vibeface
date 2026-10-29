@@ -10,6 +10,7 @@ import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
 import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -126,7 +127,7 @@ export default function ChatScreen() {
   // The empty state stays centred in the space above the composer instead of riding up with the list.
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
-  if (!bot || !id) return <EmptyState icon={Bot} title="没有这个 Bot" className="flex-1 justify-center" />
+  if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
   const offline = workspace.connection.state === 'offline'
   const blocked = offline ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
   const send = () => {

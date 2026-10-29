@@ -66,7 +66,7 @@ export default function AddDevice() {
           <Icon as={Share2} /><Text>分享</Text>
         </Button>
       </View>
-      <Text className="text-center text-meta text-muted-foreground">只发给你自己的设备，10 分钟内有效。</Text>
+      <Text className="text-center text-meta text-muted-foreground">只发给自己的设备，10 分钟内有效</Text>
     </View> : null}
     <ErrorText error={error} />
   </ScrollView>

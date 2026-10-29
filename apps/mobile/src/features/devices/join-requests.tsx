@@ -57,7 +57,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
       <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
-    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的安全码比对' : '等新设备显示安全码'}</Text>
+    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的比对，不一致就拒绝' : '等新设备显示安全码'}</Text>
     {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
     <ErrorText error={error} />
   </ActionCard>
