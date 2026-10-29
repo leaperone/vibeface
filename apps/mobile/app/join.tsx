@@ -122,14 +122,14 @@ function JoinForm() {
       <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} value={name} onChangeText={setName} maxLength={64} />
     </View>
     <ErrorText error={failure} />
-    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+    <Button disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? joinCopy.joining : joinCopy.join}</Text></Button>
   </View>
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
     <ErrorText error={failure} />
-    <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
-      <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
+      <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
       <Button variant="ghost" className="-ms-3 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>

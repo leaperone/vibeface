@@ -13,7 +13,7 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await browser.goto(`${environment.nodes.web.url}/join`);
     await screen.getByLabel('加入链接', { exact: true }).fill(secrets.get('paidWebInvitation'), { timeout: 30000 });
     await screen.getByLabel('这个浏览器叫什么？', { exact: true }).fill('VDP paid web sender');
-    await screen.getByRole('button', '继续', { exact: true }).click();
+    await screen.getByRole('button', '加入', { exact: true }).click();
     await expect.poll(async () => (await pairing('web')) !== null, { timeout: 45000, message: 'The real Web member reveals its pairing nonce' }).toBe(true);
     const joined = await pairing('web');
     assert(joined);

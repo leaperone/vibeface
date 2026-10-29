@@ -1,6 +1,6 @@
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Alert, Pressable, View } from 'react-native'
 import { Link } from 'expo-router'
@@ -87,7 +87,7 @@ export function RecoveryReview() {
         const required = member.device_id === review.requiredNode
         const gone = lost.includes(member.device_id)
         return <View key={member.device_id} className="min-h-12 flex-row items-center gap-2 rounded-lg bg-muted/60 px-3">
-          <Icon as={deviceIcon({ kind: member.kind, name: member.name, current: false, entry: required })} className="size-4 text-muted-foreground" />
+          <Icon as={deviceIcon({ kind: member.kind, name: member.name, current: false })} className="size-4 text-muted-foreground" />
           <View className="min-w-0 flex-1 py-1.5">
             <Text numberOfLines={1} className={gone ? 'text-muted-foreground line-through' : undefined}>{member.name}</Text>
             {gone ? <Text className="text-meta text-danger">生效后移出</Text> : null}
@@ -115,7 +115,6 @@ function SaveRecoveryFile({ code, saved, onSaved, save }: { code: string; saved:
   const done = !save || save.done
   return <>
     {hint(LifeBuoy, recoveryCopy.why)}
-    {hint(KeyRound, recoveryCopy.needsPassword)}
     {hint(FileWarning, recoveryCopy.onlyCopy)}
     {done ? <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={CircleCheck} className="size-4 text-success" />
@@ -173,7 +172,7 @@ export function RecoveryPendingCard() {
       const current = member.device_id === device.identity?.deviceId
       return <View key={member.device_id} className="min-w-0 flex-row items-center gap-2">
         <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
-        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current, entry: false })} className="size-4 text-muted-foreground" />
+        <Icon as={deviceIcon({ kind: member.kind, name: member.name, current })} className="size-4 text-muted-foreground" />
         <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
         {added ? <Text className="rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</Text>
           : current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{self}</Text> : null}

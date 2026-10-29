@@ -103,6 +103,12 @@ export function humanError(raw: string, code?: unknown, action = '这次操作')
   return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? `${action}没有成功，请再试一次。`
 }
 
+/** An external chat test as people read it: it arrived, or why not. */
+export function webhookTestResult(data: { ok?: boolean; status?: number | null; error?: string | null }) {
+  if (data.ok === true) return { ok: true, text: '能收到' }
+  return { ok: false, text: data.error ? humanError(data.error, undefined, '这次测试') : data.status ? `对方没收下（${data.status}）` : '没有响应' }
+}
+
 /**
  * A task's own failure: its agent's words are not a page request, so advice to refresh the page would mislead.
  * Unknown text keeps its first line under the message, since trying again may not help and the cause is the clue.

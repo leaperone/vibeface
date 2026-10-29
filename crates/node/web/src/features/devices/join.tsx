@@ -75,7 +75,7 @@ export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRe
   // Only the admin that started the comparison can allow it (the Node enforces this too).
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   return <ActionCard
-    icon={deviceIcon({ kind: request.kind, name: request.name, entry: false })}
+    icon={deviceIcon(request)}
     tone="info"
     title={<span className="flex min-w-0"><span className="truncate" title={request.name || undefined}>{request.name || "新设备"}</span><span className="shrink-0">&nbsp;想加入</span></span>}
     meta={formName[deviceForm(request.kind, request.name)]}

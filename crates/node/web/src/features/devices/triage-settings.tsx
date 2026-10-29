@@ -8,6 +8,7 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { parseTriageSettings } from "@vibeface/client/workspace/model.ts"
+import { webhookTestResult } from "@vibeface/client/lib/errors.ts"
 import type { Outlet, TriageSettings as Settings } from "@vibeface/client/workspace/types.ts"
 
 const chat = terms.externalChat.label
@@ -89,7 +90,7 @@ export function TriageSettings() {
         setTest(null)
         void call("test", "test_webhook").then((result) => {
           const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-          if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? "没有响应"}` })
+          if (data) setTest(webhookTestResult(data))
         })
       }}><BusyIcon busy={busy === "test"} icon={Zap} />测试</Button>
       {test ? <span role="status" className={cn("flex items-center gap-1 text-meta", test.ok ? "text-success" : "text-danger")}>{test.ok ? <CircleCheck aria-hidden="true" className="size-4" /> : <CircleX aria-hidden="true" className="size-4" />}{test.text}</span> : null}

@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Check, Copy, Globe, Info, Server, Unplug, Wifi, WifiOff, X } from 'lucide-react'
+import { Check, Copy, Info, Unplug, Wifi, WifiOff, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { terms } from '@/lib/glossary'
 import { Details, InlineError, SettingsDisclosure, SettingsRow } from '@/components/app/kit'
@@ -35,11 +35,11 @@ export function ConnectionSettings() {
   const current = ready ? entryKey(ready.entry) : ''
   const others = entries.filter((entry) => entryKey(entry) !== current)
   return <>
-    {ready ? <SettingsRow icon={Globe} label={<span title={entryAddress(ready.entry)}>{device.entryName(ready.entry) || addressName(entryAddress(ready.entry))}</span>}
+    {ready ? <SettingsRow icon={terms.thisComputer.icon} label={<span title={entryAddress(ready.entry)}>{device.entryName(ready.entry) || addressName(entryAddress(ready.entry))}</span>}
       description={connectionOnline ? <span className="inline-flex items-center gap-1"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />{terms.encrypted.label}</span> : undefined}>
       <span className={cn('flex items-center gap-1.5', connectionOnline ? 'text-success' : 'text-muted-foreground')}>{connectionOnline ? <Wifi aria-hidden="true" className="size-4" /> : <WifiOff aria-hidden="true" className="size-4" />}{connectionOnline ? '在线' : '离线'}</span>
     </SettingsRow> : null}
-    {others.map((entry) => <SettingsRow key={entryKey(entry)} icon={Server} label={<span title={entryAddress(entry)}>{device.entryName(entry) || addressName(entryAddress(entry))}</span>} description={hostOf(entryAddress(entry))}>
+    {others.map((entry) => <SettingsRow key={entryKey(entry)} icon={terms.thisComputer.icon} label={<span title={entryAddress(entry)}>{device.entryName(entry) || addressName(entryAddress(entry))}</span>} description={hostOf(entryAddress(entry))}>
       <Button type="button" size="sm" variant="outline" onClick={() => { setError(null); void device.connect(entry).catch(setError) }}>切换</Button>
       <Button type="button" variant="ghost" size="icon" aria-label="从列表删掉这个地址" title="从列表删掉这个地址" onClick={() => { try { device.removeEntry(entry) } catch (cause) { setError(cause) } }}><X aria-hidden="true" /></Button>
     </SettingsRow>)}
