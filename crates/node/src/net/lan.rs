@@ -161,14 +161,20 @@ impl State {
     /// Keeps `advert`; returns the member Node it names, if any.
     fn learn(&mut self, fullname: String, advert: Advert, now_ms: u64) -> Option<String> {
         if self.seen.len() >= MAX_ADVERTS && !self.seen.contains_key(&fullname) {
-            return None;
+            // Strangers' adverts must not crowd out a member's.
+            self.seen.retain(|_, seen| {
+                self.own.as_ref().is_some_and(|own| {
+                    matching_member(&self.members, &own.network, &seen.tag, now_ms).is_some()
+                })
+            });
+            if self.seen.len() >= MAX_ADVERTS {
+                return None;
+            }
         }
-        let member = self.own.as_ref().and_then(|own| {
-            self.members
-                .iter()
-                .find(|member| lan_tag_matches(&advert.tag, &own.network, member, now_ms))
-                .cloned()
-        });
+        let member = self
+            .own
+            .as_ref()
+            .and_then(|own| matching_member(&self.members, &own.network, &advert.tag, now_ms));
         self.seen.insert(fullname, advert);
         member
     }
@@ -184,6 +190,13 @@ impl State {
             .flat_map(|advert| advert.addrs.iter().copied())
             .collect()
     }
+}
+
+fn matching_member(members: &[String], network: &str, tag: &str, now_ms: u64) -> Option<String> {
+    members
+        .iter()
+        .find(|member| lan_tag_matches(tag, network, member, now_ms))
+        .cloned()
 }
 
 fn now_ms() -> u64 {
@@ -247,5 +260,14 @@ mod tests {
         assert!(state.hints("c", now + 2 * HOUR_MS).is_empty());
         state.seen.remove("c");
         assert!(state.hints("c", now).is_empty());
+
+        for i in 0..MAX_ADVERTS {
+            state.learn(format!("s{i}"), advert("other", "s", i as u64, 5), now);
+        }
+        assert_eq!(
+            state.learn("c".into(), advert("net", "c", 100, 6), now),
+            Some("c".into()),
+            "strangers filling the table do not keep a member out"
+        );
     }
 }
