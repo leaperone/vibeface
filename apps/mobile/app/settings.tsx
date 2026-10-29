@@ -1,23 +1,25 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, Crown, FileKey, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RotateCcw, Sparkles, Sun, WifiOff } from 'lucide-react-native'
+import { ArrowRightLeft, BellRing, Crown, FileKey, FlaskConical, KeyRound, LogOut, Monitor, Moon, Palette, Plus, RotateCcw, Sparkles, Sun, WifiOff } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager } from '@vibeface/client/identity/copy.ts'
+import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Segmented } from '@/components/ui/segmented'
+import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import type { Member } from '@/data/types'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { JoinRequests } from '@/features/devices/join-requests'
-import { self } from '@/platform'
+import { mobilePlatform, self } from '@/platform'
 import { factoryReset } from '@/lib/factory-reset'
 import { useRun } from '@/lib/use-run'
 
@@ -35,6 +37,7 @@ export default function Settings() {
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   const manager = device.ready?.principal.can_manage === true
+  const [experiments, setExperiments] = useExperiments(mobilePlatform.storage)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   const open = (which: 'leave' | 'reset') => { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); reveal.current = true; setConfirming(which) }
   const reset = () => factoryReset(device)
@@ -63,6 +66,11 @@ export default function Settings() {
         <View className="basis-full ps-11">
           <Segmented snap options={themes} value={current} onChange={(value) => { Appearance.setColorScheme(value === 'system' ? 'unspecified' : value); Uniwind.setTheme(value) }} />
         </View>
+      </SettingsRow>
+    </SettingsGroup>
+    <SettingsGroup>
+      <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experimentsCopy.hint}>
+        <Switch accessibilityLabel={experimentsCopy.label} value={experiments} onValueChange={setExperiments} />
       </SettingsRow>
     </SettingsGroup>
     <View className="gap-3">

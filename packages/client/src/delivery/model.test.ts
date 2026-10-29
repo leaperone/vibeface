@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -233,4 +233,10 @@ test('a record reads as file name and one plain line, and offers only what this 
   assert.equal(orderTitle(received), '待接收的文件')
   assert.deepEqual(orderActions(received), { confirm: false, accept: true, save: false })
   assert.equal(canRestart({ ...received, phase: 'recoverable', evidence: 'charity_receipt' }), false, 'a receiver never sends again')
+})
+
+test('without 实验功能 a send is free whatever mode the draft last held', () => {
+  const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'strict', max_service_amount: '5', max_gas_amount: '7' }
+  assert.deepEqual(draftFor(paid, false), { ...paid, mode: 'charity', acceptance: 'recoverable' })
+  assert.equal(draftFor(paid, true), paid)
 })

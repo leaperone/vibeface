@@ -138,6 +138,8 @@ export function parsePending(value: unknown): PendingIntent {
 export function changeMode(draft: DeliveryDraft, mode: DeliveryMode): DeliveryDraft {
   return { ...draft, mode, acceptance: mode === 'charity' ? 'recoverable' : draft.acceptance }
 }
+/** What gets sent: without 实验功能 only free delivery, since paid runs on a test chain. */
+export const draftFor = (draft: DeliveryDraft, experiments: boolean): DeliveryDraft => experiments ? draft : changeMode(draft, 'charity')
 export function canRestart(order: DeliveryOrder): boolean {
   if (order.role !== 'sender') return false
   if (order.mode === 'charity') return order.phase === 'recoverable' && order.evidence === 'charity_receipt' && order.windows.length > 0

@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Copy, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ScanLine, ShieldAlert, ShieldX, Smartphone, WifiOff, type LucideIcon } from 'lucide-react'
+import qrcode from 'qrcode-generator'
 import { cn } from '@/lib/utils'
-import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
+import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsDisclosure, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
@@ -10,6 +11,7 @@ import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { recoveryEntry, recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
 import { deviceIcon } from '@/features/devices/devices'
 
 /** Where the reminder to change the recovery password leads: settings with that form open. */
@@ -53,6 +55,32 @@ export function CurrentRecoveryFile() {
   return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={<span title={recoveryFileStem(code)}>{recoveryCopy.codeLabel} <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
     {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{recoveryCopy.day(recoverySince)}</time> : null}
   </SettingsRow>
+}
+
+/** What a phone scans in its 用恢复文件找回 to know which computer to go through; it holds no key and lets no one in. */
+export function PhoneRecovery() {
+  const device = useDevice()
+  const entry = recoveryEntry(device.entrances, device.ready?.entry ?? null)
+  const link = entry ? recoveryLink(entry) : null
+  const image = useMemo(() => {
+    if (!link) return null
+    try { const code = qrcode(0, 'M'); code.addData(link); code.make(); return code.createDataURL(4, 16) } catch { return null }
+  }, [link])
+  const [copied, setCopied] = useState(false)
+  useEffect(() => {
+    if (!copied) return
+    const timer = setTimeout(() => setCopied(false), 2000)
+    return () => clearTimeout(timer)
+  }, [copied])
+  return <SettingsDisclosure icon={Smartphone} label={recoveryCopy.byPhone}>
+    {link ? <>
+      {image ? <img src={image} alt={recoveryCopy.qr} className="size-48 rounded-lg bg-white p-2 ring-1 ring-border" /> : null}
+      <p className="flex items-center gap-2 text-meta text-muted-foreground"><ScanLine aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.scanHint}</p>
+      <Button type="button" variant="outline" size="sm" className="w-fit" onClick={() => { void navigator.clipboard.writeText(link).then(() => setCopied(true), () => {}) }}>
+        {copied ? <CircleCheck aria-hidden="true" className="text-success" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制链接'}
+      </Button>
+    </> : <p className="flex items-center gap-2 text-meta text-muted-foreground"><WifiOff aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.unreachable}</p>}
+  </SettingsDisclosure>
 }
 
 /** Someone is recovering the network with a recovery file; a manager here can stop it before it takes effect. */
