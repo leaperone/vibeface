@@ -3032,6 +3032,8 @@ fn bot_settings_refuse_secrets() -> Result<()> {
         ChangeRequest::UpdateProfile {
             name: None,
             instructions: Some(format!("Your key is {key}")),
+            avatar: None,
+            default_avatar: None,
         },
     ]
     .into_iter()
