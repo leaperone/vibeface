@@ -88,7 +88,7 @@ BotMessaged {
 | `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
 
-- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
+- 可配项是名称、说明、模型、启用的 skill、长相和创建时的项目目录。长相的 `avatar` 只给要改的轮廓、眼睛或颜色，其余按这个 bot 当前显示的补全；`default_avatar: true` 恢复由 ID 派生的长相。新建 bot 后用 `configure_bot` 给新 bot 挑长相，`update_profile` 只改自己。`model` 为空表示跟随运行它的设备的默认模型；非空时覆盖设备默认，provider 不支持就如实失败并在回复里说明这个 bot 设定的模型，不换用别的模型。skill 仍是全网共用的库；bot 的 `skills` 为 `null` 表示启用全部（含之后新存的），新建 bot 就是这样；`skills` 给出集合后只启用这些，之后新存的 skill 要再用 `configure_bot` 加上，删除的 skill 从各 bot 的集合里去掉，`all_skills: true` 恢复全部。provider 和项目目录没有工具，仍在设置页改。
 - 删除 bot：见第 5.1 节。不提供改本人或设备权限的工具。
 - 授权：网页建 bot 时 `BotCreated` 和首个 `ConversationOwner` 带本人设备签名。bot 在本人消息的轮次里建 bot 时，这两条事件不带签名，改带 `cause: Cause { conversation_id, message_id }`，指向发起轮次那条本人签名消息，并把它列为父事件；入库时与 `BotChanged` 一样核对。带 `cause` 的 `ConversationOwner` 只能是 epoch 1，且紧跟同一作者在同一会话写的 `ConversationCreated`，所以不能借本人消息改已有会话的调度 Node。新会话由发起轮次的调度 Node 调度。
 - `configure_bot` 写一条 `BotChanged::Profile` 到目标 bot 的会话，`cause` 指向发起会话里的本人消息，所以 `cause` 是带会话 ID 的 `Cause`。变更卡片出现在被改的 bot 的聊天里，`ChangeRecord.conversation_id` 标明它。
@@ -97,7 +97,7 @@ BotMessaged {
 ### 5.1 删除 bot
 
 - 事件 `BotDeleted { attestation?, cause? }` 写在被删 bot 的会话里，是墓碑，写下后不可恢复。网页删除带本人设备签名（签 `{type:"bot_deleted"}`）；`delete_bot` 工具在本人消息的轮次里写，不带签名，带 `cause` 指向那条本人消息并把它列为父事件，入库时按 `authorize_cause` 核对。bot 不能用工具删除自己（`cause` 所在会话必须不是被删会话），删自己只能在网页上。
-- 删除后：bot 从列表消失；会话不再接受新消息；它的 schedule 不再列出也不再运行；排队的轮次在认领时取消，状态记为 `bot 已删除`；正在运行的轮次走停止回复的路径取消，结果未知的照常走待核对。聊天记录保留。
+- 删除后：bot 从列表消失；会话不再接受新消息；它的 schedule 不再列出也不再运行；排队的轮次在认领时取消，状态记为 `bot 已删除`；正在运行的轮次走停止回复的路径取消，结果未知的照常走待核对。它派出的工作由各执行设备在收到删除后走 `interrupt_work` 的停止路径中断，结果未知的同样先核对，不重发；删除之后才送到的派发不再接受。聊天记录保留。
 - 主 bot：删除主 bot 后，主 bot 自动变为剩下的 bot 中最早创建的那个；删掉最后一个 bot 后没有主 bot。
 - 幂等：重复删除不写新事件；`delete_bot` 指向已删除的 bot 返回原会话、`written: false`。
 

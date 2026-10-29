@@ -3368,7 +3368,7 @@ pub(super) mod tests {
         result
     }
 
-    async fn delete_bot(node: &Runtime, admin: &LocalIdentity, scope: &str) -> Result<()> {
+    async fn delete_bot(node: &Runtime, admin: &LocalIdentity, scope: &str) -> Result<String> {
         let network = node.network_id().await?;
         let deleted = admin.attest(
             &network,
@@ -3379,12 +3379,13 @@ pub(super) mod tests {
             },
         )?;
         let signed = deleted.attestation().cloned().context("signed")?;
-        node.store
+        let written = node
+            .store
             .lock()
             .await
             .delete_bot(&node.identity, &network, scope, signed, now_ms())?
             .context("deleted")?;
-        Ok(())
+        Ok(written.hash)
     }
 
     #[tokio::test]
@@ -3495,6 +3496,73 @@ pub(super) mod tests {
             assert_eq!(next["status"], "accepted");
             assert_eq!(owner_of(&node, "wt").await?.as_deref(), Some("c"));
             assert_eq!(attributions(&node, "c").await?, 1, "the thread goes to the primary bot once");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn deleting_a_bot_stops_the_works_it_dispatched() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            bot(&node, &admin, "d", "后端", &[]).await?;
+            let network = node.network_id().await?;
+            let local = node.identity.device_id()?;
+            let spec = |work_id: &str, conversation: &str| crate::work::WorkSpec {
+                work_id: work_id.into(),
+                conversation: conversation.into(),
+                trigger: "message:m1".into(),
+                target: local.clone(),
+                dispatcher: local.clone(),
+                call_ref: "r".into(),
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
+                cwd: "/w".into(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some(format!("t-{work_id}")),
+            };
+            for (work_id, conversation) in [("w-d", "d"), ("w-c", "c")] {
+                node.store.lock().await.accept_work(
+                    &node.identity,
+                    &network,
+                    spec(work_id, conversation),
+                    now_ms(),
+                )?;
+            }
+            let hash = delete_bot(&node, &admin, "d").await?;
+            node.bot_deleted(&network, "d", &hash);
+            let late = node.store.lock().await.accept_work(
+                &node.identity,
+                &network,
+                spec("w-late", "d"),
+                now_ms(),
+            );
+            assert!(
+                late.is_err(),
+                "a dispatch that arrives after the deletion does not start"
+            );
+            let stopping = |requests: &[crate::work::StopRequest], work: &str| {
+                requests.iter().any(|request| request.work_id == work)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let held = loop {
+                let held = node.store.lock().await.stop_requests()?;
+                if stopping(&held, "w-d") || tokio::time::Instant::now() > deadline {
+                    break held;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert!(
+                stopping(&held, "w-d"),
+                "the deleted bot's work is being stopped"
+            );
+            assert!(!stopping(&held, "w-c"), "another bot's work keeps running");
             Ok::<_, anyhow::Error>(())
         }
         .await;
