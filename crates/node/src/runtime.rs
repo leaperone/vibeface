@@ -458,7 +458,7 @@ impl Runtime {
                     return;
                 };
                 let due = runtime.settle_recovery().await.unwrap_or_else(|error| {
-                    tracing::warn!(%error, "installing the directory in effect is pending");
+                    tracing::warn!(event = "recovery.install_pending", %error, "installing the directory in effect is pending");
                     Some(now_ms() as u64 + 60_000)
                 });
                 drop(runtime);

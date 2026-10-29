@@ -1219,8 +1219,12 @@ fn initialize(dir: &Path, configuration: Config, entry_token: Option<String>) ->
 /// survives to write into the data set aside.
 fn restart_fresh(dir: &Path) -> Result<()> {
     match start_over(dir) {
-        Ok(archive) => tracing::warn!(archive = %archive.display(), "removed Node data set aside"),
-        Err(error) => tracing::error!(%error, "removed Node data could not be set aside"),
+        Ok(archive) => {
+            tracing::info!(event = "node.data_set_aside", archive = %archive.display(), "removed Node data set aside")
+        }
+        Err(error) => {
+            tracing::error!(event = "node.data_set_aside_failed", %error, "removed Node data could not be set aside")
+        }
     }
     use std::os::unix::process::CommandExt;
     let error = std::process::Command::new(std::env::current_exe()?)

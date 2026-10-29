@@ -426,7 +426,7 @@ pub fn complete_saved(dir: &Path, host: &Host) -> Result<()> {
     let filled = match complete(&mut config, &mut env, host) {
         Ok(filled) => filled,
         Err(error) => {
-            tracing::warn!(%error, "provider paths are missing and could not be found");
+            tracing::warn!(event = "providers.missing", %error, "provider paths are missing and could not be found");
             return Ok(());
         }
     };

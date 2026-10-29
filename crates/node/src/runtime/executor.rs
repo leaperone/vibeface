@@ -88,7 +88,7 @@ impl Runtime {
         if let Err(signal) =
             (self.signal_work(network, &work.work_id, Signal::StartRejected(failure))).await
         {
-            tracing::warn!(%signal, work_id = work.work_id, "a failed start waits for the reconcile");
+            tracing::warn!(event = "work.start_rejected_pending", %signal, work_id = work.work_id, "a failed start waits for the reconcile");
         }
         Err(error.context("the work was not started; dispatch it again under a new call_ref"))
     }

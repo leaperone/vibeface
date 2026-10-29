@@ -1605,7 +1605,7 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
                 report(NodeJoin::Cancelled);
             }
             Err(error) => {
-                tracing::warn!(%error, "joining from the local page failed");
+                tracing::warn!(event = "join.local_failed", %error, "joining from the local page failed");
                 let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
                 report(NodeJoin::Failed);
             }

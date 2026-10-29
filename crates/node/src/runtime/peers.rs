@@ -182,7 +182,7 @@ impl Runtime {
             .filter(|_| self.config.network.relay_mode == net::RelayServiceMode::Forward)
         {
             let relay = net::spawn_relay(listen, Arc::new(RelayAccess(weak))).await?;
-            tracing::info!(%listen, "relay started");
+            tracing::info!(event = "relay.started", %listen, "relay started");
             *self.relay.lock().await = Some(relay);
         }
         self.delivery.attach(Arc::downgrade(self))?;
@@ -272,7 +272,10 @@ impl Runtime {
             view.revocation(&self.identity.device_id()?).is_some(),
             "the peer refused this Node without a removal"
         );
-        tracing::warn!("this Node has been removed from the personal network");
+        tracing::warn!(
+            event = "network.removed",
+            "this Node has been removed from the personal network"
+        );
         Ok(())
     }
 
@@ -1032,7 +1035,7 @@ impl Runtime {
                 .set_write_state(network, &from, WriteState::Forked)
                 .await
             {
-                tracing::warn!(%peer, "another copy of this device wrote different events; writes stopped");
+                tracing::warn!(event = "sync.forked", %peer, "another copy of this device wrote different events; writes stopped");
             }
         } else if confirmed {
             self.sync_peers
@@ -1063,12 +1066,12 @@ impl Runtime {
             _ => Ok(()),
         };
         if let Err(error) = recorded.and_then(|()| store.set_write_state(to)) {
-            tracing::warn!(%error, "write state change pending");
+            tracing::warn!(event = "sync.write_state_pending", %error, "write state change pending");
             return false;
         }
         self.write_state.send_replace(to);
         drop(store);
-        tracing::info!(state = ?to, "write state changed");
+        tracing::info!(event = "sync.write_state", state = ?to, "write state changed");
         let _ = self.events.send(Update {
             network_id: network.into(),
             payload: json!({"type":"write_state","state":to}),
@@ -1184,7 +1187,11 @@ impl Runtime {
                 "INSERT INTO identity_meta(key,value) VALUES('write-confirmed',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [json!({"device":device,"at_ms":now_ms()}).to_string()],
             )?;
-            tracing::info!(device, "write confirmed without a backup check");
+            tracing::info!(
+                event = "sync.write_confirmed",
+                device,
+                "write confirmed without a backup check"
+            );
         }
         Ok(())
     }
@@ -1231,7 +1238,7 @@ impl Runtime {
                     tracing::debug!(hash = %event.hash, reason, "peer event rejected")
                 }
                 IngestStatus::Conflict => {
-                    tracing::warn!(hash = %event.hash, "forked event stored as evidence")
+                    tracing::warn!(event = "sync.fork_evidence", hash = %event.hash, "forked event stored as evidence")
                 }
                 IngestStatus::Duplicate => {}
             }
@@ -1421,7 +1428,9 @@ impl Runtime {
                     self.outbox_wakeup.notify_one();
                 }
             }
-            Err(error) => tracing::warn!(%error, "recording work on removed devices is pending"),
+            Err(error) => {
+                tracing::warn!(event = "devices.removed_work_pending", %error, "recording work on removed devices is pending")
+            }
         }
         let Ok(local) = self.identity.device_id() else {
             return;
@@ -1434,7 +1443,9 @@ impl Runtime {
         {
             Ok(0) => {}
             Ok(_) => self.schedule_wakeup.notify_one(),
-            Err(error) => tracing::warn!(%error, "dropping requests to removed devices is pending"),
+            Err(error) => {
+                tracing::warn!(event = "devices.removed_requests_pending", %error, "dropping requests to removed devices is pending")
+            }
         }
     }
 
