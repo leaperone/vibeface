@@ -1,5 +1,5 @@
 import { Link } from '@tanstack/react-router'
-import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, Merge, MonitorSmartphone, RotateCcw } from 'lucide-react'
+import { Bot, CalendarClock, ChevronDown, ChevronUp, CirclePause, CircleX, Clock, LoaderCircle, Merge, MonitorSmartphone, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useState } from 'react'
 import { Markdown, PlainText } from '@/components/app/markdown'
@@ -90,7 +90,7 @@ export function Message({ message, schedule, last = true, retry, detail }: { mes
       <span className="sr-only">Bot：</span>
       <Markdown text={message.text} />
     </div>
-    {message.state === 'streaming' ? <span role="img" aria-label="正在回复" className="flex h-6 items-center">{selectedBot ? <BotFace bot={selectedBot} mood={connectionOnline ? 'replying' : 'asleep'} size={24} /> : null}</span> : null}
+    {message.state === 'streaming' ? <span role="img" aria-label="正在回复" className="flex h-6 items-center">{selectedBot ? <BotFace bot={selectedBot} mood={connectionOnline ? 'replying' : 'asleep'} size={24} /> : <LoaderCircle aria-hidden="true" className={`size-4 text-muted-foreground ${connectionOnline ? 'animate-spin' : ''}`} />}</span> : null}
     {failed ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">
       <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
       {cause ? <span className="text-muted-foreground">{cause}</span> : null}
