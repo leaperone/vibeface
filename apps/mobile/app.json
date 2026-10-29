@@ -16,12 +16,22 @@
     "ios": {
       "bundleIdentifier": "one.leaper.vibeface",
       "supportsTablet": true,
+      "icon": {
+        "light": "./assets/icon/ios-light.png",
+        "dark": "./assets/icon/ios-light.png",
+        "tinted": "./assets/icon/ios-tinted.png"
+      },
       "infoPlist": {
         "NSCameraUsageDescription": "扫描加入二维码"
       }
     },
     "android": {
       "package": "one.leaper.vibeface",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon/android-foreground.png",
+        "backgroundImage": "./assets/icon/android-background.png",
+        "monochromeImage": "./assets/icon/android-monochrome.png"
+      },
       "softwareKeyboardLayoutMode": "resize"
     },
     "plugins": [
