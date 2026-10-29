@@ -6215,11 +6215,40 @@ fn read_bot_lists_every_skill_the_prompt_index_leaves_out() -> Result<()> {
         names, expected,
         "a bot using every skill reads the whole library"
     );
+    let ids = listed(&read, "/skills", "skill_id");
     assert!(
-        listed(&read, "/skills", "skill_id")
-            .iter()
-            .all(Value::is_string),
+        ids.iter().all(Value::is_string),
         "each names the skill_id read_skill takes"
+    );
+    let chosen: std::collections::BTreeSet<String> = ids[..2]
+        .iter()
+        .filter_map(|id| id.as_str().map(str::to_owned))
+        .collect();
+    store.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "pick",
+        ChangeRequest::ConfigureBot {
+            bot: "Helper".into(),
+            name: None,
+            instructions: None,
+            model: None,
+            skills: Some(chosen),
+            all_skills: None,
+            avatar: None,
+            default_avatar: None,
+        },
+        Provider::Codex,
+        60,
+    )?;
+    let read = crate::runtime::agent_tools::read_bot(&store, &net.network, "Helper", 100)?;
+    assert_eq!(read["uses_all_skills"], json!(false));
+    assert_eq!(
+        listed(&read, "/skills", "skill_id"),
+        ids[..2].to_vec(),
+        "only those it uses"
     );
     Ok(())
 }
@@ -6287,29 +6316,51 @@ fn list_sessions_pages_every_session_with_the_version_a_hand_over_needs() -> Res
         !shown.contains(&json!("s00")),
         "the oldest falls out of the prompt"
     );
-    let sessions = store.attributed_sessions(&net.network, "c")?;
+    store.claim_session(
+        &net.a,
+        &net.network,
+        "d",
+        &Subject {
+            node: node.clone(),
+            agent: Some(Provider::Codex),
+            session_id: "theirs".into(),
+            cwd: "/work/project".into(),
+            summary: String::new(),
+            request_id: None,
+        },
+        60,
+    )?;
     let mut seen = Vec::new();
     let mut before = Value::Null;
     loop {
+        let sessions = store.attributed_sessions(&net.network, "c")?;
         let page = crate::runtime::agent_tools::list_sessions(
             &sessions,
             &json!({"before":before,"limit":7}),
         )?;
         let rows = page["sessions"].as_array().context("sessions")?.clone();
-        let last = rows.last().context("a page has rows")?;
-        before = json!({"node":last["node"],"session_id":last["session_id"]});
+        if before.is_null() {
+            let last = rows.last().context("a page has rows")?;
+            let version = last["version"].as_str().context("version")?;
+            let session = last["session_id"].as_str().context("session")?;
+            store.hand_over_session(&net.a, &net.network, "c", session, version, Some("d"), 70)?;
+        }
         seen.extend(rows);
         if page["more"] != true {
             break;
         }
+        before = page["next"].clone();
     }
     let ids: Vec<Value> = seen.iter().map(|row| row["session_id"].clone()).collect();
     let expected: Vec<Value> = (0..40).rev().map(|i| json!(format!("s{i:02}"))).collect();
-    assert_eq!(ids, expected, "every session once, newest first");
+    assert_eq!(
+        ids, expected,
+        "every session once, newest first, though one moved between pages"
+    );
     let oldest = seen.last().context("oldest")?;
     let version = oldest["version"].as_str().context("version")?;
     let (_, _, written) =
-        store.hand_over_session(&net.a, &net.network, "c", "s00", version, Some("d"), 60)?;
+        store.hand_over_session(&net.a, &net.network, "c", "s00", version, Some("d"), 80)?;
     assert!(
         written.is_some(),
         "a session left out of the prompt is handed over"

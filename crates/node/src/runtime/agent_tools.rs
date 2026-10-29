@@ -805,28 +805,23 @@ pub(crate) fn read_bot(
     )
 }
 
-/// `list_sessions`: a page of the sessions this bot follows, newest first, after the one
-/// `before` names by node and session_id.
+/// `list_sessions`: a page of the sessions this bot follows, newest first, older than the
+/// `before` a previous page returned as `next`. The cursor is a session's rank, so a session
+/// handed over or muted between pages neither breaks the next page nor hides another.
 pub(crate) fn list_sessions(sessions: &[Value], args: &Value) -> Result<Value> {
-    let rows: Vec<Value> = sessions
+    let before = args["before"].as_str();
+    let older: Vec<&Value> = sessions
         .iter()
         .rev()
-        .map(crate::scheduler::session_row)
+        .filter(|row| before.is_none_or(|before| row["rank"].as_str() < Some(before)))
         .collect();
-    let start = match args["before"].as_object() {
-        Some(before) => {
-            rows.iter()
-                .position(|row| {
-                    Some(&row["node"]) == before.get("node")
-                        && Some(&row["session_id"]) == before.get("session_id")
-                })
-                .context("before names no session this bot follows")?
-                + 1
-        }
-        None => 0,
-    };
-    let (page, more) = page(&rows, start, args);
-    Ok(json!({"sessions":page,"more":more}))
+    let rows: Vec<Value> = older
+        .iter()
+        .map(|row| crate::scheduler::session_row(row))
+        .collect();
+    let (page, more) = page(&rows, 0, args);
+    let next = more.then(|| older[page.len() - 1]["rank"].clone());
+    Ok(json!({"sessions":page,"more":more,"next":next}))
 }
 
 /// Up to `limit` rows from `start` within `PAGE_BYTES`, and whether more follow.

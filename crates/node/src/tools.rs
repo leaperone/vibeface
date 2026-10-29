@@ -356,10 +356,8 @@ impl Tool {
                 &["node", "session_id", "version"],
             ),
             Tool::ListSessions => (
-                "List the user's coding sessions you follow, newest first, with the version hand_over_session takes; bot.sessions shows only the newest. before continues after the node and session_id of the previous page's last row; more says older ones remain.",
-                json!({"before":{"type":"object","properties":{"node":string(),"session_id":string()},
-                "required":["node","session_id"],"additionalProperties":false},
-                "limit":{"type":"integer","minimum":1,"maximum":50}}),
+                "List the user's coding sessions you follow, newest first, with the version hand_over_session takes; bot.sessions shows only the newest. more says older ones remain; pass the page's next as before to read them.",
+                json!({"before":string(),"limit":{"type":"integer","minimum":1,"maximum":50}}),
                 &[],
             ),
             Tool::ProposeProviderConfig => (

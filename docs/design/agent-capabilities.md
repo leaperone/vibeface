@@ -129,11 +129,11 @@ BotMessaged {
 - `skills`：启用的 skill `{skill_id, name, description}`，按名称排，以及 `skills_omitted`；`read_bot` 列出全部；
 - `schedules`：`{schedule_id, name, prompt（前 500 字节）, first_run_at_ms, every_minutes, enabled, next_run_at_ms}`，只列活动的，下次运行最早的在前，以及 `schedules_omitted`；`read_bot` 列出全部；
 - `memory`：`{memory_id, text}`，保留最新的，以及 `memory_omitted`；`recall` 列出全部；
-- `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，`before` 给上一页最后一行的 `{node, session_id}`；
-- `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；
+- `sessions`：它名下的外来会话 `{node, session_id, version, agent, cwd, summary, following}`，保留最新的，以及 `sessions_omitted`；`summary` 是会话第一次归给某个 bot 时最后说的一句，转交时沿用；`list_sessions {before?, limit?}` 从新到旧分页列出全部，带 `hand_over_session` 要的 `version`，还有更早的时返回 `next`，下一页把它作为 `before`；翻页途中转走或不再关注某个会话，不影响下一页；
+- `sent`：它发给其他 bot 的消息 `{message_id, to: {conversation_id, name}, text（前 500 字节）, created_at_ms}`，保留最新的，以及 `sent_omitted`，对方回信时能对上原来的问题；更早的不经工具读回；
 - `bots`：其他 bot 的 `{conversation_id, name}`，以及 `bots_omitted`；`list_bots` 列出全部。
 
-每个索引最多 3000 字节，展示时从旧到新。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
+每个索引最多 3000 字节。`memory`、`sessions` 和 `sent` 保留最新的，从旧到新展示；其余按上面的顺序保留前面的。整段提示词超过上限时，依次压缩工作、检查点和消息，仍超出再压缩这些索引，省略数照实计入 `_omitted`，不让回合失败。
 
 trigger 为 schedule 时带 `{schedule_id, name, prompt, every_minutes, reminder}`，`reminder` 表示深度大于 0、由 bot 自己定的提醒。bot 消息时带那条消息和发送者。
 
