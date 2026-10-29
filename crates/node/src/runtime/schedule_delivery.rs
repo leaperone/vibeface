@@ -40,7 +40,7 @@ impl Runtime {
                 }
                 let _work = node.maintenance.enter_when_open().await;
                 if let Err(error) = node.schedule_tick().await {
-                    tracing::warn!(%error, "durable scheduling reconciliation is pending");
+                    tracing::warn!(event = "schedule.reconcile_pending", %error, "durable scheduling reconciliation is pending");
                 }
             }
         });
@@ -51,7 +51,7 @@ impl Runtime {
                 tick.tick().await;
                 let _work = node.maintenance.enter_when_open().await;
                 if let Err(error) = node.fire_schedules().await {
-                    tracing::warn!(%error, "schedule runs are pending");
+                    tracing::warn!(event = "schedule.runs_pending", %error, "schedule runs are pending");
                 }
             }
         });
@@ -167,9 +167,14 @@ impl Runtime {
                 .catch_unwind()
                 .await;
             match result {
-                Ok(Err(error)) => tracing::warn!(%error, "conversation scheduling is pending"),
+                Ok(Err(error)) => {
+                    tracing::warn!(event = "schedule.drain_pending", %error, "conversation scheduling is pending")
+                }
                 Err(_) => {
-                    tracing::error!("conversation scheduler panicked; durable state retained")
+                    tracing::error!(
+                        event = "schedule.panicked",
+                        "conversation scheduler panicked; durable state retained"
+                    )
                 }
                 _ => {}
             }

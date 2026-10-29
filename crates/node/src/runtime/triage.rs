@@ -147,7 +147,7 @@ fn remember(
     if let Some(answer) = answer {
         outcome["answer"] = answer;
     }
-    tracing::info!(request = %request_id, origin = request.origin(), %decision, %by,
+    tracing::info!(event = "request.answered", request = %request_id, origin = request.origin(), %decision, %by,
         answered = sent.is_ok(), "held request answered");
     // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
     if answered.len() > 1024 {
@@ -428,7 +428,7 @@ impl Runtime {
             .await;
         match queued {
             Ok(mut result) if result["status"] == "accepted" && result["test"] != true => {
-                tracing::info!(request = %request_id, provider = event.agent.name(), ?kind,
+                tracing::info!(event = "request.held", request = %request_id, provider = event.agent.name(), ?kind,
                     "hook request held");
                 result["request_id"] = json!(request_id);
                 self.triage.wake.notify_one();
@@ -478,7 +478,11 @@ impl Runtime {
         crate::logging::add_private_path(Path::new(&event.cwd));
         let event = event.seal(&self.identity.device_id()?, config::UNNAMED_NODE, now_ms())?;
         if event.test {
-            tracing::info!(event_id = event.event_id, "triage test event received");
+            tracing::info!(
+                event = "triage.test_received",
+                event_id = event.event_id,
+                "triage test event received"
+            );
             return Ok(json!({"status":"accepted","event_id":event.event_id,"test":true}));
         }
         let network = self.network_id().await?;
@@ -587,12 +591,12 @@ impl Runtime {
         }
         .await
         .unwrap_or_else(|error| {
-            tracing::warn!(%error, request = %request_id, "could not look up the request's question");
+            tracing::warn!(event = "request.question_lookup_failed", %error, request = %request_id, "could not look up the request's question");
             None
         });
         if let Some(question) = standing {
             let closed = !question["closed"].is_null();
-            tracing::info!(request = %request_id, method = %handed.method, closed,
+            tracing::info!(event = "request.asked_again", request = %request_id, method = %handed.method, closed,
                 "App Server request asked again");
             if !closed {
                 request.question_id = question["question_id"].as_str().map(str::to_owned);
@@ -606,7 +610,7 @@ impl Runtime {
             }
             return;
         }
-        tracing::info!(request = %request_id, method = %handed.method,
+        tracing::info!(event = "request.received", request = %request_id, method = %handed.method,
             thread = ?handed.thread_id, "App Server request received");
         let session_id = request.session_id.clone();
         lock(&self.triage.requests).insert(request_id.clone(), request);
@@ -661,7 +665,7 @@ impl Runtime {
         };
         if !waiting {
             if let Err(error) = &queued {
-                tracing::warn!(%error, "App Server request could not reach the Agent");
+                tracing::warn!(event = "request.unrouted", %error, "App Server request could not reach the Agent");
             }
             let _ = self.answer_request(&request_id, None, "fallback").await;
             return;
@@ -797,7 +801,7 @@ impl Runtime {
         lock(&self.triage.requests).retain(|request_id, request| {
             let lost = matches!(request.reply, Reply::AppServer { .. });
             if lost {
-                tracing::info!(request = %request_id, method = request.origin(),
+                tracing::info!(event = "request.lost", request = %request_id, method = request.origin(),
                     "App Server request lost with its connection");
             }
             !lost
@@ -904,7 +908,7 @@ impl Runtime {
                     _ = node.triage.wake.notified() => {}
                 }
                 if let Err(error) = node.wake_agent().await {
-                    tracing::warn!(%error, "could not hand triage events to the Agent");
+                    tracing::warn!(event = "triage.wake_failed", %error, "could not hand triage events to the Agent");
                 }
             }
         });
@@ -913,10 +917,10 @@ impl Runtime {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 if let Err(error) = node.expire_requests().await {
-                    tracing::warn!(%error, "could not answer expired requests");
+                    tracing::warn!(event = "request.expire_failed", %error, "could not answer expired requests");
                 }
                 if let Err(error) = node.send_answered().await {
-                    tracing::warn!(%error, "could not tell the webhook about answers");
+                    tracing::warn!(event = "webhook.answers_failed", %error, "could not tell the webhook about answers");
                 }
             }
         });
@@ -924,7 +928,7 @@ impl Runtime {
         tokio::spawn(async move {
             loop {
                 if let Err(error) = node.deliver_webhooks().await {
-                    tracing::warn!(%error, "webhook delivery failed");
+                    tracing::warn!(event = "webhook.failed", %error, "webhook delivery failed");
                 }
                 let _ = tokio::time::timeout(Duration::from_secs(5), node.triage.outbox.notified())
                     .await;
@@ -935,7 +939,7 @@ impl Runtime {
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
                 if let Err(error) = node.scan_sources().await {
-                    tracing::warn!(%error, "session scan failed");
+                    tracing::warn!(event = "sessions.scan_failed", %error, "session scan failed");
                 }
                 tokio::time::sleep(SCAN_EVERY).await;
             }
@@ -1343,6 +1347,7 @@ impl Runtime {
             entry.record(status, now_ms());
             if entry.state == Delivery::Dead {
                 tracing::warn!(
+                    event = "webhook.dead",
                     event_id = entry.event_id,
                     error = error.or_else(|| status.map(|value| format!("HTTP {value}"))),
                     "webhook delivery dead-lettered"

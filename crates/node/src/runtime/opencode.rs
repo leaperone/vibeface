@@ -123,7 +123,11 @@ fn kill_orphan(pidfile: &Path) {
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
     if command.contains(" serve --hostname 127.0.0.1 --port ") {
-        tracing::info!(group, "stopping the opencode serve left by an earlier run");
+        tracing::info!(
+            event = "opencode.leftover_stopped",
+            group,
+            "stopping the opencode serve left by an earlier run"
+        );
         signal_group(group, libc::SIGKILL);
     }
     let _ = std::fs::remove_file(pidfile);
@@ -1304,12 +1308,13 @@ impl Executor for Opencode {
                     };
                     // The work runs now; its follower reads the turn back.
                     if let Err(error) = node.signal_work(network, id, signal).await {
-                        tracing::warn!(%error, work_id = id, "the opencode work waits for its probe");
+                        tracing::warn!(event = "opencode.work_update_pending", %error, work_id = id, "the opencode work waits for its probe");
                     }
                 }
                 Sent::Refused(failure) => return reject(failure).await,
                 Sent::Unknown(detail) => {
                     tracing::warn!(
+                        event = "opencode.send_unknown",
                         work_id = id,
                         detail,
                         "unknown whether opencode took the work"
