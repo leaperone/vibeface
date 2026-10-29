@@ -225,9 +225,19 @@ impl Runtime {
                 .work_record(original)?
                 .context("the work to continue is not on this device")?;
             ensure!(
-                original.conversation == spec.conversation && original.kind == spec.kind,
-                "a continuation keeps the original conversation and kind"
+                original.conversation == spec.conversation,
+                "a continuation keeps the original conversation"
             );
+            match original.kind {
+                _ if original.kind == spec.kind => {}
+                WorkKind::Agent(ran) => bail!(
+                    "work {} ran on {}; continue it with agent {} or leave agent out",
+                    original.work_id,
+                    ran.label(),
+                    ran.name()
+                ),
+                WorkKind::Task => bail!("a continuation keeps the original kind"),
+            }
         }
         ensure!(
             spec.kind == WorkKind::Task || spec.dispatcher == spec.target,
