@@ -741,6 +741,11 @@ const LATE_START_MS: i64 = 5 * 60_000;
 /// A due time found later than this (the device was off or asleep) is skipped, not run late.
 pub(crate) const MAX_LATE_MS: i64 = 10 * 60_000;
 
+/// How long a new owner leaves due times alone after the handover, so a former owner that has
+/// not seen it yet can still deliver the claim of a time it ran. Stays below `MAX_LATE_MS`, so
+/// a time due in this window still runs, only late.
+pub(crate) const TAKEOVER_GRACE_MS: i64 = 5 * 60_000;
+
 /// Which Node took a schedule's due time: of all claims the network holds, the one of the
 /// highest owner epoch, ties going to the smaller author.
 fn schedule_claim(

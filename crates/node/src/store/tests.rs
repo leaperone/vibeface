@@ -2380,6 +2380,84 @@ fn a_new_owner_leaves_times_due_before_the_handover_to_the_former_owner() -> Res
 }
 
 #[test]
+fn a_new_owner_waits_out_the_grace_before_taking_a_time_after_the_handover() -> Result<()> {
+    let net = net()?;
+    let every = 5 * 60_000;
+    let slot = 1_000 + 3 * every;
+    let handover = slot - 60_000;
+    let grace_over = handover + crate::store::scheduler::TAKEOVER_GRACE_MS;
+    assert!(grace_over < slot + every);
+
+    let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 5)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        handover,
+    )?;
+    let ran_unaware = vec![("c".to_owned(), schedule_trigger(&schedule_id, slot))];
+    assert_eq!(
+        a_side.admit_due_schedules(&net.a, &net.network, slot + 10)?,
+        ran_unaware,
+        "the former owner has not seen the handover and runs the time"
+    );
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, slot + 20)?
+            .is_empty(),
+        "the new owner waits instead of running the same time a second time"
+    );
+    sync(&a_side, &mut b_side, &net)?;
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, grace_over + 10)?
+            .is_empty(),
+        "the former owner's claim arrived within the grace, so the time is not run again"
+    );
+    assert!(b_side.scheduler_jobs("c")?.is_empty());
+    let next = slot + every;
+    assert_eq!(
+        b_side.admit_due_schedules(&net.b, &net.network, next + 10)?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, next))],
+        "after the grace the new owner runs times on time"
+    );
+    sync(&b_side, &mut a_side, &net)?;
+    assert!(
+        a_side
+            .admit_due_schedules(&net.a, &net.network, next + 20)?
+            .is_empty(),
+        "back in touch, the former owner does not run a time the new owner took"
+    );
+
+    let (_, mut b_side, schedule_id) = scheduled_on_both(&net, 5)?;
+    b_side.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        handover,
+    )?;
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, slot + 20)?
+            .is_empty()
+    );
+    assert_eq!(
+        b_side.admit_due_schedules(&net.b, &net.network, grace_over + 10)?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, slot))],
+        "no claim came from the former owner, so the new owner runs the time late, not never"
+    );
+    assert_eq!(
+        claim_winner(&b_side, &net, &schedule_id, slot)?,
+        (2, net.b.device_id()?)
+    );
+    Ok(())
+}
+
+#[test]
 fn a_skipped_late_time_is_not_run_by_the_next_owner() -> Result<()> {
     let net = net()?;
     let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 60)?;
