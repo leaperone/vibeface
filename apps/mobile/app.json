@@ -17,12 +17,21 @@
       "bundleIdentifier": "one.leaper.vibeface",
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "扫描加入二维码"
+        "NSCameraUsageDescription": "扫描加入二维码",
+        "NSLocalNetworkUsageDescription": "用于在局域网内直接连接你自己的电脑。",
+        "NSBonjourServices": [
+          "_vibeface._udp"
+        ]
       }
     },
     "android": {
       "package": "one.leaper.vibeface",
-      "softwareKeyboardLayoutMode": "resize"
+      "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+      ]
     },
     "plugins": [
       "expo-router",
