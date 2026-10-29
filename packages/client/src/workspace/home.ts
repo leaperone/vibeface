@@ -1,3 +1,4 @@
+import type { Link } from "../lib/link.ts"
 import type { BotRecord } from "./types.ts"
 
 type Home = { narrow: boolean; conversation?: string; bots: readonly BotRecord[]; current: string }
@@ -11,6 +12,15 @@ export function homeBot({ narrow, conversation, bots, current }: Home): BotRecor
   if (linked) return linked
   if (narrow) return null
   return bots.find((bot) => bot.conversation_id === current) ?? bots[0] ?? null
+}
+
+/**
+ * What a list with no bot rows shows: placeholders while the first read is on its way, an unreachable network once a
+ * connect attempt has failed (so a stopped Node never looks like an endless load), else no bots yet.
+ */
+export function emptyHome({ synced, link }: { synced: boolean; link: Link }): "loading" | "unreachable" | "empty" {
+  if (synced) return "empty"
+  return link.kind === "offline" || (link.kind === "connecting" && link.attempt > 0) ? "unreachable" : "loading"
 }
 
 /** Bots by their newest message, newest first; ones without messages keep their order at the end. */

@@ -80,7 +80,7 @@ type DeviceContextValue = {
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
@@ -180,7 +180,8 @@ function absorb(seen: Vector, vector: unknown) {
   for (const [author, seq] of Object.entries(vector as Vector)) if (typeof seq === 'number' && !(seen[author] >= seq)) seen[author] = seq
 }
 
-export function DeviceProvider({ platform, children }: { platform: Platform; children: ReactNode }) {
+/** `restart` mounts a fresh provider after a factory reset, so the app starts over as on first launch. */
+export function DeviceProvider({ platform, children, restart }: { platform: Platform; children: ReactNode; restart?(): void }) {
   const { self, page } = platform
   const { load, store, savedEntries, loadAuthenticated, resumeTargets, loadJoining, approvalPins, loadEntrances, loadWait } = deviceStore(platform.storage, self)
   const { Identity, createGenesis, governancePayload, inviteSigningPayload, joinCommit, openPackage, sealPackage, shortCode, ticketEncode, verifiedView, verifyAddress, verifyAuthentication, verifyRemoval, verifyState } = secureKit(platform.secure)
@@ -739,6 +740,18 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     identityRef.current = fresh; setIdentity(fresh)
     disconnect()
   }
+  /**
+   * Erases everything this device keeps and starts over at the welcome page. A device still in its network first tries
+   * leave() once, which neither retries nor re-signs; the erase goes ahead whatever that answers.
+   */
+  async function factoryReset() {
+    const { erase } = platform
+    if (!erase || !restart) throw new Error(`${self}不能恢复出厂设置。`)
+    if (ready?.isCurrent()) await leave().catch(() => {})
+    disconnect()
+    await erase()
+    restart()
+  }
   async function setManage(deviceId: string, manage: boolean) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId && item.kind === 'client')
@@ -1275,7 +1288,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },

@@ -197,6 +197,12 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     return initClient({ replaceLostKey: true })
   }
 
+  /** Deletes this device's key here and drops it from memory; the next initClient makes a new one. */
+  async function forgetClient() {
+    await keys.remove()
+    device = undefined; initializing = null
+  }
+
   async function sign(bytes: Uint8Array) {
     if (!device) await initClient()
     return keys.sign(bytes)
@@ -303,5 +309,5 @@ export function createTransport(secure: SecureApi, keys: DeviceKeys, dialLan?: L
     }
   }
 
-  return { initClient, replaceClient, signClient, parseJoinLink, connectDevice }
+  return { initClient, replaceClient, forgetClient, signClient, parseJoinLink, connectDevice }
 }

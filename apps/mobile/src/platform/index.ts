@@ -89,9 +89,11 @@ const lan: Lan = {
   names: nativeLan.names,
 }
 
+const transport = createTransport(secure, phoneKeys, nativeLan.dial)
+
 export const mobilePlatform: Platform = {
   secure,
-  transport: createTransport(secure, phoneKeys, nativeLan.dial),
+  transport,
   storage: { getItem: (key) => store.getString(key) ?? null, setItem: (key, value) => store.set(key, value) },
   outbox: {
     all: async () => store.getAllKeys().filter((key) => key.startsWith(outboxPrefix)).map((key) => JSON.parse(store.getString(key)!) as OutboxItem),
@@ -133,4 +135,8 @@ export const mobilePlatform: Platform = {
   },
   self,
   lan,
+  async erase() {
+    await transport.forgetClient()
+    store.clearAll()
+  },
 }
