@@ -3831,6 +3831,9 @@ pub(super) mod tests {
             (node.store.lock().await).accept_work(&node.identity, &network, earlier, now_ms())?;
             let own = json!({"thread":"t-claude","call_ref":"r5","title":"t","prompt":"p",
                 "agent":"claude"});
+            let crossed = json!({"thread":"t-claude","call_ref":"r7","title":"t","prompt":"p",
+                "agent":"codex"});
+            let crossed = node.tool(access.clone(), "track_work", crossed).await;
             let own = node.tool(access, "track_work", own).await;
             node.finish_manager_attempt(&attempt).await;
             let off = off.expect_err("claude executes no work here");
@@ -3840,7 +3843,7 @@ pub(super) mod tests {
             assert_eq!(only?["may_send"], true, "codex is the only executor");
             let foreign = foreign.expect_err("a session no Claude Code work ran in");
             assert!(
-                format!("{foreign:#}").contains("sessions this device's works ran in"),
+                format!("{foreign:#}").contains("set agent to codex"),
                 "{foreign:#}"
             );
             assert_eq!(
@@ -3853,6 +3856,8 @@ pub(super) mod tests {
             assert!(
                 (on_thread.iter()).all(|run| run.kind == crate::model::WorkKind::Agent(Provider::Codex))
             );
+            let crossed = format!("{:#}", crossed.expect_err("Codex into a Claude Code session"));
+            assert!(crossed.contains("set agent to claude"), "{crossed}");
             // It goes on to Claude Code, which finds no directory for a session without one.
             let own = own?;
             assert_eq!(own["may_send"], false);

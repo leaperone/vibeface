@@ -1306,11 +1306,7 @@ impl Executor for Opencode {
                         .insert(session.clone());
                     let other = (node.store.lock().await.work_records_on_thread(&session)?)
                         .into_iter()
-                        .any(|run| {
-                            run.work_id != id
-                                && !run.state.finished()
-                                && !matches!(run.state, WorkState::Starting { .. })
-                        });
+                        .any(|run| run.work_id != id && !run.state.finished());
                     let claim = claimed.then(|| Claim(self, session.clone()));
                     if claim.is_none() || other || self.busy(&conn, &session, &directory).await? {
                         let failure = ExecFailure::new(
@@ -2307,6 +2303,43 @@ mod tests {
             1,
             "the running session got nothing more"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_work_not_known_to_be_sent_keeps_its_opencode_session() -> Result<()> {
+        let place = Place::new().await?;
+        let (node, network) = node(&place).await?;
+        let (conn, _serving) = node.opencode.conn().await?;
+        let cwd = place.dir.join("work").display().to_string();
+        let created = node.opencode.create(&conn, &cwd).await;
+        let session = created.map_err(|failure| anyhow::anyhow!(failure.detail))?;
+        let unsure = WorkSpec {
+            thread: Some(session.clone()),
+            ..spec(&node.identity.device_id()?, &place, "do it")
+        };
+        let second = WorkSpec {
+            work_id: "w-2".into(),
+            call_ref: "w-2".into(),
+            ..unsure.clone()
+        };
+        for work in [&unsure, &second] {
+            let mut store = node.store.lock().await;
+            store.accept_work(&node.identity, &network, work.clone(), now_ms())?;
+        }
+        let args = json!({"model":"fake/m"});
+        let opencode = node.opencode.clone();
+        opencode
+            .start(&node, &network, &second, Some(&session), &args)
+            .await?;
+        let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
+        assert_eq!(
+            refused.state,
+            WorkState::Finished {
+                outcome: WorkOutcome::Rejected
+            }
+        );
+        assert!(place.prompts().is_empty(), "nothing went into the session");
         Ok(())
     }
 

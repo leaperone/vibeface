@@ -537,17 +537,19 @@ impl Runtime {
         // The Codex App Server runs every turn of its threads itself. Another provider's session
         // may be open in a program the Node does not see, so it takes work only in a session one
         // of its works on this device ran in.
-        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind)
-            && provider != Provider::Codex
-        {
-            let ran = self.ran_on(network, thread).await?;
-            ensure!(
-                ran == Some(provider),
-                "{} takes work only in sessions this device's works ran in; this one is {}'s, so set agent to {} or leave agent out",
-                provider.label(),
-                ran.unwrap_or(Provider::Codex).label(),
-                ran.unwrap_or(Provider::Codex).name()
-            );
+        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
+            match self.ran_on(network, thread).await? {
+                Some(ran) if ran != provider => bail!(
+                    "this device's {} works ran in this session; set agent to {} or leave agent out",
+                    ran.label(),
+                    ran.name()
+                ),
+                None if provider != Provider::Codex => bail!(
+                    "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
+                    provider.label()
+                ),
+                _ => {}
+            }
         }
         let spec = WorkSpec {
             work_id,
