@@ -33,7 +33,7 @@ const Fade = withUniwind(Animated.View)
  * Questions sit right before the first message written after them, tasks and changes right after the message that caused
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
-function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, botId: string): Entry[] {
+function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, botId: string, offline: boolean): Entry[] {
   const rows: Entry[] = [...extras.first]
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
@@ -63,7 +63,7 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
   rows.push(...extras.rest)
   if (chat.replying && !chat.messages.some((message) => message.state === 'streaming')) rows.push({
     key: 'activity',
-    node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace botId={botId} mood="thinking" size={24} /><Text className="text-meta text-muted-foreground">{chat.status ?? '思考中'}</Text></Fade>,
+    node: <Fade entering={fadeIn} accessibilityRole="progressbar" className="min-h-7 flex-row items-center gap-2"><BotFace botId={botId} mood={offline ? 'asleep' : 'thinking'} size={24} /><Text className="text-meta text-muted-foreground">{chat.status ?? '思考中'}</Text></Fade>,
   })
   if (extras.cards.length) rows.push({ key: 'waiting-on-you', node: <View className="gap-3">{extras.cards}</View> })
   return rows.reverse()
@@ -119,7 +119,8 @@ export default function ChatScreen() {
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
   if (!bot || !id) return <EmptyState icon={Bot} title="没有这个 Bot" className="flex-1 justify-center" />
-  const blocked = workspace.connection.state === 'offline' ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
+  const offline = workspace.connection.state === 'offline'
+  const blocked = offline ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
   const send = () => {
     const { text, files } = draft
     setDraft({ text: '', files: [] })
@@ -129,7 +130,7 @@ export default function ChatScreen() {
     list.current?.scrollToOffset({ offset: ios ? -Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) : 0, animated: true })
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
-  const rows = chat ? entries(chat, extras, bot.bot_id) : []
+  const rows = chat ? entries(chat, extras, bot.bot_id, offline) : []
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const tint = botTint(faceOf(bot.bot_id).hue, theme === 'dark')
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
@@ -143,14 +144,14 @@ export default function ChatScreen() {
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerTitle: () => <ScreenFaces><Link href={`/b/${bot.bot_id}/about`} asChild>
-        <Pressable accessibilityRole="button" accessibilityLabel={`${bot.name}，Bot 信息`} className="min-h-11 shrink flex-row items-center gap-2">
-          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={28} />
+        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 rounded-lg px-2 active:bg-muted">
+          <BotFace botId={bot.bot_id} mood={offline ? 'asleep' : botMood(bot, workspace, live)} size={28} />
           <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
         </Pressable>
       </Link></ScreenFaces>,
     }} />
-    <View className="flex-1">
+    <ScreenFaces><View className="flex-1">
     {/* Always mounted, so the first message sent with the keyboard open lands in the keyboard-aware list. */}
     <FlatList
       ref={list}
@@ -165,11 +166,11 @@ export default function ChatScreen() {
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
       ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
-      renderItem={({ item }) => 'message' in item ? <Message message={item.message} botId={bot.bot_id} last={item.last} offline={workspace.connection.state === 'offline'} /> : <>{item.node}</>}
+      renderItem={({ item }) => 'message' in item ? <Message message={item.message} botId={bot.bot_id} last={item.last} offline={offline} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <ScreenFaces><BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={96} halo={tint.glow} /></ScreenFaces>
+        <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={96} halo={tint.glow} />
         <View className="items-center gap-1">
           <Text role="heading" className="text-center text-heading font-semibold">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <View className="flex-row items-center gap-1">
@@ -186,7 +187,7 @@ export default function ChatScreen() {
         </>}
       </View>
     </Animated.View>}
-    </View>
+    </View></ScreenFaces>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
