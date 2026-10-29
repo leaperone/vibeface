@@ -221,19 +221,20 @@ impl Provider {
 
     /// Refuses what a dispatch's `args` ask of a work on this provider that it cannot do.
     pub fn check_work(self, args: &Value) -> Result<()> {
-        let fields: [(&str, fn(WorkCapabilities) -> bool); 2] =
-            [("images", |can| can.images), ("effort", |can| can.effort)];
-        for (field, can) in fields {
+        let can = self.work();
+        for (field, taken, takers) in [
+            ("images", can.images, Provider::executing(|can| can.images)),
+            ("effort", can.effort, Provider::executing(|can| can.effort)),
+        ] {
             let asked = match &args[field] {
                 Value::Null => false,
                 Value::Array(items) => !items.is_empty(),
                 _ => true,
             };
             ensure!(
-                !asked || can(self.work()),
-                "{} work takes no {field}; leave {field} out, or set agent to one of {:?}",
-                self.label(),
-                Provider::executing(can)
+                !asked || taken,
+                "{} work takes no {field}; leave {field} out, or set agent to one of {takers:?}",
+                self.label()
             );
         }
         Ok(())
