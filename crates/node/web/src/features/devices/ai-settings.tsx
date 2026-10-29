@@ -250,17 +250,17 @@ const roles = {
 
 /**
  * A chip that turns one use of a provider on or off: its icon tells the two apart, a small switch says it is a control, not a status,
- * and on, the chip is also tinted so a phone without hover still reads it. A phone shows the icon and switch alone; the words stay in the name.
+ * and on, the chip is also tinted so a phone without hover still reads it.
  * Never solid, so the page's own next step stays the only filled button.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint, icon: Icon } = roles[role]
   return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
-    className={cn("rounded-full max-sm:px-2.5", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
+    className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
     {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
     <span aria-hidden="true" className={cn("relative h-3.5 w-6 shrink-0 rounded-full transition-colors", pressed ? "bg-brand" : "bg-muted-foreground/75")}>
       <span className={cn("absolute top-0.5 left-0.5 size-2.5 rounded-full bg-background transition-transform", pressed && "translate-x-2.5")} />
-    </span><span className="max-sm:sr-only">{label}</span>
+    </span>{label}
   </Button>
 }
 
@@ -472,7 +472,7 @@ function Folders({ roots, suggested, display, busy, save }: { roots: string[]; s
       <Plus aria-hidden="true" />{label}
     </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">
-      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder="~/projects" value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
+      <Input aria-label="文件夹路径" className="min-w-0 font-mono" placeholder={roots.length || suggested.length ? "其他文件夹" : "~/projects"} value={folder} disabled={busy} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); add() } }} />
       <Button type="button" variant="outline" disabled={busy || !folder.trim()} onClick={add}><Plus aria-hidden="true" />添加</Button>
     </div>
     </div>
