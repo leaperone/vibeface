@@ -110,7 +110,8 @@ export function joinCommit(joiner: string, joinerNonce: string): string /*throws
     }
 
 /**
- * Opens one client stream to the Node `device_id` at `addrs` (`ip:port`) within `timeout_ms`.
+ * Opens one client stream to the Node `device_id` at `addrs` (`ip:port`); dialing it, not
+ * binding this device's endpoint the first time, must finish within `timeout_ms`.
  */
 export async function lanConnect(deviceId: string, addrs: Array<string>, timeoutMs: number, asyncOpts_?: { signal: AbortSignal }): Promise<LanStreamLike> /*throws*/ {
     const __stack = uniffiIsDebug ? new Error().stack : undefined;
@@ -1390,7 +1391,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_join_commit() !== 48575) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_join_commit");
     }
-    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 62811) {
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 2627) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_connect");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches() !== 57767) {
