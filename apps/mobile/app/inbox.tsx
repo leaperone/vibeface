@@ -1,8 +1,8 @@
-import { Link } from 'expo-router'
+import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, Inbox as InboxIcon } from 'lucide-react-native'
+import { Bot, ChevronRight, CircleAlert, Copy, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef } from 'react'
-import { Pressable } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import Animated, { FadeIn, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
@@ -11,19 +11,30 @@ import { EmptyState } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { useWorkspace } from '@/data/context'
+import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import type { Question } from '@vibeface/client/workspace/types.ts'
+import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
 import { QuestionCard } from '@/features/chat/question-card'
+import { ConfirmCard } from '@/features/chat/work'
+import { JoinRequests } from '@/features/devices/join-requests'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
 
 const Group = withUniwind(Animated.View)
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMotion(ReduceMotion.System)
 
-/** A recovery to stop first, then questions nobody answered, grouped by bot; each group names its bot once and leads to its chat. */
+type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' }>
+const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles }
+
+/**
+ * The items the web lists: a recovery to stop first, cards to act on here, rows leading to where the rest is settled, join
+ * requests, then questions nobody answered, grouped by bot; each group names its bot once and leads to its chat.
+ */
 export default function Inbox() {
-  const workspace = useWorkspace()
+  const items = useInbox()
   const device = useDevice()
+  const shared = useLive()
   const wide = useWide()
   const bar = useHeaderHeight()
   const insets = useSafeAreaInsets()
@@ -31,8 +42,8 @@ export default function Inbox() {
   // Groups order by the newest question each bot has shown here. Answered questions leave the list, so the time is kept
   // and only rises: answering never reshuffles the groups, and only a new question lifts its bot to the top.
   const latest = useRef(new Map<string, number>()).current
-  const groups = new Map<string, typeof workspace.questions>()
-  for (const question of workspace.questions.filter((item) => item.answer === null).sort((a, b) => b.created_at_ms - a.created_at_ms)) {
+  const groups = new Map<string, Question[]>()
+  for (const question of items.flatMap((item) => item.kind === 'question' ? [item.question] : []).sort((a, b) => b.created_at_ms - a.created_at_ms)) {
     const key = question.bot?.bot_id ?? ''
     latest.set(key, Math.max(latest.get(key) ?? 0, question.created_at_ms))
     groups.set(key, [...groups.get(key) ?? [], question])
@@ -44,8 +55,12 @@ export default function Inbox() {
   const below = Math.max(0, frame.height - bar - insets.bottom - 56)
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
   return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
-    {device.pendingRecovery ? <RecoveryPendingCard /> : null}
-    {device.rotateHint ? <RotateHintCard /> : null}
+    {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
+      : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
+      : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
+      : item.kind === 'write' || item.kind === 'undelivered' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
+      : null)}
+    {items.some((item) => item.kind === 'join') ? <JoinRequests /> : null}
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
       {questions[0].bot ? <Link href={`/b/${questions[0].bot.bot_id}`} replace={wide} asChild>
         <Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-1 self-start">
@@ -53,8 +68,26 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : device.pendingRecovery || device.rotateHint ? null : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
+    </Group>) : items.length ? null : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
       <EmptyState icon={InboxIcon} title="没有要你决定的事" />
     </Animated.View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
+}
+
+/** Where a row leads on the phone; the phone cannot settle a copied or read-only computer, so that row only says it. */
+function rowHref(item: Row, chat: string | undefined, entry: string | undefined): Href | null {
+  if (item.kind === 'attention') return `/b/${item.bot.bot_id}`
+  if (item.kind === 'undelivered') return chat ? `/b/${chat}` : null
+  if (item.kind === 'setup') return !item.device || item.device === entry ? '/ai' : `/device/${item.device}`
+  return null
+}
+
+function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replace: boolean }) {
+  const row = <View className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
+    <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className="size-5 text-warning" />
+    <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{item.title}</Text>
+    {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
+    {href ? <Icon as={ChevronRight} className="size-4 text-muted-foreground" /> : null}
+  </View>
+  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className="active:opacity-70">{row}</Pressable></Link> : row
 }

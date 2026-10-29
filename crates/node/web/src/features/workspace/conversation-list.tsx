@@ -1,12 +1,15 @@
 import { Link } from "@tanstack/react-router"
 import { Bot, Plus, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
-import { BotAvatar, CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/kit"
+import { CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/kit"
+import { BotFace, botMood } from "@/components/app/bot-face"
+import { moodLabel } from "@vibeface/client/avatar/mood.ts"
 import { Button } from "@/components/ui/button"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
+import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { terms } from "@/lib/glossary"
 import { openQuestions } from "@vibeface/client/workspace/questions.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
@@ -15,7 +18,7 @@ import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
-  const open = useInbox().filter((item) => !item.done)
+  const open = waitingItems(useInbox())
   const questions = openQuestions(workspace.questions)
   const now = Date.now()
   const bots = byRecent(workspace.bots)
@@ -23,18 +26,18 @@ export function ConversationList() {
   if (bots.length) list = <ul className="grid gap-0.5">{bots.map((bot) => {
     const notes = workspace.notifications.filter((item) => item.conversation_id === bot.conversation_id)
     const unread = notes.length + questions.filter((item) => item.conversation_id === bot.conversation_id && !(item.question_id in workspace.answered)).length
-    const last = bot.last_message
+    const last = bot.last_message, mood = botMood(bot, workspace)
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
-      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" className="size-11 rounded-xl" />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
-        name={bot.name} mark={workspace.primary === bot.conversation_id ? <PrimaryMark /> : null} />
+      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace botId={bot.bot_id} mood={mood} size={44} />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
+        name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</>} />
     </li>
   })}</ul>
   else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
   else if (!workspace.synced) list = <div className="grid gap-2" aria-hidden="true">{[0, 1, 2].map((item) => <Skeleton key={item} className="h-16 rounded-xl" />)}</div>
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
-    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? (workspace.synced ? "没有待处理" : "")} />
+    <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? ""} />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
@@ -54,10 +57,10 @@ function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }:
         <span className="flex min-w-0 flex-1 items-center gap-1.5"><span className="min-w-0 truncate font-medium">{name}</span>{mark}</span>
         {time ? <span className="shrink-0 text-meta text-muted-foreground tabular-nums">{time}</span> : null}
       </span>
-      <span className="flex min-w-0 items-center gap-2">
+      {preview || unread ? <span className="flex min-w-0 items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-meta text-muted-foreground">{preview}</span>
         {unread ? <CountBadge count={unread} label={`${unread} 条未读`} /> : null}
-      </span>
+      </span> : null}
     </span>
   </Link>
 }

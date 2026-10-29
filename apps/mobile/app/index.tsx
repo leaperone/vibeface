@@ -3,9 +3,12 @@ import { useHeaderHeight } from 'expo-router/react-navigation'
 import { MessageSquare, Plus, Settings } from 'lucide-react-native'
 import { View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
+import { ConnectionMenu } from '@/components/connection-pill'
+import { ScreenFaces } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
+import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import { HomeList } from '@/features/home/list'
 import { useWide } from '@/lib/layout'
@@ -13,6 +16,7 @@ import { useWide } from '@/lib/layout'
 /** The phone's home; on a wide window the list lives in the sidebar and this pane only waits for a choice. */
 export default function Home() {
   const wide = useWide()
+  const workspace = useWorkspace()
   const bar = useHeaderHeight()
   const frame = useSafeAreaFrame()
   const insets = useSafeAreaInsets()
@@ -25,12 +29,12 @@ export default function Home() {
   return <>
     <Stack.Screen options={{
       headerShown: true,
+      headerLeft: () => <ConnectionMenu connection={workspace.connection} />,
       headerRight: () => <View className="flex-row">
         <Link href="/new-bot" asChild><Button variant="ghost" size="icon" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
         <Link href="/settings" asChild><Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} /></Button></Link>
       </View>,
     }} />
-    {/* The list fills only what shows below the bar, so the connection footer rests at the bottom rather than past it. */}
-    <HomeList minHeight={Math.max(0, frame.height - bar - insets.bottom)} />
+    <ScreenFaces><HomeList minHeight={Math.max(0, frame.height - bar - insets.bottom)} /></ScreenFaces>
   </>
 }

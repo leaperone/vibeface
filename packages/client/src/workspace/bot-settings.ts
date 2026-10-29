@@ -1,5 +1,27 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotChangeRecord, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+import { projectName } from "./questions.ts"
+import type { BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, ScheduleView } from "./types.ts"
+
+/** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
+export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const
+
+/** A bot's project folder by its name; the device is named too when it is not the one running the bot. */
+export function projectPlace(project: BotProject, owner: string | null | undefined, deviceName: (deviceId: string) => string): string {
+  const folder = projectName(project.cwd)
+  return project.target_node === owner ? folder : `${deviceName(project.target_node)} · ${folder}`
+}
+
+export type ProjectChoice = { key: string; project: BotProject; label: string }
+export const projectKey = (project: BotProject) => JSON.stringify([project.target_node, project.cwd])
+
+/** The folders a bot can work in: each folder of an online device that runs bots, named with its device. */
+export function projectChoices(nodes: readonly NodeInfo[], deviceName: (node: NodeInfo, index: number) => string): ProjectChoice[] {
+  return nodes.flatMap((node, index) => node.revoked || !node.online || !node.capabilities?.manager ? []
+    : (node.capabilities.roots ?? []).map((cwd) => {
+      const project = { target_node: node.device_id, cwd }
+      return { key: projectKey(project), project, label: `${deviceName(node, index)} · ${projectName(cwd)}` }
+    }))
+}
 
 /**
  * Where a new bot's folder gets set up when none is offered. Folders come only from devices that run a bot (`add`), and a
@@ -108,9 +130,10 @@ export function scheduleName(scheduleId: string, bot: BotSettings | undefined, c
 
 /**
  * Where each turn's changes show: after the last reply to the person's message, else after that message.
- * Changes whose message is not on screen come back as `rest`, oldest first.
+ * A turn whose message is in another chat, such as one bot changing another, sits after the last message before it,
+ * and `first` holds turns older than every message, oldest first.
  */
-export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to">[], changes: readonly BotChangeRecord[]) {
+export function placeChanges(messages: readonly Pick<TranscriptMessage, "message_id" | "role" | "in_reply_to" | "created_at_ms">[], changes: readonly BotChangeRecord[]) {
   const anchor = new Map<string, string>()
   for (const message of messages) {
     if (message.role === "user") anchor.set(message.message_id, message.message_id)
@@ -118,15 +141,15 @@ export function placeChanges(messages: readonly Pick<TranscriptMessage, "message
   }
   const turns = new Map<string, BotChangeRecord[]>()
   for (const record of changes) {
-    const cause = record.cause?.message_id ?? ""
+    const cause = record.cause?.message_id ?? record.change_id
     turns.set(cause, [...turns.get(cause) ?? [], record])
   }
-  const after = new Map<string, BotChangeRecord[]>()
-  const rest: BotChangeRecord[][] = []
+  const after = new Map<string, BotChangeRecord[][]>()
+  const first: BotChangeRecord[][] = []
   for (const [cause, items] of turns) {
-    const at = anchor.get(cause)
-    if (at) after.set(at, items)
-    else rest.push(items)
+    const at = anchor.get(cause) ?? messages.filter((message) => message.created_at_ms <= items[0].created_at_ms).at(-1)?.message_id
+    if (at) after.set(at, [...after.get(at) ?? [], items])
+    else first.push(items)
   }
-  return { after, rest }
+  return { after, first }
 }

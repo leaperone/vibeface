@@ -15,8 +15,8 @@ export type Session =
   | { phase: 'joining'; code: string | null }
   | { phase: 'ready' }
 
-/** A transcript message, or one this phone shows before the network holds it. */
-export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted' }
+/** A transcript message, or one this phone shows before the network holds it. `detail`: a failed reply's original error from the device. */
+export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' | 'interrupted'; detail?: string }
 
 /**
  * One bot's chat as the screen draws it. `status`: the live progress word while a reply runs.
@@ -36,8 +36,8 @@ export type Conversation = {
 /** A file picked for the next message. */
 export type Attachment = { uri: string; name: string; size: number | null; mimeType: string | null }
 
-/** `bot`: the device runs a bot right now, so removing it stops that bot. */
-export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean; current: boolean; entry: boolean; bot: boolean }
+/** `bot`: the device runs a bot right now, so removing it stops that bot. `online`: known for computers only. */
+export type Member = { device_id: string; name: string; kind: 'node' | 'client'; admin: boolean; online: boolean | undefined; current: boolean; entry: boolean; bot: boolean }
 
 type WorkspaceSnapshot = {
   session: Session
@@ -62,7 +62,8 @@ export type WorkspaceActions = {
   send(conversationId: string, text: string, attachments: Attachment[]): Promise<void>
   stop(conversationId: string): Promise<void>
   answer(question: Question, text: string): Promise<AnswerResult>
-  disconnect(): void
+  /** Takes this phone out of the network; coming back takes a join link. */
+  leave(): Promise<void>
 }
 
 export type Workspace = WorkspaceSnapshot & { actions: WorkspaceActions }

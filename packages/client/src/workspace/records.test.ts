@@ -60,19 +60,21 @@ test("pushed records update the network-wide lists for their conversation only",
     conversation_id: "chat", questions: [question("open", "chat"), question("done", "chat", { message_id: "a", text: "好", author: "b", created_at_ms: 2 }),
       { ...question("lost", "chat"), closed: "request_lost" }],
     notifications: [{ notification_id: "n2", kind: "question", text: "?", conversation_id: "chat" }],
-    last_message: { text: "hi", role: "assistant", created_at_ms: 5 },
+    last_message: { text: "hi", role: "assistant", created_at_ms: 5 }, busy: "replying",
   })
   const questions = mergeQuestions(parseQuestions({ questions: [question("old", "chat"), question("other", "other")] }), pushed)
   assert.deepEqual(questions.map((item) => item.question_id), ["other", "open"], "answered and closed ones leave the list")
   assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "other", questions: [] }).map((item) => item.question_id), ["open"])
   const notifications = mergeNotifications([{ notification_id: "n1", kind: "question", text: "", conversation_id: "chat" }, { notification_id: "x", kind: "question", text: "", conversation_id: "other" }], pushed)
   assert.deepEqual(notifications.map((item) => item.notification_id), ["x", "n2"])
-  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, event_hash: "", last_message: null }], pushed)
-  assert.equal(bots[0].last_message?.text, "hi")
+  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, event_hash: "", last_message: null, busy: null }], pushed)
+  assert.deepEqual([bots[0].last_message?.text, bots[0].busy], ["hi", "replying"])
+  const idle = mergeBots(bots, records({ conversation_id: "chat" }))
+  assert.deepEqual([idle[0].last_message?.text, idle[0].busy], ["hi", null], "a push without a message keeps the preview and still updates busy")
 })
 
 test("a work waits for confirmation only once its device cannot report it", () => {
-  const node = (online: boolean, codex_connected?: boolean): NodeInfo[] => [{ device_id: "worker", name: "", local: false, online, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [], codex_connected } }]
+  const node = (online: boolean, codex_connected?: boolean): NodeInfo[] => [{ device_id: "worker", name: "", local: false, online, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [], codex_connected } }]
   const running = records({ works: [work("w1")] }).works[0]
   assert.equal(confirmReason(running, []), null, "an unknown device is not judged")
   assert.equal(confirmReason(running, node(true, true)), null)
@@ -88,8 +90,8 @@ test("a work waits for confirmation only once its device cannot report it", () =
 
 test("works one offline device holds wait on one card; an unverified one keeps its own", () => {
   const nodes: NodeInfo[] = [
-    { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [] } },
-    { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [], codex_connected: false } },
+    { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [] } },
+    { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [], codex_connected: false } },
   ]
   const open = mergeOpenWorks([], records({ works: [
     work("w1"), work("w2", { state: "unverified", outcome: "unverified" }), work("w3", { target_node: "mac" }), work("w4"), work("w5", { target_node: "mac" }),

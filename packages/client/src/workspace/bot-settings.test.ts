@@ -59,22 +59,22 @@ test("schedule replies carry their schedule id", () => {
   assert.equal(scheduleTrigger(undefined), null)
 })
 
-const scheduleChange = (cause: string | null, name: string): BotChangeRecord => ({
-  change_id: `c-${cause}-${name}`, conversation_id: "chat", cause: cause === null ? null : { conversation_id: "chat", message_id: cause }, event_hash: `h-${cause}-${name}`, created_at_ms: 1,
+const scheduleChange = (cause: string | null, name: string, at = 1): BotChangeRecord => ({
+  change_id: `c-${cause}-${name}`, conversation_id: "chat", cause: cause === null ? null : { conversation_id: "chat", message_id: cause }, event_hash: `h-${cause}-${name}`, created_at_ms: at,
   change: { kind: "schedule", schedule_id: "r", before: null, after: { name, prompt: "p", first_run_at_ms: 0, every_minutes: 60, enabled: true } },
 })
 
-test("changes sit after the reply to their message, else after the message", () => {
+test("changes sit after the reply to their message, else after the message, else by time", () => {
   const messages = [
-    { message_id: "u1", role: "user" }, { message_id: "a1", role: "assistant", in_reply_to: "u1" },
-    { message_id: "u2", role: "user" },
+    { message_id: "u1", role: "user", created_at_ms: 10 }, { message_id: "a1", role: "assistant", in_reply_to: "u1", created_at_ms: 20 },
+    { message_id: "u2", role: "user", created_at_ms: 30 },
   ]
-  const first = scheduleChange("u1", "x"), second = scheduleChange("u1", "y"), third = scheduleChange("u2", "z"), lost = scheduleChange("gone", "w"), uncaused = scheduleChange(null, "v")
-  const { after, rest } = placeChanges(messages, [first, third, second, lost, uncaused])
-  assert.deepEqual(after.get("a1"), [first, second])
-  assert.deepEqual(after.get("u2"), [third])
-  assert.equal(after.has("u1"), false)
-  assert.deepEqual(rest, [[lost], [uncaused]])
+  const first = scheduleChange("u1", "x"), second = scheduleChange("u1", "y"), third = scheduleChange("u2", "z"), lost = scheduleChange("gone", "w", 25), uncaused = scheduleChange(null, "v", 5), later = scheduleChange(null, "u", 35)
+  const placed = placeChanges(messages, [first, third, second, lost, uncaused, later])
+  assert.deepEqual(placed.after.get("a1"), [[first, second], [lost]])
+  assert.deepEqual(placed.after.get("u2"), [[third], [later]])
+  assert.equal(placed.after.has("u1"), false)
+  assert.deepEqual(placed.first, [[uncaused]])
   assert.equal(scheduleName("r", { skills: [], schedules: [], memory: [] }, [first, second]), "y")
   assert.equal(scheduleName("other", undefined), "定时任务")
 })
@@ -133,5 +133,5 @@ test("a bot lists its model per provider and its skills, null meaning every skil
   const bot = { bot_id: "b", conversation_id: "c", name: "Ops", instructions: "", event_hash: "h", last_message: null }
   const [all, some] = parseBots({ bots: [{ ...bot, models: {}, skills: null }, { ...bot, models: { cursor: "gpt-x" }, skills: ["s"] }] })
   assert.deepEqual([all?.models, all?.skills, some?.models, some?.skills], [{}, null, { cursor: "gpt-x" }, ["s"]])
-  assert.throws(() => parseBots({ bots: [{ ...bot, models: { claude: "x" }, skills: null }] }))
+  assert.throws(() => parseBots({ bots: [{ ...bot, models: { codex_sdk: "x" }, skills: null }] }))
 })

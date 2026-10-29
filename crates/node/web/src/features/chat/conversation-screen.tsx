@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from '@tanstack/react-router'
 import { ArrowDown, ArrowDownToLine, ArrowRightLeft, BellOff, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Crown, Laptop, Link2, ListChecks, LoaderCircle, MessageSquareOff, MessageSquareReply, Plus, RotateCcw, Send, Server, Unplug, WifiOff } from 'lucide-react'
-import { ActionCard, BotAvatar, Details, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { ActionCard, EmptyState, InlineError, PrimaryMark } from '@/components/app/kit'
+import { BotFace, botMood } from '@/components/app/bot-face'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
@@ -21,7 +22,7 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import './chat.css'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
@@ -57,7 +58,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const agentReady = workspace.nodes.some((node) => botReadiness(node) === 'ready')
+  const reach = botReach(workspace.nodes), agentReady = reach === 'ready'
   const unready = workspace.nodes.find((node) => botReadiness(node) === 'needs_setup')
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
@@ -110,19 +111,18 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Steering already went into the running reply; it only settles once that reply ends.
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
-  const entries: ChatEntry[] = []
+  const entries: ChatEntry[] = placedChanges.first.map(changeRow)
   const waiting: ChatEntry[] = []
   for (const message of threadReplies(data?.messages ?? [], merged)) {
     const start = entries.length
     for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
     const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
+    const detail = jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail
     if (schedule) {
       // A schedule run has no message of the person; its reply stands alone and the tasks it started follow it.
-      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes) })
+      entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
-    } else if (!folded.hidden.has(message.message_id)) entries.push(pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined))
-    const cause = jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail
-    if (cause) entries.push({ key: `cause:${message.message_id}`, node: <ReplyCause raw={cause} /> })
+    } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
       for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
@@ -132,14 +132,12 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
-    const turn = placedChanges.after.get(message.message_id)
-    if (turn) entries.push(changeRow(turn))
+    for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
     if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
   entries.push(...asides.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
   for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
-  for (const turn of placedChanges.rest) entries.push(changeRow(turn))
   if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
   for (const progress of live) entries.push(pendingRow({ message_id: progress.key, event_hash: progress.key, role: 'assistant', text: progress.text, created_at_ms: 0, state: 'streaming' }))
 
@@ -178,7 +176,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   ].filter(Boolean)
   if (cards.length) entries.push({ key: 'waiting-on-you', node: <div id="chat-waiting" className="grid scroll-mb-4 gap-3">{cards}</div> })
 
-  const managerOffline = workspace.nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager)
   const notice = !workspace.connectionOnline ? '离线，恢复后可发送'
     : workspace.readOnlyNotice ? workspace.readOnlyNotice
     : workspace.writeNotice ? '同步中，稍后可发送'
@@ -187,11 +184,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
   const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
-  const reason = composerHint({ ...gate, bot: agentReady ? 'ready' : managerOffline && !unready ? 'offline' : unready ? 'needs_setup' : 'none' })
+  const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)
   const setupDevice = unready?.device_id ?? ready?.entry.device_id
-  // A device that only needs setup is fixable now, so it comes before one that is offline.
-  const away = managerOffline && !unready
+  const away = reach === 'offline'
   const setupTo = away || !setupDevice ? '/devices' : '/devices/$deviceId'
   const canSetUp = ready?.principal.can_manage === true || ready?.principal.source === 'local_session'
 
@@ -208,16 +204,18 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     })
   }, [conversationId, data, messagePending])
   useEffect(() => { setSendError(null) }, [conversationId])
-  // Nothing pushes a device's bot readiness, so while no device can reply to an open bot, read it again every 10s.
+  // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
+  const awaiting = Boolean(bot) && awaitsDevice(reach), starting = reach === 'starting'
   useEffect(() => {
-    if (!bot || agentReady) return
-    const read = () => { if (latest.current.isCurrent()) void latest.current.refresh().catch(() => {}) }
+    if (!awaiting) return
+    // A read still running is left to finish, so a slow one never queues a follow-up that reports its failure.
+    const read = () => { if (latest.current.isCurrent() && !latest.current.refreshing) void latest.current.refresh().catch(() => {}) }
     read()
-    const timer = setInterval(read, 10000)
+    const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)
-  }, [Boolean(bot), agentReady])
+  }, [awaiting, starting])
 
   function clearSentDraft(id: string, sent: string) {
     setDrafts((current) => {
@@ -238,14 +236,15 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         key={conversationId}
         entries={entries}
         empty={bot ? <div className="mx-auto my-auto grid max-w-md justify-items-center gap-4 px-4 py-12 text-center">
-          <BotAvatar name={bot.name} primary={workspace.primary === bot.conversation_id} size="lg" />
+          <BotFace botId={bot.bot_id} mood={botMood(bot, workspace)} size={96} />
           <div className="grid justify-items-center gap-1">
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {needsSetup ? <>
+          {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
+            : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
-            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
+            {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>
               : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><Crown aria-hidden="true" className="size-4 shrink-0" />请在管理设备上设置</p>}
           </>
             : <div className="flex flex-wrap justify-center gap-2">
@@ -274,7 +273,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         }}
       >
         <InlineError error={sendError} className="basis-full" />
-        {needsSetup && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
+        {needsSetup && !starting && entries.length && !notice ? <Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot?.bot_id }} className="inline-flex items-center gap-0.5 font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11">去设置<ChevronRight aria-hidden="true" className="size-3.5" /></Link> : null}
       </PromptInput> : null}
     </section>
   )
@@ -353,11 +352,6 @@ function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot
     </p>
     <p className="line-clamp-3 min-w-0 max-w-[85%] whitespace-pre-wrap rounded-2xl border px-4 py-2 [overflow-wrap:anywhere] sm:max-w-[75%]" title={sent.text}>{sent.text}</p>
   </div>
-}
-
-/** The provider's own words behind a failed reply, folded under it. */
-function ReplyCause({ raw }: { raw: string }) {
-  return <Details className="-mt-2">{raw}</Details>
 }
 
 /** `retry`: sends the message again as a new one; only offered while it is the newest. */

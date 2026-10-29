@@ -1,18 +1,16 @@
-import { Laptop, Smartphone } from 'lucide-react-native'
 import { useEffect } from 'react'
 import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import type { JoinRequest } from '@vibeface/client/lib/node.ts'
+import { openJoins } from '@vibeface/client/workspace/inbox.ts'
+import { deviceIcon } from './device-icon'
 import { ActionCard, SafetyCode } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
 
 /** Requests an admin can still act on. */
-export function useOpenJoins(): JoinRequest[] {
-  const device = useDevice()
-  return device.ready?.principal.can_manage ? device.joins.filter((request) => request.status === 'pending' || request.status === 'confirming') : []
-}
+export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
 
 /**
  * Join requests waiting on an admin, compared by the safety code shown on both screens.
@@ -49,7 +47,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   const asking = request.status === 'pending' && !auto
   const allow = (manage: boolean) => run(manage ? 'admin' : 'allow', async () => { await device.approveJoin(request.join_id, manage); onAllowed?.(request.name || '新设备') })
-  return <ActionCard icon={request.kind === 'node' ? Laptop : Smartphone} tone="info" title={`${request.name || '新设备'} 想加入`} actions={<>
+  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false, entry: false })} tone="info" title={`${request.name || '新设备'} 想加入`} actions={<>
     <Button variant="ghost" className="min-h-11" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
     {asking ? <Button className="min-h-11" disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
       {request.kind === 'client' ? <Button variant="outline" className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理设备'}</Text></Button> : null}

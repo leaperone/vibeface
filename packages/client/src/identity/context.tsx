@@ -5,6 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
+import { onlyManagerText } from './copy.ts'
 import { spentInviteText } from '../lib/errors.ts'
 import { parseChanged } from '../lib/progress.ts'
 import type { ChangedEvent } from '../lib/progress.ts'
@@ -76,7 +77,7 @@ type DeviceContextValue = {
   /** Set on the local page of a removed Node, which alone may start it over. */
   removedLocally: boolean; rejoined: boolean; nodeJoining: NodeJoining | null
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
-  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
+  connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
@@ -214,6 +215,9 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
   const [joining, setJoining] = useState<Joining | null>(null)
   const [review, setReview] = useState<Review | null>(null)
   const [initialInvitation, setInitialInvitation] = useState('')
+  // A link is single-use: once a join request went out with it, 取消 or 断开 must not bring it back.
+  const spentLinks = useRef(new Set<string>())
+  const spend = (link: string) => { spentLinks.current.add(link); setInitialInvitation(current => current === link ? '' : current) }
   const [localSetup, setLocalSetup] = useState<LocalSetup | null>(null)
   const [removedFrom, setRemovedFrom] = useState<ConnectionEntry | null>(null)
   const [rejoined, setRejoined] = useState(false)
@@ -533,6 +537,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     try {
       for (;;) {
         const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        spend(linkText)
         if (reply.status === 'cancelled') return 'cancelled'
         if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
         if (reply.status === 'joined') break
@@ -655,6 +660,41 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     await request('revoke', { event }); await refreshDirectory()
     for (const entry of savedEntries().filter(item => item.device_id === deviceId)) removeEntry(entry)
   }
+  /** Takes this device out of its network, then drops its key here: coming back is a join with a new key. */
+  async function leave() {
+    const connection = ready
+    if (connection?.isCurrent() && connection.principal.source === 'local_session') { disconnect(); return }
+    if (!connection?.isCurrent()) throw new Error(`连上后才能断开${self}。`)
+    const request = scoped(), me = own().deviceId
+    const { entry: from, principal: { network_id: networkId } } = connection
+    const onlyManager = (cause: unknown) => /at least one management device/i.test(String(cause)) ? new Error(onlyManagerText(self)) : cause
+    const response = record(await request('directory'))
+    const verified = verifyState(response.state, networkId, nodeNow(response))
+    let event: Record<string, unknown>
+    try { event = JSON.parse(verified.governanceTemplate(me, JSON.stringify({ type: 'revoke', device_id: me, cutoff_seq: 0, cutoff_hash: null }))) }
+    catch (cause) { throw onlyManager(cause) }
+    finally { verified.free() }
+    event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+    // The Node closes a removed device's channel, which can beat the reply; that close must not reconnect.
+    const target = reconnect.current; reconnect.current = null
+    try { await request('revoke', { event }) }
+    catch (cause) {
+      if (connection.isCurrent()) { reconnect.current = target; throw onlyManager(cause) }
+      // Whether it landed is unknown: a fresh connection asks the Node, and nothing is signed again.
+      const unconfirmed = () => { const failure = new Error(`${self}断开的结果还没确认。连上后再看看。`); setError(failure.message); return failure }
+      let active: Session, auth: Record<string, unknown>
+      try { active = await open(from); auth = record(await callSession(active, 'authenticate', { network_id: networkId })) }
+      catch { throw unconfirmed() }
+      if (auth.revoked !== true) {
+        if (auth.principal === null) { resetConnection(); throw unconfirmed() }
+        await authenticate(auth, active, { kind: 'network', networkId })
+        throw cause
+      }
+    }
+    const fresh = publicIdentity(await replaceClient())
+    identityRef.current = fresh; setIdentity(fresh)
+    disconnect()
+  }
   async function setManage(deviceId: string, manage: boolean) {
     const connection = managing(), request = scoped()
     const member = directory?.members.find(item => item.device_id === deviceId && item.kind === 'client')
@@ -732,6 +772,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       let response: ReturnType<typeof parseJoinRequest>
       try { response = parseJoinRequest(await scoped(active)('join', { secret: link.secret, public_key: me, kind: 'client', name, commit: joinCommit(me, nonce) })) }
       finally { link.secret = '' }
+      spend(linkText)
       if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
       if (response.status === 'rejected' || response.status === 'expired') throw new Error(spentInviteText)
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
@@ -763,8 +804,6 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
       const state = record(await request('join_status', { join_id: pending.join_id })).state
       verifiedView(state, status.network_id).members.find(member => member.device_id === own().deviceId) ?? (() => { throw new Error(`加入结果没有包含${self}。`) })()
       await authenticate(await request('authenticate', { network_id: status.network_id }), active, { kind: 'network', networkId: status.network_id })
-      // The link is single-use; a later visit to the join screen starts empty.
-      setInitialInvitation('')
       return
     }
     if (status.status === 'rejected' || status.status === 'expired') {
@@ -777,7 +816,18 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     const next = { ...mine, status: status.status, code }
     joiningRef.current = next; setJoining(next)
   }
-  const cancelJoin = disconnect
+  /**
+   * Cancelling takes the request back at the entry so the manager's approval card goes away now, not at expiry.
+   * One withdraw over the live channel, never retried: a lost reply leaves the request to expire on its own.
+   */
+  const cancelJoin = useCallback(() => {
+    const pending = joiningRef.current, active = session.current
+    if (pending && active && entryKey(active.entry) === entryKey(pending.entry)) {
+      session.current = null
+      void active.channel.request('join_withdraw', { join_id: pending.join_id }).catch(() => {}).finally(() => active.channel.close())
+    }
+    disconnect()
+  }, [disconnect])
   async function createLocalNetwork(nameValue: string, password: string, nodeName?: string) {
     if (localSetup?.kind !== 'uninitialized') throw new Error('这台电脑已经设置过。请用加入链接或恢复文件。')
     const name = deviceName(nameValue)
@@ -1026,7 +1076,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     } finally { opened.release(); verified?.free() }
   }
   async function replaceLostKey() { const me = publicIdentity(await initClient({ replaceLostKey: true })); identityRef.current = me; setIdentity(me); setPhase('disconnected'); setError('') }
-  useEffect(() => page?.watchInvitation(invitation => { setInitialInvitation(invitation); setError('') }), [])
+  useEffect(() => page?.watchInvitation(invitation => { if (!spentLinks.current.has(invitation)) { setInitialInvitation(invitation); setError('') } }), [])
   useEffect(() => ready ? connectLogSink((records) => ready.request('log', { records })) : undefined, [ready])
   useEffect(() => {
     let mounted = true
@@ -1141,19 +1191,25 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     return () => clearInterval(timer)
   }, [recovery?.status])
   useEffect(() => {
-    if (!ready?.principal.can_manage) return
+    if (!ready) return
     // ponytail: any invalidation refreshes the directory and join list; filter on join events if this gets chatty.
-    // Join requests and recoveries are not pushed, so a manager also rereads them every 30s.
+    // Membership, recovery and join changes are pushed, including joins waiting on another member Node.
     const refresh = () => { void refreshDirectory().catch(() => {}) }
-    refresh()
-    const poll = setInterval(refresh, 30_000)
+    if (ready.principal.can_manage) refresh()
     let timer: ReturnType<typeof setTimeout> | undefined
     const stop = ready.subscribe(event => {
       if (event.type !== 'invalidate') return
       clearTimeout(timer); timer = setTimeout(refresh, 300)
     })
-    return () => { clearTimeout(timer); clearInterval(poll); stop() }
+    return () => { clearTimeout(timer); stop() }
   }, [ready])
+  useEffect(() => {
+    if (!joins.length) return
+    // A join expires on the Node's clock without a push; reread once the first one is due.
+    const due = Math.min(...joins.map(item => item.expires_at_ms)) - (Date.now() + nodeClockOffset)
+    const timer = setTimeout(() => { void refreshDirectory().catch(() => {}) }, Math.max(due + 1000, 5000))
+    return () => clearTimeout(timer)
+  }, [joins, nodeClockOffset])
   const recoveryOk = ready && load(`recovery-ok.${ready.principal.network_id}`)
   function setRotateHint(network: string, recoveryKey: string | null) { try { store(`rotate-hint.${network}`, recoveryKey) } catch {} setDismissals(count => count + 1) }
   const rotateHint = !!ready?.principal.can_manage && !!directory && load(`rotate-hint.${ready.principal.network_id}`) === directory.recovery_key
@@ -1162,7 +1218,7 @@ export function DeviceProvider({ platform, children }: { platform: Platform; chi
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.local === true, rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
     startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
     async downloadBackup() { if (!sensitive.current?.download) throw new Error('当前没有可下载的恢复文件。'); await sensitive.current.download() },
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },

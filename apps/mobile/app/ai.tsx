@@ -1,19 +1,21 @@
 import * as Clipboard from 'expo-clipboard'
-import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Asterisk, Bell, Bot, Braces, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
-import { EmptyState, toneText, type Tone } from '@/components/kit'
+import { Details, EmptyState, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
 import { Segmented } from '@/components/ui/segmented'
+import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
@@ -58,19 +60,12 @@ function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
   return { value, busy, error, call, load, setError }
 }
 
-const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
   starting: { label: '启动中', tone: 'neutral', icon: LoaderCircle },
   off: { label: '未使用', tone: 'neutral', icon: CircleDashed },
-}
-// Names come from runtime/settings.rs readiness.missing.
-const checks: Record<ProviderId, { key: string; label: string }[]> = {
-  codex: [
-    { key: 'Codex CLI', label: '缺少 Codex 命令行' },
-  ],
-  cursor: [{ key: 'Cursor SDK Bridge', label: '缺少 Cursor 组件' }],
 }
 
 const services: Record<string, string> = { CURSOR_API_KEY: 'Cursor', OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
@@ -116,7 +111,7 @@ function AiSettings() {
       error={error?.at === item.provider ? error.text : ''}
       change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
       saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
-    <PathList label="可用文件夹" items={roots} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
+    <PathList label="可用文件夹" items={roots} shown={response.display_paths} suggested={folderSuggestions(response)} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
     {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
 }
@@ -128,12 +123,11 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
   const manager = assistant ? response.settings.manager : null
-  const missing = assistant ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
-  const state = states[item.state === 'ready' && missing.length ? 'needs_setup' : item.state]
+  const state = states[item.state]
   const issue = item.state === 'needs_setup' ? item.issues[0] : undefined
   const [open, setOpen] = useState(false)
-  const [bin, setBin] = useState(item.bin ?? '')
-  useEffect(() => setBin(item.bin ?? ''), [item.bin])
+  const [bin, setBin] = useState(item.bin)
+  useEffect(() => setBin(item.bin), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
   return <View className="overflow-hidden rounded-xl border border-border">
     <View className="min-h-14 flex-row items-center gap-3 px-3 py-2">
@@ -143,28 +137,25 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
-      <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', { bot: !assistant })} />
-      {/* An empty slot keeps the bot toggle in the same column on providers that cannot run tasks. */}
-      {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : <View className="size-11" />}
     </View>
-    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 pb-2">
+    {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
+    {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
+    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 py-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
         ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
         : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
-    </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 pb-2">
-      <Icon as={CircleX} className="size-4 text-danger" /><Text className="shrink text-meta">{check.label}</Text>
-    </View>)}
+    </View> : null}
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-3 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
     </Pressable>
     {open ? <View className="gap-5 px-3 pb-3">
       {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
       {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
-      {item.bin !== null ? <Field label="程序">
-        <SaveRow value={bin} saved={item.bin ?? ''} placeholder="codex" mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
-      </Field> : null}
+      <Field label="程序">
+        <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
+      </Field>
       {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} working={working} save={saveAssistant} /> : null}
       <Variables item={item} working={working} change={change} />
       {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
@@ -180,11 +171,13 @@ const roles = {
 
 function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   const { label, hint, icon } = roles[role]
-  // While a save runs the toggles keep their look and ignore taps; the spinner says which one is changing.
-  return <Button variant={pressed ? 'outline' : 'ghost'} size="icon" className="size-11 rounded-full" accessibilityRole="switch" accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
-    accessibilityState={{ checked: pressed, disabled }} onPress={disabled ? undefined : onPress}>
-    <Icon as={busy ? LoaderCircle : icon} className={pressed ? undefined : 'text-muted-foreground'} />
-  </Button>
+  // A named row with a system switch, so on and off read at a glance. While a save runs the switches keep their look and
+  // ignore taps; the spinner says which one is changing.
+  return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-3">
+    <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
+    <Text className="min-w-0 flex-1">{label}</Text>
+    <Switch value={pressed} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)} onValueChange={disabled ? undefined : onPress} />
+  </View>
 }
 
 const modes: [AppServerMode, string, LucideIcon][] = [['system', '用已在运行的', Monitor], ['spawn', '自己启动', Play]]
@@ -226,12 +219,12 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   </Field>
 }
 
-const assistantFields = ['model', 'workspace', 'cursor_sdk_bin'] as const
+const assistantFields = ['model', 'workspace'] as const
 
-/** The bot's model, folder and programs, inside the settings of the provider it runs on. */
+/** The bot's model and folder, inside the settings of the provider it runs on. */
 function AssistantDetails({ manager, working, save }: { manager: ManagerSettings; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
-  const cursor = manager.provider === 'cursor_sdk'
+  const cursor = manager.provider === 'cursor'
   const dirty = assistantFields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Field key={key} label={label}>
     <Input accessibilityLabel={label} className={cn('h-11', key !== 'model' && 'font-mono')} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
@@ -240,8 +233,7 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
   return <View className="gap-3">
     <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
-    {field('workspace', 'Bot 工作文件夹')}
-    {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : null}
+    {field('workspace', folderLabels.botRun)}
     {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>
@@ -303,81 +295,98 @@ function Triage() {
   }
   const other = (outlet: Outlet): Outlet => outlet === 'both' ? 'record' : 'both'
   const { pending, delivered, dead } = settings.outbox
+  // Until a chat is connected there is nothing to forward, so only connecting shows.
+  const connected = Boolean(settings.webhook_url)
+  const connect = <>
+    <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
+    <View className="flex-row gap-2">
+      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '密钥，至少 16 个字符'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+      {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
+    </View>
+    <View className="flex-row flex-wrap items-center gap-2">
+      <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
+        onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
+        {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
+      </Button>
+      <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
+        setTest(null)
+        void call('test', 'test_webhook').then((result) => {
+          const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
+          if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
+        })
+      }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
+      {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
+    </View>
+    {pending + delivered + dead ? <View className="flex-row items-center gap-3">
+      {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
+        count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
+    </View> : null}
+  </>
   return <View className="gap-6">
-    <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
-      onChange={(value) => void save('default', { default_outlet: value })} />
-    <Field label="按文件夹另设">
-      <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
-        trailing={(prefix) => {
-          const project = config.projects.find((item) => item.prefix === prefix)!
-          const [, text] = outlets.find(([value]) => value === project.outlet)!
-          return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
-            onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
-        }}
-        onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
-    </Field>
-    <Field label="转发到外部聊天">
-      <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
-      <View className="flex-row gap-2">
-        <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '外部聊天密钥'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
-        {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
-      </View>
-      <View className="flex-row flex-wrap items-center gap-2">
-        <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
-          onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
-          {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
-        </Button>
-        <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
-          setTest(null)
-          void call('test', 'test_webhook').then((result) => {
-            const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
-            if (data) setTest({ ok: data.ok === true, text: data.ok ? `${data.status}` : data.error || `${data.status ?? '没有响应'}` })
-          })
-        }}><Icon as={busy === 'test' ? LoaderCircle : Zap} /><Text>测试</Text></Button>
-        {test ? <View className="flex-row items-center gap-1"><Icon as={test.ok ? CircleCheck : CircleX} className={cn('size-4', test.ok ? 'text-success' : 'text-danger')} /><Text className={cn('text-meta', test.ok ? 'text-success' : 'text-danger')}>{test.text}</Text></View> : null}
-      </View>
-      {pending + delivered + dead ? <View className="flex-row items-center gap-3">
-        {([[delivered, '已送达', CircleCheck, 'text-success'], [pending, '待重试', LoaderCircle, 'text-muted-foreground'], [dead, '失败', CircleX, 'text-danger']] as const).map(([count, text, icon, tone]) =>
-          count ? <View key={text} accessible accessibilityLabel={`${text} ${count}`} className="flex-row items-center gap-1"><Icon as={icon} className={cn('size-4', tone)} /><Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{count}</Text></View> : null)}
-      </View> : null}
-    </Field>
-    <Field label="让外部聊天代你回答">
-      <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
-      {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
-        <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
-      </View> : null}
-      {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-        <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
-        <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
-        <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
-      </View>)}
-      <View className="flex-row gap-2">
-        <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-        <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
-          const value = (result as { token?: unknown } | null)?.token
-          if (typeof value === 'string') { setToken(value); setLabel('') }
-        })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
-      </View>
-    </Field>
+    {connected ? <Segmented options={outlets.map(([value, label, icon]) => ({ value, label, icon }))} value={config.default_outlet} disabled={busy !== ''}
+      onChange={(value) => void save('default', { default_outlet: value })} /> : null}
+    {/* The two folds sit together as one list of extras under the choice above. */}
+    <View>
+      {connected ? <Details label="按文件夹另设" open={config.projects.length > 0}>
+        <PathList label="" items={config.projects.map((project) => project.prefix)} busy={busy !== ''}
+          trailing={(prefix) => {
+            const project = config.projects.find((item) => item.prefix === prefix)!
+            const [, text] = outlets.find(([value]) => value === project.outlet)!
+            return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
+              onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
+          }}
+          onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
+      </Details> : null}
+      {/* Folded as on the web once connected; until then connecting shows on its own. */}
+      {connected ? <Details label="外部聊天 · 已连接">
+        {connect}
+        <Details label="让外部聊天代你回答">
+          <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
+          {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
+            <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
+          </View> : null}
+          {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
+            <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
+            <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
+            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
+          </View>)}
+          <View className="flex-row gap-2">
+            <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
+            <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
+              const value = (result as { token?: unknown } | null)?.token
+              if (typeof value === 'string') { setToken(value); setLabel('') }
+            })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
+          </View>
+        </Details>
+      </Details> : <Field label="外部聊天">{connect}</Field>}
+    </View>
     {error ? <ErrorText error={error.text} /> : null}
   </View>
 }
 
-/** Folder paths with a remove button each and a field to add one; a long path keeps its last folder readable. */
-function PathList({ label, items, busy, trailing, onChange }: { label: string; items: string[]; busy: boolean; trailing?: (item: string) => ReactNode; onChange(next: string[]): void }) {
+/**
+ * Folder paths with a remove button each, one-tap folders the device found (`suggested`) and a field to add one; a long
+ * path keeps its last folder readable. `shown`: a path's `~/…` form.
+ */
+function PathList({ label, items, shown = {}, suggested = [], busy, trailing, onChange }: {
+  label: string; items: string[]; shown?: Record<string, string>; suggested?: { path: string; label: string }[]; busy: boolean; trailing?: (item: string) => ReactNode; onChange(next: string[]): void
+}) {
   const [path, setPath] = useState('')
   const add = () => { const next = path.trim(); setPath(''); if (next && !items.includes(next)) onChange([...items, next]) }
   const body = <>
     {items.map((item) => <View key={item} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
-      <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{item}</Text>
+      <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{shown[item] ?? item}</Text>
       {trailing?.(item)}
-      <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`移除 ${item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`移除 ${shown[item] ?? item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
     </View>)}
+    {suggested.length ? <View className="flex-row flex-wrap gap-2">{suggested.map((folder) => <Button key={folder.path} variant="outline" className="min-h-11" accessibilityLabel={`添加 ${folder.label}`} disabled={busy} onPress={() => onChange([...items, folder.path])}>
+      <Icon as={Plus} /><Text className="font-mono text-meta">{folder.label}</Text>
+    </Button>)}</View> : null}
     <View className="flex-row gap-2">
-      <Input accessibilityLabel="文件夹路径" placeholder="/path/to/project" autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
+      <Input accessibilityLabel="文件夹路径" placeholder={items.length || suggested.length ? '其他文件夹' : '~/projects'} autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
         returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />
       <Button variant="outline" className="min-h-11" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
     </View>

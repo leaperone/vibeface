@@ -447,7 +447,7 @@ def gatekeeper_test(root, scratch):
     cases = (
         ("accepted", [accepted], False, 0),
         ("pending-accepted", [pending, accepted], False, 0),
-        ("pending-exhausted", [pending] * 4, False, 3),
+        ("pending-exhausted", [pending] * 10, False, 3),
         ("other-status", [(2, pending[1])], False, 2),
         ("other-source", [(3, "fixture rejection")], False, 3),
         ("wrong-success-source", [(0, pending[1])], False, 1),
@@ -479,7 +479,9 @@ def gatekeeper_test(root, scratch):
                 print("source=" + source)
                 sys.exit(status)
             else:
-                assert tool == "sleep" and sys.argv[1:] == ["15"]
+                assert tool == "sleep" and len(sys.argv) == 2
+                with open(Path(os.environ["RUNNER_TEMP"]) / "sleeps", "a") as sleeps:
+                    sleeps.write(sys.argv[1] + "\\n")
             '''))
         stub.chmod(0o755)
         for tool in ("codesign", "spctl", "sleep"):
@@ -492,6 +494,10 @@ def gatekeeper_test(root, scratch):
             result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail"], input=script, env=environment, text=True, capture_output=True)
             assert result.returncode == expected, (name, result.returncode, result.stdout, result.stderr)
             assert int((case / "calls").read_text()) == len(assessments), name
+            sleeps = [int(line) for line in (case / "sleeps").read_text().split()] if (case / "sleeps").exists() else []
+            assert len(sleeps) == len(assessments) - 1 and sleeps == sorted(sleeps), (name, sleeps)
+            if name == "pending-exhausted":
+                assert 600 <= sum(sleeps) <= 900, ("waits long enough for Apple's ticket propagation", sleeps)
     print("Gatekeeper workflow control-flow self-tests passed; native assessment remains required")
 
 

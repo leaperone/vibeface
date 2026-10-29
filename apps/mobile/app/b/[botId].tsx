@@ -1,15 +1,17 @@
 import { Link, Stack, useFocusEffect, useLocalSearchParams } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, LoaderCircle } from 'lucide-react-native'
+import { Bot, Crown, LoaderCircle, MessageSquareOff } from 'lucide-react-native'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { FadeIn, ReduceMotion, useAnimatedStyle } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { starters } from '@vibeface/client/chat/protocol.ts'
-import { botReadiness } from '@vibeface/client/workspace/model.ts'
-import { botHue, botTint, EmptyState, Monogram } from '@/components/kit'
+import { faceOf } from '@vibeface/client/avatar/face.ts'
+import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { botMood, BotFace, ScreenFaces } from '@/components/bot-face'
+import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -31,7 +33,7 @@ const Fade = withUniwind(Animated.View)
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>): Entry[] {
-  const rows: Entry[] = []
+  const rows: Entry[] = [...extras.first]
   const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
@@ -85,19 +87,21 @@ export default function ChatScreen() {
   useEffect(() => id ? workspace.actions.open(id) : undefined, [id])
   const extras = useChatExtras(id ?? '', botId)
   const live = useLive()
-  // No device can run a bot at all: the entry device's AI settings set one up; an offline one only needs to come back.
-  const noAgent = Boolean(live && !live.nodes.some((node) => !node.revoked && node.capabilities?.manager))
-  // Nothing pushes a device's bot readiness, so while no device can reply and this chat is on screen, read it again every 10s.
+  const device = useDevice()
+  // As on the web: until a device can reply, the empty chat says so and points a manager at the AI settings instead of offering starters.
+  const reach = live ? botReach(live.nodes) : 'ready'
+  const canSetUp = device.ready?.principal.can_manage === true
+  // Nothing pushes a device's bot readiness, so while a device that could reply is not ready and this chat is on screen, read it again every 10s, or every 2s while it starts.
   const latestLive = useRef(live)
   latestLive.current = live
-  const replyReady = live?.nodes.some((node) => botReadiness(node) === 'ready') ?? true
+  const awaiting = live ? awaitsDevice(reach) : false, starting = reach === 'starting'
   useFocusEffect(useCallback(() => {
-    if (replyReady) return
-    const read = () => void latestLive.current?.refresh().catch(() => {})
+    if (!awaiting) return
+    const read = () => { if (latestLive.current && !latestLive.current.refreshing) void latestLive.current.refresh().catch(() => {}) }
     read()
-    const timer = setInterval(read, 10000)
+    const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)
-  }, [replyReady]))
+  }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
   // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is
@@ -125,8 +129,8 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras) : []
-  // The bot's hue carries from its monogram into the send button and starter chips, so each chat reads as that bot's.
-  const tint = botTint(botHue(bot.bot_id), theme === 'dark')
+  // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
+  const tint = botTint(faceOf(bot.bot_id).hue, theme === 'dark')
   // No background here: the screen paints it, and a painted view would come first natively and hide the list from scrollEdgeEffects.
   return <View className="flex-1">
     <Stack.Screen options={{
@@ -160,22 +164,23 @@ export default function ChatScreen() {
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
-        <Monogram name={bot.name} seed={bot.bot_id} hero />
+        <ScreenFaces><BotFace botId={bot.bot_id} mood={botMood(bot, workspace, live)} size={80} primary={workspace.primary === bot.conversation_id} /></ScreenFaces>
         <Text role="heading" className="text-center text-title font-semibold">{bot.name}</Text>
-        <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
+        {reach === 'ready' ? <View pointerEvents="box-none" className="flex-row flex-wrap justify-center gap-2">
           {starters[bot.project ? 'project' : 'general'].map((example) => <Button key={example} variant="outline" className="rounded-full" style={{ borderColor: tint.edge }} onPress={() => setDraft({ text: example })}><Text>{example}</Text></Button>)}
-        </View>
+        </View> : starting ? <View role="status" className="flex-row items-center gap-1.5"><Icon as={LoaderCircle} className="size-4 text-muted-foreground" /><Text className="text-muted-foreground">Bot 正在启动</Text></View> : <>
+          <View className="flex-row items-center gap-1.5"><Icon as={MessageSquareOff} className="size-4 text-muted-foreground" /><Text className="text-muted-foreground">Bot 还不能回复</Text></View>
+          {reach === 'offline' ? null : canSetUp ? <Link href="/ai" asChild>
+            <Button className="min-h-11"><Icon as={Bot} /><Text>设置运行 Bot 的设备</Text></Button>
+          </Link> : <View className="flex-row items-center gap-1.5"><Icon as={Crown} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">请在管理设备上设置</Text></View>}
+        </>}
       </View>
     </Animated.View>}
     </View>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
-          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint}>
-          {noAgent ? <Link href="/ai" asChild>
-            <Button variant="link" className="min-h-11 self-start px-2"><Text>去配置</Text></Button>
-          </Link> : null}
-        </Composer>
+          blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
       </View>
     </KeyboardStickyView>
   </View>

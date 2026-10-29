@@ -270,7 +270,7 @@ impl Client {
             params,
         };
         send_value(&mut self.socket, &mut self.channel, &request).await?;
-        tokio::time::timeout(CALL_TIMEOUT, async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let value: Value = serde_json::from_slice(
                     &receive_value(&mut self.socket, &mut self.channel).await?,
@@ -841,7 +841,7 @@ async fn dispatch(
                 "join key differs from this channel's device"
             );
             let request = node.store.lock().await.join(&join, &session.device_id)?;
-            notify_join(node, &request);
+            node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "join_status" => {
@@ -871,7 +871,7 @@ async fn dispatch(
                     .await
                     .join_status(join_id, &session.device_id, reveal)?;
             if reveal.is_some() {
-                notify_join(node, &request);
+                node.join_changed(&request.network_id);
             }
             let mut result = serde_json::to_value(&request)?;
             if request.status == JoinStatus::Joined {
@@ -888,7 +888,7 @@ async fn dispatch(
                 .lock()
                 .await
                 .withdraw_join(text(&params, "join_id")?, &session.device_id)?;
-            notify_join(node, &request);
+            node.join_changed(&request.network_id);
             Ok(serde_json::to_value(request)?)
         }
         "approve" => {
@@ -901,8 +901,10 @@ async fn dispatch(
                     .await
             }
         }
+        // A manager revokes any device; any client may revoke itself, which the history checks.
         "revoke" => {
-            let view = manager_view(node, session).await?;
+            let view = node.membership_state().await?.project()?;
+            view.client(&session.device_id)?;
             let event: GovernanceEvent = from_field(&params, "event")?;
             ensure!(
                 event.issuer == session.device_id
@@ -912,6 +914,10 @@ async fn dispatch(
             );
             let mut state = node.membership_state().await?;
             state.append(event)?;
+            ensure!(
+                state.project()?.members.iter().any(|m| m.manage),
+                LAST_MANAGER
+            );
             node.install_membership(state.clone()).await?;
             authentication(node, session).await
         }
@@ -1153,7 +1159,11 @@ fn stays(view: &AuthorizationView, node_id: &str) -> Result<()> {
 
 /// One approval step for a join this Node holds; `admin` is the authenticated manager, here or
 /// at the entry that forwarded it.
-pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) -> Result<Value> {
+pub(crate) async fn approve_join(
+    node: &Arc<Runtime>,
+    admin: &str,
+    params: &Value,
+) -> Result<Value> {
     let join_id = text(params, "join_id")?;
     let request = if params["reject"] == true {
         node.store.lock().await.reject_join(join_id, admin)?
@@ -1173,7 +1183,7 @@ pub(crate) async fn approve_join(node: &Runtime, admin: &str, params: &Value) ->
         node.install_membership(state.clone()).await?;
         request
     };
-    notify_join(node, &request);
+    node.join_changed(&request.network_id);
     Ok(serde_json::to_value(request)?)
 }
 
@@ -1194,13 +1204,6 @@ async fn pushed(node: &Runtime, network: &str, client: &str, payload: Value) -> 
             json!({"type":"changed","conversation_id":payload["conversation_id"]})
         }
     }
-}
-
-fn notify_join(node: &Runtime, request: &JoinRequest) {
-    let _ = node.events.send(crate::runtime::Update {
-        network_id: request.network_id.clone(),
-        payload: json!({"type":"join","join_id":request.join_id,"status":request.status}),
-    });
 }
 
 /// Reads membership; a member wins over a local cookie.
@@ -1847,6 +1850,22 @@ mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
 
+    /// The payload of the next push this client receives.
+    async fn next_push(client: &mut Client) -> Result<Value> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let value: Value = serde_json::from_slice(
+                    &receive_value(&mut client.socket, &mut client.channel).await?,
+                )?;
+                if value["type"] == "changed" {
+                    return Ok(value["payload"].clone());
+                }
+            }
+        })
+        .await
+        .context("no push arrived")?
+    }
+
     #[tokio::test]
     async fn delivery_requires_a_current_managing_member_and_does_not_create_a_wallet_for_free_use()
     -> Result<()> {
@@ -1991,7 +2010,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2077,7 +2096,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2167,7 +2186,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
-                cursor_sdk_bin: dir.join("missing-cursor-sdk"),
             }),
         };
         let refused = dispatch(
@@ -2183,7 +2201,8 @@ mod tests {
             "{refused}"
         );
         assert!(Config::load(&dir)?.manager.is_none());
-        let choose_cursor = json!({"provider":"cursor","bot":true});
+        let choose_cursor =
+            json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
         std::os::unix::fs::symlink(&project, &workspace)?;
         assert!(
             dispatch(
@@ -2206,7 +2225,7 @@ mod tests {
         .await?;
         assert!(workspace.is_dir());
         assert_eq!(
-            chosen["settings"]["manager"]["provider"], "cursor_sdk",
+            chosen["settings"]["manager"]["provider"], "cursor",
             "choosing the bot fills in the defaults"
         );
         assert_eq!(chosen["settings"]["manager"]["model"], "auto");
@@ -2240,7 +2259,7 @@ mod tests {
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
         assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
+        assert_eq!(saved["readiness"]["missing"], json!(["cursor"]));
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
@@ -2257,8 +2276,11 @@ mod tests {
             nodes["nodes"][0]["capabilities"]["roots"],
             json!([project.canonicalize()?])
         );
-        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
-        assert_eq!(nodes["nodes"][0]["capabilities"]["manager_ready"], false);
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor");
+        assert_eq!(
+            nodes["nodes"][0]["capabilities"]["manager_state"],
+            "needs_setup"
+        );
         let persisted = Config::load(&dir)?;
         assert_eq!(persisted.network.relays, latest.network.relays);
         assert_eq!(persisted.daily_decision_limit, 11);
@@ -2293,7 +2315,7 @@ mod tests {
         )
         .await?;
         let mut expected = saved["settings"].clone();
-        expected["manager"]["provider"] = json!("codex_sdk");
+        expected["manager"]["provider"] = json!("codex");
         expected["manager"]["model"] = json!("");
         assert_eq!(
             codex["settings"], expected,
@@ -2336,7 +2358,7 @@ mod tests {
         crate::logging::capture(&logs)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2406,7 +2428,7 @@ mod tests {
                 "{text}"
             );
         }
-        assert_eq!(read["settings"]["manager"]["provider"], "codex_sdk");
+        assert_eq!(read["settings"]["manager"]["provider"], "codex");
         let codex = &read["providers"][0];
         assert_eq!(codex["provider"], "codex");
         assert_eq!(codex["roles"], json!(["agent", "execution"]));
@@ -2507,7 +2529,6 @@ mod tests {
             json!({"provider":"cursor","execution":true}),
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
-            json!({"provider":"cursor","bin":"/fixture/cursor"}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
             assert!(
@@ -2524,7 +2545,7 @@ mod tests {
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
-        assert!(!node.providers().switches.execution);
+        assert!(node.providers().switches.execution.is_empty());
         assert!(matches!(
             node.providers().codex_target(true),
             crate::providers::CodexTarget::Spawn(_)
@@ -2555,7 +2576,7 @@ mod tests {
             json!({"provider":"cursor","bot":true}),
         )
         .await?;
-        assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor");
         assert_eq!(moved["settings"]["manager"]["model"], "auto");
         assert_eq!(moved["providers"][0]["roles"], json!([]));
         assert_eq!(moved["providers"][0]["state"], "off");
@@ -2568,7 +2589,7 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            unchanged["settings"]["manager"]["provider"], "cursor_sdk",
+            unchanged["settings"]["manager"]["provider"], "cursor",
             "stopping the bot elsewhere leaves it running"
         );
         let stopped = dispatch(
@@ -2586,9 +2607,9 @@ mod tests {
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
         assert!(reopened.manager().is_none());
-        assert!(!providers.switches.execution);
+        assert!(providers.switches.execution.is_empty());
         assert_eq!(
-            providers.codex_bin,
+            providers.bin(Provider::Codex),
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(
@@ -3174,12 +3195,27 @@ mod tests {
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
 
-            let mut watching = connect(phone.clone()).await?;
-            watching.call("subscribe", json!({})).await?;
             let view = node.membership_state().await?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;
             assert!(joiner.call("revoke", json!({"event":revoke})).await.is_err(), "issuer must be the session");
-            manager.call("revoke", json!({"event":revoke})).await?;
+            let mut last = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&phone.device_id()?, None)?))?;
+            last.action = GovernanceAction::Revoke(Revocation::new(&admin.device_id()?, None)?);
+            manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", false)?})).await?;
+            let error = manager.call("revoke", json!({"event":last.sign(&admin)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
+            let view = node.membership_state().await?.project()?;
+            let mut forged = GovernanceEvent::unsigned(&view, &admin.device_id()?, GovernanceAction::Revoke(Revocation::new(&node_id, None)?))?;
+            forged.issuer = phone.device_id()?;
+            let error = joiner.call("revoke", json!({"event":forged.sign(&phone)?})).await.unwrap_err();
+            assert!(format!("{error:#}").contains("management permission required"), "{error:#}");
+            let mut watching = connect(phone.clone()).await?;
+            watching.call("subscribe", json!({})).await?;
+            let leave = GovernanceEvent::revoke(&phone, &view, Revocation::new(&phone.device_id()?, None)?)?;
+            let mut updates = node.events.subscribe();
+            assert_eq!(joiner.call("revoke", json!({"event":leave})).await?["revoked"], true, "an ordinary client leaves on its own");
+            assert!(std::iter::from_fn(|| updates.try_recv().ok()).any(|update| update.payload == json!({"type":"changed"})),
+                "open pages are told to reread the device list once a device leaves");
+            assert!(joiner.call("revoke", json!({"event":leave})).await.is_err(), "a left device cannot sign again");
             assert!(joiner.call("directory", json!({})).await.is_err());
             assert_eq!(joiner.call("authenticate", json!({})).await?["revoked"], true);
             assert!(joiner.call("join_status", json!({"join_id":join_id})).await.is_err());
@@ -3188,6 +3224,26 @@ mod tests {
             assert!(revoked_info["network_id"].is_null());
             assert!(revoked_info.get("connection_entry").is_none());
             assert!(watching.call("info", json!({})).await.is_err(), "the revoked device's subscription is closed");
+            let rejoin = manager.call("invite", invite([4; 32])?).await?["join_id"].clone();
+            let error = connect(phone.clone()).await?.call("join", join(&phone, [4; 32], &nonce)?).await.unwrap_err();
+            assert!(format!("{error:#}").contains("already a member or was revoked"), "{error:#}");
+            let fresh = LocalIdentity::generate();
+            let mut rejoining = connect(fresh.clone()).await?;
+            assert_eq!(rejoining.call("join", join(&fresh, [4; 32], &nonce)?).await?["status"], "pending", "a new key joins with a new link");
+            manager.call("approve", json!({"join_id":rejoin,"admin_nonce":admin_nonce})).await?;
+            rejoining.call("join_status", json!({"join_id":rejoin,"reveal":nonce})).await?;
+            let grant = GovernanceEvent::grant(&admin, &node.membership_state().await?.project()?, Member::client(&fresh, "phone", false)?)?;
+            assert_eq!(manager.call("approve", json!({"join_id":rejoin,"event":grant})).await?["status"], "joined");
+            assert_eq!(rejoining.call("authenticate", json!({})).await?["principal"]["can_manage"], false);
+            rejoining.call("subscribe", json!({})).await?;
+            manager.call("subscribe", json!({})).await?;
+            let later = LocalIdentity::generate();
+            manager.call("invite", invite([5; 32])?).await?;
+            connect(later.clone()).await?.call("join", join(&later, [5; 32], &nonce)?).await?;
+            for client in [&mut manager, &mut rejoining] {
+                assert_eq!(next_push(client).await?, json!({"type":"changed"}),
+                    "a new join tells every open page to reread, and tells nothing about the request");
+            }
 
             let replacement = LocalIdentity::generate();
             let before = node.membership_state().await?;
@@ -3216,6 +3272,7 @@ mod tests {
             refused(recovering.call("recover", submit(vec![&backdated])).await.unwrap_err(), RECOVERY_TOO_OLD);
             let first_since = manager.call("authenticate", json!({})).await?["recovery_since_ms"].clone();
             let waiting = recovering.call("recover", submit(vec![&checkpoint])).await?;
+            assert_eq!(next_push(&mut manager).await?, json!({"type":"changed"}), "a waiting recovery reaches open manager pages at once");
             assert_eq!((&waiting["principal"], &waiting["recovery"]["status"]), (&Value::Null, &json!("waiting")));
             assert_eq!(waiting["recovery"]["effective_at_ms"], checkpoint.effective_at_ms());
             assert_eq!(recovering.call("recover", submit(vec![&checkpoint])).await?["recovery"], waiting["recovery"], "a retry changes nothing");

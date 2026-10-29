@@ -281,6 +281,7 @@ impl Runtime {
             "messages":messages.into_iter().collect::<Vec<_>>(),
             "works":changed,
             "last_message":last_message,
+            "busy":store.busy_conversations()?.remove(scope),
             "questions":store.conversation_questions(network, scope)?,
             "sent":store.sent_bot_messages(network, scope)?,
             "notifications":notifications,

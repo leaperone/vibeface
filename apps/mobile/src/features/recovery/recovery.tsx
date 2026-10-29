@@ -1,8 +1,8 @@
 import * as DocumentPicker from 'expo-document-picker'
 import { File } from 'expo-file-system'
-import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, ShieldAlert, ShieldX, Smartphone, type LucideIcon } from 'lucide-react-native'
+import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileCheck, FileKey, FileWarning, Hand, Hourglass, KeyRound, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
-import { Alert, Switch, View } from 'react-native'
+import { Alert, View } from 'react-native'
 import { Link } from 'expo-router'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
 import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
@@ -12,9 +12,11 @@ import { ActionCard, Details, Panel } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { deviceIcon } from '@/features/devices/device-icon'
 import { useRun } from '@/lib/use-run'
+import { defaultName, self } from '@/platform'
 
 type PickedFile = { name: string; file: RecoveryFile }
 
@@ -42,7 +44,7 @@ export function RecoveryRestore() {
   const { busy, error, run } = useRun()
   const [picked, setPicked] = useState<PickedFile | null>(null)
   const [password, setPassword] = useState('')
-  const [name, setName] = useState('我的手机')
+  const [name, setName] = useState(defaultName)
   const [address, setAddress] = useState(target?.address ?? '')
   const [deviceId, setDeviceId] = useState(target?.device_id ?? '')
   const submit = () => void run('restore', async () => {
@@ -57,7 +59,7 @@ export function RecoveryRestore() {
     <Text className="text-meta text-muted-foreground">{recoveryCopy.scope}</Text>
     <FilePick picked={picked} onPick={setPicked} disabled={locked} />
     <Input {...passwordProps} accessibilityLabel="恢复密码" placeholder="恢复密码" value={password} onChangeText={setPassword} editable={!locked} />
-    <Input accessibilityLabel="这台手机叫什么？" placeholder="这台手机叫什么？" className="min-h-11" value={name} onChangeText={setName} maxLength={128} editable={!locked} />
+    <Input accessibilityLabel={`${self}叫什么？`} placeholder={`${self}叫什么？`} className="min-h-11" value={name} onChangeText={setName} maxLength={128} editable={!locked} />
     <Details label={target ? recoveryCopy.connectTo : recoveryCopy.manual} open={!target}>
       <Input accessibilityLabel="访问地址" placeholder="https://" className="min-h-11" keyboardType="url" autoCapitalize="none" autoCorrect={false} value={address} onChangeText={setAddress} editable={!locked} />
       <Input accessibilityLabel="设备编号" placeholder="设备编号" className="min-h-11 font-mono" autoCapitalize="none" autoCorrect={false} value={deviceId} onChangeText={setDeviceId} editable={!locked} />
@@ -84,7 +86,7 @@ export function RecoveryReview() {
         const required = member.device_id === review.requiredNode
         const gone = lost.includes(member.device_id)
         return <View key={member.device_id} className="min-h-12 flex-row items-center gap-2 rounded-lg bg-muted/60 px-3">
-          <Icon as={member.kind === 'client' ? Smartphone : Laptop} className="size-4 text-muted-foreground" />
+          <Icon as={deviceIcon({ kind: member.kind, name: member.name, current: false, entry: required })} className="size-4 text-muted-foreground" />
           <View className="min-w-0 flex-1 py-1.5">
             <Text numberOfLines={1} className={gone ? 'text-muted-foreground line-through' : undefined}>{member.name}</Text>
             {gone ? <Text className="text-meta text-danger">生效后移出</Text> : null}
@@ -171,7 +173,7 @@ export function RecoveryPendingCard() {
         <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
         <Icon as={deviceIcon({ kind: member.kind, name: member.name, current, entry: false })} className="size-4 text-muted-foreground" />
         <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
-        {current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这台手机</Text> : null}
+        {current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{self}</Text> : null}
       </View>
     })}
     {errorText(error)}

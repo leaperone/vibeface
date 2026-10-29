@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""A controlled stand-in for `claude -p --input-format stream-json --output-format stream-json`.
+
+It speaks the frames the Node reads and writes a transcript the way Claude Code does, under
+`$CLAUDE_CONFIG_DIR/projects/<cwd slug>/<session>.jsonl`. The first word of a prompt picks how
+the turn goes:
+
+  hang    replies, then waits until it is interrupted
+  vanish  records the finished turn in the transcript, then sleeps without reporting it
+  die     records the prompt, then exits before the turn ends
+  fail    ends the turn with an API error
+  other   replies, runs one Bash tool, and answers "done: <prompt>"
+
+Every argument list and stdin frame is appended to `$FAKE_CLAUDE_LOG` as one JSON line.
+"""
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+LOG = os.environ.get("FAKE_CLAUDE_LOG")
+
+
+def log(entry):
+    if LOG:
+        with open(LOG, "a") as handle:
+            handle.write(json.dumps(entry) + "\n")
+
+
+def emit(frame):
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+
+def option(name):
+    args = sys.argv[1:]
+    return args[args.index(name) + 1] if name in args else None
+
+
+log({
+    "argv": sys.argv[1:],
+    "cwd": os.getcwd(),
+    "env": {name: name in os.environ for name in
+            ("VIBEFACE_TOOL_TOKEN", "VIBEFACE_NODE_URL", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "FAKE_MARK")},
+})
+resumed = option("--resume")
+session = resumed or option("--session-id")
+home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+project = os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(os.getcwd())))
+transcript = os.path.join(project, f"{session}.jsonl")
+if resumed and not os.path.exists(transcript):
+    sys.stderr.write(f"No conversation found with session ID: {session}\n")
+    sys.exit(1)
+if not resumed and os.path.exists(transcript):
+    sys.stderr.write(f"Error: Session ID {session} is already in use.\n")
+    sys.exit(1)
+os.makedirs(project, exist_ok=True)
+parent = None
+
+
+def record(entry):
+    global parent
+    entry.update({"uuid": entry.get("uuid") or str(uuid.uuid4()), "parentUuid": parent,
+                  "sessionId": session, "cwd": os.getcwd(), "isSidechain": False})
+    parent = entry["uuid"]
+    with open(transcript, "a") as handle:
+        handle.write(json.dumps(entry) + "\n")
+
+
+def assistant(message_id, block, stop):
+    frame_uuid = str(uuid.uuid4())
+    emit({"type": "assistant", "message": {"id": message_id, "role": "assistant", "content": [block],
+          "stop_reason": None}, "parent_tool_use_id": None, "session_id": session, "uuid": frame_uuid})
+    record({"type": "assistant", "uuid": frame_uuid, "message": {"id": message_id, "role": "assistant",
+            "content": [block], "stop_reason": stop}})
+
+
+def result(subtype, is_error, text, reason, **extra):
+    emit({"type": "result", "subtype": subtype, "is_error": is_error, "result": text, "session_id": session,
+          "stop_reason": None, "terminal_reason": reason, "num_turns": 1, "uuid": str(uuid.uuid4()), **extra})
+
+
+def prompt_of(message):
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return " ".join(block.get("text", "") for block in content or [] if block.get("type") == "text")
+
+
+def answer_control(frame):
+    emit({"type": "control_response", "response": {"subtype": "success", "request_id": frame.get("request_id"),
+          "response": {"still_queued": []}}})
+
+
+def turn(frame):
+    prompt = prompt_of(frame["message"]).strip()
+    mode = prompt.split()[0] if prompt else ""
+    record({"type": "user", "uuid": frame.get("uuid"), "message": frame["message"]})
+    emit({"type": "system", "subtype": "init", "session_id": session, "cwd": os.getcwd(),
+          "model": option("--model") or "fake", "permissionMode": option("--permission-mode"), "tools": ["Bash"]})
+    if mode == "vanish":
+        record({"type": "assistant", "message": {"id": "msg_v", "role": "assistant",
+                "content": [{"type": "text", "text": "finished while unwatched"}], "stop_reason": "end_turn"}})
+        time.sleep(3600)
+    if mode == "die":
+        sys.exit(3)
+    if mode == "fail":
+        text = "API Error: 401 Invalid API key · Please run /login"
+        record({"type": "assistant", "isApiErrorMessage": True, "message": {"id": "msg_f", "role": "assistant",
+                "content": [{"type": "text", "text": text}], "stop_reason": "stop_sequence"}})
+        result("success", True, text, "completed")
+        return
+    assistant("msg_1", {"type": "text", "text": "Looking."}, "tool_use")
+    if mode == "hang":
+        for line in sys.stdin:
+            control = json.loads(line)
+            log({"stdin": control.get("type"), "subtype": (control.get("request") or {}).get("subtype")})
+            if (control.get("request") or {}).get("subtype") == "interrupt":
+                answer_control(control)
+                record({"type": "user", "interruptedMessageId": "msg_1",
+                        "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}})
+                result("error_during_execution", True, "", "aborted_streaming")
+                return
+        sys.exit(0)
+    assistant("msg_1", {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "true"}}, "tool_use")
+    tool_result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "", "is_error": False}
+    emit({"type": "user", "message": {"role": "user", "content": [tool_result]}, "parent_tool_use_id": None,
+          "session_id": session, "uuid": str(uuid.uuid4()), "tool_use_result": {"stdout": ""}})
+    record({"type": "user", "message": {"role": "user", "content": [tool_result]}})
+    answer = f"done: {prompt}"
+    assistant("msg_2", {"type": "text", "text": answer}, "end_turn")
+    result("success", False, answer, "completed")
+
+
+for line in sys.stdin:
+    frame = json.loads(line)
+    log({"stdin": frame.get("type"), "uuid": frame.get("uuid"),
+         "subtype": (frame.get("request") or {}).get("subtype")})
+    if frame.get("type") == "user":
+        turn(frame)
+    elif frame.get("type") == "control_request":
+        answer_control(frame)

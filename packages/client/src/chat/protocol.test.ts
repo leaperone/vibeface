@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, replyStatusLabel, roleLabel, threadReplies } from './protocol.ts'
+import { parseNodes } from '../workspace/model.ts'
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
 test('send waits for a loaded conversation', () => {
@@ -10,6 +11,34 @@ test('send waits for a loaded conversation', () => {
   assert.equal(canSend({ ...ready, loaded: false, busy: false }), false)
   assert.equal(composerHint(ready), '')
   assert.equal(composerHint({ ...ready, bot: 'needs_setup' }), '运行 Bot 的设备需设置')
+})
+test('chat rereads readiness only while a device that could reply is not ready yet', () => {
+  const node = (online: boolean, manager_state: 'ready' | 'starting' | 'needs_setup' | null) => ({
+    device_id: 'd', name: 'Mac', local: false, online, revoked: false,
+    capabilities: manager_state === null ? undefined : { manager: 'codex', manager_state, relay: false, roots: [], codex_connected: false },
+  })
+  assert.equal(botReach([]), 'none')
+  assert.equal(botReach([node(true, null)]), 'none')
+  assert.equal(botReach([node(true, 'needs_setup')]), 'needs_setup')
+  assert.equal(botReach([node(true, 'needs_setup'), node(true, 'starting')]), 'starting', 'a bot coming up is not a device to set up')
+  assert.equal(composerHint({ ...ready, bot: 'starting' }), 'Bot 正在启动')
+  assert.equal(botReach([node(false, 'needs_setup')]), 'offline')
+  assert.equal(botReach([node(false, 'needs_setup'), node(true, 'needs_setup'), node(true, 'ready')]), 'ready')
+  assert.equal(awaitsDevice('none'), false, 'with no device to wait on, setting one up rereads it')
+  assert.equal(awaitsDevice('ready'), false)
+  assert.equal(awaitsDevice('starting'), true)
+  assert.equal(awaitsDevice('needs_setup'), true)
+  assert.equal(awaitsDevice('offline'), true)
+})
+test('a bot computer the Node lists offline with its last capabilities reads as offline, not missing', () => {
+  const nodes = parseNodes({ nodes: [
+    { device_id: 'here', name: 'Server', local: true, online: true, revoked: false, capabilities: { manager: null, manager_state: null, relay: true, roots: [] } },
+    { device_id: 'mac', name: 'Mac', local: false, online: false, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', relay: false, roots: ['/work'] } },
+  ] })
+  const reach = botReach(nodes)
+  assert.equal(reach, 'offline')
+  assert.equal(awaitsDevice(reach), true, 'the chat keeps rereading until the computer is back')
+  assert.equal(composerHint({ hasConversation: true, loaded: true, bot: reach }), '能运行 Bot 的设备离线了')
 })
 test('an explicit retry preserves the complete original message request', () => {
   const first = prepareSend({ conversationId: 'chat', text: ' 继续  ', pending: null })

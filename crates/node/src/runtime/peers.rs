@@ -6,7 +6,7 @@
 use super::*;
 use crate::net::{self, AddressRecord, Net, SignedAddress};
 use iroh::{
-    endpoint::Connection,
+    endpoint::{Connection, ConnectionError},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use std::sync::Weak;
@@ -36,6 +36,8 @@ pub(super) struct PeerSync {
     forks: Option<String>,
     /// This boot has seen the peer hold nothing of this device's log beyond ours.
     confirmed: bool,
+    /// What the peer last answered to `capabilities`, kept to show while it is offline.
+    capabilities: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -346,10 +348,12 @@ impl Runtime {
             self.serve_blobs(connection, network, remote).await;
             return Ok(());
         }
-        let watched = connection.clone();
+        let (watched, closed) = (connection.clone(), connection.clone());
+        let node = self.clone();
+        let peer = remote.clone();
         net::serve_streams(connection, move |request: Value| {
             let (node, connection, network, remote) = (
-                self.clone(),
+                node.clone(),
                 watched.clone(),
                 network.clone(),
                 remote.clone(),
@@ -368,6 +372,15 @@ impl Runtime {
             }
         })
         .await;
+        // A peer that shut down closed this itself; syncing now tells clients it went offline.
+        if let Some(
+            ConnectionError::ApplicationClosed(_)
+            | ConnectionError::ConnectionClosed(_)
+            | ConnectionError::Reset,
+        ) = closed.close_reason()
+        {
+            self.wake_sync(&peer);
+        }
         Ok(())
     }
 
@@ -424,7 +437,7 @@ impl Runtime {
         let kind = field(input, "type")?;
         let _work = (!matches!(
             kind,
-            "capabilities" | "progress_read" | "addresses" | "scheduler_jobs"
+            "capabilities" | "progress_read" | "addresses" | "scheduler_jobs" | "join_changed"
         ))
         .then(|| self.maintenance.enter())
         .transpose()?;
@@ -443,6 +456,10 @@ impl Runtime {
             }
             "progress_read" => self.read_progress(network, origin, input).await,
             "dispatch_work" => self.accept_remote_dispatch(network, origin, input).await,
+            "join_changed" => {
+                self.publish_reread(network);
+                Ok(json!({}))
+            }
             "pending_joins" => Ok(
                 json!({"requests":self.store.lock().await.pending_joins(field(input, "admin")?)?}),
             ),
@@ -471,9 +488,9 @@ impl Runtime {
                 );
                 self.codex_state(network, input).await
             }
-            "codex_respond" => {
+            "respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
-                self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                self.answer_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
             "hand_over_session" => {
@@ -709,10 +726,11 @@ impl Runtime {
                 let network = network.clone();
                 tokio::spawn(async move {
                     let result = node.sync_peer(&network, &peer).await;
-                    let rerun = {
+                    let (rerun, presence_changed) = {
                         let mut states = node.sync_peers.lock().expect("sync peers");
                         let entry = states.entry(peer.clone()).or_default();
                         entry.running = false;
+                        let was_failing = entry.failures > 0;
                         match &result {
                             Ok(()) => {
                                 entry.failures = 0;
@@ -730,8 +748,11 @@ impl Runtime {
                         if rerun {
                             entry.due = Some(Instant::now());
                         }
-                        rerun
+                        (rerun, was_failing != (entry.failures > 0))
                     };
+                    if presence_changed {
+                        node.publish_reread(&network);
+                    }
                     if result.is_err() {
                         node.align(&network).await;
                     }
@@ -855,6 +876,47 @@ impl Runtime {
             tracing::debug!(%peer, %error, "attachment download pending");
         }
         Ok(())
+    }
+
+    /// The peer's capabilities: `answer` when it gave one, otherwise the last it gave, kept in
+    /// this Node's own store so a restart still shows it while the peer is offline.
+    pub(crate) async fn peer_capabilities(&self, peer: &str, answer: Option<Value>) -> Value {
+        let Some(answer) = answer else {
+            let known = self
+                .sync_peers
+                .lock()
+                .expect("sync peers")
+                .get(peer)
+                .and_then(|state| state.capabilities.clone());
+            if let Some(known) = known {
+                return known;
+            }
+            return self
+                .store
+                .lock()
+                .await
+                .peer_capabilities(peer)
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Null);
+        };
+        let changed = {
+            let mut states = self.sync_peers.lock().expect("sync peers");
+            let known = &mut states.entry(peer.to_owned()).or_default().capabilities;
+            let changed = known.as_ref() != Some(&answer);
+            *known = Some(answer.clone());
+            changed
+        };
+        if changed
+            && let Err(error) = self
+                .store
+                .lock()
+                .await
+                .keep_peer_capabilities(peer, &answer)
+        {
+            tracing::debug!(%error, "peer capabilities kept in memory only");
+        }
+        answer
     }
 
     /// Whether the last sync with `peer` failed.
@@ -1077,7 +1139,7 @@ impl Runtime {
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
             "device_id":self.identity.device_id()?, "config":{
                 "public_entry":self.config.public_entry,"project_roots":settings.roots.len(),
-                "manager_enabled":settings.manager.is_some(),"execution_enabled":self.providers().switches.execution,
+                "manager_enabled":settings.manager.is_some(),"execution":self.providers().switches.execution,
                 "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
             "peers":peers,
@@ -1132,7 +1194,7 @@ impl Runtime {
             ingested
         };
         if rebuilt {
-            self.publish_rebuilt(network);
+            self.publish_reread(network);
         }
         let mut scopes = BTreeSet::new();
         for (event, status) in events.iter().zip(&statuses) {
@@ -1250,6 +1312,26 @@ impl Runtime {
             .filter_map(|reply| reply.ok()?.ok())
             .flat_map(|reply| reply["requests"].as_array().cloned().unwrap_or_default())
             .collect()
+    }
+
+    /// A join this Node holds changed. Clients here reread, and so do those of reachable member
+    /// Nodes, which list it through `pending_joins`; the notice carries nothing of the request.
+    pub(crate) fn join_changed(self: &Arc<Self>, network: &str) {
+        self.publish_reread(network);
+        let (node, network) = (self.clone(), network.to_owned());
+        tokio::spawn(async move {
+            let Ok((_, peers)) = node.member_peers().await else {
+                return;
+            };
+            let notices = peers
+                .iter()
+                .filter(|peer| !node.sync_failing(peer))
+                .map(|peer| {
+                    let notice = node.peer_request(&network, peer, json!({"type":"join_changed"}));
+                    tokio::time::timeout(Duration::from_secs(3), notice)
+                });
+            futures_util::future::join_all(notices).await;
+        });
     }
 
     /// An approval step for a join held elsewhere goes to the Node that holds it.
@@ -2329,7 +2411,7 @@ mod tests {
                 target: ib.device_id()?,
                 dispatcher: ia.device_id()?,
                 call_ref: "remote".into(),
-                kind: WorkKind::Codex,
+                kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2781,6 +2863,252 @@ mod tests {
         for dir in [dir_a, dir_b] {
             let _ = std::fs::remove_dir_all(dir);
         }
+        result
+    }
+
+    /// A bot computer that goes offline is announced to clients and keeps its last capabilities,
+    /// so a client tells "its device is offline" from "no device runs a bot".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offline_node_is_announced_and_listed_with_its_last_capabilities() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            b.settings.lock().expect("settings").manager = Some(config::ManagerSettings {
+                provider: crate::providers::Provider::Cursor,
+                workspace: dir_b.join("manager-workspace"),
+                model: String::new(),
+            });
+            a.net()?.learn(&b.net()?.addr()).await;
+            let peer = ib.device_id()?;
+            let access = Access {
+                network_id: network.clone(),
+                human: true,
+                conversation_id: None,
+                manager: None,
+            };
+            let listed = |nodes: Value| {
+                nodes["nodes"]
+                    .as_array()
+                    .and_then(|nodes| nodes.iter().find(|node| node["device_id"] == *peer))
+                    .cloned()
+                    .context("the peer is listed")
+            };
+            a.wake_sync(&peer);
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !a
+                    .sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .get(&peer)
+                    .is_some_and(|state| state.synced_ms.is_some() && state.failures == 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .context("first sync")?;
+            let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
+            assert_eq!(online["online"], true);
+            assert_eq!(online["capabilities"]["manager"], "cursor");
+            let mut events = a.events.subscribe();
+            b.stop_network().await;
+            a.wake_sync(&peer);
+            tokio::time::timeout(Duration::from_secs(40), async {
+                loop {
+                    let update = events.recv().await?;
+                    if update.network_id == network && update.payload == json!({"type":"changed"}) {
+                        return anyhow::Ok(());
+                    }
+                }
+            })
+            .await
+            .context("clients are told to reread once the peer stops answering")??;
+
+            let offline = listed(a.rpc(access, json!({"method":"nodes"})).await?)?;
+            assert_eq!(offline["online"], false);
+            assert_eq!(offline["capabilities"], online["capabilities"]);
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    async fn first_sync(node: &Runtime, peer: &str) -> Result<()> {
+        node.wake_sync(peer);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !node
+                .sync_peers
+                .lock()
+                .expect("sync peers")
+                .get(peer)
+                .is_some_and(|state| state.synced_ms.is_some() && state.failures == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("first sync")
+    }
+
+    /// A join waits on the Node whose invite it used. A manager connected to another member Node
+    /// is told to reread at once, and lists the request from there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_held_by_another_node_reaches_managers_on_every_node() -> Result<()> {
+        use crate::identity::local::Join;
+        use vibeface_secure::join::{INVITE_DOMAIN, InviteRecord, invite_hash, join_commit};
+
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let admin = ia.fixture_admin();
+        let manager = admin.device_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            b.net()?.learn(&a.net()?.addr()).await;
+            first_sync(&a, &ib.device_id()?).await?;
+            first_sync(&b, &ia.device_id()?).await?;
+
+            let pushed = || {
+                let mut events = a.events.subscribe();
+                let network = network.clone();
+                async move {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let update = events.recv().await?;
+                            if update.network_id == network
+                                && update.payload == json!({"type":"changed"})
+                            {
+                                return anyhow::Ok(());
+                            }
+                        }
+                    })
+                    .await
+                    .context("a manager on the other Node is told to reread")?
+                }
+            };
+            let secret = [7u8; 32];
+            let mut record = InviteRecord {
+                network_id: network.clone(),
+                invite_hash: invite_hash(&secret),
+                issuer: manager.clone(),
+                expires_at_ms: crate::runtime::now_ms() + 60_000,
+                signature: String::new(),
+            };
+            record.signature = admin.sign_payload(INVITE_DOMAIN, &record.signing_payload()?)?;
+            let join_id = b.store.lock().await.register_invite(&record, &manager)?;
+            let phone = LocalIdentity::generate().device_id()?;
+            b.store.lock().await.join(
+                &Join {
+                    secret: hex::encode(secret),
+                    public_key: phone.clone(),
+                    kind: crate::identity::IdentityKind::Client,
+                    name: "phone".into(),
+                    commit: join_commit(&phone, &"11".repeat(32))?,
+                },
+                &phone,
+            )?;
+            let listed = a.remote_joins(&manager).await;
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0]["join_id"], join_id, "A lists the join B holds");
+
+            let waiting = pushed();
+            let nonce = json!({"join_id":join_id,"admin_nonce":"22".repeat(32)});
+            crate::client::approve_join(&b, &manager, &nonce).await?;
+            waiting.await?;
+            let waiting = pushed();
+            crate::client::approve_join(&b, &manager, &json!({"join_id":join_id,"reject":true}))
+                .await?;
+            waiting.await?;
+            assert!(
+                a.remote_joins(&manager).await.is_empty(),
+                "a rejected join is gone"
+            );
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    /// The last capabilities of a member Node survive this Node's restart, so a bot computer that
+    /// is off still shows as offline instead of as missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offline_node_keeps_its_last_capabilities_across_a_restart() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let peer = ib.device_id()?;
+        let access = Access {
+            network_id: ia.fixture_network_id()?,
+            human: true,
+            conversation_id: None,
+            manager: None,
+        };
+        let listed = |nodes: Value| {
+            nodes["nodes"]
+                .as_array()
+                .and_then(|nodes| nodes.iter().find(|node| node["device_id"] == *peer))
+                .cloned()
+                .context("the peer is listed")
+        };
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let online = async {
+            for node in [&a, &b] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            b.settings.lock().expect("settings").manager = Some(config::ManagerSettings {
+                provider: crate::providers::Provider::Cursor,
+                workspace: dir_b.join("manager-workspace"),
+                model: String::new(),
+            });
+            a.net()?.learn(&b.net()?.addr()).await;
+            first_sync(&a, &peer).await?;
+            listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)
+        }
+        .await;
+        a.shutdown().await;
+        b.stop_network().await;
+        // Background tasks still hold the stopped Runtime and its directory lock; a copy of the
+        // directory is what the next process would open.
+        let copy = dir_a.with_extension("restarted");
+        let result = async {
+            let online = online?;
+            assert_eq!(online["capabilities"]["manager"], "cursor");
+            std::process::Command::new("cp")
+                .arg("-R")
+                .args([&dir_a, &copy])
+                .status()?
+                .success()
+                .then_some(())
+                .context("copy the data directory")?;
+            std::fs::remove_file(copy.join("node.lock"))?;
+            let again = Arc::new(Runtime::open(&copy).await?);
+            again.start_network().await?;
+            let nodes = again.rpc(access.clone(), json!({"method":"nodes"})).await;
+            again.stop_network().await;
+            let offline = listed(nodes?)?;
+            assert_eq!(offline["online"], false);
+            assert_eq!(offline["capabilities"], online["capabilities"]);
+            anyhow::Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(copy);
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
         result
     }
 

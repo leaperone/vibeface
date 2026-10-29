@@ -1,12 +1,13 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { onlyManagerText, soleManager } from '@vibeface/client/identity/copy.ts'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
 import { CurrentRecoveryFile, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
@@ -33,6 +34,8 @@ function SettingsPage() {
   }, [exported])
   const principal = device.ready?.principal
   const operator = principal?.can_manage || principal?.source === 'local_session'
+  // A local session only disconnects, so only a member browser can be the one manager left.
+  const sole = principal?.source !== 'local_session' && soleManager(device.directory?.members ?? [], device.identity?.deviceId)
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
     <SettingsGroup title="提醒">
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
@@ -75,14 +78,24 @@ function SettingsPage() {
     </SettingsGroup>
     <Sheet open={leaving} onOpenChange={setLeaving}>
       <SheetContent side="bottom" showCloseButton={false} className="gap-0 pb-[env(safe-area-inset-bottom)] sm:mx-auto sm:max-w-md sm:rounded-t-2xl sm:border-x">
-        <SheetHeader className="gap-1.5 px-5 pt-5">
-          <SheetTitle className="flex items-center gap-2"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
-          <SheetDescription>要回来，得重新打开本机页面或用加入链接</SheetDescription>
-        </SheetHeader>
-        <div className="flex justify-end gap-2 px-5 pt-2 pb-5">
-          <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
-          <Button type="button" variant="destructive" onClick={() => device.disconnect()}>断开</Button>
-        </div>
+        {sole ? <>
+          <SheetHeader className="px-5 pt-5">
+            <SheetTitle className="flex items-start gap-2 text-base font-normal leading-normal"><Crown aria-hidden="true" className="mt-1 size-4 shrink-0 text-warning" />{onlyManagerText('这个浏览器')}</SheetTitle>
+            <SheetDescription className="sr-only">不能断开</SheetDescription>
+          </SheetHeader>
+          <div className="flex justify-end px-5 pt-2 pb-5">
+            <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>知道了</Button>
+          </div>
+        </> : <>
+          <SheetHeader className="gap-1.5 px-5 pt-5">
+            <SheetTitle className="flex items-center gap-2"><LogOut aria-hidden="true" className="size-5 text-danger" />断开这个浏览器？</SheetTitle>
+            <SheetDescription>要回来，得重新打开本机页面或用加入链接</SheetDescription>
+          </SheetHeader>
+          <div className="flex justify-end gap-2 px-5 pt-2 pb-5">
+            <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>取消</Button>
+            <Button type="button" variant="destructive" onClick={() => { void workspace.run(async () => { setLeaving(false); await device.leave() }, '断开这个浏览器') }}>断开</Button>
+          </div>
+        </>}
       </SheetContent>
     </Sheet>
   </div>

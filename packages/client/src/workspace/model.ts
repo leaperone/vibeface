@@ -1,12 +1,12 @@
 import type { Attachment, TranscriptMessage } from "../chat/types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
-  AnswerResult, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
+  AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome,
+  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
 } from "./types.ts"
 import { answerId } from "./questions.ts"
-import type { ProviderId } from "../lib/node.ts"
+import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
 
 export function inputText(value: string, label: string, maxBytes: number): string {
@@ -49,14 +49,16 @@ export function parseNodes(value: unknown): NodeInfo[] {
       device_id: text(data.device_id),
       name: typeof data.name === "string" ? data.name : "",
       local: flag(data.local), online: flag(data.online), revoked: flag(data.revoked),
-      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_ready: capabilities.manager_ready === true, relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
+      capabilities: capabilities ? { manager: capabilities.manager == null ? null : text(capabilities.manager), manager_state: capabilities.manager == null ? null : readiness(capabilities.manager_state), relay: capabilities.relay === true, roots: texts(capabilities.roots), codex_connected: capabilities.codex != null && record(capabilities.codex).connected === true } : undefined,
     }
   })
 }
-/** `ready` only when the bot's switch is on and its provider works; a switch alone leaves it `needs_setup`. */
-export function botReadiness(node: NodeInfo | undefined): "ready" | "needs_setup" | null {
+function readiness(value: unknown): BotReadiness {
+  return value === "ready" || value === "starting" ? value : "needs_setup"
+}
+export function botReadiness(node: NodeInfo | undefined): BotReadiness | null {
   if (!node || node.revoked || !node.online || !node.capabilities?.manager) return null
-  return node.capabilities.manager_ready ? "ready" : "needs_setup"
+  return node.capabilities.manager_state
 }
 export function parseNotifications(value: unknown): NotificationRecord[] {
   return list(record(value).notifications).map((item) => {
@@ -115,8 +117,8 @@ function workOutcome(value: unknown): WorkOutcome | null {
 }
 function workKind(value: unknown): WorkRecord["kind"] {
   if (value == null) return undefined
-  if (value !== "codex" && value !== "task") throw new Error("任务类型无法识别。")
-  return value
+  if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
+  throw new Error("任务类型无法识别。")
 }
 function work(value: unknown): WorkRecord {
   const data = record(value)
@@ -192,7 +194,7 @@ export function parseRecords(value: unknown): ConversationRecords {
   const scheduler = schedulerSnapshot({ jobs: data.jobs, unanswered: data.unanswered })
   return {
     conversation_id: text(data.conversation_id), messages: list(data.messages).map(message), works: list(data.works).map(work),
-    last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) },
+    last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy),
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
@@ -221,9 +223,8 @@ function edit(value: unknown): FieldEdit | undefined {
   const data = record(value)
   return { before: text(data.before), after: text(data.after) }
 }
-const providers: readonly ProviderId[] = ["codex", "cursor"]
 function provider(value: unknown): ProviderId {
-  if (!providers.includes(value as ProviderId)) throw new Error("模型的 provider 无法识别。")
+  if (!providerIds.includes(value as ProviderId)) throw new Error("模型的 provider 无法识别。")
   return value as ProviderId
 }
 function modelEdit(value: unknown): ModelEdit | undefined {
@@ -336,8 +337,9 @@ export function parseCreateBot(value: unknown): CreateBotRequest {
 }
 export function parseBot(value: unknown): BotRecord {
   const data = record(value), last = data.last_message == null ? null : record(data.last_message)
-  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) } }
+  return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
 }
+const busy = (value: unknown): Busy => value === "thinking" || value === "replying" ? value : null
 export function parseBots(value: unknown): BotRecord[] {
   return list(record(value).bots).map(parseBot)
 }
@@ -376,7 +378,7 @@ function severity(value: unknown): Severity {
 }
 function subject(value: unknown): QuestionSubject {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
+  return { node: text(data.node), agent: data.agent === null ? null : provider(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), ...(data.request_id == null ? {} : { request_id: text(data.request_id) }) }
 }
 function closeReason(value: unknown): CloseReason {
   if (value !== "request_lost") throw new Error("问题关闭的原因无法识别。")
@@ -401,7 +403,7 @@ function sentBotMessage(value: unknown): SentBotMessage {
 }
 function sessionHandoff(value: unknown): SessionHandoff {
   const data = record(value)
-  return { node: text(data.node), agent: text(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), muted: data.muted === true, created_at_ms: number(data.created_at_ms) }
+  return { node: text(data.node), agent: provider(data.agent), session_id: text(data.session_id), cwd: text(data.cwd), summary: text(data.summary), muted: data.muted === true, created_at_ms: number(data.created_at_ms) }
 }
 /** Every unanswered question across the network. */
 export function parseQuestions(value: unknown): Question[] {

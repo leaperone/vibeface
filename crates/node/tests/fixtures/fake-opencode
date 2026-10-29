@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stands in for `opencode serve` in the Node's tests: records how it was started, names the
+# address of the test's fake opencode API, and waits to be stopped.
+dir=$FAKE_OPENCODE_DIR
+printf %s "$OPENCODE_SERVER_PASSWORD" > "$dir/password"
+printf %s "$OPENCODE_CONFIG_CONTENT" > "$dir/config.json"
+printf %s "$VIBEFACE_OPENCODE_ENV" > "$dir/env-dir"
+printf '%s\n' "$*" >> "$dir/argv"
+echo "opencode server listening on http://127.0.0.1:$FAKE_OPENCODE_PORT"
+exec sleep 120

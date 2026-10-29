@@ -60,6 +60,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   // Read synchronously: the chat route selects its conversation in the same commit that sets the view.
   const viewRef = useRef<WorkspaceView>("other")
   const [nodes, setNodes] = useState<NodeInfo[]>([])
+  const nodesRef = useRef(nodes)
+  nodesRef.current = nodes
   const [writeState, setWriteState] = useState<WriteStatus>({ state: "writable", conflicts: [] })
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
@@ -273,7 +275,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       void notify(nextNotifications)
       void refreshNotificationButton()
     } catch (caught) {
-      if (current()) { readConnection.current = null; dataRef.current = null; setData(null) }
+      // What the page shows stays; writes wait for the next full read.
+      if (current()) readConnection.current = null
       throw caught
     } finally {
       if (refreshingConnection.current === connection) refreshingRef.current = false
@@ -320,6 +323,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (item.method === "delete_bot") return !parseBots(await connection.rpc("bots")).some((bot) => bot.conversation_id === item.params.conversation_id)
     // Every unanswered question is listed, so one missing from the list has its answer.
     if (item.method === "set_primary_bot") return parsePrimary(await connection.rpc("bots")) === item.params.conversation_id
+    if (item.method === "set_bot_project") {
+      const project = parseBots(await connection.rpc("bots")).find((bot) => bot.conversation_id === item.params.conversation_id)?.project ?? null
+      const wanted = item.params.project as BotProject | null
+      return project?.target_node === wanted?.target_node && project?.cwd === wanted?.cwd
+    }
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -381,12 +389,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
         return next
       })
     })
-    // Pushes carry every change; this catches a device going offline, which nothing pushes, and anything missed.
+    // A device coming or going is pushed once the Node's sync notices; this rereads sooner while one is away and catches anything missed.
     let ticks = 0
     const timer = setInterval(() => {
       ticks += 1
       if (ticks % 20 === 0) scheduleRefresh()
-      else if (openWorksRef.current.length) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
+      else if (openWorksRef.current.length || nodesRef.current.some((node) => !node.revoked && !node.online)) connection.rpc("nodes").then((raw) => { if (current()) setNodes(parseNodes(raw)) }, () => {})
     }, 15000)
     const stopForeground = platform.onForeground(scheduleRefresh)
     return () => {
@@ -599,6 +607,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     makePrimary: (id: string) => withMutation(`primary:${id}`, async () => {
       const attestation = await attest("bots", { type: "primary_bot_set", conversation_id: id })
       try { await signedWrite("primary", id, "set_primary_bot", { conversation_id: id, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      await refreshRef.current()
+    }),
+    /** `null` clears it; the bot then asks where to work. */
+    setBotProject: (id: string, project: BotProject | null) => withMutation(`bot-project:${id}`, async () => {
+      const attestation = await attest(id, { type: "bot_project_set", project })
+      try { await signedWrite("bot-project", `${id}:${project?.target_node ?? ""}:${project?.cwd ?? ""}`, "set_bot_project", { conversation_id: id, project, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()

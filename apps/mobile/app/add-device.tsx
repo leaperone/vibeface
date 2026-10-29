@@ -57,7 +57,6 @@ export default function AddDevice() {
     <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
     {result && !used ? <View className="gap-4">
       <QrCode value={result.publicEntry ? result.link : result.ticket} label={result.publicEntry ? '用手机相机扫码打开' : '在新设备的 Vibeface 里扫码'} />
-      {result.publicEntry ? null : <Text className="text-center text-meta text-muted-foreground">在新设备的 Vibeface 里点“扫码”</Text>}
       <View className="flex-row flex-wrap justify-center gap-2">
         <Button variant={requests ? 'outline' : 'default'} className="min-h-11" disabled={busy !== null} onPress={() => void run('copy', () => Clipboard.setStringAsync(result.link).then(() => setCopied(true)))}>
           <Icon as={copied ? Check : Copy} /><Text>{copied ? '已复制' : '复制链接'}</Text>

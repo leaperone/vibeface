@@ -1,5 +1,5 @@
 //! The AI providers this Node runs locally, what a bot on each can do, and the variables each
-//! provider's processes get. The bot's provider and the execution switch live in `config.json`;
+//! provider's processes get. The bot's provider and which providers execute work live in `config.json`;
 //! the variables are model keys, so they stay in one private file of the data directory and
 //! never reach events, logs or the web, which only learns which names are set.
 use crate::scheduling::TriggerKind;
@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 use vibeface_bridge::agent::CustomToolConfig;
@@ -16,17 +16,30 @@ pub const ENV_FILE: &str = "provider-env.json";
 const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
-/// A provider, and the backend a bot runs on with it. Its methods are everything the scheduler
-/// and the settings need to know about that backend; nothing else matches on the provider.
+/// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
+/// the Node watches. Its methods are everything the runtime needs to know about the product;
+/// nothing else matches on the provider.
 #[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, clap::ValueEnum,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Deserialize,
+    Serialize,
+    clap::ValueEnum,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
-    #[value(name = "codex_sdk")]
+    #[default]
     Codex,
-    #[value(name = "cursor_sdk")]
     Cursor,
+    Claude,
+    Pi,
+    Opencode,
 }
 
 /// The coordination Agent (the bot) or the execution layer that runs dispatched work.
@@ -35,6 +48,24 @@ pub enum Provider {
 pub enum Role {
     Agent,
     Execution,
+}
+
+/// How the Node hears from the provider's sessions it did not start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Watch {
+    /// `vibeface hook <provider>` on these events of a JSON hook file, relative to the home
+    /// directory.
+    Hooks {
+        file: &'static str,
+        events: &'static [&'static str],
+    },
+    /// An extension the provider loads from `file`, relative to the home directory: `source`
+    /// with `__VIBEFACE_HOOK__` replaced by the JSON argv of `vibeface hook <provider>`. Its
+    /// first line marks the file as the Node's.
+    Extension {
+        file: &'static str,
+        source: &'static str,
+    },
 }
 
 /// What a bot turn's prompt carries.
@@ -48,22 +79,65 @@ pub enum PromptMode {
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Codex, Provider::Cursor];
+    pub const ALL: [Provider; 5] = [
+        Provider::Codex,
+        Provider::Cursor,
+        Provider::Claude,
+        Provider::Pi,
+        Provider::Opencode,
+    ];
 
-    /// What the runtime can run on each provider: dispatched work runs only on the Codex
-    /// App Server, so Cursor serves only as the bot.
-    pub fn supports(self) -> &'static [Role] {
+    /// How config, events, the CLI and peers name the provider; serde and clap agree.
+    pub fn name(self) -> &'static str {
         match self {
-            Provider::Codex => &[Role::Agent, Role::Execution],
-            Provider::Cursor => &[Role::Agent],
+            Provider::Codex => "codex",
+            Provider::Cursor => "cursor",
+            Provider::Claude => "claude",
+            Provider::Pi => "pi",
+            Provider::Opencode => "opencode",
         }
     }
 
-    /// How the bot's settings, the CLI and peers name the bot on this provider.
-    pub fn sdk_name(self) -> &'static str {
+    /// How the owner reads the provider's name.
+    pub fn label(self) -> &'static str {
         match self {
-            Provider::Codex => "codex_sdk",
-            Provider::Cursor => "cursor_sdk",
+            Provider::Codex => "Codex",
+            Provider::Cursor => "Cursor",
+            Provider::Claude => "Claude Code",
+            Provider::Pi => "pi",
+            Provider::Opencode => "opencode",
+        }
+    }
+
+    /// The program the Node runs for this provider unless the owner or discovery chose one.
+    pub fn default_bin(self) -> &'static str {
+        match self {
+            Provider::Codex => "codex",
+            Provider::Cursor => "cursor-sdk-bridge",
+            Provider::Claude => "claude",
+            Provider::Pi => "pi",
+            Provider::Opencode => "opencode",
+        }
+    }
+
+    /// The variables holding this provider's model keys: it needs them to start, and logs
+    /// never show their values. `env` is what this Node sets for the provider; Codex reads
+    /// the names from the configuration in its `CODEX_HOME`.
+    pub fn key_variables(self, env: &BTreeMap<String, String>) -> Result<Vec<String>> {
+        match self {
+            Provider::Codex => crate::manager::provider_environment_keys(env),
+            Provider::Cursor => Ok(vec![CURSOR_KEY.into()]),
+            Provider::Claude | Provider::Pi | Provider::Opencode => Ok(vec![]),
+        }
+    }
+
+    /// What the runtime can run on each provider: the Cursor bridge runs only bots.
+    pub fn supports(self) -> &'static [Role] {
+        match self {
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
+                &[Role::Agent, Role::Execution]
+            }
+            Provider::Cursor => &[Role::Agent],
         }
     }
 
@@ -74,13 +148,51 @@ impl Provider {
 
     /// Whether a queued user message can join the bot's running reply.
     pub fn supports_steer(self) -> bool {
-        self == Provider::Codex
+        match self {
+            Provider::Codex | Provider::Pi | Provider::Opencode => true,
+            Provider::Cursor | Provider::Claude => false,
+        }
+    }
+
+    /// `vibeface hooks install` sets this up; `None` when the Node does not watch the
+    /// provider's own sessions.
+    pub fn watch(self) -> Option<Watch> {
+        match self {
+            Provider::Codex => Some(Watch::Hooks {
+                file: ".codex/hooks.json",
+                events: &["Stop", "PermissionRequest"],
+            }),
+            Provider::Claude => Some(Watch::Hooks {
+                file: ".claude/settings.json",
+                events: &["Stop", "StopFailure", "Notification", "PermissionRequest"],
+            }),
+            Provider::Pi => Some(Watch::Extension {
+                file: ".pi/agent/extensions/vibeface.ts",
+                source: include_str!("../extensions/pi.ts"),
+            }),
+            Provider::Opencode => Some(Watch::Extension {
+                file: ".config/opencode/plugins/vibeface.ts",
+                source: crate::runtime::opencode::PLUGIN,
+            }),
+            Provider::Cursor => None,
+        }
     }
 
     pub fn prompt_mode(self) -> PromptMode {
         match self {
-            Provider::Codex => PromptMode::Thread,
+            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
+                PromptMode::Thread
+            }
             Provider::Cursor => PromptMode::Turn,
+        }
+    }
+
+    /// Name prefixes of the variables the Node sets itself for this provider's processes.
+    fn reserved_env(self) -> &'static [&'static str] {
+        match self {
+            Provider::Cursor => &["CURSOR_SDK_"],
+            Provider::Opencode => &["OPENCODE_SERVER_", "OPENCODE_CONFIG_CONTENT"],
+            Provider::Codex | Provider::Claude | Provider::Pi => &[],
         }
     }
 
@@ -93,12 +205,12 @@ impl Provider {
         })
     }
 
-    /// The model the bot runs with: Cursor needs one, and Codex reads "auto" as a model name,
-    /// so there an empty one means its default.
+    /// The model the bot runs with: Cursor needs one, and Codex, Claude Code and pi read "auto" as a
+    /// model name, so there an empty one means their default.
     pub fn model(self, model: &str) -> String {
         match self {
             Provider::Cursor if model.trim().is_empty() => "auto".into(),
-            Provider::Codex if model == "auto" => String::new(),
+            Provider::Codex | Provider::Claude | Provider::Pi if model == "auto" => String::new(),
             _ => model.into(),
         }
     }
@@ -111,31 +223,17 @@ impl Provider {
             "cancel": true,
             "steer": self.supports_steer(),
             "resume_local_session": true,
-            "text_stream_mode": if codex { "snapshot" } else { "delta_and_snapshot" },
+            // Codex's and Claude Code's runners send whole text; the others stream it as well.
+            "text_stream_mode": match self {
+                Provider::Codex | Provider::Claude => "snapshot",
+                _ => "delta_and_snapshot",
+            },
             "cancel_request": true,
             "cancel_confirmation": true,
             "cancel_confirmation_evidence": if codex { "app_server_turn_end" } else { "provider_terminal_or_managed_process_exit" },
             "native_steer": self.supports_steer(),
             "run_reconcile": false,
         })
-    }
-}
-
-/// `ManagerSettings.provider` as `config.json` and the settings API spell it.
-pub mod sdk_name {
-    use super::Provider;
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    pub fn serialize<S: Serializer>(provider: &Provider, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(provider.sdk_name())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Provider, D::Error> {
-        let name = String::deserialize(deserializer)?;
-        Provider::ALL
-            .into_iter()
-            .find(|provider| provider.sdk_name() == name)
-            .ok_or_else(|| D::Error::unknown_variant(&name, &["codex_sdk", "cursor_sdk"]))
     }
 }
 
@@ -159,20 +257,36 @@ pub struct AppServer {
 }
 
 /// What the providers do besides the bot, which `Config.manager` chooses. A provider is in
-/// use while the bot runs on it or, for Codex, while it executes dispatched work.
+/// use while the bot runs on it or while it executes dispatched work.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Providers {
-    /// Dispatched work runs on the Codex App Server.
-    pub execution: bool,
+    /// The providers dispatched work runs on.
+    pub execution: BTreeSet<Provider>,
     #[serde(default)]
     pub codex_app_server: AppServer,
 }
 
 impl Providers {
+    /// Whether the App Server is in use: for the bot (`codex_agent`) or to execute work.
+    pub fn app_server_used(&self, codex_agent: bool) -> bool {
+        codex_agent
+            || self
+                .execution
+                .iter()
+                .any(|provider| provider.on_app_server())
+    }
+
     pub fn validate(&self, codex_agent: bool) -> Result<()> {
+        for provider in &self.execution {
+            ensure!(
+                provider.supports().contains(&Role::Execution),
+                "{} does not execute dispatched work here yet",
+                provider.label()
+            );
+        }
         ensure!(
-            !(self.execution || codex_agent)
+            !self.app_server_used(codex_agent)
                 || self.codex_app_server.mode != AppServerMode::System
                 || self.codex_app_server.socket.is_some(),
             "set an explicit App Server socket before enabling system execution"
@@ -191,13 +305,10 @@ impl Providers {
 /// The variables each provider's processes get on top of the Node's own environment. A
 /// provider's variables never reach another provider's processes. No `Debug`: it holds keys.
 #[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderEnv {
-    #[serde(default)]
-    codex: BTreeMap<String, String>,
-    #[serde(default)]
-    cursor: BTreeMap<String, String>,
-}
+#[serde(transparent)]
+pub struct ProviderEnv(BTreeMap<Provider, BTreeMap<String, String>>);
+
+static NO_VARIABLES: BTreeMap<String, String> = BTreeMap::new();
 
 impl ProviderEnv {
     pub fn load(dir: &Path) -> Result<Self> {
@@ -206,9 +317,9 @@ impl ProviderEnv {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(error) => return Err(error.into()),
         };
-        for provider in Provider::ALL {
-            for (name, value) in env.get(provider) {
-                validate(provider, name, value)?;
+        for (provider, variables) in &env.0 {
+            for (name, value) in variables {
+                validate(*provider, name, value)?;
                 crate::logging::add_private_path(std::path::Path::new(value));
             }
         }
@@ -223,10 +334,7 @@ impl ProviderEnv {
     }
 
     pub fn get(&self, provider: Provider) -> &BTreeMap<String, String> {
-        match provider {
-            Provider::Codex => &self.codex,
-            Provider::Cursor => &self.cursor,
-        }
+        self.0.get(&provider).unwrap_or(&NO_VARIABLES)
     }
 
     /// `Some` sets or replaces a variable, `None` removes it.
@@ -235,10 +343,7 @@ impl ProviderEnv {
         provider: Provider,
         changes: BTreeMap<String, Option<String>>,
     ) -> Result<()> {
-        let env = match provider {
-            Provider::Codex => &mut self.codex,
-            Provider::Cursor => &mut self.cursor,
-        };
+        let env = self.0.entry(provider).or_default();
         for (name, value) in changes {
             match value {
                 Some(value) => {
@@ -254,11 +359,14 @@ impl ProviderEnv {
             env.len() <= MAX_VARIABLES,
             "at most {MAX_VARIABLES} variables per provider"
         );
+        if env.is_empty() {
+            self.0.remove(&provider);
+        }
         Ok(())
     }
 
     fn redact_in_logs(&self) {
-        for value in self.codex.values().chain(self.cursor.values()) {
+        for value in self.0.values().flat_map(BTreeMap::values) {
             crate::logging::add_secret(value);
         }
     }
@@ -275,12 +383,26 @@ fn validate(provider: Provider, name: &str, value: &str) -> Result<()> {
     );
     ensure!(
         !name.starts_with("VIBEFACE_")
-            && !(provider == Provider::Cursor && name.starts_with("CURSOR_SDK_")),
+            && !provider
+                .reserved_env()
+                .iter()
+                .any(|prefix| name.starts_with(prefix)),
         "{name} is set by Vibeface"
     );
     ensure!(
         !value.is_empty() && value.len() <= 4096 && !value.contains('\0'),
         "a variable value must be 1 to 4096 characters"
+    );
+    Ok(())
+}
+
+/// A program path the owner or discovery chose for `provider`.
+pub fn validate_bin(provider: Provider, bin: &Path) -> Result<()> {
+    let text = bin.to_string_lossy();
+    ensure!(
+        !text.trim().is_empty() && text.len() <= 4096 && !text.contains('\0'),
+        "invalid {} program path",
+        provider.label()
     );
     Ok(())
 }
@@ -331,19 +453,33 @@ impl CodexTarget {
 #[derive(Clone)]
 pub struct Local {
     pub switches: Providers,
-    pub codex_bin: PathBuf,
+    /// The programs the owner or discovery chose; every other provider runs its `default_bin`.
+    pub bins: BTreeMap<Provider, PathBuf>,
     pub env: ProviderEnv,
 }
 
 impl Local {
+    pub fn bin(&self, provider: Provider) -> PathBuf {
+        self.bins
+            .get(&provider)
+            .cloned()
+            .unwrap_or_else(|| provider.default_bin().into())
+    }
+
+    /// Whether the Node starts the provider's program itself: Codex on the system App Server
+    /// runs the program and variables of that server.
+    pub fn launches(&self, provider: Provider) -> bool {
+        !provider.on_app_server() || self.switches.codex_app_server.mode == AppServerMode::Spawn
+    }
+
     pub fn validate(&self, codex_agent: bool) -> Result<()> {
         self.switches.validate(codex_agent)?;
-        if (self.switches.execution || codex_agent)
+        if self.switches.app_server_used(codex_agent)
             && self.switches.codex_app_server.mode == AppServerMode::Spawn
         {
             ensure!(
                 self.env
-                    .codex
+                    .get(Provider::Codex)
                     .get("CODEX_HOME")
                     .is_some_and(|home| std::path::Path::new(home).is_absolute()),
                 "set an explicit absolute CODEX_HOME before starting a managed App Server"
@@ -354,15 +490,15 @@ impl Local {
     /// The variables reach only an App Server the Node starts; the system one keeps its own.
     pub fn codex_target(&self, codex_agent: bool) -> CodexTarget {
         let app_server = &self.switches.codex_app_server;
-        match (self.switches.execution || codex_agent, app_server.mode) {
+        match (self.switches.app_server_used(codex_agent), app_server.mode) {
             (false, _) => CodexTarget::Off,
             (true, AppServerMode::System) => match &app_server.socket {
                 Some(socket) => CodexTarget::System(socket.clone()),
                 None => CodexTarget::Off,
             },
             (true, AppServerMode::Spawn) => CodexTarget::Spawn(CodexLaunch {
-                bin: self.codex_bin.clone(),
-                env: self.env.codex.clone(),
+                bin: self.bin(Provider::Codex),
+                env: self.env.get(Provider::Codex).clone(),
             }),
         }
     }
@@ -448,36 +584,44 @@ mod tests {
     }
 
     #[test]
-    fn the_execution_switch_decides_whether_codex_runs_work() {
+    fn the_execution_set_decides_whether_codex_runs_work() {
         let mut local = Local {
             switches: Providers::default(),
-            codex_bin: "codex".into(),
+            bins: BTreeMap::new(),
             env: ProviderEnv::default(),
         };
-        assert!(!local.switches.execution && local.switches.validate(false).is_ok());
+        assert!(local.switches.execution.is_empty() && local.switches.validate(false).is_ok());
         assert!(local.codex_target(false) == CodexTarget::Off);
         assert!(local.validate(true).is_err());
-        local.switches.execution = true;
+        local.switches.execution.insert(Provider::Codex);
         assert!(local.validate(false).is_err());
         local.switches.codex_app_server.socket = Some("/configured/app-server.sock".into());
         assert!(local.validate(false).is_ok());
         assert!(matches!(local.codex_target(false), CodexTarget::System(_)));
-        local.switches.execution = false;
+        local.switches.execution.clear();
         assert!(local.validate(true).is_ok());
         assert!(matches!(local.codex_target(true), CodexTarget::System(_)));
         assert!(local.codex_target(false) == CodexTarget::Off);
+        local.switches.execution.insert(Provider::Cursor);
+        assert!(
+            local.validate(true).is_err(),
+            "only a provider that executes work joins the set"
+        );
         assert!(
             serde_json::from_value::<Providers>(serde_json::json!({
-                "execution":true,"codex":{"enabled":true,"roles":["agent"]},
+                "execution":["codex"],"codex":{"enabled":true,"roles":["agent"]},
             }))
             .is_err(),
             "per-provider switches are gone"
+        );
+        assert!(
+            serde_json::from_value::<Providers>(serde_json::json!({"execution":true})).is_err()
         );
     }
 
     #[test]
     fn codex_execution_requires_an_explicit_socket_or_spawn_mode() -> Result<()> {
-        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":true}))?;
+        let saved: Providers = serde_json::from_value(serde_json::json!({"execution":["codex"]}))?;
         let mut env = ProviderEnv::default();
         env.apply(
             Provider::Codex,
@@ -485,7 +629,7 @@ mod tests {
         )?;
         let mut local = Local {
             switches: saved,
-            codex_bin: "codex".into(),
+            bins: BTreeMap::new(),
             env,
         };
         assert!(local.switches.validate(false).is_err());
@@ -502,6 +646,56 @@ mod tests {
         assert!(local.codex_target(false) == CodexTarget::System("/tmp/kept.sock".into()));
         local.switches.codex_app_server.socket = Some("relative.sock".into());
         assert!(local.switches.validate(false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_provider_has_one_name_everywhere() {
+        use clap::ValueEnum as _;
+        assert_eq!(
+            Provider::ALL.map(Provider::name),
+            ["codex", "cursor", "claude", "pi", "opencode"]
+        );
+        for provider in Provider::ALL {
+            assert_eq!(serde_json::to_value(provider).unwrap(), provider.name());
+            assert_eq!(
+                serde_json::from_value::<Provider>(json!(provider.name())).unwrap(),
+                provider
+            );
+            assert_eq!(
+                provider.to_possible_value().unwrap().get_name(),
+                provider.name()
+            );
+        }
+        for retired in ["codex_sdk", "cursor_sdk"] {
+            assert!(serde_json::from_value::<Provider>(json!(retired)).is_err());
+            assert!(<Provider as clap::ValueEnum>::from_str(retired, false).is_err());
+        }
+    }
+
+    #[test]
+    fn variables_and_programs_are_kept_per_provider() -> Result<()> {
+        let env: ProviderEnv = serde_json::from_value(json!({
+            "claude":{"ANTHROPIC_API_KEY":"fixture-claude-value"},"opencode":{"OPENCODE_MODEL":"m"},
+        }))?;
+        assert_eq!(
+            env.get(Provider::Claude)["ANTHROPIC_API_KEY"],
+            "fixture-claude-value"
+        );
+        assert!(env.get(Provider::Pi).is_empty() && env.get(Provider::Codex).is_empty());
+        assert!(serde_json::from_value::<ProviderEnv>(json!({"cursor_sdk":{}})).is_err());
+        let local = Local {
+            switches: Providers::default(),
+            bins: serde_json::from_value(json!({"pi":"/opt/pi/bin/pi"}))?,
+            env,
+        };
+        assert_eq!(local.bin(Provider::Pi), PathBuf::from("/opt/pi/bin/pi"));
+        assert_eq!(local.bin(Provider::Opencode), PathBuf::from("opencode"));
+        assert_eq!(
+            local.bin(Provider::Cursor),
+            PathBuf::from("cursor-sdk-bridge")
+        );
+        assert!(local.launches(Provider::Claude) && !local.launches(Provider::Codex));
         Ok(())
     }
 }

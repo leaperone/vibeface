@@ -7,7 +7,16 @@ export const joinCopy = {
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
+  linkFilled: '已填入加入链接',
+  deviceName: '这台设备的名字',
 }
+
+/** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
+export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
+
+/** Leaving would take the last way to approve devices and settings with it, so both apps explain instead of offering it. */
+export const soleManager = (members: readonly Member[], me: string | undefined) =>
+  members.some((member) => member.device_id === me && member.manage) && !members.some((member) => member.device_id !== me && member.manage)
 
 /** Hours until `at`, at least one while it has not passed. */
 export const hoursUntil = (at: number, now = Date.now()) => Math.max(1, Math.ceil((at - now) / 3_600_000))

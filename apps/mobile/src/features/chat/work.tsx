@@ -43,7 +43,7 @@ export function useChatExtras(conversationId: string, botId: string) {
   const after = new Map<string, Row[]>()
   const rest: Row[] = []
   const cards: ReactNode[] = []
-  if (!shared || !data) return { after, rest, cards }
+  if (!shared || !data) return { after, rest, cards, first: [] as Row[] }
   const lookup = { nodes: shared.nodes, directory }
   const add = (at: string | undefined, row: Row) => {
     if (at) after.set(at, [...after.get(at) ?? [], row])
@@ -65,8 +65,9 @@ export function useChatExtras(conversationId: string, botId: string) {
   }
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
-  for (const [at, records] of changes.after) add(at, { key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
-  for (const records of changes.rest) rest.push({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
+  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
+  for (const [at, turns] of changes.after) for (const records of turns) add(at, changeRow(records))
+  const first = changes.first.map(changeRow)
 
   const owner = data.conversation?.owner
   const here = shared.nodes.find((node) => node.device_id === data.local_node)
@@ -75,7 +76,7 @@ export function useChatExtras(conversationId: string, botId: string) {
       actions={<ActionButton icon={ArrowRightLeft} disabled={!shared.writable} action={() => shared.takeOver()}>换到 {nodeName(here.device_id, lookup)}</ActionButton>} />)
   }
   for (const check of pendingChecks(data, shared.nodes, conversationId)) cards.push(<ConfirmCard key={check.check_id} check={check} />)
-  return { after, rest, cards }
+  return { after, rest, cards, first }
 }
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */
@@ -130,7 +131,7 @@ function JobLine({ job }: { job: ManagerJob }) {
 const confirmIcons: Record<WorkCheck['reason'], LucideIcon> = { offline: WifiOff, disconnected: Unplug, unverified: CircleQuestionMark }
 
 /** The person says whether a work its device cannot report finished, or that a leftover program stopped. Nothing is re-run. */
-function ConfirmCard({ check }: { check: PendingCheck }) {
+export function ConfirmCard({ check }: { check: PendingCheck }) {
   const shared = useLive()
   const { directory } = useDevice()
   const [note, setNote] = useState('')

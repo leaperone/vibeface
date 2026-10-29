@@ -1,7 +1,7 @@
 import { CameraView, useCameraPermissions } from 'expo-camera'
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { View } from 'react-native'
@@ -19,6 +19,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
 import { useRun } from '@/lib/use-run'
+import { defaultName, self } from '@/platform'
 
 export default function JoinScreen() {
   const workspace = useWorkspace()
@@ -26,10 +27,12 @@ export default function JoinScreen() {
   const session = workspace.session
   const [lane, setLane] = useState<'invite' | 'recovery'>('invite')
   const recovering = Boolean(device.recovery || device.ready && device.recovered)
+  // The request is out, so the Node has spent the link.
+  useEffect(() => { if (session.phase === 'joining') spent = submitted }, [session.phase])
   const choosing = device.phase !== 'key_lost' && !device.review && !recovering && session.phase !== 'joining'
   // The safe-area view is not Uniwind-wrapped, so its size goes in `style`.
   return <SafeAreaView style={{ flex: 1 }}>
-    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="grow gap-8 px-6 py-10" keyboardShouldPersistTaps="handled">
+    <KeyboardAwareScrollView bottomOffset={24} contentContainerClassName="w-full max-w-md grow gap-8 self-center px-6 py-10" keyboardShouldPersistTaps="handled">
       {/* The name holds the open space; the actions sit low, where the thumb is. */}
       <View className="min-h-24 flex-1 justify-center">
         <Animated.View layout={LinearTransition.reduceMotion(ReduceMotion.System)}>
@@ -57,50 +60,66 @@ function LostKey() {
   const device = useDevice()
   const { busy, error, run } = useRun()
   return <Panel icon={ShieldAlert} title="需要重新加入">
-    <Text className="text-muted-foreground">这台手机保存的登录信息不见了。</Text>
+    <Text className="text-muted-foreground">{self}保存的登录信息不见了。</Text>
     {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
     <Button className="min-h-11 self-start" disabled={busy !== null} onPress={() => void run('restart', device.replaceLostKey)}><Text>重新开始</Text></Button>
   </Panel>
 }
 
+// A link is single-use: once a join request went out with it, coming back here after 取消 or 断开 must not offer it again.
+let submitted = '', spent = ''
+
 function JoinForm() {
   const workspace = useWorkspace()
+  const device = useDevice()
   const url = useLinkingURL()
   const [invitation, setInvitation] = useState('')
   // The raw URL keeps the ticket after `#`, which router params drop; every new `vibeface://join?link=` refills the field.
   useEffect(() => {
     const link = url ? new URL(url).searchParams.get('link') : null
-    if (link) setInvitation(link)
+    if (link && link !== spent) setInvitation(link)
   }, [url])
-  const [name, setName] = useState('我的手机')
+  const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const submit = async () => {
     setError('')
     setBusy(true)
+    submitted = invitation.trim()
     try { await workspace.actions.join(invitation.trim(), name.trim()) }
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
   if (scanning) return <Scanner onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
   const ready = invitation.trim() !== ''
-  // Scanning leads; the name and 加入 only appear once there is a link to join with.
+  // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
+  const failure = error || device.error
+  // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
+  if (ready) return <View className="gap-4">
+    <View className="min-h-12 flex-row items-center gap-3 rounded-xl bg-muted/60 ps-4">
+      <Icon as={Link2} className="text-success" />
+      <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
+      <Button variant="ghost" size="icon" className="size-12" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
+    </View>
+    <View className="gap-2">
+      <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
+      <Input accessibilityLabel={joinCopy.deviceName} placeholder={defaultName} className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
+    </View>
+    {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
+    <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
+  </View>
   return <View className="gap-4">
     <Text className="text-meta text-muted-foreground">{joinCopy.linkSource()}</Text>
-    <Button variant={ready ? 'outline' : 'default'} className="min-h-12" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
+    {failure ? <Text role="alert" className="text-meta text-danger">{failure}</Text> : null}
+    <Button className="min-h-12" onPress={() => setScanning(true)}><Icon as={Camera} /><Text>扫码加入</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder="或粘贴加入链接" autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      {ready ? null : <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
+      <Button variant="ghost" className="-ms-3 min-h-11 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
-      </Button>}
+      </Button>
     </View>
-    {ready ? <>
-      <Input accessibilityLabel="这台手机叫什么？" placeholder="这台手机叫什么？" className="min-h-11" value={name} onChangeText={setName} maxLength={64} />
-      {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
-      <Button className="min-h-12" disabled={busy || !name.trim()} onPress={submit}><Text>{busy ? '加入中' : '加入'}</Text></Button>
-    </> : null}
   </View>
 }
 

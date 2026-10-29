@@ -1,7 +1,8 @@
 import '@/platform/polyfills'
 import '../global.css'
 
-import { Stack } from 'expo-router'
+import { Stack, router } from 'expo-router'
+import { X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
 import { StatusBar } from 'expo-status-bar'
 import { useEffect } from 'react'
@@ -9,6 +10,8 @@ import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
+import { Button } from '@/components/ui/button'
+import { Icon } from '@/components/ui/icon'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace } from '@/data/live'
 import { HomeList } from '@/features/home/list'
@@ -58,17 +61,23 @@ function Screens() {
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
-            <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal' }} />
-            <Stack.Screen name="ai" options={{ title: 'Bot 与任务' }} />
+            <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
+            {/* Opened from the new bot sheet it is a sheet too, with no back button of its own. */}
+            <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />
             <Stack.Screen name="inbox" options={{ title: '待处理', ...root }} />
             <Stack.Screen name="settings" options={{ title: '设置', ...root }} />
             <Stack.Screen name="transfers" options={{ title: '文件传输' }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
-            <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal' }} />
+            <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal', headerLeft: Close }} />
             <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />
           </Stack.Protected>
         </Stack>
       </View>
     </View>
   </>
+}
+
+/** A sheet's own way out, beside the swipe down that not everyone knows. */
+function Close() {
+  return <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="关闭" onPress={() => router.back()}><Icon as={X} /></Button>
 }

@@ -1,32 +1,60 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, CirclePause, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, FolderOpen, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
-import { Alert, ScrollView, View } from 'react-native'
-import { formatIn, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { Alert, Pressable, ScrollView, View } from 'react-native'
+import { folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
+import { messageOf } from '@vibeface/client/lib/node.ts'
+import type { BotProject } from '@vibeface/client/workspace/types.ts'
+import { cn } from '@/lib/utils'
 import { ActionButton } from '@/components/action'
+import { botMood, BotFace } from '@/components/bot-face'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useWorkspace } from '@/data/context'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
 /** A bot as the web's bot panel shows it: primary or not, what it does, its schedules, notes and the shared skills. Changes are made by asking it in the chat. */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
   if (!shared || !bot) return <EmptyState icon={Bot} title="没有这个 Bot" />
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
-  const empty = view && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
+  const empty = view && !bot.project && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
+  const lookup = { nodes: shared.nodes, directory }
+  const choices = projectChoices(shared.nodes, (node, index) => nodeName(node.device_id, lookup, `设备 ${index + 1}`))
+  const projectNow = bot.project ? projectKey(bot.project) : ''
+  const place = bot.project ? projectPlace(bot.project, shared.data?.conversation?.owner, (id) => nodeName(id, lookup)) : ''
+  const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
+    ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
-    <View className="gap-3">
+    <View className="items-start gap-3">
+      <BotFace botId={bot.bot_id} mood={botMood(bot, workspace, shared)} size={80} />
       {shared.primary === bot.conversation_id
         ? <View accessible accessibilityHint={primaryHint} className="flex-row items-center gap-1.5"><Icon as={Star} className="size-4 fill-muted-foreground text-muted-foreground" /><Text className="text-muted-foreground">主 Bot</Text></View>
         : <ActionButton variant="outline" className="min-h-11 self-start" icon={Star} accessibilityHint={primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
     </View>
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">还没有设置</Text></View> : null}
+    {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>
+      {shared.writable && choices.length ? <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
+        {options.map((item, index) => {
+          const selected = item.key === projectNow
+          return <Pressable key={item.key || 'none'} accessibilityRole="radio" accessibilityState={{ checked: selected }} className={cn('min-h-12 flex-row items-center gap-3 px-4 py-2 active:bg-muted', index > 0 && 'border-t border-border')}
+            onPress={() => { if (!selected) void shared.setBotProject(bot.conversation_id, item.project).catch((error: unknown) => Alert.alert('没换成', messageOf(error))) }}>
+            <Text numberOfLines={1} className="min-w-0 flex-1">{item.label}</Text>
+            {selected ? <Icon as={Check} className="size-4" /> : null}
+          </Pressable>
+        })}
+      </View> : <Text selectable>{place}</Text>}
+    </Section> : null}
     {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
     {schedules.length ? <Section icon={CalendarClock} title="定时任务" count={schedules.length}>
       {schedules.map((schedule) => <View key={schedule.schedule_id} className="flex-row items-start gap-3">
@@ -64,7 +92,7 @@ export default function BotAbout() {
   </ScrollView>
 }
 
-const primaryHint = '没有 Bot 负责的 Codex 会话，由主 Bot 分派'
+const primaryHint = '没有 Bot 负责的会话，由主 Bot 分派'
 
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {
   return <View className="gap-3">

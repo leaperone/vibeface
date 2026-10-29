@@ -21,6 +21,8 @@ const OWNER_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub(super) struct ActiveManager {
     access: Access,
+    /// The provider the reply runs on, whatever the device switched to since.
+    provider: crate::providers::Provider,
     token: String,
     cancel: watch::Sender<bool>,
     fenced: AtomicBool,
@@ -34,6 +36,7 @@ impl Runtime {
         mut access: Access,
         attempt_id: &str,
         trigger: &str,
+        provider: crate::providers::Provider,
     ) -> Result<watch::Receiver<bool>> {
         let mut controls = self.manager_controls.lock().await;
         if let Some(active) = controls.get(attempt_id) {
@@ -58,6 +61,7 @@ impl Runtime {
         let (cancel, receiver) = watch::channel(false);
         let active = Arc::new(ActiveManager {
             access: access.clone(),
+            provider,
             token: token.clone(),
             cancel,
             fenced: AtomicBool::new(false),
@@ -66,6 +70,15 @@ impl Runtime {
         self.agent_tokens.lock().await.insert(token, access);
         controls.insert(attempt_id.into(), active);
         Ok(receiver)
+    }
+
+    /// The provider a reply of this process runs on.
+    pub(super) async fn attempt_provider(
+        &self,
+        attempt_id: &str,
+    ) -> Option<crate::providers::Provider> {
+        let controls = self.manager_controls.lock().await;
+        controls.get(attempt_id).map(|active| active.provider)
     }
 
     pub async fn fence_manager_attempt(&self, attempt_id: &str) -> Result<()> {
@@ -281,6 +294,13 @@ impl Runtime {
     /// reply was already recorded as interrupted; an unreachable App Server, or another one than
     /// the turn ran on, leaves it unknown.
     async fn codex_turn_ended(&self, turn: &ReplyTurn, attempt_id: &str) -> bool {
+        // A turn on no App Server ran in the recorded process groups, which have all exited.
+        if turn.server.is_empty() {
+            return true;
+        }
+        if turn.server == super::opencode::SERVER {
+            return self.opencode.run_ended(&turn.thread).await;
+        }
         if turn.server != self.codex.server() {
             return false;
         }
@@ -343,7 +363,7 @@ impl Runtime {
     }
 
     /// Whether the work's device can still report it: this Node with the run on record, or a
-    /// reachable one; a Codex work also needs that device's App Server connected.
+    /// reachable one; a work on the App Server also needs that device's App Server connected.
     async fn target_vouches(&self, network: &str, work: &WorkProjection) -> Result<bool> {
         let codex = if work.target_node == self.identity.device_id()? {
             let run = self.store.lock().await.work_record(&work.work_id)?;
@@ -363,7 +383,10 @@ impl Runtime {
                 _ => return Ok(false),
             }
         };
-        Ok(work.kind == WorkKind::Task || codex["connected"] == true)
+        Ok(match work.kind {
+            WorkKind::Agent(provider) if provider.on_app_server() => codex["connected"] == true,
+            _ => true,
+        })
     }
 
     async fn settle_work_check(
@@ -428,7 +451,7 @@ impl Runtime {
 }
 
 /// Signal 0 only asks whether the recorded group still exists; it never signals the processes.
-fn group_alive(group: u32) -> bool {
+pub(super) fn group_alive(group: u32) -> bool {
     let Ok(group) = libc::pid_t::try_from(group) else {
         return false;
     };

@@ -20,12 +20,16 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 pub(crate) mod agent_tools;
 mod bots;
 mod chat_controls;
+pub mod claude;
 mod codex_server;
 mod cursor;
+mod executor;
 mod followup;
 mod manager_control;
 mod observation;
+pub mod opencode;
 mod peers;
+pub mod pi;
 mod schedule_delivery;
 mod settings;
 mod triage;
@@ -33,8 +37,9 @@ mod work;
 pub use manager_control::ManagerAccess;
 pub(crate) use observation::{ObservationGuard, native_progress};
 pub use settings::NodeSettings;
-pub(crate) use settings::SETTINGS_AGENT;
-pub use triage::{SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV};
+pub use triage::{
+    AGENT_ANSWER_WITHIN, HOOK_ANSWER_WITHIN, SPOOL_DIR as HOOK_SPOOL, TRIAGE_URL_ENV,
+};
 
 fn node_display_names(bundle: &NetworkState) -> BTreeMap<String, String> {
     let mut names = BTreeMap::new();
@@ -160,6 +165,9 @@ pub struct Runtime {
     pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
+    pub(crate) claude: claude::Claude,
+    pub(crate) pi: Arc<pi::Pi>,
+    pub(crate) opencode: Arc<opencode::Opencode>,
     progress_sequence: std::sync::atomic::AtomicU64,
     /// Attempts made and the next one's time for each held stop. Only pacing lives here: the
     /// stop and its deadline are stored, so a restart retries at once.
@@ -245,7 +253,7 @@ impl Runtime {
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
         let providers = crate::providers::Local {
             switches: config.providers.clone(),
-            codex_bin: config.codex_bin.clone(),
+            bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
         };
         let codex_agent = config
@@ -253,11 +261,17 @@ impl Runtime {
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
         providers.validate(codex_agent)?;
+        let claude = claude::Claude::open(dir, providers.env.get(Provider::Claude));
         let codex = Arc::new(codex_server::CodexServer::open(
             providers.codex_target(codex_agent),
             &identity,
             dir,
             tx,
+        )?);
+        let opencode = Arc::new(opencode::Opencode::open(
+            dir,
+            providers.bin(Provider::Opencode),
+            providers.env.get(Provider::Opencode).clone(),
         )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
@@ -300,6 +314,9 @@ impl Runtime {
             cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
+            claude,
+            pi: Arc::new(pi::Pi::new(dir)),
+            opencode,
             progress_sequence: std::sync::atomic::AtomicU64::new(0),
             stop_retries: std::sync::Mutex::new(HashMap::new()),
             live_probe_at: std::sync::atomic::AtomicI64::new(now_ms()),
@@ -343,18 +360,26 @@ impl Runtime {
     pub async fn install_membership(&self, incoming: NetworkState) -> Result<AuthorizationView> {
         let _work = self.maintenance.enter()?;
         let mut store = self.store.lock().await;
-        let mut state = incoming;
-        if store.has_network()? {
-            state = store.public_state()?.merge(&state)?;
-        }
+        let previous = if store.has_network()? {
+            Some(store.public_state()?)
+        } else {
+            None
+        };
+        let state = match &previous {
+            Some(previous) => previous.merge(&incoming)?,
+            None => incoming,
+        };
+        // Clients read the device list on a change, so a join, removal or permission change
+        // shows on every open page without a reload.
+        let changed = previous.as_ref() != Some(&state);
         let network = state.genesis.network_id.clone();
         let (view, rebuilt) = store.install_state(state)?;
         if rebuilt {
             store.settle_local_works(&network)?;
         }
         drop(store);
-        if rebuilt {
-            self.publish_rebuilt(&network);
+        if rebuilt || changed {
+            self.publish_reread(&network);
         }
         self.membership.send_modify(|changes| *changes += 1);
         self.forget_revoked(&view).await;
@@ -483,11 +508,14 @@ impl Runtime {
     pub async fn authorize_bearer(&self, token: &str) -> Option<Access> {
         self.agent_tokens.lock().await.get(token).cloned()
     }
-    /// Stops the managed App Server and Cursor bridge; the Node calls this on SIGTERM before exiting.
+    /// Stops the managed App Server, Claude Code processes and Cursor bridge; the Node calls this
+    /// on SIGTERM before exiting.
     pub async fn shutdown(&self) {
         self.delivery.shutdown().await;
         self.stop_network().await;
         self.codex.stop().await;
+        self.claude.stop().await;
+        self.opencode.stop().await;
         if let Some(bridge) = self.cursor.get() {
             bridge.stop().await;
         }
@@ -521,8 +549,9 @@ impl Runtime {
         self.publish_changed(network, scope, Changed::Event(&event.hash));
         Ok(event)
     }
-    /// Which events count changed, so every conversation may read differently now.
-    pub(crate) fn publish_rebuilt(&self, network: &str) {
+    /// Clients reread everything: which events count changed, the membership changed, or a member
+    /// Node came or went.
+    pub(crate) fn publish_reread(&self, network: &str) {
         let _ = self.events.send(Update {
             network_id: network.into(),
             payload: json!({"type":"changed"}),
@@ -572,10 +601,15 @@ impl Runtime {
         let settings = self.settings_snapshot();
         let manager = self.manager().map(|m| m.provider);
         let mut codex = self.codex.capability().await;
-        codex["enabled"] = json!(self.providers().switches.execution);
+        codex["enabled"] = json!(
+            self.providers()
+                .switches
+                .execution
+                .contains(&Provider::Codex)
+        );
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
-            "manager":manager.map(Provider::sdk_name),
-            "manager_ready":self.manager_ready().await,
+            "manager":manager,
+            "manager_state":self.manager_state().await,
             "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})
     }
@@ -626,29 +660,33 @@ impl Runtime {
                     .collect();
                 let probes = members.iter().map(|member| async {
                     if member.device_id == local {
-                        return self.capabilities().await;
+                        return (true, self.capabilities().await);
                     }
                     // A Node the sync loop cannot reach would hold this answer for the timeout.
-                    if self.sync_failing(&member.device_id) {
-                        return Value::Null;
-                    }
-                    tokio::time::timeout(
-                        Duration::from_secs(3),
-                        self.peer_request(
-                            network,
-                            &member.device_id,
-                            json!({"type":"capabilities"}),
-                        ),
+                    let answer = if self.sync_failing(&member.device_id) {
+                        None
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            self.peer_request(
+                                network,
+                                &member.device_id,
+                                json!({"type":"capabilities"}),
+                            ),
+                        )
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                    };
+                    let live = answer.is_some();
+                    (
+                        live,
+                        self.peer_capabilities(&member.device_id, answer).await,
                     )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .unwrap_or(Value::Null)
                 });
                 let probes = futures_util::future::join_all(probes).await;
-                for (member, capabilities) in members.into_iter().zip(probes) {
+                for (member, (live, capabilities)) in members.into_iter().zip(probes) {
                     let here = member.device_id == local;
-                    let live = !capabilities.is_null();
                     let (seq, hash) = match heads.get(&member.device_id) {
                         Some((seq, hash)) => (*seq, Some(hash)),
                         None => (0, None),
@@ -709,6 +747,7 @@ impl Runtime {
             "create_bot" => self.create_bot(&access, &input).await,
             "delete_bot" => self.delete_bot(&access, &input).await,
             "set_primary_bot" => self.set_primary_bot(&access, &input).await,
+            "set_bot_project" => self.set_bot_project(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
@@ -754,7 +793,7 @@ impl Runtime {
                 .iter()
                 .filter_map(|r| std::fs::canonicalize(r).ok())
                 .any(|r| path.starts_with(r)),
-            "execution path is outside configured roots"
+            "execution path is outside configured roots; ask the user to allow its folder with propose_provider_config roots"
         );
         ensure!(path.is_dir(), "execution path must be a directory");
         Ok(path)

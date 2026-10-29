@@ -1,19 +1,23 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, Settings, Star } from 'lucide-react-native'
+import { Bot, ChevronRight, Inbox, Plus, Settings } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { ConnectionPill } from '@/components/connection-pill'
-import { Badge, botHue, botTint, EmptyState, Monogram } from '@/components/kit'
+import { ConnectionMenu } from '@/components/connection-pill'
+import { botMood, BotFace } from '@/components/bot-face'
+import { faceOf } from '@vibeface/client/avatar/face.ts'
+import { Badge, botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
-import { useLive } from '@/data/live'
+import { useInbox, useLive } from '@/data/live'
+import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
 import { listTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 
@@ -36,7 +40,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   const shared = useLive()
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
   const loading = !shared?.synced
-  const waiting = workspace.questions.filter((question) => question.answer === null).length + Number(!!device.pendingRecovery) + Number(device.rotateHint)
+  const waiting = waitingItems(useInbox()).length
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
   const canCreate = Boolean(shared && (shared.writable || shared.pendingBot))
@@ -48,6 +52,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     contentContainerStyle={sidebar ? { paddingTop: insets.top, paddingBottom: insets.bottom + 32 } : { minHeight }}>
     {sidebar ? <View className="mb-2 flex-row items-center ps-3 pt-2">
       <Text role="heading" className="flex-1 text-3xl font-bold">消息</Text>
+      <ConnectionMenu connection={workspace.connection} />
       <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} /></Button></Link>
     </View> : null}
@@ -61,10 +66,10 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       </Link>
     </Item> : null}
     {bots.length ? bots.map((bot, index) => {
-      const last = bot.last_message
+      const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
-        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<Monogram name={bot.name} seed={bot.bot_id} />} name={bot.name} tint={botTint(botHue(bot.bot_id), dark)}
-          mark={workspace.primary === bot.conversation_id ? <Icon as={Star} accessibilityLabel="主 Bot" className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
+        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace botId={bot.bot_id} mood={mood} size={44} primary={primary} />} name={bot.name} tint={botTint(faceOf(bot.bot_id).hue, dark)}
+          label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
           unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
         {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
@@ -75,19 +80,16 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} /></View>}
-    <View className="mt-auto px-1 pt-6"><ConnectionPill connection={workspace.connection} /></View>
   </ScrollView></LayoutAnimationConfig>
 }
 
-function Row({ href, replace, active, avatar, name, mark, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {
+function Row({ href, replace, active, avatar, name, label, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; label?: string; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {
   return <Link href={href} replace={replace} asChild>
-    <Pressable accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
+    <Pressable accessibilityLabel={label && [label, preview, time, unread ? `${unread} 条未读` : ''].filter(Boolean).join('，')} accessibilityState={{ selected: active }} className={cn('min-h-16 flex-row items-center gap-3 rounded-xl px-3 py-2.5 active:bg-muted', active && 'bg-muted')}>
       {avatar}
       <View className="min-w-0 flex-1 gap-0.5">
         <View className="flex-row items-center gap-2">
-          <View className="min-w-0 flex-1 flex-row items-center gap-1.5">
-            <Text numberOfLines={1} className={cn('shrink', unread ? 'font-semibold' : 'font-medium')}>{name}</Text>{mark}
-          </View>
+          <Text numberOfLines={1} className={cn('min-w-0 flex-1', unread ? 'font-semibold' : 'font-medium')}>{name}</Text>
           {time ? <Text maxFontSizeMultiplier={1.4} className="text-meta text-muted-foreground" style={[{ fontVariant: ['tabular-nums'] }, unread ? { color: tint.fill } : null]}>{time}</Text> : null}
         </View>
         <View className="flex-row items-center gap-2">

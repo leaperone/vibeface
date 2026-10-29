@@ -477,6 +477,12 @@ impl Revocation {
 }
 
 /// Concurrent revocations of one device keep the widest bound, the same on every replica.
+/// A client may revoke itself, and nothing else, without management permission.
+fn leaves(issuer: &str, action: &GovernanceAction, client: bool) -> bool {
+    client
+        && matches!(action, GovernanceAction::Revoke(revocation) if revocation.device_id == issuer)
+}
+
 fn widen(revoked: &mut BTreeMap<String, Revocation>, revocation: &Revocation) {
     match revoked.get_mut(&revocation.device_id) {
         Some(known) if known.bound() >= revocation.bound() => {}
@@ -521,7 +527,8 @@ impl GovernanceEvent {
         action: GovernanceAction,
     ) -> Result<Self> {
         ensure!(
-            view.member(issuer)?.is_manager(),
+            view.member(issuer)?.is_manager()
+                || leaves(issuer, &action, view.client(issuer).is_ok()),
             "management permission required"
         );
         match &action {
@@ -532,7 +539,13 @@ impl GovernanceEvent {
                     LAST_MANAGER
                 );
             }
-            GovernanceAction::Revoke(revocation) => revocation.validate()?,
+            GovernanceAction::Revoke(revocation) => {
+                revocation.validate()?;
+                ensure!(
+                    view.keeps_manager_without(&revocation.device_id),
+                    LAST_MANAGER
+                );
+            }
             GovernanceAction::Veto { checkpoint, .. } => ensure!(
                 view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
                 NO_RECOVERY_WAITING
@@ -1214,7 +1227,14 @@ impl NetworkState {
                 let (members, revoked) = project_members(base, retired, &validated, &ancestors);
                 ensure!(
                     !revoked.contains_key(&event.issuer)
-                        && members.get(&event.issuer).is_some_and(Member::is_manager),
+                        && members.get(&event.issuer).is_some_and(|member| {
+                            member.is_manager()
+                                || leaves(
+                                    &event.issuer,
+                                    &event.action,
+                                    member.kind == IdentityKind::Client,
+                                )
+                        }),
                     "management permission required"
                 );
                 verify_payload(
@@ -1585,6 +1605,60 @@ mod tests {
     }
 
     #[test]
+    fn a_client_leaves_by_revoking_itself_and_rejoins_only_with_a_new_key() -> Result<()> {
+        let (_, a, node, mut state) = setup()?;
+        let (ordinary, other) = (identity(), identity());
+        for device in [&ordinary, &other] {
+            state.append(GovernanceEvent::grant(
+                &a,
+                &state.project()?,
+                Member::client(device, "client", false)?,
+            )?)?;
+        }
+        let refused = |result: Result<GovernanceEvent>, reason: &str| {
+            assert!(format!("{:#}", result.unwrap_err()).contains(reason));
+        };
+        let view = state.project()?;
+        refused(
+            GovernanceEvent::revoke(&ordinary, &view, cut(&other, 0)),
+            "management permission required",
+        );
+        refused(
+            GovernanceEvent::revoke(&node, &view, cut(&node, 0)),
+            "management permission required",
+        );
+        refused(GovernanceEvent::revoke(&a, &view, cut(&a, 0)), LAST_MANAGER);
+        let mut forged = GovernanceEvent::revoke(&a, &view, cut(&other, 0))?;
+        forged.issuer = id(&ordinary);
+        assert!(state.append(forged.sign(&ordinary)?).is_err());
+
+        state.append(GovernanceEvent::revoke(
+            &ordinary,
+            &view,
+            cut(&ordinary, 0),
+        )?)?;
+        let view = state.project()?;
+        assert!(view.member(&id(&ordinary)).is_err());
+        assert_eq!(view.cutoff(&id(&ordinary)), Some(0));
+        assert!(view.member(&id(&other)).is_ok());
+        assert!(GovernanceEvent::revoke(&ordinary, &view, cut(&ordinary, 0)).is_err());
+        state.append(GovernanceEvent::grant(
+            &a,
+            &view,
+            Member::client(&ordinary, "back", false)?,
+        )?)?;
+        assert!(state.project()?.member(&id(&ordinary)).is_err());
+        let fresh = identity();
+        state.append(GovernanceEvent::grant(
+            &a,
+            &state.project()?,
+            Member::client(&fresh, "back", false)?,
+        )?)?;
+        assert!(state.project()?.member(&id(&fresh)).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn a_manager_can_be_demoted_while_another_remains() -> Result<()> {
         let (_, a, _, mut state) = setup()?;
         let b = identity();
@@ -1698,8 +1772,8 @@ mod tests {
         merged.append(GovernanceEvent::revoke(&b, &merged.project()?, cut(&a, 0))?)?;
         let view = merged.project()?;
         assert!(GovernanceEvent::revoke(&a, &view, cut(&b, 0)).is_err());
-        merged.append(GovernanceEvent::revoke(&b, &view, cut(&b, 0))?)?;
-        assert!(merged.project()?.members.iter().all(|m| !m.manage));
+        let last = GovernanceEvent::revoke(&b, &view, cut(&b, 0)).unwrap_err();
+        assert!(format!("{last:#}").contains(LAST_MANAGER));
         Ok(())
     }
 

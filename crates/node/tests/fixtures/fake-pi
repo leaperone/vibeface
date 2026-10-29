@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Controlled stand-in for `pi --mode rpc`: the commands and events the Node uses, and a session
+file written the way pi writes it.
+
+PI_CODING_AGENT_SESSION_DIR holds the sessions. FAKE_PI_LOG gets one JSON line per start and
+per prompt. FAKE_PI_MODE picks the turn: "reply" (a tool call, then "Hello"), "wait" (streams
+until a steer or an abort), "crash" (exits mid-turn) or "refuse" (no API key). Standard library
+only.
+"""
+import json
+import os
+import secrets
+import sys
+import threading
+import time
+import uuid
+
+MODE = os.environ.get("FAKE_PI_MODE", "reply")
+DIRECTORY = os.environ["PI_CODING_AGENT_SESSION_DIR"]
+out = threading.Lock()
+state = threading.Condition()
+steers, aborted, running = [], [False], [False]
+
+
+def log(record):
+    if os.environ.get("FAKE_PI_LOG"):
+        with open(os.environ["FAKE_PI_LOG"], "a") as file:
+            file.write(json.dumps(record) + "\n")
+
+
+def emit(event):
+    with out:
+        sys.stdout.write(json.dumps(event) + "\n")
+        sys.stdout.flush()
+
+
+def argument(name):
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
+
+
+def read(path):
+    with open(path) as file:
+        lines = [json.loads(line) for line in file if line.strip()]
+    return lines[0], lines[1:]
+
+
+log({"argv": sys.argv[1:], "run": os.environ.get("VIBEFACE_PI_RUN")})
+os.makedirs(DIRECTORY, exist_ok=True)
+stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
+if argument("--session"):
+    path = argument("--session")
+    header, entries = read(path)
+    session, flushed = header["id"], True
+else:
+    session = argument("--session-id") or str(uuid.uuid4())
+    path = os.path.join(DIRECTORY, f"{stamp}_{session}.jsonl")
+    header = {"type": "session", "version": 3, "id": session, "timestamp": stamp, "cwd": os.getcwd()}
+    entries, flushed = [], False
+    if argument("--fork"):
+        entries = read(argument("--fork"))[1]
+        with open(path, "x") as file:
+            for entry in [header] + entries:
+                file.write(json.dumps(entry) + "\n")
+        flushed = True
+
+
+def end(message):
+    """Keeps the message, then reports it: in pi a later command always finds it kept."""
+    global flushed
+    entry = {"type": "message", "id": secrets.token_hex(4), "parentId": entries[-1]["id"] if entries else None,
+             "timestamp": time.time(), "message": message}
+    entries.append(entry)
+    with open(path, "a" if flushed else "x") as file:
+        for line in [entry] if flushed else [header] + entries:
+            file.write(json.dumps(line) + "\n")
+    flushed = True
+    emit({"type": "message_end", "message": message})
+
+
+def start(role):
+    emit({"type": "message_start", "message": {"role": role, "content": []}})
+
+
+def stream(delta):
+    emit({"type": "message_update", "message": {"role": "assistant"},
+          "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": delta}})
+
+
+def reply(text, stop, *extra):
+    return {"role": "assistant", "content": [{"type": "text", "text": text}, *extra], "stopReason": stop}
+
+
+def wait(condition):
+    with state:
+        state.wait_for(condition, timeout=30)
+
+
+def turn(text):
+    emit({"type": "agent_start"})
+    start("user")
+    end({"role": "user", "content": text})
+    if MODE == "reply":
+        call = {"type": "toolCall", "id": "call-1", "name": "bash", "arguments": {"command": "true"}}
+        start("assistant")
+        stream("Looking")
+        end(reply("Looking", "toolUse", call))
+        emit({"type": "tool_execution_start", "toolCallId": "call-1", "toolName": "bash"})
+        emit({"type": "tool_execution_end", "toolCallId": "call-1", "toolName": "bash", "isError": False})
+        start("toolResult")
+        end({"role": "toolResult", "toolCallId": "call-1", "content": [{"type": "text", "text": "ok"}]})
+        start("assistant")
+        stream("Hel")
+        stream("lo")
+        end(reply("Hello", "stop"))
+    elif MODE == "wait":
+        start("assistant")
+        stream("Working")
+        wait(lambda: steers or aborted[0])
+        if aborted[0]:
+            end(reply("Working", "aborted"))
+        else:
+            end(reply("Working", "stop"))
+            emit({"type": "turn_end"})
+            start("user")
+            end({"role": "user", "content": steers.pop(0)})
+            start("assistant")
+            stream("Got it")
+            end(reply("Got it", "stop"))
+    elif MODE == "crash":
+        start("assistant")
+        time.sleep(0.5)
+        os._exit(1)
+    emit({"type": "agent_end"})
+    with state:
+        running[0] = False
+        state.notify_all()
+    emit({"type": "agent_settled"})
+
+
+def respond(command, data=None, error=None):
+    answer = {"type": "response", "command": command["type"], "success": error is None}
+    if "id" in command:
+        answer["id"] = command["id"]
+    if error is None:
+        answer["data"] = data
+    else:
+        answer["error"] = error
+    emit(answer)
+
+
+for line in sys.stdin:
+    command = json.loads(line)
+    kind = command["type"]
+    if kind == "get_state":
+        respond(command, {"sessionId": session, "sessionFile": path, "isStreaming": running[0]})
+    elif kind == "get_entries":
+        since, ids = command.get("since"), [entry["id"] for entry in entries]
+        if since is not None and since not in ids:
+            respond(command, error=f"Entry {since} not found")
+        else:
+            first = ids.index(since) + 1 if since is not None else 0
+            respond(command, {"entries": entries[first:], "leafId": ids[-1] if ids else None})
+    elif kind == "prompt":
+        log({"prompt": command["message"]})
+        if MODE == "refuse":
+            respond(command, error="No API key found for fake.")
+            continue
+        running[0] = True
+        respond(command, {"disposition": "started"})
+        threading.Thread(target=turn, args=(command["message"],), daemon=True).start()
+    elif kind == "steer":
+        with state:
+            steers.append(command["message"])
+            state.notify_all()
+        respond(command, {"disposition": "queued"})
+    elif kind == "abort":
+        with state:
+            aborted[0] = True
+            state.notify_all()
+        wait(lambda: not running[0])
+        respond(command)
+with state:
+    aborted[0] = True
+    state.notify_all()
+wait(lambda: not running[0])

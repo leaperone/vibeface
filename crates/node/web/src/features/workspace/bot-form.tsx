@@ -12,11 +12,9 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Textarea } from "@/components/ui/textarea"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { messageOf } from "@vibeface/client/lib/node.ts"
-import { folderSetup } from "@vibeface/client/workspace/bot-settings.ts"
+import { folderLabels, folderSetup, projectChoices, projectKey } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { projectName } from "@vibeface/client/workspace/questions.ts"
-import type { BotProject } from "@vibeface/client/workspace/types.ts"
 
 type BotFormProps = {
   open: boolean
@@ -24,7 +22,6 @@ type BotFormProps = {
   restoreFocus(): void
 }
 
-const projectKey = (project: BotProject) => JSON.stringify([project.target_node, project.cwd])
 
 export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const workspace = useWorkspace()
@@ -43,14 +40,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
   const setup = ready ? folderSetup(workspace.nodes, ready.principal, ready.entry.device_id) : undefined
   const botDevice = setup?.add ?? false
   const setupDevice = pending ? undefined : setup?.device
-  const projects = workspace.nodes.flatMap((node, index) => {
-    if (node.revoked || !node.online || !node.capabilities?.manager) return []
-    const deviceName = nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`)
-    return (node.capabilities?.roots ?? []).map((cwd) => {
-      const project = { target_node: node.device_id, cwd }
-      return { key: projectKey(project), project, label: `${deviceName} · ${projectName(cwd)}` }
-    })
-  })
+  const projects = projectChoices(workspace.nodes, (node, index) => nodeName(node.device_id, { nodes: workspace.nodes, directory }, node.local ? "这台电脑" : `设备 ${index + 1}`))
   const savedProject = pending?.project
   const savedProjectLabel = savedProject
     ? projects.find((item) => item.key === projectKey(savedProject))?.label ?? `${nodeName(savedProject.target_node, { nodes: workspace.nodes, directory }, "原来的设备")} · ${savedProject.cwd}`
@@ -105,7 +95,7 @@ export function BotForm({ open, onOpenChange, restoreFocus }: BotFormProps) {
             <Textarea id="bot-instructions" name="bot-instructions" className="min-h-36" maxLength={8192} value={instructions} readOnly={Boolean(pending)} disabled={busy} onChange={(event) => setInstructions(event.target.value)} placeholder="例如：帮我维护项目，回答问题并检查修改。" />
           </Field>
           <Field>
-            <FieldLabel htmlFor="bot-project">工作文件夹 <span className="font-normal text-muted-foreground">可选</span></FieldLabel>
+            <FieldLabel htmlFor="bot-project">{folderLabels.project} <span className="font-normal text-muted-foreground">可选</span></FieldLabel>
             {pending ? <Input id="bot-project" className="min-h-11" readOnly value={savedProjectLabel} aria-describedby={pending.project ? undefined : "bot-project-help"} /> : (
               <NativeSelect id="bot-project" name="bot-project" className="w-full [&>select]:min-h-11" value={selectedProject} disabled={busy} onChange={(event) => setSelectedProject(event.target.value)} aria-describedby={projects.length ? undefined : "bot-project-help"}>
                 <NativeSelectOption value="">不选</NativeSelectOption>

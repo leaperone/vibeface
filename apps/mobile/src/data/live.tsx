@@ -1,10 +1,11 @@
 import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
-import { composerHint, threadReplies, type BotReach } from '@vibeface/client/chat/protocol.ts'
+import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
-import { addressName } from '@vibeface/client/workspace/labels.ts'
+import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness } from '@vibeface/client/workspace/model.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
@@ -19,6 +20,13 @@ const SharedContext = createContext<Shared | null>(null)
 
 /** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
 export const useLive = () => useContext(SharedContext)
+
+/** 待处理, item for item as the web lists it; nothing before a member connection. */
+export function useInbox(): InboxItem[] {
+  const device = useDevice()
+  const shared = useLive()
+  return shared ? inboxItems({ device, workspace: shared }) : []
+}
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
 export function LiveWorkspace({ children }: { children: ReactNode }) {
@@ -59,7 +67,7 @@ function Offline({ children }: { children: ReactNode }) {
     send: async () => { throw new Error('还没连上') },
     stop: async () => {},
     answer: async () => { throw new Error('还没连上') },
-    disconnect: device.disconnect,
+    leave: device.leave,
   }), [device])
   return <WorkspaceProvider value={{ ...empty, session, connection, actions }}>{children}</WorkspaceProvider>
 }
@@ -91,14 +99,14 @@ function Live({ children }: { children: ReactNode }) {
     // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
     // sending, or else the latest in the history.
     const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
-    const messages: ChatMessage[] = threadReplies(data.messages)
+    const messages: ChatMessage[] = threadReplies(data.messages).map((message) => {
+      const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
+      return detail ? { ...message, detail } : message
+    })
     for (const reply of shared.interrupted) messages.push({ message_id: `interrupted:${reply.trigger}`, event_hash: `interrupted:${reply.trigger}`, role: 'assistant', text: reply.text, created_at_ms: Date.now(), state: 'interrupted' })
     const pending = shared.messagePending
     if (pending && !data.messages.some((message) => message.message_id === pending.message_id)) messages.push({ message_id: pending.message_id, event_hash: pending.message_id, role: 'user', text: pending.text, created_at_ms: Date.now(), state: 'sending' })
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
-    const unready = nodes.some((node) => botReadiness(node) === 'needs_setup')
-    const reach: BotReach = nodes.some((node) => botReadiness(node) === 'ready') ? 'ready' : unready ? 'needs_setup'
-      : nodes.some((node) => !node.revoked && !node.online && node.capabilities?.manager) ? 'offline' : 'none'
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
       messages, questions: data.questions, works: data.works,
@@ -109,7 +117,7 @@ function Live({ children }: { children: ReactNode }) {
         && !data.messages.some((message) => message.message_id === job.reply_message_id) && messages.some((message) => message.message_id === job.message_id)),
       status: jobs.some((job) => job.state === 'cancelling') ? '正在停止…' : shared.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status ?? null,
       stoppable: Boolean(stopJob && shared.writable),
-      blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '') || composerHint({ hasConversation: true, loaded: true, bot: reach }) || null,
+      blocked: shared.readOnlyNotice || (shared.writeNotice ? '同步中，稍后可发送' : '') || composerHint({ hasConversation: true, loaded: true, bot: botReach(nodes) }) || null,
       sending: shared.messageBusy,
     }
   }
@@ -119,11 +127,11 @@ function Live({ children }: { children: ReactNode }) {
   for (const question of questions) if (question.conversation_id && !question.answer && !(question.question_id in answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
 
   const members: Member[] = (device.directory?.members ?? []).map((member) => {
-    const node = nodes.find((item) => item.device_id === member.device_id)
+    const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-      online: member.kind === 'node' ? node?.online === true : member.device_id === me,
-      current: member.device_id === me, entry: member.device_id === device.ready?.entry.device_id, bot: botReadiness(node) !== null,
+      online: deviceOnline(member.kind, node, entry && (connection.state === 'online' || connection.state === 'syncing')),
+      current: member.device_id === me, entry, bot: botReadiness(node) !== null,
     }
   })
 
@@ -152,9 +160,9 @@ function Live({ children }: { children: ReactNode }) {
         if (job) await latest.current.cancelManager(job.trigger)
       },
       answer: (question, text) => latest.current.answer(question, text),
-      disconnect: device.disconnect,
+      leave: device.leave,
     }
-  }, [device.join, device.cancelJoin, device.disconnect])
+  }, [device.join, device.cancelJoin, device.leave])
 
   useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
 

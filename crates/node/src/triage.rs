@@ -1,6 +1,7 @@
 //! Node-side triage of local agent sessions: one event shape for hooks, App Server and session
 //! scans, the coordination Agent's prompts, outlet choice, webhook signing and delivery, and hook
 //! installation. The coordination Agent judges; nothing here decides what matters.
+use crate::providers::{Provider, Watch};
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,20 +17,12 @@ pub const FIRST_BACKOFF_MS: i64 = 10_000;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
+    /// The provider's hook, extension or plugin; `agent` says which provider.
     #[default]
-    CodexHook,
-    ClaudeHook,
+    Hook,
     AppServer,
     SessionScan,
     Test,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Agent {
-    #[default]
-    Codex,
-    Claude,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -39,6 +32,18 @@ pub enum Kind {
     TurnEnd,
     NeedsInput,
     Notification,
+}
+
+/// What a request a session holds asks for.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// To allow something, as running a tool.
+    Permission,
+    /// An answer to a question the session asked.
+    Question,
+    /// What the session does next, now that its turn ended.
+    Continue,
 }
 
 /// Normalized event (design 4.1). Hooks send it without `node`, `host` and `event_id`; the
@@ -51,11 +56,12 @@ pub struct AgentEvent {
     pub source: Source,
     pub host: String,
     pub node: String,
-    pub agent: Agent,
+    pub agent: Provider,
     pub event: Kind,
     pub status: Option<String>,
     pub session_id: String,
-    /// The turn's ID, or `tx:<transcript bytes>` for Claude Code, which has none.
+    /// The turn's ID. Claude Code has none: `tx:<transcript bytes>`, and for a permission request
+    /// also a hash of the tool and its input.
     pub turn_id: String,
     pub cwd: String,
     pub repo: Option<String>,
@@ -65,8 +71,11 @@ pub struct AgentEvent {
     pub detail: String,
     pub ts_ms: i64,
     pub test: bool,
-    /// An App Server request waiting for an answer; set by the Node, never by a hook.
+    /// A request waiting for an answer; set by the Node, never by a hook.
     pub request_id: Option<String>,
+    /// Set by a hook that waits for the answer on `/api/hooks/wait`: its session holds a request
+    /// of this kind.
+    pub hold: Option<RequestKind>,
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -103,8 +112,8 @@ pub fn question_id(node: &str, event_id: &str) -> String {
 
 impl AgentEvent {
     /// Status is left out, so a hook, the App Server and a scan of the same turn collide.
-    pub fn id_for(node: &str, agent: Agent, session: &str, turn: &str, kind: Kind) -> String {
-        hex32(&[node, agent_name(agent), session, turn, kind_name(kind)])
+    pub fn id_for(node: &str, agent: Provider, session: &str, turn: &str, kind: Kind) -> String {
+        hex32(&[node, agent.name(), session, turn, kind_name(kind)])
     }
 
     pub fn seal(mut self, node: &str, host: &str, now_ms: i64) -> Result<Self> {
@@ -133,12 +142,6 @@ impl AgentEvent {
     }
 }
 
-fn agent_name(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Codex => "codex",
-        Agent::Claude => "claude",
-    }
-}
 fn kind_name(kind: Kind) -> &'static str {
     match kind {
         Kind::TurnEnd => "turn_end",
@@ -160,21 +163,21 @@ pub fn from_codex_hook(input: &Value) -> Option<AgentEvent> {
         _ => return None,
     };
     Some(AgentEvent {
-        source: Source::CodexHook,
-        agent: Agent::Codex,
+        source: Source::Hook,
+        agent: Provider::Codex,
         event,
         status,
         session_id: s(input, "session_id"),
         turn_id: s(input, "turn_id"),
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_bot_message"),
+        last_message: s(input, "last_assistant_message"),
         detail,
         ..Default::default()
     })
 }
 
-/// A Claude Code hook's stdin (`Stop`, `StopFailure`, `Notification`); `transcript_bytes` keys
-/// the turn.
+/// A Claude Code hook's stdin (`Stop`, `StopFailure`, `Notification`, `PermissionRequest`);
+/// `transcript_bytes` keys the turn. A permission request or question waits for the answer.
 pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEvent> {
     let (event, status, detail) = match input["hook_event_name"].as_str()? {
         "Stop" => (Kind::TurnEnd, Some("completed".to_owned()), String::new()),
@@ -186,6 +189,9 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
                 .trim()
                 .into(),
         ),
+        // A held permission request that got no answer falls back to Claude Code's own prompt,
+        // which notifies again; the request already woke the Agent.
+        "Notification" if input["notification_type"] == "permission_prompt" => return None,
         "Notification" => (
             Kind::Notification,
             None,
@@ -194,20 +200,132 @@ pub fn from_claude_hook(input: &Value, transcript_bytes: u64) -> Option<AgentEve
                 .trim()
                 .into(),
         ),
+        "PermissionRequest" => (
+            Kind::NeedsInput,
+            None,
+            crate::runtime::claude::describe_request(input),
+        ),
         _ => return None,
     };
+    // Permission requests a turn asks at once share the transcript's length.
+    let turn_id = match event {
+        Kind::NeedsInput => format!(
+            "tx:{transcript_bytes}:{}",
+            hex32(&[&s(input, "tool_name"), &input["tool_input"].to_string()])
+        ),
+        _ => format!("tx:{transcript_bytes}"),
+    };
     Some(AgentEvent {
-        source: Source::ClaudeHook,
-        agent: Agent::Claude,
+        source: Source::Hook,
+        agent: Provider::Claude,
         event,
         status,
         session_id: s(input, "session_id"),
-        turn_id: format!("tx:{transcript_bytes}"),
+        turn_id,
         cwd: s(input, "cwd"),
-        last_message: s(input, "last_bot_message"),
+        last_message: s(input, "last_assistant_message"),
         detail,
+        hold: (event == Kind::NeedsInput).then(|| crate::runtime::claude::request_kind(input)),
         ..Default::default()
     })
+}
+
+/// What the vibeface pi extension sends when a run of a pi session settles, keyed by the
+/// session's last entry. A run the user stopped is left alone; one that replied or failed holds
+/// its session for what it does next.
+pub fn from_pi_extension(input: &Value) -> Option<AgentEvent> {
+    let (status, detail) = match input["stop_reason"].as_str()? {
+        "stop" => ("completed", String::new()),
+        "length" => ("failed", "pi stopped at the model's output limit".into()),
+        "error" => ("failed", s(input, "error")),
+        _ => return None,
+    };
+    Some(AgentEvent {
+        source: Source::Hook,
+        agent: Provider::Pi,
+        event: Kind::TurnEnd,
+        status: Some(status.into()),
+        session_id: s(input, "session_id"),
+        turn_id: s(input, "turn_id"),
+        cwd: s(input, "cwd"),
+        last_message: s(input, "last_message"),
+        detail,
+        hold: Some(RequestKind::Continue),
+        ..Default::default()
+    })
+}
+
+/// What the vibeface opencode plugin sends: a settled run, keyed by its last reply, or a
+/// permission or question a session asks, keyed by the request and held for the answer. A
+/// permission is named by its kind; its commands stay out.
+pub fn from_opencode_plugin(input: &Value) -> Option<AgentEvent> {
+    let request = || input["request_id"].as_str().filter(|id| !id.is_empty());
+    let (event, status, turn_id, detail, hold) = match input["event"].as_str()? {
+        "session.idle" => {
+            let status = input["status"]
+                .as_str()
+                .filter(|status| matches!(*status, "completed" | "interrupted" | "failed"))?;
+            let turn = s(input, "turn_id");
+            (Kind::TurnEnd, Some(status), turn, s(input, "error"), None)
+        }
+        "permission.asked" => (
+            Kind::NeedsInput,
+            None,
+            request()?.to_owned(),
+            format!(
+                "opencode asks to use {}. Answer with {{\"reply\":\"once\"}}, {{\"reply\":\"always\"}} or {{\"reply\":\"reject\"}}.",
+                input["permission"].as_str().unwrap_or("a tool")
+            ),
+            Some(RequestKind::Permission),
+        ),
+        "question.asked" => {
+            let questions = question_lines(&input["questions"]);
+            // The answer's form comes first: the Agent sees the start of a long detail.
+            let detail = format!(
+                "Answer with {{\"answers\":[[\"LABEL\"]]}}, the labels chosen for each question in order, or {{\"reject\":true}}. opencode asks: {}.",
+                questions.join("; ")
+            );
+            let request = request()?.to_owned();
+            (
+                Kind::NeedsInput,
+                None,
+                request,
+                detail,
+                Some(RequestKind::Question),
+            )
+        }
+        _ => return None,
+    };
+    Some(AgentEvent {
+        source: Source::Hook,
+        agent: Provider::Opencode,
+        event,
+        status: status.map(String::from),
+        session_id: s(input, "session_id"),
+        turn_id,
+        cwd: s(input, "cwd"),
+        last_message: s(input, "last_message"),
+        detail,
+        hold,
+        ..Default::default()
+    })
+}
+
+/// Each question of a request with its option labels, as `text [A | B]`, or its bare text when
+/// it offers none; the Agent answers with the labels.
+pub(crate) fn question_lines(questions: &Value) -> Vec<String> {
+    (questions.as_array().into_iter().flatten())
+        .map(|question| {
+            let text = question["question"].as_str().unwrap_or_default();
+            let options: Vec<&str> = (question["options"].as_array().into_iter().flatten())
+                .filter_map(|option| option["label"].as_str())
+                .collect();
+            match options.is_empty() {
+                true => text.to_owned(),
+                false => format!("{text} [{}]", options.join(" | ")),
+            }
+        })
+        .collect()
 }
 
 /// Whether a Codex session's `source` (a rollout's `session_meta`, or an App Server thread)
@@ -269,7 +387,7 @@ pub fn scan_rollout(text: &str, offset: usize) -> (Vec<AgentEvent>, usize) {
         };
         events.push(AgentEvent {
             source: Source::SessionScan,
-            agent: Agent::Codex,
+            agent: Provider::Codex,
             event: Kind::TurnEnd,
             status: Some(status.into()),
             session_id: s(&meta, "id"),
@@ -292,6 +410,7 @@ pub fn wake_prompt(
     events: &[(AgentEvent, Value)],
     cli: &str,
     answer_within_secs: u64,
+    hook_answer_within_secs: u64,
 ) -> Result<String> {
     let items: Vec<Value> = events
         .iter()
@@ -313,12 +432,16 @@ the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the li
 one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
 The answer comes back to that bot as a new turn, and it acts on it.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
-- An event with a request_id is a Codex App Server request waiting for an answer. `{cli} codex requests` \
-shows its full params. Answer it yourself with `{cli} codex respond REQUEST_ID 'RESULT_JSON'` \
-(the thread already runs with full access). Only when the user must decide, add `--request-id REQUEST_ID` \
-to the raise: the request then waits for the answer, and the bot has {answer_within_secs} seconds \
-after it to respond. A request neither answered nor raised is declined after {answer_within_secs} seconds \
-or when this turn ends.\n\
+- An event with a request_id is a request its session holds until it is answered: a Codex App Server \
+request, or one the session's hook, plugin or extension waits on. `{cli} requests` shows each in full. \
+Answer it yourself with `{cli} respond REQUEST_ID 'RESULT_JSON'` (a Codex thread already runs with full \
+access). Only when the user must decide, add `--request-id REQUEST_ID` to the raise: an App Server \
+request then waits for the answer, and the bot has {answer_within_secs} seconds after it to respond; any other request still ends {hook_answer_within_secs} seconds \
+after it came. A request neither answered nor raised is declined after {answer_within_secs} seconds \
+({hook_answer_within_secs} for one that is not the App Server's) or when this turn ends; one that is not the App Server's \
+goes back to its session undecided.\n\
+- A request of kind `continue` holds a session whose turn ended: `{{\"text\":\"TEXT\"}}` as its RESULT_JSON \
+sends TEXT to the session as its user's next message. Send one only to carry out what the user asked for.\n\
 `{cli} triage events` lists what is still pending.\n\nEvents:\n{}",
         serde_json::to_string_pretty(&items)?
     ))
@@ -491,44 +614,56 @@ impl OutboxEntry {
 
 /// Hook files `vibeface hooks install` edits under a home directory.
 pub struct HookFile {
-    pub agent: Agent,
+    pub agent: Provider,
     pub path: PathBuf,
     pub events: &'static [&'static str],
 }
 
-pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> [HookFile; 2] {
-    [
-        HookFile {
-            agent: Agent::Codex,
-            path: codex_home
-                .map(Path::to_owned)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("hooks.json"),
-            events: &["Stop", "PermissionRequest"],
-        },
-        HookFile {
-            agent: Agent::Claude,
-            path: home.join(".claude/settings.json"),
-            events: &["Stop", "StopFailure", "Notification"],
-        },
-    ]
+/// The hook files under `home`; Codex's is in `codex_home` when it has one.
+pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> Vec<HookFile> {
+    Provider::ALL
+        .into_iter()
+        .filter_map(|agent| match agent.watch()? {
+            Watch::Hooks { file, events } => Some(HookFile {
+                agent,
+                path: match (agent, codex_home) {
+                    (Provider::Codex, Some(codex_home)) => codex_home.join("hooks.json"),
+                    _ => home.join(file),
+                },
+                events,
+            }),
+            Watch::Extension { .. } => None,
+        })
+        .collect()
 }
 
-pub fn hook_command(program: &Path, agent: Agent, data_dir: &Path) -> String {
+/// An extension's code as `vibeface hooks install` writes it (see `Watch::Extension`).
+pub fn extension_code(source: &str, program: &Path, agent: Provider, data_dir: &Path) -> String {
+    let hook = json!([
+        program.to_string_lossy(),
+        "hook",
+        agent.name(),
+        "--data-dir",
+        data_dir.to_string_lossy()
+    ]);
+    source.replace("__VIBEFACE_HOOK__", &hook.to_string())
+}
+
+pub fn hook_command(program: &Path, agent: Provider, data_dir: &Path) -> String {
     let quote = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
     format!(
         "{} hook {} --data-dir {}",
         quote(&program.to_string_lossy()),
-        agent_name(agent),
+        agent.name(),
         quote(&data_dir.to_string_lossy())
     )
 }
 
-fn ours(entry: &Value, agent: Agent) -> bool {
+fn ours(entry: &Value, agent: Provider) -> bool {
     entry["hooks"].as_array().is_some_and(|hooks| {
         hooks.iter().any(|hook| {
             hook["command"].as_str().is_some_and(|command| {
-                command.contains(&format!(" hook {} ", agent_name(agent)))
+                command.contains(&format!(" hook {} ", agent.name()))
                     && command.contains("vibeface")
             })
         })
@@ -558,7 +693,14 @@ pub fn add_hooks(settings: &mut Value, file: &HookFile, command: &str) -> Result
         if entries.iter().any(|entry| ours(entry, file.agent)) {
             continue;
         }
-        entries.push(json!({"hooks":[{"type":"command","command":command,"timeout":10}]}));
+        // A Claude Code permission request waits for the bot's answer.
+        let timeout = match (file.agent, *event) {
+            (Provider::Claude, "PermissionRequest") => {
+                crate::runtime::HOOK_ANSWER_WITHIN.as_secs() + 15
+            }
+            _ => 10,
+        };
+        entries.push(json!({"hooks":[{"type":"command","command":command,"timeout":timeout}]}));
         added.push((*event).to_owned());
     }
     Ok(added)
@@ -619,7 +761,7 @@ mod tests {
     #[test]
     fn every_source_of_one_turn_gets_one_event_id() {
         let node = "n".repeat(64);
-        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_bot_message":"done"}))
+        let hook = from_codex_hook(&json!({"hook_event_name":"Stop","session_id":"t1","turn_id":"u1","cwd":"/p","last_assistant_message":"done"}))
             .unwrap()
             .seal(&node, "h", 1)
             .unwrap();
@@ -664,6 +806,30 @@ mod tests {
             (claude.turn_id.as_str(), claude.event),
             ("tx:10", Kind::Notification)
         );
+        assert_eq!(
+            from_claude_hook(
+                &json!({"hook_event_name":"Notification","session_id":"c",
+                    "notification_type":"permission_prompt","message":"Claude needs your permission"}),
+                10,
+            ),
+            None,
+            "the prompt a held permission request falls back to does not wake the Agent again"
+        );
+        let asks = |command: &str| {
+            from_claude_hook(
+                &json!({"hook_event_name":"PermissionRequest","session_id":"c",
+                    "tool_name":"Bash","tool_input":{"command":command}}),
+                10,
+            )
+            .unwrap()
+            .turn_id
+        };
+        assert_ne!(
+            asks("ls"),
+            asks("pwd"),
+            "concurrent requests are told apart"
+        );
+        assert_eq!(asks("ls"), asks("ls"));
         assert!(AgentEvent::default().seal(&node, "h", 1).is_err());
     }
 
@@ -762,30 +928,121 @@ mod tests {
     #[test]
     fn hook_install_appends_once_and_removes_only_its_own_entries() {
         let home = Path::new("/home/u");
-        let [codex, claude] = hook_files(home, None);
+        let [codex, claude] = &hook_files(home, None)[..] else {
+            panic!("Codex and Claude Code take hooks");
+        };
         assert_eq!(codex.path, home.join(".codex/hooks.json"));
-        let command = hook_command(Path::new("/opt/vibeface"), Agent::Claude, Path::new("/d'x"));
+        let codex_home = Path::new("/srv/codex");
+        let [own, other] = &hook_files(home, Some(codex_home))[..] else {
+            panic!("Codex and Claude Code take hooks");
+        };
+        assert_eq!(own.path, codex_home.join("hooks.json"));
+        assert_eq!(
+            other.path, claude.path,
+            "CODEX_HOME moves only Codex's hooks"
+        );
+        let command = hook_command(
+            Path::new("/opt/vibeface"),
+            Provider::Claude,
+            Path::new("/d'x"),
+        );
         assert_eq!(command, r"'/opt/vibeface' hook claude --data-dir '/d'\''x'");
         let other = json!({"hooks":[{"type":"command","command":"orca notify"}]});
         let mut settings = json!({"model":"x","hooks":{"Stop":[other.clone()]}});
         assert_eq!(
-            add_hooks(&mut settings, &claude, &command).unwrap(),
-            ["Stop", "StopFailure", "Notification"]
+            add_hooks(&mut settings, claude, &command).unwrap(),
+            ["Stop", "StopFailure", "Notification", "PermissionRequest"]
         );
         assert!(
-            add_hooks(&mut settings, &claude, &command)
+            add_hooks(&mut settings, claude, &command)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(settings["hooks"]["Stop"][0], other);
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-        assert_eq!(installed(&settings, &claude).len(), 3);
-        assert!(installed(&settings, &codex).is_empty());
-        assert_eq!(remove_hooks(&mut settings, &claude).len(), 3);
+        assert_eq!(settings["hooks"]["Stop"][1]["hooks"][0]["timeout"], 10);
+        assert_eq!(
+            settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 45,
+            "a permission request outlasts the wait for the bot's answer"
+        );
+        assert_eq!(installed(&settings, claude).len(), 4);
+        assert!(installed(&settings, codex).is_empty());
+        assert_eq!(remove_hooks(&mut settings, claude).len(), 4);
         assert_eq!(
             settings,
-            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[]}})
+            json!({"model":"x","hooks":{"Stop":[other],"StopFailure":[],"Notification":[],
+                "PermissionRequest":[]}})
         );
-        assert!(add_hooks(&mut json!([]), &codex, &command).is_err());
+        assert!(add_hooks(&mut json!([]), codex, &command).is_err());
+    }
+
+    #[test]
+    fn a_settled_pi_run_holds_its_session_unless_the_user_stopped_it() {
+        let input = |stop: &str| {
+            json!({"session_id":"s","turn_id":"e9","cwd":"/p","stop_reason":stop,
+                "error":"429 rate limited","last_message":"done"})
+        };
+        let ended = AgentEvent {
+            source: Source::Hook,
+            agent: Provider::Pi,
+            event: Kind::TurnEnd,
+            status: Some("completed".into()),
+            session_id: "s".into(),
+            turn_id: "e9".into(),
+            cwd: "/p".into(),
+            last_message: "done".into(),
+            hold: Some(RequestKind::Continue),
+            ..Default::default()
+        };
+        assert_eq!(from_pi_extension(&input("stop")), Some(ended));
+        let failed = from_pi_extension(&input("error")).unwrap();
+        assert_eq!(
+            (failed.status.as_deref(), failed.detail.as_str()),
+            (Some("failed"), "429 rate limited")
+        );
+        for stop in ["aborted", "toolUse"] {
+            assert!(from_pi_extension(&input(stop)).is_none(), "{stop}");
+        }
+        assert!(from_pi_extension(&json!({"session_id":"s"})).is_none());
+    }
+
+    #[test]
+    fn the_opencode_plugin_reports_settled_runs_and_holds_requests() {
+        let idle = json!({"event":"session.idle","session_id":"ses_1","turn_id":"msg_9",
+            "cwd":"/p","status":"completed","last_message":"done"});
+        let ended = AgentEvent {
+            source: Source::Hook,
+            agent: Provider::Opencode,
+            event: Kind::TurnEnd,
+            status: Some("completed".into()),
+            session_id: "ses_1".into(),
+            turn_id: "msg_9".into(),
+            cwd: "/p".into(),
+            last_message: "done".into(),
+            ..Default::default()
+        };
+        assert_eq!(from_opencode_plugin(&idle), Some(ended));
+        let asks = from_opencode_plugin(&json!({"event":"permission.asked","session_id":"ses_1",
+            "request_id":"per_1","permission":"bash","patterns":["rm -rf build"]}))
+        .unwrap();
+        assert_eq!(
+            (asks.event, asks.turn_id.as_str(), asks.hold),
+            (Kind::NeedsInput, "per_1", Some(RequestKind::Permission))
+        );
+        assert!(asks.detail.starts_with("opencode asks to use bash."));
+        assert!(!asks.detail.contains("rm -rf"), "commands stay out");
+        let question = from_opencode_plugin(&json!({"event":"question.asked","session_id":"ses_1",
+            "request_id":"que_1","questions":[{"question":"Which?","options":[{"label":"A"},
+            {"label":"B"}]}]}))
+        .unwrap();
+        assert_eq!(question.hold, Some(RequestKind::Question));
+        assert!(question.detail.ends_with("opencode asks: Which? [A | B]."));
+        for input in [
+            json!({"event":"session.idle","session_id":"ses_1","status":"busy"}),
+            json!({"event":"permission.asked","session_id":"ses_1"}),
+            json!({"event":"session.error","session_id":"ses_1"}),
+        ] {
+            assert!(from_opencode_plugin(&input).is_none(), "{input}");
+        }
     }
 }

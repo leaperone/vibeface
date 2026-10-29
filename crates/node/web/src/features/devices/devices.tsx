@@ -1,13 +1,13 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronRight, Copy, Info, Laptop, Monitor, Server, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
-import { isLoopback, phoneName } from "@vibeface/client/workspace/labels.ts"
+import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
 import type { NodeInfo } from "@vibeface/client/workspace/types.ts"
 import { botReadiness } from "@vibeface/client/workspace/model.ts"
@@ -34,15 +34,15 @@ export function useDeviceRows(): DeviceRow[] {
     return {
       id, member, node, kind, name: member?.name || node?.name || (kind === "node" ? "电脑" : "浏览器"),
       entry, browser: id === identity?.deviceId,
-      // Before the device list arrives, the computer this page talks through is as online as the connection.
-      online: kind === "node" ? node?.online ?? (entry && connectionOnline) : undefined, bot: botReadiness(node), admin: member?.manage ?? false,
+      online: deviceOnline(kind, node, entry && connectionOnline), bot: botReadiness(node), admin: member?.manage ?? false,
     }
   }).sort((a, b) => rank(a) - rank(b))
 }
 
 export function deviceIcon(row: Pick<DeviceRow, "kind" | "name" | "entry">): LucideIcon {
   if (row.kind === "node") return row.entry ? Laptop : Server
-  return phoneName(row.name) ? Smartphone : Monitor
+  const form = deviceForm(row.kind, row.name)
+  return form === "tablet" ? Tablet : form === "phone" ? Smartphone : Monitor
 }
 
 function Tag({ children, title }: { children: ReactNode; title?: string }) {
@@ -81,7 +81,7 @@ export function DevicesPage() {
           <span className="flex min-w-0 flex-1 flex-col items-start gap-x-2 gap-y-0.5 sm:flex-row sm:items-center"><span className="line-clamp-2 min-w-0 font-medium [overflow-wrap:anywhere]">{row.name}</span>
             <span className="flex flex-wrap gap-1 empty:hidden">
               {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
-              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : "Bot 需设置"}</Tag> : null}
+              {row.bot ? <Tag><terms.canRunBot.icon aria-hidden="true" className={cn("size-3.5", row.bot === "needs_setup" && "text-warning")} />{row.bot === "ready" ? "Bot" : row.bot === "starting" ? "Bot 启动中" : "Bot 需设置"}</Tag> : null}
               {row.admin ? <Tag title={terms.admin.label}><terms.admin.icon aria-hidden="true" className="size-3.5" />{terms.admin.tag}</Tag> : null}
             </span>
           </span>
@@ -141,7 +141,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">
-        <p>{row.bot === "ready" ? terms.canRunBot.label : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
+        <p>{row.bot === "ready" ? terms.canRunBot.label : row.bot === "starting" ? "Bot 启动中" : row.bot ? "Bot 需设置" : "还没配置 Bot"}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>

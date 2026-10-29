@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
-import { Bot, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
+import { ChevronDown, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { terms } from "@/lib/glossary"
 import { Button } from "@/components/ui/button"
@@ -40,15 +40,6 @@ function BrandMark({ className }: { className?: string }) {
 
 export function Wordmark({ className }: { className?: string }) {
   return <span className={cn("inline-flex items-center gap-2 text-heading font-semibold tracking-tight", className)}><BrandMark />Vibeface</span>
-}
-
-/** Bots share one quiet tile with their initial; only the primary bot takes the brand color. */
-export function BotAvatar({ name, primary = false, size = "md", className }: { name: string; primary?: boolean; size?: "sm" | "md" | "lg"; className?: string }) {
-  // "我的" says whose bot it is, not which; a name left with only "Bot" shows the bot icon.
-  const rest = name.trim().replace(/^我的\s*/, "")
-  const letter = /^(bot)?$/i.test(rest) ? <Bot className="size-[1.2em]" /> : [...rest][0].toUpperCase()
-  return <span aria-hidden="true" className={cn("grid shrink-0 place-items-center font-semibold ring-1 select-none ring-inset", primary ? "bg-brand-soft text-brand ring-brand/20" : "bg-muted text-muted-foreground ring-border",
-    size === "sm" ? "size-5 rounded-md text-[11px]" : size === "md" ? "size-8 rounded-lg text-meta" : "size-12 rounded-2xl text-title", className)}>{letter}</span>
 }
 
 /** The primary bot's star. Alone, its name shows on hover and to screen readers; `labeled` writes it out. */
@@ -146,7 +137,7 @@ function RowLead({ icon: Icon, label, description, tone = "neutral" }: { icon: L
   </>
 }
 
-/** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button. */
+/** One settings row: icon, label, then its value or control at the end. With `onClick` the whole row is a button; `expanded` marks one that folds out below itself. */
 /** `stacked`: on a phone the control gets its own full line under the label, lined up with it. */
 export function SettingsRow({ icon, label, description, tone, children, onClick, expanded, className, stacked = false, ref }: {
   icon: LucideIcon; label: ReactNode; description?: ReactNode; tone?: keyof typeof rowTile; children?: ReactNode; onClick?: () => void; expanded?: boolean; className?: string; stacked?: boolean; ref?: Ref<HTMLButtonElement>
@@ -154,7 +145,7 @@ export function SettingsRow({ icon, label, description, tone, children, onClick,
   const end = children ? <span className={cn("ms-auto flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 text-meta text-muted-foreground", stacked && "max-sm:basis-full max-sm:ps-11")}>{children}</span> : null
   if (onClick) return <button ref={ref} type="button" aria-expanded={expanded} onClick={onClick} className={cn(rowLayout, "interactive-row", className)}>
     <RowLead icon={icon} label={label} description={description} tone={tone} />{end}
-    <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-90")} />
+    {expanded === undefined ? null : <ChevronDown aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200", !end && "ms-auto", expanded && "rotate-180")} />}
   </button>
   return <div className={cn(rowLayout, className)}><RowLead icon={icon} label={label} description={description} tone={tone} />{end}</div>
 }
@@ -165,7 +156,7 @@ export function SettingsDisclosure({ icon, label, value, open, children }: { ico
     <summary className={cn(rowLayout, "interactive-row cursor-pointer list-none flex-nowrap [&::-webkit-details-marker]:hidden")}>
       <RowLead icon={icon} label={label} />
       {value ? <span className="ms-auto shrink-0 text-meta text-muted-foreground">{value}</span> : null}
-      <ChevronRight aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-90", !value && "ms-auto")} />
+      <ChevronDown aria-hidden="true" className={cn("size-4 shrink-0 text-muted-foreground transition-transform duration-200 group-open/disclosure:rotate-180", !value && "ms-auto")} />
     </summary>
     <div className="grid gap-3 px-4 pb-4 sm:ps-15">{children}</div>
   </details>
