@@ -248,6 +248,10 @@ impl Runtime {
         let mut store = Store::open(dir.join("node.sqlite3"))?;
         store.attach_process_lock(process_lock.clone());
         let have_wakeup = Arc::new(tokio::sync::Notify::new());
+        store.on_log_head_written({
+            let have_wakeup = have_wakeup.clone();
+            move || have_wakeup.notify_one()
+        });
         let store = Arc::new(Mutex::new(store));
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -573,7 +577,6 @@ impl Runtime {
             network_id: network.into(),
             payload,
         });
-        self.have_wakeup.notify_one();
     }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
         let state = self.membership_state().await?;

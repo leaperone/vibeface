@@ -1214,27 +1214,19 @@ impl Runtime {
                 IngestStatus::Accepted | IngestStatus::Pending | IngestStatus::Duplicate => {}
             }
         }
-        let mut scopes = BTreeSet::new();
-        for (event, status) in events.iter().zip(&ingested.statuses) {
-            if matches!(status, IngestStatus::Accepted | IngestStatus::Pending)
-                && let Ok(body) = serde_json::from_str::<Event>(&event.canonical_body)
-            {
-                if *status == IngestStatus::Accepted
-                    && matches!(body.body, EventBody::BotDeleted { .. })
-                {
-                    self.bot_deleted(network, &body.scope_id, &event.hash);
+        for HashedEvent { hash, event } in ingested.stored {
+            match event.body {
+                EventBody::BotDeleted { .. } => {
+                    self.bot_deleted(network, &event.scope_id, &hash);
+                    continue;
                 }
                 // A move stops this Node's turn in that conversation without delay.
-                if matches!(body.body, EventBody::ConversationOwner { .. }) {
-                    self.schedule_wakeup.notify_one();
-                }
-                scopes.insert((body.scope_id, event.hash.clone()));
+                EventBody::ConversationOwner { .. } => self.schedule_wakeup.notify_one(),
+                _ => {}
             }
-        }
-        for (scope, hash) in scopes {
             let _ = self.events.send(Update {
                 network_id: network.into(),
-                payload: json!({"type":"changed","conversation_id":scope,"event_hash":hash}),
+                payload: json!({"type":"changed","conversation_id":event.scope_id,"event_hash":hash}),
             });
         }
         Ok(())
