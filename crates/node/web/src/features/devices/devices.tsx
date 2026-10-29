@@ -63,14 +63,14 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
-export function DevicesPage() {
+export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const device = useDevice()
   const rows = useDeviceRows()
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <JoinRequests />
+    {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
       : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {

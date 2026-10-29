@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { AddDevice } from '@/features/devices/add-device'
 import { DevicesPage } from '@/features/devices/devices'
@@ -11,5 +12,7 @@ export const Route = createFileRoute('/_app/devices/')({
 function Devices() {
   const { add, bot } = Route.useSearch()
   const navigate = useNavigate()
-  return <><DevicesPage /><AddDevice opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: { bot }, replace: true }) }} /></>
+  // A waiting request shows in one place: the sheet while it is open, the page otherwise.
+  const [adding, setAdding] = useState(false)
+  return <><DevicesPage joins={!adding} /><AddDevice onOpenChange={setAdding} opening={add === true} onOpened={() => { void navigate({ to: '/devices', search: { bot }, replace: true }) }} /></>
 }
