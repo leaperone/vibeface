@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { projectName, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { projectName, questionMeta, settledAnswer } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -48,11 +48,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)
   const { tone, label, icon: severityIcon } = looks[question.severity]
-  // A held App Server request reads as 需要你同意 wherever it shows, and names the task it holds.
-  const approval = Boolean(question.about.request_id)
+  const { approval, task, local } = questionMeta(question, workspace.openWorks, workspace.bots, ready?.entry.device_id)
   const icon = approval ? terms.approval.icon : severityIcon
-  const task = approval ? workspace.openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
-  const taskBot = task ? workspace.bots.find((bot) => bot.conversation_id === task.conversation_id)?.bot_id : undefined
   const disabled = !workspace.writable || action.busy !== null
   const shown = question.choices
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
@@ -74,13 +71,13 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   >
     <Lines lines={lines} />
     {inTask ? null : <p className="flex min-w-0 items-center gap-3 text-meta text-muted-foreground">
-      {task && taskBot ? <Link to="/b/$botId/work/$workId" params={{ botId: taskBot, workId: task.work_id }} search={inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
-        <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title || "任务"}</span>
+      {task ? <Link to="/b/$botId/work/$workId" params={{ botId: task.bot_id, workId: task.work_id }} search={inbox ? { from: "inbox" } : {}} className="inline-flex min-w-12 items-center gap-1 rounded-md underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
+        <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title}</span>
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自" compact={Boolean(task)}>{providerNames[question.about.agent]}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
       {/* As on task rows, only another device is named on screen. */}
-      {question.about.node === ready?.entry.device_id ? <span className="sr-only">设备 {node}</span>
+      {local ? <span className="sr-only">设备 {node}</span>
         : <Meta icon={Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>}
       {inbox && question.bot ? <Link to="/b/$botId" params={{ botId: question.bot.bot_id }} title={question.bot.name} className="ms-auto inline-flex min-w-0 shrink-[2] items-center justify-end gap-1.5 rounded-md font-medium text-foreground underline-offset-4 hover:underline max-md:min-h-11 max-md:min-w-11">
         <BotFace bot={workspace.bots.find((item) => item.bot_id === question.bot?.bot_id) ?? { bot_id: question.bot.bot_id, avatar: null }} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate max-sm:sr-only">{question.bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />

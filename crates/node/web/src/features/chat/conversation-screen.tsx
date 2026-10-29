@@ -17,7 +17,7 @@ import { nodeName, progressLabel, shownState, taskActive, taskLabel } from '@vib
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
+import { agentName, awaitsAnswer, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { RecoveryAlert } from '@/features/identity/recovery-controls'
 import { providerIcons } from '@/features/devices/ai-settings'
@@ -156,7 +156,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const remote = data?.scheduler?.remote
   if (remote && !remote.reachable && !ownerAway && newest?.role === 'user') entries.push({ key: 'owner-unknown', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="size-4 shrink-0" />{nodeName(remote.owner, lookup)} 连不上，回复情况未知</p> })
   // A question waiting on the person is the status already; a spinner under it would say the bot is still thinking.
-  const asked = questions.find((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered))
+  const toAnswer = questions.filter((question) => awaitsAnswer(question, workspace.answered, folded.answers))
+  const asked = toAnswer[0]
   const stopping = activeJobs.some((job) => job.state === 'cancelling')
   if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <><CircleStop aria-hidden="true" className="size-4" />正在停止…</>
     : <>{bot ? <BotFace bot={bot} mood={workspace.connectionOnline ? 'thinking' : 'asleep'} size={24} /> : null}{status ? progressLabel(status) : '思考中'}</>}</p> })
@@ -188,7 +189,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     : messagePending && messageBusy ? '上一条消息还没确认送达' : ''
   // Questions sit where they were asked, so an older one scrolls away; the pill above the composer brings back the first still open.
   const waitingTarget = asked ? `question-${asked.question_id}` : cards.length ? 'chat-waiting' : null
-  const waitingCount = questions.filter((question) => !question.answer && !folded.answers.has(question.question_id) && !(question.question_id in workspace.answered)).length + cards.length
+  const waitingCount = toAnswer.length + cards.length
   const targetHidden = useOffscreen(waitingTarget, entries.length)
   const reason = composerHint({ ...gate, bot: reach })
   const needsSetup = Boolean(bot && !agentReady)

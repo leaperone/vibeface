@@ -8,6 +8,7 @@ import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from 
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness } from '@vibeface/client/workspace/model.ts'
+import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
@@ -127,7 +128,7 @@ function Live({ children }: { children: ReactNode }) {
 
   const unread: Record<string, number> = {}
   for (const item of notifications) unread[item.conversation_id] = (unread[item.conversation_id] ?? 0) + 1
-  for (const question of questions) if (question.conversation_id && !question.answer && !(question.question_id in answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
+  for (const question of questions) if (question.conversation_id && awaitsAnswer(question, answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
 
   const members: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
