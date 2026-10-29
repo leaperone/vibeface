@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
 import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
@@ -30,7 +30,9 @@ export function useInbox(): InboxItem[] {
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
 export function LiveWorkspace({ children }: { children: ReactNode }) {
-  return <DeviceProvider platform={mobilePlatform}><Device>{children}</Device></DeviceProvider>
+  // A factory reset remounts everything below, back to the welcome page.
+  const [run, setRun] = useState(0)
+  return <DeviceProvider key={run} platform={mobilePlatform} restart={() => setRun((count) => count + 1)}><Device>{children}</Device></DeviceProvider>
 }
 
 function useConnection(): { session: Session; connection: Connection } {
