@@ -317,12 +317,12 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
         <form className="grid gap-3" noValidate onSubmit={(event) => {
           event.preventDefault()
           const form = event.currentTarget, address = value(form, 'address')
-          const deviceId = value(form, 'device_id').trim() || (sameOrigin(address) ? pageNode.deviceId : '')
+          const deviceId = value(form, 'device_id').trim() || (!publicEntry && sameOrigin(address) ? pageNode.deviceId : '')
           void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
         }}>
           <fieldset disabled={linking} className="grid gap-3">
             <Field label="访问地址"><Input type="url" name="address" defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={publicEntry ? undefined : manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
             <p className="-mt-1 text-muted-foreground">{manualCopy.where}</p>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>

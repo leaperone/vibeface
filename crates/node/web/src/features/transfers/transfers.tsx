@@ -44,6 +44,9 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   const sending = draftFor(draft, paid)
   const mine = receiverChoices(directory?.members ?? [], status?.node_peer ?? '')
   const picked = mine.some(item => item.device_id === draft.receiver_peer)
+  // Once a pasted ID shows its field, clearing it must not fold the field shut mid-edit.
+  const other = useRef(false)
+  if (!picked && draft.receiver_peer) other.current = true
   const receiverId = <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={picked ? '' : draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required={!picked} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
   const unusable = working || !file || !draft.receiver_peer || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
@@ -79,7 +82,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
               {mine.map(item => <NativeSelectOption key={item.device_id} value={item.device_id}>{item.name}</NativeSelectOption>)}
             </NativeSelect>
           </Field>
-          <Details label={transferCopy.otherDevice} open={!picked && Boolean(draft.receiver_peer) || undefined}>{receiverId}</Details>
+          <Details label={transferCopy.otherDevice} open={other.current || undefined}>{receiverId}</Details>
         </> : receiverId}
         <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
         {paid ? <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
