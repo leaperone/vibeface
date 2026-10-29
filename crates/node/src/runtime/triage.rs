@@ -331,16 +331,18 @@ fn own_turn(store: &crate::store::Store, event: &AgentEvent) -> Result<bool> {
 }
 
 /// What the coordination Agent knows of a bot: the start of its instructions and its newest
-/// notes, each within its own byte budget.
+/// notes that fit, each within its own byte budget.
 fn bot_context(bot: &crate::model::Bot, notes: &[crate::model::MemoryEntry]) -> Value {
     let mut left = BOT_NOTES_BYTES;
     let kept: Vec<&str> = notes
         .iter()
         .rev()
         .map(|note| note.text.as_str())
-        .take_while(|text| {
+        .filter(|text| {
             let fits = text.len() <= left;
-            left = left.saturating_sub(text.len());
+            if fits {
+                left -= text.len();
+            }
             fits
         })
         .collect();
@@ -1019,19 +1021,10 @@ impl Runtime {
             return Ok(());
         }
         let network = self.network_id().await?;
-        let reserved =
-            self.store
-                .lock()
-                .await
-                .reserve_budget(&network, 1, self.config.daily_decision_limit);
-        if let Err(error) = reserved {
-            self.settle_offered(&fresh).await?;
-            return Err(error.context("no coordination turn"));
-        }
         let mut offered = Vec::new();
         let mut bots = Vec::new();
-        {
-            let store = self.store.lock().await;
+        let reserved = {
+            let mut store = self.store.lock().await;
             let mut seen = HashSet::new();
             for event in &fresh {
                 let owner = owner(&store, &network, event)?;
@@ -1055,6 +1048,16 @@ impl Runtime {
                     json!({"conversation_id":owner,"name":name}),
                 ));
             }
+            // A count of its own under the same daily limit, so triage never starves bot turns.
+            store.reserve_budget(
+                &format!("triage:{network}"),
+                1,
+                self.config.daily_decision_limit,
+            )
+        };
+        if let Err(error) = reserved {
+            self.settle_offered(&fresh).await?;
+            return Err(error.context("no coordination turn"));
         }
         let turn = self
             .coordination_turn(|cli| {
@@ -4316,12 +4319,20 @@ pub(super) mod tests {
                 "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
                 params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms()],
             )?;
+            node.store.lock().await.connection.execute(
+                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?)",
+                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1],
+            )?;
             let mut requests = coordination_app_server(&node)?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
             let prompt = turn_starts(&mut requests).concat();
             assert!(prompt.contains("只管前端仓库，发版前先问用户。"), "the bot's instructions");
-            assert!(prompt.contains("用户每周五才发版"), "the bot's notes");
+            assert!(
+                prompt.contains("用户每周五才发版"),
+                "older notes stay when the newest is too long"
+            );
+            assert!(!prompt.contains("长长长"), "a note too long to fit is left out");
             assert!(!prompt.contains("截断之后"), "only the start of long instructions");
             Ok::<_, anyhow::Error>(())
         }
@@ -4331,17 +4342,18 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_turns_count_against_the_daily_budget() -> Result<()> {
+    async fn coordination_turns_have_their_own_daily_budget() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let limit = node.config.daily_decision_limit;
+            let triage = format!("triage:{network}");
             node.store
                 .lock()
                 .await
-                .reserve_budget(&network, limit - 1, limit)?;
+                .reserve_budget(&triage, limit - 1, limit)?;
             let mut requests = coordination_app_server(&node)?;
 
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
@@ -4372,6 +4384,11 @@ pub(super) mod tests {
                     .contains_key(&request_id),
                 "a held request gets the fallback answer at once"
             );
+            node.store
+                .lock()
+                .await
+                .reserve_budget(&network, limit, limit)
+                .context("the bots' own turns keep their whole budget")?;
             assert!(
                 node.pending_events().await?.is_empty(),
                 "its events are dropped"
