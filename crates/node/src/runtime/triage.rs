@@ -205,9 +205,15 @@ struct DecisionInput {
     text: Option<String>,
 }
 
-/// One line of what a session last said.
+/// One line of what a session last said. A held request's `detail` tells the coordination Agent
+/// how to answer, so the person never sees it.
 fn summary(event: &AgentEvent) -> String {
-    [&event.last_message, &event.detail]
+    let detail = if event.hold.is_some() {
+        ""
+    } else {
+        event.detail.as_str()
+    };
+    [event.last_message.as_str(), detail]
         .into_iter()
         .flat_map(|text| text.lines())
         .map(str::trim)

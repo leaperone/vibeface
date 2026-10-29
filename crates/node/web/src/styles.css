@@ -3,6 +3,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
 @import "@vibeface/theme/theme.css";
 
 @custom-variant dark (&:where(.dark, .dark *));
@@ -59,22 +60,12 @@ body {
 @theme inline {
   --font-heading: var(--font-sans);
   --font-sans: 'Geist Variable', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
-  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
-  --shadow-xs: var(--elevation-xs);
-  --shadow-sm: var(--elevation-sm);
-  --shadow-lg: var(--elevation-lg);
-  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
-  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
-  --default-transition-duration: 150ms;
-  --default-transition-timing-function: var(--ease-out);
+  --font-mono: 'Geist Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 }
 
 :root {
   /* Pages and the header's middle column share this width. */
   --page-width: 48rem;
-  --elevation-xs: 0 1px 2px oklch(0.2 0.02 270 / 0.05);
-  --elevation-sm: 0 1px 2px oklch(0.2 0.02 270 / 0.05), 0 2px 8px -2px oklch(0.2 0.02 270 / 0.07);
-  --elevation-lg: 0 2px 4px oklch(0.2 0.02 270 / 0.04), 0 12px 32px -8px oklch(0.2 0.02 270 / 0.18);
 }
 
 /* Dark: the workspace sidebar is lifted a step above the page, as a card is, and a hairline parts them. Web only; the shared theme and the sign-in page keep theirs. */
@@ -84,22 +75,11 @@ body {
   --sidebar-border: var(--line-soft);
 }
 
-/* Dark lines, web only: the shared 8% white sat near 1.2:1 and cards lost their edge. A card's outline and a field's border reach 3:1 against the page and the card; a divider inside stays soft so a card reads as one block. */
-:root.dark {
-  --line-soft: oklch(0.86 0.016 270 / 20%);
-  --line-strong: oklch(0.86 0.016 270 / 42%);
-  --border: var(--line-soft);
-  --input: var(--line-strong);
-}
+/* Dark: a card's outline takes the theme's strong line and what sits inside it the page's soft one, so a card reads as one block. */
+:root.dark { --line-soft: var(--border); }
 :root.dark :is([data-slot="card"], .bg-card) { --border: var(--line-strong); }
 :root.dark :is([data-slot="card"], .bg-card) > * { --border: var(--line-soft); }
 .workspace-shell [data-slot="sidebar-container"] { border-color: var(--sidebar-border); }
-
-:root.dark {
-  --elevation-xs: 0 1px 2px oklch(0 0 0 / 0.3);
-  --elevation-sm: 0 1px 2px oklch(0 0 0 / 0.3), 0 2px 8px -2px oklch(0 0 0 / 0.3);
-  --elevation-lg: 0 2px 4px oklch(0 0 0 / 0.25), 0 16px 40px -8px oklch(0 0 0 / 0.55);
-}
 
 @layer base {
   * {
@@ -145,11 +125,10 @@ svg.lucide-star, svg.lucide-download { translate: 0 -5%; }
 .workspace-screen { flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 1rem; }
 .workspace-screen [data-slot="card-content"] { display: grid; gap: .75rem; }
 .workspace-screen [data-slot="card-content"] > dl { display: grid; gap: .75rem; }
-.workspace-screen [data-slot="card-content"] dt { color: var(--muted-foreground); font-size: .875rem; }
 .workspace-screen dd, .workspace-screen code { overflow-wrap: anywhere; }
-.workspace-screen pre { max-width: 100%; overflow: auto; font-size: .8rem; }
+.workspace-screen pre { max-width: 100%; overflow: auto; font-size: 13px; line-height: 20px; }
 @media (min-width: 40rem) {
-  .workspace-screen { padding: 1.25rem 1.5rem; }
+  .workspace-screen { padding: 1.5rem; }
   .workspace-notices { padding-inline: 1.5rem; }
 }
 @media (max-width: 48rem) {
@@ -169,21 +148,11 @@ svg.lucide { stroke-width: 1.75; }
 }
 
 /* Native checkbox drawn as a switch: <input type="checkbox" role="switch" class="switch"> */
-.switch { appearance: none; position: relative; width: 2.25rem; height: 1.25rem; flex-shrink: 0; border-radius: 9999px; background: color-mix(in oklab, var(--muted-foreground) 75%, var(--background)); transition: background .15s; cursor: pointer; }
-.switch::before { content: ""; position: absolute; top: .125rem; left: .125rem; width: 1rem; height: 1rem; border-radius: 9999px; background: var(--background); transition: transform .15s; }
+.switch { appearance: none; position: relative; width: 2.25rem; height: 1.25rem; flex-shrink: 0; border-radius: 9999px; background: color-mix(in oklab, var(--muted-foreground) 75%, var(--background)); transition: background-color 150ms var(--ease-out); cursor: pointer; }
+.switch::before { content: ""; position: absolute; top: .125rem; left: .125rem; width: 1rem; height: 1rem; border-radius: 9999px; background: var(--background); transition: transform 150ms var(--ease-out); }
 .switch:checked { background: var(--success); }
 .switch[data-tone=danger]:checked { background: var(--danger); }
 .switch:checked::before { transform: translateX(1rem); }
 .switch:disabled { cursor: not-allowed; opacity: .35; }
 .switch:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 
-/* Streaming reply: three dots that breathe in turn. */
-.typing-dots { display: inline-flex; align-items: center; gap: 4px; height: 1.5rem; color: var(--muted-foreground); }
-.typing-dots > span { width: 6px; height: 6px; border-radius: 9999px; background: currentColor; animation: typing-dot 1.2s ease-in-out infinite; }
-.typing-dots > span:nth-child(2) { animation-delay: .15s; }
-.typing-dots > span:nth-child(3) { animation-delay: .3s; }
-.typing-dots[data-paused] > span { animation: none; opacity: .5; }
-@keyframes typing-dot { 0%, 60%, 100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } }
-@media (min-width: 64rem) {
-  .workspace-screen { padding: 2rem 2rem 2.5rem; }
-}

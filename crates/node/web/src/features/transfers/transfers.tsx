@@ -35,7 +35,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   }
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
   const unusable = working || !file || status?.max_file_bytes === 0 || draft.mode === 'charity' && !status?.charity_enabled || draft.mode === 'paid' && !status?.paid_enabled
-  return <div className="mx-auto grid w-full max-w-(--page-width) gap-8">
+  return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
     {!status ? <p role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</p> : <>
       <section aria-labelledby="transfer-settings" className="grid gap-4 rounded-xl border bg-card p-4">

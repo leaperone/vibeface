@@ -1,6 +1,6 @@
 "use client"
 
-import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type ComponentProps, type CSSProperties, type KeyboardEvent, type ReactNode, type Ref } from "react"
 import { createPortal } from "react-dom"
 import { ChevronDown, ChevronRight, CircleAlert, CircleCheck, Eye, EyeOff, Info, LoaderCircle, TriangleAlert, Upload, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -38,8 +38,9 @@ function BrandMark({ className }: { className?: string }) {
   </svg>
 }
 
-export function Wordmark({ className }: { className?: string }) {
-  return <span className={cn("inline-flex items-center gap-2 text-heading font-semibold tracking-tight", className)}><BrandMark />Vibeface</span>
+/** `large`: the join and create pages, where it stands alone over the form. */
+export function Wordmark({ className, large = false }: { className?: string; large?: boolean }) {
+  return <span className={cn("inline-flex items-center gap-2 font-semibold tracking-tight", large ? "text-title" : "text-heading", className)}><BrandMark className={large ? "size-8" : undefined} />Vibeface</span>
 }
 
 /** The primary bot's star. Alone, its name shows on hover and to screen readers; `labeled` writes it out. */
@@ -70,7 +71,7 @@ export function PageActions({ children }: { children: ReactNode }) {
 
 export function EmptyState({ icon: Icon, title, description, action, className }: { icon: LucideIcon; title: string; description?: string; action?: ReactNode; className?: string }) {
   return <div className={cn("mx-auto flex max-w-sm flex-col items-center gap-3 px-4 py-12 text-center animate-in fade-in-0 duration-200 ease-out", className)}>
-    <span className="mb-1 grid size-12 place-items-center rounded-2xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
+    <span className="mb-1 grid size-16 place-items-center rounded-2xl bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-8" /></span>
     <h2 className="text-heading font-semibold">{title}</h2>
     {description ? <p className="text-meta text-muted-foreground">{description}</p> : null}
     {action ? <div className="pt-1">{action}</div> : null}
@@ -81,7 +82,7 @@ const stepCount = 5
 /** Progress through first-time setup, shared by the connection screen and onboarding. */
 export function Steps({ step }: { step: number }) {
   return <div className="flex items-center gap-3 text-meta text-muted-foreground">
-    <span className="flex gap-1" aria-hidden="true">{Array.from({ length: stepCount }, (_, index) => index + 1).map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors duration-200", item <= step ? "bg-brand" : "bg-border")} />)}</span>
+    <span className="flex gap-1" aria-hidden="true">{Array.from({ length: stepCount }, (_, index) => index + 1).map((item) => <span key={item} className={cn("h-1 w-6 rounded-full transition-colors", item <= step ? "bg-brand" : "bg-border")} />)}</span>
     <span aria-hidden="true" className="tabular-nums">{step}/{stepCount}</span>
     <span className="sr-only">第 {step} 步，共 {stepCount} 步</span>
   </div>
@@ -93,8 +94,8 @@ export function Steps({ step }: { step: number }) {
  */
 export function AuthPage({ header, children }: { header?: ReactNode; children: ReactNode }) {
   return <main className="h-[var(--app-height,100dvh)] overflow-y-auto overscroll-contain sm:bg-sidebar">
-    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 pt-10 pb-[max(2.5rem,env(safe-area-inset-bottom))] sm:pt-[min(14vh,8rem)] sm:pb-16">
-      <header className="grid gap-3"><Wordmark />{header}</header>
+    <div className="mx-auto grid w-full max-w-md content-start gap-6 px-4 pt-12 pb-[max(3rem,env(safe-area-inset-bottom))] sm:pt-[min(14vh,8rem)] sm:pb-12">
+      <header className="grid gap-3"><Wordmark large />{header}</header>
       {children}
     </div>
   </main>
@@ -109,8 +110,8 @@ export function claimFocus(node: HTMLElement | null) {
 /** One step of first-time setup: a raised card under an icon title. */
 export function Panel({ icon: Icon, title, busy = false, children }: { icon: LucideIcon; title: string; busy?: boolean; children: ReactNode }) {
   // A phone has no room for a frame inside the page's own margins, so there the card is only its content.
-  return <section className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-(--ease-out-quint) sm:rounded-2xl sm:border sm:bg-card sm:p-6 sm:shadow-sm">
-    <h2 ref={claimFocus} tabIndex={-1} className="flex items-center gap-3 text-title font-semibold outline-none"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className={cn("size-[1.125rem]", busy && "animate-spin")} /></span>{title}</h2>
+  return <section className="grid gap-4 animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out sm:rounded-xl sm:border sm:bg-card sm:p-6 sm:shadow-sm">
+    <h2 ref={claimFocus} tabIndex={-1} className="flex items-center gap-3 text-title font-semibold outline-none"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className={cn("size-5", busy && "animate-spin")} /></span>{title}</h2>
     {children}
   </section>
 }
@@ -183,13 +184,29 @@ export function Segmented<T extends string>({ label, value, options, onChange, d
     radios[next]?.focus()
     if (options[next].value !== value) onChange(options[next].value)
   }
-  return <div role="radiogroup" aria-label={label} onKeyDown={move} className={cn("inline-flex max-w-full flex-wrap justify-self-start gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
+  // One thumb slides to the checked option; it is measured, since options differ in width and the track may wrap.
+  const track = useRef<HTMLDivElement>(null)
+  const [thumb, setThumb] = useState<CSSProperties>()
+  useLayoutEffect(() => {
+    const element = track.current
+    if (!element) return
+    const place = () => {
+      const checked = element.querySelector<HTMLElement>("[aria-checked=true]")
+      setThumb(checked ? { width: checked.offsetWidth, height: checked.offsetHeight, translate: `${checked.offsetLeft}px ${checked.offsetTop}px` } : undefined)
+    }
+    place()
+    const resize = new ResizeObserver(place)
+    resize.observe(element)
+    return () => resize.disconnect()
+  }, [value])
+  return <div ref={track} role="radiogroup" aria-label={label} onKeyDown={move} className={cn("relative inline-flex max-w-full flex-wrap justify-self-start gap-0.5 rounded-lg bg-muted p-0.5", fill && "max-sm:flex max-sm:w-full max-sm:flex-nowrap max-sm:[&>button]:flex-1 max-sm:[&>button]:px-2")}>
+    {thumb ? <span aria-hidden="true" style={thumb} className="absolute top-0 left-0 rounded-lg bg-card shadow-xs ring-1 ring-border transition-[translate,width,height] duration-200 ease-out dark:bg-accent" /> : null}
     {options.map(({ value: option, label: text, icon: Icon }) => <button key={option} type="button" role="radio" aria-checked={value === option} tabIndex={option === tabStop ? 0 : -1} aria-label={Icon && !labels ? text : undefined} title={Icon && !labels ? text : undefined}
       // Not `disabled`: a choice that saves disables the group while it does, and a disabled button drops focus to <body>.
       aria-disabled={disabled || undefined} onClick={() => { if (!disabled && option !== value) onChange(option) }}
-      className={cn("inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] duration-150 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 aria-disabled:opacity-50 max-md:h-11 max-md:px-3",
+      className={cn("relative inline-flex h-9 items-center justify-center gap-1.5 rounded-lg px-2.5 text-meta font-medium whitespace-nowrap transition-[color,background-color,box-shadow] outline-none focus-visible:ring-3 focus-visible:ring-ring/50 active:bg-card/70 aria-disabled:opacity-50 max-md:h-11 max-md:px-3",
         Icon && !labels && "max-sm:w-11 max-sm:px-0",
-        value === option ? "bg-card text-foreground shadow-xs ring-1 ring-border dark:bg-accent" : "text-muted-foreground hover:text-foreground")}>
+        value === option ? "text-foreground" : "text-muted-foreground hover:text-foreground")}>
       {Icon ? <><Icon aria-hidden="true" className="size-4" /><span className={labels ? undefined : "max-sm:hidden"}>{text}</span></> : text}
     </button>)}
   </div>
@@ -243,16 +260,16 @@ export function ActionCard({ icon: Icon, tone = "warning", title, meta, trailing
 
 export function SafetyCode({ code, label = "安全码" }: { code: string; label?: string }) {
   const groups = code.match(code.length === 6 ? /.{3}/g : /.{1,4}/g) ?? []
-  return <output aria-label={`${label} ${code.split("").join(" ")}`} className="flex flex-wrap justify-center gap-x-5 rounded-xl bg-muted/60 px-4 py-3 font-mono text-3xl font-semibold tracking-[0.12em] tabular-nums ring-1 ring-border">
+  return <output aria-label={`${label} ${code.split("").join(" ")}`} className="flex flex-wrap justify-center gap-x-4 rounded-xl bg-muted/60 px-4 py-3 font-mono text-2xl font-semibold tracking-[0.1em] tabular-nums ring-1 ring-border">
     {groups.map((group, index) => <span key={index}>{group}</span>)}
   </output>
 }
 
-/** Waiting on another device: a soft brand ping, a still dot under reduced motion. */
+/** Waiting on another device: a soft ping, a still dot under reduced motion. */
 export function WaitingDot() {
   return <span aria-hidden="true" className="relative grid size-4 shrink-0 place-items-center">
-    <span className="absolute size-2 animate-ping rounded-full bg-brand/60 motion-reduce:hidden" />
-    <span className="size-2 rounded-full bg-brand" />
+    <span className="absolute size-2 animate-ping rounded-full bg-info/60 motion-reduce:hidden" />
+    <span className="size-2 rounded-full bg-info" />
   </span>
 }
 
@@ -260,7 +277,7 @@ export function WaitingDot() {
 export function Details({ children, label = "详细信息", className, open }: { children: ReactNode; label?: string; className?: string; open?: boolean }) {
   return <details open={open} className={cn("details text-meta", className)}>
     <summary className="hit-area relative inline-flex min-h-9 items-center gap-1 text-muted-foreground hover:text-foreground">
-      <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-150" />{label}
+      <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />{label}
     </summary>
     <div className="grid gap-2 break-all pt-2 text-muted-foreground">{children}</div>
   </details>
@@ -289,7 +306,7 @@ export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeo
 export function FilePicker({ name, accept, required, disabled, label = "选择文件", onFile }: { name?: string; accept?: string; required?: boolean; disabled?: boolean; label?: string; onFile?(file: File): void }) {
   const [chosen, setChosen] = useState("")
   return <span className="flex min-w-0 items-center gap-3">
-    <label className={cn("relative inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border bg-background px-3 text-sm font-medium hover:bg-muted max-md:h-11 has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50", disabled && "pointer-events-none opacity-50")}>
+    <label className={cn("relative inline-flex h-9 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border bg-background px-3 font-medium hover:bg-muted max-md:h-11 has-[:focus-visible]:ring-3 has-[:focus-visible]:ring-ring/50", disabled && "pointer-events-none opacity-50")}>
       <Upload aria-hidden="true" className="size-4" />{label}
       <input className="absolute inset-0 size-full cursor-pointer opacity-0" type="file" name={name} accept={accept} required={required} disabled={disabled} onChange={(event) => {
         const file = event.currentTarget.files?.item(0)
@@ -370,11 +387,11 @@ export function Toaster() {
   return <div ref={stack} aria-live="polite" style={{ "--toast-space": `${space}px` } as CSSProperties} className="pointer-events-none fixed inset-x-0 bottom-[max(calc(var(--toast-space)+0.5rem),calc(env(safe-area-inset-bottom)+1rem))] z-[60] flex flex-col items-center gap-2 px-4 md:inset-x-auto md:right-6 md:items-end">
     {items.map((item) => {
       const Icon = item.icon ?? toastIcon[item.tone]
-      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-(--ease-out-quint)">
+      return <div key={item.id} role="status" className="pointer-events-auto flex w-full max-w-sm items-center gap-2 rounded-xl border bg-popover px-3 py-2 text-popover-foreground shadow-lg animate-in fade-in-0 slide-in-from-bottom-2 zoom-in-[0.98] duration-200 ease-out">
         <Icon aria-hidden="true" className={cn("size-4 shrink-0", toneText[item.tone])} />
         <span className="min-w-0 flex-1 text-meta">{item.text}</span>
         {item.action ? <Button type="button" size="sm" variant="ghost" className="-my-2 h-11 px-3 md:my-0 md:h-7 md:px-2.5" onClick={() => { item.action?.onClick(); dismissToast(item.id) }}>{item.action.label}</Button> : null}
-        <button type="button" aria-label="关闭" className="-my-2 -me-2 grid size-11 shrink-0 md:-my-1.5 md:size-9 place-items-center rounded-md text-muted-foreground hover:text-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
+        <button type="button" aria-label="关闭" className="-my-2 -me-2 grid size-11 shrink-0 md:-my-1.5 md:size-9 place-items-center rounded-lg text-muted-foreground hover:text-foreground" onClick={() => dismissToast(item.id)}><X aria-hidden="true" className="size-4" /></button>
       </div>
     })}
   </div>

@@ -21,11 +21,12 @@ function share(invitation: Invitation): Share {
 }
 
 /** "添加设备": one link (QR for phones) the new device opens, then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
-export function AddDevice({ opening = false, onOpened }: { opening?: boolean; onOpened?(): void }) {
+export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
+  useEffect(() => onOpenChange?.(open), [open])
   const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
@@ -91,7 +92,7 @@ export function AddDevice({ opening = false, onOpened }: { opening?: boolean; on
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
       <SheetContent ref={sheet} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
-        <div className="grid gap-5 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
+        <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
           <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
           {added && !requests ? <div className="grid gap-3">

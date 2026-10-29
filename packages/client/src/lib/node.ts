@@ -57,6 +57,8 @@ export type AppServer = { mode: AppServerMode; socket: string | null; link: AppS
  */
 export type ProviderStatus = {
   provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string; app_server: AppServer | null
+  /** Whether its program is on that device. */
+  installed: boolean
   /** Codex only: the Codex folder and the sessions folder the device uses. */
   home: string | null; sessions: string | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
@@ -190,6 +192,12 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
   return first && provider.supports.includes('execution') ? { bot: true, execution: true } : { bot: true }
 }
 
+/** Providers in use or on the device get a row; the others fold away until someone looks for one. */
+export function providerGroups(providers: readonly ProviderStatus[]): { shown: ProviderStatus[]; folded: ProviderStatus[] } {
+  const shown = providers.filter((item) => item.installed || item.roles.length > 0)
+  return { shown, folded: providers.filter((item) => !shown.includes(item)) }
+}
+
 export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   const v = record(value, '设备设置'), settings = record(v.settings), defaults = record(v.defaults), readiness = record(v.readiness)
   let manager: ManagerSettings | null = null
@@ -209,6 +217,8 @@ export function parseNodeSettings(value: unknown): NodeSettingsResponse {
   }
 }
 export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 'pi', 'opencode']
+/** A provider named by a peer's capabilities, or null when it names none this client knows. */
+export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
 const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
@@ -248,7 +258,7 @@ function parseProvider(value: unknown): ProviderStatus {
   return {
     provider: oneOf(v.provider, providerIds),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
-    bin: text(v.bin), app_server: parseAppServer(v.app_server),
+    installed: boolean(v.installed), bin: text(v.bin), app_server: parseAppServer(v.app_server),
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),

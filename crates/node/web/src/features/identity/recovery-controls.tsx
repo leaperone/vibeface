@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, BellRing, CalendarClock, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ShieldAlert, ShieldX, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -59,18 +59,27 @@ export function CurrentRecoveryFile() {
 export function RecoveryPendingCard() {
   const device = useDevice()
   const { busy, error, run } = useGenerationRun()
+  // Stopping cannot be undone, so it takes one confirmation, as on the phone.
+  const [asking, setAsking] = useState(false)
   const pending = device.pendingRecovery
   if (!pending) return null
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
-  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={<>
-    <Button type="button" variant="ghost" disabled={busy} onClick={device.dismissPendingRecovery}>{recoveryCopy.itsMe}</Button>
+  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={asking || busy ? <>
+    {/* Keys remount both buttons, so the focus lands on 取消 and a second press of the same key does not confirm. */}
+    <Button key="cancel" type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setAsking(false)}>取消</Button>
     {/* Solid here, unlike the soft global destructive: the time-limited step must outrank every other button on the page. */}
-    <Button type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
-      await device.vetoRecovery(pending.checkpoint)
+    <Button key="confirm" type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
+      try { await device.vetoRecovery(pending.checkpoint) } finally { setAsking(false) }
       toast(recoveryCopy.stopDone, { tone: 'success' })
     })}><BusyIcon busy={busy} icon={Hand} />{recoveryCopy.stop}</Button>
+  </> : <>
+    <Button type="button" variant="ghost" onClick={device.dismissPendingRecovery}>{recoveryCopy.itsMe}</Button>
+    <Button type="button" variant="destructive" onClick={() => setAsking(true)}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
   </>}>
-    {changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
+    {asking || busy ? <div role="alert" className="grid gap-1 rounded-lg bg-danger-soft px-3 py-2">
+      <p className="font-medium">{recoveryCopy.stopAsk}</p>
+      <p className="text-meta text-muted-foreground">{recoveryCopy.stopNote}</p>
+    </div> : changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon({ kind: member.kind, name: member.name, entry: false })
       const Change = added ? CirclePlus : CircleMinus
@@ -78,11 +87,27 @@ export function RecoveryPendingCard() {
         <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
         <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         <span className={cn('truncate', !added && 'text-muted-foreground line-through')}>{member.name}</span>
-        {member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
+        {added ? <span className="shrink-0 rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</span>
+          : member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
       </li>
     })}</ul> : null}
     <InlineError error={error || null} />
   </ActionCard>
+}
+
+/** Above the chat while a recovery waits: a manager sees it without opening 待处理, and one tap leads there. */
+export function RecoveryAlert() {
+  const device = useDevice()
+  const pending = device.pendingRecovery
+  if (!pending) return null
+  return <div className="mx-auto w-full max-w-(--page-width) shrink-0 px-4 pt-3 sm:px-6">
+    <Link to="/inbox" className="flex min-h-11 min-w-0 items-center gap-2.5 rounded-xl border border-danger-border bg-card py-1.5 ps-1.5 pe-3 shadow-xs transition-colors hover:bg-danger-soft">
+      <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-danger-soft text-danger ring-1 ring-danger-border"><ShieldAlert aria-hidden="true" className="size-4" /></span>
+      <span className="min-w-0 flex-1 truncate font-medium">{recoveryCopy.pending}</span>
+      <span className="shrink-0 text-meta text-danger tabular-nums">{recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)}</span>
+      <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+    </Link>
+  </div>
 }
 
 /** Left after stopping a recovery: whoever started it holds the file, so a new password retires it. */
@@ -108,6 +133,7 @@ export function SaveRecoveryFile({ code, saved, onSaved, download, busy = false 
   const wasSettled = useRef(settled)
   useEffect(() => { if (settled && !wasSettled.current) claimFocus(box.current); wasSettled.current = settled }, [settled])
   return <>
+    <p className="flex items-center gap-2 text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.why}</p>
     <p className="flex items-center gap-2 text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.needsPassword}</p>
     <p className="flex items-center gap-2 text-muted-foreground"><FileWarning aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.onlyCopy}</p>
     {downloaded ? <p className="flex min-h-11 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
@@ -231,7 +257,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   }
   if (device.review?.kind === 'recovery') return <RecoveryReview />
   // In settings the password is a row that folds its form out below itself; alone, a form stands as a card.
-  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-5 sm:ps-15">{body}</section>
+  const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-4 sm:ps-15">{body}</section>
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
       <p className="text-meta text-muted-foreground">{recoveryCopy.scope}</p>
       <form className="grid gap-4" noValidate onSubmit={(event) => {

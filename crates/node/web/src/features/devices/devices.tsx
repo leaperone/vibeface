@@ -63,14 +63,14 @@ function useEntryLabel() {
   return connectionOnline ? "当前连接" : "重连中"
 }
 
-export function DevicesPage() {
+export function DevicesPage({ joins = true }: { joins?: boolean }) {
   const device = useDevice()
   const rows = useDeviceRows()
   const entryLabel = useEntryLabel()
   const [error, setError] = useState<unknown>(null)
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(setError) }, [device.ready])
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <JoinRequests />
+    {joins ? <JoinRequests /> : null}
     <InlineError error={error} action={{ label: "重试", onClick: () => { setError(null); device.refreshDirectory().catch(setError) } }} />
     {!rows.length ? <div className="grid gap-2" aria-busy="true"><Skeleton className="h-14" /><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
       : <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-xs">{rows.map((row) => {
@@ -175,7 +175,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
-      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label}>
+      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label} description={deviceCopy.manageHint}>
         <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
           disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
           onChange={(event) => { const manage = event.target.checked; void action.run("manage", () => device.setManage(row.id, manage), "已保存") }} />

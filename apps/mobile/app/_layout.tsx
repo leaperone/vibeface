@@ -50,7 +50,8 @@ function Screens() {
           headerBackButtonDisplayMode: 'minimal',
           headerTintColor: foreground,
           headerTitleStyle: { fontFamily: 'Geist', fontWeight: '600', fontSize: Platform.OS === 'ios' ? 17 : 20, color: foreground },
-          headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '700', color: foreground },
+          // The native large title takes no letter spacing, so it stays at the font's own.
+          headerLargeTitleStyle: { fontFamily: 'Geist', fontWeight: '600', color: foreground },
           contentStyle: { backgroundColor: background },
         }}>
           <Stack.Protected guard={!ready}>
@@ -79,5 +80,5 @@ function Screens() {
 
 /** A sheet's own way out, beside the swipe down that not everyone knows. */
 function Close() {
-  return <Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="关闭" onPress={() => router.back()}><Icon as={X} /></Button>
+  return <Button variant="ghost" size="icon" className="rounded-full" accessibilityLabel="关闭" onPress={() => router.back()}><Icon as={X} className="size-5" /></Button>
 }

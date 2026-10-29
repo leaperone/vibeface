@@ -1,16 +1,16 @@
 import * as Clipboard from 'expo-clipboard'
-import { Asterisk, Bell, Bot, Braces, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, Pencil, Play, PlugZap, Plus, Sparkles, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
-import { Details, EmptyState, toneText, type Tone } from '@/components/kit'
+import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -27,8 +27,8 @@ import { cn } from '@/lib/utils'
 export default function AiScreen() {
   const { ready } = useDevice()
   if (!ready) return null
-  if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理设备能修改" />
-  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-8 p-4 pb-10">
+  if (!ready.principal.can_manage && ready.principal.source !== 'local_session') return <EmptyState icon={Sparkles} title="只有管理设备能修改" className="flex-1 justify-center" />
+  return <KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Section icon={Sparkles} title={ready.info.name || 'AI'}><AiSettings /></Section>
     <Section icon={Bell} title="会话等你时"><Triage /></Section>
   </KeyboardAwareScrollView>
@@ -60,7 +60,6 @@ function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
   return { value, busy, error, call, load, setError }
 }
 
-const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
@@ -99,18 +98,23 @@ function AiSettings() {
   const botState = response?.providers.find((item) => item.roles.includes('agent'))?.state
   const folders = response?.settings.roots.join('\n')
   useEffect(() => { if (folders !== undefined) live?.refresh().then(() => setError((shown) => shown?.at === 'refresh' ? null : shown), (cause) => { if (ready?.isCurrent()) setError({ at: 'refresh', text: messageOf(cause, '读取最新内容') }) }) }, [botState, folders])
-  if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-28 rounded-xl bg-muted" />
+  if (!response) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-28 rounded-xl" />
   const { roots, manager } = response.settings
   const test = async (): Promise<AppServerLink | null> => {
     if (!ready?.isCurrent()) return null
     try { const link = parseAppServerLink(await ready.request('test_codex_app_server')); void load(); return link }
     catch (cause) { setError({ at: 'codex', text: messageOf(cause) }); return null }
   }
+  const { shown, folded } = providerGroups(response.providers)
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} busy={busy} test={test}
+    error={error?.at === item.provider ? error.text : ''}
+    change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
+    saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
   return <View className="gap-6">
-    {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} busy={busy} test={test}
-      error={error?.at === item.provider ? error.text : ''}
-      change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
-      saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
+    {shown.map(card)}
+    {folded.length ? <Details label={`未安装 · ${folded.map((item) => providerNames[item.provider]).join('、')}`} open={!shown.length}>
+      <View className="gap-6">{folded.map(card)}</View>
+    </Details> : null}
     <PathList label="可用文件夹" items={roots} shown={response.display_paths} suggested={folderSuggestions(response)} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
     {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
@@ -129,8 +133,8 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
   const [bin, setBin] = useState(item.bin)
   useEffect(() => setBin(item.bin), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
-  return <View className="overflow-hidden rounded-xl border border-border">
-    <View className="min-h-14 flex-row items-center gap-3 px-3 py-2">
+  return <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
+    <View className="min-h-14 flex-row items-center gap-3 px-4 py-2">
       <Icon as={providerIcons[item.provider]} className="text-muted-foreground" />
       <Text className="min-w-0 flex-1 font-medium">{name}</Text>
       <View className="flex-row items-center gap-1">
@@ -140,17 +144,17 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
     </View>
     {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
     {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
-    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 py-2">
+    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-4 py-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
-        ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
-        : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
+        ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
+        : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-3 active:bg-muted/60" onPress={() => setOpen(!open)}>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-4 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
     </Pressable>
-    {open ? <View className="gap-5 px-3 pb-3">
+    {open ? <View className="gap-4 px-4 pb-4">
       {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
       {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
       <Field label="程序">
@@ -160,7 +164,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       <Variables item={item} working={working} change={change} />
       {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
     </View> : null}
-    {error ? <View className="px-3 pb-3"><ErrorText error={error} /></View> : null}
+    {error ? <View className="px-4 pb-3"><ErrorText error={error} /></View> : null}
   </View>
 }
 
@@ -173,7 +177,7 @@ function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof 
   const { label, hint, icon } = roles[role]
   // A named row with a system switch, so on and off read at a glance. While a save runs the switches keep their look and
   // ignore taps; the spinner says which one is changing.
-  return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-3">
+  return <View className="min-h-12 flex-row items-center gap-3 border-t border-border px-4">
     <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
     <Text className="min-w-0 flex-1">{label}</Text>
     <Switch value={pressed} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)} onValueChange={disabled ? undefined : onPress} />
@@ -202,14 +206,14 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   return <Field label="连接方式">
     <View accessibilityRole="radiogroup" className="flex-row gap-1 self-start rounded-lg bg-muted p-1">
       {modes.map(([mode, text, modeIcon]) => <Button key={mode} accessibilityRole="radio" accessibilityState={{ checked: server.mode === mode }} disabled={working}
-        variant={server.mode === mode ? 'outline' : 'ghost'} className="min-h-11" onPress={() => { if (mode !== server.mode) void save('app_server', { app_server: { mode, socket: server.socket } }) }}>
+        variant={server.mode === mode ? 'outline' : 'ghost'} onPress={() => { if (mode !== server.mode) void save('app_server', { app_server: { mode, socket: server.socket } }) }}>
         <Icon as={modeIcon} /><Text>{text}</Text>
       </Button>)}
     </View>
     <View className="flex-row flex-wrap items-center gap-2">
       <Icon as={icon} className={cn('size-4', tone)} />
       <Text className={cn('shrink text-meta', tone)}>{tested ? '测试：' : ''}{label}</Text>
-      <Button variant="ghost" className="min-h-11" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
+      <Button variant="ghost" disabled={working || testing || server.link.state === 'off'} onPress={async () => { setTesting(true); try { setTested(await test()) } finally { setTesting(false) } }}>
         <Icon as={testing ? LoaderCircle : PlugZap} /><Text>测试连接</Text>
       </Button>
     </View>
@@ -227,14 +231,14 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
   const cursor = manager.provider === 'cursor'
   const dirty = assistantFields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Field key={key} label={label}>
-    <Input accessibilityLabel={label} className={cn('h-11', key !== 'model' && 'font-mono')} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
+    <Input accessibilityLabel={label} className={key !== 'model' ? 'font-mono' : undefined} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
       value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
   </Field>
   return <View className="gap-3">
     <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
     {field('workspace', folderLabels.botRun)}
-    {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
+    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>
 }
@@ -254,20 +258,20 @@ function Variables({ item, working, change }: { item: ProviderStatus; working: b
         <View className="min-h-11 flex-row items-center gap-2">
           <Text numberOfLines={1} className="min-w-0 flex-1 font-mono text-meta">{row.name}</Text>
           <Text className={cn('text-meta', missing ? 'text-warning' : 'text-muted-foreground')}>{row.set ? '••••••' : row.inherited ? '沿用本机' : '未填'}</Text>
-          <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`${row.set ? '替换' : '填写'} ${row.name}`} disabled={working} onPress={() => { setEditing(row.name); setValue('') }}><Icon as={Pencil} className="size-4" /></Button>
-          {row.set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
+          <Button variant="ghost" size="icon" accessibilityLabel={`${row.set ? '替换' : '填写'} ${row.name}`} disabled={working} onPress={() => { setEditing(row.name); setValue('') }}><Icon as={Pencil} className="size-4" /></Button>
+          {row.set ? <Button variant="ghost" size="icon" accessibilityLabel={`删除 ${row.name}`} disabled={working} onPress={() => void set(row.name, null)}><Icon as={Trash2} className="size-4" /></Button> : null}
         </View>
         {editing === row.name ? <View className="flex-row gap-2 pe-2 pb-1">
-          <Input secureTextEntry autoFocus accessibilityLabel={`${row.name} 的值`} className="min-h-11 min-w-0 flex-1" maxLength={4096} value={value} onChangeText={setValue} />
-          <Button variant="outline" className="min-h-11" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
-          <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
+          <Input secureTextEntry autoFocus accessibilityLabel={`${row.name} 的值`} className="min-w-0 flex-1" maxLength={4096} value={value} onChangeText={setValue} />
+          <Button variant="outline" disabled={working || !value} onPress={() => void set(row.name, value).then((ok) => { if (ok) { setEditing(null); setValue('') } })}><Text>保存</Text></Button>
+          <Button variant="ghost" size="icon" accessibilityLabel="取消" onPress={() => { setEditing(null); setValue('') }}><Icon as={X} /></Button>
         </View> : null}
       </View>
     })}
-    <Input accessibilityLabel="变量名" placeholder="变量名" className="min-h-11 font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
+    <Input accessibilityLabel="变量名" placeholder="变量名" className="font-mono" autoCapitalize="characters" autoCorrect={false} maxLength={256} value={newName} editable={!working} onChangeText={setNewName} />
     <View className="flex-row gap-2">
-      <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-h-11 min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
-      <Button variant="outline" className="min-h-11" disabled={working || !addName || !newValue} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
+      <Input secureTextEntry accessibilityLabel="值" placeholder="值" className="min-w-0 flex-1" maxLength={4096} value={newValue} editable={!working} onChangeText={setNewValue} />
+      <Button variant="outline" disabled={working || !addName || !newValue} onPress={() => void set(addName, newValue).then((ok) => { if (ok) { setNewName(''); setNewValue('') } })}>
         <Icon as={Plus} /><Text>添加</Text>
       </Button>
     </View>
@@ -287,7 +291,7 @@ function Triage() {
   const [token, setToken] = useState('')
   const [test, setTest] = useState<{ ok: boolean; text: string } | null>(null)
   useEffect(() => { if (settings) setUrl(settings.webhook_url) }, [settings?.webhook_url])
-  if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <View className="h-24 rounded-xl bg-muted" />
+  if (!settings) return error ? <Retry error={error.text} onRetry={load} /> : <Skeleton className="h-24 rounded-xl" />
   const config = { default_outlet: settings.default_outlet, projects: settings.projects, webhook_url: settings.webhook_url, scan_codex_sessions: settings.scan_codex_sessions, codex_sessions: settings.codex_sessions }
   const save = (key: string, patch: Partial<typeof config>, extra: Record<string, unknown> = {}) => {
     const next = { ...config, ...patch }
@@ -298,17 +302,17 @@ function Triage() {
   // Until a chat is connected there is nothing to forward, so only connecting shows.
   const connected = Boolean(settings.webhook_url)
   const connect = <>
-    <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="min-h-11 font-mono" value={url} onChangeText={setUrl} />
+    <Input accessibilityLabel="外部聊天地址" placeholder="https://" keyboardType="url" autoCapitalize="none" autoCorrect={false} className="font-mono" value={url} onChangeText={setUrl} />
     <View className="flex-row gap-2">
-      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '密钥，至少 16 个字符'} maxLength={512} className="min-h-11 min-w-0 flex-1" value={secret} onChangeText={setSecret} />
-      {settings.webhook_secret_set ? <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
+      <Input secureTextEntry accessibilityLabel="外部聊天密钥" placeholder={settings.webhook_secret_set ? '密钥已设置' : '密钥，至少 16 个字符'} maxLength={512} className="min-w-0 flex-1" value={secret} onChangeText={setSecret} />
+      {settings.webhook_secret_set ? <Button variant="ghost" size="icon" accessibilityLabel="清除密钥" disabled={busy !== ''} onPress={() => void save('webhook', {}, { webhook_secret: null })}><Icon as={Trash2} /></Button> : null}
     </View>
     <View className="flex-row flex-wrap items-center gap-2">
-      <Button variant="outline" className="min-h-11" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
+      <Button variant="outline" disabled={busy !== '' || (url.trim() === settings.webhook_url && !secret) || (secret.length > 0 && secret.length < 16)}
         onPress={() => void save('webhook', { webhook_url: url }, secret ? { webhook_secret: secret } : {}).then(() => setSecret(''))}>
         {busy === 'webhook' ? <Icon as={LoaderCircle} /> : null}<Text>保存</Text>
       </Button>
-      <Button variant="ghost" className="min-h-11" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
+      <Button variant="ghost" disabled={busy !== '' || !settings.webhook_url || !settings.webhook_secret_set} onPress={() => {
         setTest(null)
         void call('test', 'test_webhook').then((result) => {
           const data = result as { ok?: boolean; status?: number | null; error?: string | null } | null
@@ -332,7 +336,7 @@ function Triage() {
           trailing={(prefix) => {
             const project = config.projects.find((item) => item.prefix === prefix)!
             const [, text] = outlets.find(([value]) => value === project.outlet)!
-            return <Button variant="ghost" className="min-h-11 px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
+            return <Button variant="ghost" className="px-2" accessibilityHint="点一下切换" disabled={busy !== ''}
               onPress={() => void save('projects', { projects: config.projects.map((item) => item.prefix === prefix ? { ...item, outlet: other(item.outlet) } : item) })}><Text className="text-meta">{text}</Text></Button>
           }}
           onChange={(prefixes) => void save('projects', { projects: prefixes.map((prefix) => config.projects.find((item) => item.prefix === prefix) ?? { prefix, outlet: other(config.default_outlet) }) })} />
@@ -344,17 +348,17 @@ function Triage() {
           <Text selectable numberOfLines={1} className="rounded-lg bg-muted/60 px-3 py-2 font-mono text-meta">{settings.decision_url}</Text>
           {token ? <View className="flex-row items-center gap-2 rounded-lg border border-warning-border bg-warning-soft ps-3">
             <Text selectable className="min-w-0 flex-1 font-mono text-meta">{token}</Text>
-            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
-            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
+            <Button variant="ghost" size="icon" accessibilityLabel="复制授权码" accessibilityHint="只显示这一次" onPress={() => void Clipboard.setStringAsync(token)}><Icon as={Copy} /></Button>
+            <Button variant="ghost" size="icon" accessibilityLabel="收起" onPress={() => setToken('')}><Icon as={X} /></Button>
           </View> : null}
           {settings.decision_tokens.map((item) => <View key={item.token_id} className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
             <Text numberOfLines={1} className="min-w-0 flex-1 text-meta">{item.label || '未命名'}</Text>
             <Text className="text-meta text-muted-foreground">{new Date(item.created_ms).toLocaleDateString()}</Text>
-            <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
+            <Button variant="ghost" size="icon" accessibilityLabel={`撤销 ${item.label || '授权码'}`} disabled={busy !== ''} onPress={() => void call('revoke', 'revoke_decision_token', { token_id: item.token_id })}><Icon as={Trash2} className="size-4" /></Button>
           </View>)}
           <View className="flex-row gap-2">
-            <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-h-11 min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
-            <Button variant="outline" className="min-h-11" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
+            <Input accessibilityLabel="授权码名称" placeholder="外部聊天" maxLength={64} className="min-w-0 flex-1" value={label} editable={busy === ''} onChangeText={setLabel} />
+            <Button variant="outline" disabled={busy !== ''} onPress={() => void call('token', 'create_decision_token', { label: label.trim() || '外部聊天' }).then((result) => {
               const value = (result as { token?: unknown } | null)?.token
               if (typeof value === 'string') { setToken(value); setLabel('') }
             })}><Icon as={busy === 'token' ? LoaderCircle : Plus} /><Text>生成授权码</Text></Button>
@@ -380,15 +384,15 @@ function PathList({ label, items, shown = {}, suggested = [], busy, trailing, on
       <Icon as={FolderOpen} className="size-4 text-muted-foreground" />
       <Text numberOfLines={1} ellipsizeMode="head" className="min-w-0 flex-1 font-mono text-meta">{shown[item] ?? item}</Text>
       {trailing?.(item)}
-      <Button variant="ghost" size="icon" className="size-11" accessibilityLabel={`移除 ${shown[item] ?? item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel={`移除 ${shown[item] ?? item}`} disabled={busy} onPress={() => onChange(items.filter((other) => other !== item))}><Icon as={X} /></Button>
     </View>)}
-    {suggested.length ? <View className="flex-row flex-wrap gap-2">{suggested.map((folder) => <Button key={folder.path} variant="outline" className="min-h-11" accessibilityLabel={`添加 ${folder.label}`} disabled={busy} onPress={() => onChange([...items, folder.path])}>
+    {suggested.length ? <View className="flex-row flex-wrap gap-2">{suggested.map((folder) => <Button key={folder.path} variant="outline" accessibilityLabel={`添加 ${folder.label}`} disabled={busy} onPress={() => onChange([...items, folder.path])}>
       <Icon as={Plus} /><Text className="font-mono text-meta">{folder.label}</Text>
     </Button>)}</View> : null}
     <View className="flex-row gap-2">
-      <Input accessibilityLabel="文件夹路径" placeholder={items.length || suggested.length ? '其他文件夹' : '~/projects'} autoCapitalize="none" autoCorrect={false} className="min-h-11 min-w-0 flex-1 font-mono" value={path} editable={!busy}
+      <Input accessibilityLabel="文件夹路径" placeholder={items.length || suggested.length ? '其他文件夹' : '~/projects'} autoCapitalize="none" autoCorrect={false} className="min-w-0 flex-1 font-mono" value={path} editable={!busy}
         returnKeyType="done" onChangeText={setPath} onSubmitEditing={add} />
-      <Button variant="outline" className="min-h-11" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
+      <Button variant="outline" disabled={busy || !path.trim()} onPress={add}><Icon as={Plus} /><Text>添加</Text></Button>
     </View>
   </>
   return label ? <Field label={label}>{body}</Field> : <View className="gap-2">{body}</View>
@@ -396,8 +400,8 @@ function PathList({ label, items, shown = {}, suggested = [], busy, trailing, on
 
 function SaveRow({ value, saved, placeholder, mono, working, onChange, onSave }: { value: string; saved: string; placeholder: string; mono?: boolean; working: boolean; onChange(value: string): void; onSave(): void }) {
   return <View className="flex-row gap-2">
-    <Input accessibilityLabel={placeholder} placeholder={placeholder} autoCapitalize="none" autoCorrect={false} className={cn('h-11 min-w-0 flex-1', mono && 'font-mono')} value={value} editable={!working} onChangeText={onChange} />
-    {value.trim() !== saved ? <Button variant="outline" className="min-h-11" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
+    <Input accessibilityLabel={placeholder} placeholder={placeholder} autoCapitalize="none" autoCorrect={false} className={cn('min-w-0 flex-1', mono && 'font-mono')} value={value} editable={!working} onChangeText={onChange} />
+    {value.trim() !== saved ? <Button variant="outline" disabled={working} onPress={onSave}><Text>保存</Text></Button> : null}
   </View>
 }
 
@@ -409,7 +413,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function Retry({ error, onRetry }: { error: string; onRetry(): void }) {
-  return <View className="gap-2"><ErrorText error={error} /><Button variant="outline" className="min-h-11 self-start" onPress={onRetry}><Text>重试</Text></Button></View>
+  return <View className="gap-2"><ErrorText error={error} /><Button variant="outline" className="self-start" onPress={onRetry}><Text>重试</Text></Button></View>
 }
 
 function Section({ icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }) {

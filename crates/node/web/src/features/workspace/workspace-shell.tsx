@@ -152,10 +152,10 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             {back ? <Button asChild variant="ghost" size="icon" className={cn("-ms-3", !nested && "md:hidden")}><Link to={back} aria-label="返回" title="返回"><ChevronLeft aria-hidden="true" /></Link></Button> : null}
             {isMobile ? null : <SidebarTrigger aria-label="菜单" title="菜单" className={cn("max-md:hidden", nested ? "max-lg:hidden" : "-ms-2.5")} />}
           </div>
-          <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-8")}>
+          <div className={cn("col-start-2 flex min-w-0 items-center gap-2", chatRoute && "lg:px-6")}>
             <div className="flex min-w-0 flex-1 items-center gap-2">
               {/* On the chat route the bot's name is the button that opens its panel; the heading around it still takes the focus. */}
-              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-heading font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
+              <h1 ref={landing ? claimFocus : undefined} tabIndex={-1} className={cn("min-w-0 text-title font-semibold outline-none", botTitle ? "flex" : "truncate")} title={botTitle ? undefined : title}>{botTitle ? <BotPanelButton /> : title}</h1>
             </div>
             <div ref={setActionsSlot} className="flex shrink-0 items-center gap-1 empty:hidden" />
           </div>
@@ -284,7 +284,7 @@ export function ShellSkeleton({ retry = null, onRetry, onLeave, home = false }: 
       {status ? <div className="mt-auto flex items-center gap-2 px-2 text-meta text-info" role="status">{status}</div> : null}
     </div>
     <div className="flex min-w-0 flex-1 flex-col">
-      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-heading font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} />{status ? <span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden">{status}</span> : null}</div>
+      <div className="flex h-14 items-center gap-3 border-b px-4">{home ? <span className="text-title font-semibold md:hidden">消息</span> : null}<Skeleton className={cn("h-5 w-32", home && "max-md:hidden")} />{status ? <span className="ml-auto flex items-center gap-2 text-meta text-info md:hidden">{status}</span> : null}</div>
       {offline ? <div className="my-auto"><EmptyState icon={WifiOff} title="连不上设备" action={<div className="grid justify-items-center gap-3">
         <p className="flex items-center gap-1 text-meta text-muted-foreground"><span aria-hidden={retrying || undefined}>{retrying ? "正在重连" : `${shown.current} 秒后自动重试`}</span>
           {/* The countdown ticks every second, so only the state change is announced. */}

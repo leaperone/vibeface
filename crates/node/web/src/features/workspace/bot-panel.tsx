@@ -8,7 +8,7 @@ import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
-import { providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
+import { asProvider, providerNames, type ProviderId } from "@vibeface/client/lib/node.ts"
 import { folderLabels, formatIn, formatWhen, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from "@vibeface/client/workspace/bot-settings.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
@@ -60,7 +60,9 @@ export function BotPanelButton() {
     setConfirming(null)
     window.setTimeout(drop, GAP_MS)
   }
-  const models = Object.entries(bot.models) as [ProviderId, string][]
+  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
+  const running = asProvider(ownerNode?.capabilities?.manager)
+  const models = running ? [[running, bot.models[running] ?? ""]] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
   const empty = view && !bot.instructions.trim() && !rows.length && !view.memory.length && !view.skills.length
   const deviceName = owner ? nodeName(owner, { nodes: workspace.nodes, directory }) : ""
   const mood = botMood(bot, workspace)
@@ -83,7 +85,7 @@ export function BotPanelButton() {
         const composer = document.getElementById("message-text")
         if (composer) { event.preventDefault(); composer.focus() }
       }}>
-        <SheetHeader className="flex-row items-center gap-3 px-4 pt-5 pb-6 pr-14">
+        <SheetHeader className="flex-row items-center gap-3 px-4 pt-4 pb-6 pr-14">
           <BotFace botId={bot.bot_id} mood={mood} size={48} />
           <span className="grid min-w-0 gap-0.5">
             <SheetTitle className="text-title font-semibold break-words">{bot.name}</SheetTitle>
@@ -104,7 +106,7 @@ export function BotPanelButton() {
               </NativeSelect> : <span className="max-w-48 truncate" title={bot.project?.cwd}>{projectLabel}</span>}
             </SettingsRow> : null}
             {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
-              <span className="max-w-48 truncate font-mono" title={model}>{model}</span>
+              {model ? <span className="max-w-48 truncate font-mono" title={model}>{model}</span> : <span>设备默认</span>}
             </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><span>设备默认</span></SettingsRow>}
             <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
