@@ -323,13 +323,13 @@ impl ProviderEnv {
                 crate::logging::add_private_path(std::path::Path::new(value));
             }
         }
-        env.redact_in_logs();
+        env.hide_values();
         Ok(env)
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
         crate::config::private_write(&dir.join(ENV_FILE), &serde_json::to_vec(self)?)?;
-        self.redact_in_logs();
+        self.hide_values();
         Ok(())
     }
 
@@ -365,9 +365,13 @@ impl ProviderEnv {
         Ok(())
     }
 
-    fn redact_in_logs(&self) {
-        for value in self.0.values().flat_map(BTreeMap::values) {
-            crate::logging::add_secret(value);
+    fn hide_values(&self) {
+        for (name, value) in self.0.values().flat_map(BTreeMap::iter) {
+            if crate::logging::credential_name(name) || crate::model::looks_secret(value) {
+                crate::logging::add_credential(value);
+            } else {
+                crate::logging::add_secret(value);
+            }
         }
     }
 }

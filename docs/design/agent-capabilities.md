@@ -56,7 +56,8 @@ BotChange::Memory { memory_id, before: Option<String>, after: Option<String> }  
 | `recall {query?}` | 列出这个 bot 的笔记，`query` 按子串过滤 |
 
 - 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `bot.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
-- 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。
+- 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。bot 说明、skill 的描述和正文、schedule 提示按同一规则拒绝。
+- Node 签名自己的每条写入前，把已知的密钥换成 `[redacted]`，包括回复、bot 消息和工作结果。已知密钥指进程环境和设置页 Provider 变量里名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾或疑似凭证的值、入口令牌、Cursor 回调令牌，以及 `Bearer` 后的令牌。带本人设备签名的写入保持原样。
 - `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。理由是记忆注入之后每一轮的提示词，作用等同于说明；工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
 - 投影 `memories` 按 `memory_id` 后写者胜，删除保留墓碑。
 

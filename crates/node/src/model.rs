@@ -483,6 +483,15 @@ pub fn validate_instructions(instructions: &str) -> anyhow::Result<()> {
         instructions.len() <= MAX_INSTRUCTIONS_BYTES,
         "Bot instructions must be at most {MAX_INSTRUCTIONS_BYTES} bytes"
     );
+    refuse_secret(instructions)
+}
+
+/// Bot settings sync to every device, so they never hold a credential.
+fn refuse_secret(text: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !looks_secret(text),
+        "this looks like a credential; keys, tokens and passwords are never kept in bot settings"
+    );
     Ok(())
 }
 
@@ -497,7 +506,8 @@ impl Skill {
             !self.body.trim().is_empty() && self.body.len() <= MAX_SKILL_BODY_BYTES,
             "a skill body must be 1-{MAX_SKILL_BODY_BYTES} bytes"
         );
-        Ok(())
+        refuse_secret(&self.description)?;
+        refuse_secret(&self.body)
     }
 }
 
@@ -524,7 +534,7 @@ impl Schedule {
             self.depth <= MAX_CHAIN_DEPTH,
             "at most {MAX_CHAIN_DEPTH} automatic wakes may follow the user's message"
         );
-        Ok(())
+        refuse_secret(&self.prompt)
     }
 }
 
@@ -891,6 +901,18 @@ pub enum EventBody {
 }
 
 impl EventBody {
+    /// This Node's write with every credential it knows blanked, so no key reaches the shared
+    /// record. A write the user signed is theirs and stays as signed.
+    pub fn without_credentials(self) -> anyhow::Result<Self> {
+        if self.attestation().is_some() {
+            return Ok(self);
+        }
+        let mut value = serde_json::to_value(&self)?;
+        if !crate::logging::blank_credentials_in(&mut value) {
+            return Ok(self);
+        }
+        Ok(serde_json::from_value(value)?)
+    }
     /// Present on writes that need the user's own device signature; see `crypto::validate_event_shape`.
     pub fn attestation(&self) -> Option<&Attestation> {
         match self {
