@@ -60,6 +60,7 @@ impl LocalIdentity {
         event.deps.dedup();
         event.blobs.sort();
         event.blobs.dedup();
+        event.body = event.body.without_credentials()?;
         validate_event_shape(&event)?;
         let canonical_body = serde_json::to_string(&event)?;
         ensure!(canonical_body.len() <= MAX_EVENT_BYTES, "event too large");

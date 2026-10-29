@@ -3015,6 +3015,158 @@ fn notes_refuse_secrets_and_sync() -> Result<()> {
 }
 
 #[test]
+fn bot_settings_refuse_secrets() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let key = "sk-proj-FAKEFAKEFAKEFAKEFAKEFAKE000000";
+    for (index, request) in [
+        save_skill(None, "Deploy", &format!("Use {key} to call the API")),
+        ChangeRequest::SaveSchedule {
+            schedule_id: None,
+            name: "Nightly".into(),
+            prompt: format!("Call the API with {key}"),
+            first_run_at_ms: 1_000,
+            every_minutes: Some(60),
+            enabled: None,
+        },
+        ChangeRequest::UpdateProfile {
+            name: None,
+            instructions: Some(format!("Your key is {key}")),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = origin
+            .change_bot(
+                &net.a,
+                &net.network,
+                "c",
+                "message:m1",
+                &format!("s{index}"),
+                request,
+                Provider::Codex,
+                10,
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("credential"), "{refused}");
+    }
+    assert!(origin.skills(&net.network)?.is_empty());
+    assert!(origin.schedules(&net.network, "c")?.is_empty());
+    Ok(())
+}
+
+/// A key this Node knows never leaves it in a reply, a bot message or a work result, while what
+/// the user signed stays exactly as signed.
+#[test]
+fn shared_records_never_carry_a_known_credential() -> Result<()> {
+    let key = "fake-shared-record-credential-0123456789";
+    crate::logging::add_credential(key);
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    second_bot(&mut origin, &net, "Ops")?;
+    let mut reply = bot_reply("r1", "m1");
+    if let EventBody::MessagePosted { text, .. } = &mut reply {
+        *text = format!("The key is {key}.");
+    }
+    origin.append_event(&net.a, &net.network, "c", reply, vec![], 4)?;
+    origin.message_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "s1",
+        "Ops",
+        &format!("Use {key} for the backups"),
+        5,
+    )?;
+    let trigger = message_trigger("m1");
+    let spec = WorkSpec {
+        work_id: WorkSpec::id("c", &trigger, "call-1"),
+        conversation: "c".into(),
+        trigger,
+        target: net.a.device_id()?,
+        dispatcher: net.a.device_id()?,
+        call_ref: "call-1".into(),
+        kind: WorkKind::Agent(Provider::Codex),
+        cwd: "/tmp".into(),
+        title: "t".into(),
+        prompt: "p".into(),
+        continues: None,
+        parent: None,
+        thread: None,
+    };
+    let id = spec.work_id.clone();
+    origin.accept_work(&net.a, &net.network, spec, 6)?;
+    for (signal, at) in [
+        (Signal::ThreadCreated("t".into()), 7),
+        (
+            Signal::TurnStarted {
+                turn_id: "u".into(),
+                epoch: 1,
+            },
+            8,
+        ),
+        (
+            Signal::TurnCompleted {
+                turn_id: "u".into(),
+                status: vibeface_bridge::turn::TurnStatus::Completed,
+                text: format!("env printed OPENAI_API_KEY={key}"),
+                error: None,
+            },
+            9,
+        ),
+    ] {
+        origin.apply_work_signal(&net.a, &net.network, &id, signal, at)?;
+    }
+    let typed = format!("my key is {key}");
+    origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        user(&net, "m2", &typed),
+        vec![],
+        10,
+    )?;
+
+    let texts = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .messages(&net.network, "c")?
+            .into_iter()
+            .map(|m| m.text)
+            .collect())
+    };
+    let mut other = store(&net)?;
+    all_accepted(&mut other, &net, &origin)?;
+    for store in [&origin, &other] {
+        let envelopes: Vec<String> = store
+            .connection
+            .prepare("SELECT envelope FROM events WHERE network_id=?")?
+            .query_map([&net.network], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let carrying: Vec<_> = envelopes.iter().filter(|e| e.contains(key)).collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "only the user's signed message: {carrying:?}"
+        );
+        let texts = texts(store)?;
+        assert!(
+            texts.contains(&"The key is [redacted].".to_owned()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&typed), "{texts:?}");
+        assert_eq!(
+            store.works(&net.network, "c")?[0].result_text,
+            "env printed OPENAI_API_KEY=[redacted]"
+        );
+        let sent = store.sent_bot_messages(&net.network, "c")?;
+        assert_eq!(sent[0].text, "Use [redacted] for the backups");
+    }
+    Ok(())
+}
+
+#[test]
 fn append_path_uses_indexes_only() -> Result<()> {
     let net = net()?;
     let store = store(&net)?;
