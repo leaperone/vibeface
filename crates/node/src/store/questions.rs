@@ -200,6 +200,7 @@ impl Store {
                 row["muted"] = json!(muted);
                 row["created_at_ms"] = json!(created_at_ms);
                 row["version"] = json!(super::version(&rank));
+                row["rank"] = json!(rank);
                 Ok(row)
             })
             .collect()
