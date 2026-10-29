@@ -17,5 +17,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 uniffi = { version = "=0.31.2", default-features = false }
 vibeface-secure = { path = "../secure" }
 
+# netdev, under iroh, reads `libc::in6_ifreq` on every Apple target; libc 0.2.190 defines it for macOS only.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "=0.2.189"
+
 [dev-dependencies]
 hex.workspace = true
