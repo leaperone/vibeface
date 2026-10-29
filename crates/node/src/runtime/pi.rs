@@ -1163,7 +1163,7 @@ impl Executor for Pi {
                         .pi_report(&network, &conversation, &work_id, report)
                         .await
                     {
-                        tracing::warn!(%error, work_id, "a pi work report waits for the next probe");
+                        tracing::warn!(event = "pi.work_report_pending", %error, work_id, "a pi work report waits for the next probe");
                     }
                 }
             });

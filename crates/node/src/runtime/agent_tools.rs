@@ -43,6 +43,13 @@ impl Runtime {
             .context("missing tool scope")?;
         self.require_scope(&access, &scope).await?;
         let tool = Tool::parse(name).context("unknown or unavailable coordination tool")?;
+        if let Some(call_ref) = args["call_ref"].as_str()
+            && vibeface_protocol::validate_id(call_ref).is_err()
+        {
+            bail!(
+                "call_ref must contain 1-128 ASCII letters, digits, hyphens, dots or underscores, such as create-dokilove; it only keys retries of this call"
+            );
+        }
         ensure!(
             tool.effect() == Effect::Read || access.manager.is_some(),
             "work changes require a live agent invocation"
@@ -484,7 +491,6 @@ impl Runtime {
             .as_ref()
             .context("dispatch requires an agent invocation")?;
         let call_ref = field(args, "call_ref")?;
-        vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
         let local = self.identity.device_id()?;
         let optional = |key: &str| args[key].as_str().map(String::from);
         let task = manager.trigger.strip_prefix("task:");
@@ -605,8 +611,8 @@ impl Runtime {
         Some(provider)
     }
 
-    /// The provider a work on this device runs on: the one asked for, or the only one that
-    /// executes work here.
+    /// The provider a work on this device runs on: the one asked for, else the bot's own
+    /// provider when it executes work here, else the first one that does.
     fn executing(&self, agent: Option<Provider>) -> Result<Provider> {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let execution = self.providers().switches.execution;
@@ -620,16 +626,12 @@ impl Runtime {
                 agent.label(),
                 agent.name()
             ))),
-            None => match Vec::from_iter(&execution)[..] {
-                [only] => Ok(*only),
-                [] => Err(off(
+            None => (self.manager().map(|manager| manager.provider))
+                .filter(|provider| execution.contains(provider))
+                .or_else(|| execution.first().copied())
+                .ok_or_else(|| off(
                     "execution is turned off on this device; ask the user to turn it on with propose_provider_config execution".into(),
                 )),
-                _ => bail!(
-                    "this device executes work on {}; name one as agent",
-                    Vec::from_iter(execution.iter().map(|provider| provider.name())).join(", ")
-                ),
-            },
         }
     }
 }

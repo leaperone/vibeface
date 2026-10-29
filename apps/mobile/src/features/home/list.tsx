@@ -1,5 +1,5 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star } from 'lucide-react-native'
+import { Bot, ChevronRight, Inbox, Plus, RefreshCw, Settings, ShieldAlert, Star, WifiOff } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
@@ -18,6 +18,7 @@ import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useInbox, useLive } from '@/data/live'
 import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
+import { emptyHome } from '@vibeface/client/workspace/home.ts'
 import { listTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 
@@ -39,7 +40,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
   const insets = useSafeAreaInsets()
   const shared = useLive()
   // Until the first read lands an empty list is not yet known, so rows hold their place instead of 还没有 Bot.
-  const loading = !shared?.synced
+  const empty = emptyHome({ synced: Boolean(shared?.synced), link: device.link })
   const waiting = waitingItems(useInbox()).length
   const bots = [...workspace.bots].sort((a, b) => (b.last_message?.created_at_ms ?? -1) - (a.last_message?.created_at_ms ?? -1))
   const now = Date.now()
@@ -75,7 +76,9 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
         {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
       </Item>
-    }) : loading ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
+    }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title="连不上你的网络，正在重试"
+      action={<Button variant="outline" className="min-h-11" onPress={device.retryNow}><Icon as={RefreshCw} /><Text>重试</Text></Button>} /></View>
+    : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
       <Skeleton className="size-11 rounded-full" />
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-full" /><Skeleton className="h-3 w-2/3 rounded-full" /></View>
     </View>)}</View> : <View className="flex-1 justify-center"><EmptyState icon={Bot} title="还没有 Bot" action={canCreate ? <Link href="/new-bot" asChild>
