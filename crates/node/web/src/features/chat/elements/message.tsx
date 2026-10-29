@@ -90,7 +90,7 @@ export function Message({ message, schedule, last = true, retry, detail }: { mes
       <span className="sr-only">Bot：</span>
       <Markdown text={message.text} />
     </div>
-    {message.state === 'streaming' ? <span role="img" aria-label="正在回复" className="flex h-6 items-center">{selectedBot ? <BotFace botId={selectedBot.bot_id} mood={connectionOnline ? 'replying' : 'asleep'} size={24} /> : null}</span> : null}
+    {message.state === 'streaming' ? <span role="img" aria-label="正在回复" className="flex h-6 items-center">{selectedBot ? <BotFace bot={selectedBot} mood={connectionOnline ? 'replying' : 'asleep'} size={24} /> : null}</span> : null}
     {failed ? <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-meta">
       <span className="flex items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4" />{ended}</span>
       {cause ? <span className="text-muted-foreground">{cause}</span> : null}

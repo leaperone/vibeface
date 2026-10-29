@@ -1,6 +1,7 @@
 import type { ProviderId } from "../lib/node.ts"
 import type { PendingMessage, TranscriptMessage } from "../chat/types.ts"
 import type { FailureKind } from "../lib/errors.ts"
+import type { Avatar } from "../avatar/face.ts"
 
 export type NodeInfo = {
   device_id: string
@@ -120,9 +121,11 @@ type MemoryEntry = { memory_id: string; text: string }
 /** null: every shared skill, later ones included. */
 export type SkillSet = string[] | null
 type SkillsEdit = { before: SkillSet; after: SkillSet }
+/** null: the face its id gives. */
+export type AvatarEdit = { before: Avatar | null; after: Avatar | null }
 /** `before` null is a new item, `after` null a removed one (docs/design/bot-config.md section 2). */
 export type BotChange =
-  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; skills?: SkillsEdit }
+  | { kind: "profile"; name?: FieldEdit; instructions?: FieldEdit; model?: ModelEdit; skills?: SkillsEdit; avatar?: AvatarEdit }
   | { kind: "skill"; skill_id: string; before: BotSkill | null; after: BotSkill | null }
   | { kind: "schedule"; schedule_id: string; before: BotSchedule | null; after: BotSchedule | null }
   | { kind: "memory"; memory_id: string; before: string | null; after: string | null }
@@ -167,7 +170,8 @@ export type CreateBotRequest = { bot_id: string; conversation_id: string; name: 
 type LastMessage = { text: string; role: string; created_at_ms: number }
 /** What the bot does on the device serving this list: a message waiting or claimed, or a reply running. A bot another device schedules reads null once its message is delivered. */
 export type Busy = "thinking" | "replying" | null
-export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; event_hash: string; last_message: LastMessage | null; busy: Busy }
+/** `avatar` null: the face its id gives. */
+export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
 
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }

@@ -1,5 +1,5 @@
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -8,7 +8,8 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
-import type { BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, providerIcons } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -186,17 +187,18 @@ function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedu
       <Icon as={CircleCheck} className="size-4 text-success" />
       <Text role="heading" className="text-meta font-medium text-muted-foreground">{changeTitle(records.map((record) => record.change))}</Text>
     </View>
-    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} schedules={schedules} />)}
+    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules} />)}
   </View>
 }
 
-function ChangeRows({ change, schedules }: { change: BotChange; schedules: readonly ScheduleView[] }) {
+function ChangeRows({ change, conversationId, schedules }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <ChangeRow icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></ChangeRow> : null}
     {change.instructions ? <ChangeRow icon={ScrollText} label="说明">
       {lineDiff(change.instructions.before, change.instructions.after).slice(0, 6).map((line, index) =>
         <Text key={index} className={cn('text-meta', line.kind === 'added' ? 'text-foreground' : 'text-muted-foreground line-through')}>{line.kind === 'added' ? '+ ' : '- '}{line.text}</Text>)}
     </ChangeRow> : null}
+    {change.avatar ? <ChangeRow icon={Smile} label="长相"><AvatarChange edit={change.avatar} conversationId={conversationId} /></ChangeRow> : null}
   </>
   if (change.kind === 'skill') {
     const skill = change.after ?? change.before!
@@ -222,6 +224,16 @@ function ChangeRows({ change, schedules }: { change: BotChange; schedules: reado
     <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
     <Text numberOfLines={2} className="text-meta text-muted-foreground">{next.prompt}</Text>
   </ChangeRow>
+}
+
+/** The face before and after, drawn; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
+function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversationId: string }) {
+  const botId = useLive()?.bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
+  return <View className="flex-row items-center gap-2">
+    <View accessible accessibilityRole="image" accessibilityLabel="原来的长相"><BotFace bot={{ bot_id: botId, avatar: edit.before }} mood="idle" size={28} /></View>
+    <Icon as={ArrowRight} accessibilityLabel="改为" className="size-4 text-muted-foreground" />
+    <View accessible accessibilityRole="image" accessibilityLabel={edit.after ? '新的长相' : '默认长相'}><BotFace bot={{ bot_id: botId, avatar: edit.after }} mood="idle" size={28} /></View>
+  </View>
 }
 
 function ChangeRow({ icon, label, tag, removed, children }: { icon: LucideIcon; label: string; tag?: string; removed?: boolean; children?: ReactNode }) {

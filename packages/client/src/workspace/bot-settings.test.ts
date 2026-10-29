@@ -135,3 +135,11 @@ test("a bot lists its model per provider and its skills, null meaning every skil
   assert.deepEqual([all?.models, all?.skills, some?.models, some?.skills], [{}, null, { cursor: "gpt-x" }, ["s"]])
   assert.throws(() => parseBots({ bots: [{ ...bot, models: { codex_sdk: "x" }, skills: null }] }))
 })
+
+test("a bot's picked face parses, none means the face its id gives, and a hue outside the set is refused", () => {
+  const bot = { bot_id: "b", conversation_id: "c", name: "Ops", instructions: "", event_hash: "h", last_message: null, models: {}, skills: null }
+  const avatar = { outline: "cloud", eyes: "wide", hue: 345 }
+  const [picked, plain] = parseBots({ bots: [{ ...bot, avatar }, { ...bot, avatar: null }] })
+  assert.deepEqual([picked?.avatar, plain?.avatar], [avatar, null])
+  assert.throws(() => parseBots({ bots: [{ ...bot, avatar: { ...avatar, hue: 70 } }] }))
+})

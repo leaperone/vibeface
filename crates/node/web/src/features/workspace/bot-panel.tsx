@@ -17,13 +17,15 @@ import { providerIcons } from "@/features/devices/ai-settings"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
+import { AvatarPicker } from "./avatar-picker"
+import { useAvatarPick } from "@vibeface/client/avatar/pick.ts"
 import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 
 /** A deleted schedule keeps its place for a moment, so a second click does not land on the next row. */
 type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
 const GAP_MS = 4000
 
-/** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where schedules can be paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
+/** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
@@ -43,7 +45,10 @@ export function BotPanelButton() {
   const view = workspace.data?.bot_settings
   const owner = workspace.data?.conversation?.owner
   const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
+  const look = useAvatarPick(bot ?? { bot_id: "", avatar: null }, (avatar) => workspace.setBotAvatar(bot!.conversation_id, avatar),
+    (caught) => toast(messageOf(caught, "换长相"), { tone: "danger" }))
   if (!bot) return null
+  const shown = { bot_id: bot.bot_id, avatar: look.avatar }
   const rank = (id: string) => { const at = order.current.indexOf(id); return at < 0 ? order.current.length : at }
   const schedules = sortSchedules(view?.schedules ?? []).sort((a, b) => rank(a.schedule_id) - rank(b.schedule_id))
   order.current = schedules.map((schedule) => schedule.schedule_id)
@@ -74,7 +79,7 @@ export function BotPanelButton() {
     .catch((caught: unknown) => toast(messageOf(caught, "换文件夹"), { tone: "danger" }))
   return <>
     <button type="button" className="-ms-1.5 flex min-h-11 min-w-0 items-center gap-2 rounded-lg ps-1 pe-1.5 outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 enabled:hover:bg-muted enabled:active:bg-muted md:min-h-10 dark:enabled:hover:bg-muted/50" aria-haspopup="dialog" title={bot.name} disabled={!view} onClick={() => { order.current = []; setOpen(true) }}>
-      <BotFace botId={bot.bot_id} mood={mood} size={32} />
+      <BotFace bot={shown} mood={mood} size={32} />
       <span className="min-w-0 truncate">{bot.name}</span>
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
@@ -86,13 +91,16 @@ export function BotPanelButton() {
         if (composer) { event.preventDefault(); composer.focus() }
       }}>
         <SheetHeader className="flex-row items-center gap-3 px-4 pt-4 pb-6 pr-14">
-          <BotFace botId={bot.bot_id} mood={mood} size={48} />
+          <BotFace bot={shown} mood={mood} size={48} />
           <span className="grid min-w-0 gap-0.5">
             <SheetTitle className="text-title font-semibold break-words">{bot.name}</SheetTitle>
             <SheetDescription className="text-meta">在聊天里说一声就能改</SheetDescription>
           </span>
         </SheetHeader>
         {view ? <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+          <SettingsGroup>
+            <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} pick={look.pick} />
+          </SettingsGroup>
           <SettingsGroup>
             {owner ? <SettingsRow icon={owner === ready?.entry.device_id ? Laptop : Server} label="运行设备">
               {ownerNode && !ownerNode.online ? <span className="inline-flex items-center gap-1 text-warning"><WifiOff aria-hidden="true" className="size-4" />离线</span> : null}

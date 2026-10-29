@@ -67,7 +67,7 @@ test("pushed records update the network-wide lists for their conversation only",
   assert.deepEqual(mergeQuestions(questions, { ...pushed, conversation_id: "other", questions: [] }).map((item) => item.question_id), ["open"])
   const notifications = mergeNotifications([{ notification_id: "n1", kind: "question", text: "", conversation_id: "chat" }, { notification_id: "x", kind: "question", text: "", conversation_id: "other" }], pushed)
   assert.deepEqual(notifications.map((item) => item.notification_id), ["x", "n2"])
-  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, event_hash: "", last_message: null, busy: null }], pushed)
+  const bots = mergeBots([{ bot_id: "b", conversation_id: "chat", name: "", instructions: "", models: {}, skills: null, avatar: null, event_hash: "", last_message: null, busy: null }], pushed)
   assert.deepEqual([bots[0].last_message?.text, bots[0].busy], ["hi", "replying"])
   const idle = mergeBots(bots, records({ conversation_id: "chat" }))
   assert.deepEqual([idle[0].last_message?.text, idle[0].busy], ["hi", null], "a push without a message keeps the preview and still updates busy")

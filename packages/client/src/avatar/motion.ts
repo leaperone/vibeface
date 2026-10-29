@@ -1,4 +1,4 @@
-import { BODY, HALO, eyePaths, faceOf, mix, outlinePath, pose, thinkingDots, type Mood, type Pose } from './face.ts'
+import { BODY, HALO, eyePaths, faceOf, mix, outlinePath, pose, thinkingDots, type Avatar, type Mood, type Pose } from './face.ts'
 
 /** The pose drawn when motion is off: eyes open, mid-drift, so each mood still reads. */
 const STILL_T = 2600
@@ -16,8 +16,8 @@ export type Frame = {
  * A face's clock. A mood change blends from the pose on screen over 420 ms, easing out; `frame(null)` draws the still pose
  * and ends any blend. Each id starts at its own phase so a list of faces does not blink in step.
  */
-export function faceMotion(botId: string, mood: Mood) {
-  const face = faceOf(botId)
+export function faceMotion(botId: string, mood: Mood, avatar?: Avatar | null) {
+  const face = faceOf(botId, avatar)
   let offset = 0
   for (const c of botId) offset = (offset * 31 + c.charCodeAt(0)) >>> 0
   offset %= 10000

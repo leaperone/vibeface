@@ -50,3 +50,11 @@ test('every hue gives in-gamut hex colours in both themes, asleep included', () 
     for (const value of Object.values(colors({ ...faceOf('bot-a'), hue }, dark, saturation))) assert.match(value, /^#[0-9a-f]{6}$/)
   }
 })
+
+test('a picked avatar replaces outline, eyes and hue but keeps the id\'s spacing, tilt and rhythm', () => {
+  const derived = faceOf('bot-a')
+  const picked = faceOf('bot-a', { outline: 'cloud', eyes: 'wide', hue: 345 })
+  assert.deepEqual(picked, { ...derived, outline: 'cloud', eyes: 'wide', hue: 345 })
+  assert.deepEqual(faceOf('bot-a', null), derived)
+  for (let t = 0; t <= 20000; t += 50) assert.equal(pose(picked, 'idle', t).open, pose(derived, 'idle', t).open, `blink at ${t}`)
+})

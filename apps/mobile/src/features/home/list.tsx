@@ -68,7 +68,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
-        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace botId={bot.bot_id} mood={mood} size={44} />} name={bot.name} tint={botTint(faceOf(bot.bot_id).hue, dark)}
+        <Row href={`/b/${bot.bot_id}`} replace={replace} active={active(`/b/${bot.bot_id}`)} avatar={<BotFace bot={bot} mood={mood} size={44} />} name={bot.name} tint={botTint(faceOf(bot.bot_id, bot.avatar).hue, dark)}
           mark={primary ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
           label={[bot.name, primary ? '主 Bot' : '', moodLabel[mood]].filter(Boolean).join('，')}
           unread={workspace.unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined}

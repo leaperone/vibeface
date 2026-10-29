@@ -1,8 +1,11 @@
 import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, Smile, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
+import { BotFace } from '@/components/app/bot-face'
+import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
 import { formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
@@ -27,17 +30,18 @@ export function ChangeCard({ records, schedules }: { records: BotChangeRecord[];
       <h3 id={id} className="text-meta font-medium text-muted-foreground">{cardTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
-      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} schedules={schedules} />)}
+      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules} />)}
     </ul>
   </section>
 }
 
-function ChangeRows({ change, schedules }: { change: BotChange; schedules: readonly ScheduleView[] }) {
+function ChangeRows({ change, conversationId, schedules }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[] }) {
   if (change.kind === 'profile') return <>
     {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
     {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
     {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} /></Row> : null}
     {change.skills ? <Row icon={BookOpen} label='Skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
+    {change.avatar ? <Row icon={Smile} label='长相'><AvatarChange edit={change.avatar} conversationId={conversationId} /></Row> : null}
   </>
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
   if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
@@ -66,6 +70,16 @@ function BeforeAfter({ before, after, className }: { before: string; after: stri
     <ArrowRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     <span className="sr-only">改为</span>
     <span>{after}</span>
+  </p>
+}
+
+/** The face before and after, drawn; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */
+function AvatarChange({ edit, conversationId }: { edit: AvatarEdit; conversationId: string }) {
+  const botId = useWorkspace().bots.find((bot) => bot.conversation_id === conversationId)?.bot_id ?? conversationId
+  return <p className='flex items-center gap-2'>
+    <span role='img' aria-label='原来的长相'><BotFace bot={{ bot_id: botId, avatar: edit.before }} mood='idle' size={28} /></span>
+    <ArrowRight aria-hidden='true' className='size-4 shrink-0 text-muted-foreground' />
+    <span role='img' aria-label={edit.after ? '新的长相' : '默认长相'}><BotFace bot={{ bot_id: botId, avatar: edit.after }} mood='idle' size={28} /></span>
   </p>
 }
 

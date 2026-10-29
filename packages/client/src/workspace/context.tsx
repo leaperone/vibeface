@@ -13,6 +13,7 @@ import {
   parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder, attachmentLimit,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
+import { sameAvatar, type Avatar } from "../avatar/face.ts"
 import { mergeBots, mergeConversation, mergeNotifications, mergeOpenWorks, mergeQuestions } from "./records.ts"
 import { answerBody, answerId } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
@@ -328,6 +329,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       const wanted = item.params.project as BotProject | null
       return project?.target_node === wanted?.target_node && project?.cwd === wanted?.cwd
     }
+    if (item.method === "set_bot_avatar") {
+      const bot = parseBots(await connection.rpc("bots")).find((entry) => entry.conversation_id === item.params.conversation_id)
+      return !bot || sameAvatar(bot.avatar, item.params.avatar as Avatar | null)
+    }
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -615,6 +620,14 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     setBotProject: (id: string, project: BotProject | null) => withMutation(`bot-project:${id}`, async () => {
       const attestation = await attest(id, { type: "bot_project_set", project })
       try { await signedWrite("bot-project", `${id}:${project?.target_node ?? ""}:${project?.cwd ?? ""}`, "set_bot_project", { conversation_id: id, project, attestation }) }
+      catch (caught) { requireControlRefresh(); throw caught }
+      requireCurrent()
+      await refreshRef.current()
+    }),
+    /** `null` goes back to the face the bot's id gives. */
+    setBotAvatar: (id: string, avatar: Avatar | null) => withMutation(`bot-avatar:${id}`, async () => {
+      const attestation = await attest(id, { type: "bot_avatar_set", avatar })
+      try { await signedWrite("bot-avatar", `${id}:${avatar ? `${avatar.outline}:${avatar.eyes}:${avatar.hue}` : ""}`, "set_bot_avatar", { conversation_id: id, avatar, attestation }) }
       catch (caught) { requireControlRefresh(); throw caught }
       requireCurrent()
       await refreshRef.current()

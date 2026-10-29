@@ -51,17 +51,22 @@ export function ScreenFaces({ children }: { children: ReactNode }) {
   return <Covered.Provider value={covered}>{children}</Covered.Provider>
 }
 
-/** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the row says the mood. */
+/** Who a face belongs to: its id gives what `avatar` leaves out. */
+export type FaceBot = Pick<BotRecord, 'bot_id' | 'avatar'>
+
+/** A bot's face, picked by its id and avatar and moving with its mood. Hidden from screen readers: the row says the mood. */
 /** `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. */
-export function BotFace({ botId, mood, size, halo }: { botId: string; mood: Mood; size: number; halo?: string }) {
+export function BotFace({ bot, mood, size, halo }: { bot: FaceBot; mood: Mood; size: number; halo?: string }) {
   const { theme } = useUniwind()
   const dark = theme === 'dark'
-  const face = useMemo(() => faceOf(botId), [botId])
+  const { bot_id: botId, avatar } = bot
+  const look = avatar ? `${avatar.outline}:${avatar.eyes}:${avatar.hue}` : ''
+  const face = useMemo(() => faceOf(botId, avatar), [botId, look])
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
   const reducedMotion = useReduced()
   const motionOff = useContext(Covered) || reducedMotion
   const gradient = `face${useId().replace(/[^a-zA-Z0-9]/g, '')}`
-  const motion = useMemo(() => faceMotion(botId, mood), [botId])
+  const motion = useMemo(() => faceMotion(botId, mood, avatar), [botId, look])
   const frame = useSharedValue<Frame>(useState(() => motion.frame(null))[0])
 
   useEffect(() => {
