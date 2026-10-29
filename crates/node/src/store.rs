@@ -140,6 +140,17 @@ pub(crate) fn rank(lamport: u64, created_at_ms: i64, hash: &str) -> String {
     format!("{lamport:020}:{created_at_ms:020}:{hash}")
 }
 
+/// What a client names to change a projected row: the start of the hash of the event that last
+/// set it, which ends the row's rank (or is the event's hash). Any change gives a new version.
+pub(crate) fn version(rank: &str) -> String {
+    rank.rsplit(':')
+        .next()
+        .unwrap_or(rank)
+        .chars()
+        .take(16)
+        .collect()
+}
+
 pub(crate) fn private_file_connection(path: &Path) -> Result<Connection> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path

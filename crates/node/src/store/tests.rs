@@ -5728,19 +5728,19 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
 
     let mut panel_device = store(&net)?;
     panel_device.ingest_events(&net.network, &early)?;
-    let signed = |before, avatar| {
+    let signed = |version, avatar| {
         net.a.fixture_admin().attest(
             &net.network,
             "c",
             EventBody::BotAvatarSet {
-                before,
+                version,
                 avatar,
                 attestation: None,
             },
         )
     };
     let unsigned = EventBody::BotAvatarSet {
-        before: None,
+        version: None,
         avatar: Some(panel),
         attestation: None,
     };
@@ -5751,14 +5751,14 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
         "only the user picks a face from the panel"
     );
     let mut forged = signed(None, Some(panel))?;
-    if let EventBody::BotAvatarSet { before, .. } = &mut forged {
-        *before = Some(chat);
+    if let EventBody::BotAvatarSet { version, .. } = &mut forged {
+        *version = Some("0123456789abcdef".into());
     }
     assert!(
         panel_device
             .append_event(&net.b, &net.network, "c", forged, vec![], 9)
             .is_err(),
-        "the signature covers the face the user saw"
+        "the signature covers the version the user saw"
     );
     panel_device.append_event(
         &net.b,
@@ -5814,12 +5814,13 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
         "default_avatar writes null: {:?}",
         reset.change
     );
+    let reset_bot = back
+        .bot_for_conversation(&net.network, "c")?
+        .context("bot")?;
     assert_eq!(
-        back.bot_for_conversation(&net.network, "c")?
-            .context("bot")?
-            .avatar,
-        None,
-        "a later chat change outranks the panel's pick"
+        (reset_bot.avatar, reset_bot.avatar_version),
+        (None, Some(super::version(&reset.event_hash))),
+        "a later chat change outranks the panel's pick and gives the face a new version"
     );
     second_bot(&mut back, &net, "Ops")?;
     let shown = back
@@ -5881,7 +5882,11 @@ fn the_node_derives_the_same_face_from_an_id_as_the_clients() -> Result<()> {
         env!("CARGO_MANIFEST_DIR"),
         "/../../packages/client/src/avatar/derived-faces.json"
     )))?;
-    let mut hues = std::collections::BTreeSet::new();
+    let (mut hues, mut outlines, mut eyes) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
     for vector in &vectors {
         let face = Avatar::derived(&vector.bot_id);
         assert_eq!(
@@ -5891,11 +5896,18 @@ fn the_node_derives_the_same_face_from_an_id_as_the_clients() -> Result<()> {
             vector.bot_id
         );
         hues.insert(u16::from(face.hue));
+        outlines.insert(serde_json::to_string(&face.outline)?);
+        eyes.insert(serde_json::to_string(&face.eyes)?);
     }
     assert_eq!(
         hues.into_iter().collect::<Vec<_>>(),
         crate::model::HUES,
         "the vectors reach every hue, so both lists agree"
+    );
+    assert_eq!(
+        (outlines.len(), eyes.len()),
+        (5, 4),
+        "the vectors reach every outline and eye shape, so both orders agree"
     );
     Ok(())
 }

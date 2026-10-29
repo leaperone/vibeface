@@ -29,8 +29,9 @@ export function AvatarPicker({ botId, avatar, face, disabled, busy, pick }: { bo
       </Choice>)}
     </Choices>
     <div className="flex min-h-11 items-center gap-2">
-      <button type="button" disabled={off || !avatar} onClick={() => pick(null)}
-        className="flex min-h-11 items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 enabled:hover:bg-muted enabled:hover:text-foreground disabled:opacity-50">
+      <button type="button" aria-disabled={off || !avatar || undefined} onClick={off || !avatar ? undefined : () => pick(null)}
+        className={cn("flex min-h-11 items-center gap-2 rounded-lg px-2 text-meta text-muted-foreground outline-none transition-colors focus-visible:ring-3 focus-visible:ring-ring/50",
+          off || !avatar ? "cursor-not-allowed opacity-50" : "hover:bg-muted hover:text-foreground")}>
         <RotateCcw aria-hidden="true" className="size-4" />恢复默认
       </button>
       <span role="status" className="flex items-center gap-1 text-meta text-muted-foreground">

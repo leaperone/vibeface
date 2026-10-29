@@ -1,6 +1,6 @@
 import { Eye, Palette, RotateCcw, Shapes, type LucideIcon } from 'lucide-react-native'
-import type { ReactNode } from 'react'
-import { ActivityIndicator, Pressable, View } from 'react-native'
+import { useEffect, type ReactNode } from 'react'
+import { AccessibilityInfo, ActivityIndicator, Pressable, View } from 'react-native'
 import { useUniwind } from 'uniwind'
 import { colors, EYES, HUES, OUTLINES, type Avatar, type Face } from '@vibeface/client/avatar/face.ts'
 import { eyeNames, hueNames, outlineNames, withPart } from '@vibeface/client/avatar/pick.ts'
@@ -13,6 +13,8 @@ import { cn } from '@/lib/utils'
 export function AvatarPicker({ botId, avatar, face, disabled, busy, pick }: { botId: string; avatar: Avatar | null; face: Face; disabled: boolean; busy: boolean; pick: (avatar: Avatar | null) => void }) {
   const { theme } = useUniwind()
   const off = disabled || busy
+  // iOS ignores live regions, so the wait is announced on both platforms.
+  useEffect(() => { if (busy) AccessibilityInfo.announceForAccessibility('正在换') }, [busy])
   return <View accessibilityState={{ busy }} className="gap-1 self-stretch">
     <Choices icon={Shapes} label="轮廓">
       {OUTLINES.map((outline) => <Choice key={outline} label={outlineNames[outline]} on={face.outline === outline} disabled={off} onPress={() => pick(withPart(face, { outline }))}>
@@ -35,7 +37,7 @@ export function AvatarPicker({ botId, avatar, face, disabled, busy, pick }: { bo
         <Icon as={RotateCcw} className="size-4 text-muted-foreground" />
         <Text className="text-meta text-muted-foreground">恢复默认</Text>
       </Pressable>
-      {busy ? <View accessibilityLiveRegion="polite" className="flex-row items-center gap-1"><ActivityIndicator size="small" /><Text className="text-meta text-muted-foreground">正在换</Text></View> : null}
+      {busy ? <View className="flex-row items-center gap-1"><ActivityIndicator size="small" /><Text className="text-meta text-muted-foreground">正在换</Text></View> : null}
     </View>
   </View>
 }

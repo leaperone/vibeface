@@ -83,7 +83,7 @@ BotMessaged {
 |---|---|---|
 | `list_bots {}` | 读 | 每个 bot 的名称、说明前 200 字符、项目设备与目录、模型、启用的 skill、实际显示的长相（`picked` 标出是否挑过）、活动 schedule 概要 |
 | `read_bot {bot}` | 读 | 一个 bot 的完整配置：名称、说明、项目、模型、启用的 skill、实际显示的长相、schedule、笔记；没有任何密钥 |
-| `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话 |
+| `create_bot {call_ref, name, instructions?, project_node?, project_cwd?}` | 设置 | 新建 bot 和它的会话，返回的 bot 同样给出实际显示的长相 |
 | `configure_bot {call_ref, bot, name?, instructions?, model?, skills? \| all_skills?, avatar? \| default_avatar?}` | 设置 | 改自己或另一个 bot 的名称、说明、模型、启用的 skill 和长相 |
 | `delete_bot {bot}` | 设置 | 删除另一个 bot |
 

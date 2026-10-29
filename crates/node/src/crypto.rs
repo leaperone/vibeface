@@ -548,12 +548,18 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             event.scope_id != BOTS_SCOPE,
             "a bot's project is set in its own conversation"
         ),
-        EventBody::BotAvatarSet { before, avatar, .. } => {
+        EventBody::BotAvatarSet { version, .. } => {
             ensure!(
                 event.scope_id != BOTS_SCOPE,
                 "a bot's face is set in its own conversation"
             );
-            ensure!(before != avatar, "the face is unchanged");
+            ensure!(
+                version
+                    .as_ref()
+                    .is_none_or(|version| version.len() == 16
+                        && version.bytes().all(|b| b.is_ascii_hexdigit())),
+                "a face version is the start of an event hash"
+            );
         }
         EventBody::PrimaryBotSet {
             conversation_id, ..

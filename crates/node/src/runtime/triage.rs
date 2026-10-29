@@ -3529,7 +3529,7 @@ pub(super) mod tests {
         result
     }
 
-    async fn start_reply(
+    pub(in crate::runtime) async fn start_reply(
         node: &Runtime,
         admin: &LocalIdentity,
         id: &str,

@@ -835,10 +835,11 @@ pub enum EventBody {
         cause: Option<Cause>,
     },
     /// In the bot's conversation: the user picks its face from the web, or `None` for the one
-    /// its ID gives. It and a chat change of the face win by rank alike. `before` is the face
-    /// the user saw, so the signature covers it; the Node takes the write only while it stands.
+    /// its ID gives. It and a chat change of the face win by rank alike. `version` is the face's
+    /// version the user saw, `None` before any change; the signature covers it, so a request
+    /// replayed after the face moved on cannot be pointed at the new version.
     BotAvatarSet {
-        before: Option<Avatar>,
+        version: Option<String>,
         avatar: Option<Avatar>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
@@ -1031,6 +1032,8 @@ pub struct Bot {
     pub models: BotModels,
     pub skills: SkillSet,
     pub avatar: Option<Avatar>,
+    /// The start of the hash of the event that last set the face, `None` before any change.
+    pub avatar_version: Option<String>,
     pub event_hash: EventHash,
 }
 

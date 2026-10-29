@@ -81,6 +81,10 @@ fn bot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
             models: BotModels::new(),
             skills: None,
             avatar: None,
+            avatar_version: r
+                .get::<_, Option<String>>(9)?
+                .as_deref()
+                .map(super::version),
             event_hash: r.get(5)?,
         },
         r.get(4)?,
@@ -99,9 +103,9 @@ const MERGED_COLUMNS: &str = "b.bot_id,b.conversation_id,
     CASE WHEN i.rank>b.rank THEN i.value ELSE b.instructions END,
     CASE WHEN p.rank>b.rank THEN p.value ELSE b.project END,b.event_hash,
     (SELECT json_group_object(m.provider,m.model) FROM bot_models m WHERE m.network_id=b.network_id AND m.conversation_id=b.conversation_id AND m.model<>''),
-    s.value,a.value";
+    s.value,a.value,a.rank";
 const CREATED_COLUMNS: &str =
-    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'{}',NULL,NULL";
+    "b.bot_id,b.conversation_id,b.name,b.instructions,b.project,b.event_hash,'{}',NULL,NULL,NULL";
 
 /// Bots not deleted.
 fn bots_where(

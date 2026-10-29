@@ -117,7 +117,7 @@ impl Runtime {
                     .context(
                         "nothing was dispatched, changed, sent or created with this call_ref",
                     )?;
-                Ok(json!(bot))
+                Ok(tool_bot(&bot))
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -254,7 +254,7 @@ impl Runtime {
                         Changed::Event(&bot.event_hash),
                     );
                 }
-                Ok(json!(bot))
+                Ok(tool_bot(&bot))
             }
             Tool::MessageBot => {
                 let manager = access
@@ -632,6 +632,17 @@ impl Runtime {
             },
         }
     }
+}
+
+/// A bot as `list_bots` and `read_bot` show its face: the one it shows and whether it was picked.
+/// The face's version only names a panel write, so a tool leaves it out.
+fn tool_bot(bot: &crate::model::Bot) -> Value {
+    let mut value = json!(bot);
+    value["avatar"] = json!(bot.shown_avatar());
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("avatar_version");
+    }
+    value
 }
 
 /// Bytes one tool result carries, and one event within it; the rest is read page by page.

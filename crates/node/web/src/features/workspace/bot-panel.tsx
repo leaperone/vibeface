@@ -46,7 +46,7 @@ export function BotPanelButton() {
   const owner = workspace.data?.conversation?.owner
   const ownerNode = workspace.nodes.find((node) => node.device_id === owner)
   // The pick on show belongs to one bot: switching bots drops it (useAvatarPick compares bot_id).
-  const look = useAvatarPick(bot ?? { bot_id: "", avatar: null }, (before, avatar) => workspace.setBotAvatar(bot!.conversation_id, before, avatar),
+  const look = useAvatarPick(bot ?? { bot_id: "", avatar: null, avatar_version: null }, (version, avatar) => workspace.setBotAvatar(bot!.conversation_id, version, avatar),
     (caught) => toast(messageOf(caught, "换长相"), { tone: "danger" }))
   if (!bot) return null
   const shown = { bot_id: bot.bot_id, avatar: look.avatar }

@@ -68,28 +68,29 @@ test('the id gives the same outline, eyes and hue as the Node derives, every hue
     assert.deepEqual({ outline, eyes, hue }, expected, bot_id)
   }
   assert.deepEqual([...new Set(vectors.map(vector => vector.hue))].sort((a, b) => a - b), [...HUES])
+  assert.deepEqual(new Set(vectors.map(vector => vector.outline)), new Set(outlines))
+  assert.deepEqual(new Set(vectors.map(vector => vector.eyes)), new Set(['dot', 'pill', 'oval', 'wide']))
 })
 
-test('a pending panel write lands, goes again over the face it saw, or is dropped once something else changed it', () => {
+test('a pending panel write goes again only while the face is at the version it was signed over', () => {
   const cloud = { outline: 'cloud', eyes: 'wide', hue: 285 } as const
   const bean = { outline: 'bean', eyes: 'dot', hue: 155 } as const
-  assert.equal(avatarWrite(cloud, null, cloud), 'landed')
-  assert.equal(avatarWrite(null, null, cloud), 'unsent')
-  assert.equal(avatarWrite(null, cloud, null), 'landed')
-  assert.equal(avatarWrite(cloud, cloud, null), 'unsent')
-  assert.equal(avatarWrite(bean, null, cloud), 'superseded')
+  assert.equal(avatarWrite({ avatar: cloud, avatar_version: 'v1' }, null, cloud), 'landed')
+  assert.equal(avatarWrite({ avatar: null, avatar_version: null }, null, cloud), 'unsent')
+  assert.equal(avatarWrite({ avatar: cloud, avatar_version: 'v1' }, 'v1', null), 'unsent')
+  assert.equal(avatarWrite({ avatar: null, avatar_version: 'v2' }, null, cloud), 'superseded', 'the face went back, yet its version moved on')
+  assert.equal(avatarWrite({ avatar: bean, avatar_version: 'v3' }, null, cloud), 'superseded')
 })
 
-test('a written pick stays on show until the list moves off the faces it was picked over, and never on another bot', () => {
-  const cloud = { outline: 'cloud', eyes: 'wide', hue: 285 } as const
+test('a written pick stays on show until the face has a new version, and never on another bot', () => {
   const bean = { outline: 'bean', eyes: 'dot', hue: 155 } as const
-  const writing: Look = { bot_id: 'a', avatar: bean, stale: [null, cloud], writing: true }
+  const writing: Look = { bot_id: 'a', avatar: bean, version: null, writing: true }
   const written = { ...writing, writing: false }
-  assert.equal(liveLook(writing, { bot_id: 'a', avatar: bean }), writing, 'kept while the Node has not answered')
-  assert.equal(liveLook(written, { bot_id: 'a', avatar: null }), written, 'a list not yet refreshed keeps the pick')
-  assert.equal(liveLook(written, { bot_id: 'a', avatar: cloud }), written, 'nor does the earlier pick flash back')
-  assert.equal(liveLook(written, { bot_id: 'a', avatar: bean }), null, 'the list shows the pick')
-  assert.equal(liveLook(writing, { bot_id: 'b', avatar: null }), null, 'another bot starts clean')
+  assert.equal(liveLook(writing, { bot_id: 'a', avatar: null, avatar_version: 'v1' }), writing, 'kept while the Node has not answered')
+  assert.equal(liveLook(written, { bot_id: 'a', avatar: null, avatar_version: null }), written, 'a list not yet refreshed keeps the pick')
+  assert.equal(liveLook(written, { bot_id: 'a', avatar: bean, avatar_version: 'v1' }), null, 'the list shows the pick')
+  assert.equal(liveLook(written, { bot_id: 'a', avatar: null, avatar_version: 'v2' }), null, 'a later change elsewhere shows, even back to the old face')
+  assert.equal(liveLook(writing, { bot_id: 'b', avatar: null, avatar_version: null }), null, 'another bot starts clean')
 })
 
 test('a face change reads out in words, the id\'s face named too', () => {
