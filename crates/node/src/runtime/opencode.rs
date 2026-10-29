@@ -2398,7 +2398,8 @@ mod tests {
             opencode.start(&node, &network, &first, Some(&session), &args),
             opencode.start(&node, &network, &second, Some(&session), &args)
         );
-        (one?, two?);
+        one?;
+        two?;
         assert_eq!(
             place.prompts().len(),
             1,
