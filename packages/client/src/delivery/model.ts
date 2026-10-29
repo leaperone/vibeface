@@ -1,4 +1,4 @@
-import { array, boolean, record, text } from '../lib/node.ts'
+import { array, boolean, record, text, type Member } from '../lib/node.ts'
 import type { Acceptance, DeliveryDeadlines, DeliveryDraft, DeliveryEvidence, DeliveryMode, DeliveryOrder, DeliveryPayment, DeliveryPhase, DeliveryStatus, PendingIntent, PaymentState, ReceivedFile } from './types.ts'
 
 const maxAmount = (1n << 256n) - 1n
@@ -88,7 +88,7 @@ export function parseOrder(value: unknown): DeliveryOrder {
     const p = order.payment
     if (order.acceptance !== 'recoverable' || p.state !== 'free' || [p.delivery_fee, p.reservation_fee, p.priority_fee, p.total, p.gas_cap, p.earned, p.withdrawn, p.refunded].some(value => value !== '0')
       || [p.chain_id, p.asset, p.payer, p.provider_wallet, p.tx_hash].some(value => value !== null)
-      || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('公益订单只能免费，不能带付款或付款条件。')
+      || !['none', 'charity_receipt'].includes(order.evidence) || order.windows.some(window => window.decryption_proven)) throw new Error('免费订单不能带付款或付款条件。')
   } else if (order.payment.state === 'free' || order.payment.chain_id === null || order.payment.asset === null || order.payment.payer === null || order.payment.provider_wallet === null) throw new Error('付费订单缺少固定付款信息。')
   if (order.mode === 'paid') {
     const d = order.deadlines
@@ -149,10 +149,10 @@ export function canRestart(order: DeliveryOrder): boolean {
 }
 export function walletNotice(wallet: DeliveryStatus['wallet']): string {
   switch (wallet.state) {
-    case 'absent': return '未创建钱包。公益转发仍可使用。'
+    case 'absent': return '未创建钱包。免费传输仍可使用。'
     case 'locked': return '钱包已锁定。订单仍可查看，付款需在发送设备本机解锁。'
     case 'unlocked': return '钱包已在本机解锁。每笔付款仍需单独确认。'
-    case 'unavailable': return '钱包暂不可用。请在发送设备本机检查，从独立钱包备份恢复后重启。公益转发和订单查看仍可使用。'
+    case 'unavailable': return '钱包暂不可用。请在发送设备本机检查，从独立钱包备份恢复后重启。免费传输和订单查看仍可使用。'
   }
 }
 
@@ -187,7 +187,10 @@ export function deadlineRows(order: DeliveryOrder): Array<[string, string]> {
   return rows.map(([label, seconds]) => [label, new Date(seconds * 1000).toLocaleString(undefined, { timeZoneName: 'short' })])
 }
 
-export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '公益转发' }, { value: 'paid', label: '付费交付' }]
+/** Where a file can go without pasting an ID: my other computers, since a Node is what receives. */
+export const receiverChoices = (members: readonly Member[], self: string): Member[] => members.filter(item => item.kind === 'node' && item.device_id !== self)
+
+export const modeOptions: Array<{ value: DeliveryMode; label: string }> = [{ value: 'charity', label: '免费传输' }, { value: 'paid', label: '付费传输' }]
 export const acceptanceOptions: Array<{ value: Acceptance; label: string }> = [{ value: 'recoverable', label: '对方能取回后付款' }, { value: 'strict', label: '对方打开后付款' }]
 
 /** Sizes for people: bytes below 1 KB, then KB or MB. `floor` keeps a limit from rounding up past what fits. */
@@ -227,10 +230,19 @@ export const transferCopy = {
   adminOnly: '只有管理设备能更改设置和发送',
   free: '全程加密 · 免费',
   connectionId: '连接 ID · 收文件时发给对方',
+  charity: '免费传输',
+  paid: '付费传输',
+  sendTo: '发给',
+  pickDevice: '选一台设备',
+  otherDevice: '发给别人的设备',
   receiver: '接收方的连接 ID',
   provider: '中转设备的连接 ID',
   providerHint: '只经手加密后的文件，不会加入你的设备',
   noRecords: '还没有传输记录',
+  serviceCap: '服务费上限',
+  gasCap: '链费上限',
+  serviceTotal: '服务费合计',
+  units: '金额按测试代币和测试链原生币的最小单位计。',
   strict: '对方确认打开后才付款。对方离线或没确认时，中转设备可能收不到费用。',
   walletFirst: '先在发送设备本机创建或解锁钱包，再刷新。',
   unknownPayment: '付款结果还没确定。点“检查进度”会查询原来那笔，不会重复付款。',

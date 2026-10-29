@@ -62,7 +62,7 @@ export function createDeliveryClient(connection: ReadyConnection, storage: KeyVa
     async configure(settings: DeliverySettings) { manage(); return parseStatus(await request('configure', settings)) },
     async prepare(draft: DeliveryDraft, file: TransferFile, status: DeliveryStatus, restartIntentId?: string) {
       manage()
-      if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('公益转发不能选“对方打开后付款”。')
+      if (draft.mode === 'charity' && draft.acceptance !== 'recoverable') throw new Error('免费传输不能选“对方打开后付款”。')
       if (!status.enabled || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled) throw new Error('这台设备尚未启用所选传输方式。')
       if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > status.max_file_bytes) throw new Error(`文件须在 ${status.max_file_bytes} 字节以内。`)
       const bytes = new Uint8Array(await file.arrayBuffer())

@@ -71,8 +71,8 @@ export default function Settings() {
         </View>
       </SettingsRow>
     </SettingsGroup>
-    <SettingsGroup>
-      <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experimentsCopy.hint}>
+    <SettingsGroup title={experimentsCopy.group}>
+      <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experiments ? experimentsCopy.on : experimentsCopy.hint}>
         <Switch accessibilityLabel={experimentsCopy.label} value={experiments} onValueChange={setExperiments} />
       </SettingsRow>
     </SettingsGroup>

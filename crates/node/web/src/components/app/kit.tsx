@@ -293,6 +293,14 @@ export function DetailRow({ label, value, mono = false }: { label: string; value
   return <div className="grid gap-0.5"><span>{label}</span>{typeof value === "string" && /^[0-9a-f]{20,}$/.test(value) ? <LongId value={value} /> : <span className={cn("text-foreground", mono && "font-mono")}>{value}</span>}</div>
 }
 
+/** A long path gives up its parent folders first, so the folder's own name stays readable. `shown`: its `~/…` form. */
+export function FolderPath({ path, shown = path }: { path: string; shown?: string }) {
+  const cut = shown.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
+  return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
+    <span className="min-w-0 truncate text-muted-foreground">{shown.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{shown.slice(cut)}</span>
+  </span>
+}
+
 /** A password field with an eye button that shows what was typed. */
 export function PasswordInput({ className, ...props }: Omit<ComponentProps<typeof Input>, "type">) {
   const [shown, setShown] = useState(false)

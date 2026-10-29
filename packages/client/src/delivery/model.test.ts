@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import type { ReadyConnection } from '../lib/node.ts'
 import { createDeliveryClient } from './client.ts'
-import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
+import { amount, canRead, canRestart, changeMode, checkedFile, draftFor, fromBase64, orderActions, orderSummary, orderTitle, parseOrder, parseReceived, parseStatus, receiverChoices, settlementAmountsLabel, sha256, sizeLabel, toBase64, walletNotice } from './model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliveryStatus } from './types.ts'
 
 const source = '11'.repeat(32), receiver = '22'.repeat(32), provider = '33'.repeat(32)
@@ -120,7 +120,7 @@ test('charity resets strict mode and rejects every financial or strong proof fie
   assert.equal(changeMode({ ...draft, mode: 'paid', acceptance: 'strict' }, 'charity').acceptance, 'recoverable')
   let calls = 0
   const client = createDeliveryClient(connection(async () => { calls += 1; return order() }), { getItem: () => null, setItem: () => { throw new Error('must not store a strict charity intent') } })
-  await assert.rejects(client.prepare({ ...draft, acceptance: 'strict' }, file, status), /公益转发不能选/)
+  await assert.rejects(client.prepare({ ...draft, acceptance: 'strict' }, file, status), /免费传输不能选/)
   assert.equal(calls, 0)
   assert.throws(() => parseOrder({ ...order(), acceptance: 'strict' }))
   for (const field of ['chain_id', 'asset', 'payer', 'provider_wallet', 'tx_hash']) assert.throws(() => parseOrder({ ...order(), payment: { ...order().payment, [field]: field === 'chain_id' ? '31337' : field === 'tx_hash' ? `0x${'88'.repeat(32)}` : `0x${'88'.repeat(20)}` } }))
@@ -239,4 +239,13 @@ test('without 实验功能 a send is free whatever mode the draft last held', ()
   const paid: DeliveryDraft = { receiver_peer: receiver, provider_peer: provider, mode: 'paid', acceptance: 'strict', max_service_amount: '5', max_gas_amount: '7' }
   assert.deepEqual(draftFor(paid, false), { ...paid, mode: 'charity', acceptance: 'recoverable' })
   assert.equal(draftFor(paid, true), paid)
+})
+
+test('a file goes to my other computers without pasting, never to this one or a browser', () => {
+  const members = [
+    { device_id: source, kind: 'node' as const, name: '我的 Mac', manage: true },
+    { device_id: receiver, kind: 'node' as const, name: '书房电脑', manage: false },
+    { device_id: provider, kind: 'client' as const, name: 'Mac 上的 Chrome', manage: true },
+  ]
+  assert.deepEqual(receiverChoices(members, source).map(item => item.device_id), [receiver])
 })

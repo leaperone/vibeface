@@ -81,7 +81,7 @@ export function RecoveryRestore({ link }: { link?: string | null }) {
   </View>
 }
 
-/** Which computer to recover through: scanned from the QR code its web page shows under 用手机找回, or pasted as that link. */
+/** Which computer to recover through: scanned from the QR code its web page shows under 在手机上完成找回, or pasted as that link. */
 function PickTarget({ onPicked }: { onPicked(entry: ConnectionEntry): void }) {
   const [scanning, setScanning] = useState(false)
   const [text, setText] = useState('')

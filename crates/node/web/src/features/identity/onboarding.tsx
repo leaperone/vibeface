@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
 import { Bot, FolderOpen, MessageSquarePlus } from "lucide-react"
-import { AuthPage, BusyIcon, InlineError, Panel, Steps } from "@/components/app/kit"
+import { AuthPage, BusyIcon, FolderPath, InlineError, Panel, Steps } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { AiSettings } from "@/features/devices/ai-settings"
@@ -54,7 +54,7 @@ export function Onboarding() {
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">
       <form className="grid gap-4" noValidate onSubmit={(event) => { event.preventDefault(); if (name.trim()) void create(); else setError(new Error("还没填名称")) }}>
         <label className="grid gap-1.5 text-meta font-medium">名称<Input required maxLength={512} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></label>
-        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground" title={project.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><span className="truncate font-mono">{shown[project.cwd] ?? project.cwd}</span></p> : null}
+        {project && shown ? <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project}</span><FolderPath path={project.cwd} shown={shown[project.cwd]} /></p> : null}
         <InlineError error={error} />
         <div className="flex justify-between gap-2 border-t pt-4">
           <Button type="button" variant="ghost" className="-ms-3" disabled={busy} onClick={() => setOnboardingStep(4)}>上一步</Button>

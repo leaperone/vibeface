@@ -23,7 +23,7 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await screen.getByRole('switch', '实验功能', { exact: true }).check({ timeout: 30000 });
     await browser.goto(`${environment.nodes.web.url}/transfers`);
     await expect(screen.getByRole('heading', '传输设置', { exact: true })).toBeVisible({ timeout: 30000 });
-    await expect(screen.getByRole('switch', '付费交付（本地测试）')).toBeChecked();
+    await expect(screen.getByRole('switch', '付费传输')).toBeChecked();
     await event('observer-ready', { role: 'web' });
     for (const kind of ['source-partial', 'source-unknown'] as const) {
       const inspection = await nextInspection(kind);
@@ -60,10 +60,10 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await expect.poll(async () => (await facts()).paired.android, { timeout: 180000, message: 'The Android receiver joins through its actual invitation' }).toBe(true);
     await screen.getByLabel('接收方的连接 ID').fill(environment.nodes.android.peer);
     await screen.getByLabel('中转设备的连接 ID').fill(environment.nodes.provider.peer);
-    await screen.getByRole('radio', '付费交付', { exact: true }).click();
+    await screen.getByRole('radio', '付费传输', { exact: true }).click();
     await expect(screen.getByRole('radio', '对方能取回后付款')).toBeChecked();
-    await screen.getByLabel('服务费上限（测试代币最小单位）').fill(environment.serviceCap);
-    await screen.getByLabel('链费上限（测试链原生币最小单位）').fill(environment.gasCap);
+    await screen.getByLabel('服务费上限').fill(environment.serviceCap);
+    await screen.getByLabel('链费上限').fill(environment.gasCap);
     const input = insideArtifacts(resolve(root, environment.sourceFile));
     const bytes = await readFile(input);
     assert.equal(bytes.length, 4096);
@@ -94,10 +94,10 @@ test('quotes and pays one recoverable file through the real Web UI while Android
     await expect(details.getByText('31337', { exact: true })).toBeVisible();
     await expect(details.getByText(prepared.payment.asset, { exact: true })).toBeVisible();
     await expect(details.getByText(prepared.payment.provider_wallet, { exact: true })).toBeVisible();
-    await expect(details.getByText('服务费合计（最小单位）', { exact: true })).toBeVisible();
+    await expect(details.getByText('服务费合计', { exact: true })).toBeVisible();
     await expect(details.getByText('17', { exact: true })).toBeVisible();
     await expect(details.getByText(environment.sha256, { exact: true })).toBeVisible();
-    await details.getByText('服务费合计（最小单位）', { exact: true }).scrollIntoView();
+    await details.getByText('服务费合计', { exact: true }).scrollIntoView();
     await event('prepared');
     const quotationScreenshot = await preserveScreenshot('web.png', await app.screenshot('ordinary-paid-quotation'));
     const recording = await webRecording();
