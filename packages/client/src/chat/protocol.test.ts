@@ -13,24 +13,27 @@ test('send waits for a loaded conversation', () => {
   assert.equal(composerHint({ ...ready, bot: 'needs_setup' }), '运行 Bot 的设备需设置')
 })
 test('chat rereads readiness only while a device that could reply is not ready yet', () => {
-  const node = (online: boolean, manager_ready: boolean | null) => ({
+  const node = (online: boolean, manager_state: 'ready' | 'starting' | 'needs_setup' | null) => ({
     device_id: 'd', name: 'Mac', local: false, online, revoked: false,
-    capabilities: manager_ready === null ? undefined : { manager: 'codex', manager_ready, relay: false, roots: [], codex_connected: false },
+    capabilities: manager_state === null ? undefined : { manager: 'codex', manager_state, relay: false, roots: [], codex_connected: false },
   })
   assert.equal(botReach([]), 'none')
   assert.equal(botReach([node(true, null)]), 'none')
-  assert.equal(botReach([node(true, false)]), 'needs_setup')
-  assert.equal(botReach([node(false, false)]), 'offline')
-  assert.equal(botReach([node(false, false), node(true, false), node(true, true)]), 'ready')
+  assert.equal(botReach([node(true, 'needs_setup')]), 'needs_setup')
+  assert.equal(botReach([node(true, 'needs_setup'), node(true, 'starting')]), 'starting', 'a bot coming up is not a device to set up')
+  assert.equal(composerHint({ ...ready, bot: 'starting' }), 'Bot 正在启动')
+  assert.equal(botReach([node(false, 'needs_setup')]), 'offline')
+  assert.equal(botReach([node(false, 'needs_setup'), node(true, 'needs_setup'), node(true, 'ready')]), 'ready')
   assert.equal(awaitsDevice('none'), false, 'with no device to wait on, setting one up rereads it')
   assert.equal(awaitsDevice('ready'), false)
+  assert.equal(awaitsDevice('starting'), true)
   assert.equal(awaitsDevice('needs_setup'), true)
   assert.equal(awaitsDevice('offline'), true)
 })
 test('a bot computer the Node lists offline with its last capabilities reads as offline, not missing', () => {
   const nodes = parseNodes({ nodes: [
-    { device_id: 'here', name: 'Server', local: true, online: true, revoked: false, capabilities: { manager: null, manager_ready: false, relay: true, roots: [] } },
-    { device_id: 'mac', name: 'Mac', local: false, online: false, revoked: false, capabilities: { manager: 'codex', manager_ready: true, relay: false, roots: ['/work'] } },
+    { device_id: 'here', name: 'Server', local: true, online: true, revoked: false, capabilities: { manager: null, manager_state: null, relay: true, roots: [] } },
+    { device_id: 'mac', name: 'Mac', local: false, online: false, revoked: false, capabilities: { manager: 'codex', manager_state: 'ready', relay: false, roots: ['/work'] } },
   ] })
   const reach = botReach(nodes)
   assert.equal(reach, 'offline')

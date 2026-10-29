@@ -74,7 +74,7 @@ test("pushed records update the network-wide lists for their conversation only",
 })
 
 test("a work waits for confirmation only once its device cannot report it", () => {
-  const node = (online: boolean, codex_connected?: boolean): NodeInfo[] => [{ device_id: "worker", name: "", local: false, online, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [], codex_connected } }]
+  const node = (online: boolean, codex_connected?: boolean): NodeInfo[] => [{ device_id: "worker", name: "", local: false, online, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [], codex_connected } }]
   const running = records({ works: [work("w1")] }).works[0]
   assert.equal(confirmReason(running, []), null, "an unknown device is not judged")
   assert.equal(confirmReason(running, node(true, true)), null)
@@ -90,8 +90,8 @@ test("a work waits for confirmation only once its device cannot report it", () =
 
 test("works one offline device holds wait on one card; an unverified one keeps its own", () => {
   const nodes: NodeInfo[] = [
-    { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [] } },
-    { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, manager_ready: false, relay: false, roots: [], codex_connected: false } },
+    { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [] } },
+    { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [], codex_connected: false } },
   ]
   const open = mergeOpenWorks([], records({ works: [
     work("w1"), work("w2", { state: "unverified", outcome: "unverified" }), work("w3", { target_node: "mac" }), work("w4"), work("w5", { target_node: "mac" }),

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -461,7 +461,10 @@ function Folders({ roots, suggested, display, busy, save }: { roots: string[]; s
       <FolderPath path={root} shown={display[root]} />
       <Button type="button" variant="ghost" size="icon" aria-label={`移除 ${root}`} title="移除" disabled={busy} onClick={() => save(roots.filter((item) => item !== root))}><X aria-hidden="true" /></Button>
     </li>)}</ul> : null}
-    {suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
+    {suggested.length && !roots.length ? <div className="grid gap-1">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" className="h-auto min-h-11 justify-start border-dashed border-primary/60 bg-primary/5 hover:bg-primary/10" title={path} aria-label={`添加 ${label}`} disabled={busy} onClick={() => save([path])}>
+      <FolderPlus aria-hidden="true" className="text-primary" /><FolderPath path={path} shown={label} /><span className="text-meta font-medium text-primary">添加</span>
+    </Button>)}</div>
+    : suggested.length ? <div className="flex flex-wrap gap-2">{suggested.map(({ path, label }) => <Button key={path} type="button" variant="outline" size="sm" className="font-mono" title={path} disabled={busy} onClick={() => save([...roots, path])}>
       <Plus aria-hidden="true" />{label}
     </Button>)}</div> : null}
     <div className="flex min-w-0 gap-2">

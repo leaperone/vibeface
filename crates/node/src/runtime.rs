@@ -609,7 +609,7 @@ impl Runtime {
         );
         json!({"roots":settings.roots,"relay":self.config.network.relay_listen.is_some(),
             "manager":manager,
-            "manager_ready":self.manager_ready().await,
+            "manager_state":self.manager_state().await,
             "manager_capabilities":manager.map(Provider::capabilities),
             "codex":codex})
     }
