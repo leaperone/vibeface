@@ -1,6 +1,7 @@
 import '@/platform/polyfills'
 import '../global.css'
 
+import { useLinkingURL } from 'expo-linking'
 import { Stack, router } from 'expo-router'
 import { X } from 'lucide-react-native'
 import * as SystemUI from 'expo-system-ui'
@@ -10,12 +11,17 @@ import { Platform, View } from 'react-native'
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { KeyboardProvider } from 'react-native-keyboard-controller'
 import { useCSSVariable } from 'uniwind'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { useWorkspace } from '@/data/context'
 import { LiveWorkspace } from '@/data/live'
 import { HomeList } from '@/features/home/list'
+import { openedLink } from '@/lib/join-link'
 import { useWide } from '@/lib/layout'
+
+// The join address last answered here, so a remount or a return to the app does not ask again.
+let answered: string | null = null
 
 export default function RootLayout() {
   return <GestureHandlerRootView style={{ flex: 1 }}>
@@ -33,6 +39,16 @@ function Screens() {
   // Mid-rotation, UIKit can show the window behind a view that has not resized yet; paint it the page colour, not white.
   useEffect(() => { void SystemUI.setBackgroundColorAsync(background) }, [background])
   const ready = workspace.session.phase === 'ready'
+  const device = useDevice()
+  const url = useLinkingURL()
+  // The join page is closed to a phone in a network, even one it cannot reach; a link of another network asks to switch.
+  useEffect(() => {
+    const link = openedLink(url)
+    if (!ready || !link || url === answered) return
+    answered = url
+    if (device.linkTarget(link) === 'other') router.push('/switch-network')
+    else router.navigate('/')
+  }, [url, ready])
   const wide = useWide()
   // Beside the sidebar, its own screens are roots: no back button or swipe to the empty placeholder.
   const root = wide ? { headerBackVisible: false, gestureEnabled: false } : {}
@@ -71,6 +87,7 @@ function Screens() {
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />
             <Stack.Screen name="add-device" options={{ title: '添加设备', presentation: 'modal', headerLeft: Close }} />
             <Stack.Screen name="recovery" options={{ title: '换恢复密码' }} />
+            <Stack.Screen name="switch-network" options={{ headerShown: false, presentation: 'formSheet', sheetAllowedDetents: 'fitToContents', sheetGrabberVisible: true }} />
           </Stack.Protected>
         </Stack>
       </View>
