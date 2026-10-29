@@ -349,24 +349,40 @@ impl Runtime {
         if dispatch.state != DispatchState::Pending {
             return Ok(dispatch);
         }
+        match self.offer_dispatch(network, &dispatch, notify).await? {
+            Ok(answered) => Ok(answered),
+            Err(error) => {
+                tracing::debug!(%error, "dispatch waits for its target");
+                Ok(dispatch)
+            }
+        }
+    }
+
+    /// Asks the target to take a pending dispatch and records its answer; the inner error is the
+    /// request's when the target gave none, and the dispatch stays pending.
+    async fn offer_dispatch(
+        self: &Arc<Self>,
+        network: &str,
+        dispatch: &Dispatch,
+        notify: bool,
+    ) -> Result<Result<Dispatch>> {
         let request = json!({"type":"dispatch_work","spec":dispatch.spec});
-        let state = match self
+        let reply = match self
             .peer_request(network, &dispatch.spec.target, request)
             .await
         {
-            Ok(reply) if reply["work_id"] == dispatch.spec.work_id.as_str() => {
-                DispatchState::Accepted
-            }
-            Ok(reply) => DispatchState::Rejected {
+            Ok(reply) => reply,
+            Err(error) => return Ok(Err(error)),
+        };
+        let state = if reply["work_id"] == dispatch.spec.work_id.as_str() {
+            DispatchState::Accepted
+        } else {
+            DispatchState::Rejected {
                 reason: reply["rejected"]
                     .as_str()
                     .unwrap_or("the device refused the work")
                     .into(),
                 failure: serde_json::from_value(reply["failure"].clone()).unwrap_or_default(),
-            },
-            Err(error) => {
-                tracing::debug!(%error, "dispatch waits for its target");
-                return Ok(dispatch);
             }
         };
         let spec = &dispatch.spec;
@@ -402,7 +418,7 @@ impl Runtime {
         if receipt.is_some() {
             self.wake_scheduler()?;
         }
-        Ok(dispatch)
+        Ok(Ok(dispatch))
     }
 
     /// The Agent's report of its own send to the App Server: the thread before `turn/start`, then
@@ -905,16 +921,26 @@ impl Runtime {
     /// Retries waiting dispatches and the stops held for other devices' works.
     pub(super) async fn deliver_work_requests(self: &Arc<Self>, network: &str) -> Result<()> {
         let dispatches = self.store.lock().await.dispatches()?;
-        for dispatch in dispatches {
-            if dispatch.state == DispatchState::Pending {
-                self.send_dispatch(network, dispatch.spec, true).await?;
-            }
-        }
+        let pending = dispatches
+            .into_iter()
+            .filter(|dispatch| dispatch.state == DispatchState::Pending)
+            .map(|dispatch| (dispatch.spec.target.clone(), dispatch));
         let local = self.identity.device_id()?;
         let stops = self.store.lock().await.stop_requests()?;
-        for request in stops.into_iter().filter(|request| request.target != local) {
-            self.deliver_held_stop(network, request).await?;
-        }
+        let held = stops
+            .into_iter()
+            .filter(|request| request.target != local)
+            .map(|request| (request.target.clone(), request));
+        tokio::join!(
+            peers::each_device(pending.collect(), |_, dispatch| async move {
+                self.offer_dispatch(network, &dispatch, true)
+                    .await?
+                    .map(drop)
+            }),
+            peers::each_device(held.collect(), |_, request| {
+                self.deliver_held_stop(network, request)
+            }),
+        );
         Ok(())
     }
 
@@ -939,19 +965,16 @@ impl Runtime {
             self.store.lock().await.save_stop_request(&request)?;
             self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
         }
-        if !ended && !self.stop_attempt_due(&work_id) {
-            return Ok(());
+        if !ended {
+            if !self.stop_attempt_due(&work_id) {
+                return Ok(());
+            }
+            tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request))
+                .await
+                .map_err(|_| crate::net::Unanswered::error("stop request timed out".into()))??;
         }
-        let delivered = !ended
-            && matches!(
-                tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, self.deliver_stop(network, &request))
-                    .await,
-                Ok(Ok(_))
-            );
-        if ended || delivered {
-            self.drop_stop(&work_id).await?;
-            self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
-        }
+        self.drop_stop(&work_id).await?;
+        self.publish_changed(network, &request.conversation, Changed::Work(&work_id));
         Ok(())
     }
 

@@ -19,9 +19,13 @@ const BLOB_SYNC_BYTES: u64 = 1024 * 1024;
 const MAX_STAGED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_STAGED_OBJECTS: usize = 64;
 const MAX_ADDRESS_RECORDS: usize = 256;
-const MAX_FORK_PAGES: usize = 64;
+const MAX_FORK_PAGES: usize = 4;
 /// How long a turn waits for the attachments it shows before it marks them pending.
 const ATTACHMENT_WAIT: Duration = Duration::from_secs(15);
+const JOIN_NOTICE_WAIT: Duration = Duration::from_secs(3);
+
+/// `(author, seq, hash)` of a fork evidence event, the order the evidence is read in.
+type ForkKey = (String, u64, String);
 
 #[derive(Default)]
 pub(super) struct PeerSync {
@@ -34,6 +38,8 @@ pub(super) struct PeerSync {
     /// The last pair of differing fork digests that woke a sync, so evidence one side cannot
     /// store does not keep both waking each other.
     forks: Option<String>,
+    /// Where the next round goes on reading the peer's fork evidence.
+    fork_after: Option<ForkKey>,
     /// This boot has seen the peer hold nothing of this device's log beyond ours.
     confirmed: bool,
     /// What the peer last answered to `capabilities`, kept to show while it is offline.
@@ -749,10 +755,11 @@ impl Runtime {
                         entry.running = false;
                         let was_failing = entry.failures > 0;
                         match &result {
-                            Ok(()) => {
+                            Ok(more) => {
                                 entry.failures = 0;
                                 entry.synced_ms = Some(now_ms());
                                 entry.due = Some(Instant::now() + HELLO_INTERVAL);
+                                entry.rerun |= *more;
                             }
                             Err(error) => {
                                 entry.failures = entry.failures.saturating_add(1);
@@ -782,8 +789,9 @@ impl Runtime {
     }
 
     /// One `Hello` round with `peer`: align membership, swap address books, then pull every
-    /// author range the peer has beyond ours.
-    pub(super) async fn sync_peer(self: &Arc<Self>, network: &str, peer: &str) -> Result<()> {
+    /// author range the peer has beyond ours. Returns whether the round made progress and left
+    /// history the next round can still pull.
+    pub(super) async fn sync_peer(self: &Arc<Self>, network: &str, peer: &str) -> Result<bool> {
         let net = self.net()?.clone();
         let ours = self.hello(network).await?;
         let theirs = net.request(peer, net::SYNC, &ours, PEER_TIMEOUT).await?;
@@ -804,7 +812,7 @@ impl Runtime {
                 // round dials again.
                 net.peer_restarted(peer);
             }
-            return removed;
+            return removed.map(|()| false);
         }
         ensure!(
             theirs["network_id"].as_str() == Some(network),
@@ -828,6 +836,7 @@ impl Runtime {
         }
         let vector: BTreeMap<String, (u64, String)> =
             serde_json::from_value(theirs["vector"].clone()).context("invalid peer vector")?;
+        let before = self.store.lock().await.heads(network)?;
         for _pass in 0..4 {
             let mut progressed = false;
             for (author, (seq, _)) in &vector {
@@ -870,29 +879,57 @@ impl Runtime {
             )
             .await?;
         }
-        if theirs["forks"] != json!(self.store.lock().await.fork_digest(network)?) {
-            let mut after: Option<(String, u64, String)> = None;
-            for _ in 0..MAX_FORK_PAGES {
-                let reply = net
-                    .request(
-                        peer,
-                        net::SYNC,
-                        &json!({"type":"forks","network_id":network,"after":after}),
-                        PEER_TIMEOUT,
-                    )
-                    .await?;
-                let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
-                let Some(last) = events.last() else { break };
-                let event: Event = serde_json::from_str(&last.canonical_body)?;
-                after = Some((event.author, event.seq, last.hash.clone()));
-                self.ingest(network, &events).await?;
-            }
-        }
+        let forks_left = theirs["forks"] != json!(self.store.lock().await.fork_digest(network)?)
+            && self.pull_forks(network, peer).await?;
+        let heads = self.store.lock().await.heads(network)?;
+        let behind = vector
+            .iter()
+            .any(|(author, (seq, _))| heads.get(author).map_or(0, |head| head.0) < *seq);
         self.check_own_log(network, peer, &vector).await?;
         if let Err(error) = self.fetch_blobs(network, peer).await {
             tracing::debug!(%peer, %error, "attachment download pending");
         }
-        Ok(())
+        Ok(forks_left || (behind && heads != before))
+    }
+
+    /// Reads up to `MAX_FORK_PAGES` pages of the peer's fork evidence from where the last round
+    /// stopped. Returns whether more is left.
+    async fn pull_forks(self: &Arc<Self>, network: &str, peer: &str) -> Result<bool> {
+        let cursor = |after: Option<ForkKey>| {
+            self.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.to_owned())
+                .or_default()
+                .fork_after = after;
+        };
+        let mut after = self
+            .sync_peers
+            .lock()
+            .expect("sync peers")
+            .get(peer)
+            .and_then(|state| state.fork_after.clone());
+        for _ in 0..MAX_FORK_PAGES {
+            let reply = self
+                .net()?
+                .request(
+                    peer,
+                    net::SYNC,
+                    &json!({"type":"forks","network_id":network,"after":after}),
+                    PEER_TIMEOUT,
+                )
+                .await?;
+            let events: Vec<SignedEvent> = serde_json::from_value(reply["events"].clone())?;
+            let Some(last) = events.last() else {
+                cursor(None);
+                return Ok(false);
+            };
+            let event: Event = serde_json::from_str(&last.canonical_body)?;
+            after = Some((event.author, event.seq, last.hash.clone()));
+            self.ingest(network, &events).await?;
+            cursor(after.clone());
+        }
+        Ok(true)
     }
 
     /// The peer's capabilities: `answer` when it gave one, otherwise the last it gave, kept in
@@ -1338,14 +1375,27 @@ impl Runtime {
             let Ok((_, peers)) = node.member_peers().await else {
                 return;
             };
-            let notices = peers
-                .iter()
-                .filter(|peer| !node.sync_failing(peer))
-                .map(|peer| {
+            let notify = async |peers: Vec<String>, wait| {
+                let notices = peers.iter().map(|peer| {
                     let notice = node.peer_request(&network, peer, json!({"type":"join_changed"}));
-                    tokio::time::timeout(Duration::from_secs(3), notice)
+                    tokio::time::timeout(wait, notice)
                 });
-            futures_util::future::join_all(notices).await;
+                let answers = futures_util::future::join_all(notices).await;
+                peers
+                    .into_iter()
+                    .zip(answers)
+                    .filter(|(_, answer)| !matches!(answer, Ok(Ok(_))))
+                    .map(|(peer, _)| peer)
+                    .collect::<Vec<_>>()
+            };
+            let reachable = peers.into_iter().filter(|peer| !node.sync_failing(peer));
+            let missed = notify(reachable.collect(), JOIN_NOTICE_WAIT).await;
+            if !missed.is_empty() {
+                // A Node that syncs fine but missed this notice is told once more, given the
+                // time a slow path needs.
+                tokio::time::sleep(JOIN_NOTICE_WAIT).await;
+                notify(missed, PEER_TIMEOUT).await;
+            }
         });
     }
 
@@ -1589,22 +1639,23 @@ impl Runtime {
                 _ = tokio::time::sleep(Duration::from_secs(3)) => {},
                 _ = self.outbox_wakeup.notified() => {},
             }
-            if let Err(error) = self.deliver_outbox().await {
+            let Ok(state) = self.membership_state().await else {
+                continue;
+            };
+            let network = &state.genesis.network_id;
+            let (outbox, works) =
+                tokio::join!(self.deliver_outbox(), self.deliver_work_requests(network));
+            if let Err(error) = outbox {
                 tracing::debug!(%error, "scheduler delivery pending");
             }
-            if let Ok(state) = self.membership_state().await
-                && let Err(error) = self.deliver_work_requests(&state.genesis.network_id).await
-            {
+            if let Err(error) = works {
                 tracing::debug!(%error, "work requests wait for their devices");
             }
-            if let Ok(state) = self.membership_state().await {
-                let network = &state.genesis.network_id;
-                if let Err(error) = self.reconcile_works(network).await {
-                    tracing::debug!(%error, "work reconciliation pending");
-                }
-                if let Err(error) = self.reconcile_checks(network).await {
-                    tracing::debug!(%error, "pending check reconciliation pending");
-                }
+            if let Err(error) = self.reconcile_works(network).await {
+                tracing::debug!(%error, "work reconciliation pending");
+            }
+            if let Err(error) = self.reconcile_checks(network).await {
+                tracing::debug!(%error, "pending check reconciliation pending");
             }
         }
     }
@@ -1615,8 +1666,8 @@ impl Runtime {
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
         };
-        let local = self.identity.device_id()?;
         let entries = self.store.lock().await.scheduler_outbox()?;
+        let mut owned = Vec::new();
         for entry in entries {
             let owner = self
                 .store
@@ -1625,38 +1676,38 @@ impl Runtime {
                 .conversation(&network, &entry.conversation_id)?
                 .and_then(|conversation| conversation.owner)
                 .context("conversation has no scheduling Node")?;
-            let delivered = if owner == local {
+            owned.push((owner, entry));
+        }
+        let (local, network) = (&self.identity.device_id()?, &network);
+        each_device(owned, |owner, entry| async move {
+            let delivered = if owner == *local {
                 self.store
                     .lock()
                     .await
-                    .admit_delivery(&local, &network, &entry.conversation_id, &entry.trigger)
+                    .admit_delivery(local, network, &entry.conversation_id, &entry.trigger)
                     .map(|receipt| json!({ "receipt": receipt }))
             } else {
                 let request = json!({"type":"deliver","conversation_id":entry.conversation_id,
                         "trigger":entry.trigger});
-                self.peer_request(&network, &owner, request).await
-            };
-            match delivered {
-                Ok(reply) if reply["receipt"].is_object() => {
-                    self.store
-                        .lock()
-                        .await
-                        .remove_outbox(&entry.conversation_id, &entry.trigger)?;
-                    self.publish_changed(
-                        &network,
-                        &entry.conversation_id,
-                        Changed::Job(&entry.trigger),
-                    );
-                    self.schedule_wakeup.notify_one();
-                }
-                Ok(_) => {
-                    tracing::debug!(%owner, "delivery answer had no receipt")
-                }
-                Err(error) => {
-                    tracing::debug!(%owner, %error, "scheduler delivery pending")
-                }
-            }
-        }
+                self.peer_request(network, &owner, request).await
+            }?;
+            ensure!(
+                delivered["receipt"].is_object(),
+                "delivery answer had no receipt"
+            );
+            self.store
+                .lock()
+                .await
+                .remove_outbox(&entry.conversation_id, &entry.trigger)?;
+            self.publish_changed(
+                network,
+                &entry.conversation_id,
+                Changed::Job(&entry.trigger),
+            );
+            self.schedule_wakeup.notify_one();
+            Ok(())
+        })
+        .await;
         Ok(())
     }
 
@@ -1893,6 +1944,31 @@ impl Runtime {
         self.store.lock().await.commit_offset(&blob.hash, None)?;
         Ok(())
     }
+}
+
+/// Sends each device its requests in order, all devices at once. A device that does not answer
+/// keeps the rest of its requests for the next round, so it holds up nobody else's.
+pub(super) async fn each_device<T, F, Fut>(requests: Vec<(String, T)>, send: F)
+where
+    F: Fn(String, T) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut queues: BTreeMap<String, Vec<T>> = BTreeMap::new();
+    for (device, request) in requests {
+        queues.entry(device).or_default().push(request);
+    }
+    let send = &send;
+    futures_util::future::join_all(queues.into_iter().map(|(device, requests)| async move {
+        for request in requests {
+            if let Err(error) = send(device.clone(), request).await {
+                tracing::debug!(%device, %error, "request waits for its device");
+                if net::Unanswered::is(&error) {
+                    break;
+                }
+            }
+        }
+    }))
+    .await;
 }
 
 /// Devices out of `view` by a manager's signed revocation in an epoch in effect, not only
@@ -3571,6 +3647,346 @@ mod tests {
         for dir in [dir_r, dir_a, dir_b] {
             let _ = std::fs::remove_dir_all(dir);
         }
+        result
+    }
+
+    /// A member Node that is off costs only its own messages a wait: the others' are handed over
+    /// in the same round.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_offline_owner_does_not_hold_up_delivery_to_online_ones() -> Result<()> {
+        let [ia, ib, ix] = [
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        ];
+        let device = |id: &LocalIdentity| id.device_id().unwrap();
+        let state = ia.sign_network_fixture(1, vec![device(&ia), device(&ib), device(&ix)])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let (x, dir_x) = node(&ix).await?;
+        let result = async {
+            for node in [&a, &b, &x] {
+                node.install_membership(state.clone()).await?;
+                node.start_network().await?;
+            }
+            a.net()?.learn(&b.net()?.addr()).await;
+            a.net()?.learn(&x.net()?.addr()).await;
+            b.net()?.learn(&a.net()?.addr()).await;
+            x.stop_network().await;
+            let message = |scope: &str, id: &str| -> Result<Attestation> {
+                posted(&ia, &network, scope, id)?
+                    .attestation()
+                    .cloned()
+                    .context("signed message")
+            };
+            {
+                let mut store = a.store.lock().await;
+                for (scope, owner) in [("a1", &ix), ("a2", &ix), ("c", &ib)] {
+                    let owner = ia.owner_fixture(&network, scope, &device(owner))?;
+                    store.create_conversation(&ia, &network, scope, scope, owner, now_ms())?;
+                }
+            }
+            first_sync(&b, &device(&ia)).await?;
+            {
+                let mut store = a.store.lock().await;
+                for (scope, id) in [("a1", "x1"), ("a2", "x2"), ("c", "b1")] {
+                    store.accept_message(
+                        &ia,
+                        &network,
+                        scope,
+                        id,
+                        id,
+                        vec![],
+                        true,
+                        message(scope, id)?,
+                        now_ms(),
+                    )?;
+                }
+                assert_eq!(store.scheduler_outbox()?.len(), 3);
+            }
+            a.outbox_wakeup.notify_one();
+            let trigger = crate::scheduling::message_trigger("b1");
+            tokio::time::timeout(Duration::from_secs(8), async {
+                // B stores the job before A reads its receipt and drops the entry.
+                while b.store.lock().await.scheduler_job("c", &trigger)?.is_none()
+                    || a.store.lock().await.scheduler_outbox()?.len() != 2
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("the online owner gets its message while the offline one is still dialed")??;
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b), (x, dir_x)]).await;
+        result
+    }
+
+    fn posted(identity: &LocalIdentity, network: &str, scope: &str, id: &str) -> Result<EventBody> {
+        identity.fixture_admin().attest(
+            network,
+            scope,
+            EventBody::MessagePosted {
+                message_id: id.into(),
+                role: Role::User,
+                text: id.into(),
+                attachments: vec![],
+                report_results: Some(true),
+                in_reply_to: None,
+                status: None,
+                answers: None,
+                attestation: None,
+                failure: None,
+            },
+        )
+    }
+
+    /// A Node that missed a join notice while its sync still looked fine is told once more, so
+    /// its managers see the request without waiting for another change.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missed_join_notice_is_sent_once_more() -> Result<()> {
+        let (ia, ib) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let state = ia.sign_network_fixture(1, vec![ia.device_id()?, ib.device_id()?])?;
+        let network = ia.fixture_network_id()?;
+        let (a, dir_a) = node(&ia).await?;
+        let (b, dir_b) = node(&ib).await?;
+        let result = async {
+            // Sync stays out of the way: only the join notice tells B's clients to reread.
+            for (node, peer) in [(&a, &ib), (&b, &ia)] {
+                node.install_membership(state.clone()).await?;
+                node.sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .entry(peer.device_id()?)
+                    .or_default()
+                    .running = true;
+            }
+            a.start_network().await?;
+            let mut updates = b.events.subscribe();
+            a.join_changed(&network);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            b.start_network().await?;
+            a.net()?.learn(&b.net()?.addr()).await;
+            assert!(
+                !a.sync_failing(&ib.device_id()?),
+                "A's sync with B looks fine"
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let update = updates.recv().await?;
+                    if update.payload == json!({"type":"changed"}) {
+                        return anyhow::Ok(());
+                    }
+                }
+            })
+            .await
+            .context("B's managers are told to reread")??;
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(a, dir_a), (b, dir_b)]).await;
+        result
+    }
+
+    /// Fork evidence longer than one round's pages arrives over the following rounds, which run
+    /// right away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_evidence_past_one_rounds_pages_arrives_in_the_next_rounds() -> Result<()> {
+        let [il, ic] = [LocalIdentity::generate(), LocalIdentity::generate()];
+        let mut forked = [LocalIdentity::generate(), LocalIdentity::generate()];
+        forked.sort_by_key(|identity| identity.device_id().unwrap());
+        let [f1, f2] = &forked;
+        let device = |id: &LocalIdentity| id.device_id().unwrap();
+        let state =
+            il.sign_network_fixture(1, vec![device(&il), device(&ic), device(f1), device(f2)])?;
+        let network = il.fixture_network_id()?;
+        let (l, dir_l) = node(&il).await?;
+        let (c, dir_c) = node(&ic).await?;
+        let scratch_dir = dir_l.with_extension("other-branch");
+        let result = async {
+            for node in [&l, &c] {
+                node.install_membership(state.clone()).await?;
+            }
+            let mut other = crate::store::Store::open(scratch_dir.join("db.sqlite"))?;
+            other.install_trust_bundle(&network, &state)?;
+            let long = MAX_FORK_PAGES * crate::store::MAX_PULL_EVENTS + 100;
+            {
+                let mut store = l.store.lock().await;
+                for i in 0..long {
+                    store.append_event(
+                        f1,
+                        &network,
+                        "c",
+                        posted(&il, &network, "c", &format!("f{i}"))?,
+                        vec![],
+                        i as i64,
+                    )?;
+                }
+                store.append_event(
+                    f2,
+                    &network,
+                    "c",
+                    posted(&il, &network, "c", "g")?,
+                    vec![],
+                    0,
+                )?;
+                for (author, id) in [(f1, "f-other"), (f2, "g-other")] {
+                    let branch = other.append_event(
+                        author,
+                        &network,
+                        "c",
+                        posted(&il, &network, "c", id)?,
+                        vec![],
+                        0,
+                    )?;
+                    store.ingest_events(&network, &[branch])?;
+                }
+            }
+            let digest = l.store.lock().await.fork_digest(&network)?;
+            assert!(!digest.is_empty(), "L holds both forks");
+            for node in [&l, &c] {
+                node.start_network().await?;
+            }
+            c.net()?.learn(&l.net()?.addr()).await;
+            c.wake_sync(&il.device_id()?);
+            tokio::time::timeout(Duration::from_secs(240), async {
+                while c.store.lock().await.fork_digest(&network)? != digest {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("C holds all of L's fork evidence")??;
+            anyhow::Ok(())
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&scratch_dir);
+        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
+        result
+    }
+
+    /// A round that leaves events waiting on other authors past the pending limit is followed
+    /// by another one right away instead of the next Hello a minute later.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_left_behind_pulls_again_without_waiting_for_hello() -> Result<()> {
+        let [il, ic, ih, ij] = [
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+            LocalIdentity::generate(),
+        ];
+        let device = |id: &LocalIdentity| id.device_id().unwrap();
+        let state =
+            il.sign_network_fixture(1, vec![device(&il), device(&ic), device(&ih), device(&ij)])?;
+        let network = il.fixture_network_id()?;
+        let (l, dir_l) = node(&il).await?;
+        let (c, dir_c) = node(&ic).await?;
+        let result = async {
+            for node in [&l, &c] {
+                node.install_membership(state.clone()).await?;
+            }
+            {
+                let mut store = l.store.lock().await;
+                for i in 0..40_000 {
+                    let author = if i % 2 == 0 { &ih } else { &ij };
+                    store.append_event(
+                        author,
+                        &network,
+                        "c",
+                        posted(&il, &network, "c", &format!("m{i}"))?,
+                        vec![],
+                        i,
+                    )?;
+                }
+            }
+            let target = l.store.lock().await.heads(&network)?;
+            let peer = device(&il);
+            // Anything that wakes C during its round would also start the next one at once: L's
+            // own Hello, or an address record C has not seen. Only C's schedule decides here.
+            l.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(device(&ic))
+                .or_default()
+                .running = true;
+            c.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.clone())
+                .or_default()
+                .running = true;
+            for node in [&l, &c] {
+                node.start_network().await?;
+            }
+            c.net()?.learn(&l.net()?.addr()).await;
+            let book = async |node: &Runtime| -> Result<Vec<(String, u64)>> {
+                Ok(node
+                    .store
+                    .lock()
+                    .await
+                    .address_book()?
+                    .iter()
+                    .filter_map(|signed| signed.open(&network).ok())
+                    .map(|record| (record.device_id, record.seq))
+                    .collect())
+            };
+            let mut settled = Vec::new();
+            loop {
+                let now = vec![book(&l).await?, book(&c).await?];
+                if now.iter().all(|records| records.len() == 1) && now == settled {
+                    break;
+                }
+                settled = now;
+                tokio::time::sleep(Duration::from_secs(6)).await;
+            }
+            let records = l.store.lock().await.address_book()?;
+            c.merge_addresses(&network, records).await?;
+            c.sync_peers
+                .lock()
+                .expect("sync peers")
+                .entry(peer.clone())
+                .or_default()
+                .running = false;
+            c.wake_sync(&peer);
+            let synced = || {
+                c.sync_peers
+                    .lock()
+                    .expect("sync peers")
+                    .get(&peer)
+                    .and_then(|s| s.synced_ms)
+            };
+            tokio::time::timeout(Duration::from_secs(300), async {
+                while synced().is_none() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .context("the first round ends")?;
+            let first = c.store.lock().await.heads(&network)?;
+            assert_ne!(first, target, "one round stops at the pending limit");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while c.store.lock().await.heads(&network)? == first {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("C pulls again right after a round that left it behind")??;
+            tokio::time::timeout(Duration::from_secs(300), async {
+                while c.store.lock().await.heads(&network)? != target {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                anyhow::Ok(())
+            })
+            .await
+            .context("C catches up")??;
+            anyhow::Ok(())
+        }
+        .await;
+        stop_nodes(vec![(l, dir_l), (c, dir_c)]).await;
         result
     }
 }
