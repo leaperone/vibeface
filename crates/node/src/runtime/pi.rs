@@ -894,11 +894,11 @@ impl Pi {
                 if event["type"] == "agent_settled" {
                     break match seen.ending(false) {
                         (TurnStatus::Completed, _) => Ok(seen.text()),
-                        (TurnStatus::Interrupted, _) => Err(error(
-                            ManagerFailure::Cancelled,
-                            native,
-                            own("pi turn was interrupted".into()),
-                        )),
+                        (TurnStatus::Interrupted, _) => {
+                            let (outcome, failure) =
+                                crate::manager::interrupted(&cancel, Provider::Pi);
+                            Err(error(outcome, native, failure))
+                        }
                         (_, failure) => Err(error(
                             ManagerFailure::Failed,
                             native,
@@ -1083,9 +1083,7 @@ impl Executor for Pi {
                         FailureKind::WriterBusy,
                         "pi still runs another work in this session",
                     );
-                    node.signal_work(network, &work.work_id, Signal::StartRejected(failure))
-                        .await?;
-                    bail!("pi still runs another work in this session");
+                    return Err(failure.into());
                 }
                 None => None,
             };
@@ -1127,17 +1125,9 @@ impl Executor for Pi {
                     }
                     prompt["images"] = json!(images);
                 }
-                Ok((origin, prompt))
+                anyhow::Ok((origin, prompt))
             };
-            let (origin, prompt) = match prepared.await {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    let failure = ExecFailure::new(FailureKind::Rejected, format!("{e:#}"));
-                    node.signal_work(network, &work.work_id, Signal::StartRejected(failure))
-                        .await?;
-                    return Err(e);
-                }
-            };
+            let (origin, prompt) = prepared.await?;
             let (session, mut launch_args) = match &origin {
                 Origin::Resume { session, file } => (
                     session.clone(),
@@ -1489,10 +1479,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, network, spec.clone(), now_ms())?;
-        let sends = node
-            .pi
-            .start(node, network, &spec, None, &Value::Null)
-            .await?;
+        let pi = node.pi.clone();
+        let sends = (node.start_work(pi.as_ref(), network, &spec, None, &Value::Null)).await?;
         ensure!(!sends, "the Node sends a pi work itself");
         Ok(())
     }
@@ -1699,9 +1687,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
-        node.pi
-            .start(&node, &network, &spec, Some(&session), &Value::Null)
-            .await?;
+        let pi = node.pi.clone();
+        (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {
             let record = node.store.lock().await.work_record("w-2")?.context("w-2")?;

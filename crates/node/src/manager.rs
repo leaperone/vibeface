@@ -629,16 +629,27 @@ where
             let ended = turn_snapshot(&message["params"]["turn"]);
             break match ended.status {
                 Some(TurnStatus::Completed) => Ok(()),
-                Some(TurnStatus::Interrupted) => Err(error(
-                    ManagerFailure::Cancelled,
-                    native,
-                    own("Codex turn was interrupted".into()),
-                )),
-                _ => Err(failed(
+                Some(TurnStatus::Interrupted) => {
+                    let (outcome, failure) =
+                        interrupted(&cancel, crate::providers::Provider::Codex);
+                    Err(error(outcome, native, failure))
+                }
+                Some(TurnStatus::Failed) => Err(failed(
                     native,
                     ended
                         .error
                         .unwrap_or_else(|| own("Codex turn failed".into())),
+                )),
+                // As for a work, an end this build cannot read is one to reconcile.
+                status => Err(error(
+                    ManagerFailure::Unknown,
+                    native,
+                    ended.error.unwrap_or_else(|| {
+                        own(format!(
+                            "Codex ended the turn as {}",
+                            status.as_ref().map_or("nothing", TurnStatus::as_str)
+                        ))
+                    }),
                 )),
             };
         }
@@ -653,6 +664,33 @@ where
         usage: None,
     })
 }
+/// How a bot turn its provider reports interrupted ends: stopped when the Node asked it to stop,
+/// else failed, as when the owner interrupted it in their own program on a shared App Server.
+pub(crate) fn interrupted(
+    cancel: &watch::Receiver<bool>,
+    provider: crate::providers::Provider,
+) -> (ManagerFailure, ExecFailure) {
+    match *cancel.borrow() {
+        true => (
+            ManagerFailure::Cancelled,
+            ExecFailure::new(
+                FailureKind::Unknown,
+                format!("{} turn was interrupted", provider.label()),
+            ),
+        ),
+        false => (
+            ManagerFailure::Failed,
+            ExecFailure::new(
+                FailureKind::Unknown,
+                format!(
+                    "{} interrupted the turn without being asked to stop",
+                    provider.label()
+                ),
+            ),
+        ),
+    }
+}
+
 pub(crate) fn secret_values(config: &ManagerConfig) -> Vec<String> {
     let mut values: Vec<_> = config
         .tool_env
@@ -796,8 +834,12 @@ mod tests {
     #[derive(Clone, Copy, PartialEq)]
     enum Turn {
         Answers,
-        Runs { confirm: bool },
+        Runs {
+            confirm: bool,
+        },
         Drops,
+        /// Codex ends the turn as this status on its own.
+        Ends(&'static str),
     }
 
     struct Fake {
@@ -871,6 +913,10 @@ mod tests {
                                 note("item/completed", json!({"item":{"id":"a","type":"agentMessage","text":"hello"}})),
                                 note("turn/completed", json!({"turn":{"id":"turn-1","status":"completed"}})),
                             ]),
+                            ("turn/start", Turn::Ends(status)) => replies.push(note(
+                                "turn/completed",
+                                json!({"turn":{"id":"turn-1","status":status}}),
+                            )),
                             ("turn/interrupt", Turn::Runs { confirm: true }) => {
                                 status = "interrupted";
                                 replies.push(note(
@@ -1019,6 +1065,32 @@ mod tests {
             );
             assert_eq!(fake.calls("thread/resume").len(), 1);
             assert_eq!(fake.calls("turn/interrupt").len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_codex_ends_on_its_own_is_no_stop_and_an_unread_end_stays_unknown() {
+        for (status, expected) in [
+            ("interrupted", ManagerFailure::Failed),
+            ("paused", ManagerFailure::Unknown),
+            ("failed", ManagerFailure::Failed),
+        ] {
+            let fake = fake_app_server(Turn::Ends(status));
+            let config = codex(workspace(), fake.socket.clone());
+            let error = run_manager(
+                &config,
+                "fixture",
+                Some("thread-1"),
+                |_| async { Ok(()) },
+                watch::channel(false).1,
+                |_| async { Ok(()) },
+            )
+            .await
+            .err()
+            .unwrap();
+            let error = error.downcast_ref::<ManagerError>().unwrap();
+            assert_eq!(error.outcome, expected, "{status}: {error}");
+            assert!(fake.calls("turn/interrupt").is_empty(), "{status}");
         }
     }
 

@@ -5,7 +5,7 @@ use crate::{
         HUES, MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS,
         SCHEDULE_MINUTES,
     },
-    providers::{Provider, Role},
+    providers::Provider,
     scheduling::TriggerKind,
 };
 use serde_json::{Value, json};
@@ -205,15 +205,7 @@ impl Tool {
             json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1}},
             "required":["author","seq"],"additionalProperties":false})
         };
-        let executors = || {
-            json!(
-                Provider::ALL
-                    .into_iter()
-                    .filter(|provider| provider.supports().contains(&Role::Execution))
-                    .map(Provider::name)
-                    .collect::<Vec<_>>()
-            )
-        };
+        let executors = || json!(Provider::executing(|_| true));
         Some(match self {
             Tool::Nodes => (
                 "List personal Nodes, device names and allowed roots.",
@@ -229,7 +221,7 @@ impl Tool {
                 &[],
             ),
             Tool::DispatchWork => (
-                "Start work in cwd on target_node (default: this device). On this device the Node registers the work, then agent runs it as one turn with full access; agent is a provider this device executes work on; left out, a work in thread or continues goes on with the provider that session or work ran on (a thread no work ran in is Codex's), else this bot's own provider when it executes work here, else the first that does. On another device that device's bot gets the task. Reuse call_ref to retry the same dispatch; it reads the work back and never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up, going on from its session. thread sends the prompt into an existing session on this device instead. model, effort and images (local image paths) pass to the turn.",
+                "Start work in cwd on target_node (default: this device). On this device the Node registers the work, then agent runs it as one turn with full access; agent is a provider this device executes work on; left out, a work in thread or continues goes on with the provider that session or work ran on (a thread no work ran in is Codex's), else this bot's own provider when it executes work here, else the first that does. On another device that device's bot gets the task. Reuse call_ref to retry the same dispatch; it reads the work back and never starts a second turn. parent names the work this one belongs to; continues names an earlier work this one follows up, going on from its session. thread sends the prompt into an existing session on this device instead. model passes to the turn, and effort and images do on an agent that takes them; another refuses the dispatch.",
                 json!({"title":{"type":"string","description":"A few words for the user, in their language, saying what this work does"},
                 "prompt":{"type":"string","minLength":1,"description":"The task as the coding agent should read it: goal, where, limits, what done means; a required result format with a short example. Not a relay of the chat"},
                 "agent":{"type":"string","enum":executors()},
@@ -237,8 +229,10 @@ impl Tool {
                 "parent":string(),"continues":string(),
                 "thread":{"type":"string","minLength":1,"description":"An existing session on this device for prompt; cwd is taken from it. Any Codex thread but a sub-agent's, steering its running turn or starting one; for another agent only a session one of this device's works ran in"},
                 "model":string(),
-                "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"]},
-                "images":{"type":"array","items":string(),"maxItems":8}}),
+                "effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh"],
+                    "description":format!("Taken by agent {:?}", Provider::executing(|can| can.effort))},
+                "images":{"type":"array","items":string(),"maxItems":8,
+                    "description":format!("Local image paths, taken by agent {:?}", Provider::executing(|can| can.images))}}),
                 &["title", "prompt", "cwd", "call_ref"],
             ),
             Tool::WorkStatus => (

@@ -883,11 +883,8 @@ impl Opencode {
                 return Err(failed(native, failure));
             }
             Some(reply) if reply["error"]["name"] == "MessageAbortedError" => {
-                return Err(error(
-                    ManagerFailure::Cancelled,
-                    native,
-                    own("the opencode run was aborted"),
-                ));
+                let (outcome, failure) = manager::interrupted(&cancel, Provider::Opencode);
+                return Err(error(outcome, native, failure));
             }
             Some(reply) if !reply["error"].is_null() => {
                 return Err(failed(native, failure_of(&reply["error"])));
@@ -1261,27 +1258,22 @@ impl Executor for Opencode {
         Box::pin(async move {
             let id = work.work_id.as_str();
             let sending = Claim::take(&self.sending, id);
-            let reject = |failure: ExecFailure| async move {
-                (node
-                    .signal_work(network, id, Signal::StartRejected(failure))
-                    .await)
-                    .map(|_| false)
-            };
+            let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let mut parts = vec![json!({"type":"text","text":work.prompt})];
             for image in args["images"].as_array().into_iter().flatten() {
                 match image_part(image) {
                     Ok(part) => parts.push(part),
-                    Err(failure) => return reject(failure).await,
+                    Err(failure) => return reject(failure),
                 }
             }
             // ponytail: opencode takes no effort per message; a model variant would carry it.
             let model = match parse_model(args["model"].as_str().unwrap_or_default()) {
                 Ok(model) => model,
-                Err(failure) => return reject(failure).await,
+                Err(failure) => return reject(failure),
             };
             let (conn, serving) = match self.conn().await {
                 Ok(conn) => conn,
-                Err(error) => return reject(launch_failure(&error)).await,
+                Err(error) => return reject(launch_failure(&error)),
             };
             let (session, directory) = match thread {
                 Some(session) => match self.session(&conn, session).await? {
@@ -1294,7 +1286,7 @@ impl Executor for Opencode {
                             FailureKind::Rejected,
                             format!("opencode has no session {session}"),
                         );
-                        return reject(failure).await;
+                        return reject(failure);
                     }
                 },
                 None => {
@@ -1304,11 +1296,11 @@ impl Executor for Opencode {
                             FailureKind::Rejected,
                             "the work directory must be an existing absolute path",
                         );
-                        return reject(failure).await;
+                        return reject(failure);
                     }
                     match self.create(&conn, &work.cwd).await {
                         Ok(session) => (session, work.cwd.clone()),
-                        Err(failure) => return reject(failure).await,
+                        Err(failure) => return reject(failure),
                     }
                 }
             };
@@ -1342,7 +1334,7 @@ impl Executor for Opencode {
                         _ => None,
                     };
                     if let Some(busy) = busy {
-                        return reject(ExecFailure::new(FailureKind::WriterBusy, busy)).await;
+                        return reject(ExecFailure::new(FailureKind::WriterBusy, busy));
                     }
                     claim
                 }
@@ -1378,7 +1370,7 @@ impl Executor for Opencode {
                         tracing::warn!(event = "opencode.work_update_pending", %error, work_id = id, "the opencode work waits for its probe");
                     }
                 }
-                Sent::Refused(failure) => return reject(failure).await,
+                Sent::Refused(failure) => return reject(failure),
                 Sent::Unknown(detail) => {
                     tracing::warn!(
                         event = "opencode.send_unknown",
@@ -2031,10 +2023,8 @@ mod tests {
         let at = now_ms();
         (node.store.lock().await).accept_work(&node.identity, network, spec.clone(), at)?;
         let args = json!({"model":"fake/m"});
-        let sends = node
-            .opencode
-            .start(node, network, spec, None, &args)
-            .await?;
+        let opencode = node.opencode.clone();
+        let sends = (node.start_work(opencode.as_ref(), network, spec, None, &args)).await?;
         ensure!(!sends, "the Node sends an opencode work itself");
         Ok(())
     }
@@ -2332,10 +2322,14 @@ mod tests {
         )?;
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
-        let sends = opencode
-            .start(&node, &network, &second, Some(&session), &args)
-            .await?;
-        assert!(!sends);
+        let busy = node
+            .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
+            .await
+            .expect_err("the session runs another work");
+        assert!(
+            format!("{busy:#}").contains("still holds this opencode session"),
+            "the dispatch says why: {busy:#}"
+        );
         let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
         assert_eq!(
             refused.state,
@@ -2374,9 +2368,11 @@ mod tests {
         }
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
-        opencode
-            .start(&node, &network, &second, Some(&session), &args)
-            .await?;
+        let busy = node
+            .start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
+            .await
+            .expect_err("the unsure work holds the session");
+        assert!(format!("{busy:#}").contains("still holds"), "{busy:#}");
         let refused = (node.store.lock().await.work_record("w-2")?).context("recorded")?;
         assert_eq!(
             refused.state,
@@ -2412,11 +2408,14 @@ mod tests {
         let args = json!({"model":"fake/m"});
         let opencode = node.opencode.clone();
         let (one, two) = tokio::join!(
-            opencode.start(&node, &network, &first, Some(&session), &args),
-            opencode.start(&node, &network, &second, Some(&session), &args)
+            node.start_work(opencode.as_ref(), &network, &first, Some(&session), &args),
+            node.start_work(opencode.as_ref(), &network, &second, Some(&session), &args)
         );
-        one?;
-        two?;
+        assert_eq!(
+            [one, two].iter().filter(|start| start.is_err()).count(),
+            1,
+            "the refused start says so"
+        );
         assert_eq!(
             place.prompts().len(),
             1,

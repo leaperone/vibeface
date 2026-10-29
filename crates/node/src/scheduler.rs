@@ -86,6 +86,20 @@ pub(crate) fn bot_model(
     bot?.model(device.provider).map(str::to_owned)
 }
 
+/// A failed reply names the model the bot set only when the provider refused the request or
+/// did not know the model, which that model may cause.
+fn model_noted(failure: ExecFailure, model: Option<&str>) -> ExecFailure {
+    match model {
+        Some(model) if matches!(failure.kind, FailureKind::NoModel | FailureKind::Rejected) => {
+            ExecFailure {
+                detail: format!("{}（这个 bot 设定的模型是 {model}）", failure.detail),
+                ..failure
+            }
+        }
+        _ => failure,
+    }
+}
+
 pub(crate) fn boot_id() -> &'static str {
     static BOOT: OnceLock<String> = OnceLock::new();
     BOOT.get_or_init(|| uuid::Uuid::new_v4().to_string())
@@ -213,15 +227,11 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         .context("local tool listener is not ready")?;
     // A Codex thread keeps the Shell environment it was created with, tool URL included: when
     // the Node could not get its earlier tool port back, a new thread starts. It lives on one
-    // App Server; another one starts a new thread too, and so do new thread instructions. A
-    // thread of a provider without an App Server is on none, but for opencode, whose sessions
-    // live in its own store whichever serve runs them.
-    let server = if provider.on_app_server() {
-        node.codex.server()
-    } else if provider == crate::providers::Provider::Opencode {
-        crate::runtime::opencode::SERVER.to_owned()
-    } else {
-        String::new()
+    // App Server; another one starts a new thread too, and so do new thread instructions.
+    let server = match provider.sessions() {
+        crate::providers::Sessions::AppServer => node.codex.server(),
+        crate::providers::Sessions::Store(store) => store.to_owned(),
+        crate::providers::Sessions::Process => String::new(),
     };
     let tool_cli = std::env::current_exe()?;
     // A thread lists the tools once, with the guidance that holds for all its turns.
@@ -459,13 +469,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 process_unconfirmed: true,
             }
         } else {
-            JobOutcome::Failed(match &bot_model {
-                Some(model) => ExecFailure {
-                    detail: format!("{}（这个 bot 设定的模型是 {model}）", failure.detail),
-                    ..failure
-                },
-                None => failure,
-            })
+            JobOutcome::Failed(model_noted(failure, bot_model.as_deref()))
         };
         let text = partial.lock().expect("partial text").text();
         job = node.store.lock().await.finish_job(
@@ -1398,6 +1402,26 @@ mod tests {
             tools
                 .values()
                 .all(|tool| tool.input_schema["additionalProperties"] == false)
+        );
+    }
+
+    #[test]
+    fn only_a_refusal_or_an_unknown_model_names_the_bots_model() {
+        for (kind, named) in [
+            (FailureKind::NoModel, true),
+            (FailureKind::Rejected, true),
+            (FailureKind::Transport, false),
+            (FailureKind::Lost, false),
+            (FailureKind::MissingKey, false),
+            (FailureKind::Unknown, false),
+        ] {
+            let noted = model_noted(ExecFailure::new(kind, "x"), Some("m-1"));
+            assert_eq!(noted.detail.contains("m-1"), named, "{kind:?}");
+            assert_eq!(noted.kind, kind);
+        }
+        assert_eq!(
+            model_noted(ExecFailure::new(FailureKind::NoModel, "x"), None).detail,
+            "x"
         );
     }
 }
