@@ -6412,7 +6412,10 @@ dependencies = [
 name = "vibeface-secure-ffi"
 version = "0.0.1-nightly.20261028.2"
 dependencies = [
+ "hex",
+ "iroh",
  "thiserror 2.0.21",
+ "tokio",
  "uniffi",
  "vibeface-secure",
 ]

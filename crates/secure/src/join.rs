@@ -190,7 +190,8 @@ pub fn ticket_encode(
     ticket.encode()
 }
 
-/// `{entry_id, invite_hash, invite_id}`; the secret stays out of JSON the page logs.
+/// `{entry_id, invite_id, invite_hash, secret, relay_url, direct_addrs}`; `direct_addrs` are
+/// `ip:port` where the entry Node listened when it made the ticket.
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = ticketDecode))]
 pub fn ticket_decode(text: &str) -> Result<String> {
     let ticket = Ticket::decode(text)?;
@@ -200,6 +201,8 @@ pub fn ticket_decode(text: &str) -> Result<String> {
         "invite_id": invite_id(&hash)?,
         "invite_hash": hash,
         "secret": hex::encode(ticket.secret),
+        "relay_url": ticket.entry.relay_url,
+        "direct_addrs": ticket.entry.direct_addrs,
     })
     .to_string())
 }
@@ -227,6 +230,17 @@ mod tests {
         assert!(Ticket::decode(&text.replace("vibeface1", "vibeface2")).is_err());
         assert!(Ticket::decode(&format!("{text}a")).is_err());
         assert_eq!(invite_id(&ticket.invite_hash()).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn decoded_tickets_name_where_the_entry_listens() {
+        let entry = Identity::generate().unwrap().device_id();
+        let addrs = vec!["192.168.1.5:7000".into(), "[fd00::5]:7000".into()];
+        let text = ticket_encode(&entry, &hex::encode([7; 32]), None, addrs.clone()).unwrap();
+        let decoded: Value = serde_json::from_str(&ticket_decode(&text).unwrap()).unwrap();
+        assert_eq!(decoded["direct_addrs"], serde_json::json!(addrs));
+        assert_eq!(decoded["relay_url"], Value::Null);
+        assert_eq!(decoded["entry_id"], entry);
     }
 
     #[test]
