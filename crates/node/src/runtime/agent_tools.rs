@@ -357,7 +357,7 @@ impl Runtime {
             }
             Tool::WaitWork => {
                 drop((_lease, _work));
-                Ok(json!({"agent": self.ready_for(&args["agent"]).await}))
+                Ok(json!({"agent": self.ready_for(network, &args).await}))
             }
             // The Cursor SDK calls back instead of running the CLI; the same flow runs here.
             Tool::DispatchWork => {
@@ -369,8 +369,8 @@ impl Runtime {
                     |work_id, report| async move {
                         self.bind_work(network, scope, &work_id, report).await
                     },
-                    |agent| async move {
-                        (self.ready_for(&agent).await).map(|agent| agent.name().to_owned())
+                    |args| async move {
+                        (self.ready_for(network, &args).await).map(|agent| agent.name().to_owned())
                     },
                     &socket,
                 )
@@ -520,32 +520,39 @@ impl Runtime {
         }
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
-        let kind = match agent {
-            _ if target == local => WorkKind::Agent(self.executing(agent)?),
-            None => WorkKind::Task,
-            Some(_) => {
+        let work_id = WorkSpec::id(scope, &manager.trigger, call_ref);
+        // A retry keeps the provider the first call settled on, whatever the switches say now.
+        let retried = match agent {
+            None => (self.store.lock().await.work_record(&work_id)?).map(|run| run.kind),
+            Some(_) => None,
+        };
+        let kind = match (agent, retried) {
+            (None, Some(kind)) if target == local => kind,
+            _ if target == local => WorkKind::Agent(self.executing(network, args).await?),
+            (None, _) => WorkKind::Task,
+            (Some(_), _) => {
                 bail!("agent picks a provider of this device; another device's bot picks its own")
             }
         };
         // The Codex App Server runs every turn of its threads itself. Another provider's session
         // may be open in a program the Node does not see, so it takes work only in a session one
         // of its works on this device ran in.
-        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind)
-            && provider != Provider::Codex
-        {
-            let store = self.store.lock().await;
-            let own = (store.work_records_on_thread(thread)?.iter()).any(|run| {
-                run.kind == kind
-                    && matches!(store.conversation(network, &run.conversation), Ok(Some(_)))
-            });
-            ensure!(
-                own,
-                "{} takes work only in sessions this device's works ran in; dispatch it without thread, or follow an earlier work with continues",
-                provider.label()
-            );
+        if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
+            match self.ran_on(network, thread).await? {
+                Some(ran) if ran != provider => bail!(
+                    "this device's {} works ran in this session; set agent to {} or leave agent out",
+                    ran.label(),
+                    ran.name()
+                ),
+                None if provider != Provider::Codex => bail!(
+                    "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
+                    provider.label()
+                ),
+                _ => {}
+            }
         }
         let spec = WorkSpec {
-            work_id: WorkSpec::id(scope, &manager.trigger, call_ref),
+            work_id,
             conversation: scope.into(),
             trigger: manager.trigger.clone(),
             target: target.clone(),
@@ -600,26 +607,40 @@ impl Runtime {
         )
     }
 
-    /// The provider a work naming `agent` would run on here, once the Node's App Server
+    /// The provider a dispatch with these `args` would run on here, once the Node's App Server
     /// connection is up when that is Codex; `None` when none would, as `track_work` then says.
-    async fn ready_for(&self, agent: &Value) -> Option<Provider> {
-        let agent = serde_json::from_value(agent.clone()).ok()?;
-        let provider = self.executing(agent).ok()?;
+    async fn ready_for(&self, network: &str, args: &Value) -> Option<Provider> {
+        let provider = self.executing(network, args).await.ok()?;
         if provider == Provider::Codex {
             self.codex.ready().await;
         }
         Some(provider)
     }
 
-    /// The provider a work on this device runs on: the one asked for, else the bot's own
-    /// provider when it executes work here, else the first one that does.
-    fn executing(&self, agent: Option<Provider>) -> Result<Provider> {
+    /// The provider a work on this device runs on: `agent`; else the one its thread's works ran
+    /// on, a thread none ran in being a Codex one; else the one the work it continues ran on;
+    /// else the bot's own provider when it executes work here, else the first one that does.
+    async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
+        let agent: Option<Provider> =
+            serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
+        let earlier = match (agent, args["thread"].as_str(), args["continues"].as_str()) {
+            (Some(_), _, _) => None,
+            (None, Some(thread), _) => {
+                Some((self.ran_on(network, thread).await?).unwrap_or(Provider::Codex))
+            }
+            (None, None, Some(original)) => (self.store.lock().await.work_record(original)?)
+                .and_then(|run| match run.kind {
+                    WorkKind::Agent(provider) => Some(provider),
+                    WorkKind::Task => None,
+                }),
+            (None, None, None) => None,
+        };
         let execution = self.providers().switches.execution;
         let off = |what: String| -> anyhow::Error {
             ExecFailure::new(FailureKind::ExecutionDisabled, what).into()
         };
-        match agent {
+        match agent.or(earlier) {
             Some(agent) if execution.contains(&agent) => Ok(agent),
             Some(agent) => Err(off(format!(
                 "{} execution is turned off on this device; ask the user to turn it on with propose_provider_config execution=[\"{}\"]",
@@ -633,6 +654,20 @@ impl Runtime {
                     "execution is turned off on this device; ask the user to turn it on with propose_provider_config execution".into(),
                 )),
         }
+    }
+
+    /// The provider this device's works in a session of this network ran on.
+    async fn ran_on(&self, network: &str, thread: &str) -> Result<Option<Provider>> {
+        let store = self.store.lock().await;
+        let runs = store.work_records_on_thread(thread)?;
+        Ok(runs.iter().find_map(|run| match run.kind {
+            WorkKind::Agent(provider)
+                if matches!(store.conversation(network, &run.conversation), Ok(Some(_))) =>
+            {
+                Some(provider)
+            }
+            _ => None,
+        }))
     }
 }
 
