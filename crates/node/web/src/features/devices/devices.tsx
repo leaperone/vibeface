@@ -161,7 +161,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
             onChange={(event) => { const enabled = event.target.checked; void action.run("local", () => device.setLocalAutoAccess(enabled), "已保存") }} />
         </label>
         <p id="local-access-risk" className={cn("flex items-center gap-1.5 text-meta", device.localAutoAccess ? "text-warning" : "text-muted-foreground")}>
-          <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这" : "那"}台电脑上的人和程序不用批准就能看对话、改设置
+          <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />{isLoopback(address) ? "这" : "那"}台电脑上的人和程序不用批准就能看对话、改设置、替你回 Bot
         </p>
       </div> : null}
       {action.errorKey === "local" ? <InlineError error={action.error} /> : null}

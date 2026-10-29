@@ -265,14 +265,14 @@ const roles = {
 
 /**
  * A chip for one use of a provider: its icon tells the two apart, and on, the chip is tinted so a phone without hover still reads it.
- * Only one provider runs the bot, so that chip is a radio dot, picking it moves the bot here; executing tasks is a switch any provider can have on.
+ * Only one provider runs the bot, so that chip draws a radio dot, picking it moves the bot here and picking it again turns it off; it stays a toggle
+ * button for assistive tech for that reason. Executing tasks is a switch any provider can have on.
  * Never solid, so the page's own next step stays the only filled button.
  */
 function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onClick(): void }) {
   const { label, hint, icon: Icon } = roles[role]
   const one = role === "bot"
-  return <Button type="button" size="sm" variant="outline" role={one ? "radio" : undefined} aria-checked={one ? pressed : undefined} aria-pressed={one ? undefined : pressed}
-    aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
+  return <Button type="button" size="sm" variant="outline" aria-pressed={pressed} aria-label={`${name} ${label}`} aria-description={hint(name)} title={hint(name)} disabled={disabled}
     className={cn("rounded-full", pressed ? "border-brand/30 bg-brand-soft hover:bg-brand-soft dark:border-brand/30 dark:bg-brand-soft dark:hover:bg-brand-soft" : "text-muted-foreground")} onClick={onClick}>
     {busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : <Icon aria-hidden="true" />}
     {one ? <span aria-hidden="true" className={cn("grid size-3.5 shrink-0 place-items-center rounded-full border-[1.5px] transition-colors", pressed ? "border-brand" : "border-muted-foreground/75")}>

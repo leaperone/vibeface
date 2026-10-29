@@ -151,9 +151,9 @@ const roles = {
 
 function Toggle({ role, name, pressed, busy, disabled, onPress }: { role: keyof typeof roles; name: string; pressed: boolean; busy: boolean; disabled: boolean; onPress(): void }) {
   const { label, hint, icon } = roles[role]
-  // Only one provider runs the bot, so that row is a radio: tapping it moves the bot here, tapping it again turns it off.
+  // Only one provider runs the bot, so that row draws a radio dot: tapping it moves the bot here, tapping it again turns it off, hence a toggle for assistive tech.
   // Executing tasks is a system switch any provider can have on. While a save runs the controls keep their look and ignore taps; the spinner says which one is changing.
-  if (role === 'bot') return <Pressable accessibilityRole="radio" accessibilityState={{ checked: pressed }} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
+  if (role === 'bot') return <Pressable accessibilityRole="togglebutton" accessibilityState={{ checked: pressed, disabled }} accessibilityLabel={`${name} ${label}`} accessibilityHint={hint(name)}
     onPress={disabled ? undefined : onPress} className="min-h-12 flex-row items-center gap-3 border-t border-border px-4 active:bg-muted">
     <Icon as={busy ? LoaderCircle : icon} className="text-muted-foreground" />
     <Text className="min-w-0 flex-1">{label}</Text>
