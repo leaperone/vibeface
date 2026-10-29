@@ -13,6 +13,8 @@ export const joinCopy = {
 
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
+/** The login this device kept only in its own storage is gone; the web and the phone say so the same way. */
+export const lostKeyText = (self: string) => `${self}保存的登录信息不见了。用加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。`
 
 /** Leaving would take the last way to approve devices and settings with it, so both apps explain instead of offering it. */
 export const soleManager = (members: readonly Member[], me: string | undefined) =>
@@ -54,6 +56,7 @@ export const recoveryCopy = {
   pending: '有人正在用恢复文件找回',
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
+  added: '新设备',
   itsMe: '是我在找回',
   stop: '拦下',
   stopAsk: '拦下这次找回？',
@@ -77,6 +80,7 @@ export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
 
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
+  manageHint: '能添加、移除设备，改设置，拦下找回',
   removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
   /** A provider's two switches on a device; `hint` says what each turns on, named for the provider's row. */
   roles: {

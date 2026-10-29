@@ -4,6 +4,8 @@ import type { ClientPrincipal, MembershipView, PublicIdentity } from './node.ts'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
+const notRecoveryFile = '这不是恢复文件。请选名字以 vibeface-recovery 开头的文件。'
+const damagedRecoveryFile = '这个恢复文件已损坏。请选下载时的那个文件。'
 /** What the device already trusts before it reads an authentication answer. */
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
@@ -60,13 +62,16 @@ export function secureKit(secure: SecureApi) {
     } finally { cleartext.fill(0) }
   }
   async function openPackage(file: RecoveryFile, password: string) {
-    if (!file.size || file.size > 4 * 1024 * 1024) throw new Error('恢复文件不能超过 4 MiB。')
-    const bundle = record(JSON.parse(await file.text()), '恢复文件')
-    if (bundle.version !== 1) throw new Error('恢复文件版本不对。')
-    const networkId = text(bundle.network_id)
+    let networkId: string, envelope: Record<string, unknown>
+    try {
+      if (!file.size || file.size > 4 * 1024 * 1024) throw new Error()
+      const bundle = record(JSON.parse(await file.text()))
+      if (bundle.version !== 1) throw new Error()
+      networkId = text(bundle.network_id); envelope = record(bundle.envelope)
+    } catch { throw new Error(notRecoveryFile) }
     let cleartext: Uint8Array
-    try { cleartext = secure.recoveryOpen(encoder.encode(JSON.stringify(record(bundle.envelope))), password) }
-    catch { throw new Error('打不开恢复文件。请检查密码，并使用原始文件。') }
+    try { cleartext = secure.recoveryOpen(encoder.encode(JSON.stringify(envelope)), password) }
+    catch { throw new Error('打不开恢复文件。请确认密码，并选下载时的那个文件。') }
     let payload: Record<string, unknown>
     try { payload = record(JSON.parse(decoder.decode(cleartext)), '恢复内容') } finally { cleartext.fill(0) }
     let root: SecureIdentity | undefined
@@ -74,10 +79,10 @@ export function secureKit(secure: SecureApi) {
       root = Identity.fromSecretHex(text(payload.root_secret_key))
       payload.root_secret_key = ''
       const material: RecoveryMaterial = { networkId, genesis: record(payload.genesis), checkpoints: array(payload.checkpoints), events: array(payload.events) }
-      if (payload.version !== 1 || payload.network_id !== networkId) throw new Error('恢复文件内容对不上。')
+      if (payload.version !== 1 || payload.network_id !== networkId) throw new Error(damagedRecoveryFile)
       verifiedView({ genesis: material.genesis, checkpoints: material.checkpoints, events: material.events }, networkId)
       // The file holds the key its last checkpoint hands recovery to, in effect yet or not.
-      if ((material.checkpoints.length ? record(material.checkpoints.at(-1)).recovery_key : networkId) !== root.deviceId()) throw new Error('恢复文件内容对不上。')
+      if ((material.checkpoints.length ? record(material.checkpoints.at(-1)).recovery_key : networkId) !== root.deviceId()) throw new Error(damagedRecoveryFile)
       const openedRoot = root
       let released = false
       return { material, root: openedRoot, networkId, release() { if (!released) { released = true; openedRoot.free() } } }

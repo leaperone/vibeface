@@ -175,7 +175,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           {row.node?.capabilities && (row.node.capabilities.relay || row.node.capabilities.manager) ? <DetailRow label="设备能力" value={[row.node.capabilities.manager ? "运行 Bot" : null, row.node.capabilities.relay ? "转发" : null].filter(Boolean).join("、")} /> : null}
         </div>
       </SettingsDisclosure>
-      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label}>
+      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label} description={deviceCopy.manageHint}>
         <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
           disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
           onChange={(event) => { const manage = event.target.checked; void action.run("manage", () => device.setManage(row.id, manage), "已保存") }} />

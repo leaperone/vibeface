@@ -44,7 +44,7 @@ export default function DeviceDetail() {
     {/* The AI page sets up the computer this phone connects through, so its detail leads there instead of ending. */}
     {member.entry && device.ready?.principal.can_manage ? <SettingsGroup><SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" /></SettingsGroup> : null}
     {manageable || removable ? <SettingsGroup>
-      {manageable ? <SettingsRow icon={Crown} label="管理设备">
+      {manageable ? <SettingsRow icon={Crown} label="管理设备" description={deviceCopy.manageHint}>
         <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
           onValueChange={(manage) => void run('manage', () => device.setManage(member.device_id, manage))} />
         {error && busy === null && !removing ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}

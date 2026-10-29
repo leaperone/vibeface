@@ -1,4 +1,5 @@
 import * as Haptics from 'expo-haptics'
+import { Link } from 'expo-router'
 import { ArrowRightLeft, BellRing, Crown, KeyRound, LogOut, Monitor, Moon, Palette, Plus, Sparkles, Sun } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
@@ -31,6 +32,7 @@ export default function Settings() {
   const scroll = useRef<ScrollViewInstance>(null)
   const reveal = useRef(false)
   const sole = soleManager(device.directory?.members ?? [], device.identity?.deviceId)
+  const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   const manager = device.ready?.principal.can_manage === true
   useEffect(() => { if (device.ready) device.refreshDirectory().catch(() => {}) }, [device.ready])
   // The confirmation opens at the foot of the page, below the fold on a phone.
@@ -63,7 +65,11 @@ export default function Settings() {
       </SettingsGroup>
       {leaving && sole ? <View className="gap-3 px-1">
         <View className="flex-row items-start gap-2"><Icon as={Crown} className="mt-1 text-warning" /><Text className="min-w-0 flex-1">{onlyManagerText(self)}</Text></View>
-        <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+        <View className="flex-row gap-2">
+          <Button variant="ghost" className="-ms-3" onPress={() => setLeaving(false)}><Text>知道了</Text></Button>
+          {/* With no other device to promote, the next manager has to join first. */}
+          {otherClient ? null : <Link href="/add-device" asChild><Button><Icon as={Plus} /><Text>添加设备</Text></Button></Link>}
+        </View>
       </View> : leaving ? <View className="gap-3 px-1">
         <Text>断开后，要用加入链接才能回来。</Text>
         <ErrorText error={error} />

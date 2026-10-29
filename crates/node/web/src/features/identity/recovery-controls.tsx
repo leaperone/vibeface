@@ -78,7 +78,8 @@ export function RecoveryPendingCard() {
         <Change role="img" aria-label={added ? '加入' : '移出'} className={cn('size-4 shrink-0', added ? 'text-warning' : 'text-danger')} />
         <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         <span className={cn('truncate', !added && 'text-muted-foreground line-through')}>{member.name}</span>
-        {member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
+        {added ? <span className="shrink-0 rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</span>
+          : member.device_id === device.identity?.deviceId ? <span className="shrink-0 rounded-md bg-muted px-1.5 text-meta text-muted-foreground">这个浏览器</span> : null}
       </li>
     })}</ul> : null}
     <InlineError error={error || null} />

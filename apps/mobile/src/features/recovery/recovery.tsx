@@ -173,7 +173,8 @@ export function RecoveryPendingCard() {
         <Icon as={added ? CirclePlus : CircleMinus} accessibilityLabel={added ? '加入' : '移出'} className={`size-4 ${added ? 'text-warning' : 'text-danger'}`} />
         <Icon as={deviceIcon({ kind: member.kind, name: member.name, current, entry: false })} className="size-4 text-muted-foreground" />
         <Text numberOfLines={1} className={`shrink ${added ? '' : 'text-muted-foreground line-through'}`}>{member.name}</Text>
-        {current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{self}</Text> : null}
+        {added ? <Text className="rounded-md bg-warning-soft px-1.5 text-meta text-warning">{recoveryCopy.added}</Text>
+          : current ? <Text className="rounded-md bg-muted px-1.5 text-meta text-muted-foreground">{self}</Text> : null}
       </View>
     })}
     <ErrorText error={error} />

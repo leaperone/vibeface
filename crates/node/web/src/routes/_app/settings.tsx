@@ -1,6 +1,7 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, LogOut, Monitor, Moon, Palette, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -36,6 +37,7 @@ function SettingsPage() {
   const operator = principal?.can_manage || principal?.source === 'local_session'
   // A local session only disconnects, so only a member browser can be the one manager left.
   const sole = principal?.source !== 'local_session' && soleManager(device.directory?.members ?? [], device.identity?.deviceId)
+  const otherClient = device.directory?.members.some((member) => member.kind === 'client' && member.device_id !== device.identity?.deviceId)
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <SettingsGroup title="提醒">
       <SettingsRow icon={Bell} label="浏览器提醒" description={workspace.notificationButton.state === 'denied' ? '在浏览器设置里允许' : undefined}>
@@ -52,7 +54,7 @@ function SettingsPage() {
     <SettingsGroup title="文件传输">
       <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="发送和接收文件"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
     </SettingsGroup>
-    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer="恢复文件只有一份有效，丢了不能补">
+    {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回" footer={device.unsavedRecovery ? undefined : '恢复文件只有一份有效，丢了不能补'}>
       <CurrentRecoveryFile />
       <RecoveryControls />
     </SettingsGroup> : null}
@@ -83,8 +85,10 @@ function SettingsPage() {
             <SheetTitle className="flex items-start gap-2 text-body font-normal"><Crown aria-hidden="true" className="mt-1 size-4 shrink-0 text-warning" />{onlyManagerText('这个浏览器')}</SheetTitle>
             <SheetDescription className="sr-only">不能断开</SheetDescription>
           </SheetHeader>
-          <div className="flex justify-end px-4 pt-2 pb-4">
+          <div className="flex justify-end gap-2 px-4 pt-2 pb-4">
             <Button type="button" variant="ghost" onClick={() => setLeaving(false)}>知道了</Button>
+            {/* With no other device to promote, the next manager has to join first. */}
+            <Button asChild><Link to="/devices" search={otherClient ? {} : { add: true }}>{otherClient ? <terms.myDevices.icon aria-hidden="true" /> : <Plus aria-hidden="true" />}{otherClient ? terms.myDevices.label : '添加设备'}</Link></Button>
           </div>
         </> : <>
           <SheetHeader className="gap-1.5 px-4 pt-4">

@@ -3,12 +3,13 @@ import type { Notifier, Platform } from '@vibeface/client/lib/platform.ts'
 import { createTransport } from '@vibeface/client/lib/transport.ts'
 import type { DeviceKeys } from '@vibeface/client/lib/transport.ts'
 import type { SecureApi } from '@vibeface/client/secure-api.ts'
+import { lostKeyText } from '@vibeface/client/identity/copy.ts'
 import { indexedOutbox } from './indexed-outbox'
 import { localPage } from './local-page'
 import { joinTabs } from './tabs'
 
 const secure: SecureApi = wasm
-const lostKeyMessage = '这个浏览器保存的登录信息不见了。用加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。'
+const lostKeyMessage = lostKeyText('这个浏览器')
 const hex = (bytes: ArrayBuffer) => [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('')
 type StoredKey = { privateKey: CryptoKey; deviceId: string; created_at: number }
 
