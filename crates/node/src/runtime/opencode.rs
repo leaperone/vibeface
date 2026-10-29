@@ -2589,8 +2589,7 @@ mod tests {
         let control = async {
             let started = futures_util::future::join_all(turns.iter().map(started)).await;
             channels[0].0.send(true).unwrap();
-            for index in 1..16 {
-                let (session, turn) = &started[index];
+            for (index, (session, turn)) in started.iter().enumerate().skip(1) {
                 let target = SteerTarget {
                     provider: Provider::Opencode,
                     attempt_id: format!("attempt-{index}"),
