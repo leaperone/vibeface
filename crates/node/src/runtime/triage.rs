@@ -131,6 +131,32 @@ impl HeldRequest {
     }
 }
 
+/// Keeps how a held request was answered, so a second answer and its hook's wait find it.
+fn remember(
+    answered: &mut HashMap<String, Value>,
+    request: &HeldRequest,
+    request_id: &str,
+    decision: &str,
+    by: &str,
+    sent: Result<(), String>,
+    answer: Option<Value>,
+) -> Value {
+    let mut outcome = json!({"request_id":request_id,"provider":request.provider,
+        "session_id":request.session_id,"kind":request.kind,"decision":decision,"by":by,
+        "answered":sent.is_ok(),"error":sent.as_ref().err()});
+    if let Some(answer) = answer {
+        outcome["answer"] = answer;
+    }
+    tracing::info!(request = %request_id, origin = request.origin(), %decision, %by,
+        answered = sent.is_ok(), "held request answered");
+    // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
+    if answered.len() > 1024 {
+        answered.clear();
+    }
+    answered.insert(request_id.into(), outcome.clone());
+    outcome
+}
+
 /// What the hook prints when nobody answered: its session decides.
 fn undecided() -> Value {
     json!({"decision":null})
@@ -633,78 +659,82 @@ impl Runtime {
         if let Some(done) = lock(&self.triage.answered).get(request_id) {
             return Ok(done.clone());
         }
-        let request = {
+        let (request, result, decision, settled) = {
             let mut requests = lock(&self.triage.requests);
-            let request = requests.remove(request_id);
-            // An answer given at the same time finds this one while it is sent.
-            if request.is_some() {
-                let sending = json!({"request_id":request_id,"by":by,"sending":true});
-                lock(&self.triage.answered).insert(request_id.into(), sending);
-            }
-            request
-        };
-        let Some(request) = request else {
-            return lock(&self.triage.answered)
-                .get(request_id)
-                .cloned()
-                .context("no request is waiting with this ID");
-        };
-        let (result, decision) = match (result, &request.reply) {
-            (Some(result), _) => {
-                let decision = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|r| r["decision"].as_str().or(r["action"].as_str()))
-                    .unwrap_or(if result.is_ok() { "answered" } else { "error" })
-                    .to_owned();
-                (result, decision)
-            }
-            (None, Reply::AppServer { method, .. }) => {
-                let (result, decision) = vibeface_bridge::methods::fallback(method);
-                (result, decision.to_owned())
-            }
-            (None, Reply::Hook { .. }) => (Ok(undecided()), "undecided".to_owned()),
-        };
-        let mut answer = None;
-        let sent = match &request.reply {
-            Reply::AppServer { rpc_id, .. } => self
-                .codex
-                .client()
-                .respond(rpc_id, result, &decision)
-                .await
-                .map_err(|error| error.message),
-            // Its hook left at the deadline, or when the user answered in the session.
-            Reply::Hook {
-                answer: waiting,
-                waited,
-            } if *waited && waiting.receiver_count() == 0 => {
-                Err("the session no longer waits for this request".to_owned())
-            }
-            Reply::Hook {
-                answer: waiting, ..
-            } => {
-                let given = result.unwrap_or_else(|_| undecided());
-                waiting.send_replace(Some(given.clone()));
-                answer = Some(given);
-                Ok(())
-            }
-        };
-        let mut outcome = json!({"request_id":request_id,"provider":request.provider,
-            "session_id":request.session_id,"kind":request.kind,"decision":decision,"by":by,
-            "answered":sent.is_ok(),"error":sent.as_ref().err()});
-        if let Some(answer) = answer {
-            outcome["answer"] = answer;
-        }
-        tracing::info!(request = %request_id, origin = request.origin(), %decision, %by,
-            answered = sent.is_ok(), "held request answered");
-        {
             let mut answered = lock(&self.triage.answered);
-            // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
-            if answered.len() > 1024 {
-                answered.clear();
+            let Some(request) = requests.remove(request_id) else {
+                return (answered.get(request_id).cloned())
+                    .context("no request is waiting with this ID");
+            };
+            let (result, decision) = match (result, &request.reply) {
+                (Some(result), _) => {
+                    let decision = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r["decision"].as_str().or(r["action"].as_str()))
+                        .unwrap_or(if result.is_ok() { "answered" } else { "error" })
+                        .to_owned();
+                    (result, decision)
+                }
+                (None, Reply::AppServer { method, .. }) => {
+                    let (result, decision) = vibeface_bridge::methods::fallback(method);
+                    (result, decision.to_owned())
+                }
+                (None, Reply::Hook { .. }) => (Ok(undecided()), "undecided".to_owned()),
+            };
+            // A hook is answered here at once, so its wait always finds the answer. An answer
+            // given at the same time finds an App Server's while it is sent.
+            let settled = match &request.reply {
+                Reply::AppServer { .. } => {
+                    let sending = json!({"request_id":request_id,"by":by,"sending":true});
+                    answered.insert(request_id.into(), sending);
+                    None
+                }
+                Reply::Hook {
+                    answer: waiting,
+                    waited,
+                } => {
+                    // Its hook left at the deadline, or when the user answered in the session.
+                    let (sent, given) = if *waited && waiting.receiver_count() == 0 {
+                        let left = "the session no longer waits for this request";
+                        (Err(left.to_owned()), None)
+                    } else {
+                        let given = result.clone().unwrap_or_else(|_| undecided());
+                        waiting.send_replace(Some(given.clone()));
+                        (Ok(()), Some(given))
+                    };
+                    let outcome = remember(
+                        &mut answered,
+                        &request,
+                        request_id,
+                        &decision,
+                        by,
+                        sent,
+                        given,
+                    );
+                    Some(outcome)
+                }
+            };
+            (request, result, decision, settled)
+        };
+        let outcome = match (settled, &request.reply) {
+            (Some(outcome), _) => outcome,
+            (None, Reply::Hook { .. }) => unreachable!("a hook is answered with its removal"),
+            (None, Reply::AppServer { rpc_id, .. }) => {
+                let sent = (self.codex.client().respond(rpc_id, result, &decision).await)
+                    .map_err(|error| error.message);
+                let mut answered = lock(&self.triage.answered);
+                remember(
+                    &mut answered,
+                    &request,
+                    request_id,
+                    &decision,
+                    by,
+                    sent,
+                    None,
+                )
             }
-            answered.insert(request_id.into(), outcome.clone());
-        }
+        };
         self.store
             .lock()
             .await
@@ -2584,11 +2614,34 @@ mod tests {
                 async move { node.wait_request(&request_id).await }
             });
             tokio::task::yield_now().await;
+            // What a hook's wait sees once the request is gone from the held ones.
+            let seen = std::thread::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                move || loop {
+                    let requests = node.triage.requests.lock().unwrap();
+                    if !requests.contains_key(&request_id) {
+                        return node
+                            .triage
+                            .answered
+                            .lock()
+                            .unwrap()
+                            .get(&request_id)
+                            .cloned();
+                    }
+                }
+            });
 
             let answered = node
                 .triage_command(json!({"action":"respond","request_id":request_id,
                     "result":{"behavior":"allow"}}))
                 .await?;
+            let seen = seen.join().unwrap().context("answered")?;
+            assert_eq!(
+                (seen["answer"].clone(), seen.get("sending")),
+                (json!({"behavior":"allow"}), None),
+                "a hook's request is never seen gone and not yet answered"
+            );
             assert_eq!(
                 (answered["answered"].clone(), answered["by"].clone()),
                 (json!(true), json!("agent"))
@@ -3763,7 +3816,15 @@ mod tests {
             let on_thread = node.store.lock().await.work_records_on_thread("t-other")?;
             assert_eq!(on_thread.len(), 2, "the refused work left nothing behind");
             // It goes on to Claude Code, which finds no directory for a session without one.
-            assert_eq!(own?["may_send"], false);
+            let own = own?;
+            assert_eq!(own["may_send"], false);
+            assert_eq!(
+                own["state"],
+                serde_json::to_value(crate::work::WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Rejected
+                })?,
+                "the Agent sees the start it was refused"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

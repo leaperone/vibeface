@@ -518,9 +518,7 @@ impl Launch<'_> {
             while let Ok(Some(line)) = lines.next_line().await {
                 tail.push_str(&line);
                 tail.push('\n');
-                if tail.len() > 4000 {
-                    tail = tail.chars().skip(tail.chars().count() - 2000).collect();
-                }
+                keep_end(&mut tail);
             }
             tail.trim().to_owned()
         });
@@ -531,6 +529,14 @@ impl Launch<'_> {
             lines: BufReader::new(stdout).lines(),
             stderr: Some(stderr),
         })
+    }
+}
+
+/// Keeps the last 2000 characters of `tail` once it grows past 4000.
+fn keep_end(tail: &mut String) {
+    let count = tail.chars().count();
+    if count > 4000 {
+        *tail = tail.chars().skip(count - 2000).collect();
     }
 }
 
@@ -1225,6 +1231,17 @@ mod tests {
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude")
+    }
+
+    #[test]
+    fn a_stderr_tail_of_wide_characters_keeps_its_end() {
+        let mut tail = "错".repeat(1399) + "尾";
+        keep_end(&mut tail);
+        assert_eq!(tail.chars().count(), 1400);
+        let mut tail = "错".repeat(4000) + "尾";
+        keep_end(&mut tail);
+        assert_eq!(tail.chars().count(), 2000);
+        assert!(tail.ends_with('尾'));
     }
 
     /// A private directory with Claude Code's home and the fixture's log inside it.

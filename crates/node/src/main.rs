@@ -1829,7 +1829,13 @@ async fn hooks(options: Hooks) -> Result<()> {
     let stamp = vibeface::runtime::now_ms();
     // Every file is read and checked before any is written: one that cannot change leaves all.
     let mut planned = Vec::new();
-    for file in triage::hook_files(home) {
+    let codex_home = vibeface::discovery::Host {
+        home: Some(home.clone()),
+        ..vibeface::discovery::Host::current()
+    }
+    .codex_home()
+    .ok();
+    for file in triage::hook_files(home, codex_home.as_deref()) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {

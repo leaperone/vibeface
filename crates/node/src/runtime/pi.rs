@@ -1197,6 +1197,9 @@ impl Executor for Pi {
                                 .position(|entry| is_message(entry, "user"))
                             {
                                 Some(at) => Some(start + at),
+                                None if group_alive(pointer.group) => {
+                                    bail!("pi may still take the prompt")
+                                }
                                 None => return Ok(Probe::NotStarted),
                             }
                         }
@@ -1743,6 +1746,7 @@ mod tests {
         crate::work::transition(&mut work, Signal::ThreadCreated("s-1".into()));
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);
         let (process, _) = pi.open(&launch(&dir, "reply", "s-1"), "s-1").await?;
+        assert!(pi.probe(&work).await.is_err());
         process.end().await;
         assert!(pi.pointer("s-1")?.is_some());
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);

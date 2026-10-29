@@ -583,6 +583,11 @@ impl Runtime {
                     args,
                 )
                 .await?;
+        let record = match created {
+            true => (self.store.lock().await.work_record(&record.work_id)?)
+                .context("work not found on this device")?,
+            false => record,
+        };
         Ok(
             json!({"work_id":record.work_id,"call_ref":call_ref,"state":record.state,
             "may_send":may_send,"send_by_ms":record.send_by_ms,"cwd":spec.cwd,"thread_id":thread}),

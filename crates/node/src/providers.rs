@@ -223,9 +223,9 @@ impl Provider {
             "cancel": true,
             "steer": self.supports_steer(),
             "resume_local_session": true,
-            // Claude Code's runner reads whole messages; the others stream text as well.
+            // Codex's and Claude Code's runners send whole text; the others stream it as well.
             "text_stream_mode": match self {
-                Provider::Claude => "snapshot",
+                Provider::Codex | Provider::Claude => "snapshot",
                 _ => "delta_and_snapshot",
             },
             "cancel_request": true,
