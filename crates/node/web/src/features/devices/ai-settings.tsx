@@ -339,9 +339,9 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
     </p> : null}
     {onboarding ? null : <details id={`provider-${item.provider}`} className="details">
       <summary className="-mt-2 flex min-h-11 w-fit items-center gap-1 px-4 sm:ps-12 text-meta text-muted-foreground hover:text-foreground">
-        <ChevronRight aria-hidden="true" className="size-4 transition-transform" />设置
+        <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
-      <div className="grid gap-5 px-4 sm:ps-12 pt-1 pb-4">
+      <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
         {serverSettings}
 
         {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} working={working}

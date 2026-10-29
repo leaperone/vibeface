@@ -4,7 +4,7 @@ import { Bot, ChevronRight, CircleAlert, Copy, Inbox as InboxIcon, Lock, Message
 import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
-import Animated, { FadeIn, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
+import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { EmptyState } from '@/components/kit'
@@ -15,14 +15,14 @@ import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import type { Question } from '@vibeface/client/workspace/types.ts'
 import { useInbox, useLive } from '@/data/live'
 import { useWide } from '@/lib/layout'
+import { move } from '@/lib/motion'
 import { QuestionCard } from '@/features/chat/question-card'
 import { ConfirmCard } from '@/features/chat/work'
 import { JoinRequests } from '@/features/devices/join-requests'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recovery'
 
-const Group = withUniwind(Animated.View)
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
-const move = LinearTransition.springify().dampingRatio(1).duration(300).reduceMotion(ReduceMotion.System)
+const Group = withUniwind(Animated.View)
 
 type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' }>
 const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles }
@@ -54,7 +54,7 @@ export default function Inbox() {
   // Its extra 24 on top evens out the container's 16 top and 40 bottom padding, so it centres in that area.
   const below = Math.max(0, frame.height - bar - insets.bottom - 56)
   // Entering animations skip the first render: an inbox opened empty just shows it, one emptied by an answer fades it in.
-  return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-2xl self-center gap-4 p-4 pb-10">
+  return <LayoutAnimationConfig skipEntering><KeyboardAwareScrollView bottomOffset={24} keyboardShouldPersistTaps="handled" contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-3 p-4 pb-10">
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
@@ -68,9 +68,9 @@ export default function Inbox() {
         </Pressable>
       </Link> : null}
       {questions.map((question) => <Animated.View key={question.question_id} layout={move}><QuestionCard question={question} /></Animated.View>)}
-    </Group>) : items.length ? null : <Animated.View entering={FadeIn.duration(200).reduceMotion(ReduceMotion.System)} style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
+    </Group>) : items.length ? null : <View style={{ minHeight: below, paddingTop: 24, justifyContent: 'center' }}>
       <EmptyState icon={InboxIcon} title="没有要你决定的事" />
-    </Animated.View>}
+    </View>}
   </KeyboardAwareScrollView></LayoutAnimationConfig>
 }
 
@@ -83,11 +83,12 @@ function rowHref(item: Row, chat: string | undefined, entry: string | undefined)
 }
 
 function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replace: boolean }) {
-  const row = <View className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
+  const card = 'min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-xs dark:border-line-strong'
+  const body = <>
     <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className="size-5 text-warning" />
     <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{item.title}</Text>
     {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
-    {href ? <Icon as={ChevronRight} className="size-4 text-muted-foreground" /> : null}
-  </View>
-  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className="active:opacity-70">{row}</Pressable></Link> : row
+    {href ? <Icon as={ChevronRight} className="text-muted-foreground" /> : null}
+  </>
+  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
 }

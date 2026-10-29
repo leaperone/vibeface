@@ -3,8 +3,10 @@ import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import type { JoinRequest } from '@vibeface/client/lib/node.ts'
 import { openJoins } from '@vibeface/client/workspace/inbox.ts'
+import { deviceForm, formName } from '@vibeface/client/workspace/labels.ts'
 import { deviceIcon } from './device-icon'
-import { ActionCard, SafetyCode } from '@/components/kit'
+import { ErrorText } from '@/components/action'
+import { ActionCard, SafetyCode, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
@@ -47,15 +49,16 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   const asking = request.status === 'pending' && !auto
   const allow = (manage: boolean) => run(manage ? 'admin' : 'allow', async () => { await device.approveJoin(request.join_id, manage); onAllowed?.(request.name || '新设备') })
-  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false, entry: false })} tone="info" title={`${request.name || '新设备'} 想加入`} actions={<>
-    <Button variant="ghost" className="min-h-11" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
-    {asking ? <Button className="min-h-11" disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
-      {request.kind === 'client' ? <Button variant="outline" className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理设备'}</Text></Button> : null}
-      <Button className="min-h-11" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
+  return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false, entry: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
+    meta={formName[deviceForm(request.kind, request.name)]} actions={<>
+    <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
+    {asking ? <Button disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
+      {request.kind === 'client' ? <Button variant="outline" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理设备'}</Text></Button> : null}
+      <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
     <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的安全码比对' : '等新设备显示安全码'}</Text>
-    {request.code ? <SafetyCode code={request.code} /> : <View className="h-8 w-40 rounded-md bg-muted" />}
-    {error ? <Text role="alert" className="text-meta text-danger">{error}</Text> : null}
+    {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
+    <ErrorText error={error} />
   </ActionCard>
 }

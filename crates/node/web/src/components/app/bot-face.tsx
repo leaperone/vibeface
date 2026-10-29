@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react"
-import { colors, faceOf, HALO, pose, thinkingDots, type Mood } from "@vibeface/client/avatar/face.ts"
+import { colors, faceOf, HALO, oklch, pose, thinkingDots, type Mood } from "@vibeface/client/avatar/face.ts"
 import { ASLEEP, faceMotion, type Frame } from "@vibeface/client/avatar/motion.ts"
 import { moodOf } from "@vibeface/client/avatar/mood.ts"
 import type { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -35,6 +35,15 @@ const followDark = (change: () => void) => {
   observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] })
   return () => observer.disconnect()
 }
+export const useDark = () => useSyncExternalStore(followDark, () => document.documentElement.classList.contains("dark"), () => false)
+
+/** A bot's face hue as a solid fill with legible ink on it, a soft edge for outlines, and a bright glow that stays that hue when faded, so its chat's accents read as that bot's. Same numbers as the phone app. */
+export function botTint(hue: number, dark: boolean) {
+  const glow = oklch(0.74, 0.14, hue)
+  return dark
+    ? { fill: oklch(0.78, 0.09, hue), ink: oklch(0.2, 0.03, hue), edge: oklch(0.42, 0.05, hue), glow }
+    : { fill: oklch(0.45, 0.1, hue), ink: "#fff", edge: oklch(0.86, 0.04, hue), glow }
+}
 
 function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body: SVGPathElement; grey: SVGPathElement; left: SVGPathElement; right: SVGPathElement; dots: SVGCircleElement[] }) {
   parts.g.setAttribute("transform", transformOf(frame))
@@ -50,9 +59,9 @@ function apply(frame: Frame, parts: { g: SVGGElement; ring: SVGPathElement; body
 
 const transformOf = (frame: Frame) => `translate(${50 + frame.dx} ${50 + frame.dy}) rotate(${frame.rotate}) scale(${frame.scale}) translate(-50 -50)`
 
-/** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. */
-export function BotFace({ botId, mood, size, className }: { botId: string; mood: Mood; size: number; className?: string }) {
-  const dark = useSyncExternalStore(followDark, () => document.documentElement.classList.contains("dark"), () => false)
+/** A bot's face, picked by its id and moving with its mood. Hidden from screen readers: the name next to it says who, and lists say the mood. `halo`: a still glow in the bot's tint behind the face, 1.8 times its size. */
+export function BotFace({ botId, mood, size, halo, className }: { botId: string; mood: Mood; size: number; halo?: string; className?: string }) {
+  const dark = useDark()
   const reduced = useSyncExternalStore(followReduced, () => reducedQuery?.matches ?? false, () => false)
   const face = useMemo(() => faceOf(botId), [botId])
   const palette = useMemo(() => ({ awake: colors(face, dark, 1), asleep: colors(face, dark, ASLEEP) }), [face, dark])
@@ -86,7 +95,12 @@ export function BotFace({ botId, mood, size, className }: { botId: string; mood:
         <stop offset={0.55} stopColor={palette[key].base} />
         <stop offset={1} stopColor={palette[key].bottom} />
       </radialGradient>)}
+      {halo ? <radialGradient id={`${gradient}halo`}>
+        <stop offset={0.5} stopColor={halo} stopOpacity={dark ? 0.18 : 0.14} />
+        <stop offset={1} stopColor={halo} stopOpacity={0} />
+      </radialGradient> : null}
     </defs>
+    {halo ? <rect x={-40} y={-40} width={180} height={180} fill={`url(#${gradient}halo)`} /> : null}
     <g transform={transformOf(first)}>
       <path data-ring="" d={first.ring} opacity={first.ringOpacity} fill="none" stroke={palette.awake.ring} strokeWidth={HALO.width} />
       <path data-body="" d={first.body} fill={`url(#${gradient}awake)`} />
