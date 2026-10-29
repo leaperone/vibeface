@@ -245,6 +245,10 @@ impl Store {
             );
             return Ok((existing, false));
         }
+        ensure!(
+            !super::bots::bot_deleted_from(&tx, network, &spec.conversation)?,
+            "the bot that dispatched this work was deleted"
+        );
         let busy = spec.kind == WorkKind::Task
             && !query_runs(
                 &tx,
