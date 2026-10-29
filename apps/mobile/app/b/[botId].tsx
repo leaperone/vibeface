@@ -5,7 +5,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { FlatList, Platform, Pressable, StyleSheet, View } from 'react-native'
 import { KeyboardChatScrollView, KeyboardStickyView, useReanimatedKeyboardAnimation } from 'react-native-keyboard-controller'
 import Animated, { useAnimatedStyle } from 'react-native-reanimated'
-import { useSafeAreaInsets } from 'react-native-safe-area-context'
+import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
@@ -23,6 +23,7 @@ import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
 import { useChatExtras, type Row } from '@/features/chat/work'
 import { RecoveryAlert } from '@/features/recovery/recovery'
+import { useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
 
 /** One row of the chat: a message, or a question or status line between them. */
@@ -78,6 +79,10 @@ export default function ChatScreen() {
   const ios = Platform.OS === 'ios'
   const barHeight = useHeaderHeight()
   const header = ios ? barHeight : 0
+  // A custom title is sized against the whole bar, back button included, so a long name would run under it; the screen's
+  // width less the sidebar and a back button's room on each side keeps it centred and truncated.
+  const frame = useSafeAreaFrame().width
+  const titleWidth = (useWide() ? frame - 320 : frame) - 120
   const { theme } = useUniwind()
   const bot = workspace.bots.find((item) => item.bot_id === botId)
   const id = bot?.conversation_id
@@ -146,7 +151,7 @@ export default function ChatScreen() {
       // Follows the app's own appearance setting, which the system material does not see.
       headerBlurEffect: theme === 'dark' ? 'systemChromeMaterialDark' : 'systemChromeMaterialLight',
       headerTitle: () => <ScreenFaces><Link href={`/b/${bot.bot_id}/about`} asChild>
-        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted">
+        <Pressable accessibilityRole="link" accessibilityLabel={[bot.name, workspace.primary === bot.conversation_id ? '主 Bot' : '', 'Bot 信息'].filter(Boolean).join('，')} className="-mx-2 min-h-11 shrink flex-row items-center gap-2 self-start rounded-lg px-2 active:bg-muted" style={{ maxWidth: titleWidth }}>
           <BotFace botId={bot.bot_id} mood={mood} size={28} />
           <Text numberOfLines={1} className="shrink font-semibold">{bot.name}</Text>
           {workspace.primary === bot.conversation_id ? <Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /> : null}
