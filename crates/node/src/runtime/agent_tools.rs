@@ -523,9 +523,9 @@ impl Runtime {
                 bail!("agent picks a provider of this device; another device's bot picks its own")
             }
         };
-        // The Codex App Server runs every turn of its threads itself. Another provider's session
-        // may be open in a program the Node does not see, so it takes work only in a session one
-        // of its works on this device ran in.
+        if let WorkKind::Agent(provider) = kind {
+            provider.check_work(args)?;
+        }
         if let (Some(thread), WorkKind::Agent(provider)) = (&thread, kind) {
             match self.ran_on(network, thread).await? {
                 Some(ran) if ran != provider => bail!(
@@ -533,7 +533,7 @@ impl Runtime {
                     ran.label(),
                     ran.name()
                 ),
-                None if provider != Provider::Codex => bail!(
+                None if !provider.work().any_thread => bail!(
                     "{} takes work only in sessions this device's works ran in; leave agent out for a Codex thread, and dispatch without thread for a session the user opened",
                     provider.label()
                 ),
@@ -600,24 +600,27 @@ impl Runtime {
     /// connection is up when that is Codex; `None` when none would, as `track_work` then says.
     async fn ready_for(&self, network: &str, args: &Value) -> Option<Provider> {
         let provider = self.executing(network, args).await.ok()?;
-        if provider == Provider::Codex {
+        if provider.on_app_server() {
             self.codex.ready().await;
         }
         Some(provider)
     }
 
     /// The provider a work on this device runs on: `agent`; else the one its thread's works ran
-    /// on, a thread none ran in being a Codex one; else the one the work it continues ran on;
-    /// else the bot's own provider when it executes work here, else the first one that does.
+    /// on, a thread none ran in going to the provider that takes work in any thread; else the
+    /// one the work it continues ran on; else the bot's own provider when it executes work
+    /// here, else the first one that does.
     async fn executing(&self, network: &str, args: &Value) -> Result<Provider> {
         use vibeface_bridge::failure::{ExecFailure, FailureKind};
         let agent: Option<Provider> =
             serde_json::from_value(args["agent"].clone()).context("agent names a provider")?;
         let earlier = match (agent, args["thread"].as_str(), args["continues"].as_str()) {
             (Some(_), _, _) => None,
-            (None, Some(thread), _) => {
-                Some((self.ran_on(network, thread).await?).unwrap_or(Provider::Codex))
-            }
+            (None, Some(thread), _) => (self.ran_on(network, thread).await?).or_else(|| {
+                Provider::ALL
+                    .into_iter()
+                    .find(|provider| provider.work().any_thread)
+            }),
             (None, None, Some(original)) => (self.store.lock().await.work_record(original)?)
                 .and_then(|run| match run.kind {
                     WorkKind::Agent(provider) => Some(provider),

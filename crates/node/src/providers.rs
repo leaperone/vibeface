@@ -17,8 +17,9 @@ const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
-/// the Node watches. Its methods are everything the runtime needs to know about the product;
-/// nothing else matches on the provider.
+/// the Node watches. Its methods say what the runtime needs to know about the product; besides
+/// them, only the code that speaks a provider's protocol matches on it: its `Executor`, its bot
+/// turn's `Sdk` and its hook parser.
 #[derive(
     Clone,
     Copy,
@@ -66,6 +67,29 @@ pub enum Watch {
         file: &'static str,
         source: &'static str,
     },
+}
+
+/// What a dispatched work on the provider can ask for. `track_work` refuses anything else
+/// before it registers the work, and `dispatch_work` describes it from here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkCapabilities {
+    pub images: bool,
+    pub effort: bool,
+    /// It takes work in any of its sessions; otherwise only in one this device's works ran in,
+    /// since another may be open in a program the Node does not see.
+    pub any_thread: bool,
+}
+
+/// Where the provider keeps a bot's threads, which decides whether a thread outlives the
+/// process that ran it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sessions {
+    /// On the App Server the thread was created on.
+    AppServer,
+    /// In the provider's own store, named so, whichever process serves them.
+    Store(&'static str),
+    /// Only in the process that ran the turn.
+    Process,
 }
 
 /// What a bot turn's prompt carries.
@@ -143,7 +167,76 @@ impl Provider {
 
     /// A Codex bot runs its turns on this Node's App Server, which must be up first.
     pub fn on_app_server(self) -> bool {
-        self == Provider::Codex
+        self.sessions() == Sessions::AppServer
+    }
+
+    pub fn sessions(self) -> Sessions {
+        match self {
+            Provider::Codex => Sessions::AppServer,
+            Provider::Opencode => Sessions::Store(crate::runtime::opencode::SERVER),
+            Provider::Cursor | Provider::Claude | Provider::Pi => Sessions::Process,
+        }
+    }
+
+    /// What a work on the provider can ask for; Cursor runs none.
+    pub fn work(self) -> WorkCapabilities {
+        match self {
+            Provider::Codex => WorkCapabilities {
+                images: true,
+                effort: true,
+                any_thread: true,
+            },
+            Provider::Claude => WorkCapabilities {
+                images: false,
+                effort: true,
+                any_thread: false,
+            },
+            Provider::Pi => WorkCapabilities {
+                images: true,
+                effort: true,
+                any_thread: false,
+            },
+            Provider::Opencode => WorkCapabilities {
+                images: true,
+                effort: false,
+                any_thread: false,
+            },
+            Provider::Cursor => WorkCapabilities {
+                images: false,
+                effort: false,
+                any_thread: false,
+            },
+        }
+    }
+
+    /// The providers whose work can ask for what `can` reads.
+    pub fn executing(can: fn(WorkCapabilities) -> bool) -> Vec<&'static str> {
+        Provider::ALL
+            .into_iter()
+            .filter(|provider| provider.supports().contains(&Role::Execution))
+            .filter(|provider| can(provider.work()))
+            .map(Provider::name)
+            .collect()
+    }
+
+    /// Refuses what a dispatch's `args` ask of a work on this provider that it cannot do.
+    pub fn check_work(self, args: &Value) -> Result<()> {
+        let fields: [(&str, fn(WorkCapabilities) -> bool); 2] =
+            [("images", |can| can.images), ("effort", |can| can.effort)];
+        for (field, can) in fields {
+            let asked = match &args[field] {
+                Value::Null => false,
+                Value::Array(items) => !items.is_empty(),
+                _ => true,
+            };
+            ensure!(
+                !asked || can(self.work()),
+                "{} work takes no {field}; leave {field} out, or set agent to one of {:?}",
+                self.label(),
+                Provider::executing(can)
+            );
+        }
+        Ok(())
     }
 
     /// Whether a queued user message can join the bot's running reply.

@@ -33,12 +33,13 @@ pub(crate) enum SteerTrace {
 /// One provider's turns on this device.
 pub(crate) trait Executor: Send + Sync {
     /// Starts `work`, registered just now, in `thread` when there is one: the thread it names
-    /// or that of the work it continues. `args` are `dispatch_work`'s, with model, effort and
-    /// images. The thread is journaled (`Signal::ThreadCreated`) before anything is sent, so a
-    /// restart reads the turn back by the work ID. `true` leaves the send to the dispatching
-    /// Agent, which reports it through `bind_work`. An error means nothing was started, and
-    /// `Runtime::start_work` rejects the work; once something may run, the follower and probes
-    /// settle it.
+    /// or that of the work it continues. `args` are `dispatch_work`'s, whose model it takes,
+    /// with effort and images only as `Provider::work` says. The thread is journaled
+    /// (`Signal::ThreadCreated`) before anything is sent, so a restart reads the turn back by
+    /// the work ID. `true` leaves the send to the dispatching Agent, which reports it through
+    /// `bind_work`. An error means nothing was started: the provider records nothing itself,
+    /// and `Runtime::start_work` rejects the work with it, an `ExecFailure` keeping its kind.
+    /// Once something may run, it returns `Ok` and the follower and probes settle the work.
     fn start<'a>(
         &'a self,
         node: &'a Arc<Runtime>,
@@ -84,7 +85,10 @@ impl Runtime {
             Ok(may_send) => return Ok(may_send),
             Err(error) => error,
         };
-        let failure = ExecFailure::new(FailureKind::Rejected, format!("{error:#}"));
+        let failure = match error.downcast_ref::<ExecFailure>() {
+            Some(failure) => failure.clone(),
+            None => ExecFailure::new(FailureKind::Rejected, format!("{error:#}")),
+        };
         if let Err(signal) =
             (self.signal_work(network, &work.work_id, Signal::StartRejected(failure))).await
         {

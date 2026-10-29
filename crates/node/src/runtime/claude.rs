@@ -783,8 +783,8 @@ where
     match ending.status {
         TurnStatus::Completed => {}
         TurnStatus::Interrupted => {
-            let failure = own("Claude Code turn was interrupted");
-            return Err(error(ManagerFailure::Cancelled, native, failure));
+            let (outcome, failure) = manager::interrupted(&cancel, Provider::Claude);
+            return Err(error(outcome, native, failure));
         }
         _ => {
             let failure = ending
@@ -997,21 +997,7 @@ impl Executor for Claude {
     ) -> BoxFuture<'a, Result<bool>> {
         Box::pin(async move {
             let work_id = work.work_id.as_str();
-            let reject = |failure: ExecFailure| async move {
-                node.signal_work(network, work_id, Signal::StartRejected(failure))
-                    .await
-                    .map(|_| false)
-            };
-            if args["images"]
-                .as_array()
-                .is_some_and(|images| !images.is_empty())
-            {
-                return reject(ExecFailure::new(
-                    FailureKind::Rejected,
-                    "Claude Code work takes no images yet",
-                ))
-                .await;
-            }
+            let reject = |failure: ExecFailure| -> Result<bool> { Err(failure.into()) };
             let env = node.provider_env(Provider::Claude);
             let projects = projects_dir(&env);
             *self.projects.lock().unwrap_or_else(PoisonError::into_inner) = projects.clone();
@@ -1027,8 +1013,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::WriterBusy,
                     "Claude Code still runs another work in this session",
-                ))
-                .await;
+                ));
             }
             let _claim = Claim(self, session.clone());
             // A session is resumed where it ran; Claude Code files it under that directory.
@@ -1040,8 +1025,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::Rejected,
                     format!("the work directory {} does not exist", cwd.display()),
-                ))
-                .await;
+                ));
             }
             if work.thread.is_none() {
                 node.signal_work(network, work_id, Signal::ThreadCreated(session.clone()))
@@ -1064,7 +1048,7 @@ impl Executor for Claude {
             };
             let mut process = match launch.spawn() {
                 Ok(process) => process,
-                Err(failure) => return reject(failure).await,
+                Err(failure) => return reject(failure),
             };
             let sent = async {
                 self.processes.track(process.group, &bin)?;
@@ -1076,8 +1060,7 @@ impl Executor for Claude {
                 return reject(ExecFailure::new(
                     FailureKind::Lost,
                     format!("Claude Code did not take the prompt: {e}"),
-                ))
-                .await;
+                ));
             }
             let interrupted = Arc::new(AtomicBool::new(false));
             self.live().insert(
@@ -1529,6 +1512,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_bot_turn_claude_code_aborts_on_its_own_fails_instead_of_reading_as_stopped()
+    -> Result<()> {
+        let place = Place::new()?;
+        let (record, _) = recorder();
+        let (_, never) = tokio::sync::watch::channel(false);
+        let (result, _, _) = bot_turn(
+            &place,
+            &bot_config(&place, record),
+            "abort now",
+            None,
+            never,
+        )
+        .await;
+        let Err(error) = result else {
+            bail!("an aborted turn has no reply");
+        };
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("a manager error")?;
+        assert_eq!(error.outcome, ManagerFailure::Failed, "{error}");
+        assert!(error.to_string().contains("without being asked"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_bot_turn_shows_no_provider_key() -> Result<()> {
         let place = Place::new()?;
         let (record, _) = recorder();
@@ -1644,8 +1652,8 @@ mod tests {
             .lock()
             .await
             .accept_work(&node.identity, network, spec.clone(), now_ms())?;
-        node.executor(Provider::Claude)?
-            .start(node, network, spec, None, &json!({}))
+        let claude = node.executor(Provider::Claude)?;
+        node.start_work(claude, network, spec, None, &json!({}))
             .await
     }
 
@@ -1806,11 +1814,16 @@ mod tests {
         }
         let (claude, args) = (node.executor(Provider::Claude)?, json!({}));
         let (a, b) = tokio::join!(
-            claude.start(&node, &network, &specs[0], Some(&session), &args),
-            claude.start(&node, &network, &specs[1], Some(&session), &args),
+            node.start_work(claude, &network, &specs[0], Some(&session), &args),
+            node.start_work(claude, &network, &specs[1], Some(&session), &args),
         );
-        a?;
-        b?;
+        let refused: Vec<_> = [a, b].into_iter().filter_map(Result::err).collect();
+        assert_eq!(refused.len(), 1, "the start of the other one says why");
+        assert!(
+            format!("{:#}", refused[0]).contains("still runs another work in this session"),
+            "{:#}",
+            refused[0]
+        );
         let mut rejected = 0;
         for spec in &specs {
             let state = until(&node, &spec.work_id, |state| {

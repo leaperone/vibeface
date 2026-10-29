@@ -3781,7 +3781,7 @@ pub(super) mod tests {
             let access = Access {
                 manager: Some(crate::runtime::ManagerAccess {
                     attempt_id: attempt.clone(),
-                    trigger,
+                    trigger: trigger.clone(),
                 }),
                 ..access
             };
@@ -3859,15 +3859,119 @@ pub(super) mod tests {
             let crossed = format!("{:#}", crossed.expect_err("Codex into a Claude Code session"));
             assert!(crossed.contains("set agent to claude"), "{crossed}");
             // It goes on to Claude Code, which finds no directory for a session without one.
-            let own = own?;
-            assert_eq!(own["may_send"], false);
-            assert_eq!(
-                own["state"],
-                serde_json::to_value(crate::work::WorkState::Finished {
-                    outcome: crate::model::WorkOutcome::Rejected
-                })?,
-                "the Agent sees the start it was refused"
+            let own = format!("{:#}", own.expect_err("Claude Code refuses the start"));
+            assert!(
+                own.contains("does not exist") && own.contains("new call_ref"),
+                "the Agent reads why its start was refused: {own}"
             );
+            let refused = crate::work::WorkSpec::id("c", &trigger, "r5");
+            let refused = (node.store.lock().await.work_record(&refused)?)
+                .context("the refused work")?;
+            assert_eq!(
+                refused.state,
+                crate::work::WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Rejected
+                }
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_work_asking_what_its_agent_cannot_do_is_refused_before_it_is_registered()
+    -> Result<()> {
+        use crate::providers::Provider;
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            node.settings.lock().unwrap().roots = vec![dir.clone()];
+            {
+                let mut providers = node.providers.lock().unwrap();
+                for provider in [Provider::Claude, Provider::Opencode] {
+                    providers.switches.execution.insert(provider);
+                    let bin = format!("/nonexistent/{}", provider.name());
+                    (providers.bins).insert(provider, bin.into());
+                }
+            }
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                Provider::Codex,
+            )
+            .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger: trigger.clone(),
+                }),
+                ..access
+            };
+            let asks = |call_ref: &str, agent: &str, extra: Value| {
+                let mut args = json!({"cwd":dir.display().to_string(),"call_ref":call_ref,
+                    "title":"t","prompt":"p","agent":agent});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                args
+            };
+            let images = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r1", "claude", json!({"images":["/a.png"]})),
+                )
+                .await;
+            let effort = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r2", "opencode", json!({"effort":"high"})),
+                )
+                .await;
+            let plain = node
+                .tool(
+                    access.clone(),
+                    "track_work",
+                    asks("r3", "claude", json!({"images":[]})),
+                )
+                .await;
+            node.finish_manager_attempt(&attempt).await;
+            let images = format!("{:#}", images.expect_err("Claude Code takes no images"));
+            assert!(
+                images.contains("takes no images") && images.contains("\"pi\""),
+                "{images}"
+            );
+            let effort = format!("{:#}", effort.expect_err("opencode takes no effort"));
+            assert!(effort.contains("takes no effort"), "{effort}");
+            let plain = format!(
+                "{:#}",
+                plain.expect_err("the start fails on the missing program")
+            );
+            assert!(
+                !plain.contains("takes no"),
+                "an empty image list asks for nothing: {plain}"
+            );
+            for call_ref in ["r1", "r2"] {
+                let work_id = crate::work::WorkSpec::id("c", &trigger, call_ref);
+                assert!(
+                    node.store.lock().await.work_record(&work_id)?.is_none(),
+                    "{call_ref} left no work behind"
+                );
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
