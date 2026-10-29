@@ -8,6 +8,7 @@ import { providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, taskActive, taskLabel } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
+import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
 import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
@@ -52,7 +53,7 @@ export function useChatExtras(conversationId: string, botId: string) {
     if (at) after.set(at, [...after.get(at) ?? [], row])
     else rest.push(row)
   }
-  const asking = new Set(data.questions.filter((question) => !question.answer && question.about.request_id).map((question) => question.about.session_id))
+  const asking = new Set(data.questions.filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
   const jobs = data.scheduler?.jobs ?? []
   const shown = new Set(data.messages.map((message) => message.message_id))
   data.works.forEach((work, index) => {
