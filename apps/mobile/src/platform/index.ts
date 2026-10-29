@@ -79,7 +79,7 @@ const lan: Lan = {
   watch(listener) {
     let browsing: { remove(): void } | null = null
     const follow = (state: string | null | undefined) => {
-      if (state === 'active' && !browsing) browsing = LanBrowser.addListener('onChange', ({ services }) => listener(services))
+      if (state === 'active' && !browsing) { nativeLan.prepare(); browsing = LanBrowser.addListener('onChange', ({ services }) => listener(services)) }
       if (state === 'background' && browsing) { browsing.remove(); browsing = null; listener([]) }
     }
     follow(AppState.currentState)

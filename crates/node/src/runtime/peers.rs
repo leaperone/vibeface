@@ -226,6 +226,9 @@ impl Runtime {
     }
 
     pub(super) async fn stop_network(&self) {
+        if let Ok(net) = self.net() {
+            net.stop_lan().await;
+        }
         if let Some(router) = self.router.lock().await.take() {
             let _ = router.shutdown().await;
         }

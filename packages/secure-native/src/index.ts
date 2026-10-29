@@ -196,4 +196,6 @@ export const lan = {
     }
   },
   names: (tag: string, networkId: string, deviceId: string) => ffi.lanTagMatches(tag, networkId, deviceId),
+  /** Binds the QUIC endpoint once, so a dial's time goes to dialing; a failure surfaces on that dial. */
+  prepare: () => { ffi.lanPrepare().catch(() => {}) },
 }

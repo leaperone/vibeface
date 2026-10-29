@@ -359,6 +359,8 @@ extern "C" {
         RustBuffer addrs, 
         uint32_t timeout_ms
     );
+    /*handle*/ uint64_t uniffi_vibeface_secure_ffi_fn_func_lan_prepare(
+    );
     int8_t uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(
         RustBuffer tag, 
         RustBuffer network_id, 
@@ -589,6 +591,8 @@ extern "C" {
     uint16_t uniffi_vibeface_secure_ffi_checksum_func_verify_membership(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_func_lan_connect(
+    );
+    uint16_t uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(
     );
     uint16_t uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(
     );
@@ -2524,6 +2528,14 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
             return this->cpp_uniffi_vibeface_secure_ffi_fn_func_lan_connect(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_prepare"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_prepare"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_fn_func_lan_prepare(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches"),
@@ -3026,6 +3038,14 @@ NativeVibefaceSecureFfi::NativeVibefaceSecureFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches"] = jsi::Function::createFromHostFunction(
@@ -3950,6 +3970,13 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_lan_c
         
         return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
 }
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_lan_prepare(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_fn_func_lan_prepare(
+        );
+
+        
+        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
+}
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::vibeface_secure_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[0]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::vibeface_secure_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]), 
@@ -4425,6 +4452,13 @@ jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func
 }
 jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_vibeface_secure_ffi_checksum_func_lan_connect(
+        );
+
+        
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeVibefaceSecureFfi::cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(
         );
 
         
