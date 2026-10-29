@@ -21,6 +21,7 @@ import { Text } from '@/components/ui/text'
 import { Textarea } from '@/components/ui/textarea'
 import { useWorkspace } from '@/data/context'
 import { RecoveredStep, RecoveryRestore, RecoveryReview, RecoveryWaiting } from '@/features/recovery/recovery'
+import { openedLink } from '@/lib/join-link'
 import { move } from '@/lib/motion'
 import { useRun } from '@/lib/use-run'
 import { defaultName, self } from '@/platform'
@@ -88,9 +89,9 @@ function JoinForm() {
   const device = useDevice()
   const url = useLinkingURL()
   const [invitation, setInvitation] = useState('')
-  // The raw URL keeps the ticket after `#`, which router params drop; every new `vibeface://join?link=` refills the field.
+  // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
-    const link = url ? new URL(url).searchParams.get('link') : null
+    const link = openedLink(url)
     if (link && link !== spent) setInvitation(link)
   }, [url])
   const [name, setName] = useState(defaultName)

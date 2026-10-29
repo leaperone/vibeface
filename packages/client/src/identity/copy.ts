@@ -13,6 +13,15 @@ export const joinCopy = {
 
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
+/** An erase takes this device's management with it; the phone warns before clearing itself. */
+export const eraseSoleManagerText = (self: string) => `${self}是唯一的管理设备，清除后这个网络就没有管理设备了。`
+/** A join link from another network, opened on a device already in one. */
+export const switchCopy = {
+  title: '换到新的网络？',
+  erase: (self: string) => `${self}会离开当前网络，并清除本机数据`,
+  leave: (self: string) => `${self}会离开当前网络`,
+  confirm: '换网络',
+}
 /** The login this device kept only in its own storage is gone; the web and the phone say so the same way. */
 export const lostKeyText = (self: string) => `${self}保存的登录信息不见了。用加入链接重新加入，或用恢复文件找回。原任务不会因此重新执行。`
 
