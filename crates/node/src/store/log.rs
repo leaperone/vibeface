@@ -92,13 +92,22 @@ fn head(connection: &Connection, network: &str, author: &str) -> Result<Option<(
         .optional()?)
 }
 
+/// What placing a batch did besides each event's own status.
+#[derive(Default)]
+pub(crate) struct Placed {
+    /// The effective set must be recomputed before the batch commits.
+    pub stale: bool,
+    /// Each event stored on its author's main chain, in order, including those that waited for
+    /// an ancestor in this batch.
+    pub stored: Vec<HashedEvent>,
+}
+
 /// Verifies once, then places; events waiting on this one are placed without re-verifying.
-/// Sets `stale` when the effective set must be recomputed before the batch commits.
 pub(crate) fn ingest_from(
     connection: &Connection,
     view: &AuthorizationView,
     envelope: &SignedEvent,
-    stale: &mut bool,
+    placed: &mut Placed,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
     let event = match check_event(network, envelope) {
@@ -124,9 +133,9 @@ pub(crate) fn ingest_from(
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    let status = place(connection, view, envelope, &event, stale)?;
+    let status = place(connection, view, envelope, &event, placed)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
-        cascade(connection, view, &envelope.hash, stale)?;
+        cascade(connection, view, &envelope.hash, placed)?;
     }
     Ok(status)
 }
@@ -135,7 +144,7 @@ fn cascade(
     connection: &Connection,
     view: &AuthorizationView,
     hash: &str,
-    stale: &mut bool,
+    placed: &mut Placed,
 ) -> Result<()> {
     let mut ready = vec![hash.to_owned()];
     while let Some(hash) = ready.pop() {
@@ -149,7 +158,7 @@ fn cascade(
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             if matches!(
-                place(connection, view, &envelope, &event, stale)?,
+                place(connection, view, &envelope, &event, placed)?,
                 IngestStatus::Accepted | IngestStatus::Conflict
             ) {
                 ready.push(envelope.hash);
@@ -190,7 +199,7 @@ fn place(
     view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
-    stale: &mut bool,
+    placed: &mut Placed,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
     let (max, head_hash) = head(connection, network, &event.author)?.unwrap_or((0, String::new()));
@@ -239,12 +248,15 @@ fn place(
         Some(prev) => *prev == head_hash,
         None => max == 0,
     };
-    *stale |= !insert_event(connection, view, envelope, event, main)?;
-    Ok(if main {
-        IngestStatus::Accepted
-    } else {
-        IngestStatus::Conflict
-    })
+    placed.stale |= !insert_event(connection, view, envelope, event, main)?;
+    if !main {
+        return Ok(IngestStatus::Conflict);
+    }
+    placed.stored.push(HashedEvent {
+        hash: envelope.hash.clone(),
+        event: event.clone(),
+    });
+    Ok(IngestStatus::Accepted)
 }
 
 /// The user's device signature on `cause` is what authorizes a write a bot makes for the user:

@@ -55,6 +55,15 @@ impl WriteState {
     }
 }
 
+/// One ingested batch: each envelope's status, the events it stored on their authors' main
+/// chains (an event that waited for an ancestor is stored with that ancestor), and whether it
+/// changed which events count and so rebuilt the projections.
+pub struct Ingested {
+    pub statuses: Vec<IngestStatus>,
+    pub stored: Vec<HashedEvent>,
+    pub rebuilt: bool,
+}
+
 pub struct Store {
     pub(crate) connection: Connection,
     blob_dir: PathBuf,
@@ -293,31 +302,43 @@ impl Store {
                 .optional()?,
         )
     }
+    /// Calls `written` whenever any log head is written, whichever path appended or ingested it.
+    pub(crate) fn on_log_head_written(&self, written: impl Fn() + Send + 'static) {
+        self.connection
+            .update_hook(Some(move |_, _: &str, table: &str, _| {
+                if table == "log_heads" {
+                    written();
+                }
+            }));
+    }
     /// The member record of a current, unrevoked Node.
     pub fn authorize_node(&self, network_id: &str, device_id: &str) -> Result<Member> {
         authorize_node_from(&self.connection, network_id, device_id)
     }
     /// Stores each event or reports why not; one bad event never aborts the batch.
-    /// Signatures are verified here, once; stored events are trusted afterwards. Also returns
-    /// whether the batch changed which events count and so rebuilt the projections.
+    /// Signatures are verified here, once; stored events are trusted afterwards.
     pub fn ingest_events(
         &mut self,
         network_id: &str,
         envelopes: &[SignedEvent],
-    ) -> Result<(Vec<IngestStatus>, bool)> {
+    ) -> Result<Ingested> {
         ensure!(envelopes.len() <= 1024, "event batch is too large");
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let view = membership_from(&tx, network_id)?;
-        let mut stale = false;
+        let mut placed = log::Placed::default();
         let statuses = envelopes
             .iter()
-            .map(|envelope| log::ingest_from(&tx, &view, envelope, &mut stale))
+            .map(|envelope| log::ingest_from(&tx, &view, envelope, &mut placed))
             .collect::<Result<Vec<_>>>()?;
-        let rebuilt = stale && log::recompute(&tx, &view)?;
+        let rebuilt = placed.stale && log::recompute(&tx, &view)?;
         tx.commit()?;
-        Ok((statuses, rebuilt))
+        Ok(Ingested {
+            statuses,
+            stored: placed.stored,
+            rebuilt,
+        })
     }
 
     pub fn append_event(

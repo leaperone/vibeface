@@ -131,7 +131,7 @@ fn out_of_order_delivery_converges() -> Result<()> {
     let expected = projection(&origin, &net, "c")?;
 
     let mut b_first = store(&net)?;
-    let statuses = b_first.ingest_events(&net.network, &b_events)?.0;
+    let statuses = b_first.ingest_events(&net.network, &b_events)?.statuses;
     assert!(
         statuses
             .iter()
@@ -176,22 +176,22 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
     assert_eq!(
         target
             .ingest_events(&net.network, std::slice::from_ref(&first))?
-            .0,
+            .statuses,
         vec![IngestStatus::Accepted]
     );
     assert_eq!(
         target
             .ingest_events(&net.network, std::slice::from_ref(&first))?
-            .0,
+            .statuses,
         vec![IngestStatus::Duplicate]
     );
     assert!(
-        matches!(target.ingest_events(&net.network, &[third])?.0[0], IngestStatus::Rejected(ref e) if e.contains("gap"))
+        matches!(target.ingest_events(&net.network, &[third])?.statuses[0], IngestStatus::Rejected(ref e) if e.contains("gap"))
     );
     let mut forged = first.clone();
     forged.signature = "00".repeat(64);
     assert_eq!(
-        target.ingest_events(&net.network, &[forged])?.0,
+        target.ingest_events(&net.network, &[forged])?.statuses,
         vec![IngestStatus::Duplicate]
     );
     let stranger = LocalIdentity::generate();
@@ -208,7 +208,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         blobs: vec![],
     })?;
     assert!(
-        matches!(target.ingest_events(&net.network, &[foreign])?.0[0], IngestStatus::Rejected(ref e) if e.contains("unknown author"))
+        matches!(target.ingest_events(&net.network, &[foreign])?.statuses[0], IngestStatus::Rejected(ref e) if e.contains("unknown author"))
     );
     let mut tampered = net.b.sign_event(Event {
         version: WIRE_VERSION,
@@ -227,7 +227,7 @@ fn duplicates_gaps_and_forgeries_are_rejected() -> Result<()> {
         .sign_event(serde_json::from_str::<Event>(&first.canonical_body)?)?
         .signature;
     assert!(matches!(
-        target.ingest_events(&net.network, &[tampered])?.0[0],
+        target.ingest_events(&net.network, &[tampered])?.statuses[0],
         IngestStatus::Rejected(_)
     ));
     Ok(())
@@ -281,7 +281,7 @@ fn a_forked_log_stops_counting_and_the_conversation_stays_appendable() -> Result
     assert_eq!(
         target
             .ingest_events(&net.network, &[created, kept, fork, after_fork])?
-            .0,
+            .statuses,
         vec![
             IngestStatus::Accepted,
             IngestStatus::Accepted,
@@ -306,7 +306,7 @@ fn a_forked_log_stops_counting_and_the_conversation_stays_appendable() -> Result
         5,
     )?;
     assert_eq!(
-        target.ingest_events(&net.network, &[next])?.0,
+        target.ingest_events(&net.network, &[next])?.statuses,
         vec![IngestStatus::Accepted]
     );
     let texts: Vec<_> = target
@@ -351,7 +351,7 @@ fn the_write_gate_stops_local_appends_only() -> Result<()> {
         assert!(error.to_string().contains(refusal), "{error}");
     }
     assert_eq!(
-        gated.ingest_events(&net.network, &[created])?.0,
+        gated.ingest_events(&net.network, &[created])?.statuses,
         vec![IngestStatus::Accepted]
     );
     gated.set_write_state(WriteState::Writable)?;
@@ -1604,7 +1604,9 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
 
     let mut replica = store(&net)?;
     let a_log = |side: &Store| side.events_from(&net.network, &net.a.device_id().unwrap(), 1, 500);
-    let statuses = replica.ingest_events(&net.network, &a_log(&a_side)?)?.0;
+    let statuses = replica
+        .ingest_events(&net.network, &a_log(&a_side)?)?
+        .statuses;
     assert_eq!(statuses.last(), Some(&IngestStatus::Pending));
     let b_log = b_side.events_from(&net.network, &net.b.device_id()?, 1, 500)?;
     replica.ingest_events(&net.network, &b_log)?;
@@ -1630,7 +1632,7 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
     assert_eq!(
         replica
             .ingest_events(&net.network, std::slice::from_ref(&late))?
-            .0,
+            .statuses,
         [IngestStatus::Accepted]
     );
 
@@ -1659,7 +1661,7 @@ fn owner_only_writes_follow_the_owner_their_author_knew() -> Result<()> {
         blobs: vec![],
     })?;
     assert!(matches!(
-        &replica.ingest_events(&net.network, &[forged])?.0[0],
+        &replica.ingest_events(&net.network, &[forged])?.statuses[0],
         IngestStatus::Rejected(error) if error.contains("scheduling Node")
     ));
     assert_eq!(checkpoints(&replica, &net)?, ["back", "late"]);
@@ -1752,7 +1754,7 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     assert!(
         target
             .ingest_events(&net.network, &a_events)?
-            .0
+            .statuses
             .iter()
             .all(|status| *status == IngestStatus::Accepted)
     );
@@ -1792,7 +1794,7 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
         ("m2", vec![m1.hash.clone()]),
     ] {
         assert!(
-            matches!(&target.ingest_events(&net.network, &[change(cause, deps)?])?.0[0],
+            matches!(&target.ingest_events(&net.network, &[change(cause, deps)?])?.statuses[0],
                 IngestStatus::Rejected(error) if error.contains("user's own signed message")),
             "{cause}"
         );
@@ -1801,7 +1803,7 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
     assert_eq!(
         target
             .ingest_events(&net.network, &[change("m1", vec![m1.hash.clone()])?])?
-            .0,
+            .statuses,
         vec![IngestStatus::Accepted]
     );
     assert_eq!(target.bots(&net.network)?[0].name, "Nova");
@@ -2094,7 +2096,7 @@ fn second_bot(store: &mut Store, net: &Net, name: &str) -> Result<()> {
 fn all_accepted(target: &mut Store, net: &Net, source: &Store) -> Result<()> {
     for author in [&net.a, &net.b] {
         let events = source.events_from(&net.network, &author.device_id()?, 1, 500)?;
-        let statuses = target.ingest_events(&net.network, &events)?.0;
+        let statuses = target.ingest_events(&net.network, &events)?.statuses;
         assert!(
             statuses
                 .iter()
@@ -2474,7 +2476,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
         blobs: vec![],
     })?;
     assert!(matches!(
-        &other.ingest_events(&net.network, &[forged])?.0[0],
+        &other.ingest_events(&net.network, &[forged])?.statuses[0],
         IngestStatus::Rejected(error) if error.contains("one-time reminder")
     ));
     Ok(())
@@ -2778,7 +2780,7 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
         blobs: vec![],
     })?;
     assert!(matches!(
-        &other.ingest_events(&net.network, &[hijack])?.0[0],
+        &other.ingest_events(&net.network, &[hijack])?.statuses[0],
         IngestStatus::Rejected(error) if error.contains("follows its creation")
     ));
     Ok(())
@@ -3761,10 +3763,12 @@ fn a_retired_bound_holds_across_recovery_and_old_attestations_verify() -> Result
 
     let mut late = store(net)?;
     late.install_trust_bundle(&net.network, &recovered)?;
-    let (statuses, _) = late.ingest_events(
-        &net.network,
-        &[vec![created.clone()], writes.clone()].concat(),
-    )?;
+    let statuses = late
+        .ingest_events(
+            &net.network,
+            &[vec![created.clone()], writes.clone()].concat(),
+        )?
+        .statuses;
     assert!(
         statuses.iter().all(|s| *s == IngestStatus::Accepted),
         "{statuses:?}"
@@ -6046,7 +6050,7 @@ fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()>
     for batches in [[&early, &late, &picks], [&early, &picks, &late]] {
         let mut device = store(&net)?;
         for batch in batches {
-            let statuses = device.ingest_events(&net.network, batch)?.0;
+            let statuses = device.ingest_events(&net.network, batch)?.statuses;
             assert!(
                 statuses
                     .iter()
