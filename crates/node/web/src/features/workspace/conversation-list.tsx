@@ -29,7 +29,7 @@ export function ConversationList() {
     const last = bot.last_message, mood = botMood(bot, workspace)
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
-      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace botId={bot.bot_id} mood={mood} size={44} />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
+      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace bot={bot} mood={mood} size={44} />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
         name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</>} />
     </li>
   })}</ul>

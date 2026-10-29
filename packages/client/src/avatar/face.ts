@@ -1,7 +1,11 @@
 export type Outline = 'round' | 'squircle' | 'drop' | 'bean' | 'cloud'
 export type Eyes = 'dot' | 'pill' | 'oval' | 'wide'
 export type Mood = 'idle' | 'thinking' | 'replying' | 'waiting' | 'asleep'
-export type Face = { hue: number; outline: Outline; eyes: Eyes; gap: number; tilt: number }
+export type Hue = typeof HUES[number]
+/** The parts of a face a person or the bot picked; anything unpicked comes from the bot's id. */
+export type Avatar = { outline: Outline; eyes: Eyes; hue: Hue }
+/** `seed` sets the blink phase; it always comes from the id, so a new look keeps the bot's rhythm. */
+export type Face = Avatar & { gap: number; tilt: number; seed: number }
 export type Pose = {
   radii: number[]; dx: number; dy: number; scale: number; rotate: number
   open: number; gazeX: number; gazeY: number; squint: number; saturation: number; ring: number; dots: number
@@ -12,26 +16,26 @@ export const SAMPLES = 48
 /** Body radius in the 100 viewBox; the halo ring sits a 1.5 gap outside it. */
 export const BODY = 36
 export const HALO = { r: BODY + 1.5 + 1.2, width: 2.4 }
-const OUTLINES: Outline[] = ['round', 'squircle', 'drop', 'bean', 'cloud']
-const EYES: Eyes[] = ['dot', 'pill', 'oval', 'wide']
-// OKLCH hues. 60 to 90 is left to the amber waiting halo so no face blurs into it.
-const HUES = [20, 45, 100, 130, 155, 180, 205, 230, 255, 285, 315, 345]
+export const OUTLINES: readonly Outline[] = ['round', 'squircle', 'drop', 'bean', 'cloud']
+export const EYES: readonly Eyes[] = ['dot', 'pill', 'oval', 'wide']
+// OKLCH hues. 60 to 90 is left to the amber waiting halo so no face blurs into it. The Node accepts these same values.
+export const HUES = [20, 45, 100, 130, 155, 180, 205, 230, 255, 285, 315, 345] as const
 const YELLOW = 100
 const ANGLES = Array.from({ length: SAMPLES }, (_, i) => 2 * Math.PI * i / SAMPLES)
 
-export function faceOf(id: string): Face {
+export function faceOf(id: string, avatar?: Avatar | null): Face {
   let hash = 2166136261
   for (const char of id) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619)
   hash = (hash ^ (hash >>> 16)) >>> 0
   const more = unit(hash, 7) * 2 ** 32 >>> 0
-  return {
-    hue: HUES[hash % HUES.length],
-    outline: OUTLINES[(hash >>> 3) % OUTLINES.length],
-    eyes: EYES[(more >>> 4) % EYES.length],
-    gap: 10 + (more >>> 9) % 41 / 10,
-    tilt: (more >>> 17) % 13 - 6,
-  }
+  const hue = HUES[hash % HUES.length], outline = OUTLINES[(hash >>> 3) % OUTLINES.length]
+  const gap = 10 + (more >>> 9) % 41 / 10, tilt = (more >>> 17) % 13 - 6
+  const seed = Math.round(gap * 10) * 7919 + (tilt + 6) * 131 + hue + OUTLINES.indexOf(outline) * 31
+  return { hue, outline, eyes: EYES[(more >>> 4) % EYES.length], gap, tilt, seed, ...avatar }
 }
+
+export const sameAvatar = (a: Avatar | null, b: Avatar | null) =>
+  a === b || Boolean(a && b && a.outline === b.outline && a.eyes === b.eyes && a.hue === b.hue)
 
 const shapes: Record<Outline, (a: number) => number> = {
   round: () => 1,
@@ -74,7 +78,7 @@ const moods: Record<Mood, (t: number, seed: number) => Motion> = {
 }
 
 export function pose(face: Face, mood: Mood, t: number): Pose {
-  const { lean, ripple, ...motion } = moods[mood](t, seedOf(face))
+  const { lean, ripple, ...motion } = moods[mood](t, face.seed)
   const base = BASE[face.outline]
   const radii = ripple ? base.map((r, i) => clamp(r + ripple(ANGLES[i]), 0.85, 1.15)) : base.map(r => clamp(r, 0.85, 1.15))
   return { ...motion, radii, rotate: face.tilt + lean }
@@ -219,10 +223,6 @@ function blink(t: number, seed: number, double: boolean) {
     return x * x * (3 - 2 * x)
   }
   return double && unit(seed + 1, slot) < 0.5 ? Math.min(shut(t - at), shut(t - at - 260)) : shut(t - at)
-}
-
-function seedOf(face: Face) {
-  return Math.round(face.gap * 10) * 7919 + (face.tilt + 6) * 131 + face.hue + OUTLINES.indexOf(face.outline) * 31
 }
 
 function unit(seed: number, n: number) {

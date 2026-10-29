@@ -216,6 +216,115 @@ pub struct SkillsEdit {
     pub after: SkillSet,
 }
 
+/// A face's outline; `packages/client/src/avatar/face.ts` draws it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Outline {
+    Round,
+    Squircle,
+    Drop,
+    Bean,
+    Cloud,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Eyes {
+    Dot,
+    Pill,
+    Oval,
+    Wide,
+}
+
+/// The OKLCH hues a face may take. 60 to 90 stays the waiting halo's amber.
+pub const HUES: [u16; 12] = [20, 45, 100, 130, 155, 180, 205, 230, 255, 285, 315, 345];
+
+/// One of `HUES`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct Hue(u16);
+
+impl TryFrom<u16> for Hue {
+    type Error = String;
+    fn try_from(value: u16) -> Result<Self, String> {
+        if HUES.contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!("hue is one of {HUES:?}"))
+        }
+    }
+}
+
+impl From<Hue> for u16 {
+    fn from(hue: Hue) -> u16 {
+        hue.0
+    }
+}
+
+/// The face picked for a bot. Without one the face comes from the bot's ID, as do its eye
+/// spacing and tilt either way.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Avatar {
+    pub outline: Outline,
+    pub eyes: Eyes,
+    pub hue: Hue,
+}
+
+/// In `face.ts` order: the ID derivation indexes these.
+const OUTLINES: [Outline; 5] = [
+    Outline::Round,
+    Outline::Squircle,
+    Outline::Drop,
+    Outline::Bean,
+    Outline::Cloud,
+];
+const EYES: [Eyes; 4] = [Eyes::Dot, Eyes::Pill, Eyes::Oval, Eyes::Wide];
+
+impl Avatar {
+    /// The face `faceOf` in `face.ts` gives a bot that has none picked; the two must agree, as
+    /// `packages/client/src/avatar/derived-faces.json` checks.
+    pub fn derived(bot_id: &str) -> Self {
+        let mut hash: u32 = 2_166_136_261;
+        for c in bot_id.chars() {
+            // `charCodeAt(0)` of each code point: the first UTF-16 unit.
+            let unit = c.encode_utf16(&mut [0; 2])[0];
+            hash = (hash ^ u32::from(unit)).wrapping_mul(16_777_619);
+        }
+        hash ^= hash >> 16;
+        let more = scramble(hash, 7);
+        Self {
+            outline: OUTLINES[(hash >> 3) as usize % OUTLINES.len()],
+            eyes: EYES[(more >> 4) as usize % EYES.len()],
+            hue: Hue(HUES[hash as usize % HUES.len()]),
+        }
+    }
+}
+
+/// `unit` in `face.ts` before it divides by 2^32.
+fn scramble(seed: u32, n: u32) -> u32 {
+    let mut h = (seed ^ n.wrapping_mul(0x9e37_79b1)).wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
+}
+
+/// The face a bot shows, and whether one was picked rather than given by its ID.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ShownAvatar {
+    #[serde(flatten)]
+    pub avatar: Avatar,
+    pub picked: bool,
+}
+
+/// `None` is the face the bot's ID gives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarEdit {
+    pub before: Option<Avatar>,
+    pub after: Option<Avatar>,
+}
+
 /// One setting's value before and after a change; `before` is what the writer saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -307,6 +416,8 @@ pub enum BotChange {
         model: Option<ModelEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<SkillsEdit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<AvatarEdit>,
     },
     Skill {
         skill_id: String,
@@ -491,11 +602,19 @@ impl BotChange {
                 instructions,
                 model,
                 skills,
+                avatar,
             } => {
                 anyhow::ensure!(
-                    name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
+                    name.is_some()
+                        || instructions.is_some()
+                        || model.is_some()
+                        || skills.is_some()
+                        || avatar.is_some(),
                     "a profile change names a field"
                 );
+                if let Some(avatar) = avatar {
+                    anyhow::ensure!(avatar.before != avatar.after, "the face is unchanged");
+                }
                 if let Some(model) = model {
                     validate_model(&model.after)?;
                     anyhow::ensure!(model.before != model.after, "the model is unchanged");
@@ -715,6 +834,16 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<Cause>,
     },
+    /// In the bot's conversation: the user picks its face from the web, or `None` for the one
+    /// its ID gives. It and a chat change of the face win by rank alike. `version` is the face's
+    /// version the user saw, `None` before any change; the signature covers it, so a request
+    /// replayed after the face moved on cannot be pointed at the new version.
+    BotAvatarSet {
+        version: Option<String>,
+        avatar: Option<Avatar>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// In the bot's conversation: the user moves its project folder, or clears it, from the web.
     BotProjectSet {
         project: Option<BotProject>,
@@ -773,6 +902,7 @@ impl EventBody {
             | Self::NotificationAcked { attestation, .. }
             | Self::PrimaryBotSet { attestation, .. }
             | Self::BotProjectSet { attestation, .. }
+            | Self::BotAvatarSet { attestation, .. }
             | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
@@ -794,6 +924,7 @@ impl EventBody {
             Self::SessionMuted { .. } => "session_muted",
             Self::PrimaryBotSet { .. } => "primary_bot_set",
             Self::BotProjectSet { .. } => "bot_project_set",
+            Self::BotAvatarSet { .. } => "bot_avatar_set",
             Self::BotChanged { .. } => "bot_changed",
             Self::BotDeleted { .. } => "bot_deleted",
             Self::ScheduleControlled { .. } => "schedule_controlled",
@@ -900,6 +1031,9 @@ pub struct Bot {
     pub project: Option<BotProject>,
     pub models: BotModels,
     pub skills: SkillSet,
+    pub avatar: Option<Avatar>,
+    /// The start of the hash of the event that last set the face, `None` before any change.
+    pub avatar_version: Option<String>,
     pub event_hash: EventHash,
 }
 
@@ -907,6 +1041,13 @@ impl Bot {
     /// The model this bot runs on `provider`; `None` follows the device's default.
     pub fn model(&self, provider: Provider) -> Option<&str> {
         self.models.get(&provider).map(String::as_str)
+    }
+
+    pub fn shown_avatar(&self) -> ShownAvatar {
+        ShownAvatar {
+            avatar: self.avatar.unwrap_or_else(|| Avatar::derived(&self.bot_id)),
+            picked: self.avatar.is_some(),
+        }
     }
 }
 

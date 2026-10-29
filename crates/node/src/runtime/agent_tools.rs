@@ -124,7 +124,7 @@ impl Runtime {
                     .context(
                         "nothing was dispatched, changed, sent or created with this call_ref",
                     )?;
-                Ok(json!(bot))
+                Ok(tool_bot(&bot))
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -163,7 +163,7 @@ impl Runtime {
                         json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,
                         "name":bot.name,"instructions":instructions,
                         "instructions_truncated":instructions.len() < bot.instructions.len(),
-                        "project":bot.project,"models":bot.models,"skills":bot.skills,
+                        "project":bot.project,"models":bot.models,"skills":bot.skills,"avatar":bot.shown_avatar(),
                         "schedules":schedules,"this_bot":bot.conversation_id == scope}),
                     );
                 }
@@ -191,7 +191,7 @@ impl Runtime {
                     json!({"conversation_id":bot.conversation_id,"bot_id":bot.bot_id,"name":bot.name,
                     "instructions":bot.instructions,"project":bot.project,
                     "models":bot.models,"skills":skills,"uses_all_skills":bot.skills.is_none(),
-                    "schedules":schedules,"memory":memory}),
+                    "avatar":bot.shown_avatar(),"schedules":schedules,"memory":memory}),
                 )
             }
             Tool::DeleteBot => {
@@ -261,7 +261,7 @@ impl Runtime {
                         Changed::Event(&bot.event_hash),
                     );
                 }
-                Ok(json!(bot))
+                Ok(tool_bot(&bot))
             }
             Tool::MessageBot => {
                 let manager = access
@@ -634,6 +634,17 @@ impl Runtime {
                 )),
         }
     }
+}
+
+/// A bot as `list_bots` and `read_bot` show its face: the one it shows and whether it was picked.
+/// The face's version only names a panel write, so a tool leaves it out.
+fn tool_bot(bot: &crate::model::Bot) -> Value {
+    let mut value = json!(bot);
+    value["avatar"] = json!(bot.shown_avatar());
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("avatar_version");
+    }
+    value
 }
 
 /// Bytes one tool result carries, and one event within it; the rest is read page by page.

@@ -1,0 +1,17 @@
+[
+  {"bot_id":"bot-a","outline":"drop","eyes":"dot","hue":100},
+  {"bot_id":"c","outline":"cloud","eyes":"wide","hue":315},
+  {"bot_id":"ops","outline":"round","eyes":"pill","hue":45},
+  {"bot_id":"bot_7f3a9c2e-41d0-4b8e-9a51-0c2d6e8f1b37","outline":"drop","eyes":"pill","hue":155},
+  {"bot_id":"x.y:z","outline":"drop","eyes":"pill","hue":345},
+  {"bot_id":"机器人🙂","outline":"drop","eyes":"wide","hue":205},
+  {"bot_id":"bot-6","outline":"cloud","eyes":"dot","hue":255},
+  {"bot_id":"bot-7","outline":"drop","eyes":"pill","hue":130},
+  {"bot_id":"bot-8","outline":"squircle","eyes":"pill","hue":205},
+  {"bot_id":"bot-9","outline":"drop","eyes":"dot","hue":180},
+  {"bot_id":"bot-11","outline":"squircle","eyes":"oval","hue":45},
+  {"bot_id":"bot-13","outline":"bean","eyes":"dot","hue":345},
+  {"bot_id":"bot-15","outline":"round","eyes":"pill","hue":285},
+  {"bot_id":"bot-22","outline":"squircle","eyes":"wide","hue":230},
+  {"bot_id":"bot-33","outline":"cloud","eyes":"wide","hue":20}
+]

@@ -28,9 +28,12 @@ pub fn change_id(conversation: &str, trigger: &str, call_ref: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(tag = "tool", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChangeRequest {
+    /// `default_avatar` goes back to the face the bot's ID gives, `avatar` picks one.
     UpdateProfile {
         name: Option<String>,
         instructions: Option<String>,
+        avatar: Option<AvatarParts>,
+        default_avatar: Option<bool>,
     },
     /// A bot's profile, this one's or another's; `bot` is its conversation ID, bot ID or name.
     /// `model` is the one for the writing device's provider, empty for its default;
@@ -42,6 +45,8 @@ pub enum ChangeRequest {
         model: Option<String>,
         skills: Option<std::collections::BTreeSet<String>>,
         all_skills: Option<bool>,
+        avatar: Option<AvatarParts>,
+        default_avatar: Option<bool>,
     },
     SaveSkill {
         skill_id: Option<String>,
@@ -78,13 +83,58 @@ pub enum ChangeRequest {
     },
 }
 
-/// The profile fields one request sets; `skills` is `Some(None)` for every shared skill.
+/// The parts of a face the chat names; the others stay as the bot shows them now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarParts {
+    pub outline: Option<Outline>,
+    pub eyes: Option<Eyes>,
+    pub hue: Option<Hue>,
+}
+
+impl AvatarParts {
+    fn over(self, shown: Avatar) -> Avatar {
+        Avatar {
+            outline: self.outline.unwrap_or(shown.outline),
+            eyes: self.eyes.unwrap_or(shown.eyes),
+            hue: self.hue.unwrap_or(shown.hue),
+        }
+    }
+
+    fn fits(self, avatar: Avatar) -> bool {
+        self.outline.is_none_or(|outline| outline == avatar.outline)
+            && self.eyes.is_none_or(|eyes| eyes == avatar.eyes)
+            && self.hue.is_none_or(|hue| hue == avatar.hue)
+    }
+}
+
+/// The profile fields one request sets; `skills` is `Some(None)` for every shared skill and
+/// `avatar` `Some(None)` for the face the bot's ID gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileRequest {
     name: Option<String>,
     instructions: Option<String>,
     model: Option<(Provider, String)>,
     skills: Option<SkillSet>,
+    avatar: Option<Option<AvatarParts>>,
+}
+
+fn avatar_request(
+    avatar: Option<AvatarParts>,
+    default: Option<bool>,
+) -> Result<Option<Option<AvatarParts>>> {
+    Ok(match (avatar, default) {
+        (Some(_), Some(true)) => bail!("give avatar or default_avatar, not both"),
+        (_, Some(true)) => Some(None),
+        (Some(parts), _) => {
+            ensure!(
+                parts != AvatarParts::default(),
+                "avatar names an outline, eyes or hue"
+            );
+            Some(Some(parts))
+        }
+        (None, _) => None,
+    })
 }
 
 impl ChangeRequest {
@@ -96,11 +146,17 @@ impl ChangeRequest {
     /// A model applies to `provider`, the one the writing device runs bots on.
     fn profile(&self, provider: Provider) -> Result<Option<ProfileRequest>> {
         Ok(Some(match self {
-            Self::UpdateProfile { name, instructions } => ProfileRequest {
+            Self::UpdateProfile {
+                name,
+                instructions,
+                avatar,
+                default_avatar,
+            } => ProfileRequest {
                 name: name.clone(),
                 instructions: instructions.clone(),
                 model: None,
                 skills: None,
+                avatar: avatar_request(*avatar, *default_avatar)?,
             },
             Self::ConfigureBot {
                 name,
@@ -108,6 +164,8 @@ impl ChangeRequest {
                 model,
                 skills,
                 all_skills,
+                avatar,
+                default_avatar,
                 ..
             } => ProfileRequest {
                 name: name.clone(),
@@ -121,6 +179,7 @@ impl ChangeRequest {
                     (Some(skills), _) => Some(Some(skills.clone())),
                     (None, _) => None,
                 },
+                avatar: avatar_request(*avatar, *default_avatar)?,
             },
             _ => return Ok(None),
         }))
@@ -131,11 +190,33 @@ impl ChangeRequest {
     fn matches(&self, change: &BotChange, provider: Provider) -> bool {
         let after = |edit: &Option<Edit>| edit.as_ref().map(|edit| edit.after.clone());
         if let Ok(Some(wanted)) = self.profile(provider) {
-            return matches!(change, BotChange::Profile { name, instructions, model, skills }
-                if wanted.name == after(name)
-                    && wanted.instructions == after(instructions)
-                    && wanted.model == model.as_ref().map(|edit| (edit.provider, edit.after.clone()))
-                    && wanted.skills == skills.as_ref().map(|edit| edit.after.clone()));
+            let BotChange::Profile {
+                name,
+                instructions,
+                model,
+                skills,
+                avatar,
+            } = change
+            else {
+                return false;
+            };
+            let avatar = match (wanted.avatar, avatar) {
+                (None, None) => true,
+                (Some(parts), Some(edit)) => match (parts, edit.after) {
+                    (None, None) => true,
+                    (Some(parts), Some(after)) => parts.fits(after),
+                    _ => false,
+                },
+                _ => false,
+            };
+            return avatar
+                && wanted.name == after(name)
+                && wanted.instructions == after(instructions)
+                && wanted.model
+                    == model
+                        .as_ref()
+                        .map(|edit| (edit.provider, edit.after.clone()))
+                && wanted.skills == skills.as_ref().map(|edit| edit.after.clone());
         }
         match (self, change) {
             (
@@ -376,6 +457,7 @@ fn change_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRow> {
                 instructions: None,
                 model: None,
                 skills: None,
+                avatar: None,
             },
         },
         r.get(1)?,
@@ -521,11 +603,16 @@ fn resolve(
         instructions,
         model,
         skills,
+        avatar,
     }) = request.profile(provider)?
     {
         ensure!(
-            name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
-            "name, instructions, model, skills or all_skills is required"
+            name.is_some()
+                || instructions.is_some()
+                || model.is_some()
+                || skills.is_some()
+                || avatar.is_some(),
+            "name, instructions, model, skills, all_skills, avatar or default_avatar is required"
         );
         let bot = bot_for_conversation_from(connection, network, scope)?
             .context("this conversation has no bot profile to change")?;
@@ -566,6 +653,14 @@ fn resolve(
                 "the bot already uses these skills; nothing to change"
             );
         }
+        let shown = bot.shown_avatar().avatar;
+        let avatar = avatar.map(|parts| parts.map(|parts| parts.over(shown)));
+        if let Some(after) = avatar {
+            ensure!(
+                after.map_or(bot.avatar.is_some(), |after| after != shown),
+                "the bot already has this face; nothing to change"
+            );
+        }
         let model = model.map(|(provider, after)| ModelEdit {
             provider,
             before: bot.model(provider).unwrap_or_default().to_owned(),
@@ -583,6 +678,10 @@ fn resolve(
             model,
             skills: skills.map(|after| SkillsEdit {
                 before: bot.skills,
+                after,
+            }),
+            avatar: avatar.map(|after| AvatarEdit {
+                before: bot.avatar,
                 after,
             }),
         };

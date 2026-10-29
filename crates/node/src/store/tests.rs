@@ -1720,6 +1720,8 @@ fn rename(name: &str) -> ChangeRequest {
     ChangeRequest::UpdateProfile {
         name: Some(name.into()),
         instructions: None,
+        avatar: None,
+        default_avatar: None,
     }
 }
 
@@ -1778,6 +1780,7 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
                     instructions: None,
                     model: None,
                     skills: None,
+                    avatar: None,
                 },
             },
             blobs: vec![],
@@ -1855,7 +1858,8 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
             }),
             instructions: None,
             model: None,
-            skills: None
+            skills: None,
+            avatar: None
         }
     );
     assert_eq!(
@@ -2464,6 +2468,7 @@ fn reminders_chain_boundedly_and_only_they_need_no_cause() -> Result<()> {
                 instructions: None,
                 model: None,
                 skills: None,
+                avatar: None,
             },
         },
         blobs: vec![],
@@ -2728,6 +2733,8 @@ fn a_bot_creates_and_configures_bots_for_the_users_message() -> Result<()> {
             model: None,
             skills: None,
             all_skills: None,
+            avatar: None,
+            default_avatar: None,
         },
         Provider::Codex,
         11,
@@ -2790,6 +2797,8 @@ fn configure(
         model: model.map(Into::into),
         skills: skills.map(|ids| ids.iter().map(|id| id.to_string()).collect()),
         all_skills,
+        avatar: None,
+        default_avatar: None,
     }
 }
 
@@ -5744,6 +5753,279 @@ fn the_users_project_choice_replaces_and_clears_a_bots_folder() -> Result<()> {
             .append_event(&net.a, &net.network, "c", unsigned, vec![], 5)
             .is_err(),
         "only the user moves a bot's folder"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_bots_face_from_the_chat_and_from_the_panel_converge_by_rank() -> Result<()> {
+    use crate::model::{Avatar, Eyes, Hue, Outline};
+    use crate::store::bot_settings::AvatarParts;
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    let hue = |hue: u16| Hue::try_from(hue).map_err(anyhow::Error::msg);
+    let panel = Avatar {
+        outline: Outline::Bean,
+        eyes: Eyes::Dot,
+        hue: hue(155)?,
+    };
+    assert!(
+        Hue::try_from(70).is_err(),
+        "the halo's amber is no face hue"
+    );
+    assert!(
+        serde_json::from_value::<ChangeRequest>(
+            json!({"tool":"update_profile","avatar":{"hue":70}})
+        )
+        .is_err()
+    );
+    let parts = |outline, eyes, hue| AvatarParts { outline, eyes, hue };
+    let picked = |avatar: Option<AvatarParts>, default_avatar| ChangeRequest::UpdateProfile {
+        name: None,
+        instructions: None,
+        avatar,
+        default_avatar,
+    };
+    let early = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    let mut change = |call_ref: &str, request: ChangeRequest, at: i64| {
+        origin.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            request,
+            Provider::Codex,
+            at,
+        )
+    };
+    let derived = Avatar::derived("bot");
+    let cloud = parts(Some(Outline::Cloud), None, None);
+    let (first, written) = change("f1", picked(Some(cloud), None), 4)?;
+    let chat = Avatar {
+        outline: Outline::Cloud,
+        ..derived
+    };
+    assert!(written);
+    assert!(
+        matches!(first.change, BotChange::Profile { avatar: Some(ref edit), .. }
+            if edit.before.is_none() && edit.after == Some(chat)),
+        "the named part changes and the rest stays as the id gives it: {:?}",
+        first.change
+    );
+    assert_eq!(
+        change("f1", picked(Some(cloud), None), 5)?,
+        (first.clone(), false),
+        "the same call_ref with the same content reads back"
+    );
+    let other = change(
+        "f1",
+        picked(Some(parts(Some(Outline::Bean), None, None)), None),
+        5,
+    )
+    .unwrap_err();
+    assert!(other.to_string().contains("call_ref"), "{other}");
+    let unchanged = change("f2", picked(Some(cloud), None), 5).unwrap_err();
+    assert!(
+        unchanged.to_string().contains("nothing to change"),
+        "{unchanged}"
+    );
+    let empty = change("f3", picked(Some(AvatarParts::default()), None), 5).unwrap_err();
+    assert!(
+        empty.to_string().contains("outline, eyes or hue"),
+        "{empty}"
+    );
+    let both = change("f4", picked(Some(cloud), Some(true)), 5).unwrap_err();
+    assert!(both.to_string().contains("not both"), "{both}");
+    let late = origin.events_from(
+        &net.network,
+        &net.a.device_id()?,
+        early.len() as u64 + 1,
+        100,
+    )?;
+
+    let mut panel_device = store(&net)?;
+    panel_device.ingest_events(&net.network, &early)?;
+    let signed = |version, avatar| {
+        net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::BotAvatarSet {
+                version,
+                avatar,
+                attestation: None,
+            },
+        )
+    };
+    let unsigned = EventBody::BotAvatarSet {
+        version: None,
+        avatar: Some(panel),
+        attestation: None,
+    };
+    assert!(
+        panel_device
+            .append_event(&net.b, &net.network, "c", unsigned, vec![], 9)
+            .is_err(),
+        "only the user picks a face from the panel"
+    );
+    let mut forged = signed(None, Some(panel))?;
+    if let EventBody::BotAvatarSet { version, .. } = &mut forged {
+        *version = Some("0123456789abcdef".into());
+    }
+    assert!(
+        panel_device
+            .append_event(&net.b, &net.network, "c", forged, vec![], 9)
+            .is_err(),
+        "the signature covers the version the user saw"
+    );
+    panel_device.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        signed(None, Some(panel))?,
+        vec![],
+        9,
+    )?;
+    let picks = panel_device.events_from(&net.network, &net.b.device_id()?, 1, 100)?;
+
+    let mut faces = Vec::new();
+    for batches in [[&early, &late, &picks], [&early, &picks, &late]] {
+        let mut device = store(&net)?;
+        for batch in batches {
+            let statuses = device.ingest_events(&net.network, batch)?.0;
+            assert!(
+                statuses
+                    .iter()
+                    .all(|status| *status == IngestStatus::Accepted),
+                "{statuses:?}"
+            );
+        }
+        faces.push(
+            device
+                .bot_for_conversation(&net.network, "c")?
+                .context("bot")?
+                .avatar,
+        );
+    }
+    assert_eq!(
+        faces,
+        [Some(panel), Some(panel)],
+        "the later rank wins in any order"
+    );
+
+    let mut back = store(&net)?;
+    all_accepted(&mut back, &net, &origin)?;
+    back.ingest_events(&net.network, &picks)?;
+    let (reset, _) = back.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "f5",
+        picked(None, Some(true)),
+        Provider::Codex,
+        20,
+    )?;
+    assert!(
+        matches!(reset.change, BotChange::Profile { avatar: Some(ref edit), .. }
+            if edit.before == Some(panel) && edit.after.is_none()),
+        "default_avatar writes null: {:?}",
+        reset.change
+    );
+    let reset_bot = back
+        .bot_for_conversation(&net.network, "c")?
+        .context("bot")?;
+    assert_eq!(
+        (reset_bot.avatar, reset_bot.avatar_version),
+        (None, Some(super::version(&reset.event_hash))),
+        "a later chat change outranks the panel's pick and gives the face a new version"
+    );
+    second_bot(&mut back, &net, "Ops")?;
+    let shown = back
+        .bot_for_conversation(&net.network, "c")?
+        .context("bot")?
+        .shown_avatar();
+    assert_eq!((shown.avatar, shown.picked), (derived, false));
+    assert_eq!(
+        crate::scheduler::bot_value(&back, &net.network, "c", 0)?["configured_bot"]["avatar"],
+        json!({"outline":derived.outline,"eyes":derived.eyes,"hue":derived.hue,"picked":false}),
+        "a turn sees the face the bot shows"
+    );
+
+    let (other_bot, _) = back.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "f6",
+        ChangeRequest::ConfigureBot {
+            bot: "Ops".into(),
+            name: None,
+            instructions: None,
+            model: None,
+            skills: None,
+            all_skills: None,
+            avatar: Some(parts(None, Some(Eyes::Wide), Some(hue(285)?))),
+            default_avatar: None,
+        },
+        Provider::Codex,
+        21,
+    )?;
+    let ops = back
+        .bot_for_conversation(&net.network, "d")?
+        .context("ops")?;
+    assert_eq!(other_bot.conversation_id, "d");
+    assert_eq!(
+        ops.avatar,
+        Some(Avatar {
+            eyes: Eyes::Wide,
+            hue: hue(285)?,
+            ..Avatar::derived("bot-d")
+        }),
+        "configure_bot gives another bot a face"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_node_derives_the_same_face_from_an_id_as_the_clients() -> Result<()> {
+    use crate::model::Avatar;
+    #[derive(serde::Deserialize)]
+    struct Vector {
+        bot_id: String,
+        #[serde(flatten)]
+        face: serde_json::Value,
+    }
+    let vectors: Vec<Vector> = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/client/src/avatar/derived-faces.json"
+    )))?;
+    let (mut hues, mut outlines, mut eyes) = (
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    );
+    for vector in &vectors {
+        let face = Avatar::derived(&vector.bot_id);
+        assert_eq!(
+            serde_json::to_value(face)?,
+            vector.face,
+            "{}",
+            vector.bot_id
+        );
+        hues.insert(u16::from(face.hue));
+        outlines.insert(serde_json::to_string(&face.outline)?);
+        eyes.insert(serde_json::to_string(&face.eyes)?);
+    }
+    assert_eq!(
+        hues.into_iter().collect::<Vec<_>>(),
+        crate::model::HUES,
+        "the vectors reach every hue, so both lists agree"
+    );
+    assert_eq!(
+        (outlines.len(), eyes.len()),
+        (5, 4),
+        "the vectors reach every outline and eye shape, so both orders agree"
     );
     Ok(())
 }

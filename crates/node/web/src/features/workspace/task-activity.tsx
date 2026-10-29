@@ -76,7 +76,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
           <span className="grid min-w-0 flex-1">
             <span className="font-medium [overflow-wrap:anywhere]" title={work.title}>{taskLink(work, <span className="line-clamp-2">{work.title || "任务结果"}</span>, "max-md:block max-md:py-2.5")}</span>
             {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1 text-meta text-muted-foreground underline-offset-4 hover:text-foreground hover:underline max-md:min-h-11">
-              <BotFace botId={bot.bot_id} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
+              <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span></Link> : null}
           </span>
           <span className="flex shrink-0 gap-1.5">
             <ActionButton variant="ghost" disabled={disabled} action={settle(work, "interrupted")}>没做完</ActionButton>
@@ -100,7 +100,7 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
     <p>{reason}那个任务实际做完了吗？</p>
     {check.reason === "offline" ? <BackOnline device={device} /> : null}
     {bot ? <Link to="/b/$botId" params={{ botId: bot.bot_id }} className="inline-flex w-fit max-w-full min-w-0 items-center gap-1.5 rounded-md text-meta font-medium underline-offset-4 hover:underline max-md:min-h-11">
-      <BotFace botId={bot.bot_id} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
+      <BotFace bot={bot} mood="idle" size={16} /><span className="sr-only">去对话 </span><span className="truncate">{bot.name}</span><ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" /></Link> : null}
     <Details label="补充说明（可选）"><Textarea id={`${id}-note`} aria-label="补充说明" rows={2} maxLength={2000} value={note} disabled={disabled} onChange={(event) => setNote(event.target.value)} /></Details>
     {check.detail ? <Details><span>{check.detail}</span></Details> : null}
   </ActionCard>
