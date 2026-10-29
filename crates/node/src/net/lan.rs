@@ -6,13 +6,15 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use vibeface_secure::lan::{SERVICE, TXT_KEY, hour, lan_tag, lan_tag_matches};
 
 /// Anyone on the LAN can advertise; these bound what each dial checks and tries.
 const MAX_ADVERTS: usize = 64;
 const MAX_ADDRS: usize = 4;
+/// A replayed advert must not turn into a sync on every packet.
+const WAKE_EVERY_MS: u64 = 10_000;
 
 pub(super) type Wake = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -32,6 +34,8 @@ struct State {
     /// Adverts by full service name. They are matched to members when used, so one seen
     /// before this Node learned of its sender still counts.
     seen: HashMap<String, Advert>,
+    /// When each member Node was last woken, Unix ms.
+    woken: HashMap<String, u64>,
 }
 
 /// The network this Node is in and the advert naming it there; `advertised` is false until
@@ -48,11 +52,20 @@ struct Advert {
     addrs: Vec<SocketAddr>,
     /// When it was last heard, Unix ms.
     at: u64,
+    /// Whether it named a member Node when heard; a full table drops the others first without
+    /// matching every advert again.
+    member: bool,
 }
 
 impl Lan {
     /// `wake` hears which member Node an advert names, as soon as it appears or changes.
-    pub(super) fn start(device: String, port: u16, wake: Wake) -> mdns_sd::Result<Self> {
+    /// `off` names the address families with no socket on `port`, which are not advertised.
+    pub(super) fn start(
+        device: String,
+        port: u16,
+        off: Vec<IfKind>,
+        wake: Wake,
+    ) -> mdns_sd::Result<Self> {
         let lan = Self {
             daemon: ServiceDaemon::new()?,
             service: format!("{SERVICE}.local."),
@@ -60,8 +73,12 @@ impl Lan {
             port,
             state: Arc::default(),
         };
-        lan.daemon
-            .disable_interface(vec![IfKind::LoopbackV4, IfKind::LoopbackV6])?;
+        lan.daemon.disable_interface(
+            [IfKind::LoopbackV4, IfKind::LoopbackV6]
+                .into_iter()
+                .chain(off)
+                .collect::<Vec<_>>(),
+        )?;
         let events = lan.daemon.browse(&lan.service)?;
         tokio::spawn(watch(events, lan.state.clone(), wake));
         Ok(lan)
@@ -104,6 +121,17 @@ impl Lan {
             fullname: format!("{tag}.{}", self.service),
             advertised: advert.is_ok(),
         });
+    }
+
+    /// Withdraws the advert, waiting a moment for the goodbye to go out, so the other devices
+    /// drop it now rather than when it expires.
+    pub(super) async fn stop(&self) {
+        let own = self.state.lock().expect("LAN state").own.take();
+        if let Some(own) = own.filter(|own| own.advertised)
+            && let Ok(done) = self.daemon.unregister(&own.fullname)
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(1), done.recv_async()).await;
+        }
     }
 
     pub(super) fn hints(&self, device: &str) -> Vec<SocketAddr> {
@@ -167,20 +195,17 @@ impl Advert {
                 .map(|ip| SocketAddr::new(ip, service.port))
                 .collect(),
             at,
+            member: false,
         })
     }
 }
 
 impl State {
-    /// Keeps `advert`; returns the member Node it names, if any.
-    fn learn(&mut self, fullname: String, advert: Advert, now_ms: u64) -> Option<String> {
+    /// Keeps `advert`; returns the member Node it names, at most once per `WAKE_EVERY_MS`.
+    fn learn(&mut self, fullname: String, mut advert: Advert, now_ms: u64) -> Option<String> {
         if self.seen.len() >= MAX_ADVERTS && !self.seen.contains_key(&fullname) {
             // Strangers' adverts go first, so they cannot crowd out a member's; then the oldest.
-            self.seen.retain(|_, seen| {
-                self.own.as_ref().is_some_and(|own| {
-                    matching_member(&self.members, &own.network, &seen.tag, now_ms).is_some()
-                })
-            });
+            self.seen.retain(|_, seen| seen.member);
             if self.seen.len() >= MAX_ADVERTS
                 && let Some(oldest) = self
                     .seen
@@ -195,8 +220,17 @@ impl State {
             .own
             .as_ref()
             .and_then(|own| matching_member(&self.members, &own.network, &advert.tag, now_ms));
+        advert.member = member.is_some();
         self.seen.insert(fullname, advert);
-        member
+        let member = member?;
+        let due = self
+            .woken
+            .get(&member)
+            .is_none_or(|last| now_ms.saturating_sub(*last) >= WAKE_EVERY_MS);
+        if due {
+            self.woken.insert(member.clone(), now_ms);
+        }
+        due.then_some(member)
     }
 
     /// The addresses of the latest advert naming `device`, so one dial tries at most
@@ -240,6 +274,7 @@ mod tests {
             tag: lan_tag(network, device, hour),
             addrs: vec![SocketAddr::from(([192, 168, 1, 20], port))],
             at: u64::from(port),
+            member: false,
         }
     }
 
@@ -291,8 +326,16 @@ mod tests {
         }
         assert_eq!(
             state.learn("c".into(), advert("net", "c", 100, 6), now),
-            Some("c".into()),
+            None,
+            "a member heard again within the wake interval is not woken again"
+        );
+        assert!(
+            state.seen.contains_key("c"),
             "strangers filling the table do not keep a member out"
+        );
+        assert_eq!(
+            state.learn("c".into(), advert("net", "c", 100, 6), now + WAKE_EVERY_MS),
+            Some("c".into())
         );
 
         for i in 0..MAX_ADVERTS as u16 {

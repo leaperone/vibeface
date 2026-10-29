@@ -20,7 +20,10 @@ class LanBrowserModule : Module() {
   private val found = mutableMapOf<String, Map<String, Any>>()
   /** Android 14+: one callback per service, which also follows its address changes. */
   private val callbacks = mutableMapOf<String, NsdManager.ServiceInfoCallback>()
-  /** Older Android resolves one service at a time. */
+  /**
+   * Older Android resolves one service at a time, once.
+   * ponytail: an address change shows up when the Node's hourly name change does; resolve on a beat if that is too slow.
+   */
   private val waiting = ArrayDeque<NsdServiceInfo>()
   private var resolving = false
   private val executor = Executors.newSingleThreadExecutor()

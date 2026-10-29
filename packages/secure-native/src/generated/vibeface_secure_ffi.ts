@@ -145,6 +145,35 @@ export async function lanConnect(deviceId: string, addrs: Array<string>, timeout
     }
 
 /**
+ * Binds this device's endpoint ahead of the first dial, which then spends its time dialing.
+ */
+export async function lanPrepare(asyncOpts_?: { signal: AbortSignal }): Promise<void> /*throws*/ {
+    const __stack = uniffiIsDebug ? new Error().stack : undefined;
+    try {
+        return await uniffiRustCallAsync(
+            /*rustCaller:*/ uniffiCaller,
+            /*rustFutureFunc:*/ () => {
+                return nativeModule().ubrn_uniffi_vibeface_secure_ffi_fn_func_lan_prepare(
+                );
+            },
+            /*pollFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_poll_void,
+            /*cancelFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_cancel_void,
+            /*completeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_complete_void,
+            /*freeFunc:*/ nativeModule().ubrn_ffi_vibeface_secure_ffi_rust_future_free_void,
+            /*liftFunc:*/ (_v) => {},
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+            /*asyncOpts:*/ asyncOpts_,
+            /*errorHandler:*/ FfiConverterTypeSecureError.lift.bind(FfiConverterTypeSecureError)
+        );
+    } catch (__error: any) {
+        if (uniffiIsDebug && __error instanceof Error) {
+            __error.stack = __stack;
+        }
+        throw __error;
+    }
+    }
+
+/**
  * Whether an advertised mDNS `tag` names `device_id` of `network_id`, by this device's clock.
  */
 export function lanTagMatches(tag: string, networkId: string, deviceId: string): boolean {
@@ -1393,6 +1422,9 @@ function uniffiEnsureInitialized() {
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_connect() !== 2627) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_connect");
+    }
+    if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare() !== 35893) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_prepare");
     }
     if (nativeModule().ubrn_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches() !== 57767) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches");

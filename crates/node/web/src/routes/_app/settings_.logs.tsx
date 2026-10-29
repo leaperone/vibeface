@@ -39,6 +39,7 @@ const workOutcomes: Record<string, string> = { completed: '任务完成', failed
 /** Plain titles for the stable event names the device and this page write; others show their own message. */
 const eventTitles: Record<string, string | ((fields: Fields) => string)> = {
   'agent.turn.started': 'Bot 开始回复',
+  'lan.off': '局域网发现没有启动',
   'agent.turn.finished': (f) => turnEnded[String(f.state)] ?? (f.error ? 'Bot 回复没能保存' : 'Bot 回复结束'),
   'agent.turn.fenced': '对话交给了其他设备，这里停止回复',
   'agent.turn.steer_refused': '新消息等下一次回复',

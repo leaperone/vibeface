@@ -70,6 +70,7 @@ class NativeVibefaceSecureFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_func_verify(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_func_verify_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_func_lan_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_func_lan_prepare(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_fn_func_lan_tag_matches(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_ffi_vibeface_secure_ffi_rust_future_poll_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_ffi_vibeface_secure_ffi_rust_future_cancel_u8(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -133,6 +134,7 @@ class NativeVibefaceSecureFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_func_verify(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_func_verify_membership(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_prepare(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_func_lan_tag_matches(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_channel_open_record(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_vibeface_secure_ffi_checksum_method_channel_seal_message(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);

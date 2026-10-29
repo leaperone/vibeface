@@ -1409,15 +1409,33 @@ fn invite_addrs(addrs: impl Iterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     addrs
 }
 
-/// Splits `https://origin/join#vibeface1…` into the Gateway origin and the ticket.
-pub fn parse_join_link(link: &str) -> Result<(String, Ticket)> {
-    let url = reqwest::Url::parse(link.trim()).context("invite link must be a URL")?;
+/// The ticket in an invite: `https://origin/join#vibeface1…`, the app's
+/// `vibeface://join?link=…` around either form, or `vibeface1…` alone. A Node joins over iroh,
+/// so the Gateway origin is not needed.
+pub fn parse_join_link(link: &str) -> Result<Ticket> {
+    parse_join_link_within(link.trim(), true)
+}
+
+fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
+    const SHAPE: &str = "invite link must look like https://host/join#vibeface1…";
+    if link.starts_with("vibeface1") {
+        return Ok(Ticket::decode(link)?);
+    }
+    let url = reqwest::Url::parse(link).context(SHAPE)?;
+    if nest && url.scheme() == "vibeface" && url.host_str() == Some("join") {
+        let (_, inner) = url
+            .query_pairs()
+            .find(|(key, _)| key == "link")
+            .context(SHAPE)?;
+        return parse_join_link_within(&inner, false);
+    }
     ensure!(
         matches!(url.scheme(), "http" | "https") && url.path() == "/join",
-        "invite link must look like https://host/join#vibeface1…"
+        SHAPE
     );
-    let ticket = Ticket::decode(url.fragment().context("invite link has no ticket")?)?;
-    Ok((url.origin().ascii_serialization(), ticket))
+    Ok(Ticket::decode(
+        url.fragment().context("invite link has no ticket")?,
+    )?)
 }
 
 /// Saved so an interrupted `vibeface join` resumes with the same commitment.
@@ -1656,7 +1674,7 @@ async fn join_as_node(
     report: impl Fn(NodeJoin),
     cancel: &tokio::sync::Notify,
 ) -> Result<NetworkState> {
-    let (_, ticket) = parse_join_link(link)?;
+    let ticket = parse_join_link(link)?;
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
@@ -1869,6 +1887,23 @@ async fn receive_value(socket: &mut ClientSocket, channel: &mut Channel) -> Resu
 mod tests {
     use super::*;
     use crate::identity::{Genesis, Member, Revocation};
+
+    #[test]
+    fn join_links_from_the_app_or_a_bare_ticket_name_the_same_ticket() {
+        let ticket = Ticket::new(&LocalIdentity::generate().device_id().unwrap(), [7; 32]).unwrap();
+        let text = ticket.encode().unwrap();
+        let web = format!("http://192.168.1.10:4790/join#{text}");
+        let app = |link: &str| {
+            reqwest::Url::parse_with_params("vibeface://join", [("link", link)])
+                .unwrap()
+                .to_string()
+        };
+        for link in [web.clone(), text.clone(), app(&text), app(&web)] {
+            assert_eq!(parse_join_link(&link).unwrap(), ticket, "{link}");
+        }
+        assert!(parse_join_link(&app(&app(&text))).is_err());
+        assert!(parse_join_link(&format!("http://h/other#{text}")).is_err());
+    }
 
     #[test]
     fn invites_keep_private_ipv4_within_the_ticket_limit() {
