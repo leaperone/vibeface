@@ -6397,6 +6397,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
  "hex",
+ "hmac",
  "js-sys",
  "postcard",
  "serde",
