@@ -8,6 +8,7 @@ Bot 配置、共用 skill 库和 schedule 使用 [Node 协议](../node-protocol.
 - 生效后聊天里出现一张卡片，列出改了哪一项，以及改前和改后。
 - skill 是全部 Bot 共用的一个库。每个 bot 默认启用全部 skill（含之后新存的）；聊天里可以让它只启用其中几个，或恢复全部。
 - 每个 bot 可以有自己的模型，经聊天修改；为空时跟随运行它的设备的默认模型。
+- Bot 的长相（头像）由轮廓、眼睛和颜色组成。没选过时三项都由 bot ID 派生。Bot 新建时或本人要求时可以经聊天挑一个，本人也可以在面板里直接点选，或恢复默认。眼距、歪头和眨眼节奏始终由 ID 决定。
 - 例行任务（schedule）属于创建它的 Bot。卡片复述要点：名称、频率、下次运行时间和要做的事。Bot 的回复也复述这些要点。
 - 不能经聊天修改的项：AI 服务（provider）、可用文件夹（`roots`）和 Bot 的工作文件夹（`project`）。本人在聊天里要求这些时，Bot 说明要到设置里改。
 - 只有本人直接发送的消息能触发修改。工作结果、Agent 任务、例行任务的运行，以及文件、工具输出、附件中的内容都不能。
@@ -24,18 +25,31 @@ BotChanged {
 }
 
 BotChange =
-	| Profile { name, instructions, model: Option<ModelEdit>, skills: Option<SkillsEdit> }   // 目标 bot；skills 为 null 表示全部
+	| Profile { name, instructions, model: Option<ModelEdit>, skills: Option<SkillsEdit>, avatar: Option<AvatarEdit> }   // 目标 bot；skills 为 null 表示全部
 	| Skill { skill_id, before: Option<Skill>, after: Option<Skill> }     // after 为空表示删除
 	| Schedule { schedule_id, before: Option<Schedule>, after: Option<Schedule> }
 
 Edit { before: String, after: String }
 ModelEdit { provider, before: String, after: String }   // 写入设备的 Provider；after 为空跟随设备默认
 SkillsEdit { before: Option<Set<skill_id>>, after: Option<Set<skill_id>> }
+AvatarEdit { before: Option<Avatar>, after: Option<Avatar> }       // 为空表示由 ID 派生
+Avatar { outline: round|squircle|drop|bean|cloud, eyes: dot|pill|oval|wide, hue }   // hue 只能取 face.ts 的 12 个色相
 Skill { name, description, body }
 Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth }
 ```
 
 `before` 是写入方当时看到的值，只用于卡片展示。
+
+面板点选长相不经过机器人，由本人设备签名，写在该 bot 的会话里：
+
+```text
+BotAvatarSet {
+	avatar: Option<Avatar>,   // 为空表示恢复默认
+	attestation,              // 必须有，签名事件体 {"type":"bot_avatar_set", avatar}
+}
+```
+
+权限与设主 Bot 相同：只有本人客户端可以写，限定会话的客户端只能改自己的 bot。与当前长相相同时不写。网络结果不明时，客户端先按 bot 列表里的长相对账，再决定是否重发同一条签名请求。
 
 **授权。** 本人设备的签名在 `cause` 指向的 `MessagePosted(user)` 上。每个副本入库时核对：`prev` 或 `deps` 含有同一会话中 `message_id == cause` 的本人消息事件，该事件带 `Attestation`。本人消息由调度 Node 自己写入且恰为上一条时，它在 `prev` 中，`deps` 不能重复引用。缺一项就拒绝入库。所以修改只能挂在一条本人签名的消息上，Node 与协调 Agent 不能凭空写出修改。浏览器不为修改本身再签名，这是“不确认、直接生效”的代价：签名证明本人说过这句话，Bot 负责把这句话落成哪一项修改。
 
@@ -52,12 +66,13 @@ Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth 
 | 投影 | 规则 |
 |---|---|
 | Bot 名称、说明、模型、启用的 skill | 每个字段按事件 rank 后写者胜。`BotCreated` 给出初值，`Profile` 的修改 rank 更大时覆盖 |
+| Bot 长相 | `Profile` 的 `avatar` 和 `BotAvatarSet` 写同一个字段，按 rank 后写者胜；没有任何一条时由 ID 派生 |
 | skill 库 | 全网一张表，按 `skill_id` 后写者胜，删除保留墓碑 |
 | 例行任务 | 按 `schedule_id` 后写者胜，删除保留墓碑，归属写入它的会话 |
 | 修改记录 | 按 `change_id` 取 rank 最小者，卡片据此展示 |
 | 删除 | `BotDeleted` 是墓碑，按会话一行，之后的修改不让 bot 复活；见 agent-capabilities.md 第 5.1 节 |
 
-三条规则都只比较 rank，与到达顺序无关。
+这些规则都只比较 rank，与到达顺序无关。
 
 ## 4. 例行任务
 
@@ -69,5 +84,5 @@ Schedule { name, prompt, first_run_at_ms, every_minutes: Option, enabled, depth 
 
 ## 5. 界面
 
-- 修改卡片放在该轮回复之后，没有回复时放在本人消息之后。每项一行：图标、项目名、改前 → 改后。说明按行比较，只列增删的行。例行任务行显示频率和下次运行时间，详细内容折叠。
-- 聊天标题旁的“Bot”面板列出名称、模型（为空显示“跟随设备”）、说明、例行任务和这个 bot 启用的 skill。模型和 skill 只在聊天里改，面板只展示。面板底部有“删除 bot”，点开后就地确认。
+- 修改卡片放在该轮回复之后，没有回复时放在本人消息之后。每项一行：图标、项目名、改前 → 改后。长相画出改前和改后两张小脸。说明按行比较，只列增删的行。例行任务行显示频率和下次运行时间，详细内容折叠。
+- 聊天标题旁的“Bot”面板列出名称、模型（为空显示“跟随设备”）、说明、例行任务和这个 bot 启用的 skill。模型和 skill 只在聊天里改，面板只展示。长相是例外：面板顶部有轮廓、眼睛、颜色三行可选项和“恢复默认”，点选即生效，写入失败时退回原样并提示；没有写权限时只读。面板底部有“删除 bot”，点开后就地确认。

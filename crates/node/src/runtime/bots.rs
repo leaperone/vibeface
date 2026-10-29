@@ -267,6 +267,44 @@ impl Runtime {
         Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
     }
 
+    /// The user picks a bot's face, or `null` for the one its ID gives; asking for the current
+    /// one writes nothing.
+    pub(super) async fn set_bot_avatar(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user picks a bot's face here");
+        let scope = id(input, "conversation_id")?;
+        if let Some(allowed) = &access.conversation_id {
+            ensure!(allowed == &scope, "outside this client's conversation");
+        }
+        let avatar: Option<Avatar> = serde_json::from_value(input["avatar"].clone())
+            .context("avatar is an outline, eyes and hue, or null")?;
+        let bot = self
+            .store
+            .lock()
+            .await
+            .bot_for_conversation(&access.network_id, &scope)?
+            .context("no such bot")?;
+        if bot.avatar == avatar {
+            return Ok(json!({"bot":bot}));
+        }
+        let event = self
+            .append(
+                &access.network_id,
+                &scope,
+                EventBody::BotAvatarSet {
+                    avatar,
+                    attestation: Some(attestation(input)?),
+                },
+            )
+            .await?;
+        tracing::info!(
+            event = "bot.avatar",
+            conversation_id = scope,
+            "bot face set"
+        );
+        self.publish_changed(&access.network_id, &scope, Changed::Event(&event.hash));
+        Ok(json!({"bot":self.store.lock().await.bot_for_conversation(&access.network_id, &scope)?}))
+    }
+
     pub(super) async fn validate_bot_project(
         &self,
         network: &str,

@@ -216,6 +216,69 @@ pub struct SkillsEdit {
     pub after: SkillSet,
 }
 
+/// A face's outline; `packages/client/src/avatar/face.ts` draws it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Outline {
+    Round,
+    Squircle,
+    Drop,
+    Bean,
+    Cloud,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Eyes {
+    Dot,
+    Pill,
+    Oval,
+    Wide,
+}
+
+/// The OKLCH hues a face may take. 60 to 90 stays the waiting halo's amber.
+pub const HUES: [u16; 12] = [20, 45, 100, 130, 155, 180, 205, 230, 255, 285, 315, 345];
+
+/// One of `HUES`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct Hue(u16);
+
+impl TryFrom<u16> for Hue {
+    type Error = String;
+    fn try_from(value: u16) -> Result<Self, String> {
+        if HUES.contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!("hue is one of {HUES:?}"))
+        }
+    }
+}
+
+impl From<Hue> for u16 {
+    fn from(hue: Hue) -> u16 {
+        hue.0
+    }
+}
+
+/// The face picked for a bot. Without one the face comes from the bot's ID, as do its eye
+/// spacing and tilt either way.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Avatar {
+    pub outline: Outline,
+    pub eyes: Eyes,
+    pub hue: Hue,
+}
+
+/// `None` is the face the bot's ID gives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AvatarEdit {
+    pub before: Option<Avatar>,
+    pub after: Option<Avatar>,
+}
+
 /// One setting's value before and after a change; `before` is what the writer saw.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -307,6 +370,8 @@ pub enum BotChange {
         model: Option<ModelEdit>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<SkillsEdit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<AvatarEdit>,
     },
     Skill {
         skill_id: String,
@@ -491,11 +556,19 @@ impl BotChange {
                 instructions,
                 model,
                 skills,
+                avatar,
             } => {
                 anyhow::ensure!(
-                    name.is_some() || instructions.is_some() || model.is_some() || skills.is_some(),
+                    name.is_some()
+                        || instructions.is_some()
+                        || model.is_some()
+                        || skills.is_some()
+                        || avatar.is_some(),
                     "a profile change names a field"
                 );
+                if let Some(avatar) = avatar {
+                    anyhow::ensure!(avatar.before != avatar.after, "the face is unchanged");
+                }
                 if let Some(model) = model {
                     validate_model(&model.after)?;
                     anyhow::ensure!(model.before != model.after, "the model is unchanged");
@@ -715,6 +788,13 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<Cause>,
     },
+    /// In the bot's conversation: the user picks its face from the web, or `None` for the one
+    /// its ID gives. It and a chat change of the face win by rank alike.
+    BotAvatarSet {
+        avatar: Option<Avatar>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+    },
     /// In the bot's conversation: the user moves its project folder, or clears it, from the web.
     BotProjectSet {
         project: Option<BotProject>,
@@ -773,6 +853,7 @@ impl EventBody {
             | Self::NotificationAcked { attestation, .. }
             | Self::PrimaryBotSet { attestation, .. }
             | Self::BotProjectSet { attestation, .. }
+            | Self::BotAvatarSet { attestation, .. }
             | Self::ScheduleControlled { attestation, .. } => attestation.as_ref(),
             _ => None,
         }
@@ -794,6 +875,7 @@ impl EventBody {
             Self::SessionMuted { .. } => "session_muted",
             Self::PrimaryBotSet { .. } => "primary_bot_set",
             Self::BotProjectSet { .. } => "bot_project_set",
+            Self::BotAvatarSet { .. } => "bot_avatar_set",
             Self::BotChanged { .. } => "bot_changed",
             Self::BotDeleted { .. } => "bot_deleted",
             Self::ScheduleControlled { .. } => "schedule_controlled",
@@ -900,6 +982,7 @@ pub struct Bot {
     pub project: Option<BotProject>,
     pub models: BotModels,
     pub skills: SkillSet,
+    pub avatar: Option<Avatar>,
     pub event_hash: EventHash,
 }
 

@@ -2,7 +2,8 @@
 //! Node's handler and the `vibeface tool` CLI.
 use crate::{
     model::{
-        MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS, SCHEDULE_MINUTES,
+        HUES, MAX_BOT_MESSAGE_BYTES, MAX_BOT_SKILLS, MAX_MEMORY_CHARS, MAX_MODEL_CHARS,
+        SCHEDULE_MINUTES,
     },
     providers::{Provider, Role},
     scheduling::TriggerKind,
@@ -189,6 +190,13 @@ impl Tool {
     /// `wait_work` are the steps `vibeface tool dispatch_work` takes and are not offered on their own.
     pub fn schema(self) -> Option<(&'static str, Value, &'static [&'static str])> {
         let string = || json!({"type":"string","minLength":1});
+        let avatar = || {
+            json!({"type":"object","additionalProperties":false,"required":["outline","eyes","hue"],
+            "description":"The bot's face: an outline, eyes and a hue (OKLCH degrees)",
+            "properties":{"outline":{"type":"string","enum":["round","squircle","drop","bean","cloud"]},
+            "eyes":{"type":"string","enum":["dot","pill","oval","wide"]},
+            "hue":{"type":"integer","enum":HUES}}})
+        };
         let position = || {
             json!({"type":"object","properties":{"author":string(),"seq":{"type":"integer","minimum":1}},
             "required":["author","seq"],"additionalProperties":false})
@@ -245,8 +253,9 @@ impl Tool {
                 &["call_ref"],
             ),
             Tool::UpdateProfile => (
-                "Rename this bot or replace its standing instructions because the user's own message asked. Apply it right away, without asking to confirm; the chat shows the change. instructions replaces the whole text, so keep what should stay. Reuse call_ref only to retry the same change.",
-                json!({"call_ref":string(),"name":string(),"instructions":{"type":"string"}}),
+                "Rename this bot, replace its standing instructions or change its face because the user's own message asked. Apply it right away, without asking to confirm; the chat shows the change. instructions replaces the whole text, so keep what should stay. avatar picks a face; default_avatar=true goes back to the one the bot's ID gives. Reuse call_ref only to retry the same change.",
+                json!({"call_ref":string(),"name":string(),"instructions":{"type":"string"},
+                "avatar":avatar(),"default_avatar":{"type":"boolean","const":true}}),
                 &["call_ref"],
             ),
             Tool::SaveSkill => (
@@ -323,11 +332,12 @@ impl Tool {
                 &["call_ref", "name"],
             ),
             Tool::ConfigureBot => (
-                "Change a bot's name, standing instructions, model or skills because the user's own message asked; bot is this or another bot's conversation_id, bot_id or name. instructions replaces the whole text, so keep what should stay. model is the model name the bot runs with on this device's provider (models lists one per provider); an empty string follows the device's default. skills lists the shared skill_ids it uses from now on; all_skills=true uses every shared skill again, new ones included. Its provider and workspace change only in Settings; this device's provider paths go through propose_provider_config. Reuse call_ref only to retry the same change.",
+                "Change a bot's name, standing instructions, model, skills or face because the user's own message asked; bot is this or another bot's conversation_id, bot_id or name. instructions replaces the whole text, so keep what should stay. model is the model name the bot runs with on this device's provider (models lists one per provider); an empty string follows the device's default. skills lists the shared skill_ids it uses from now on; all_skills=true uses every shared skill again, new ones included. avatar picks a face; default_avatar=true goes back to the one the bot's ID gives. Its provider and workspace change only in Settings; this device's provider paths go through propose_provider_config. Reuse call_ref only to retry the same change.",
                 json!({"call_ref":string(),"bot":string(),"name":string(),"instructions":{"type":"string"},
                 "model":{"type":"string","maxLength":MAX_MODEL_CHARS},
                 "skills":{"type":"array","items":string(),"maxItems":MAX_BOT_SKILLS,"uniqueItems":true},
-                "all_skills":{"type":"boolean","const":true}}),
+                "all_skills":{"type":"boolean","const":true},
+                "avatar":avatar(),"default_avatar":{"type":"boolean","const":true}}),
                 &["call_ref", "bot"],
             ),
             Tool::DeleteBot => (
