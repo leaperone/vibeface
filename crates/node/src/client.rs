@@ -2010,7 +2010,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2096,7 +2096,7 @@ mod tests {
         config::private_dir(&dir)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [crate::providers::Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2186,7 +2186,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: workspace.clone(),
                 model: "auto".into(),
-                cursor_sdk_bin: dir.join("missing-cursor-sdk"),
             }),
         };
         let refused = dispatch(
@@ -2202,7 +2201,8 @@ mod tests {
             "{refused}"
         );
         assert!(Config::load(&dir)?.manager.is_none());
-        let choose_cursor = json!({"provider":"cursor","bot":true});
+        let choose_cursor =
+            json!({"provider":"cursor","bot":true,"bin":dir.join("missing-cursor-sdk")});
         std::os::unix::fs::symlink(&project, &workspace)?;
         assert!(
             dispatch(
@@ -2225,7 +2225,7 @@ mod tests {
         .await?;
         assert!(workspace.is_dir());
         assert_eq!(
-            chosen["settings"]["manager"]["provider"], "cursor_sdk",
+            chosen["settings"]["manager"]["provider"], "cursor",
             "choosing the bot fills in the defaults"
         );
         assert_eq!(chosen["settings"]["manager"]["model"], "auto");
@@ -2259,7 +2259,7 @@ mod tests {
         assert!(workspace.is_dir());
         assert_eq!(saved["settings"]["roots"], json!([project.canonicalize()?]));
         assert_eq!(saved["readiness"]["manager"], "missing_prerequisites");
-        assert_eq!(saved["readiness"]["missing"], json!(["Cursor SDK Bridge"]));
+        assert_eq!(saved["readiness"]["missing"], json!(["cursor"]));
         assert!(node.info().get("manager_available").is_none());
         let nodes = node
             .rpc(
@@ -2276,7 +2276,7 @@ mod tests {
             nodes["nodes"][0]["capabilities"]["roots"],
             json!([project.canonicalize()?])
         );
-        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor_sdk");
+        assert_eq!(nodes["nodes"][0]["capabilities"]["manager"], "cursor");
         assert_eq!(
             nodes["nodes"][0]["capabilities"]["manager_state"],
             "needs_setup"
@@ -2315,7 +2315,7 @@ mod tests {
         )
         .await?;
         let mut expected = saved["settings"].clone();
-        expected["manager"]["provider"] = json!("codex_sdk");
+        expected["manager"]["provider"] = json!("codex");
         expected["manager"]["model"] = json!("");
         assert_eq!(
             codex["settings"], expected,
@@ -2358,7 +2358,7 @@ mod tests {
         crate::logging::capture(&logs)?;
         let mut config = Config::local("127.0.0.1:4790".parse()?, vec![], false);
         config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
-        config.providers.execution = true;
+        config.providers.execution = [Provider::Codex].into();
         config.save(&dir)?;
         config::private_write(
             &dir.join("data-epoch.json"),
@@ -2428,7 +2428,7 @@ mod tests {
                 "{text}"
             );
         }
-        assert_eq!(read["settings"]["manager"]["provider"], "codex_sdk");
+        assert_eq!(read["settings"]["manager"]["provider"], "codex");
         let codex = &read["providers"][0];
         assert_eq!(codex["provider"], "codex");
         assert_eq!(codex["roles"], json!(["agent", "execution"]));
@@ -2529,7 +2529,6 @@ mod tests {
             json!({"provider":"cursor","execution":true}),
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
-            json!({"provider":"cursor","bin":"/fixture/cursor"}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
         ] {
             assert!(
@@ -2546,7 +2545,7 @@ mod tests {
         )
         .await?;
         assert_eq!(off["providers"][0]["roles"], json!(["agent"]));
-        assert!(!node.providers().switches.execution);
+        assert!(node.providers().switches.execution.is_empty());
         assert!(matches!(
             node.providers().codex_target(true),
             crate::providers::CodexTarget::Spawn(_)
@@ -2577,7 +2576,7 @@ mod tests {
             json!({"provider":"cursor","bot":true}),
         )
         .await?;
-        assert_eq!(moved["settings"]["manager"]["provider"], "cursor_sdk");
+        assert_eq!(moved["settings"]["manager"]["provider"], "cursor");
         assert_eq!(moved["settings"]["manager"]["model"], "auto");
         assert_eq!(moved["providers"][0]["roles"], json!([]));
         assert_eq!(moved["providers"][0]["state"], "off");
@@ -2590,7 +2589,7 @@ mod tests {
         )
         .await?;
         assert_eq!(
-            unchanged["settings"]["manager"]["provider"], "cursor_sdk",
+            unchanged["settings"]["manager"]["provider"], "cursor",
             "stopping the bot elsewhere leaves it running"
         );
         let stopped = dispatch(
@@ -2608,9 +2607,9 @@ mod tests {
         let reopened = Runtime::reopen(&dir).await?;
         let providers = reopened.providers();
         assert!(reopened.manager().is_none());
-        assert!(!providers.switches.execution);
+        assert!(providers.switches.execution.is_empty());
         assert_eq!(
-            providers.codex_bin,
+            providers.bin(Provider::Codex),
             std::path::PathBuf::from("/fixture/codex")
         );
         assert_eq!(

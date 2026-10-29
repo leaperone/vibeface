@@ -9,13 +9,15 @@ use vibeface_bridge::{
 };
 use vibeface_protocol::now_ms;
 
-/// Registers the work with the Node (`track`), reports its thread before the send, sends the
-/// prompt with `clientUserMessageId` = work ID and reports how the send ended (`bind`). Without `thread` the work starts a
-/// turn in a new thread (or the one it continues); with `thread` it goes into that existing
-/// thread, steering its running turn or starting one, and the thread's directory is read first.
-/// Only the registration that created the work sends, and only inside its window. Each connect
-/// first waits on `ready` for the Node's own App Server connection, so a send right after the
-/// Node starts is not refused while the App Server comes up.
+/// Registers the work with the Node (`track`); a work the Node runs on Codex is sent here.
+/// The CLI reports its thread before the send, sends the prompt with `clientUserMessageId` =
+/// work ID and reports how the send ended (`bind`). Without `thread` the work starts a turn in
+/// a new thread (or the one it continues); with `thread` it goes into that existing thread,
+/// steering its running turn or starting one, and the thread's directory is read first. Only
+/// the registration that created the work sends, and only inside its window. `ready` names the
+/// provider the Node runs a work naming `agent` on, after waiting for the Node's own App Server
+/// connection when that is Codex, so a send right after the Node starts is not refused while
+/// the App Server comes up.
 pub async fn dispatch<T, TF, B, BF, R, RF>(
     args: &Value,
     track: T,
@@ -28,14 +30,19 @@ where
     TF: Future<Output = Result<Value>>,
     B: Fn(String, StartReport) -> BF,
     BF: Future<Output = Result<Value>>,
-    R: Fn() -> RF,
-    RF: Future<Output = ()>,
+    R: Fn(Value) -> RF,
+    RF: Future<Output = Option<String>>,
 {
     let mut args = args.clone();
     let existing = args["thread"].as_str().map(str::to_owned);
-    // A send reads its thread before registering, so a missing thread leaves nothing behind.
-    if let Some(thread) = &existing {
-        ready().await;
+    // A Codex send reads its thread before registering, so a missing thread leaves nothing
+    // behind. The Node checks the session another provider would take the work in.
+    let readied = match &existing {
+        Some(_) => Some(ready(args["agent"].clone()).await),
+        None => None,
+    };
+    if let (Some(thread), Some(Some("codex"))) = (&existing, readied.as_ref().map(Option::as_deref))
+    {
         let mut session = DirectSession::connect(socket)
             .await
             .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -68,7 +75,9 @@ where
         .to_owned();
     let report = |report| bind(work_id.clone(), report);
     let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
-    ready().await;
+    if readied.is_none() {
+        ready(args["agent"].clone()).await;
+    }
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
         Err(error) => return fail(error.failure()).await,

@@ -62,11 +62,12 @@ impl Runtime {
                     crate::providers::cursor_launch(&self.provider_env(manager.provider));
                 Some((manager, key?, env))
             });
+        let bin = self.providers().bin(Provider::Cursor);
         tokio::spawn(async move {
             bridge.retire().await;
             if let Some((manager, api_key, env)) = launch
                 && let Err(error) = bridge
-                    .prewarm(&manager.cursor_sdk_bin, &manager.workspace, &api_key, &env)
+                    .prewarm(&bin, &manager.workspace, &api_key, &env)
                     .await
             {
                 tracing::warn!(%error, "Cursor SDK bridge did not start ahead of a reply");

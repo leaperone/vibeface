@@ -70,13 +70,32 @@ pub enum ReplyStatus {
     Failed,
 }
 
+/// `Agent`: a turn on one of this device's providers that the Node watches, named by the
+/// provider. `task`: work handed to a device's coordination Agent as a task turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-/// `codex`: a Codex turn this device's coordination Agent sent and the Node watches.
-/// `task`: work handed to a device's coordination Agent as a task turn.
+#[serde(into = "String", try_from = "String")]
 pub enum WorkKind {
-    Codex,
+    Agent(Provider),
     Task,
+}
+
+impl From<WorkKind> for String {
+    fn from(kind: WorkKind) -> String {
+        match kind {
+            WorkKind::Agent(provider) => provider.name().into(),
+            WorkKind::Task => "task".into(),
+        }
+    }
+}
+
+impl TryFrom<String> for WorkKind {
+    type Error = serde_json::Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        if name == "task" {
+            return Ok(WorkKind::Task);
+        }
+        serde_json::from_value(serde_json::Value::String(name)).map(WorkKind::Agent)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -113,7 +132,7 @@ pub enum Severity {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CloseReason {
-    /// The App Server request it held is gone, so no answer can reach it.
+    /// The request it held is gone, so no answer can reach it.
     RequestLost,
 }
 
@@ -126,14 +145,16 @@ pub const BOTS_SCOPE: &str = "bots";
 #[serde(deny_unknown_fields)]
 pub struct Subject {
     pub node: DeviceId,
-    /// `codex` or `claude`.
-    pub agent: String,
-    /// A Codex thread ID or a Claude Code session ID.
+    /// The provider running the session; `None` when the question is about `node`'s own
+    /// settings, whose answer goes to `apply_provider_config`.
+    pub agent: Option<crate::providers::Provider>,
+    /// The provider's thread or session ID.
     pub session_id: String,
     pub cwd: String,
     /// One line: what the session last said.
     pub summary: String,
-    /// The App Server request `node` holds until the question is answered.
+    /// The request `node` holds until the question is answered: an App Server's, or one a
+    /// session's hook, plugin or extension waits on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
@@ -657,7 +678,7 @@ pub enum EventBody {
     /// deleted included, or the bot its owner hands it to. The latest by rank stands.
     SessionAttributed {
         node: DeviceId,
-        agent: String,
+        agent: crate::providers::Provider,
         session_id: String,
         cwd: String,
         summary: String,

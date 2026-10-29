@@ -370,15 +370,10 @@ fn cause_id(scope: &str, cause: &Cause) -> Result<()> {
     Ok(())
 }
 
-fn subject(node: &str, agent: &str, session: &str, cwd: &str, summary: &str) -> Result<()> {
+fn subject(node: &str, session: &str, cwd: &str, summary: &str) -> Result<()> {
     decode32(node)?;
     ensure!(
-        !agent.is_empty()
-            && agent.len() <= 32
-            && !session.is_empty()
-            && session.len() <= 256
-            && cwd.len() <= 4096
-            && summary.len() <= 1024,
+        !session.is_empty() && session.len() <= 256 && cwd.len() <= 4096 && summary.len() <= 1024,
         "invalid session subject"
     );
     Ok(())
@@ -572,13 +567,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 !text.trim().is_empty() && text.len() <= 1024,
                 "a question is 1-1024 bytes"
             );
-            subject(
-                &about.node,
-                &about.agent,
-                &about.session_id,
-                &about.cwd,
-                &about.summary,
-            )?;
+            subject(&about.node, &about.session_id, &about.cwd, &about.summary)?;
             about.request_id.as_deref().map(id).transpose()?;
             ensure!(choices.len() <= 8, "at most 8 choices");
             for (index, choice) in choices.iter().enumerate() {
@@ -602,10 +591,10 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
         }
         EventBody::SessionAttributed {
             node,
-            agent,
             session_id,
             cwd,
             summary,
+            ..
         } => {
             ensure!(
                 event.scope_id != BOTS_SCOPE,
@@ -615,7 +604,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 *node == event.author,
                 "only the device running a session hands it over"
             );
-            subject(node, agent, session_id, cwd, summary)?;
+            subject(node, session_id, cwd, summary)?;
         }
         EventBody::SessionMuted { node, session_id } => {
             ensure!(
@@ -626,7 +615,7 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
                 *node == event.author,
                 "only the device running a session mutes it"
             );
-            subject(node, "-", session_id, "", "")?;
+            subject(node, session_id, "", "")?;
         }
         EventBody::ContextCheckpoint { covers, .. } => {
             for author in covers.keys() {

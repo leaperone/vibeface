@@ -1,9 +1,9 @@
-//! Drives the work state machine from App Server results and events. Every change goes through
-//! `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
+//! Drives the work state machine from what the providers report and read back. Every change goes
+//! through `Store::apply_work_signal`, so the journal, the DAG and the UI agree.
 use super::*;
 use crate::scheduling::task_trigger;
 use crate::work::{
-    Dispatch, DispatchState, Handle, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
+    Dispatch, DispatchState, Probe, Signal, StopRequest, WorkRecord, WorkSpec, WorkState,
 };
 use vibeface_bridge::{
     codex::{ExecEvent, StartReport},
@@ -28,6 +28,11 @@ fn live(record: &WorkRecord) -> bool {
         record.state,
         WorkState::Finished { .. } | WorkState::Unverified { probe: false, .. }
     )
+}
+
+/// Whether the work's turn runs on the App Server, whose connection and events the Node follows.
+fn on_app_server(record: &WorkRecord) -> bool {
+    matches!(record.kind, WorkKind::Agent(provider) if provider.on_app_server())
 }
 
 impl Runtime {
@@ -91,11 +96,11 @@ impl Runtime {
         }
         // A held stop reaches a turn as soon as it is known to run, as when it binds.
         if !quiet
-            && let WorkState::Running { handle } = &record.state
+            && matches!(record.state, WorkState::Running { .. })
             && self.waiting_stop(work_id).await?
             && self.stop_attempt_due(work_id)
         {
-            match Box::pin(self.interrupt_turn(network, work_id, handle)).await {
+            match Box::pin(self.interrupt_turn(network, &record)).await {
                 Ok(stopped) => return Ok(stopped),
                 Err(error) => tracing::warn!(%error, work_id, "stop waits for the next reconcile"),
             }
@@ -116,7 +121,7 @@ impl Runtime {
             .work_records()
             .unwrap_or_default()
             .into_iter()
-            .filter(live)
+            .filter(|record| live(record) && on_app_server(record))
             .filter_map(|record| record.state.thread().map(str::to_owned))
             .collect();
         let _ = self.codex.observe(threads);
@@ -203,12 +208,12 @@ impl Runtime {
                     .context("agent task not found on this device")?;
                 ensure!(
                     spec.dispatcher == spec.target
-                        && spec.kind == WorkKind::Codex
+                        && matches!(spec.kind, WorkKind::Agent(_))
                         && task.kind == WorkKind::Task
                         && task.conversation == spec.conversation
                         && spec.parent.as_deref() == Some(task.work_id.as_str())
                         && !task.state.finished(),
-                    "an agent task only starts Codex work on its own device"
+                    "an agent task only starts work on its own device"
                 );
             }
             _ => bail!("invalid work trigger"),
@@ -239,9 +244,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// Records the dispatch. A Codex work is then started by the Agent that registered it; an
-    /// agent task is queued for this device's bot. A retry of the same `work_id` returns the
-    /// existing record and `false`, so it never starts a second turn.
+    /// Records the dispatch. Its provider then starts it (see `Executor::start`); an agent task
+    /// is queued for this device's bot. A retry of the same `work_id` returns the existing
+    /// record and `false`, so it never starts a second turn.
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,
@@ -388,8 +393,8 @@ impl Runtime {
         Ok(dispatch)
     }
 
-    /// The Agent's report of its own send: the thread before `turn/start`, then the turn, a
-    /// refusal, or an unknown result that the Node settles by reading the thread.
+    /// The Agent's report of its own send to the App Server: the thread before `turn/start`, then
+    /// the turn, a refusal, or an unknown result that the Node settles by reading the thread.
     pub(super) async fn bind_work(
         self: &Arc<Self>,
         network: &str,
@@ -404,7 +409,7 @@ impl Runtime {
             .work_record(work_id)?
             .context("work not found on this device")?;
         ensure!(
-            record.conversation == scope && record.kind == WorkKind::Codex,
+            record.conversation == scope && on_app_server(&record),
             "work belongs to another conversation"
         );
         let mut record = record;
@@ -460,11 +465,9 @@ impl Runtime {
                     );
                 }
                 // The turn may have ended before it was bound.
-                if let Some(handle) = record.state.handle().cloned()
-                    && let Ok(probe @ Probe::Terminal { .. }) = self
-                        .codex
-                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id)
-                        .await
+                if record.state.handle().is_some()
+                    && let Ok(probe @ Probe::Terminal { .. }) =
+                        self.work_executor(&record)?.probe(&record).await
                 {
                     record = self
                         .signal_work(network, work_id, Signal::Probed(probe))
@@ -507,8 +510,8 @@ impl Runtime {
         Ok(json!({"work_id":work_id,"state":record.state}))
     }
 
-    /// Reads the thread to settle a work's state; it never starts or resends anything. Before the
-    /// Agent's window is over only a found turn is applied, so a late send is never written off.
+    /// Reads the turn back to settle a work's state; it never starts or resends anything. Before
+    /// the send window is over only a found turn is applied, so a late send is never written off.
     pub(super) async fn probe_work(
         self: &Arc<Self>,
         network: &str,
@@ -521,7 +524,7 @@ impl Runtime {
             .await
             .work_record(work_id)?
             .context("work not found")?;
-        if record.kind != WorkKind::Codex {
+        if record.kind == WorkKind::Task {
             return Ok(());
         }
         let over = record.send_window_over(now_ms());
@@ -533,7 +536,6 @@ impl Runtime {
         if !now && !over && unsent {
             return Ok(());
         }
-        let codex = &self.codex;
         let probe = match &record.state {
             WorkState::Accepted | WorkState::Starting { thread: None } => {
                 if over {
@@ -542,23 +544,15 @@ impl Runtime {
                         work_id,
                         Signal::StartRejected(ExecFailure::new(
                             FailureKind::TimedOut,
-                            "the coordination Agent did not start this work in time",
+                            "this work was not started in time",
                         )),
                     )
                     .await?;
                 }
                 return Ok(());
             }
-            state => match (state.handle(), state.thread()) {
-                (Some(handle), _) => {
-                    codex
-                        .probe(&handle.thread_id, Some(&handle.turn_id), work_id)
-                        .await
-                }
-                // A send not seen in time is looked for by its work ID.
-                (None, Some(thread)) => codex.probe(thread, None, work_id).await,
-                (None, None) => return Ok(()),
-            },
+            state if state.thread().is_none() => return Ok(()),
+            _ => self.work_executor(&record)?.probe(&record).await,
         };
         match probe {
             Ok(Probe::NotStarted | Probe::Missing)
@@ -571,7 +565,7 @@ impl Runtime {
                     .await?;
                 Ok(())
             }
-            Err(error) => bail!("App Server probe failed: {error}"),
+            Err(error) => Err(error),
         }
     }
 
@@ -589,7 +583,7 @@ impl Runtime {
                 .is_ok();
         let records = self.store.lock().await.work_records()?;
         for record in records {
-            if record.kind != WorkKind::Codex {
+            if record.kind == WorkKind::Task {
                 continue;
             }
             let due = match record.state {
@@ -598,7 +592,7 @@ impl Runtime {
                 _ => false,
             };
             if due && let Err(error) = self.probe_work(network, &record.work_id, false).await {
-                tracing::debug!(%error, "work probe waits for the App Server");
+                tracing::debug!(%error, "work probe waits for its provider");
             }
         }
         let local = self.identity.device_id()?;
@@ -606,7 +600,7 @@ impl Runtime {
         for request in stops.into_iter().filter(|request| request.target == local) {
             let work_id = request.work_id.clone();
             if let Err(error) = self.reconcile_stop(network, request).await {
-                tracing::debug!(%error, work_id, "stop waits for the App Server");
+                tracing::debug!(%error, work_id, "stop waits for its provider");
             }
         }
         Ok(())
@@ -661,26 +655,23 @@ impl Runtime {
         Ok(())
     }
 
-    /// Sends `turn/interrupt` for a held stop. Only the App Server's answer moves the work to
+    /// Asks the provider to stop a held stop's turn. Only its answer moves the work to
     /// interrupting and starts the deadline; a failed or unknown result leaves the stop to the
     /// next reconcile, which reads the turn before asking again.
     async fn interrupt_turn(
         self: &Arc<Self>,
         network: &str,
-        work_id: &str,
-        handle: &Handle,
+        record: &WorkRecord,
     ) -> Result<WorkRecord> {
-        self.codex
-            .interrupt(&handle.thread_id, &handle.turn_id)
-            .await
-            .map_err(|error| anyhow::anyhow!("interrupt was not confirmed: {error}"))?;
+        let work_id = record.work_id.as_str();
+        self.work_executor(record)?.interrupt(record).await?;
         self.stop_retries
             .lock()
             .expect("stop retries")
             .remove(work_id);
         {
             let mut store = self.store.lock().await;
-            // A turn that outlived an interrupt the App Server took is still being stopped.
+            // A turn that outlived an interrupt the provider took is still being stopped.
             let again = store
                 .work_record(work_id)?
                 .is_some_and(|record| matches!(record.state, WorkState::Interrupting { .. }));
@@ -700,7 +691,7 @@ impl Runtime {
 
     /// Carries out a stop this device holds for its own work until the work ends. Before asking
     /// again it reads the turn, so a turn that has ended is settled and never interrupted. An
-    /// interrupt the App Server took that has not ended the turn by the deadline is sent again;
+    /// interrupt the provider took that has not ended the turn by the deadline is sent again;
     /// one whose turn cannot be read then leaves the work unverified.
     async fn reconcile_stop(
         self: &Arc<Self>,
@@ -715,9 +706,9 @@ impl Runtime {
             return Ok(());
         };
         // An unbound work is interrupted once its turn binds.
-        let Some(handle) = record.state.handle().cloned() else {
+        if record.state.handle().is_none() {
             return Ok(());
-        };
+        }
         let at = now_ms();
         if !request.timed_out && at >= request.deadline_ms {
             request.timed_out = true;
@@ -728,9 +719,7 @@ impl Runtime {
         if (interrupting && at < request.deadline_ms) || !self.stop_attempt_due(&work_id) {
             return Ok(());
         }
-        let probe = self
-            .codex
-            .probe(&handle.thread_id, Some(&handle.turn_id), &work_id);
+        let probe = self.work_executor(&record)?.probe(&record);
         match tokio::time::timeout(STOP_ATTEMPT_TIMEOUT, probe).await {
             Ok(Ok(Probe::Running { turn_id, epoch })) => {
                 if matches!(record.state, WorkState::Unverified { .. }) {
@@ -738,7 +727,7 @@ impl Runtime {
                     self.signal_work(network, &work_id, Signal::Probed(running))
                         .await?;
                 }
-                self.interrupt_turn(network, &work_id, &handle).await?;
+                self.interrupt_turn(network, &record).await?;
             }
             Ok(Ok(probe)) => {
                 self.signal_work(network, &work_id, Signal::Probed(probe))
@@ -789,7 +778,7 @@ impl Runtime {
             | WorkState::Starting { .. }
             | WorkState::Running { .. }
             | WorkState::Unverified { probe: true, .. }
-                if record.kind == WorkKind::Codex =>
+                if record.kind != WorkKind::Task =>
             {
                 let at = now_ms();
                 let held = self
@@ -803,10 +792,10 @@ impl Runtime {
                     })
                     .await?;
                 match &record.state {
-                    WorkState::Running { handle } => {
+                    WorkState::Running { .. } => {
                         retrying = !(held
                             && self.stop_attempt_due(work_id)
-                            && Box::pin(self.interrupt_turn(network, work_id, handle))
+                            && Box::pin(self.interrupt_turn(network, &record))
                                 .await
                                 .inspect_err(|error| {
                                     tracing::warn!(%error, work_id, "stop waits for the next reconcile")
@@ -969,7 +958,10 @@ impl Runtime {
             return Ok(());
         };
         let records = self.store.lock().await.work_records()?;
-        for record in records.into_iter().filter(live) {
+        for record in records
+            .into_iter()
+            .filter(|record| live(record) && on_app_server(record))
+        {
             if connected {
                 if let Err(error) = self.probe_work(&network, &record.work_id, false).await {
                     tracing::debug!(%error, "work probe after reconnect failed");

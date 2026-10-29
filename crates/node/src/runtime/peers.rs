@@ -488,9 +488,9 @@ impl Runtime {
                 );
                 self.codex_state(network, input).await
             }
-            "codex_respond" => {
+            "respond" => {
                 let result = input.get("result").cloned().context("result is required")?;
-                self.answer_codex_request(field(input, "request_id")?, Some(Ok(result)), "agent")
+                self.answer_request(field(input, "request_id")?, Some(Ok(result)), "agent")
                     .await
             }
             "hand_over_session" => {
@@ -1139,7 +1139,7 @@ impl Runtime {
             "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
             "device_id":self.identity.device_id()?, "config":{
                 "public_entry":self.config.public_entry,"project_roots":settings.roots.len(),
-                "manager_enabled":settings.manager.is_some(),"execution_enabled":self.providers().switches.execution,
+                "manager_enabled":settings.manager.is_some(),"execution":self.providers().switches.execution,
                 "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
             "peers":peers,
@@ -2411,7 +2411,7 @@ mod tests {
                 target: ib.device_id()?,
                 dispatcher: ia.device_id()?,
                 call_ref: "remote".into(),
-                kind: WorkKind::Codex,
+                kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2884,7 +2884,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
-                cursor_sdk_bin: "cursor-sdk".into(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             let peer = ib.device_id()?;
@@ -2917,7 +2916,7 @@ mod tests {
             .context("first sync")?;
             let online = listed(a.rpc(access.clone(), json!({"method":"nodes"})).await?)?;
             assert_eq!(online["online"], true);
-            assert_eq!(online["capabilities"]["manager"], "cursor_sdk");
+            assert_eq!(online["capabilities"]["manager"], "cursor");
             let mut events = a.events.subscribe();
             b.stop_network().await;
             a.wake_sync(&peer);
@@ -3076,7 +3075,6 @@ mod tests {
                 provider: crate::providers::Provider::Cursor,
                 workspace: dir_b.join("manager-workspace"),
                 model: String::new(),
-                cursor_sdk_bin: "cursor-sdk".into(),
             });
             a.net()?.learn(&b.net()?.addr()).await;
             first_sync(&a, &peer).await?;
@@ -3090,7 +3088,7 @@ mod tests {
         let copy = dir_a.with_extension("restarted");
         let result = async {
             let online = online?;
-            assert_eq!(online["capabilities"]["manager"], "cursor_sdk");
+            assert_eq!(online["capabilities"]["manager"], "cursor");
             std::process::Command::new("cp")
                 .arg("-R")
                 .args([&dir_a, &copy])

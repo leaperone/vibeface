@@ -1,5 +1,5 @@
 import * as Clipboard from 'expo-clipboard'
-import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Asterisk, Bell, Bot, Braces, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, Switch, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -59,19 +59,12 @@ function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
   return { value, busy, error, call, load, setError }
 }
 
-const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2 }
+const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
   starting: { label: '启动中', tone: 'neutral', icon: LoaderCircle },
   off: { label: '未使用', tone: 'neutral', icon: CircleDashed },
-}
-// Names come from runtime/settings.rs readiness.missing.
-const checks: Record<ProviderId, { key: string; label: string }[]> = {
-  codex: [
-    { key: 'Codex CLI', label: '缺少 Codex 命令行' },
-  ],
-  cursor: [{ key: 'Cursor SDK Bridge', label: '缺少 Cursor 组件' }],
 }
 
 const services: Record<string, string> = { CURSOR_API_KEY: 'Cursor', OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
@@ -129,12 +122,11 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
   const manager = assistant ? response.settings.manager : null
-  const missing = assistant ? checks[item.provider].filter((check) => response.readiness.missing.includes(check.key)) : []
-  const state = states[item.state === 'ready' && missing.length ? 'needs_setup' : item.state]
+  const state = states[item.state]
   const issue = item.state === 'needs_setup' ? item.issues[0] : undefined
   const [open, setOpen] = useState(false)
-  const [bin, setBin] = useState(item.bin ?? '')
-  useEffect(() => setBin(item.bin ?? ''), [item.bin])
+  const [bin, setBin] = useState(item.bin)
+  useEffect(() => setBin(item.bin), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
   return <View className="overflow-hidden rounded-xl border border-border">
     <View className="min-h-14 flex-row items-center gap-3 px-3 py-2">
@@ -145,7 +137,7 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
       </View>
     </View>
-    <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} />
+    {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
     {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
     {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-3 py-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
@@ -153,18 +145,16 @@ function ProviderCard({ item, response, busy, error, change, saveAssistant, test
       {issue.code === 'app_server_not_found' && item.app_server
         ? <Button variant="link" className="min-h-11 px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>改为自己启动</Text></Button>
         : <Button variant="link" className="min-h-11 px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
-    </View> : missing.map((check) => <View key={check.key} className="flex-row items-center gap-2 px-3 py-2">
-      <Icon as={CircleX} className="size-4 text-danger" /><Text className="shrink text-meta">{check.label}</Text>
-    </View>)}
+    </View> : null}
     <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-3 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
     </Pressable>
     {open ? <View className="gap-5 px-3 pb-3">
       {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
       {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
-      {item.bin !== null ? <Field label="程序">
-        <SaveRow value={bin} saved={item.bin ?? ''} placeholder="codex" mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
-      </Field> : null}
+      <Field label="程序">
+        <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
+      </Field>
       {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} working={working} save={saveAssistant} /> : null}
       <Variables item={item} working={working} change={change} />
       {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
@@ -228,12 +218,12 @@ function AppServerSettings({ server, working, save, test }: { server: AppServer;
   </Field>
 }
 
-const assistantFields = ['model', 'workspace', 'cursor_sdk_bin'] as const
+const assistantFields = ['model', 'workspace'] as const
 
-/** The bot's model, folder and programs, inside the settings of the provider it runs on. */
+/** The bot's model and folder, inside the settings of the provider it runs on. */
 function AssistantDetails({ manager, working, save }: { manager: ManagerSettings; working: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
-  const cursor = manager.provider === 'cursor_sdk'
+  const cursor = manager.provider === 'cursor'
   const dirty = assistantFields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Field key={key} label={label}>
     <Input accessibilityLabel={label} className={cn('h-11', key !== 'model' && 'font-mono')} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
@@ -243,7 +233,6 @@ function AssistantDetails({ manager, working, save }: { manager: ManagerSettings
     <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     {field('model', '模型', cursor ? 'auto' : '默认')}
     {field('workspace', folderLabels.botRun)}
-    {cursor ? field('cursor_sdk_bin', 'Cursor 组件') : null}
     {dirty ? <Button variant="outline" className="min-h-11 self-start" disabled={working || (cursor && !draft.model.trim())}
       onPress={() => void save(Object.fromEntries(Object.entries(draft).map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])) as ManagerSettings)}><Text>保存</Text></Button> : null}
   </View>

@@ -1,21 +1,22 @@
 //! Triage workers (design 4): capture into one queue, hand batches to the coordination Agent,
 //! ask the user in the chat of the bot that owns each session, deliver webhooks from a
-//! local outbox, hold App Server requests for the Agent, and give sessions no bot started
-//! to the primary bot until it hands them to another or stops following them.
+//! local outbox, hold the requests sessions wait on for the Agent, and give sessions no bot
+//! started to the primary bot until it hands them to another or stops following them.
 use super::{Access, Changed, Runtime, now_ms};
 use crate::{
     config,
     manager::{self, ManagerConfig},
     model::{Choice, EventBody, Subject},
     net,
-    triage::{self, AgentEvent, Delivery, OutboxEntry, Severity, TriageConfig},
+    providers::Provider,
+    triage::{self, AgentEvent, Delivery, OutboxEntry, RequestKind, Severity, TriageConfig},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -30,17 +31,19 @@ const SCAN_WINDOW_MS: i64 = 24 * 3600 * 1000;
 const SEEN_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
 /// The session of an App Server request that belongs to no thread.
 const NO_THREAD: &str = "app-server";
-/// How long an App Server request waits for the coordination Agent before the fallback answer.
-pub(crate) const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
+/// How long a held App Server request waits for the coordination Agent before the fallback answer.
+pub const AGENT_ANSWER_WITHIN: Duration = Duration::from_secs(120);
+/// How long a hook's held request waits; its session sits blocked in front of the user meanwhile.
+pub const HOOK_ANSWER_WITHIN: Duration = Duration::from_secs(30);
 const WEBHOOK_KEY: &str = "triage-webhook.key";
 const DECISION_TOKENS: &str = "decision-tokens.json";
 pub const SPOOL_DIR: &str = "hook-spool";
 
 pub(crate) struct TriageState {
     config: std::sync::Mutex<TriageConfig>,
-    /// App Server requests waiting for an answer, by the Node's own request ID. They live only as
-    /// long as the connection that carried them.
-    requests: std::sync::Mutex<HashMap<String, CodexRequest>>,
+    /// Requests sessions hold until they are answered, by the Node's own request ID. An App
+    /// Server request lives only as long as the connection that carried it.
+    requests: std::sync::Mutex<HashMap<String, HeldRequest>>,
     /// Answers given in this process: answering again returns the first answer.
     answered: std::sync::Mutex<HashMap<String, Value>>,
     wake: tokio::sync::Notify,
@@ -80,19 +83,91 @@ impl TriageState {
     }
 }
 
+/// A request a session holds until it is answered.
 #[derive(Clone, Serialize)]
-struct CodexRequest {
+struct HeldRequest {
     request_id: String,
-    #[serde(skip)]
-    rpc_id: Value,
-    method: String,
-    thread_id: Option<String>,
-    turn_id: Option<String>,
-    params: Value,
+    provider: Provider,
+    /// The thread or session that asked.
+    session_id: String,
+    kind: RequestKind,
     received_ms: i64,
-    /// `None` while a question holds it for the user.
+    /// `None` while a question holds it for the user. A hook's stays: the hook waits only so long.
     answer_by_ms: Option<i64>,
     question_id: Option<String>,
+    #[serde(flatten)]
+    reply: Reply,
+}
+
+/// Where a held request's answer goes.
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum Reply {
+    /// The JSON-RPC answer on the App Server connection that asked.
+    AppServer {
+        #[serde(skip)]
+        rpc_id: Value,
+        method: String,
+        turn_id: Option<String>,
+        params: Value,
+    },
+    /// The hook waiting on `/api/hooks/wait`.
+    Hook {
+        #[serde(skip)]
+        answer: tokio::sync::watch::Sender<Option<Value>>,
+        /// A hook came to wait; once none waits any more, its session no longer takes an answer.
+        #[serde(skip)]
+        waited: bool,
+    },
+}
+
+impl HeldRequest {
+    /// What asked, for logs: the App Server method, or a hook.
+    fn origin(&self) -> &str {
+        match &self.reply {
+            Reply::AppServer { method, .. } => method,
+            Reply::Hook { .. } => "hook",
+        }
+    }
+}
+
+/// Keeps how a held request was answered, so a second answer and its hook's wait find it.
+fn remember(
+    answered: &mut HashMap<String, Value>,
+    request: &HeldRequest,
+    request_id: &str,
+    decision: &str,
+    by: &str,
+    sent: Result<(), String>,
+    answer: Option<Value>,
+) -> Value {
+    let mut outcome = json!({"request_id":request_id,"provider":request.provider,
+        "session_id":request.session_id,"kind":request.kind,"decision":decision,"by":by,
+        "answered":sent.is_ok(),"error":sent.as_ref().err()});
+    if let Some(answer) = answer {
+        outcome["answer"] = answer;
+    }
+    tracing::info!(request = %request_id, origin = request.origin(), %decision, %by,
+        answered = sent.is_ok(), "held request answered");
+    // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
+    if answered.len() > 1024 {
+        answered.clear();
+    }
+    answered.insert(request_id.into(), outcome.clone());
+    outcome
+}
+
+/// What the hook prints when nobody answered: its session decides.
+fn undecided() -> Value {
+    json!({"decision":null})
+}
+
+/// Approvals ask permission; every other App Server request asks a question.
+fn codex_kind(method: &str) -> RequestKind {
+    match method.ends_with("Approval") {
+        true => RequestKind::Permission,
+        false => RequestKind::Question,
+    }
 }
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -102,14 +177,9 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// What a request asks, for the event the Agent and the outlets see. Commands, patches and
-/// paths are left out; the Agent reads them with `vibeface codex requests`.
+/// paths are left out; the Agent reads them with `vibeface requests`.
 fn describe(method: &str, params: &Value) -> String {
-    let questions: Vec<&str> = params["questions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|question| question["question"].as_str())
-        .collect();
+    let questions = crate::triage::question_lines(&params["questions"]);
     json!({"method":method,"reason":params["reason"],"message":params["message"],
         "questions":questions,"server":params["serverName"]})
     .to_string()
@@ -148,15 +218,15 @@ fn summary(event: &AgentEvent) -> String {
         .collect()
 }
 
-fn subject(event: &AgentEvent, request_id: Option<String>) -> Result<Subject> {
-    Ok(Subject {
+fn subject(event: &AgentEvent, request_id: Option<String>) -> Subject {
+    Subject {
         node: event.node.clone(),
-        agent: name(event.agent)?,
+        agent: Some(event.agent),
         session_id: event.session_id.clone(),
         cwd: event.cwd.clone(),
         summary: summary(event),
         request_id,
-    })
+    }
 }
 
 fn shared_event(event: &AgentEvent, roots: &[PathBuf]) -> AgentEvent {
@@ -304,11 +374,98 @@ impl Runtime {
     /// was deleted, goes to the primary bot first; without a bot its events drop. An event ID
     /// seen before is a duplicate, whichever source sent it first.
     pub(crate) async fn ingest_agent_event(&self, event: AgentEvent) -> Result<Value> {
-        self.queue_event(AgentEvent {
+        let event = AgentEvent {
             request_id: None,
             ..event
-        })
-        .await
+        };
+        match event.hold {
+            Some(kind) => self.hold_request(event, kind).await,
+            None => self.queue_event(event).await,
+        }
+    }
+
+    /// A hook's event whose session waits for the answer: held like an App Server request, and
+    /// answered to the hook waiting on `/api/hooks/wait`. An event that is not queued holds
+    /// nothing, and neither does a second one for a request already held; their hooks leave
+    /// the decision to the session.
+    async fn hold_request(&self, event: AgentEvent, kind: RequestKind) -> Result<Value> {
+        let request_id = AgentEvent::id_for(
+            &self.identity.device_id()?,
+            event.agent,
+            &event.session_id,
+            &event.turn_id,
+            event.event,
+        );
+        let now = now_ms();
+        let request = HeldRequest {
+            request_id: request_id.clone(),
+            provider: event.agent,
+            session_id: event.session_id.clone(),
+            kind,
+            received_ms: now,
+            answer_by_ms: Some(now + HOOK_ANSWER_WITHIN.as_millis() as i64),
+            question_id: None,
+            reply: Reply::Hook {
+                answer: tokio::sync::watch::channel(None).0,
+                waited: false,
+            },
+        };
+        match lock(&self.triage.requests).entry(request_id.clone()) {
+            Entry::Occupied(_) => return Ok(json!({"status":"duplicate","event_id":request_id})),
+            Entry::Vacant(slot) => slot.insert(request),
+        };
+        let queued = self
+            .queue_event(AgentEvent {
+                request_id: Some(request_id.clone()),
+                ..event
+            })
+            .await;
+        match queued {
+            Ok(mut result) if result["status"] == "accepted" && result["test"] != true => {
+                tracing::info!(request = %request_id, provider = event.agent.name(), ?kind,
+                    "hook request held");
+                result["request_id"] = json!(request_id);
+                self.triage.wake.notify_one();
+                Ok(result)
+            }
+            queued => {
+                lock(&self.triage.requests).remove(&request_id);
+                queued
+            }
+        }
+    }
+
+    /// `/api/hooks/wait`: the answer to a hook's held request once it is given, or
+    /// `{"decision":null}` at its deadline or when nothing is held, so the hook leaves the
+    /// decision to its session.
+    pub(crate) async fn wait_request(&self, request_id: &str) -> Value {
+        let held = match lock(&self.triage.requests).get_mut(request_id) {
+            Some(HeldRequest {
+                reply: Reply::Hook { answer, waited },
+                answer_by_ms: Some(by),
+                ..
+            }) => {
+                *waited = true;
+                Some((answer.subscribe(), *by))
+            }
+            _ => None,
+        };
+        let Some((mut answer, by)) = held else {
+            // Answered before its hook came to wait.
+            return lock(&self.triage.answered)
+                .get(request_id)
+                .and_then(|done| done.get("answer").cloned())
+                .unwrap_or_else(undecided);
+        };
+        let left = Duration::from_millis(u64::try_from(by - now_ms()).unwrap_or(0));
+        let answered = tokio::time::timeout(left, answer.wait_for(Option::is_some))
+            .await
+            .is_ok();
+        if !answered {
+            let _ = self.answer_request(request_id, None, "fallback").await;
+        }
+        let answer = answer.borrow().clone();
+        answer.unwrap_or_else(undecided)
     }
 
     async fn queue_event(&self, event: AgentEvent) -> Result<Value> {
@@ -375,7 +532,7 @@ impl Runtime {
             &self.identity,
             network,
             &primary,
-            &subject(&shared_event(event, &self.settings_snapshot().roots), None)?,
+            &subject(&shared_event(event, &self.settings_snapshot().roots), None),
             now_ms(),
         )?;
         if let Some(written) = written {
@@ -397,16 +554,20 @@ impl Runtime {
     pub(crate) async fn on_codex_request(self: &Arc<Self>, handed: &ServerRequest) {
         let request_id = triage::request_id(&handed.method, &handed.params)
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-        let mut request = CodexRequest {
+        let mut request = HeldRequest {
             request_id: request_id.clone(),
-            rpc_id: json!(handed.id),
-            method: handed.method.clone(),
-            thread_id: handed.thread_id.clone(),
-            turn_id: handed.params["turnId"].as_str().map(str::to_owned),
-            params: handed.params.clone(),
+            provider: Provider::Codex,
+            session_id: handed.thread_id.clone().unwrap_or(NO_THREAD.into()),
+            kind: codex_kind(&handed.method),
             received_ms: now_ms(),
             answer_by_ms: Some(now_ms() + AGENT_ANSWER_WITHIN.as_millis() as i64),
             question_id: None,
+            reply: Reply::AppServer {
+                rpc_id: json!(handed.id),
+                method: handed.method.clone(),
+                turn_id: handed.params["turnId"].as_str().map(str::to_owned),
+                params: handed.params.clone(),
+            },
         };
         // Asked again, the App Server never got the earlier answer.
         lock(&self.triage.answered).remove(&request_id);
@@ -425,7 +586,7 @@ impl Runtime {
         });
         if let Some(question) = standing {
             let closed = !question["closed"].is_null();
-            tracing::info!(request = %request_id, method = %request.method, closed,
+            tracing::info!(request = %request_id, method = %handed.method, closed,
                 "App Server request asked again");
             if !closed {
                 request.question_id = question["question_id"].as_str().map(str::to_owned);
@@ -435,23 +596,21 @@ impl Runtime {
             }
             lock(&self.triage.requests).insert(request_id.clone(), request);
             if closed {
-                let _ = self
-                    .answer_codex_request(&request_id, None, "fallback")
-                    .await;
+                let _ = self.answer_request(&request_id, None, "fallback").await;
             }
             return;
         }
-        tracing::info!(request = %request.request_id, method = %request.method,
-            thread = ?request.thread_id, "App Server request received");
-        lock(&self.triage.requests).insert(request_id.clone(), request.clone());
+        tracing::info!(request = %request_id, method = %handed.method,
+            thread = ?handed.thread_id, "App Server request received");
+        let session_id = request.session_id.clone();
+        lock(&self.triage.requests).insert(request_id.clone(), request);
         // The observer only resumes work threads, so their folder comes from the dispatch.
-        let mut cwd = request
-            .thread_id
-            .as_ref()
-            .and_then(|thread| lock(&self.triage.threads).get(thread).map(|t| t.0.clone()))
+        let mut cwd = lock(&self.triage.threads)
+            .get(&session_id)
+            .map(|thread| thread.0.clone())
             .unwrap_or_default();
         if cwd.is_empty()
-            && let Some(thread) = &request.thread_id
+            && let Some(thread) = &handed.thread_id
         {
             cwd = self
                 .store
@@ -463,19 +622,16 @@ impl Runtime {
                 .unwrap_or_default();
         }
         if cwd.is_empty() {
-            cwd = request.params["cwd"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned();
+            cwd = handed.params["cwd"].as_str().unwrap_or_default().to_owned();
         }
         let event = AgentEvent {
             source: triage::Source::AppServer,
-            agent: triage::Agent::Codex,
+            agent: Provider::Codex,
             event: triage::Kind::NeedsInput,
-            session_id: request.thread_id.clone().unwrap_or(NO_THREAD.into()),
+            session_id,
             turn_id: format!("request:{request_id}"),
             cwd,
-            detail: describe(&request.method, &request.params),
+            detail: describe(&handed.method, &handed.params),
             request_id: Some(request_id.clone()),
             ..Default::default()
         };
@@ -501,17 +657,16 @@ impl Runtime {
             if let Err(error) = &queued {
                 tracing::warn!(%error, "App Server request could not reach the Agent");
             }
-            let _ = self
-                .answer_codex_request(&request_id, None, "fallback")
-                .await;
+            let _ = self.answer_request(&request_id, None, "fallback").await;
             return;
         }
         self.triage.wake.notify_one();
     }
 
-    /// Answers a held request once: `result` from the Agent or the user, or the method's fallback
-    /// when `None`. Answering again returns the first answer.
-    pub(crate) async fn answer_codex_request(
+    /// Answers a held request once: `result` from the Agent or the user, or when `None` the
+    /// App Server method's fallback, or no decision for a hook. Answering again returns the
+    /// first answer.
+    pub(crate) async fn answer_request(
         &self,
         request_id: &str,
         result: Option<Result<Value, Value>>,
@@ -520,42 +675,82 @@ impl Runtime {
         if let Some(done) = lock(&self.triage.answered).get(request_id) {
             return Ok(done.clone());
         }
-        let request = lock(&self.triage.requests)
-            .remove(request_id)
-            .context("no App Server request is waiting with this ID")?;
-        let (result, decision) = match result {
-            Some(result) => {
-                let decision = result
-                    .as_ref()
-                    .ok()
-                    .and_then(|r| r["decision"].as_str().or(r["action"].as_str()))
-                    .unwrap_or(if result.is_ok() { "answered" } else { "error" })
-                    .to_owned();
-                (result, decision)
-            }
-            None => {
-                let (result, decision) = vibeface_bridge::methods::fallback(&request.method);
-                (result, decision.to_owned())
+        let (request, result, decision, settled) = {
+            let mut requests = lock(&self.triage.requests);
+            let mut answered = lock(&self.triage.answered);
+            let Some(request) = requests.remove(request_id) else {
+                return (answered.get(request_id).cloned())
+                    .context("no request is waiting with this ID");
+            };
+            let (result, decision) = match (result, &request.reply) {
+                (Some(result), _) => {
+                    let decision = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r["decision"].as_str().or(r["action"].as_str()))
+                        .unwrap_or(if result.is_ok() { "answered" } else { "error" })
+                        .to_owned();
+                    (result, decision)
+                }
+                (None, Reply::AppServer { method, .. }) => {
+                    let (result, decision) = vibeface_bridge::methods::fallback(method);
+                    (result, decision.to_owned())
+                }
+                (None, Reply::Hook { .. }) => (Ok(undecided()), "undecided".to_owned()),
+            };
+            // A hook is answered here at once, so its wait always finds the answer. An answer
+            // given at the same time finds an App Server's while it is sent.
+            let settled = match &request.reply {
+                Reply::AppServer { .. } => {
+                    let sending = json!({"request_id":request_id,"by":by,"sending":true});
+                    answered.insert(request_id.into(), sending);
+                    None
+                }
+                Reply::Hook {
+                    answer: waiting,
+                    waited,
+                } => {
+                    // Its hook left at the deadline, or when the user answered in the session.
+                    let (sent, given) = if *waited && waiting.receiver_count() == 0 {
+                        let left = "the session no longer waits for this request";
+                        (Err(left.to_owned()), None)
+                    } else {
+                        let given = result.clone().unwrap_or_else(|_| undecided());
+                        waiting.send_replace(Some(given.clone()));
+                        (Ok(()), Some(given))
+                    };
+                    let outcome = remember(
+                        &mut answered,
+                        &request,
+                        request_id,
+                        &decision,
+                        by,
+                        sent,
+                        given,
+                    );
+                    Some(outcome)
+                }
+            };
+            (request, result, decision, settled)
+        };
+        let outcome = match (settled, &request.reply) {
+            (Some(outcome), _) => outcome,
+            (None, Reply::Hook { .. }) => unreachable!("a hook is answered with its removal"),
+            (None, Reply::AppServer { rpc_id, .. }) => {
+                let sent = (self.codex.client().respond(rpc_id, result, &decision).await)
+                    .map_err(|error| error.message);
+                let mut answered = lock(&self.triage.answered);
+                remember(
+                    &mut answered,
+                    &request,
+                    request_id,
+                    &decision,
+                    by,
+                    sent,
+                    None,
+                )
             }
         };
-        let sent = self
-            .codex
-            .client()
-            .respond(&request.rpc_id, result, &decision)
-            .await;
-        let outcome = json!({"request_id":request_id,"method":request.method,"thread_id":request.thread_id,
-            "turn_id":request.turn_id,"decision":decision,"by":by,"answered":sent.is_ok(),
-            "error":sent.as_ref().err().map(|error| error.message.clone())});
-        tracing::info!(request = %request_id, method = %request.method, %decision, %by,
-            answered = sent.is_ok(), "App Server request answered");
-        {
-            let mut answered = lock(&self.triage.answered);
-            // ponytail: forget answers past 1024; a restart forgets them all, as the requests.
-            if answered.len() > 1024 {
-                answered.clear();
-            }
-            answered.insert(request_id.into(), outcome.clone());
-        }
         self.store
             .lock()
             .await
@@ -566,9 +761,9 @@ impl Runtime {
 
     /// Requests past their deadline get the fallback answer. One a question holds gets its
     /// deadline once the question is answered, so the bot can act on the answer first.
-    async fn expire_codex_requests(&self) -> Result<()> {
+    async fn expire_requests(&self) -> Result<()> {
         let now = now_ms();
-        let requests: Vec<CodexRequest> = lock(&self.triage.requests).values().cloned().collect();
+        let requests: Vec<HeldRequest> = lock(&self.triage.requests).values().cloned().collect();
         for request in requests {
             if let (Some(question), None) = (&request.question_id, request.answer_by_ms) {
                 let network = self.network_id().await?;
@@ -584,19 +779,23 @@ impl Runtime {
                     held.answer_by_ms = Some(now + AGENT_ANSWER_WITHIN.as_millis() as i64);
                 }
             } else if request.answer_by_ms.is_some_and(|by| by <= now) {
-                self.answer_codex_request(&request.request_id, None, "fallback")
+                self.answer_request(&request.request_id, None, "fallback")
                     .await?;
             }
         }
         Ok(())
     }
 
-    /// The connection that carried the held requests is gone, and so are they.
+    /// The connection that carried the held App Server requests is gone, and so are they.
     pub(crate) fn drop_codex_requests(&self) {
-        for (request_id, request) in lock(&self.triage.requests).drain() {
-            tracing::info!(request = %request_id, method = %request.method,
-                "App Server request lost with its connection");
-        }
+        lock(&self.triage.requests).retain(|request_id, request| {
+            let lost = matches!(request.reply, Reply::AppServer { .. });
+            if lost {
+                tracing::info!(request = %request_id, method = request.origin(),
+                    "App Server request lost with its connection");
+            }
+            !lost
+        });
     }
 
     /// Once the App Server finished observing this device's threads after a connect, any request
@@ -669,7 +868,7 @@ impl Runtime {
                     .map_or("completed", |status| status.as_str());
                 let event = AgentEvent {
                     source: triage::Source::AppServer,
-                    agent: triage::Agent::Codex,
+                    agent: Provider::Codex,
                     event: triage::Kind::TurnEnd,
                     status: Some(status.into()),
                     session_id: thread,
@@ -707,8 +906,8 @@ impl Runtime {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if let Err(error) = node.expire_codex_requests().await {
-                    tracing::warn!(%error, "could not answer expired App Server requests");
+                if let Err(error) = node.expire_requests().await {
+                    tracing::warn!(%error, "could not answer expired requests");
                 }
                 if let Err(error) = node.send_answered().await {
                     tracing::warn!(%error, "could not tell the webhook about answers");
@@ -751,7 +950,7 @@ impl Runtime {
         let cli = format!("'{}'", program.to_string_lossy().replace('\'', r"'\''"));
         let config = ManagerConfig {
             tool_cli: Some(program),
-            ..self.manager_config(settings)
+            ..self.manager_config(settings)?
         };
         let (_cancel, cancel) = tokio::sync::watch::channel(false);
         // Kept before the turn starts, so its hooks, scans and App Server events are known.
@@ -771,7 +970,7 @@ impl Runtime {
     }
 
     /// Hands waiting events, each with the bot that owns its session, to one turn of the
-    /// coordination Agent. It answers through `vibeface triage` and `vibeface codex respond`;
+    /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`;
     /// what it leaves alone is dropped after the turn, and a request it neither answered nor
     /// raised gets the fallback answer.
     async fn wake_agent(&self) -> Result<()> {
@@ -808,7 +1007,12 @@ impl Runtime {
         }
         let turn = self
             .coordination_turn(|cli| {
-                triage::wake_prompt(&offered, cli, AGENT_ANSWER_WITHIN.as_secs())
+                triage::wake_prompt(
+                    &offered,
+                    cli,
+                    AGENT_ANSWER_WITHIN.as_secs(),
+                    HOOK_ANSWER_WITHIN.as_secs(),
+                )
             })
             .await;
         self.settle_offered(&fresh).await?;
@@ -820,10 +1024,9 @@ impl Runtime {
             if let Some(request_id) = &event.request_id {
                 let unattended = lock(&self.triage.requests)
                     .get(request_id)
-                    .is_some_and(|request| request.answer_by_ms.is_some());
+                    .is_some_and(|request| request.question_id.is_none());
                 if unattended {
-                    self.answer_codex_request(request_id, None, "fallback")
-                        .await?;
+                    self.answer_request(request_id, None, "fallback").await?;
                 }
             }
             dequeue(&self.store.lock().await.connection, event)?;
@@ -836,7 +1039,7 @@ impl Runtime {
         let network = self.network_id().await?;
         let action = super::field(&input, "action")?;
         if action == "requests" {
-            let requests: Vec<CodexRequest> =
+            let requests: Vec<HeldRequest> =
                 lock(&self.triage.requests).values().cloned().collect();
             return Ok(json!({"requests":requests}));
         }
@@ -850,12 +1053,12 @@ impl Runtime {
                     .peer_request(
                         &network,
                         node,
-                        json!({"type":"codex_respond","request_id":request_id,"result":result}),
+                        json!({"type":"respond","request_id":request_id,"result":result}),
                     )
                     .await;
             }
             return self
-                .answer_codex_request(request_id, Some(Ok(result)), "agent")
+                .answer_request(request_id, Some(Ok(result)), "agent")
                 .await;
         }
         if action == "events" {
@@ -901,7 +1104,7 @@ impl Runtime {
                 if let Some(request_id) = &request_id {
                     ensure!(
                         lock(&self.triage.requests).contains_key(request_id),
-                        "no App Server request is waiting with this ID"
+                        "no request is waiting with this ID"
                     );
                 }
                 let question = EventBody::QuestionAsked {
@@ -917,7 +1120,7 @@ impl Runtime {
                     about: subject(
                         &shared_event(&event, &self.settings_snapshot().roots),
                         request_id,
-                    )?,
+                    ),
                 };
                 self.raise(&network, &event, question).await?
             }
@@ -954,7 +1157,9 @@ impl Runtime {
             && let Some(request) = lock(&self.triage.requests).get_mut(request_id)
             && request.question_id.is_none()
         {
-            request.answer_by_ms = None;
+            if let Reply::AppServer { .. } = request.reply {
+                request.answer_by_ms = None;
+            }
             request.question_id = Some(question_id.clone());
         }
         let mut sent = false;
@@ -1599,7 +1804,7 @@ mod tests {
             &uuid::Uuid::new_v4().simple().to_string()[..12]
         );
         configuration.providers.codex_app_server.socket = Some(socket.into());
-        configuration.providers.execution = true;
+        configuration.providers.execution = [crate::providers::Provider::Codex].into();
         configuration.network = network;
         configuration.save(&dir)?;
         config::private_write(
@@ -1627,7 +1832,6 @@ mod tests {
             provider: crate::providers::Provider::Codex,
             workspace: "/tmp".into(),
             model: "fixture".into(),
-            cursor_sdk_bin: "/nonexistent".into(),
         });
     }
 
@@ -1818,7 +2022,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "r".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -1886,7 +2090,7 @@ mod tests {
             target: local.clone(),
             dispatcher: local,
             call_ref: work_id.into(),
-            kind: crate::model::WorkKind::Codex,
+            kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -1980,7 +2184,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "late".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2384,6 +2588,327 @@ mod tests {
         result
     }
 
+    fn asks_permission(session: &str) -> AgentEvent {
+        AgentEvent {
+            agent: Provider::Claude,
+            event: triage::Kind::NeedsInput,
+            hold: Some(RequestKind::Permission),
+            ..turn(session, "t1", "/w")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_waits_for_the_answer_to_its_request() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let held = node.ingest_agent_event(asks_permission("s1")).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            assert!(
+                node.ingest_agent_event(asks_permission("s1")).await?["request_id"].is_null(),
+                "a request is held once"
+            );
+            let listed =
+                node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
+            assert_eq!(
+                (listed["provider"].clone(), listed["kind"].clone()),
+                (json!("claude"), json!("permission"))
+            );
+            assert_eq!(
+                listed["answer_by_ms"].as_i64().context("a deadline")?
+                    - listed["received_ms"].as_i64().context("received")?,
+                HOOK_ANSWER_WITHIN.as_millis() as i64,
+                "a hook's request is held only as long as its session can wait"
+            );
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            // What a hook's wait sees once the request is gone from the held ones.
+            let seen = std::thread::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                move || loop {
+                    let requests = node.triage.requests.lock().unwrap();
+                    if !requests.contains_key(&request_id) {
+                        return node
+                            .triage
+                            .answered
+                            .lock()
+                            .unwrap()
+                            .get(&request_id)
+                            .cloned();
+                    }
+                }
+            });
+
+            let answered = node
+                .triage_command(json!({"action":"respond","request_id":request_id,
+                    "result":{"behavior":"allow"}}))
+                .await?;
+            let seen = seen.join().unwrap().context("answered")?;
+            assert_eq!(
+                (seen["answer"].clone(), seen.get("sending")),
+                (json!({"behavior":"allow"}), None),
+                "a hook's request is never seen gone and not yet answered"
+            );
+            assert_eq!(
+                (answered["answered"].clone(), answered["by"].clone()),
+                (json!(true), json!("agent"))
+            );
+            assert_eq!(waiting.await?, json!({"behavior":"allow"}));
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"behavior":"allow"}),
+                "a hook that comes to wait late still gets the answer"
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"events"})).await?["events"],
+                json!([])
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_hook_request_goes_back_to_its_session() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let held = node.ingest_agent_event(asks_permission("s1")).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            node.triage
+                .requests
+                .lock()
+                .unwrap()
+                .get_mut(&request_id)
+                .context("held")?
+                .answer_by_ms = Some(now_ms() + 50);
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"decision":null})
+            );
+            assert_eq!(
+                node.triage_command(json!({"action":"requests"})).await?["requests"],
+                json!([])
+            );
+            let late = node
+                .triage_command(json!({"action":"respond","request_id":request_id,
+                    "result":{"behavior":"allow"}}))
+                .await?;
+            assert_eq!(
+                (late["decision"].clone(), late["by"].clone()),
+                (json!("undecided"), json!("fallback")),
+                "a late answer gets the first one"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn an_answer_after_the_hook_left_is_not_reported_as_given() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let held = node.ingest_agent_event(asks_permission("s1")).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            waiting.abort();
+            let _ = waiting.await;
+            let answered = node
+                .triage_command(json!({"action":"respond","request_id":request_id,
+                    "result":{"behavior":"allow"}}))
+                .await?;
+            assert_eq!(
+                (answered["answered"].clone(), answered["error"].clone()),
+                (
+                    json!(false),
+                    json!("the session no longer waits for this request")
+                )
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn answers_given_at_once_all_get_the_first() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            for session in 0..20 {
+                let held = node
+                    .ingest_agent_event(asks_permission(&format!("s{session}")))
+                    .await?;
+                let request_id = held["request_id"]
+                    .as_str()
+                    .context("a held request")?
+                    .to_owned();
+                let start = Arc::new(tokio::sync::Barrier::new(4));
+                let answers: Vec<_> = (0..4)
+                    .map(|_| {
+                        let (node, request_id, start) =
+                            (node.clone(), request_id.clone(), start.clone());
+                        tokio::spawn(async move {
+                            start.wait().await;
+                            let result = Some(Ok(json!({"behavior":"allow"})));
+                            node.answer_request(&request_id, result, "agent").await
+                        })
+                    })
+                    .collect();
+                for answer in answers {
+                    assert_eq!(answer.await??["by"], json!("agent"));
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_pi_session_whose_turn_ended_gets_its_next_message_or_nothing() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let ended = |turn: &str| {
+                triage::from_pi_extension(&json!({"session_id":"p1","turn_id":turn,"cwd":"/w",
+                    "stop_reason":"stop","last_message":"Tests written."}))
+                .context("a turn end")
+            };
+            let held = node.ingest_agent_event(ended("e1")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let listed =
+                node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
+            assert_eq!(
+                (listed["provider"].clone(), listed["kind"].clone()),
+                (json!("pi"), json!("continue"))
+            );
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            node.triage_command(json!({"action":"respond","request_id":request_id,
+                "result":{"text":"Now run them."}}))
+                .await?;
+            assert_eq!(waiting.await?, json!({"text":"Now run them."}));
+
+            let held = node.ingest_agent_event(ended("e2")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            node.triage
+                .requests
+                .lock()
+                .unwrap()
+                .get_mut(&request_id)
+                .context("held")?
+                .answer_by_ms = Some(now_ms() + 50);
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"decision":null}),
+                "nothing is sent to a session nobody answered"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn an_opencode_permission_gets_its_reply_or_goes_back_to_the_session() -> Result<()> {
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let asks = |request: &str| {
+                triage::from_opencode_plugin(&json!({"event":"permission.asked",
+                    "session_id":"ses_1","request_id":request,"cwd":"/w","permission":"bash"}))
+                .context("a permission request")
+            };
+            let held = node.ingest_agent_event(asks("per_1")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            let listed =
+                node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
+            assert_eq!(
+                (listed["provider"].clone(), listed["kind"].clone()),
+                (json!("opencode"), json!("permission"))
+            );
+            let waiting = tokio::spawn({
+                let node = node.clone();
+                let request_id = request_id.clone();
+                async move { node.wait_request(&request_id).await }
+            });
+            tokio::task::yield_now().await;
+            node.triage_command(json!({"action":"respond","request_id":request_id,
+                "result":{"reply":"always"}}))
+                .await?;
+            assert_eq!(waiting.await?, json!({"reply":"always"}));
+
+            let held = node.ingest_agent_event(asks("per_2")?).await?;
+            let request_id = held["request_id"]
+                .as_str()
+                .context("a held request")?
+                .to_owned();
+            node.triage
+                .requests
+                .lock()
+                .unwrap()
+                .get_mut(&request_id)
+                .context("held")?
+                .answer_by_ms = Some(now_ms() + 50);
+            assert_eq!(
+                node.wait_request(&request_id).await,
+                json!({"decision":null}),
+                "an unanswered request is left to the user"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
     #[tokio::test]
     async fn without_an_agent_requests_are_declined_and_events_dropped() -> Result<()> {
         let (node, _, dir) = node().await?;
@@ -2446,7 +2971,7 @@ mod tests {
                 (json!(true), json!("c"))
             );
             let question = raised["question_id"].as_str().unwrap().to_owned();
-            node.expire_codex_requests().await?;
+            node.expire_requests().await?;
             let held =
                 node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
             assert_eq!(
@@ -2469,7 +2994,7 @@ mod tests {
                 jobs.iter().map(|job| job.kind).collect::<Vec<_>>(),
                 vec![crate::scheduling::TriggerKind::Answer]
             );
-            node.expire_codex_requests().await?;
+            node.expire_requests().await?;
             let held =
                 node.triage_command(json!({"action":"requests"})).await?["requests"][0].clone();
             assert!(
@@ -2648,7 +3173,7 @@ mod tests {
 
     fn turn(session: &str, turn: &str, cwd: &str) -> AgentEvent {
         AgentEvent {
-            source: triage::Source::CodexHook,
+            source: triage::Source::Hook,
             session_id: session.into(),
             turn_id: turn.into(),
             cwd: cwd.into(),
@@ -2763,7 +3288,7 @@ mod tests {
                 conversation_id: Some("c".into()),
                 manager: None,
             };
-            node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger)
+            node.register_manager_attempt("token".into(), idle.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
                 .await?;
             let live = Access {
                 manager: Some(crate::runtime::ManagerAccess {
@@ -2933,7 +3458,7 @@ mod tests {
                 target: local.clone(),
                 dispatcher: local,
                 call_ref: "r".into(),
-                kind: crate::model::WorkKind::Codex,
+                kind: crate::model::WorkKind::Agent(crate::providers::Provider::Codex),
                 cwd: "/w".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -3190,8 +3715,14 @@ mod tests {
                 conversation_id: Some("c".into()),
                 manager: None,
             };
-            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger)
-                .await?;
+            node.register_manager_attempt(
+                "token".into(),
+                access.clone(),
+                &attempt,
+                &trigger,
+                crate::providers::Provider::Codex,
+            )
+            .await?;
             let access = Access {
                 manager: Some(crate::runtime::ManagerAccess {
                     attempt_id: attempt.clone(),
@@ -3206,6 +3737,109 @@ mod tests {
             assert!(
                 refused.to_string().contains("own reply thread"),
                 "{refused:#}"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        cleanup(node, dir).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_work_runs_on_the_provider_it_names() -> Result<()> {
+        use crate::providers::Provider;
+        let (node, admin, dir) = node().await?;
+        let result = async {
+            assert!(std::ptr::addr_eq(
+                node.executor(Provider::Codex)?,
+                &*node.codex
+            ));
+            assert!(node.executor(Provider::Cursor).is_err());
+            with_agent(&node);
+            bot(&node, &admin, "c", "前端", &[]).await?;
+            let network = node.network_id().await?;
+            let (trigger, attempt) = start_reply(&node, &admin, "m1").await?;
+            let access = Access {
+                network_id: network.clone(),
+                human: false,
+                conversation_id: Some("c".into()),
+                manager: None,
+            };
+            node.register_manager_attempt("token".into(), access.clone(), &attempt, &trigger, crate::providers::Provider::Codex)
+                .await?;
+            let access = Access {
+                manager: Some(crate::runtime::ManagerAccess {
+                    attempt_id: attempt.clone(),
+                    trigger,
+                }),
+                ..access
+            };
+            let send = |call_ref: &str, agent: Value| {
+                json!({"thread":"t-other","call_ref":call_ref,"title":"t","prompt":"p","agent":agent})
+            };
+            let off = node
+                .tool(access.clone(), "track_work", send("r1", json!("claude")))
+                .await;
+            let named = node
+                .tool(access.clone(), "track_work", send("r2", json!("codex")))
+                .await;
+            let retried = node
+                .tool(access.clone(), "track_work", send("r2", json!("codex")))
+                .await;
+            let only = node
+                .tool(access.clone(), "track_work", send("r3", Value::Null))
+                .await;
+            {
+                let mut providers = node.providers.lock().unwrap();
+                providers.switches.execution.insert(Provider::Claude);
+                (providers.bins).insert(Provider::Claude, "/nonexistent/claude".into());
+            }
+            // A Codex thread is no session of Claude Code's own works.
+            let foreign = node
+                .tool(access.clone(), "track_work", send("r4", json!("claude")))
+                .await;
+            let local = node.identity.device_id()?;
+            let earlier = crate::work::WorkSpec {
+                work_id: "w-earlier".into(),
+                conversation: "c".into(),
+                trigger: "message:m0".into(),
+                target: local.clone(),
+                dispatcher: local,
+                call_ref: "w-earlier".into(),
+                kind: crate::model::WorkKind::Agent(Provider::Claude),
+                cwd: String::new(),
+                title: "t".into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: Some("t-claude".into()),
+            };
+            (node.store.lock().await).accept_work(&node.identity, &network, earlier, now_ms())?;
+            let own = json!({"thread":"t-claude","call_ref":"r5","title":"t","prompt":"p",
+                "agent":"claude"});
+            let own = node.tool(access, "track_work", own).await;
+            node.finish_manager_attempt(&attempt).await;
+            let off = off.expect_err("claude executes no work here");
+            assert!(format!("{off:#}").contains("turned off"), "{off:#}");
+            assert_eq!(named?["may_send"], true, "the Codex CLI sends it");
+            assert_eq!(retried?["may_send"], false, "a retry never sends again");
+            assert_eq!(only?["may_send"], true, "codex is the only executor");
+            let foreign = foreign.expect_err("a session no Claude Code work ran in");
+            assert!(
+                format!("{foreign:#}").contains("sessions this device's works ran in"),
+                "{foreign:#}"
+            );
+            let on_thread = node.store.lock().await.work_records_on_thread("t-other")?;
+            assert_eq!(on_thread.len(), 2, "the refused work left nothing behind");
+            // It goes on to Claude Code, which finds no directory for a session without one.
+            let own = own?;
+            assert_eq!(own["may_send"], false);
+            assert_eq!(
+                own["state"],
+                serde_json::to_value(crate::work::WorkState::Finished {
+                    outcome: crate::model::WorkOutcome::Rejected
+                })?,
+                "the Agent sees the start it was refused"
             );
             Ok::<_, anyhow::Error>(())
         }

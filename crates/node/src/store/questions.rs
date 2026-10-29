@@ -344,6 +344,7 @@ impl Store {
             about.node == identity.device_id()?,
             "the device running the session attributes it"
         );
+        let agent = about.agent.context("only an agent session is attributed")?;
         if session_owner_from(&tx, network, &about.node, &about.session_id)?.is_some() {
             return Ok(None);
         }
@@ -355,7 +356,7 @@ impl Store {
             conversation,
             EventBody::SessionAttributed {
                 node: about.node.clone(),
-                agent: about.agent.clone(),
+                agent,
                 session_id: about.session_id.clone(),
                 cwd: about.cwd.clone(),
                 summary: about.summary.clone(),
@@ -425,7 +426,7 @@ impl Store {
                 let text = |key: &str| attribution[key].as_str().unwrap_or_default().to_owned();
                 EventBody::SessionAttributed {
                     node: node.clone(),
-                    agent: text("agent"),
+                    agent: serde_json::from_value(attribution["agent"].clone())?,
                     session_id: session.into(),
                     cwd: text("cwd"),
                     summary: text("summary"),

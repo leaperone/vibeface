@@ -632,7 +632,8 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     store.mark_started("c", &trigger, &attempt)?;
     say(&mut store, &net, "m2", true)?;
     say(&mut store, &net, "quiet", false)?;
-    let candidates = |store: &Store| store.steer_candidates(&net.network, &local, "boot");
+    let candidates =
+        |store: &Store| store.steer_candidates(&net.network, &local, "boot", Provider::Codex);
     assert!(candidates(&store)?.is_empty());
     store.record_manager_turn(&attempt, "system", "thread", None, &Default::default())?;
     assert!(candidates(&store)?.is_empty());
@@ -645,7 +646,7 @@ fn a_message_joins_the_running_turn_once_or_waits_its_turn() -> Result<()> {
     )?;
     assert!(
         store
-            .steer_candidates(&net.network, &local, "later")?
+            .steer_candidates(&net.network, &local, "later", Provider::Codex)?
             .is_empty()
     );
     let found = candidates(&store)?;
@@ -809,7 +810,7 @@ fn work_retries_never_start_twice_and_results_report_back() -> Result<()> {
         target: net.a.device_id()?,
         dispatcher: net.a.device_id()?,
         call_ref: "call-1".into(),
-        kind: WorkKind::Codex,
+        kind: WorkKind::Agent(Provider::Codex),
         cwd: "/tmp".into(),
         title: "t".into(),
         prompt: "p".into(),
@@ -1022,7 +1023,7 @@ fn removed_targets_leave_results_unknown_and_signed_choices_settle() -> Result<(
             target: target.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: call.into(),
-            kind: WorkKind::Codex,
+            kind: WorkKind::Agent(Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".into(),
@@ -2760,7 +2761,6 @@ fn a_bot_runs_the_model_of_its_devices_provider_or_the_devices_default() -> Resu
             provider,
             workspace: "/w".into(),
             model: "auto".into(),
-            cursor_sdk_bin: "/sdk".into(),
         };
         let bot = store.bot_for_conversation(&net.network, "c")?;
         Ok(crate::scheduler::bot_model(&device, bot.as_ref()))
@@ -3580,7 +3580,7 @@ fn question(net: &Net, id: &str, session: &str) -> Result<EventBody> {
         }],
         about: Subject {
             node: net.a.device_id()?,
-            agent: "codex".into(),
+            agent: Some(crate::providers::Provider::Codex),
             session_id: session.into(),
             cwd: "/w".into(),
             summary: "tests fail".into(),
@@ -3699,7 +3699,7 @@ fn the_answer_to_a_settings_card_turns_into_apply_provider_config() -> Result<()
     conversation(&mut store, &net)?;
     let mut card = question(&net, "q-settings", "provider-setup-1")?;
     if let EventBody::QuestionAsked { about, .. } = &mut card {
-        about.agent = crate::runtime::SETTINGS_AGENT.into();
+        about.agent = None;
     }
     store.ask(&net.a, &net.network, "c", card, 2)?;
     store.ask(
@@ -3949,7 +3949,7 @@ fn a_hand_over_from_an_old_version_writes_nothing() -> Result<()> {
     second_bot(&mut local, &net, "Other")?;
     let about = Subject {
         node: net.a.device_id()?,
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: "s1".into(),
         cwd: "/w".into(),
         summary: "tests fail".into(),
@@ -3996,7 +3996,7 @@ fn a_session_owner_is_written_once_and_only_its_bot_hands_it_over() -> Result<()
     let node = net.a.device_id()?;
     let about = Subject {
         node: node.clone(),
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: "s1".into(),
         cwd: "/w".into(),
         summary: "tests fail".into(),
@@ -4328,7 +4328,7 @@ fn an_oversized_turn_prompt_keeps_the_newest_context_and_fits() -> Result<()> {
             target: net.a.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
-            kind: WorkKind::Codex,
+            kind: WorkKind::Agent(Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(600),
@@ -4454,7 +4454,7 @@ fn the_bot_prompt_lists_the_newest_sessions_it_follows() -> Result<()> {
     let node = net.a.device_id()?;
     let about = |session: &str| Subject {
         node: node.clone(),
-        agent: "codex".into(),
+        agent: Some(crate::providers::Provider::Codex),
         session_id: session.into(),
         cwd: "/work/project".into(),
         summary: format!("{session}: {}", "tests fail again. ".repeat(6)),
@@ -4722,7 +4722,7 @@ fn a_new_owner_replies_to_what_the_old_one_left_unanswered_once() -> Result<()> 
     a_side.record_manager_turn(&a1, "system", "thread", Some("turn"), &Default::default())?;
     say(&mut a_side, &net, "m2", true)?;
     let into = a_side
-        .steer_candidates(&net.network, &local, "boot")?
+        .steer_candidates(&net.network, &local, "boot", Provider::Codex)?
         .pop()
         .context("steer candidate")?
         .into;
@@ -4909,7 +4909,7 @@ fn a_resumed_codex_turn_sends_only_what_changed() -> Result<()> {
             target: net.a.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
-            kind: WorkKind::Codex,
+            kind: WorkKind::Agent(Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(300),
@@ -5451,7 +5451,7 @@ fn a_streamed_event_reads_only_the_runs_on_its_thread() -> Result<()> {
             target: net.a.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
-            kind: WorkKind::Codex,
+            kind: WorkKind::Agent(Provider::Codex),
             cwd: format!("/tmp/{thread}"),
             title: "t".into(),
             prompt: "p".into(),
@@ -5551,7 +5551,7 @@ fn work_status_pages_newest_first_within_a_byte_cap() -> Result<()> {
             target: net.a.device_id()?,
             dispatcher: net.a.device_id()?,
             call_ref: format!("call-{i}"),
-            kind: WorkKind::Codex,
+            kind: WorkKind::Agent(Provider::Codex),
             cwd: "/tmp".into(),
             title: "t".into(),
             prompt: "p".repeat(2_000),

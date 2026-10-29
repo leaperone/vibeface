@@ -15,7 +15,7 @@ pub enum FailureKind {
     Quota,
     /// The provider's program is not on this computer.
     MissingBinary,
-    /// Codex execution is turned off on this device.
+    /// Executing work is turned off on this device for the provider it asked for.
     ExecutionDisabled,
     /// No model is chosen, or the provider does not know it.
     NoModel,

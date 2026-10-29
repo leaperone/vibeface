@@ -160,7 +160,7 @@ function LogRow({ record, chat, task, open, onToggle, onCopyAll }: { record: Log
   const { title, detail } = describe(record)
   const Icon = alert?.icon ?? sourceIcon[record.source]
   const names: Array<[string, string | undefined]> = [['对话', chat], ['任务', task]]
-  const ids: Array<[string, string | undefined]> = [['事件', record.event], ['原文', record.message === title ? undefined : record.message], ['对话', record.conversation_id], ['任务', record.work_id], ['Codex 会话', record.thread_id]]
+  const ids: Array<[string, string | undefined]> = [['事件', record.event], ['原文', record.message === title ? undefined : record.message], ['对话', record.conversation_id], ['任务', record.work_id], ['会话', record.thread_id]]
   return <li>
     <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
       {alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
