@@ -1347,6 +1347,124 @@ fn a_moved_conversation_hands_queued_turns_to_its_new_owner() -> Result<()> {
     Ok(())
 }
 
+fn answered(store: &mut Store, net: &Net, at: i64) -> Result<SchedulerJob> {
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = claimed.job.trigger.clone();
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        at,
+    )
+}
+
+fn replied_elsewhere(store: &mut Store, net: &Net, identity: &LocalIdentity) -> Result<()> {
+    assert!(
+        store
+            .claim_next(identity, &net.network, "c", "boot", "cfg")?
+            .is_none(),
+        "a message answered in the shared record does not run again"
+    );
+    let job = store
+        .scheduler_job("c", &message_trigger("m1"))?
+        .context("job")?;
+    assert!(
+        matches!(&job.state, JobState::Cancelled { evidence, .. } if evidence == "已在别处回复"),
+        "{:?}",
+        job.state
+    );
+    let replies = store
+        .messages(&net.network, "c")?
+        .into_iter()
+        .filter(|m| m.in_reply_to.as_deref() == Some("m1"))
+        .count();
+    assert_eq!(replies, 1);
+    Ok(())
+}
+
+#[test]
+fn a_restored_backup_does_not_rerun_a_turn_answered_since() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    origin.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let dir = std::env::temp_dir()
+        .canonicalize()?
+        .join(format!("vibeface-restore-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let backup = dir.join("backup.sqlite3");
+    origin
+        .connection
+        .execute("VACUUM INTO ?", [backup.to_str().context("path")?])?;
+    answered(&mut origin, &net, 3)?;
+
+    let mut restored = Store::open(&backup)?;
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 500)?;
+    restored.ingest_events(&net.network, &events)?;
+    let result = replied_elsewhere(&mut restored, &net, &net.a);
+    drop(restored);
+    std::fs::remove_dir_all(dir)?;
+    result
+}
+
+#[test]
+fn a_new_owner_does_not_rerun_a_delivery_the_former_owner_answered() -> Result<()> {
+    let net = net()?;
+    let mut former = store(&net)?;
+    conversation(&mut former, &net)?;
+    former.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    answered(&mut former, &net, 3)?;
+
+    let mut next = store(&net)?;
+    all_accepted(&mut next, &net, &former)?;
+    next.append_event(
+        &net.b,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        4,
+    )?;
+    let receipt = next
+        .admit_delivery(
+            &net.b.device_id()?,
+            &net.network,
+            "c",
+            &message_trigger("m1"),
+        )?
+        .context("the entry retries the delivery whose receipt was lost")?;
+    assert_eq!(receipt.state, "queued");
+    replied_elsewhere(&mut next, &net, &net.b)
+}
+
 #[test]
 fn a_move_fences_the_old_owners_running_turn() -> Result<()> {
     let net = net()?;
