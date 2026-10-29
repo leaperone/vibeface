@@ -31,6 +31,7 @@ export function AiOffHint({ className }: { className?: string }) {
   const closed = useSyncExternalStore(subscribe, () => entry !== "" && dismissed(entry), () => false)
   const [off, setOff] = useState(false)
   useEffect(() => {
+    setOff(false)
     if (!ready || !canSetUp || !isComputer || closed || onPage) return
     let live = true
     ready.request("node_settings").then((raw) => {
@@ -39,7 +40,7 @@ export function AiOffHint({ className }: { className?: string }) {
     }, () => { if (live) setOff(false) })
     return () => { live = false }
   }, [ready, canSetUp, isComputer, closed, onPage])
-  if (!off || closed || onPage || !canSetUp) return null
+  if (!off || closed || onPage || !canSetUp || !isComputer) return null
   function dismiss() {
     try { localStorage.setItem(key(entry), "dismissed") } catch {}
     listeners.forEach((listener) => listener())
