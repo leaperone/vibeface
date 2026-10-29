@@ -9,7 +9,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -230,12 +230,21 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
 
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
+  const { shown, folded } = providerGroups(response.providers)
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
+    error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
+    change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
+    saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
   return <div className="grid gap-6">
     <ul className={cn("divide-y overflow-hidden rounded-xl border", !onboarding && "bg-card shadow-xs")}>
-      {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
-        error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
-        change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
-        saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />)}
+      {shown.map(card)}
+      {folded.length ? <li><details className="details" open={!shown.length || undefined}>
+        <summary className="flex min-h-11 items-center gap-1 px-4 text-meta text-muted-foreground hover:text-foreground">
+          <ChevronRight aria-hidden="true" className="size-4 shrink-0 transition-transform duration-200" />
+          <span className="min-w-0 truncate">未安装 · {folded.map((item) => providerNames[item.provider]).join("、")}</span>
+        </summary>
+        <ul className="divide-y border-t">{folded.map(card)}</ul>
+      </details></li> : null}
     </ul>
     {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}

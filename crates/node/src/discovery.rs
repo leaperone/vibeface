@@ -74,6 +74,12 @@ impl Host {
         }
     }
 
+    /// Whether `program` is on this computer: it runs as configured, or discovery would find it.
+    pub fn installed(&self, program: &Path) -> bool {
+        runnable(program, self.path.as_ref())
+            || bare(program).and_then(|name| self.program(name)).is_some()
+    }
+
     /// A program's absolute path: from the Node's `PATH`, then where installers put programs
     /// that a service's short `PATH` leaves out.
     pub fn program(&self, name: &str) -> Option<PathBuf> {

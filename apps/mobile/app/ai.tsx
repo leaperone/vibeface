@@ -1,16 +1,16 @@
 import * as Clipboard from 'expo-clipboard'
-import { Asterisk, Bell, Bot, Braces, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Sparkles, SquareTerminal, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
+import { Bell, Bot, ChevronDown, ChevronRight, CircleAlert, CircleCheck, CircleDashed, CircleX, Copy, FolderOpen, Inbox, Layers, ListChecks, LoaderCircle, Monitor, Pencil, Play, PlugZap, Plus, Sparkles, Trash2, X, Zap, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { botOnChange, folderSuggestions, messageOf, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { parseTriageSettings } from '@vibeface/client/workspace/model.ts'
 import type { Outlet } from '@vibeface/client/workspace/types.ts'
 import { ErrorText } from '@/components/action'
-import { Details, EmptyState, Skeleton, toneText, type Tone } from '@/components/kit'
+import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Input } from '@/components/ui/input'
@@ -60,7 +60,6 @@ function useCall<T>(parse: (value: unknown) => T, loadMethod: string) {
   return { value, busy, error, call, load, setError }
 }
 
-const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
 const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
@@ -106,11 +105,16 @@ function AiSettings() {
     try { const link = parseAppServerLink(await ready.request('test_codex_app_server')); void load(); return link }
     catch (cause) { setError({ at: 'codex', text: messageOf(cause) }); return null }
   }
+  const { shown, folded } = providerGroups(response.providers)
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} busy={busy} test={test}
+    error={error?.at === item.provider ? error.text : ''}
+    change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
+    saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
   return <View className="gap-6">
-    {response.providers.map((item) => <ProviderCard key={item.provider} item={item} response={response} busy={busy} test={test}
-      error={error?.at === item.provider ? error.text : ''}
-      change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
-      saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />)}
+    {shown.map(card)}
+    {folded.length ? <Details label={`未安装 · ${folded.map((item) => providerNames[item.provider]).join('、')}`} open={!shown.length}>
+      <View className="gap-6">{folded.map(card)}</View>
+    </Details> : null}
     <PathList label="可用文件夹" items={roots} shown={response.display_paths} suggested={folderSuggestions(response)} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
     {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>

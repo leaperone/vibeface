@@ -1,10 +1,11 @@
 import * as Haptics from 'expo-haptics'
 import { humanError } from '@vibeface/client/lib/errors.ts'
+import { providerNames } from '@vibeface/client/lib/node.ts'
 import { ArrowUp, CircleCheck, FolderOpen, Info, Laptop, LoaderCircle, MessageCircleQuestionMark, PencilLine, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { ErrorText } from '@/components/action'
-import { ActionCard, type Tone } from '@/components/kit'
+import { ActionCard, providerIcons, type Tone } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { caret } from '@/components/ui/input'
 import { Icon } from '@/components/ui/icon'
@@ -53,6 +54,7 @@ export function QuestionCard({ question }: { question: Question }) {
   const { icon, tone } = looks[question.severity]
   return <ActionCard icon={icon} tone={tone} title={question.text}>
     <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+      {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自">{providerNames[question.about.agent]}</Meta> : null}
       {question.about.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(question.about.cwd)}</Meta> : null}
       <Meta icon={Laptop} label="设备">{device}</Meta>
     </View>
