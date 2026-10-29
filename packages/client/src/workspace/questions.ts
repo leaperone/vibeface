@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { Question } from "./types.ts"
+import type { BotRecord, OpenWork, Question } from "./types.ts"
 import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
@@ -22,6 +22,21 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
 
 /** Nobody answered it and the device that asked did not close it. */
 export const questionOpen = (question: Question) => question.answer === null && question.closed === null
+
+/** Still waiting on the person: open, and answered neither from this device (`answered`) nor in the chat (`folded`). */
+export const awaitsAnswer = (question: Question, answered: Readonly<Record<string, string>>, folded?: ReadonlyMap<string, string>) =>
+  questionOpen(question) && !(question.question_id in answered) && !folded?.has(question.question_id)
+
+/**
+ * What a question card shows under its text, the same on every screen. `approval`: a held App Server request, read as 需要你同意.
+ * `task`: the running task that request holds, to link to. `local`: asked by `entry`, the device this screen goes through, which the card leaves unnamed.
+ */
+export function questionMeta(question: Question, works: readonly OpenWork[], bots: readonly Pick<BotRecord, "bot_id" | "conversation_id">[], entry: string | undefined) {
+  const approval = Boolean(question.about.request_id)
+  const work = approval ? works.find((item) => item.thread_id === question.about.session_id && !item.outcome) : undefined
+  const bot = work && bots.find((item) => item.conversation_id === work.conversation_id)
+  return { approval, task: work && bot ? { bot_id: bot.bot_id, work_id: work.work_id, title: work.title || "任务" } : null, local: question.about.node === entry }
+}
 
 /** What 待处理 lists: open questions, urgent ones first, then newest first. */
 export function openQuestions(questions: readonly Question[]): Question[] {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { parseAnswer, parseConversation, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, foldAnswers, openQuestions, placeByTime, projectName, settledAnswer } from "./questions.ts"
+import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
+import { answerBody, awaitsAnswer, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -93,4 +93,24 @@ test("an answer replaced by another side's says so instead of vanishing", () => 
   assert.deepEqual(settledAnswer("继续", "继续"), { text: "继续", elsewhere: false })
   assert.deepEqual(settledAnswer("停下", undefined), { text: "停下", elsewhere: false }, "an answer given elsewhere with nothing tried here")
   assert.deepEqual(settledAnswer("停下", "继续"), { text: "停下", elsewhere: true }, "the other side's answer won the race")
+})
+
+test("only an open question waits on the person: a closed one is no count and no reason to hide 思考中", () => {
+  const questions = parseQuestions({ questions: [row("open", 1), row("lost", 2, { about: { ...about, request_id: "r" }, closed: "request_lost" }),
+    row("done", 3, { answer: { message_id: "a-done", text: "继续", author: "c", created_at_ms: 4 } }), row("here", 5), row("chat", 6)] })
+  const waiting = questions.filter((question) => awaitsAnswer(question, { here: "继续" }, new Map([["chat", "停下"]])))
+  assert.deepEqual(waiting.map((question) => question.question_id), ["open"])
+})
+
+test("an approval card names the task its request holds and leaves the device this screen goes through unnamed", () => {
+  const works = parseOpenWorks({ works: [
+    { work_id: "w-done", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "旧的", prompt: "p", state: "finished", summary: "", outcome: "completed", result_text: "", failure_reason: null, kind: "codex" },
+    { work_id: "w1", conversation_id: "chat", thread_id: "s", trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex" },
+  ] })
+  const bots = [{ bot_id: "bot", conversation_id: "chat" }]
+  const [approval, question] = parseQuestions({ questions: [row("s1", 1, { about: { ...about, request_id: "r" } }), row("q1", 2)] })
+  assert.deepEqual(questionMeta(approval, works, bots, "worker"), { approval: true, task: { bot_id: "bot", work_id: "w1", title: "任务" }, local: true })
+  assert.deepEqual(questionMeta(approval, works, bots, "gateway"), { approval: true, task: { bot_id: "bot", work_id: "w1", title: "任务" }, local: false })
+  assert.equal(questionMeta(approval, works, [], "worker").task, null, "a task whose bot is gone has nowhere to link")
+  assert.deepEqual(questionMeta(question, works, bots, "gateway"), { approval: false, task: null, local: false }, "a plain question holds no task")
 })
