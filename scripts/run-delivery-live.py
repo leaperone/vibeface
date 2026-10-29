@@ -2116,14 +2116,21 @@ def self_test():
     _, original = checks["sandbox_commands"](Path("/context"))
     package = ROOT / ".artifacts/vdp/live-input/package"
     command_line = live_container(original, package, "1" * 40, "vdp-live-self-test")
-    assert command_line.count("--mount") == 4 and "--privileged" not in command_line
+    mounts = [command_line[index + 1] for index, value in enumerate(command_line) if value == "--mount"]
+    assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
+        (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"),
+        (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
+    assert "--privileged" not in command_line
     assert command_line.count("--network") == 1 and command_line[command_line.index("--network") + 1] == "host"
-    assert "--user" not in command_line and not any(argument.startswith("HOME=") for argument in command_line)
+    assert "--user" not in command_line
     assert command_line[command_line.index("--memory") + 1] == command_line[command_line.index("--memory-swap") + 1] == "11g"
     assert command_line[command_line.index("--pids-limit") + 1] == "64"
-    assert command_line[command_line.index("--env") + 1] == "TOKIO_WORKER_THREADS=2"
+    environments = [command_line[index + 1] for index, value in enumerate(command_line) if value == "--env"]
+    assert environments == ["HOME=/home/runner", "TOKIO_WORKER_THREADS=2",
+                             f"VIBEFACE_DELIVERY_UI_UID={os.getuid()}", f"VIBEFACE_DELIVERY_UI_GID={os.getgid()}"]
     assert command_line[-1] == "1" * 40 and command_line[-3] == str(Path("/work/.artifacts/vdp/live-input/package"))
     assert command_line.count(original[-4]) == 1
+    assert not {"--env-file", "-e", "--privileged"}.intersection(command_line)
     assert not any("sock" in argument or "RISC0_DEV_MODE" in argument or "RISC0_SKIP_BUILD" in argument for argument in command_line)
     snapshot = {"memory.events": "low 0\nhigh 0\nmax 1\noom 2\noom_kill 1\noom_group_kill 0\n"}
     assert not any(oom_delta(snapshot, {"memory.events": snapshot["memory.events"].replace("max 1", "max 99")}).values())

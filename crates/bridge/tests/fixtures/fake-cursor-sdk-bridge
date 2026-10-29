@@ -19,6 +19,9 @@ def argument(name):
 
 if not os.environ.get("CURSOR_API_KEY") or os.environ.get("CURSOR_SDK_CLIENT_LANGUAGE") != "rust":
     sys.exit(3)
+local_store = json.loads(argument("--local-store"))
+if local_store.get("type") != "jsonl" or not os.path.isabs(local_store.get("rootDir", "")):
+    sys.exit(4)
 token = uuid.uuid4().hex
 token_file = os.path.join(argument("--state-root"), "fake-bridge-token")
 descriptor = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -29,6 +32,32 @@ if os.environ.get("FAKE_BRIDGE_LOG"):
     with open(os.environ["FAKE_BRIDGE_LOG"], "a") as log:
         log.write(f"{os.getpid()}\n")
 runs = {}
+store_log = os.environ.get("FAKE_BRIDGE_STORE_LOG")
+send_log = os.environ.get("FAKE_BRIDGE_SEND_LOG")
+gate_dir = os.environ.get("FAKE_BRIDGE_GATE_DIR")
+delay_ms = int(os.environ.get("FAKE_BRIDGE_DELAY_MS", "0"))
+callback_token = None
+
+
+def record_store(body):
+    if not store_log:
+        return
+    local = body.get("options", {}).get("local", {})
+    store = local.get("store")
+    with open(store_log, "a") as log:
+        log.write(json.dumps(store, sort_keys=True) + "\n")
+
+
+def record_send(agent, text):
+    if not send_log:
+        return
+    with open(send_log, "a") as log:
+        log.write(json.dumps({"pid": os.getpid(), "agent": agent, "text": text,
+                              "callback": callback_token}) + "\n")
+
+
+def agent_file(agent):
+    return os.path.join(local_store["rootDir"], agent + ".jsonl")
 
 
 def frame(flags, message):
@@ -56,6 +85,7 @@ class Bridge(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        global callback_token
         request = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if self.headers.get("Authorization") != f"Bearer {token}":
             return self.answer(401, b"{}")
@@ -65,17 +95,45 @@ class Bridge(BaseHTTPRequestHandler):
             agent, run = message["agentId"], "run-" + uuid.uuid4().hex
             runs[run] = agent
             text = message["message"]["text"]
+            try:
+                with open(agent_file(agent)) as history_file:
+                    history = [json.loads(line) for line in history_file]
+            except FileNotFoundError:
+                return self.answer(404, b'{"message":"agent not found"}')
+            with open(agent_file(agent), "a") as history_file:
+                history_file.write(json.dumps({"prompt": text}) + "\n")
+            record_send(agent, text)
+            if gate_dir:
+                while not os.path.exists(os.path.join(gate_dir, text.split("-", 1)[0])):
+                    time.sleep(0.01)
             if "hang" in text:
                 time.sleep(3600)
-            stream = (frame(0, finished(agent, run, "done: " + text))
+            if delay_ms:
+                time.sleep(delay_ms / 1000)
+            answer = "done: " + text
+            if text == "recall":
+                answer = "remembered: " + next(row["prompt"] for row in reversed(history) if "prompt" in row)
+            stream = (frame(0, finished(agent, run, answer))
                       + frame(0, {"done": {"agentId": agent, "runId": run}}) + frame(2, {}))
             return self.answer(200, stream, "application/connect+json")
         body = json.loads(request or b"{}")
+        if method == "SetToolCallback":
+            callback_token = body.get("authToken")
+        if method in ("CreateAgent", "ResumeAgent"):
+            record_store(body)
+            if body.get("options", {}).get("local", {}).get("store") != local_store:
+                return self.answer(400, b'{"message":"private JSONL store mismatch"}')
+            agent = body.get("agentId") or "agent-" + uuid.uuid4().hex
+            if method == "CreateAgent":
+                descriptor = os.open(agent_file(agent), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.write(descriptor, b'{"created":true}\n')
+                os.close(descriptor)
+            elif not os.path.isfile(agent_file(agent)):
+                return self.answer(404, b'{"message":"agent not found in private store"}')
+            return self.answer(200, json.dumps({"agentId": agent}).encode())
         replies = {
             "Ping": {"message": "pong"},
             "GetVersion": {"protocolVersion": "sdk.v1"},
-            "CreateAgent": {"agentId": "agent-" + uuid.uuid4().hex},
-            "ResumeAgent": {"agentId": body.get("agentId")},
             "GetRun": {"run": {"agentId": runs.get(body.get("runId")), "runId": body.get("runId"),
                                "status": "RUN_LIFECYCLE_STATUS_CANCELLED"}},
         }

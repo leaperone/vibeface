@@ -66,8 +66,8 @@ flowchart LR
 | Codex CLI | 已安装并登录 | 可选，Codex bot 与执行任务 |
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装并登录 | 可选，Claude Code bot 与执行任务 |
 | [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 已安装并登录 | 可选，pi bot 与执行任务 |
-| [opencode](https://opencode.ai) | 已安装并登录 | 可选，opencode bot 与执行任务 |
-| [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.0.37) | v1.0.37 | 可选，用 Cursor 作为协调 Agent 时需要 |
+| [opencode](https://opencode.ai) | v2.2.0，已登录 | 可选，opencode bot 与执行任务 |
+| [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) | 已验证 v1.2.0 | 可选，Cursor Bot 与协调 Agent |
 
 ### 安装
 

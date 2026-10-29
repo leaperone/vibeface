@@ -136,8 +136,8 @@ def checked_verification(result, compiled, proof):
 def sandbox_commands(context):
     image = "vibeface-vdp-proof:check-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
     build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "proofs/delivery/Sandbox.Dockerfile"), "--tag", image, str(context)]
-    container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64"]
-    for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
+    container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64", "--env", "HOME=/home/runner"]
+    for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
     container.extend([image, "bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"])
     return build, container
@@ -293,10 +293,12 @@ def self_test():
         assert container[container.index(flag) + 1] == value
     mounts = [container[index + 1] for index, value in enumerate(container) if value == "--mount"]
     assert mounts == [f"type=bind,source={source},target={destination}" for source, destination in (
-        (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
+        (ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts"))]
     assert build[-2] == container[-4]
     assert container[-3:] == ["bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"]
-    assert not {"--env", "--env-file", "-e", "--privileged"}.intersection(container)
+    env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
+    assert env_pairs == ["HOME=/home/runner"]
+    assert not {"--env-file", "-e", "--privileged"}.intersection(container)
     with patch(f"{__name__}.FIXTURES", ROOT / ".artifacts/no-public-proof-fixture"), patch(f"{__name__}.load_fixtures") as loader:
         assert optional_fixtures() is None
         loader.assert_not_called()

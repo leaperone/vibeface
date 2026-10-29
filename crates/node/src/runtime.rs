@@ -159,10 +159,7 @@ pub struct Runtime {
     pub tool_url: std::sync::OnceLock<String>,
     /// The resident Cursor SDK bridge, created with the tool listener it calls back to.
     pub(crate) cursor: std::sync::OnceLock<Arc<vibeface_bridge::agent::SdkBridge>>,
-    /// Shared by every Cursor turn, so it only proves the bridge called; the agent picks the attempt.
     cursor_callback_token: String,
-    /// Cursor agent id → token of the attempt running it.
-    pub(crate) cursor_agents: Arc<Mutex<HashMap<String, String>>>,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
     pub(crate) claude: claude::Claude,
@@ -316,7 +313,6 @@ impl Runtime {
             tool_url: std::sync::OnceLock::new(),
             cursor: std::sync::OnceLock::new(),
             cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
-            cursor_agents: Arc::new(Mutex::new(HashMap::new())),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,
             claude,

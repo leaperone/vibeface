@@ -17,6 +17,8 @@ import uuid
 
 MODE = os.environ.get("FAKE_PI_MODE", "reply")
 DIRECTORY = os.environ["PI_CODING_AGENT_SESSION_DIR"]
+GATE_DIR = os.environ.get("FAKE_PI_GATE_DIR")
+GATE_RELEASE = os.environ.get("FAKE_PI_GATE_RELEASE")
 out = threading.Lock()
 state = threading.Condition()
 steers, aborted, running = [], [False], [False]
@@ -95,10 +97,27 @@ def wait(condition):
         state.wait_for(condition, timeout=30)
 
 
+def gated():
+    if not GATE_DIR or not GATE_RELEASE:
+        return False
+    os.makedirs(GATE_DIR, exist_ok=True)
+    open(os.path.join(GATE_DIR, f"{session}.started"), "w").close()
+    with state:
+        while not os.path.exists(GATE_RELEASE) and not aborted[0]:
+            state.wait(timeout=0.05)
+        return aborted[0]
+
+
 def turn(text):
     emit({"type": "agent_start"})
     start("user")
     end({"role": "user", "content": text})
+    if gated():
+        start("assistant")
+        end(reply("Working", "aborted"))
+        emit({"type": "agent_end"})
+        emit({"type": "agent_settled"})
+        return
     if MODE == "reply":
         call = {"type": "toolCall", "id": "call-1", "name": "bash", "arguments": {"command": "true"}}
         start("assistant")
@@ -111,7 +130,12 @@ def turn(text):
         start("assistant")
         stream("Hel")
         stream("lo")
-        end(reply("Hello", "stop"))
+        end(reply(f"done: {text}" if GATE_DIR else "Hello", "stop"))
+    elif MODE == "fail":
+        start("assistant")
+        failed = reply("fixture failure", "error")
+        failed["errorMessage"] = "fixture failure"
+        end(failed)
     elif MODE == "wait":
         start("assistant")
         stream("Working")
@@ -174,6 +198,7 @@ for line in sys.stdin:
             state.notify_all()
         respond(command, {"disposition": "queued"})
     elif kind == "abort":
+        log({"abort": True, "session": session})
         with state:
             aborted[0] = True
             state.notify_all()
