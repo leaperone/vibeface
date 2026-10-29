@@ -97,7 +97,7 @@ export default function ChatScreen() {
   const awaiting = live ? awaitsDevice(reach) : false, starting = reach === 'starting'
   useFocusEffect(useCallback(() => {
     if (!awaiting) return
-    const read = () => void latestLive.current?.refresh().catch(() => {})
+    const read = () => { if (latestLive.current && !latestLive.current.refreshing) void latestLive.current.refresh().catch(() => {}) }
     read()
     const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)

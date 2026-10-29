@@ -273,6 +273,8 @@ pub(crate) struct CodexServer {
 
 /// How long a send waits for the App Server, as right after the Node starts, before it is refused.
 const READY_WAIT: Duration = Duration::from_secs(20);
+/// How long a started App Server may stay unconnected before the settings page asks the user.
+const START_LIMIT: Duration = Duration::from_secs(60);
 
 struct Inner {
     client: CodexClient,
@@ -526,9 +528,21 @@ impl Inner {
             }
         };
         self.set_link(Link::Starting);
-        let status = tokio::select! {
-            status = child.wait() => Some(status),
-            () = self.changed.notified() => None,
+        let limit = tokio::time::sleep(START_LIMIT);
+        tokio::pin!(limit);
+        let mut late = false;
+        let status = loop {
+            tokio::select! {
+                status = child.wait() => break Some(status),
+                () = self.changed.notified() => break None,
+                () = &mut limit, if !late => {
+                    late = true;
+                    self.set_link(Link::HandshakeFailed {
+                        socket: self.spawn_socket.clone(),
+                        reason: format!("Codex 启动 {} 秒后仍连不上", START_LIMIT.as_secs()),
+                    });
+                }
+            }
         };
         let group = self.group.lock().expect("group lock").take();
         let replaced = match status {

@@ -210,7 +210,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const awaiting = Boolean(bot) && awaitsDevice(reach), starting = reach === 'starting'
   useEffect(() => {
     if (!awaiting) return
-    const read = () => { if (latest.current.isCurrent()) void latest.current.refresh().catch(() => {}) }
+    // A read still running is left to finish, so a slow one never queues a follow-up that reports its failure.
+    const read = () => { if (latest.current.isCurrent() && !latest.current.refreshing) void latest.current.refresh().catch(() => {}) }
     read()
     const timer = setInterval(read, starting ? 2000 : 10000)
     return () => clearInterval(timer)
@@ -240,7 +241,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
             <h2 className="text-heading font-semibold">{bot.name}</h2>
             {workspace.primary === bot.conversation_id ? <PrimaryMark labeled /> : null}
           </div>
-          {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className="size-4 shrink-0 animate-spin" />Bot 正在启动</p>
+          {starting ? <p role="status" className="flex items-center gap-1.5 text-muted-foreground"><LoaderCircle aria-hidden="true" className={`size-4 shrink-0 ${workspace.connectionOnline ? 'animate-spin' : ''}`} />Bot 正在启动</p>
             : needsSetup ? <>
             <p className="flex items-center gap-1.5 text-muted-foreground"><MessageSquareOff aria-hidden="true" className="size-4 shrink-0" />Bot 还不能回复</p>
             {away || canSetUp ? <Button asChild><Link to={setupTo} params={{ deviceId: setupDevice ?? '' }} search={{ bot: bot.bot_id }}><Bot aria-hidden="true" />{away ? '查看设备' : '设置运行 Bot 的设备'}</Link></Button>

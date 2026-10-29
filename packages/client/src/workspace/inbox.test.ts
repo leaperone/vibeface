@@ -32,6 +32,8 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   const starting = source(true)
   starting.workspace.nodes = [{ ...unready, capabilities: { ...unready.capabilities!, manager_state: 'starting' } }]
   assert.deepEqual(inboxItems(starting).map((item) => item.kind), ['question', 'join'], 'a bot still starting is not a device to set up')
+  starting.workspace.nodes.push({ ...unready, device_id: 'pc', local: false })
+  assert.deepEqual(inboxItems(starting).find((item) => item.kind === 'setup'), { key: 'setup', kind: 'setup', device: 'pc', title: '运行 Bot 的设备需设置' }, 'one device starting does not hide another that needs setup')
 })
 
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {

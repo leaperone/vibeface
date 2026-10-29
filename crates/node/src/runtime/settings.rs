@@ -768,16 +768,19 @@ impl Runtime {
     /// this computer; the card is a shared record.
     fn proposal_text(&self, paths: &Paths, roots: &[PathBuf]) -> String {
         let shown = |path: &PathBuf| self.host.display(path);
-        let mut lines = vec!["要把这台电脑的 AI 设置改成这样吗？".to_owned()];
-        if let Some(on) = paths.execution {
-            lines.push(
-                if on {
-                    "用 Codex 执行任务"
-                } else {
-                    "不再用 Codex 执行任务"
-                }
-                .into(),
-            );
+        let execute = paths.execution == Some(true);
+        let only_folder = paths.is_empty() && roots.len() == 1;
+        let mut lines = vec![if execute {
+            "要让这台电脑用 Codex 执行任务吗？".to_owned()
+        } else if only_folder {
+            format!("要让 Bot 在 {} 里工作吗？", shown(&roots[0]))
+        } else if paths.is_empty() {
+            "要让 Bot 在这些文件夹里工作吗？".to_owned()
+        } else {
+            "要改这台电脑的这些 AI 设置吗？".to_owned()
+        }];
+        if paths.execution == Some(false) {
+            lines.push("不再用 Codex 执行任务".into());
         }
         if let Some(server) = &paths.app_server {
             lines.push(match (&server.mode, &server.socket) {
@@ -798,7 +801,7 @@ impl Runtime {
                 lines.push(format!("{label}：{}", shown(path)));
             }
         }
-        for root in roots {
+        for root in roots.iter().filter(|_| !only_folder) {
             lines.push(format!("可用文件夹：{}", shown(root)));
         }
         let mut text = crate::logging::scrub(&lines.join("\n"));
