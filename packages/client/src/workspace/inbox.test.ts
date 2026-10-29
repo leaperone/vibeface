@@ -13,7 +13,7 @@ const join = (status: JoinRequest['status']): JoinRequest => ({
   join_id: status, status, network_id: 'n', invite_id: 'i', device_id: 'phone', kind: 'client', name: '我的手机', commit: 'c',
   admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: 1,
 })
-const unready: NodeInfo = { device_id: 'mac', name: 'Mac', local: true, online: true, revoked: false, capabilities: { manager: 'codex', manager_ready: false, relay: false, roots: [] } }
+const unready: NodeInfo = { device_id: 'mac', name: 'Mac', local: true, online: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'needs_setup', relay: false, roots: [] } }
 
 const source = (manage: boolean, answered: Record<string, string> = {}): InboxSource => ({
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
@@ -29,6 +29,9 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.equal(waitingItems(items).length, 3)
   assert.equal(waitingItems(inboxItems(source(true, { open: 'ok' }))).length, 2, 'a question this device just answered no longer counts')
   assert.deepEqual(inboxItems(source(false)).map((item) => item.kind), ['question'], 'only a manager is asked to approve or set up')
+  const starting = source(true)
+  starting.workspace.nodes = [{ ...unready, capabilities: { ...unready.capabilities!, manager_state: 'starting' } }]
+  assert.deepEqual(inboxItems(starting).map((item) => item.kind), ['question', 'join'], 'a bot still starting is not a device to set up')
 })
 
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {

@@ -20,7 +20,7 @@ export function Onboarding() {
   const [busy, setBusy] = useState(false)
   const [botOn, setBotOn] = useState(false)
   const [error, setError] = useState<unknown>(null)
-  const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready")
+  const canReply = workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "starting")
   // The first bot works in this computer's first folder; its panel changes it later.
   const project = projectChoices(workspace.nodes.filter((node) => node.local), () => "")[0]?.project
   const done = () => { finishOnboarding(); void navigate({ to: "/" }) }

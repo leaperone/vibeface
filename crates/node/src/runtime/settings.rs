@@ -294,16 +294,15 @@ impl Runtime {
             .clone()
     }
 
-    /// Whether the bot's provider works now; the bot switch alone does not make it run.
-    pub(crate) async fn manager_ready(&self) -> bool {
+    /// Whether the bot's provider works now (`ready`), is coming up (`starting`) or needs the
+    /// user (`needs_setup`); the bot switch alone does not make it run. `None` without a bot.
+    pub(crate) async fn manager_state(&self) -> Option<Value> {
         let settings = self.settings_snapshot();
-        let Some(manager) = &settings.manager else {
-            return false;
-        };
+        let manager = settings.manager.as_ref()?;
         let status = self
             .provider_status(manager.provider, &self.providers(), &settings)
             .await;
-        status["state"] == "ready"
+        Some(status["state"].clone())
     }
 
     pub(crate) async fn node_settings(&self) -> Result<Value> {
