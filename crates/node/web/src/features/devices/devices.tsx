@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { addOnManager, deviceCopy } from "@vibeface/client/identity/copy.ts"
+import { addOnManager, anotherManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
@@ -28,7 +28,8 @@ export function useDeviceRows(): DeviceRow[] {
   const members = directory?.members ?? []
   const removed = new Set(directory?.revoked.map((item) => item.device_id))
   const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])].filter((id) => !removed.has(id))
-  const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
+  // Every device lists the same way: the one in hand first, then computers, phones and tablets, browsers.
+  const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : deviceForm(row.kind, row.name) === "browser" ? 4 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
     const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id
@@ -91,10 +92,31 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
+    <SoleBrowserManager rows={rows} />
     {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-meta text-muted-foreground">
       <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>
     </p> : null}
   </div>
+}
+
+/**
+ * One line while the only management device is a browser: clearing its site data takes management with it. A manager
+ * is led to the device to promote, or to 添加设备 when there is none yet.
+ */
+function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
+  const { ready } = useDevice()
+  const admins = rows.filter((row) => row.admin)
+  const sole = admins.length === 1 ? admins[0] : null
+  if (!sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
+  const next = rows.find((row) => row.kind === "client" && !row.admin)
+  const link = "hit-area relative shrink-0 font-medium text-foreground underline underline-offset-4"
+  return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-meta text-warning">
+    <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />
+    <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
+    {ready?.principal.can_manage ? next
+      ? <Link to="/devices/$deviceId" params={{ deviceId: next.id }} className={link}>{anotherManager}</Link>
+      : <Link to="/devices" search={{ add: true }} className={link}>{anotherManager}</Link> : null}
+  </p>
 }
 
 /** Captioned like a settings group, so a device reads the same as 设置. `bare`: the content brings its own cards. */

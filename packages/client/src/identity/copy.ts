@@ -3,7 +3,7 @@ import type { Member, PendingRecovery } from '../lib/node.ts'
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
-  showCode: '在已有设备上比对安全码',
+  showCode: '正在生成安全码…',
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
   byLink: '用加入链接',
@@ -20,6 +20,14 @@ export const joinCopy = {
   installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
 }
 
+/** A computer's own page before it belongs anywhere: two equal ways on, so a second computer does not start a second network. */
+export const startCopy = {
+  create: '新建我的网络',
+  createNote: '第一次用 Vibeface',
+  join: '加入已有网络',
+  joinNote: '有加入链接',
+}
+
 /** The computer this device reaches its network through does not answer; `name`: that computer as the person named it. */
 export const offlineCopy = {
   title: (name: string) => `连不上${name || '你的电脑'}`,
@@ -34,12 +42,21 @@ export const manualCopy = {
   where: '在我的设备 → 那台设备 → 详细信息里复制',
 }
 
-/** 添加设备: a phone scans the code; another computer runs one command, so both ways show without opening the raw link. */
+/**
+ * 添加设备: a phone scans the code. Another computer opens the link on its own Vibeface page, or runs one command
+ * there while its Vibeface is stopped; both ways show without opening the raw link.
+ */
 export const addDeviceCopy = {
   phone: '手机',
   computer: '电脑',
   copyCommand: '复制命令',
+  openThere: '在那台电脑的 Vibeface 网页选“加入已有网络”，粘贴',
+  installThere: '那台电脑要先装好 Vibeface',
+  orCommand: '或在那台电脑的终端运行',
+  stopFirst: '先停止那台电脑上的 Vibeface',
   runThere: '在另一台电脑的终端里运行',
+  /** The browser could not write to the clipboard; the text below opens selected instead. */
+  copyFailed: '没能复制，请手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
   /** The Node numbers a name another device already has, so one suggested name is enough. */
   command: (link: string) => `vibeface join '${link}' --name '我的电脑'`,
@@ -49,6 +66,10 @@ export const addOnManager = (managers: readonly string[]) => managers.length ===
 
 /** Settings' two red rows each say what they cost before either is tapped. */
 export const exitCopy = { leave: '要用加入链接才能回来', reset: '清除本机数据，回到欢迎页' }
+
+/** The only management device is a browser, whose key goes with its site data; `name`: that browser, 这个浏览器 when it is this one. */
+export const soleBrowserManagerText = (name: string) => `清除${name}的数据会失去管理权`
+export const anotherManager = '再设一台管理设备'
 
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
@@ -97,7 +118,7 @@ export const recoveryCopy = {
   pasteLabel: '找回链接',
   notRecoveryLink: '这不是找回链接，到电脑网页的设置 → 找回 → 在手机上完成找回里复制',
   target: '要连的电脑',
-  replaceHint: '需要现在的恢复文件和旧密码，旧文件会作废',
+  replaceHint: '要用现在的恢复文件和它的密码，换后旧文件作废',
   replaced: '已换密码，旧恢复文件已失效',
   waiting: '找回等待生效',
   left: (at: number, now = Date.now()) => at > now ? `剩余 ${hoursUntil(at, now)} 小时` : '马上生效',
@@ -109,7 +130,7 @@ export const recoveryCopy = {
   recovered: '已找回，旧文件已作废',
   why: '设备都丢了时，用它和恢复密码找回',
   passwordWhy: '设备都丢了时，用它和恢复文件找回',
-  onlyCopy: '只有这一份，丢了不能补',
+  onlyCopy: '只能在这一步下载，之后补不回',
   keptApart: '已把文件和密码分开保存',
   pending: '有人正在用恢复文件找回',
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
@@ -142,6 +163,8 @@ export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
   manageHint: '能添加、移除设备，改设置，拦下找回',
+  /** 可用文件夹: what it is, and during setup that it can wait. */
+  folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
   botStatus: { ready: '能运行 Bot', starting: 'Bot 启动中', needs_setup: 'Bot 需设置', none: '还没配置 Bot' },
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */

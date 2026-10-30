@@ -50,13 +50,13 @@ function SettingsPage() {
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
-    <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回">
       <CurrentRecoveryFile />
       <PhoneRecovery />
       <RecoveryControls />
     </SettingsGroup> : null}
     <SettingsGroup title="高级">
+      <ConnectionSettings />
       <Link to="/settings/lab" className="interactive-row block">
         <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
