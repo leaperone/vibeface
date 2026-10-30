@@ -1,3 +1,8 @@
+---
+title: 构建与发布
+description: 了解 Vibeface 的 CI、制品和 Nightly 发布流程。
+---
+
 # 构建与发布
 
 [CI](https://github.com/leaperone/vibeface/actions/workflows/ci.yml) 按改动范围选择 PR 和 `main` 的核心检查，Draft 与 Ready 相同；merge queue 执行全工作区核心检查，定时、手动和 `v*` tag 执行扩展回归。PR 与 `main` 只上传 Actions 制品，不创建公开版本，也不部署主机。公开版本在 [Releases](https://github.com/leaperone/vibeface/releases) 下载。具体选择规则见 [按改动选择 CI](ci.md)。
@@ -44,7 +49,7 @@ cd vibeface-<version>-<target>
 
 `crypto-web` 在固定版本的 wasm-bindgen 工具链生成一份浏览器密码学资源，运行 native Rust 与 WASM 的实际 Noise 互通和篡改、重放、身份错配负例。`web` 下载这份资源及其真实 TypeScript 声明，以锁定的 pnpm 依赖生成 TanStack Start 静态 SPA。被选中的检查和打包任务下载同一份密码学资源和 SPA，再由 Rust 构建脚本内嵌。缺少资源时构建失败，不用空模块替代。
 
-质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。纯文档不构建；Web-only PR 只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。所有 PR 和 `main` 仅保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品移至定时、手动与 tag 扩展检查。`ci-gate` 要求本次计划中的任务全部成功。
+质量检查按计划选择受影响的 crate，包含 Rust fmt、快慢测试、Clippy、声明的最低 Rust 版本编译检查、工作流和 shell 静态检查、JavaScript 语法、Web TypeScript 检查和静态构建，以及 Atlas 迁移文件校验。Atlas 不打开用户数据库。README 和项目指引不触发构建，`docs/` 触发门户构建；Node Web-only PR 只构建 Linux x64 包并验收网页资源，不运行 Node 库业务测试。所有 PR 和 `main` 仅保留相关快速测试、Clippy 和 Linux x64 制品。慢测试、最低 Rust 版本和三平台制品移至定时、手动与 tag 扩展检查。`ci-gate` 要求本次计划中的任务全部成功。
 
 打包任务校验 SHA256、源码提交、版本、target、密码学资源和存储 epoch。扩展检查在 Linux x64 启动解包后的程序运行无账号网络验收；每个选中的平台独立启动网页进程，检查 SPA 路由、JavaScript、CSS、字体、每段内联脚本的 CSP hash、HEAD、缓存策略和未知资源的 404。Linux x64 还安装包内锁定的 SDK 依赖并导入模块，不开启模型会话。
 
@@ -59,6 +64,19 @@ bash scripts/package-node.sh
 `build-web.sh` 校验生成资源、按 lockfile 安装依赖、生成路由、检查类型，再构建 `crates/node/web/dist/client`。Rust 只内嵌这个目录，不运行 Start 的 SSR 输出。页面和密码学资源使用 `no-store`，成功命中的 `/assets/` 内容使用 immutable 缓存。CSP 根据最终 HTML 生成脚本 hash，并允许 WASM、WebSocket 和 Radix 所需的动态样式。
 
 验收失败时只上传各模式的报告、进程日志和 `node.log`，不上传测试目录或数据库。正常制品保留 14 天，诊断保留 7 天。CI 不验证真实模型调用、实体手机、物理局域网、公网反向代理或用户后台服务安装。
+
+## 门户静态制品
+
+`apps/www` 是面向 `www.vibeface.dev` 的独立门户，使用根 `docs/` 的公开文档。它不编译进 Rust，也不需要运行 Node 服务端。使用 Node.js 24，在仓库根目录执行：
+
+```sh
+pnpm install --frozen-lockfile
+pnpm --filter vibeface-www run typecheck
+pnpm --filter vibeface-www run build
+pnpm --filter vibeface-www run check:static
+```
+
+产物在 `apps/www/dist/client`。CI 的 `www-<SHA>` artifact 包含相同目录，可用于审核或后续静态部署；CI 不自动部署域名。门户配置与验收命令见 [`apps/www/README.md`](../apps/www/README.md)。
 
 ## 显式发布版本
 
@@ -95,7 +113,7 @@ Rust 更新器从 `leaperone/vibeface` 的公开 GitHub Releases 发现版本，
 
 每小时的独立用户服务调用 `update apply --automatic`，不调用模型，不消耗模型 token。更新器先下载并校验，再请求 Node 进入维护状态。正在执行的操作、管理 Agent 调用或 `unknown` 结果会推迟升级。更新器不会为升级强行结束任务。更新只更换程序，不覆盖身份、历史、配置和凭证，也不更新 Codex、Cursor 或其他 Provider 程序。
 
-`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=8`，两者取自 `crates/node/src/config.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 要求同名 `vibeface` 程序和制品。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=8`，Atlas HCL 为 `crates/node/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
+`BUILD-INFO.json` 声明 `update_protocol=1` 和 `data_epoch=7`，两者取自 `crates/node/src/config.rs` 的 `UPDATE_PROTOCOL` 和 `DATA_EPOCH`。包协议 1 要求同名 `vibeface` 程序和制品。设备授权和业务记录使用单一 `node.sqlite3`，数据库 `user_version=7`，Atlas HCL 为 `crates/node/schema.hcl`。不同 epoch 的数据目录和节点不能混用。更新器只安装与本机存储 epoch 一致的包，不隐式转换或清空数据目录。安装后会重启用户服务并核验本机健康状态；失败时恢复上一份程序入口。更新器不自动恢复业务数据库，不能以程序回退代替数据恢复。网络、校验或安装错误通过命令退出状态和私有更新日志报告，不当作“没有更新”。
 
 ## 首次安装
 

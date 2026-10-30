@@ -2,6 +2,9 @@ packages:
   - crates/node/web
   - packages/*
   - apps/*
+allowBuilds:
+  esbuild: true
+  lightningcss: true
 minimumReleaseAge: 0
 onlyBuiltDependencies:
   - esbuild
