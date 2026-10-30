@@ -219,18 +219,44 @@ def check():
     print("Delivery receipts, cross-language bytes and production EVM adapter checks passed" if fixtures else "Guest rebuild, cross-language bytes and production EVM adapter checks passed; skipped: no public proof fixture")
 
 
+def publish_small_results(public, verified_bundle=None):
+    directories = [public.parent.parent, public.parent, public]
+    for directory in directories:
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("Public experiment directories must not be symlinks")
+    files = []
+    for name, limit in (("summary.json", 2 * 1024 * 1024), ("resources.json", 64 * 1024)):
+        file = public / name
+        if file.exists() or file.is_symlink():
+            read_fixture(name, limit, public)
+            if file.stat().st_nlink != 1:
+                raise ValueError("Public experiment files must not have other hard links")
+            files.append(file)
+    for directory in directories:
+        directory.chmod(0o755)
+    for file in files:
+        file.chmod(0o644)
+    if verified_bundle is not None:
+        proofs = public / "proofs"
+        proofs.mkdir(mode=0o755)
+        proofs.chmod(0o755)
+        for name in ("manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]):
+            shutil.copyfile(verified_bundle / name, proofs / name)
+            (proofs / name).chmod(0o644)
+
+
 def prove_small():
     live = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))
     _, initial = live["resources"]()
     destination = Path("/artifacts/small") / uuid.uuid4().hex
     destination.parent.mkdir(parents=True, exist_ok=True)
     public = destination / "public"
-    status, failure = "FAIL", None
+    status, failure, verified_bundle = "FAIL", None, None
     try:
         check()
         run(["node", "contracts/delivery/experiment-delivery.mjs", str(destination)])
         compiled = json.loads((ARTIFACTS / "host-info.json").read_bytes())
-        directory = public / "proofs"
+        directory = destination / "private/proofs"
         manifest, proofs = load_fixtures(directory)
         expected = {"manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]}
         if {file.name for file in directory.iterdir()} != expected:
@@ -244,6 +270,7 @@ def prove_small():
         summary = json.loads((public / "summary.json").read_bytes())
         if summary["status"] != "PASS" or len(summary["proofs"]) != 4 or len(summary["branches"]) != 3 or summary["corruptERejectedWithoutOutput"] is not True:
             raise ValueError("Small experiment did not complete proofs, settlement and recovery")
+        verified_bundle = directory
         status = "PASS"
     except Exception as error:
         failure = error
@@ -263,6 +290,7 @@ def prove_small():
         with (public / "resources.json").open("x") as output:
             json.dump(resources, output, indent=2)
             output.write("\n")
+        publish_small_results(public, verified_bundle)
         print(f"Small experiment {status}: {public}", flush=True)
     if failure:
         raise failure
@@ -393,7 +421,52 @@ def self_test():
         assert name.startswith("vdp-") and len(name.rsplit("-", 1)[1]) == 32
         assert owned[owned.index("--label") + 1] == "vibeface.task-root=" + str(ROOT)
         assert owned.count("--name") == 1 and "--rm" in owned
-    print("Delivery fixture, product profile, receipt export and sandbox command self-tests passed; no Docker job or cryptographic proof ran")
+    with tempfile.TemporaryDirectory(prefix="public-export-self-test-", dir=ARTIFACTS) as directory:
+        base = Path(directory) / "run"
+        public = base / "public"
+        private = base / "private"
+        for path in (base, public, private):
+            path.mkdir(mode=0o700)
+        for path in (public / "summary.json", private / "witness.json", public / "not-public.json"):
+            path.write_text("{}\n")
+            path.chmod(0o600)
+        publish_small_results(public)
+        assert all(path.stat().st_mode & 0o777 == 0o755 for path in (base, public))
+        assert (public / "summary.json").stat().st_mode & 0o777 == 0o644
+        assert all(path.stat().st_mode & 0o777 == 0o600 for path in (private / "witness.json", public / "not-public.json"))
+        assert private.stat().st_mode & 0o777 == 0o700
+        bundle = private / "verified-bundle-layout"
+        bundle.mkdir(mode=0o700)
+        names = {"manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]}
+        for name in names:
+            (bundle / name).write_bytes(b"public-file-layout-only")
+            (bundle / name).chmod(0o600)
+        previous_umask = os.umask(0o077)
+        try:
+            publish_small_results(public, bundle)
+        finally:
+            os.umask(previous_umask)
+        assert all(path.stat().st_mode & 0o777 == 0o755 for path in (base.parent, base, public, public / "proofs"))
+        assert {file.name for file in (public / "proofs").iterdir()} == names
+        for name in names:
+            assert (public / "proofs" / name).read_bytes() == b"public-file-layout-only"
+            assert (public / "proofs" / name).stat().st_mode & 0o777 == 0o644
+            assert (bundle / name).stat().st_mode & 0o777 == 0o600
+        (public / "summary.json").unlink()
+        for hard_link in (False, True):
+            if hard_link:
+                os.link(private / "witness.json", public / "summary.json")
+            else:
+                (public / "summary.json").symlink_to(private / "witness.json")
+            try:
+                publish_small_results(public)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Private data linked into the public allowlist must be rejected")
+            assert (private / "witness.json").stat().st_mode & 0o777 == 0o600
+            (public / "summary.json").unlink()
+    print("Delivery fixture, profile, receipt export, public permissions and sandbox self-tests passed; no Docker job or cryptographic proof ran")
 
 
 if __name__ == "__main__":

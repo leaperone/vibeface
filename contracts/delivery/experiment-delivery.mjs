@@ -11,7 +11,8 @@ const directory = process.argv[2];
 assert(path.isAbsolute(directory));
 fs.mkdirSync(directory, { mode: 0o700 });
 const privateDir = path.join(directory, 'private'), publicDir = path.join(directory, 'public');
-for (const name of [privateDir, publicDir, path.join(publicDir, 'proofs')]) fs.mkdirSync(name, { mode: 0o700 });
+const proofDir = path.join(privateDir, 'proofs');
+for (const name of [privateDir, publicDir, proofDir]) fs.mkdirSync(name, { mode: 0o700 });
 const encode = value => `${JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item, 2)}\n`;
 const write = (file, value) => fs.writeFileSync(file, encode(value), { flag: 'wx', mode: 0o600 });
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -119,8 +120,8 @@ try {
   const proofs = [];
   for (let relation = 1; relation <= 4; relation++) {
     const input = path.join(material, `relation-${relation}.private.json`);
-    const receipt = path.join(publicDir, 'proofs', `relation-${relation}.receipt`);
-    const publicFile = path.join(publicDir, 'proofs', `relation-${relation}.json`);
+    const receipt = path.join(proofDir, `relation-${relation}.receipt`);
+    const publicFile = path.join(proofDir, `relation-${relation}.json`);
     const execution = readJson(await invoke(`execute-${relation}`, prover, ['execute'], input));
     assert.equal(execution.proved, false); assert.equal(execution.imageId, compiled.imageId);
     await invoke(`prove-${relation}`, prover, ['prove', receipt, '--succinct-receipt', path.join(privateDir, `relation-${relation}.succinct.receipt`)], input, publicFile);
@@ -136,9 +137,9 @@ try {
     result.proofs.push({ relation, cycles: execution.cycles, segments: execution.segments,
       receiptBytes: fs.statSync(receipt).size, sealBytes: getBytes(`0x${proof.seal}`).length, journalHash: proof.journalHash, independentlyVerified: true });
   }
-  write(path.join(publicDir, 'proofs', 'manifest.json'), { schemaVersion: 1, imageId: compiled.imageId, schemaHash: compiled.schemaHash,
+  write(path.join(proofDir, 'manifest.json'), { schemaVersion: 1, imageId: compiled.imageId, schemaHash: compiled.schemaHash,
     elfSha256: compiled.elfSha256, proofs: proofs.map(proof => ({ receipt: `relation-${proof.relation}.receipt`, public: `relation-${proof.relation}.json` })) });
-  await invoke('adapter', process.execPath, [path.join(root, 'verify-delivery.mjs'), path.join(publicDir, 'proofs')]);
+  await invoke('adapter', process.execPath, [path.join(root, 'verify-delivery.mjs'), proofDir]);
   progress('fund-and-hold');
   const fields = artifact('DeliveryEscrow').abi.find(item => item.name === 'preview').inputs[0].components;
   const statementType = `tuple(${fields.map(item => `${item.type} ${item.name}`).join(',')})`, coder = AbiCoder.defaultAbiCoder();

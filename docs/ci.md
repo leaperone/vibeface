@@ -83,7 +83,7 @@ python3 scripts/check-delivery.py --sandbox --prove-small
 
 同一 Held 快照分别验证正常 publish/open/withdraw、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
 
-结果在 `.artifacts/vdp/canonical/small/<run>/public/`。上传白名单只含摘要、cgroup 资源以及公开九文件 bundle，不含原文、E、witness、私钥、Succinct checkpoint 或原始日志。CPU 是每个命令期间整个 sandbox 的增量，`memory.peak` 是容器生命周期累计峰值；两者不表示单个业务角色的独占消耗。任何证明、结算、恢复或资源检查失败都不能报告实验通过。
+结果在 `.artifacts/vdp/canonical/small/<run>/public/`。上传白名单只含摘要、cgroup 资源以及独立验真后复制的公开九文件 bundle，不含原文、E、witness、私钥、Succinct checkpoint 或原始日志。生成中的证明留在 `private/proofs/`；失败时只导出安全诊断，不把未验证文件设为公开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`，宿主 CI 用户可读取白名单结果。CPU 是每个命令期间整个 sandbox 的增量，`memory.peak` 是容器生命周期累计峰值；两者不表示单个业务角色的独占消耗。任何证明、结算、恢复或资源检查失败都不能报告实验通过。
 
 现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
 
