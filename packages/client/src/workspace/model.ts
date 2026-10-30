@@ -477,14 +477,20 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   const data = record(value), consistency = overviewConsistency(data.consistency), generatedAt = nullableNumber(data.generated_at_ms), networkEpoch = nullableNumber(data.network_epoch), truncated = data.truncated === true
   const heads = data.heads == null ? {} : Object.fromEntries(Object.entries(record(data.heads)).map(([key, head]) => [key, number(head)]))
   const tasks = list(data.tasks ?? []).map(parseOverviewTask)
-  const deliveries = list(data.deliveries ?? []).flatMap((delivery) => {
-    const raw = record(delivery), workId = nullableText(raw.work_id)
-    if (!workId || tasks.some((task) => task.kind === "dispatch" && task.work_id === workId)) return []
-    return [parseOverviewTask({ ...raw, item_kind: "dispatch" })]
+  const deliveries = list(data.deliveries ?? []).map((delivery) => parseOverviewTask({ ...record(delivery), item_kind: "dispatch" }))
+  const stops = new Map(deliveries.filter((delivery) => delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out")).map((delivery) => [delivery.work_id, delivery]))
+  const mergedTasks = tasks.map((task) => {
+    const stop = task.work_id ? stops.get(task.work_id) : undefined
+    return stop && task.kind !== "check" ? { ...task, state: stop.state, outcome: stop.outcome, reason: stop.reason ?? task.reason, cwd: task.cwd || stop.cwd } : task
+  })
+  const extraDeliveries = deliveries.filter((delivery) => {
+    if (!delivery.work_id) return true
+    const existing = tasks.some((task) => task.work_id === delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out" || task.kind === "dispatch"))
+    return !existing
   })
   return {
     schema: nullableNumber(data.schema), generated_at_ms: generatedAt, network_epoch: networkEpoch, heads, consistency,
-    bots: list(data.bots ?? []).map(parseOverviewBot), conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...tasks, ...deliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
+    bots: list(data.bots ?? []).map(parseOverviewBot), conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...mergedTasks, ...extraDeliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
       const raw = record(question)
       return raw.answer == null && raw.closed == null && raw.state !== "answered" && raw.state !== "closed"
     }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),

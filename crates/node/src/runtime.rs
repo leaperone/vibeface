@@ -903,14 +903,18 @@ impl Runtime {
             if !scope_ids.contains(stop.conversation.as_str()) {
                 continue;
             }
-            deliveries.push(json!({
+            let mut delivery = json!({
                 "work_id": stop.work_id,
                 "conversation_id": stop.conversation,
                 "target_node": stop.target,
                 "state": if stop.timed_out { "stop_timed_out" } else { "stop_waiting" },
                 "requested_at_ms": stop.requested_at_ms,
                 "deadline_ms": stop.deadline_ms,
-            }));
+            });
+            if let Some(work) = all_works.iter().find(|work| work.work_id == stop.work_id) {
+                delivery["cwd"] = json!(workspace_bounded(&work.cwd, 512));
+            }
+            deliveries.push(delivery);
         }
 
         let questions = store

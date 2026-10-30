@@ -73,20 +73,20 @@ test("a bounded overview parser retains unknown and unreachable states", () => {
   const overview = parseWorkspaceOverview({
     schema: 1, generated_at_ms: 10, network_epoch: 2, consistency: "mixed_remote", truncated: false,
     bots: [], questions: [{ question_id: "answered", conversation_id: "chat", text: "已处理", severity: "info", answer: { text: "好" }, created_at_ms: 1 }], jobs: [{ conversation_id: "chat", trigger: "message:m1", state: "running", source_node: "worker" }],
-    tasks: [{ work_id: "work-1", conversation_id: "chat", kind: "work", state: "finished", outcome: "completed", target_node: "worker", remote_reachable: false },
+    tasks: [{ work_id: "work-1", conversation_id: "chat", kind: "work", state: "running", outcome: null, target_node: "worker", cwd: "/project", remote_reachable: false },
       { work_id: "delivery-1", conversation_id: "chat", kind: "task", state: "accepted_waiting_sync", source: "local_dispatch", target_node: "worker", cwd: "/project", outcome: null }],
-    deliveries: [{ work_id: "stop-1", conversation_id: "chat", state: "stop_waiting", target_node: "worker", cwd: "/project" }],
+    deliveries: [{ work_id: "work-1", conversation_id: "chat", state: "stop_waiting", target_node: "worker", cwd: "/project" }],
     checks: [{ check_id: "check-1", conversation_id: "chat", trigger: "work:1", created_at_ms: 2 }],
     relations: [{ from_work: "child", to_work: "parent", kind: "parent" }],
     coverage: { bounded: true, local_heads: true, remote_owners: [{ owner: "worker", reachable: false, reason: "offline" }] },
   })
-  assert.equal(overview.tasks[0]?.state, "unverified")
-  assert.equal(overview.tasks[0]?.outcome, "unverified")
+  assert.equal(overview.tasks[0]?.state, "stop_waiting")
+  assert.equal(overview.tasks[0]?.outcome, null)
+  assert.equal(overview.tasks[0]?.cwd, "/project")
   assert.equal(overview.tasks[1]?.kind, "dispatch")
   assert.equal(overview.tasks[1]?.cwd, "/project")
-  assert.equal(overview.tasks[2]?.kind, "dispatch")
-  assert.equal(overview.tasks[2]?.cwd, "/project")
-  assert.equal(overview.tasks[3]?.kind, "check")
+  assert.equal(overview.tasks[2]?.kind, "check")
+  assert.equal(overview.tasks.filter((task) => task.work_id === "work-1").length, 1)
   assert.equal(overview.questions.length, 0)
   assert.equal(overview.jobs[0]?.state, "running")
   assert.equal(overview.coverage.remote_owners[0]?.reachable, false)
