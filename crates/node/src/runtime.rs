@@ -151,6 +151,7 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
         "trigger": work.trigger,
         "title": workspace_bounded(&work.title, 256),
         "summary": workspace_bounded(&work.summary, 512),
+        "cwd": workspace_bounded(&work.cwd, 512),
         "state": work.state,
         "outcome": work.outcome,
         "kind": work.kind,
@@ -286,6 +287,7 @@ mod workspace_overview_tests {
         assert!(value.get("prompt").is_none());
         assert!(value.get("result_text").is_none());
         assert_eq!(value["title"], "title");
+        assert_eq!(value["cwd"], "/private/project");
     }
 }
 
