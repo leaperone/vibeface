@@ -16,10 +16,12 @@ export type BotReadiness = "ready" | "starting" | "needs_setup"
 export type ConversationSummary = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
 /** Where a work stands in the signed DAG. */
 export type WorkState = "accepted" | "running" | "interrupting" | "finished" | "unverified"
+/** The phase recorded by a WorkProgress event. */
+export type WorkPhase = "started" | "running" | "interrupting" | "finishing"
 /** A dispatch this device still carries: the target has not taken it, refused it, or was removed before saying. Not in the DAG yet. */
-type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch_unverified"
+export type DispatchState = "dispatch_waiting" | "dispatch_rejected" | "dispatch_unverified"
 /** A stop this device still carries: its device has not confirmed it, or the deadline passed. */
-type StopState = "stop_waiting" | "stop_timed_out"
+export type StopState = "stop_waiting" | "stop_timed_out"
 export type WorkOutcome = "completed" | "failed" | "interrupted" | "rejected" | "unverified"
 export type WorkRecord = {
   work_id: string
@@ -39,6 +41,18 @@ export type WorkRecord = {
   failure?: FailureKind
   /** A provider: a turn on it that its device watches; `task`: a task run by its device's coordination Agent. */
   kind?: ProviderId | "task"
+  /** The device that signed the dispatch; absent in snapshots from older Nodes. */
+  dispatcher?: string
+  /** The caller's idempotency key; absent in snapshots from older Nodes. */
+  call_ref?: string
+  /** A follow-up work continues the prior work's provider session. */
+  continues?: string
+  /** The causal parent work, if this was dispatched as a child. */
+  parent?: string
+  /** The existing provider thread that received this dispatch, when applicable. */
+  thread?: string
+  /** The durable phase from the latest WorkProgress event. */
+  phase?: WorkPhase
   /** The Codex thread and turn running it; works steered into one turn share both. */
   thread_id?: string
   turn_id?: string
@@ -179,6 +193,107 @@ type LastMessage = { text: string; role: string; created_at_ms: number }
 export type Busy = "thinking" | "replying" | null
 /** `avatar` null: the face its id gives. `avatar_version` names the face to change it, null before any change. */
 export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
+
+export type OverviewBot = Pick<BotRecord, "bot_id" | "conversation_id" | "name">
+export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "revoked" | "local">
+export type OverviewConsistency = "local_snapshot" | "mixed_remote" | "partial"
+export type OverviewTaskState = WorkState | DispatchState | StopState | "unknown"
+export type OverviewTaskKind = "work" | "check" | "dispatch"
+export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
+
+type OverviewTaskCommon = {
+  item_id: string
+  work_id: string | null
+  conversation_id: string
+  bot: OverviewBot | null
+  title: string
+  summary: string
+  state: OverviewTaskState
+  outcome: WorkOutcome | null
+  target_node: string | null
+  dispatcher: string | null
+  call_ref: string | null
+  work_kind: ProviderId | "task" | null
+  parent: string | null
+  continues: string | null
+  thread: string | null
+  thread_id: string | null
+  turn_id: string | null
+  phase: WorkPhase | null
+  reason: string | null
+  node: OverviewNode | null
+  navigation: OverviewNavigation | null
+  source: "event" | "local_dispatch" | "local_check" | "remote_owner"
+}
+
+/** A work fact, a user confirmation check, or a pre-DAG dispatch delivery. */
+export type OverviewTask =
+  | (OverviewTaskCommon & { kind: "work" })
+  | (OverviewTaskCommon & { kind: "check"; check_id: string; work_ids: string[] })
+  | (OverviewTaskCommon & { kind: "dispatch"; delivery_state: DispatchState })
+
+export type OverviewQuestion = {
+  kind: "question"
+  question_id: string
+  conversation_id: string
+  bot: OverviewBot | null
+  text: string
+  severity: Severity
+  choices: { label: string }[]
+  request_id: string | null
+  work_id: string | null
+  created_at_ms: number
+  state: "unanswered"
+  navigation: { bot_id: string; conversation_id: string } | null
+}
+
+export type OverviewJob = {
+  job_id: string
+  conversation_id: string | null
+  trigger: string
+  state: string
+  message_id: string | null
+  reply_message_id: string | null
+  source_node: string | null
+  pending_check: boolean
+  outcome: SteerOutcome | null
+  unknown_reason: string | null
+}
+
+export type OverviewRemoteOwner = { owner: string; reachable: boolean; reason: string | null }
+export type OverviewCoverage = {
+  source: "open_works" | "workspace_overview"
+  complete: boolean
+  bounded: boolean
+  generated_at_ms: number | null
+  network_epoch: number | null
+  consistency: OverviewConsistency
+  truncated: boolean
+  local_heads: boolean
+  remote_owners: OverviewRemoteOwner[]
+  unreachable_nodes: string[]
+  omitted_finished: number | null
+  omitted_sessions: number | null
+  omitted_dispatches: number | null
+  omitted_jobs: number | null
+  omitted_live_progress: boolean
+}
+
+/** A finite read-only projection. It never implies a complete global queue. */
+export type WorkspaceOverview = {
+  schema: number | null
+  generated_at_ms: number | null
+  network_epoch: number | null
+  heads: Record<string, number>
+  consistency: OverviewConsistency
+  bots: OverviewBot[]
+  tasks: OverviewTask[]
+  questions: OverviewQuestion[]
+  jobs: OverviewJob[]
+  coverage: OverviewCoverage
+  truncated: boolean
+  next_cursor: string | null
+}
 
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }
