@@ -285,7 +285,7 @@ Event {
 }
 ```
 
-每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件。`created_at_ms` 用于展示，排序时只在 `lamport` 相同时作为第二键。SQLite 的 `events` 行另存本机首次落库时间 `seen_at_ms`；它不进入签名 envelope、不随事件同步，投影重放时复用原值。浏览器不写日志，它发起的写入由所连 Node 作为作者写入并附 `attestation`。
+每台 Node 在网络中只有一条日志：`seq` 从 1 连续递增，`prev` 为同一作者 `seq - 1` 的 hash。`deps` 引用写入时依据的其他作者事件。`created_at_ms` 用于展示，排序时只在 `lamport` 相同时作为第二键。SQLite 的 `events` 行另存本机首次落库时间 `seen_at_ms`；它不进入签名 envelope、不随事件同步，投影重放时复用原值。收到的事件 `created_at_ms` 与 `seen_at_ms` 相差超过 5 分钟时，Node 记一条 `event.clock_skew` 警告日志，只用于排查写入方时钟，不影响入库。浏览器不写日志，它发起的写入由所连 Node 作为作者写入并附 `attestation`。
 
 | 类型 | 主要字段 | 作者 |
 |---|---|---|
