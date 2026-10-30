@@ -1187,6 +1187,8 @@ def fixture_cli(initial, *arguments, check=True):
 
 def fixture_triage(run, initial, prompt, bot):
     """The coordination Agent's triage turn: answer, ask about or dismiss each event per the fixture thread's directive."""
+    while (run / "hold-triage").exists():
+        time.sleep(0.05)
     events = json.loads(prompt[prompt.index("Events:\n") + len("Events:\n"):])
     state_path = run / "fixture-codex-state.json"
     threads = json.loads(state_path.read_text())["threads"] if state_path.exists() else {}
@@ -1228,7 +1230,8 @@ def fixture_manager(run, initial, bot):
     require("VIBEFACE_CODEX_SOCKET" in initial["tool_env"], "the coordination Agent's Shell reaches the App Server socket")
     native = bot.thread["id"]
     if TRIAGE_WAKE in prompt:
-        fixture_record(run, "triage-invocations.jsonl", {"pid": os.getpid(), "native_session_id": native})
+        fixture_record(run, "triage-invocations.jsonl", {"pid": os.getpid(), "native_session_id": native,
+                                                        "attempt": initial["tool_env"].get("VIBEFACE_TRIAGE_ATTEMPT")})
         initial["session_id"] = native
         fixture_triage(run, initial, prompt, bot)
         return
@@ -2313,6 +2316,95 @@ def no_agent_checks(run, a, passed):
            answer=answer.get("result", answer.get("error")))
 
 
+def triage_budget_checks(run, workspace, a, network, passed):
+    settings = a.client.call("triage_settings")
+    config = {key: settings[key] for key in ("default_outlet", "projects", "webhook_url", "scan_codex_sessions", "codex_sessions")}
+    a.client.call("configure_triage", {**config, "scan_codex_sessions": False})
+    wait_for("previous triage batches settle", lambda: (value := a.client.call("triage_settings")["status"])["inflight_events"] == 0
+             and value["pending_events"] == 0, timeout=90)
+    day, limit = settings["status"]["budget"]["day"], settings["status"]["budget"]["limit"]
+
+    def usage(used):
+        with sqlite3.connect(a.directory / "node.sqlite3") as connection:
+            connection.execute("INSERT INTO budget_days(network_id,day,used) VALUES(?,?,?) "
+                               "ON CONFLICT(network_id,day) DO UPDATE SET used=excluded.used", ("triage:" + network, day, used))
+
+    def status():
+        return a.client.call("triage_settings")["status"]
+
+    def event(session, hold=False):
+        return {"source": "hook", "agent": "claude" if hold else "codex", "event": "needs_input" if hold else "turn_end",
+                "session_id": session, "turn_id": "budget-turn", "cwd": str(workspace),
+                **({"hold": "permission"} if hold else {})}
+
+    def invocations():
+        return fixture_records(run, "triage-invocations.jsonl")
+
+    def actions(session):
+        return [row for row in fixture_records(run, "triage-actions.jsonl") if row["session_id"] == session]
+
+    usage(limit)
+    before = len(invocations())
+    ordinary = event("budget-ordinary")
+    local_post(a, "/api/hooks", ordinary)
+    held = local_post(a, "/api/hooks", event("budget-deadline", hold=True))
+    paused = wait_for("budget denial leaves events pending", lambda: (value if
+        (value := status())["budget"]["paused_reason"] == "budget_exhausted" and value["pending_events"] == 2 else None))
+    require(paused["budget"]["used"] == paused["budget"]["limit"] == limit and paused["budget"]["retry_at_ms"] > time.time() * 1000,
+            "the existing settings response gives usage and the UTC retry boundary")
+    requests = json.loads(node_cli(a, "requests").stdout)["requests"]
+    require(any(row["request_id"] == held["request_id"] for row in requests), "budget denial preserves the original held request")
+    wait_for("the original hook deadline falls back", lambda: not json.loads(node_cli(a, "requests").stdout)["requests"], timeout=45)
+    expired = json.loads(node_cli(a, "triage", "events").stdout)["events"]
+    require(len(expired) == 2 and all(row.get("request_id") is None for row in expired) and len(invocations()) == before,
+            "deadline fallback retains both unreviewed events without a model call")
+    local_post(a, "/api/hooks", event("budget-orphan", hold=True))
+    a.stop(crash=True)
+    stop_fixture_processes(run)
+    a.start()
+    a.client.connect()
+    a.client.authenticate()
+    require(status()["pending_events"] == 3 and not json.loads(node_cli(a, "requests").stdout)["requests"],
+            "restart retains Pending events without recreating the orphan transport")
+    usage(0)
+    wait_for("restored budget reviews every retained event", lambda: all(len(actions(session)) == 1 for session in
+             ("budget-ordinary", "budget-deadline", "budget-orphan")) and status()["inflight_events"] == 0, timeout=90)
+    require(len(invocations()) == before + 1 and status()["pending_events"] == 0,
+            "one recovered batch invokes exactly once")
+    require(local_post(a, "/api/hooks", ordinary)["status"] == "duplicate", "repeat scans keep the same seen event")
+    require_quiet("repeat scans do not replay actions", lambda: len(invocations()) == before + 1)
+    passed("triage budget denial retains events, deadline fallback keeps review data and recovery runs one batch",
+           used=paused["budget"]["used"], limit=limit, recovered_actions=3)
+
+    hold = run / "hold-triage"
+    hold.touch()
+    unknown = local_post(a, "/api/hooks", event("budget-unknown"))
+    accepted = wait_for("the controlled coordination turn starts before its crash", lambda:
+                        invocations()[-1] if len(invocations()) == before + 2 and status()["inflight_events"] == 1 else None, timeout=90)
+    require(accepted["attempt"], "the real CLI turn receives an exact attempt context")
+    a.stop(crash=True)
+    stop_fixture_processes(run)
+    hold.unlink()
+    a.start()
+    a.client.connect()
+    a.client.authenticate()
+    fenced = status()
+    require(fenced["unknown_events"] == 1 and fenced["budget"]["used"] == 2,
+            "an accepted turn keeps its charge and becomes observable Unknown after restart")
+    late_env = {**a.environment(), "VIBEFACE_DATA_DIR": str(a.directory), "VIBEFACE_TRIAGE_URL": f"http://127.0.0.1:{a.local_port}",
+                "VIBEFACE_TRIAGE_ATTEMPT": accepted["attempt"]}
+    late = subprocess.run([str(a.binary), "triage", "dismiss", "--event-id", unknown["event_id"]],
+                          env=late_env, capture_output=True, text=True, timeout=30)
+    require(late.returncode != 0 and "no longer active" in late.stderr, "an old CLI attempt cannot mutate Unknown evidence")
+    local_post(a, "/api/hooks", event("budget-positive-after-unknown"))
+    wait_for("a fresh Pending event remains reviewable beside Unknown", lambda: len(actions("budget-positive-after-unknown")) == 1
+             and status()["inflight_events"] == 0, timeout=90)
+    require(not actions("budget-unknown") and status()["unknown_events"] == 1 and len(invocations()) == before + 3,
+            "Unknown is neither refunded nor replayed while fresh work proceeds")
+    passed("triage crash fencing preserves charges, rejects stale CLI writes and allows fresh Pending work",
+           unknown_events=1, late_attempt_refused=True)
+
+
 def bot_settings_checks(run, a, network, passed):
     """The user's own message changes the bot through tools; a schedule runs once per time."""
     name = "bot-history-alpha"
@@ -2506,6 +2598,7 @@ def chat_agent_acceptance(options):
         triage_checks(run, workspace, a, network, passed)
         foreign_session_checks(run, workspace, a, network, passed)
         bot_settings_checks(run, a, network, passed)
+        triage_budget_checks(run, workspace, a, network, passed)
         report["manager_invocations"] = len(fixture_records(run))
         report["triage_invocations"] = len(fixture_records(run, "triage-invocations.jsonl"))
         no_agent_checks(run, a, passed)
@@ -2517,12 +2610,32 @@ def chat_agent_acceptance(options):
         report["failure"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        cleanup_errors = []
         for node in reversed(nodes):
-            node.client.close()
-            node.stop()
-        stop_fixture_processes(run)
+            for operation, cleanup in (("client.close", node.client.close), ("node.stop", node.stop)):
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_errors.append({"node": node.name, "operation": operation,
+                                           "type": type(error).__name__, "message": str(error)})
+                    if operation == "node.stop" and node.process is not None:
+                        try:
+                            node.stop(crash=True)
+                        except BaseException as error:
+                            cleanup_errors.append({"node": node.name, "operation": "node.stop(crash=True)",
+                                                   "type": type(error).__name__, "message": str(error)})
+        try:
+            stop_fixture_processes(run)
+        except BaseException as error:
+            cleanup_errors.append({"operation": "stop_fixture_processes",
+                                   "type": type(error).__name__, "message": str(error)})
+        if cleanup_errors:
+            report["status"] = "failed"
+            report["cleanup_errors"] = cleanup_errors
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+        if cleanup_errors and "failure" not in report:
+            raise RuntimeError("fixture cleanup failed; see " + str(run / "report.json"))
 
 
 def verify_dag(node, network):

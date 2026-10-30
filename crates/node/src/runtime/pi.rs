@@ -701,9 +701,13 @@ impl Pi {
             "manager workspace must be an existing absolute directory"
         );
         let secrets = crate::manager::secret_values(config);
+        let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
                 outcome,
+                start: *start
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 session_id: session.map(str::to_owned),
                 failure: ExecFailure {
                     detail: crate::manager::redact_string(failure.detail, &secrets),
@@ -721,7 +725,10 @@ impl Pi {
             )
         };
         let resumed = match previous {
-            Some(id) => self.pointer(id)?.filter(|pointer| pointer.file.is_file()),
+            Some(id) => self
+                .pointer(id)
+                .map_err(ManagerError::not_started)?
+                .filter(|pointer| pointer.file.is_file()),
             None => None,
         };
         let session = match (&resumed, previous) {
@@ -751,8 +758,8 @@ impl Pi {
         );
         if !guide.is_empty() {
             let path = self.dir.join(format!("{session}.md"));
-            config::private_dir(&self.dir)?;
-            config::private_write(&path, guide.as_bytes())?;
+            config::private_dir(&self.dir).map_err(ManagerError::not_started)?;
+            config::private_write(&path, guide.as_bytes()).map_err(ManagerError::not_started)?;
             args.extend(["--append-system-prompt".into(), path.display().to_string()]);
         }
         if !config.model.is_empty() {
@@ -817,12 +824,14 @@ impl Pi {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let within = PREFLIGHT.min(Duration::from_secs(config.timeout_secs));
         let prompt = json!({"type":"prompt","message":prompt});
+        *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
         let turn = match process
             .begin(after.as_deref(), prompt, within, &mut cancel)
             .await
         {
             Begin::Started(turn) => turn,
             Begin::Refused(failure) => {
+                *start.lock().unwrap() = crate::manager::StartEvidence::NotStarted;
                 let tail = process.end().await;
                 return Err(if *cancel.borrow() {
                     stopped(native)
@@ -839,6 +848,7 @@ impl Pi {
                 ));
             }
         };
+        *start.lock().unwrap() = crate::manager::StartEvidence::Started;
         let mut seen = Seen::default();
         lock(&self.live).insert(
             session.clone(),
@@ -2078,6 +2088,136 @@ mod tests {
         assert_eq!(pi.probe(&work).await?, Probe::NotStarted);
         assert!(prompts(&dir).is_empty());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pi_management_failures_refund_only_proven_not_started_triage() -> Result<()> {
+        use crate::manager::StartEvidence::{NotStarted, Started, Unknown};
+        use crate::store::triage::TriageAdmission;
+
+        for (mode, expected_start, expected_kind, charged, pending) in [
+            ("refuse", NotStarted, FailureKind::MissingKey, 0, 1),
+            ("refuse-model", NotStarted, FailureKind::NoModel, 0, 1),
+            ("fail-key", Started, FailureKind::MissingKey, 1, 0),
+            ("prompt-lost", Unknown, FailureKind::Lost, 1, 0),
+            ("crash", Started, FailureKind::Lost, 1, 0),
+            ("instructions-error", NotStarted, FailureKind::Unknown, 0, 1),
+            (
+                "instructions-write-error",
+                NotStarted,
+                FailureKind::Unknown,
+                0,
+                1,
+            ),
+            ("pointer-error", NotStarted, FailureKind::Unknown, 0, 1),
+        ] {
+            let dir = scratch(mode);
+            let pi = Arc::new(Pi::new(&dir));
+            let mut config = bot(&dir, &pi, mode, None);
+            let previous = match mode {
+                "instructions-error" => {
+                    std::fs::write(&pi.dir, "not a directory")?;
+                    None
+                }
+                "instructions-write-error" => {
+                    let file = dir.join("session.jsonl");
+                    std::fs::write(&file, "")?;
+                    pi.keep("s-1", &file, &dir, 0)?;
+                    std::fs::create_dir(pi.dir.join("s-1.md"))?;
+                    Some("s-1")
+                }
+                "pointer-error" => {
+                    config::private_dir(&pi.dir)?;
+                    std::fs::write(pi.pointer_path("s-1")?, "not json")?;
+                    Some("s-1")
+                }
+                _ => None,
+            };
+            let mut store = crate::store::Store::open(":memory:")?;
+            let now = now_ms();
+            store.queue_triage_event(
+                crate::triage::AgentEvent {
+                    event_id: "event-1".into(),
+                    ts_ms: now,
+                    ..Default::default()
+                },
+                now,
+            )?;
+            let TriageAdmission::Claimed(attempt) =
+                store.admit_triage("network", "boot", 1, 1, now)?
+            else {
+                panic!("the first event must reserve one unit");
+            };
+            let result = run_manager(
+                &config,
+                "review event-1",
+                previous,
+                |_| async { anyhow::Ok(()) },
+                watch::channel(false).1,
+                |_| async { anyhow::Ok(()) },
+            )
+            .await
+            .map(|_| ());
+            let error = result.as_ref().expect_err("controlled pi failure");
+            let evidence = error.downcast_ref::<ManagerError>();
+            let actual = evidence.map(|error| (error.start, error.failure.kind));
+            store.finish_triage(attempt, &result)?;
+            let status = store.triage_status("network", "boot", None, 1, now)?;
+            assert_eq!(
+                (
+                    actual,
+                    status.budget.used,
+                    status.pending_events,
+                    status.unknown_events
+                ),
+                (
+                    Some((expected_start, expected_kind)),
+                    charged,
+                    pending,
+                    1 - pending
+                ),
+                "{mode}"
+            );
+            if pending == 1 {
+                if mode == "instructions-error" {
+                    std::fs::remove_file(&pi.dir)?;
+                }
+                config.provider_env = env(&dir, "reply");
+                let TriageAdmission::Claimed(retry) =
+                    store.admit_triage("network", "boot", 1, 1, now)?
+                else {
+                    panic!("a call proven not started must be retryable");
+                };
+                let result = run_manager(
+                    &config,
+                    "review event-1",
+                    None,
+                    |_| async { anyhow::Ok(()) },
+                    watch::channel(false).1,
+                    |_| async { anyhow::Ok(()) },
+                )
+                .await?;
+                assert_eq!(result.output, "Hello");
+                store.finish_triage(retry, &Ok(()))?;
+                let status = store.triage_status("network", "boot", None, 1, now)?;
+                assert_eq!(
+                    (
+                        status.budget.used,
+                        status.pending_events,
+                        status.unknown_events
+                    ),
+                    (1, 0, 0),
+                    "{mode} recovers without losing the event"
+                );
+            }
+            assert!(matches!(
+                store.admit_triage("network", "boot", 1, 1, now)?,
+                TriageAdmission::Empty
+            ));
+            drop(store);
+            std::fs::remove_dir_all(&dir)?;
+        }
         Ok(())
     }
 

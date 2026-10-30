@@ -1199,6 +1199,7 @@ impl Runtime {
                 "manager_enabled":settings.manager.is_some(),"execution":self.providers().switches.execution,
                 "session_scanning":self.triage.config().scan_codex_sessions},
             "write_state":*self.write_state.borrow(), "conflicts":conflicts,
+            "triage":self.triage_status().await?,
             "peers":peers,
             "range":{"since_ms":since_ms,"until_ms":until_ms},
             "logs":{"node.log":records,"service.stderr.log":stderr},

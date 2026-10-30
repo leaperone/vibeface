@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::watch;
-pub use vibeface_bridge::agent::AgentFailure as ManagerFailure;
+pub use vibeface_bridge::agent::{AgentFailure as ManagerFailure, StartEvidence};
 use vibeface_bridge::{
     agent::{self, AgentResult, CustomToolConfig, SdkBridge, SdkTurn},
     codex::DirectSession,
@@ -165,10 +165,20 @@ impl ManagerConfig {
 #[derive(Debug)]
 pub struct ManagerError {
     pub outcome: ManagerFailure,
+    pub start: StartEvidence,
     pub session_id: Option<String>,
     pub failure: ExecFailure,
 }
 impl ManagerError {
+    pub(crate) fn not_started(error: anyhow::Error) -> anyhow::Error {
+        Self {
+            outcome: ManagerFailure::Failed,
+            start: StartEvidence::NotStarted,
+            session_id: None,
+            failure: ExecFailure::new(FailureKind::Unknown, format!("{error:#}")),
+        }
+        .into()
+    }
     pub fn uncertain(&self) -> bool {
         self.outcome == ManagerFailure::Unknown
     }
@@ -196,17 +206,26 @@ where
     P: FnMut(Value) -> PF,
     PF: Future<Output = Result<()>>,
 {
-    ensure!(config.timeout_secs > 0, "manager timeout must be positive");
-    ensure!(
-        !prompt.trim().is_empty() && prompt.len() <= 65_536,
-        "management prompt must be nonempty and at most 65536 bytes"
-    );
-    if let Some(id) = previous_session_id {
-        vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
-    }
+    (|| -> Result<()> {
+        ensure!(config.timeout_secs > 0, "manager timeout must be positive");
+        ensure!(
+            config.workspace.is_absolute() && config.workspace.is_dir(),
+            "manager workspace must be an existing absolute directory"
+        );
+        ensure!(
+            !prompt.trim().is_empty() && prompt.len() <= 65_536,
+            "management prompt must be nonempty and at most 65536 bytes"
+        );
+        if let Some(id) = previous_session_id {
+            vibeface_protocol::validate_id(id).map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    })()
+    .map_err(ManagerError::not_started)?;
     if *cancel.borrow() {
         return Err(ManagerError {
             outcome: ManagerFailure::Cancelled,
+            start: StartEvidence::NotStarted,
             session_id: previous_session_id.map(str::to_owned),
             failure: ExecFailure::new(
                 FailureKind::Unknown,
@@ -224,6 +243,7 @@ where
         } => {
             let not_started = |kind, detail: &str| ManagerError {
                 outcome: ManagerFailure::Failed,
+                start: StartEvidence::NotStarted,
                 session_id: previous_session_id.map(str::to_owned),
                 failure: ExecFailure::new(kind, detail),
             };
@@ -279,6 +299,7 @@ where
                 .map_err(|error| {
                     ManagerError {
                         outcome: error.outcome,
+                        start: error.start,
                         session_id: error.session_id,
                         failure: error.failure,
                     }
@@ -513,9 +534,13 @@ where
         "manager workspace must be an existing absolute directory"
     );
     let secrets = secret_values(config);
+    let start = std::sync::Mutex::new(StartEvidence::NotStarted);
     let error = |outcome, session_id: Option<&str>, failure: ExecFailure| -> anyhow::Error {
         ManagerError {
             outcome,
+            start: *start
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             session_id: session_id.map(str::to_owned),
             failure: ExecFailure {
                 detail: redact_string(failure.detail, &secrets),
@@ -634,9 +659,13 @@ where
     if *cancel.borrow() {
         return Err(stopped(native));
     }
+    *start.lock().unwrap() = StartEvidence::Unknown;
     let turn = match session.request("turn/start", turn_params).await {
         Ok(reply) => reply["turn"]["id"].as_str().map(str::to_owned),
-        Err(e) if !e.uncertain => return Err(failed(native, e.failure())),
+        Err(e) if !e.uncertain => {
+            *start.lock().unwrap() = StartEvidence::NotStarted;
+            return Err(failed(native, e.failure()));
+        }
         Err(e) => match session.read_back(&thread, &client_id).await {
             Ok(Some(turn)) => Some(turn),
             _ => return Err(error(ManagerFailure::Unknown, native, e.failure())),
@@ -644,6 +673,7 @@ where
     }
     .context("Codex started a turn without an ID")
     .map_err(|e| error(ManagerFailure::Unknown, native, own(e.to_string())))?;
+    *start.lock().unwrap() = StartEvidence::Started;
     if let Some(record) = &config.codex_turn
         && let Err(e) = (record.record)(thread.clone(), Some(turn.clone())).await
     {
@@ -1404,6 +1434,11 @@ mod tests {
             .unwrap();
             let error = error.downcast_ref::<ManagerError>().unwrap();
             assert_eq!(error.outcome, expected, "{status}: {error}");
+            assert_eq!(
+                error.start,
+                StartEvidence::Started,
+                "a terminal failure consumed the model turn"
+            );
             assert!(fake.calls("turn/interrupt").is_empty(), "{status}");
         }
     }
@@ -1453,6 +1488,10 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.downcast_ref::<ManagerError>().unwrap().uncertain());
+        assert_eq!(
+            error.downcast_ref::<ManagerError>().unwrap().start,
+            StartEvidence::Unknown
+        );
         assert_eq!(fake.calls("turn/start").len(), 1);
     }
 

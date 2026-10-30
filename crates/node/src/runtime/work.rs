@@ -987,7 +987,7 @@ impl Runtime {
                 .connected(*epoch.as_ref().unwrap_or(&self.codex.epoch()));
             epoch?;
         } else {
-            self.drop_codex_requests();
+            self.drop_codex_requests().await?;
         }
         let Some(network) = self.store.lock().await.network()? else {
             return Ok(());
