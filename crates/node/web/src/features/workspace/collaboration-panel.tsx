@@ -1,6 +1,6 @@
 "use client"
 
-import { Bot, CircleQuestionMark, CircleStop, Clock3, Laptop, Send, Server, Unplug } from "lucide-react"
+import { Bot, CircleQuestionMark, Clock3, ListChecks, Laptop, Send, Server, Unplug } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Card, CardContent } from "@/components/ui/card"
 import { Details, DetailRow, StatusPill, type Tone } from "@/components/app/kit"
@@ -136,7 +136,7 @@ function WorkRow({ work, botId, nodes }: { work: WorkRecord; botId?: string; nod
   const state = shownState(work, nodes)
   return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
-      <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-info-soft text-info"><CircleStop aria-hidden="true" className="size-4" /></span>
+      <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-info-soft text-info"><ListChecks aria-hidden="true" className="size-4" /></span>
       <span className="min-w-0 flex-1">
         <span className="block min-w-0 truncate font-medium" title={work.title || work.prompt}>{work.title || "执行工作"}</span>
         <span className="block text-meta text-muted-foreground">dispatch_work · {nodeName(work.target_node, { nodes })}</span>
