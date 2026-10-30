@@ -15,6 +15,9 @@ export const joinCopy = {
   deviceName: '这台设备的名字',
   join: '加入',
   joining: '加入中',
+  noComputer: '还没有电脑？',
+  installFirst: '先在电脑上安装 Vibeface',
+  installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
 }
 
 /** The computer this device reaches its network through does not answer; `name`: that computer as the person named it. */
@@ -43,6 +46,9 @@ export const addDeviceCopy = {
 }
 /** Where a device without management goes to add one; `managers`: the names of the management devices. */
 export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
+
+/** Settings' two red rows each say what they cost before either is tapped. */
+export const exitCopy = { leave: '要用加入链接才能回来', reset: '清除本机数据，回到欢迎页' }
 
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
@@ -163,4 +169,7 @@ export const waitingCopy = {
   secretHint: '自己设一串，外部聊天那边填同一串',
   forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/docs/node.md#转发到外部聊天',
   outlets: { record: '只在待处理', both: '也发给外部聊天' },
+  /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
+  notifyTip: '会话等你时提醒你',
+  notifyOn: '打开通知',
 }

@@ -27,6 +27,9 @@ export type Conversation = {
   /** Questions before the message written after them, and those asked after the last. */
   before: ReadonlyMap<string, Question[]>
   rest: Question[]
+  /** Question ID to the message answering it; `hidden`: those messages, which show inside their question. */
+  answers: ReadonlyMap<string, string>
+  hidden: ReadonlySet<string>
   /** The row 新消息 sits above: what this chat's badge counted, from its first in the order shown. */
   unread: string | null
   works: WorkRecord[]

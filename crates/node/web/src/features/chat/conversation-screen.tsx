@@ -17,7 +17,7 @@ import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLa
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, awaitsAnswer, foldAnswers, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
+import { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { RecoveryAlert } from '@/features/identity/recovery-controls'
 import { providerIcons } from '@/features/devices/ai-settings'
@@ -352,13 +352,15 @@ function TaskMeta({ device, here, label, agent, quiet = false, className = '' }:
 
 /** A session no bot started that this bot looks after. Bots hand sessions to each other themselves; the row only shows it. */
 function SessionRow({ session }: { session: SessionHandoff }) {
+  const { nodes } = useWorkspace()
   const Icon = providerIcons[session.agent]
+  const project = sharedProject(session.cwd, session.node, nodes)
   return <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
     <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
     <span className="grid min-w-0 flex-1">
       <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-      <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
-        <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
+      <span className="truncate text-meta text-muted-foreground" title={[project.path, session.summary].filter(Boolean).join('\n')}>
+        <span className="sr-only">项目 </span>{project.name}{session.summary ? ` · ${session.summary}` : ''}
       </span>
     </span>
   </div>

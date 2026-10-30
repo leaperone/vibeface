@@ -1,3 +1,8 @@
+---
+title: 安装与管理节点
+description: 在自己的 Mac 或 Linux 设备上安装 Vibeface Nightly，并初始化本机 Node。
+---
+
 # 安装与管理节点
 
 本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。

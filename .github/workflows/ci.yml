@@ -35,6 +35,7 @@ jobs:
     outputs:
       plan: ${{ steps.select.outputs.plan }}
       web: ${{ steps.select.outputs.web }}
+      www: ${{ steps.select.outputs.www }}
       rust: ${{ steps.select.outputs.rust }}
       slow: ${{ steps.select.outputs.slow }}
       delivery: ${{ steps.select.outputs.delivery }}
@@ -95,6 +96,37 @@ jobs:
           node --check scripts/package-npm.mjs
           node scripts/package-npm.mjs --self-test
       - run: cargo fmt --all -- --check
+
+  www:
+    needs: plan
+    if: needs.plan.outputs.www == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check and build the static www portal
+        run: |
+          pnpm --filter vibeface-www run typecheck
+          pnpm --filter vibeface-www run build
+          pnpm --filter vibeface-www run check:static
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: www-${{ github.sha }}
+          path: apps/www/dist/client
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
   crypto-web:
     needs: plan
@@ -819,7 +851,7 @@ jobs:
   ci-gate:
     name: ci-gate
     if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
-    needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
+    needs: [plan, quick-check, crypto-web, web, www, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

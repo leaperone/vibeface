@@ -6358,7 +6358,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibeface"
-version = "0.0.1-nightly.20261030.6"
+version = "0.0.1-nightly.20261030.8"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -6403,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-bridge"
-version = "0.0.1-nightly.20261030.6"
+version = "0.0.1-nightly.20261030.8"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -6437,7 +6437,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-protocol"
-version = "0.0.1-nightly.20261030.6"
+version = "0.0.1-nightly.20261030.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -6445,7 +6445,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure"
-version = "0.0.1-nightly.20261030.6"
+version = "0.0.1-nightly.20261030.8"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6467,7 +6467,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure-ffi"
-version = "0.0.1-nightly.20261030.6"
+version = "0.0.1-nightly.20261030.8"
 dependencies = [
  "hex",
  "iroh",

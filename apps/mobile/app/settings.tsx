@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { addOnManager, eraseSoleManagerText, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
@@ -57,9 +57,6 @@ export default function Settings() {
       <Notifications />
       {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
     </SettingsGroup> : null}
-    <SettingsGroup>
-      <SettingsRow href="/transfers" icon={ArrowRightLeft} label="发送和接收文件" />
-    </SettingsGroup>
     {manager ? <SettingsGroup title="找回">
       <CurrentRecoveryFile />
       <SettingsRow href="/recovery" icon={KeyRound} label={recoveryCopy.rotate} />
@@ -74,14 +71,15 @@ export default function Settings() {
       </SettingsRow>
     </SettingsGroup>
     <SettingsGroup title={experimentsCopy.group}>
+      <SettingsRow href="/transfers" icon={ArrowRightLeft} label="文件传输" />
       <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experiments ? experimentsCopy.on : experimentsCopy.hint}>
         <Switch accessibilityLabel={experimentsCopy.label} value={experiments} onValueChange={setExperiments} />
       </SettingsRow>
     </SettingsGroup>
     <View className="gap-3">
       <SettingsGroup>
-        <SettingsRow icon={LogOut} tone="danger" label={`断开${self}`} onPress={() => open('leave')} />
-        <SettingsRow icon={RotateCcw} tone="danger" label="恢复出厂设置" onPress={() => open('reset')} />
+        <SettingsRow icon={LogOut} tone="danger" label={`断开${self}`} description={exitCopy.leave} onPress={() => open('leave')} />
+        <SettingsRow icon={RotateCcw} tone="danger" label="恢复出厂设置" description={exitCopy.reset} onPress={() => open('reset')} />
       </SettingsGroup>
       {confirming === 'leave' && !device.ready ? <View className="gap-3 px-1">
         {/* Leaving is signed by the network, so it waits for a connection; an erase does not. */}

@@ -76,10 +76,11 @@ function AiSettings() {
     catch (cause) { setError({ at: 'codex', text: messageOf(cause) }); return null }
   }
   const { shown, folded } = providerGroups(response.providers)
-  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} busy={busy} test={test}
+  const row = (item: ProviderStatus, index: number) => <ProviderRow key={item.provider} item={item} first={index === 0} response={response} busy={busy} test={test}
     error={error?.at === item.provider ? error.text : ''}
     change={(key, change) => call(`${item.provider}:${key}`, 'configure_provider', { provider: item.provider, ...change }, item.provider).then(Boolean)}
     saveAssistant={(next) => call(`${item.provider}:assistant_details`, 'configure_node', { roots, manager: next }, item.provider).then(Boolean)} />
+  const list = (items: ProviderStatus[]) => <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">{items.map(row)}</View>
   return <View className="gap-6">
     <View className="gap-1 px-1">
       {(['bot', 'execution'] as const).map((role) => <View key={role} className="flex-row items-start gap-1.5">
@@ -87,59 +88,61 @@ function AiSettings() {
         <Text className="min-w-0 flex-1 text-meta text-muted-foreground"><Text className="text-meta font-medium">{roles[role].label}</Text> · {roles[role].note}</Text>
       </View>)}
     </View>
-    {shown.map(card)}
-    {folded.length ? <Details label={`未安装 · ${folded.map((item) => providerNames[item.provider]).join('、')}`} open={!shown.length}>
-      <View className="gap-6">{folded.map(card)}</View>
-    </Details> : null}
+    {shown.length ? list(shown) : null}
+    {folded.length ? <Details label={`未安装 · ${folded.map((item) => providerNames[item.provider]).join('、')}`} open={!shown.length}>{list(folded)}</Details> : null}
     <PathList label="可用文件夹" items={roots} shown={response.display_paths} suggested={folderSuggestions(response)} busy={busy !== ''} onChange={(next) => void call('roots', 'configure_node', { roots: next, manager }, 'roots')} />
     {error && ['roots', 'refresh', ''].includes(error.at) ? <ErrorText error={error.text} /> : null}
   </View>
 }
 
-function ProviderCard({ item, response, busy, error, change, saveAssistant, test }: {
-  item: ProviderStatus; response: NodeSettingsResponse; busy: string; error: string
+/** One line per provider, as on the web: its uses that are on, and its state unless it is unused. Tapping it opens the switches and settings. */
+function ProviderRow({ item, first, response, busy, error, change, saveAssistant, test }: {
+  item: ProviderStatus; first: boolean; response: NodeSettingsResponse; busy: string; error: string
   change(key: string, value: Change): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
 }) {
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
   const manager = assistant ? response.settings.manager : null
-  const state = states[item.state]
+  const state = item.state === 'off' ? null : states[item.state]
   const issue = item.state === 'needs_setup' ? item.issues[0] : undefined
   const [open, setOpen] = useState(false)
   const [bin, setBin] = useState(item.bin)
   useEffect(() => setBin(item.bin), [item.bin])
   const working = busy.startsWith(`${item.provider}:`)
-  return <View className="overflow-hidden rounded-xl border border-border bg-card shadow-xs dark:border-line-strong">
-    <View className="min-h-14 flex-row items-center gap-3 px-4 py-2">
+  const using = [assistant ? roles.bot : null, execution ? roles.execution : null].filter((role) => role !== null)
+  return <View className={cn(!first && 'border-t border-border')}>
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state?.label].filter(Boolean).join('，')}
+      className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted/60" onPress={() => setOpen(!open)}>
       <Icon as={providerIcons[item.provider]} className="text-muted-foreground" />
-      <Text className="min-w-0 flex-1 font-medium">{name}</Text>
-      <View className="flex-row items-center gap-1">
+      <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{name}</Text>
+      {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-brand" />)}
+      {state ? <View className="flex-row items-center gap-1">
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
-      </View>
-    </View>
-    {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
-    {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
-    {issue ? <View className="flex-row flex-wrap items-center gap-x-2 px-4 py-2">
+      </View> : null}
+      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" />
+    </Pressable>
+    {issue ? <View className="-mt-1 flex-row flex-wrap items-center gap-x-2 px-4 pb-2">
       <Icon as={CircleAlert} className="size-4 text-warning" />
       <Text className="shrink text-meta text-warning">{issueText(item.provider, issue)}{item.issues.length > 1 ? `，还有 ${item.issues.length - 1} 项` : ''}</Text>
       {issue.code === 'app_server_not_found' && item.app_server
         ? <Button variant="link" className="px-0" disabled={working} onPress={() => void change('app_server', { app_server: { mode: 'spawn', socket: item.app_server?.socket ?? null } })}><Text>{deviceCopy.appServer.useSpawn}</Text></Button>
-        : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
+        : open ? null : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} className="min-h-11 flex-row items-center gap-1 border-t border-border px-4 active:bg-muted/60" onPress={() => setOpen(!open)}>
-      <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">设置</Text>
-    </Pressable>
-    {open ? <View className="gap-4 px-4 pb-4">
-      {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
-      {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
-      <Field label="程序">
-        <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
-      </Field>
-      {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} working={working} save={saveAssistant} /> : null}
-      <Variables item={item} working={working} change={change} />
-      {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
-    </View> : null}
+    {open ? <>
+      {item.supports.includes('agent') ? <Toggle role="bot" name={name} pressed={assistant} busy={busy === `${item.provider}:bot`} disabled={busy !== ''} onPress={() => void change('bot', assistant ? { bot: false } : botOnChange(response, item))} /> : null}
+      {item.supports.includes('execution') ? <Toggle role="execution" name={name} pressed={execution} busy={busy === `${item.provider}:execution`} disabled={busy !== ''} onPress={() => void change('execution', { execution: !execution })} /> : null}
+      <View className="gap-4 border-t border-border p-4">
+        {/* Keyed by the roles, so switching one drops a test result that no longer matches what runs. */}
+        {item.app_server ? <AppServerSettings key={item.roles.join()} server={item.app_server} working={working} save={change} test={test} /> : null}
+        <Field label="程序">
+          <SaveRow value={bin} saved={item.bin} placeholder={item.bin.split(/[\\/]/).pop() ?? ''} mono working={working} onChange={setBin} onSave={() => void change('bin', { bin: bin.trim() })} />
+        </Field>
+        {manager ? <AssistantDetails key={JSON.stringify(manager)} manager={manager} working={working} save={saveAssistant} /> : null}
+        <Variables item={item} working={working} change={change} />
+        {issue?.code === 'launch_failed' ? <Field label="启动失败原因"><Text selectable className="font-mono text-meta">{issue.detail}</Text></Field> : null}
+      </View>
+    </> : null}
     {error ? <View className="px-4 pb-3"><ErrorText error={error} /></View> : null}
   </View>
 }

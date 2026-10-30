@@ -1,9 +1,9 @@
 import * as Clipboard from 'expo-clipboard'
-import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { openURL, useLinkingURL } from 'expo-linking'
+import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, X } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
-import { View } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import Animated from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -53,10 +53,13 @@ export default function JoinScreen() {
         : session.phase === 'joining' ? <Waiting code={session.code} onCancel={workspace.actions.cancelJoin} />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm />}
-      {choosing ? <View className="border-t border-border pt-4">
+      {choosing ? <View className="gap-1 border-t border-border pt-4">
         {lane === 'recovery'
           ? <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>{joinCopy.byLink}</Text></Button>
-          : <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
+          : <>
+            <NoComputer />
+            <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>
+          </>}
       </View> : null}
     </KeyboardAwareScrollView>
   </SafeAreaView>
@@ -72,6 +75,19 @@ function Wordmark() {
     </Svg>
     <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
   </View>
+}
+
+/** A first phone with no computer yet: Vibeface runs on a computer first, and its 添加设备 brings the phone in. */
+function NoComputer() {
+  return <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})}
+    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-accent">
+    <Icon as={Laptop} />
+    <View className="min-w-0 flex-1">
+      <Text className="font-medium">{joinCopy.noComputer}</Text>
+      <Text className="text-meta text-muted-foreground">{joinCopy.installFirst}</Text>
+    </View>
+    <Icon as={ExternalLink} className="size-4 text-muted-foreground" />
+  </Pressable>
 }
 
 /** The phone's device key is gone; starting over makes a new one, then it joins again by link or recovery file. */
@@ -142,11 +158,19 @@ function JoinForm() {
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
       {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
-      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => edit((await Clipboard.getStringAsync()).trim())}>
-        <Icon as={ClipboardPaste} /><Text>粘贴</Text>
-      </Button>
+      <Paste onText={(text) => edit(text.trim())} />
     </View>
   </View>
+}
+
+/** iOS's own paste control reads the clipboard without asking each time; elsewhere a button reads it. */
+function Paste({ onText }: { onText: (text: string) => void }) {
+  const [fill, ink] = useCSSVariable(['--muted', '--foreground']) as [string, string]
+  if (Clipboard.isPasteButtonAvailable) return <Clipboard.ClipboardPasteButton acceptedContentTypes={['plain-text', 'url']} backgroundColor={fill} foregroundColor={ink}
+    cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') onText(data.text) }} />
+  return <Button variant="ghost" className="-ms-3 self-start" onPress={async () => onText(await Clipboard.getStringAsync())}>
+    <Icon as={ClipboardPaste} /><Text>粘贴</Text>
+  </Button>
 }
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {

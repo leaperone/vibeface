@@ -1,5 +1,9 @@
 /target/
 /.artifacts/
+apps/www/.artifacts/
+apps/www/.source/
+apps/www/.tanstack/
+apps/www/dist/
 /.worktrees/
 node_modules/
 /crates/node/web/generated/

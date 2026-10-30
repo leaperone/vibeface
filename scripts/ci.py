@@ -25,6 +25,7 @@ CRATES = dict(zip(("protocol", "bridge", "secure", "node", "secure-ffi", "delive
 PATH_RULES = (
     ("delivery", ("crates/delivery/*", "proofs/delivery/*", "contracts/delivery/*", "tests/fixtures/delivery-probe/*", "crates/node/src/delivery/*", "crates/node/src/client.rs", "crates/node/src/config.rs", "crates/node/src/main.rs", "crates/node/src/maintenance.rs", "crates/node/src/net.rs", "crates/node/src/net/pkarr.rs", "crates/node/src/runtime.rs", "crates/node/src/runtime/peers.rs", "scripts/check-delivery.py", "scripts/install-delivery-toolchain.py", "scripts/run-delivery-live.py")),
     ("full", ("Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "rust-toolchain*", ".cargo/*", ".github/*", ".preflight.toml", "scripts/ci.py")),
+    ("www", ("apps/www/*",)),
     ("docs", ("README.md", "AGENTS.md", "CLAUDE.md", "docs/*")),
     ("node", ("packages/client/src/avatar/derived-faces.json", "packages/client/src/avatar/face.ts")),
     ("web", ("crates/node/web/*", "packages/client/*", "packages/theme/*", "packages/secure-native/*", "apps/mobile/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml", "scripts/build-web.sh", "scripts/build-web-crypto.sh")),
@@ -34,6 +35,7 @@ PATH_RULES = (
     ("secure-ffi", ("crates/secure-ffi/*", "scripts/build-mobile-secure.sh")),
     ("node", ("crates/node/*", "install.sh", "scripts/package-node.sh", "scripts/install-node-service.sh", "scripts/verify-node.py")),
 )
+WWW_PATHS = ("apps/www/*", "docs/*", "packages/theme/*", "package.json", "pnpm-workspace.yaml", "pnpm-lock.yaml")
 SLOW_TESTS = (
     "store::tests::append_100k_stays_flat",
     "runtime::peers::tests::a_round_left_behind_pulls_again_without_waiting_for_hello",
@@ -43,20 +45,21 @@ PLATFORMS = (
     {"runner": "ubuntu-24.04-arm", "target": "aarch64-unknown-linux-gnu"},
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
 )
-JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke")
+JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
 
 
 def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
-    scopes = {
-        next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full")
-        for path in paths
-    }
+    scopes = set()
+    for path in paths:
+        scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
+        if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
+            scopes.add("www")
     return dict(scope_plan(scopes, event, ref_type, channel), changed_files=len(paths))
 
 
 def scope_plan(scopes, event, ref_type, channel):
     if (
-        scopes - {"full", "docs", "web", *DEPENDENTS}
+        scopes - {"full", "docs", "web", "www", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
@@ -74,6 +77,7 @@ def scope_plan(scopes, event, ref_type, channel):
                 pending.extend(DEPENDENTS[dependent])
     packages = [package for crate, package in CRATES.items() if crate in affected]
     web = full or "web" in scopes or "node" in affected
+    www = full or "www" in scopes
     slow = "node" in affected and extended
     delivery = full or "delivery" in affected
     platforms = PLATFORMS if "node" in affected and extended else PLATFORMS[:1]
@@ -87,6 +91,7 @@ def scope_plan(scopes, event, ref_type, channel):
         "channel": channel,
         "scopes": sorted(scopes),
         "web": web,
+        "www": www,
         "node": "node" in affected,
         "delivery": delivery,
         "rust_packages": packages,
@@ -106,6 +111,8 @@ def scope_plan(scopes, event, ref_type, channel):
         required.add("delivery")
     if plan["npm"]:
         required.update(("npm-package", "npm-smoke"))
+    if www:
+        required.add("www")
     plan["required_jobs"] = [job for job in JOBS if job in required]
     return plan
 
@@ -173,6 +180,7 @@ def write_plan(plan, output=None):
         outputs = {
             "plan": encoded,
             "web": str(plan["web"]).lower(),
+            "www": str(plan["www"]).lower(),
             "rust": str(bool(plan["rust_packages"])).lower(),
             "slow": str("slow" in plan["test_tiers"]).lower(),
             "delivery": str(plan["delivery"]).lower(),
@@ -271,11 +279,14 @@ def self_test():
     assert web["required_jobs"] == ["quick-check", "crypto-web", "web", "package"]
     assert web["package_mode"] == "web" and web["package_matrix"]["include"] == list(PLATFORMS[:1])
     assert make_plan(["crates/node/web/src/content.md"])["web"]
-    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web"]
-    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web"]
+    www = make_plan(["apps/www/src/routes/index.tsx"])
+    assert www["www"] and not www["web"] and not www["rust_packages"]
+    assert www["required_jobs"] == ["quick-check", "www"]
+    assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web", "www"]
+    assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web", "www"]
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
     docs = make_plan(["README.md", "docs/node.md"])
-    assert docs["docs_only"] and docs["required_jobs"] == ["quick-check"]
+    assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
         "node": ["vibeface"],
         "bridge": ["vibeface-bridge", "vibeface"],
@@ -330,6 +341,12 @@ def self_test():
         expect_failure(lambda: gate(broken))
     broken = json.loads(json.dumps(needs))
     broken["plan"]["result"] = "skipped"
+    expect_failure(lambda: gate(broken))
+    www_needs = {job: {"result": "success" if job in www["required_jobs"] else "skipped"} for job in JOBS}
+    www_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(www)}}
+    gate(www_needs)
+    broken = json.loads(json.dumps(www_needs))
+    del broken["www"]
     expect_failure(lambda: gate(broken))
     broken = json.loads(json.dumps(needs))
     broken["rust-slow"]["result"] = "failure"

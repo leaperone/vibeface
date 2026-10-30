@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { projectName, questionMeta, settledAnswer } from "@vibeface/client/workspace/questions.ts"
+import { questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -53,6 +53,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
   const disabled = !workspace.writable || action.busy !== null
   const shown = question.choices
   const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
+  const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, workspace.nodes) : null
   const send = (key: string, value: string) => action.run(key, async () => {
     answering.current = true
     const result = await workspace.answer(question, value)
@@ -75,7 +76,7 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false }
         <ListChecks aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">任务 </span><span className="truncate">{task.title}</span>
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自" compact={Boolean(task)}>{providerNames[question.about.agent]}</Meta> : null}
-      {question.about.cwd ? <Meta icon={FolderOpen} label="项目" title={question.about.cwd} compact={Boolean(task)}>{projectName(question.about.cwd)}</Meta> : null}
+      {project ? <Meta icon={FolderOpen} label="项目" title={project.path} compact={Boolean(task)}>{project.name}</Meta> : null}
       {/* As on task rows, only another device is named on screen. */}
       {local ? <span className="sr-only">设备 {node}</span>
         : <Meta icon={Server} label="设备" title={node} compact={Boolean(task)}>{node}</Meta>}
