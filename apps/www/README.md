@@ -17,10 +17,12 @@ pnpm --filter vibeface-www run build
 pnpm --filter vibeface-www run check:static
 pnpm --filter vibeface-www run test:e2e:check
 
-# Chromium must already be installed for the e2e command.
+# The e2e runner downloads Chromium on its first run if needed.
 pnpm --filter vibeface-www run test:e2e
 ```
 
-The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. `wrangler.toml` describes a Cloudflare Workers Static Assets deployment, but this repository does not deploy the site automatically.
+The deployable files are in `apps/www/dist/client`. Serve that directory with a static server to review deep links such as `/docs/install/`. The portal reuses the logo from `crates/node/web/public/icon.svg` in `public/logo.svg`, including the document navigation and favicon.
+
+`.github/workflows/deploy-www.yml` dispatches `deploy-vibeface-www` to `leaperone/leaperone-releases` when matching changes reach `main`, or when the workflow runs manually. `apps/www/Dockerfile` builds a static Nginx container. `wrangler.toml` remains an optional Cloudflare Workers Static Assets configuration.
 
 The portal does not include the user app, Node runtime, discovery service, credentials, or private workspace data. The public repository currently exposes Nightly Releases, so the download page links to the GitHub Releases page instead of claiming a stable package.

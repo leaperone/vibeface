@@ -35,5 +35,5 @@ function Content({ path }: { path: string }) {
 function DocsRoute() {
   const data = Route.useLoaderData() as DocsLoaderData
   const pageTree = useFumadocsLoader({ pageTree: data.pageTree }).pageTree
-  return <DocsLayout nav={{ title: 'Vibeface' }} tree={pageTree} searchToggle={{ full: { children: '搜索文档', 'aria-label': '打开文档搜索' }, sm: { children: '搜索', 'aria-label': '打开文档搜索' } }} themeSwitch={{ mode: 'light-dark' }}><Suspense><Content path={data.path} /></Suspense></DocsLayout>
+  return <DocsLayout nav={{ title: <><img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />Vibeface</> }} tree={pageTree} searchToggle={{ full: { children: '搜索文档', 'aria-label': '打开文档搜索' }, sm: { children: '搜索', 'aria-label': '打开文档搜索' } }} themeSwitch={{ mode: 'light-dark' }}><Suspense><Content path={data.path} /></Suspense></DocsLayout>
 }
