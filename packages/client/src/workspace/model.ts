@@ -244,6 +244,7 @@ function overviewDispatchState(value: unknown): OverviewDeliveryState {
   switch (value) {
     case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": return value
     case "dispatch_accepted": case "stop_waiting": case "stop_timed_out": return value
+    case "accepted_waiting_sync": return "dispatch_accepted"
     default: return "dispatch_unverified"
   }
 }
