@@ -1,0 +1,15 @@
+{
+  "pages": [
+    "overview",
+    "comparison",
+    "install",
+    "bot-and-execution",
+    "history-sync",
+    "privacy-security",
+    "node",
+    "deployment",
+    "troubleshooting",
+    "releasing",
+    "ci"
+  ]
+}

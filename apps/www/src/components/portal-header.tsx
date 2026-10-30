@@ -8,7 +8,7 @@ export function PortalHeader({ label }: { label?: string }) {
         <span>Vibeface</span>
       </a>
       <nav aria-label="主导航">
-        <a href="/docs/install">文档</a>
+        <a href="/docs/overview">文档</a>
         <a href="/download">下载</a>
         <a href="/community">社区</a>
         <a href="/security">安全</a>

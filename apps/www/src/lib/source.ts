@@ -6,7 +6,12 @@ export const docs = defineDocs({
   docs: {
     async: true,
     files: [
+      'overview.md',
+      'comparison.md',
       'install.md',
+      'bot-and-execution.md',
+      'history-sync.md',
+      'privacy-security.md',
       'node.md',
       'deployment.md',
       'troubleshooting.md',
@@ -15,6 +20,7 @@ export const docs = defineDocs({
     ],
     postprocess: { includeProcessedMarkdown: true },
   },
+  meta: { files: ['meta.json'] },
 })
 
 export const source = loader({
