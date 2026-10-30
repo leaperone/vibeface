@@ -3,7 +3,7 @@ import test from 'node:test'
 import type { JoinRequest } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { deviceForm, deviceOnline, formName } from './labels.ts'
-import type { NodeInfo, Question } from './types.ts'
+import type { BotRecord, NodeInfo, NotificationRecord, Question } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -19,7 +19,7 @@ const source = (manage: boolean, answered: Record<string, string> = {}): InboxSo
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
   workspace: {
     writeState: { state: 'writable', conflicts: [] }, questions: [question('open'), question('closed', true)], answered, openWorks: [], nodes: [unready], data: null,
-    messagePending: null, messageBusy: false, selectedBot: null, notifications: [], bots: [],
+    messagePending: null, messageBusy: false, selectedBot: null, notifications: [], ignoredNotifications: new Set(), bots: [],
   },
 })
 
@@ -46,4 +46,17 @@ test('a phone asking to join reads as a phone, and only a computer has an online
   assert.equal(deviceOnline('node', undefined, true, true), true, 'the connected computer is online before the device list arrives')
   assert.equal(deviceOnline('node', { online: true }, true, false), false, 'the computer this device lost reads offline, not its last report')
   assert.equal(deviceOnline('node', { online: true }, false, false), undefined, 'another computer is unknown while this device is offline')
+})
+
+test('manager attention keeps its notification identity and can be hidden locally', () => {
+  const attention = source(true)
+  const bot = { bot_id: 'b', conversation_id: 'c', name: '助手' } as unknown as BotRecord
+  const note = { notification_id: 'n1', kind: 'manager_attention', text: '看看进展', conversation_id: 'c' } satisfies NotificationRecord
+  attention.workspace.bots = [bot]
+  attention.workspace.notifications = [note]
+  const item = inboxItems(attention).find((candidate) => candidate.kind === 'attention')
+  assert.equal(item?.kind, 'attention')
+  if (item?.kind === 'attention') assert.equal(item.notification.notification_id, 'n1')
+  attention.workspace.ignoredNotifications = new Set(['n1'])
+  assert.equal(inboxItems(attention).some((candidate) => candidate.kind === 'attention'), false)
 })
