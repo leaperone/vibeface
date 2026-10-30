@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://www.vibeface.dev/</loc></url>
+  <url><loc>https://www.vibeface.dev/download</loc></url>
+  <url><loc>https://www.vibeface.dev/community</loc></url>
+  <url><loc>https://www.vibeface.dev/security</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/install</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/node</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/deployment</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/troubleshooting</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/releasing</loc></url>
+  <url><loc>https://www.vibeface.dev/docs/ci</loc></url>
+</urlset>

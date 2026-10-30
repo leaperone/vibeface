@@ -1,3 +1,8 @@
+---
+title: 按改动选择 CI
+description: 查看 Vibeface CI 如何按改动范围选择检查。
+---
+
 # 按改动选择 CI
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
@@ -8,16 +13,20 @@ Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查�
 
 | 改动 | 核心检查 |
 | --- | --- |
-| README、项目指引、`docs/`、SDK README | 静态快检，不构建或运行 Rust 测试 |
+| README、项目指引、SDK README | 静态快检，不构建或运行 Rust 测试 |
+| `apps/www/`、`docs/` | 门户类型检查、静态构建和产物检查，不运行 Rust 测试 |
 | `crates/node/web/`、Web 构建脚本 | 浏览器密码学互通、Web 测试与类型检查、静态构建、Linux x64 完整包及网页进程验收 |
+| 共享主题、根 JS package、pnpm workspace 或 lockfile | Node Web 检查与门户检查 |
 | Node Rust、迁移、SDK、安装、打包或进程验收脚本 | Node 快速测试、Clippy、Web 和 Linux x64 制品启动验收 |
 | Bridge | Bridge 和 Node 的核心检查 |
 | Protocol | Protocol、Bridge 和 Node 的核心检查 |
 | Secure、密码学验收脚本 | Secure、Node 和浏览器密码学互通 |
 | Delivery 领域库、proof、合约和服务入口 | Delivery 与 Node 核心检查、新 guest 的公开证明验证和本地 EVM 验收 |
-| Cargo manifest、锁文件、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
+| Cargo manifest、`Cargo.lock`、工具链、CI 规则、未知输入 | 整个工作区的核心检查 |
 
 静态快检保留 Rust fmt、工作流与 shell 检查、JavaScript 语法、选择器和安装器自检。涉及 Rust 时校验 Atlas 迁移文件，不打开数据库。快速 Rust 测试保留权限、个人网络隔离、数据持久化、写操作去重与未知结果对账等已有回归，只跳过 `SLOW_TESTS` 明确列出的重型用例，目前是 10 万事件追加测试和超出待补依赖上限的 4 万事件追平测试。
+
+`www` 使用 Node.js 24 和冻结的 pnpm 依赖，依次运行 `typecheck`、`build`、`check:static`，上传 `apps/www/dist/client` 为 `www-<SHA>` 制品。门户与 Node 内嵌网页分别构建；根 `docs/` 是门户文档正文的唯一来源，修改文档也会触发 `www`。
 
 改 `crates/node/migrations/` 下的 schema 必须同时提高 `crates/node/src/config.rs` 的 `DATA_EPOCH`，并更新相邻的 `DATA_EPOCH_SCHEMA_SHA256`；否则 Node 快速测试 `schema_changes_bump_the_data_epoch` 失败。存储 epoch 不变时旧数据库能打开，运行中才因缺列出错，自更新也会误判可原地升级。`install.sh` 中写死的 epoch 一并修改，由 `ci.py --self-test` 核对。
 

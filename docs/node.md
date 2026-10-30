@@ -1,3 +1,8 @@
+---
+title: 部署与使用 Node
+description: 管理自己的设备、个人网络和本机 Agent。
+---
+
 # 部署与使用 Node
 
 本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。
