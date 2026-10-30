@@ -4,7 +4,7 @@ import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
-  WorkPhase, DispatchState, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview,
+  WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation,
 } from "./types.ts"
 import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
@@ -222,7 +222,7 @@ function overviewConsistency(value: unknown): OverviewConsistency {
 function overviewState(value: unknown): OverviewTaskState {
   switch (value) {
     case "accepted": case "running": case "interrupting": case "finished": case "unverified":
-    case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": case "stop_waiting": case "stop_timed_out": case "unknown": return value
+    case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": case "stop_waiting": case "stop_timed_out": case "accepted_waiting_sync": case "unknown": return value
     default: return "unknown"
   }
 }
@@ -238,11 +238,12 @@ function overviewOutcome(value: unknown): WorkOutcome | null {
   }
 }
 function overviewSource(value: unknown): OverviewTask["source"] {
-  return value === "local_dispatch" || value === "local_check" || value === "remote_owner" || value === "event" ? value : "event"
+  return value === "local_dispatch" || value === "local_check" || value === "remote_owner" || value === "event" || value === "dag" ? value : "event"
 }
-function overviewDispatchState(value: unknown): DispatchState {
+function overviewDispatchState(value: unknown): OverviewDeliveryState {
   switch (value) {
     case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": return value
+    case "dispatch_accepted": case "stop_waiting": case "stop_timed_out": return value
     default: return "dispatch_unverified"
   }
 }
@@ -261,7 +262,7 @@ function overviewNodeFromValue(value: unknown): OverviewNode | null {
 
 function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskState, node: OverviewNode | null): WorkOutcome | null {
   const unreachable = node !== null && (!node.online || node.revoked)
-  return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || unreachable) ? "unverified" : outcome
+  return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync" || unreachable) ? "unverified" : outcome
 }
 
 function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
@@ -364,11 +365,11 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
   const coverage: OverviewCoverage = {
     source: "open_works", complete: false, bounded: true, generated_at_ms: null, network_epoch: null, consistency,
     truncated: false, local_heads: false, remote_owners: remoteOwners, unreachable_nodes: unreachable,
-    omitted_finished: null, omitted_sessions: null, omitted_dispatches: null, omitted_jobs: null, omitted_live_progress: true,
+    omitted_finished: null, omitted_sessions: null, omitted_tasks: null, omitted_questions: null, omitted_checks: null, omitted_dispatches: null, omitted_deliveries: null, omitted_relations: null, omitted_jobs: null, omitted_live_progress: true,
   }
   return {
     schema: null, generated_at_ms: null, network_epoch: null, heads: {}, consistency, bots: botRows,
-    tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], coverage, truncated: false, next_cursor: null,
+    tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], relations: [], coverage, truncated: false, next_cursor: null,
   }
 }
 
@@ -381,7 +382,8 @@ function parseOverviewBot(value: unknown): OverviewBot {
 function parseOverviewTask(value: unknown): OverviewTask {
   const data = record(value)
   const rawKind = data.item_kind ?? data.kind
-  const itemKind = rawKind === "check" || rawKind === "dispatch" ? rawKind : "work"
+  const rawState = data.state
+  const itemKind = rawKind === "check" ? "check" : rawKind === "dispatch" || data.source === "local_dispatch" || rawState === "accepted_waiting_sync" || rawState === "dispatch_waiting" || rawState === "dispatch_rejected" || rawState === "dispatch_unverified" || rawState === "dispatch_accepted" || rawState === "stop_waiting" || rawState === "stop_timed_out" ? "dispatch" : "work"
   const workId = nullableText(data.work_id)
   const conversationId = text(data.conversation_id)
   const bot = data.bot == null ? null : parseOverviewBot(data.bot)
@@ -421,15 +423,32 @@ function parseOverviewJob(value: unknown): OverviewJob {
     unknown_reason: unknownReason,
   }
 }
+function parseOverviewCheck(value: unknown): OverviewTask {
+  const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
+  return {
+    kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot: null,
+    title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), state: "unknown", outcome: "unverified",
+    target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
+    reason, node: null, navigation: null, source: "local_check",
+  }
+}
+function parseOverviewRelation(value: unknown): OverviewRelation {
+  const data = record(value), kind = data.kind
+  if (kind !== "parent" && kind !== "continues" && kind !== "dispatches") throw new Error("任务关系无法识别。")
+  return { from_work: text(data.from_work), to_work: text(data.to_work), kind }
+}
 function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency, truncated: boolean, generatedAt: number | null, networkEpoch: number | null): OverviewCoverage {
   const data = value == null ? {} : record(value)
-  const remote = list(data.remote_owners ?? []).map((item) => { const owner = record(item); return { owner: nullableText(owner.owner), reachable: owner.reachable == null ? null : owner.reachable === true, reason: nullableText(owner.reason) } })
+  const remote = list(data.remote_owners ?? []).map((item) => {
+    const owner = record(item)
+    return { owner: nullableText(owner.owner), reachable: owner.reachable == null ? null : owner.reachable === true, reason: nullableText(owner.reason), ...(owner.status == null ? {} : { status: text(owner.status) }) }
+  })
   const unreachable = list(data.unreachable_nodes ?? []).map(text)
   return {
     source: data.source === "workspace_overview" ? "workspace_overview" : "open_works", complete: data.complete === true, bounded: data.bounded !== false,
     generated_at_ms: nullableNumber(data.generated_at_ms ?? generatedAt), network_epoch: nullableNumber(data.network_epoch ?? networkEpoch), consistency: overviewConsistency(data.consistency ?? consistency), truncated: data.truncated === true || truncated,
     local_heads: data.local_heads === true, remote_owners: remote, unreachable_nodes: unreachable,
-    omitted_finished: nullableNumber(data.omitted_finished), omitted_sessions: nullableNumber(data.omitted_sessions), omitted_dispatches: nullableNumber(data.omitted_dispatches), omitted_jobs: nullableNumber(data.omitted_jobs), omitted_live_progress: data.omitted_live_progress !== false,
+    omitted_finished: nullableNumber(data.omitted_finished), omitted_sessions: nullableNumber(data.omitted_sessions), omitted_tasks: nullableNumber(data.omitted_tasks), omitted_questions: nullableNumber(data.omitted_questions), omitted_checks: nullableNumber(data.omitted_checks), omitted_dispatches: nullableNumber(data.omitted_dispatches), omitted_deliveries: nullableNumber(data.omitted_deliveries), omitted_relations: nullableNumber(data.omitted_relations), omitted_jobs: nullableNumber(data.omitted_jobs), omitted_live_progress: data.omitted_live_progress !== false,
   }
 }
 
@@ -437,13 +456,19 @@ function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency,
 export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   const data = record(value), consistency = overviewConsistency(data.consistency), generatedAt = nullableNumber(data.generated_at_ms), networkEpoch = nullableNumber(data.network_epoch), truncated = data.truncated === true
   const heads = data.heads == null ? {} : Object.fromEntries(Object.entries(record(data.heads)).map(([key, head]) => [key, number(head)]))
+  const tasks = list(data.tasks ?? []).map(parseOverviewTask)
+  const deliveries = list(data.deliveries ?? []).flatMap((delivery) => {
+    const raw = record(delivery), workId = nullableText(raw.work_id)
+    if (!workId || tasks.some((task) => task.kind === "dispatch" && task.work_id === workId)) return []
+    return [parseOverviewTask({ ...raw, item_kind: "dispatch" })]
+  })
   return {
     schema: nullableNumber(data.schema), generated_at_ms: generatedAt, network_epoch: networkEpoch, heads, consistency,
-    bots: list(data.bots ?? []).map(parseOverviewBot), tasks: list(data.tasks ?? []).map(parseOverviewTask), questions: list(data.questions ?? []).filter((question) => {
+    bots: list(data.bots ?? []).map(parseOverviewBot), tasks: [...tasks, ...deliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
       const raw = record(question)
       return raw.answer == null && raw.closed == null && raw.state !== "answered" && raw.state !== "closed"
     }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),
-    coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
+    relations: list(data.relations ?? []).map(parseOverviewRelation), coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
   }
 }
 

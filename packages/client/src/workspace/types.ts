@@ -197,7 +197,8 @@ export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet
 export type OverviewBot = Pick<BotRecord, "bot_id" | "conversation_id" | "name">
 export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "revoked" | "local">
 export type OverviewConsistency = "local_snapshot" | "mixed_remote" | "partial"
-export type OverviewTaskState = WorkState | DispatchState | StopState | "unknown"
+export type OverviewTaskState = WorkState | DispatchState | StopState | "accepted_waiting_sync" | "unknown"
+export type OverviewDeliveryState = DispatchState | "dispatch_accepted" | StopState
 export type OverviewTaskKind = "work" | "check" | "dispatch"
 export type OverviewNavigation = { bot_id: string; conversation_id: string; work_id?: string }
 
@@ -223,14 +224,14 @@ type OverviewTaskCommon = {
   reason: string | null
   node: OverviewNode | null
   navigation: OverviewNavigation | null
-  source: "event" | "local_dispatch" | "local_check" | "remote_owner"
+  source: "event" | "dag" | "local_dispatch" | "local_check" | "remote_owner"
 }
 
 /** A work fact, a user confirmation check, or a pre-DAG dispatch delivery. */
 export type OverviewTask =
   | (OverviewTaskCommon & { kind: "work" })
   | (OverviewTaskCommon & { kind: "check"; check_id: string; work_ids: string[] })
-  | (OverviewTaskCommon & { kind: "dispatch"; delivery_state: DispatchState })
+  | (OverviewTaskCommon & { kind: "dispatch"; delivery_state: OverviewDeliveryState })
 
 export type OverviewQuestion = {
   kind: "question"
@@ -260,7 +261,7 @@ export type OverviewJob = {
   unknown_reason: string | null
 }
 
-export type OverviewRemoteOwner = { owner: string | null; reachable: boolean | null; reason: string | null }
+export type OverviewRemoteOwner = { owner: string | null; reachable: boolean | null; reason: string | null; status?: string }
 export type OverviewCoverage = {
   source: "open_works" | "workspace_overview"
   complete: boolean
@@ -274,10 +275,17 @@ export type OverviewCoverage = {
   unreachable_nodes: string[]
   omitted_finished: number | null
   omitted_sessions: number | null
+  omitted_tasks: number | null
+  omitted_questions: number | null
+  omitted_checks: number | null
   omitted_dispatches: number | null
+  omitted_deliveries: number | null
+  omitted_relations: number | null
   omitted_jobs: number | null
   omitted_live_progress: boolean
 }
+
+export type OverviewRelation = { from_work: string; to_work: string; kind: "parent" | "continues" | "dispatches" }
 
 /** A finite read-only projection. It never implies a complete global queue. */
 export type WorkspaceOverview = {
@@ -290,6 +298,7 @@ export type WorkspaceOverview = {
   tasks: OverviewTask[]
   questions: OverviewQuestion[]
   jobs: OverviewJob[]
+  relations: OverviewRelation[]
   coverage: OverviewCoverage
   truncated: boolean
   next_cursor: string | null
