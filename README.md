@@ -19,16 +19,20 @@
 ## ✨ 核心特性
 
 - 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用自己的 Shell 和文件工具读写本机，把改代码的任务派给本机或其他设备的 Agent。
-- 🌐 **个人设备网络**。所有设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
+- 🌐 **个人设备网络**。所有 Node 设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
 - 🔁 **换设备接着干**。任务、进度、审批和结果写进签名事件日志并同步到每台 Node。A 离线时，在 C 打开同一会话就能接手，已执行的副作用不会重放。
-- 🔐 **端到端加密入口**。浏览器用不可导出的设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入网络、不存数据。
+- 🔐 **端到端加密入口**。浏览器和手机 App 用本机设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
 - 📦 **单个二进制**。网页是 React + TanStack Start 静态 SPA，内嵌在 Rust 程序里，生产环境不需要 Node.js Web 服务。
+- 📱 **原生移动端**。Expo iOS/Android 客户端复用同一套 client 协议、恢复包和加入链接，设备密钥保存在系统安全存储。
+
+> [!WARNING]
+> 文件交付仍是实验功能，默认关闭。公益转发不需要钱包；付费交付只接受本机 `chain_id=31337` 测试链，不接入真实资产。配置、费用和证据边界见[文件交付实验参考](docs/paid-delivery.md)。
 
 ## 🏗️ 工作原理
 
 ```mermaid
 flowchart LR
-    U[本人的网页或手机浏览器]
+    U[本人的网页或手机 App]
     G[公共入口<br>网页、relay 与密文转发]
     A[Node A<br>协调 Agent]
     B[Node B<br>协调 Agent 与本机工具]
@@ -47,10 +51,12 @@ flowchart LR
 | **协调 Agent** | Codex、Claude Code、pi、opencode 或 Cursor SDK 驱动。Cursor 用 SDK 原生自定义工具，其余经本机 `vibeface tool` 命令回调 Node，不需要 MCP。 |
 | **执行** | 宿主命令和文件操作直接用 Agent 自己的工具。任务在本机 Codex App Server、Claude Code、pi 或 opencode 的会话里运行。 |
 | **网页** | 内嵌静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
+| **手机 App**（Expo） | 复用共享 client 与原生安全模块，设备密钥保存在系统安全存储。 |
 
 几条设计约束值得先知道：
 
 - 每个人管理自己的设备网络，网络之间完全隔离。公网服务器只是 Node 的一种部署方式，可以作为成员加入网络，也可以只当公共入口。
+- 公共入口默认不保存个人网络数据；显式启用文件交付后，独立 `delivery/` 保存交付对象、服务账本和本机恢复材料，可能含私钥及私密证明材料，须按凭证保管。启用交付不授予个人网络成员权限，见[文件交付实验参考](docs/paid-delivery.md#接收密钥和恢复材料)。
 - bot 定义和共享聊天历史独立于本机 SDK 缓存。创建 bot 不会启动模型。
 - 写操作结果未知时先核对实际结果，不换 ID 或设备重发。
 - 数据目录带数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。同一网络里的节点使用同一版本。
@@ -176,18 +182,28 @@ bash scripts/package-node.sh
 
 `bash scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，输出到 `.artifacts/packages/`。
 
+移动端先用 `bash scripts/build-mobile-secure.sh ios` 或 `bash scripts/build-mobile-secure.sh android` 构建原生安全模块，再按 `apps/mobile` 的 Expo 脚本构建对应平台。
+
 ## 📁 目录结构
 
 ```text
 .
+├── apps/
+│   └── mobile/      # Expo iOS/Android 客户端，复用 packages/client
 ├── crates/
 │   ├── node/        # vibeface 主程序：CLI、Node 运行时、存储、同步、调度
 │   │   └── web/     # React + TanStack Start 网页，构建后内嵌进二进制
 │   ├── bridge/      # Codex App Server 与 Agent 客户端
 │   ├── protocol/    # 共享 RPC 与消息类型
-│   └── secure/      # 设备签名、成员关系、浏览器到 Node 的 Noise 通道（含 wasm 构建）
+│   ├── secure/      # 设备签名、成员关系、Noise 通道与恢复逻辑（含 wasm 构建）
+│   ├── secure-ffi/  # secure 的 UniFFI 绑定，供移动端原生模块使用
+│   └── delivery/    # 文件交付的语句、加密与证明领域库
+├── packages/        # 共享 client、主题与移动端原生安全模块
+├── contracts/       # 交付托管合约、verifier 与本地测试链脚本
+├── proofs/          # 文件交付的 RISC Zero guest、host 与 profile
 ├── npm/             # npm 分发包
-├── scripts/         # 网页构建、打包、CI 与验收脚本
+├── scripts/         # 网页与移动端构建、打包、CI 与验收脚本
+├── tests/           # e2e 场景、fixtures 与 delivery probe
 ├── docs/            # 用户文档、协议参考与设计文档
 └── install.sh       # GitHub 完整包安装脚本
 ```
@@ -197,8 +213,10 @@ bash scripts/package-node.sh
 | 文档 | 内容 |
 |---|---|
 | [安装说明](docs/install.md) | npm Nightly、GitHub 完整包、初始化、状态和后台服务。 |
+| [部署配置](docs/deployment.md) | 数据目录、运行平台和首次部署时要启用的集成。 |
 | [部署与使用 Node](docs/node.md) | 局域网、公共入口、relay、SDK、后台运行、更新渠道、备份恢复。 |
 | [Node 协议参考](docs/node-protocol.md) | 配置、HTTP 与浏览器通道、业务 RPC、事件 DAG、写入保护、iroh 传输。 |
+| [文件交付实验参考](docs/paid-delivery.md) | VDP-1 的角色、费用、钱包、证明与结算边界。 |
 | [排障](docs/troubleshooting.md) | `status`、`node.log`、诊断包，只读与分叉处理。 |
 | [构建与发布](docs/releasing.md) | 三个平台包、SHA256、Stable 与 Nightly 渠道、tag 规则。 |
 | [CI](docs/ci.md) | PR 核心检查与本地专项检查。 |
