@@ -20,7 +20,7 @@
 
 - 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用自己的 Shell 和文件工具读写本机，把改代码的任务派给本机或其他设备的 Agent。
 - 🌐 **个人设备网络**。所有 Node 设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
-- 🔁 **换设备接着干**。任务、进度、审批和结果写进签名事件日志并同步到每台 Node。A 离线时，在 C 打开同一会话就能接手，已执行的副作用不会重放。
+- 🔁 **换设备接着干**。Bot 聊天、设置、任务阶段、摘要和结果写进签名 DAG 并在授权 Node 间同步，完整逐字进度不进入共享历史。A 离线时，在已同步的 C 打开原聊天，由本人切换负责人后接着协调。历史回放不启动旧工作，工程、登录和原生 SDK 状态不会自动迁移。
 - 🔐 **端到端加密入口**。浏览器和手机 App 用本机设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
 - 📦 **单个二进制**。网页是 React + TanStack Start 静态 SPA，内嵌在 Rust 程序里，生产环境不需要 Node.js Web 服务。
 - 📱 **原生移动端**。Expo iOS/Android 客户端复用同一套 client 协议、恢复包和加入链接，设备密钥保存在系统安全存储。
@@ -49,7 +49,7 @@ flowchart LR
 |---|---|
 | **Node**（Rust） | 认证、路由、签名日志同步、写入保护、SQLite 存储、任务调度、去重和通知。 |
 | **协调 Agent** | Codex、Claude Code、pi、opencode 或 Cursor SDK 驱动。Cursor 用 SDK 原生自定义工具，其余经本机 `vibeface tool` 命令回调 Node，不需要 MCP。 |
-| **执行** | 宿主命令和文件操作直接用 Agent 自己的工具。任务在本机 Codex App Server、Claude Code、pi 或 opencode 的会话里运行。 |
+| **执行** | 宿主命令和文件操作直接用 Agent 自己的工具。任务在本机 Codex App Server、Claude Code、pi、opencode 或 Cursor 的会话里运行。 |
 | **网页** | 内嵌静态 SPA。浏览器设备密钥签名，经 Noise 通道访问指定 Node。 |
 | **手机 App**（Expo） | 复用共享 client 与原生安全模块，设备密钥保存在系统安全存储。 |
 
@@ -73,7 +73,7 @@ flowchart LR
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | 已安装并登录 | 可选，Claude Code bot 与执行任务 |
 | [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 已安装并登录 | 可选，pi bot 与执行任务 |
 | [opencode](https://opencode.ai) | v2.2.0，已登录 | 可选，opencode bot 与执行任务 |
-| [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) | 已验证 v1.2.0 | 可选，Cursor Bot 与协调 Agent |
+| [Cursor SDK Bridge](https://github.com/cursor/sdk-bridge/releases/tag/v1.2.0) | v1.2.0 发布包，需按自己的环境验证 | 可选，Cursor Bot、协调 Agent 与执行任务 |
 
 ### 安装
 
@@ -140,7 +140,7 @@ vibeface join '<加入链接>' --name '<设备显示名称>'
 
 ### 跨设备派活与接续
 
-- 在 A 的 bot 聊天里让它把任务交给 B。进度和结果会回到原聊天，协调 Agent 汇报后可继续派发。
+- 在 A 的 bot 聊天里让它把任务交给 B。任务阶段、摘要和持久结果回到原聊天，逐字流式进度是来源 Node 的临时观察数据。协调 Agent 汇报后可继续派发。
 - A 离线时，在已同步的 C 打开同一会话，点 **交给这台设备处理**，由 C 的协调 Agent 接着回复。
 - 普通进度和通知不调用模型。客户端离线时保留未读通知，重连后补发。
 - 执行任务的 Agent 默认 bypass。会话发起的请求由协调 Agent 处理，需要本人拍板时才在 bot 聊天里提问，也可经 webhook 转发给 Grok Bot。
@@ -212,6 +212,11 @@ bash scripts/package-node.sh
 
 | 文档 | 内容 |
 |---|---|
+| [产品概览](docs/overview.md) | 用途、Bot 与执行的关系，以及从一台电脑开始的条件。 |
+| [选型比较](docs/comparison.md) | Codex、Claude Code、OpenClaw 与 Vibeface 各自适合的工作方式。 |
+| [Bot 与任务执行](docs/bot-and-execution.md) | 复用本机 Agent、协调与执行分工、任务结果回到原聊天。 |
+| [历史同步](docs/history-sync.md) | DAG 同步范围、换设备接手条件、同步与备份的区别。 |
+| [隐私与安全](docs/privacy-security.md) | 设备身份、谁能读到内容、凭证、本机权限与恢复边界。 |
 | [安装说明](docs/install.md) | npm Nightly、GitHub 完整包、初始化、状态和后台服务。 |
 | [部署配置](docs/deployment.md) | 数据目录、运行平台和首次部署时要启用的集成。 |
 | [部署与使用 Node](docs/node.md) | 局域网、公共入口、relay、SDK、后台运行、更新渠道、备份恢复。 |
