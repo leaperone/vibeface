@@ -6,6 +6,7 @@ WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/www/package.json apps/www/package.json
 COPY packages packages
+COPY docs docs
 RUN pnpm install --frozen-lockfile
 COPY apps/www apps/www
 RUN pnpm --filter vibeface-www run typecheck \
