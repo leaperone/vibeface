@@ -1,12 +1,12 @@
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Hand, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
@@ -101,7 +101,7 @@ function TaskCard({ work, state, stale, joined, botId, device }: { work: WorkRec
     <Text className="text-meta text-muted-foreground">· {stale ? staleTaskLabel : taskLabel(state)}</Text>
   </View>
   if (!open) {
-    const result = work.result_text ? work.result_text.split('\n')[0] : workCause(work)
+    const result = work.result_text ? work.result_text.split('\n')[0] : workCause(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
     const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
       <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
@@ -117,7 +117,8 @@ function TaskCard({ work, state, stale, joined, botId, device }: { work: WorkRec
   }
   return <Link href={href} asChild>
     <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 shadow-xs active:bg-muted dark:border-line-strong">
-      <Icon as={active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
+      {/* Waiting on an answer, it only says so: the question card below asks. */}
+      <Icon as={state === 'waiting' ? Hand : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}

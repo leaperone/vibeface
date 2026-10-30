@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from "../chat/types.ts"
-import type { BotRecord, OpenWork, Question } from "./types.ts"
+import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
 import { providerNames, type ProviderId } from "../lib/node.ts"
 
 /** Each question has one answer ID, so the web, Grok and every retry write the same message. */
@@ -72,5 +72,16 @@ export function placeByTime<T extends { created_at_ms: number }>(messages: reado
 }
 
 export const projectName = (cwd: string) => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || cwd
+
+/**
+ * A question's or session's folder: `name` its last segment, `path` in full. A device shares that folder as `workspace-N/…`, its
+ * N-th folder counted from 1, so the full path stays off shared records; the folders it lists to every device turn it back.
+ */
+export function sharedProject(cwd: string, node: string, nodes: readonly Pick<NodeInfo, "device_id" | "capabilities">[]) {
+  const [, index, rest] = /^workspace-(\d+)(?:[\\/](.*))?$/.exec(cwd) ?? []
+  const root = index ? nodes.find((item) => item.device_id === node)?.capabilities?.roots[Number(index) - 1] : undefined
+  const path = root ? rest ? `${root.replace(/[\\/]+$/, "")}/${rest}` : root : cwd
+  return { name: projectName(path), path }
+}
 
 export const agentName = (agent: ProviderId) => providerNames[agent]

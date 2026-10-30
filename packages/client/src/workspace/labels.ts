@@ -91,6 +91,8 @@ export const taskLabel = (state: string) => taskStates[state] ?? stateNames[stat
 /** A task still running when this device went offline may have moved on since; it reads unknown, not running. */
 export const taskStale = (state: string, connected: boolean) => !connected && taskActive(state)
 export const staleTaskLabel = "状态未知"
+/** A task that stopped without a cause of its own: stopped by hand, or its device or app went away mid-turn. Nothing redoes it. */
+export const interruptedCopy = { reason: "中途停下了，不会自动重做", resume: "让 Bot 接着做", ask: (title: string) => `接着做「${title}」` }
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {
