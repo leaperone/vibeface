@@ -253,6 +253,25 @@ mod tests {
         ] {
             let input = fixture.input(relation, 0);
             verify_relation(&input.profile, &input.statement, &input.witness).unwrap();
+            let journal = input.statement.abi_bytes();
+            assert_eq!(Statement::from_bytes(journal).unwrap(), input.statement);
+            let mut wrong_journal = journal.to_vec();
+            let word_index = if relation == Relation::KeyBinding {
+                5
+            } else {
+                30
+            };
+            wrong_journal[word_index * 32] ^= 1;
+            assert_ne!(
+                Statement::from_bytes(&wrong_journal).unwrap(),
+                input.statement
+            );
+            let mut wrong_image = journal.to_vec();
+            wrong_image[5 * 32] ^= 1;
+            assert_eq!(
+                Statement::from_bytes(&wrong_image).is_ok(),
+                relation == Relation::KeyBinding
+            );
         }
         let hold = fixture.input(Relation::Hold, 0);
         let capsule = &fixture.encrypted[0].capsule;

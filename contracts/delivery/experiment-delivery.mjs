@@ -117,6 +117,8 @@ try {
   const vectors = readJson(path.join(material, 'vectors.json'));
   assert.deepEqual(vectors.profile, deployment.profile);
   assert.equal(vectors.profileId, deployment.profile_id.slice(2));
+  const fields = artifact('DeliveryEscrow').abi.find(item => item.name === 'preview').inputs[0].components;
+  const statementType = `tuple(${fields.map(item => `${item.type} ${item.name}`).join(',')})`, coder = AbiCoder.defaultAbiCoder();
   const proofs = [];
   for (let relation = 1; relation <= 4; relation++) {
     const input = path.join(material, `relation-${relation}.private.json`);
@@ -131,8 +133,13 @@ try {
     assert.equal(proof.imageId, compiled.imageId); assert.equal(proof.profileId, vectors.profileId);
     const verified = readJson(await invoke(`verify-${relation}`, prover, ['verify', proof.journal], receipt));
     assert.deepEqual(verified, { verified: true, kind: 'groth16', seal: proof.seal, imageId: compiled.imageId, journalHash: proof.journalHash });
-    const wrong = Buffer.from(proof.journal, 'hex'); wrong[5 * 32] ^= 1;
-    await invoke(`wrong-journal-${relation}`, prover, ['verify', wrong.toString('hex')], receipt, undefined, true);
+    const wrong = Buffer.from(proof.journal, 'hex');
+    const wordIndex = fields.findIndex(item => item.name === (relation === 1 ? 'guestImageId' : 'ciphertextHash'));
+    assert(wordIndex >= 0 && wrong.length === fields.length * 32);
+    wrong[wordIndex * 32] ^= 1;
+    const wrongJournal = wrong.toString('hex');
+    assert.notEqual(wrongJournal, proof.journal);
+    await invoke(`wrong-journal-${relation}`, prover, ['verify', wrongJournal], receipt, undefined, true);
     proofs.push(proof);
     result.proofs.push({ relation, cycles: execution.cycles, segments: execution.segments,
       receiptBytes: fs.statSync(receipt).size, sealBytes: getBytes(`0x${proof.seal}`).length, journalHash: proof.journalHash, independentlyVerified: true });
@@ -141,8 +148,6 @@ try {
     elfSha256: compiled.elfSha256, proofs: proofs.map(proof => ({ receipt: `relation-${proof.relation}.receipt`, public: `relation-${proof.relation}.json` })) });
   await invoke('adapter', process.execPath, [path.join(root, 'verify-delivery.mjs'), proofDir]);
   progress('fund-and-hold');
-  const fields = artifact('DeliveryEscrow').abi.find(item => item.name === 'preview').inputs[0].components;
-  const statementType = `tuple(${fields.map(item => `${item.type} ${item.name}`).join(',')})`, coder = AbiCoder.defaultAbiCoder();
   const decode = proof => {
     const decoded = coder.decode([statementType], `0x${proof.journal}`)[0];
     return Object.fromEntries(fields.map(item => [item.name, decoded[item.name]]));
