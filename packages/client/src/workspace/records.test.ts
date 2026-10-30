@@ -95,6 +95,9 @@ test("a failed work stays open until a later work of its conversation ends", () 
   assert.deepEqual(open.map((item) => item.work_id), ["w1", "w2"], "a work still running does not settle it")
   open = mergeOpenWorks(open, records({ works: [work("w2", { state: "finished", outcome: "completed" })] }))
   assert.equal(open.length, 0, "the later work ended, so the failure leaves")
+  open = mergeOpenWorks(mergeOpenWorks([], records({ works: [work("w3")] })), records({ works: [work("w4", { state: "finished", outcome: "failed" })] }))
+  open = mergeOpenWorks(open, records({ works: [work("w3", { state: "finished", outcome: "completed" })] }))
+  assert.deepEqual(open.map((item) => item.work_id), ["w4"], "an earlier work ending late does not settle a later failure")
 })
 
 test("works one offline device holds wait on one card; an unverified one keeps its own", () => {

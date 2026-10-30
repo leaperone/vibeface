@@ -43,7 +43,9 @@ export function mergeBots(bots: BotRecord[], records: ConversationRecords): BotR
  */
 export function mergeOpenWorks(works: OpenWork[], records: ConversationRecords): OpenWork[] {
   const changed = records.works.map((item) => ({ ...item, conversation_id: records.conversation_id }))
-  const newest = changed.filter((item) => !delivery(item) && !open(item)).at(-1)?.work_id
-  return upsert(works, changed, (item) => item.work_id).filter((item) => open(item)
-    || !delivery(item) && (item.outcome === "failed" || item.outcome === "rejected") && (item.conversation_id !== records.conversation_id || !newest || item.work_id === newest))
+  const merged = upsert(works, changed, (item) => item.work_id)
+  // The list keeps dispatch order, so its last ended work of the conversation is the one the Node calls newest.
+  const newest = merged.filter((item) => item.conversation_id === records.conversation_id && !delivery(item) && !open(item)).at(-1)?.work_id
+  return merged.filter((item) => open(item)
+    || !delivery(item) && (item.outcome === "failed" || item.outcome === "rejected") && (item.conversation_id !== records.conversation_id || item.work_id === newest))
 }

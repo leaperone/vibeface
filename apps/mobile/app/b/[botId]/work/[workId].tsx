@@ -37,7 +37,7 @@ export default function TaskDetail() {
   const progress = shared.liveProgress.find((item) => item.kind === 'native' && item.work_id === workId && item.target_node === device)
   const canStop = state !== 'awaiting_confirmation' && !work.outcome && !work.stop && ['accepted', 'running'].includes(work.state)
   // A failed task's text is what it said before failing, so its cause leads and that text waits in 详细信息.
-  const failed = ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified'].includes(state)
+  const failed = ['failed', 'rejected', 'dispatch_rejected'].includes(state)
   const result = failed ? workFailure(work) || '这个任务没有成功。' : work.result_text || workFailure(work) || (state === 'completed' ? '没有返回文字' : state === 'interrupted' ? interruptedCopy.reason : '')
   // It may have done its writes anyway, so it is checked first; running it again could do them twice.
   const unknown = state === 'dispatch_unverified' || outcomeUnknown(work.failure, work.failure_reason)
@@ -74,7 +74,7 @@ export default function TaskDetail() {
     {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {failed || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={unknown ? SearchCheck : RotateCw} disabled={!shared.writable}
+    {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={unknown ? SearchCheck : RotateCw} disabled={!shared.writable}
       action={async () => {
         const title = work.title || '这个任务'
         if (await shared.sendMessage(unknown ? uncheckedCopy.ask(title) : state === 'interrupted' ? interruptedCopy.ask(title) : `再试一次「${title}」`)) router.back()

@@ -1042,7 +1042,6 @@ pub(crate) fn authorize_node_from(
     membership_from(connection, network_id)?.node(device_id)
 }
 
-/// A unit enum's serde name, for a text column.
 /// One conversation's works that want the user: those with no result yet or one only they can
 /// settle, and its newest ended work when that failed, since nothing has followed it up yet. A
 /// later work ending, even one that fails again, takes the old failure off the list.
@@ -1062,6 +1061,7 @@ pub(crate) fn unsettled(works: Vec<WorkProjection>) -> Vec<WorkProjection> {
         .collect()
 }
 
+/// A unit enum's serde name, for a text column.
 pub(crate) fn enum_text<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(Value::String(text)) => text,

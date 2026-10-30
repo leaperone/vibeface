@@ -85,7 +85,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   // The last progress line is stale once a task ends, so it never stands in for a result.
   // A failed task's text is whatever it said before failing, so its cause leads and that text waits in 详细信息.
   // A task settled by hand carries no text either, so an empty result shows no section rather than an odd placeholder.
-  const failed = ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
+  const failed = ["failed", "rejected", "dispatch_rejected"].includes(state)
   const cause = work ? workFailure(work) : ""
   const result = failed ? cause || "这个任务没有成功。" : work?.result_text || cause
   // It may have done its writes anyway, so it is checked first; running it again could do them twice.
@@ -136,7 +136,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
-      {failed || state === "interrupted" ? <div className="grid gap-2">
+      {failed || unknown || state === "interrupted" ? <div className="grid gap-2">
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
         <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
           const title = work.title || "这个任务"
