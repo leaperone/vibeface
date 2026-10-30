@@ -23,7 +23,7 @@ const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
 /**
  * What this phone last saw of its network, so a cold start that cannot reach it still lists its bots and devices.
  * `me`: this phone's device ID then; leaving or a reset gives the phone a new one, which retires the record, and a removal
- * keeping the ID erases it, so another network never shows this one's.
+ * or a join keeping the ID erases it, so another network never shows this one's.
  */
 type LastSeen = { me: string; entry: string; bots: BotRecord[]; primary: string | null; members: Member[] }
 
@@ -88,7 +88,8 @@ function Offline({ children }: { children: ReactNode }) {
   const { session, connection } = useConnection()
   const me = device.identity?.deviceId
   const seen = useMemo(() => session.phase === 'ready' ? lastSeen(me) : null, [session.phase, me])
-  useEffect(() => { if (device.phase === 'removed') writeStorage('last-seen', null) }, [device.phase])
+  const gone = device.phase === 'removed' || session.phase === 'joining'
+  useEffect(() => { if (gone) writeStorage('last-seen', null) }, [gone])
   const actions = useMemo<WorkspaceActions>(() => ({
     join: (invitation, name) => device.join(invitation, name),
     cancelJoin: device.cancelJoin,
@@ -188,9 +189,10 @@ function Live({ children }: { children: ReactNode }) {
       join: (invitation, name) => device.join(invitation, name),
       cancelJoin: device.cancelJoin,
       open(id) {
+        let closed = false
         latest.current.setView('chat')
-        void select(id).catch(() => { waiting.current = id })
-        return () => { waiting.current = null; latest.current.setView('other') }
+        void select(id).catch((cause) => { if (!closed && cause instanceof Error && cause.message === botCopy.notFound) waiting.current = id })
+        return () => { closed = true; waiting.current = null; latest.current.setView('other') }
       },
       async send(id, text, attachments) {
         await select(id)
