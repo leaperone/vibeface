@@ -134,14 +134,11 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
               </ol>
               <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
                 <Download aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.installThere}
-                <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer">怎么装</a>
+                <a className="hit-area relative font-medium text-foreground underline underline-offset-4" href={joinCopy.installGuide} target="_blank" rel="noopener noreferrer">{addDeviceCopy.installHow}</a>
               </p>
               <div className="grid gap-2 border-t pt-3">
                 <p className="flex min-w-0 items-center gap-1.5 text-meta text-muted-foreground"><SquareTerminal aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.orCommand}</p>
-                <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-                  {copyButton("command", addDeviceCopy.command(result.link), addDeviceCopy.copyCommand, false)}
-                  <span className="text-meta text-muted-foreground">{addDeviceCopy.stopFirst}</span>
-                </div>
+                {copyButton("command", addDeviceCopy.command(result.link), addDeviceCopy.copyCommand, false)}
               </div>
             </>}
             <ul className="grid gap-1.5 text-meta text-muted-foreground">

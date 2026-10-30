@@ -1508,7 +1508,9 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 
 async fn join(options: Join) -> Result<()> {
     prepare_start(&options.data.data_dir)?;
-    ensure_stopped_for_join(&options.data.data_dir)?;
+    if node_running(&options.data.data_dir)? {
+        return join_through_running_node(&options).await;
+    }
     let state =
         vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
             .await?;
@@ -1519,29 +1521,131 @@ async fn join(options: Join) -> Result<()> {
     Ok(())
 }
 
-/// `join` changes pairing state the running Node owns. Its progress lines are in Chinese, so
-/// the one refusal people meet by following the web's command says what to do in the same words.
-fn ensure_stopped_for_join(dir: &Path) -> Result<()> {
+fn node_running(dir: &Path) -> Result<bool> {
     // Without an identity no Node runs here, and opening the data directory says so itself.
     if !dir.join("identity.json").exists() {
-        return Ok(());
+        return Ok(false);
     }
     match config::lock_data_dir(dir) {
-        Ok(_lock) => Ok(()),
+        Ok(_lock) => Ok(false),
         Err(error)
             if matches!(
                 error.downcast_ref::<fs::TryLockError>(),
                 Some(fs::TryLockError::WouldBlock)
             ) =>
         {
-            bail!(
-                "这台电脑上的 Vibeface 正在运行，不能用这条命令加入。\n\
-                 改在它的网页里选“加入已有网络”，粘贴加入链接；\n\
-                 或先停止它（后台服务用 vibeface service stop，前台运行就按 Ctrl-C），再运行这条命令。"
-            )
+            Ok(true)
         }
         Err(error) => Err(error),
     }
+}
+
+/// The running Node owns this computer's pairing state, so it runs the join; this command asks
+/// it to start and then follows along. Every ask carries the same link, which the Node reads as
+/// "how far is it", never as a second request.
+async fn join_through_running_node(options: &Join) -> Result<()> {
+    use vibeface::client::NodeJoin;
+    const UNREACHABLE_TRIES: u32 = 5;
+    let dir = &options.data.data_dir;
+    let mut shown = None;
+    let mut unreachable = 0;
+    println!("这台电脑上的 Vibeface 正在运行，交给它来加入。");
+    loop {
+        let status = match maintenance::join(dir, &options.link, &options.name).await {
+            Ok(status) => status,
+            Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                bail!("Vibeface 正在更新。等它重新启动后，再运行同一条命令。")
+            }
+            Err(error) if error.downcast_ref::<maintenance::Refused>().is_some() => {
+                bail!(join_failure_text(&error.to_string()))
+            }
+            Err(error) => {
+                unreachable += 1;
+                if unreachable < UNREACHABLE_TRIES {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                bail!(
+                    "连不上正在运行的 Vibeface（{error}）。\n\
+                     加入可能还在进行：确认它在运行后，再运行同一条命令，会接着上次的请求，不会重复提交。"
+                )
+            }
+        };
+        unreachable = 0;
+        if shown.as_ref() != Some(&status) {
+            match &status {
+                NodeJoin::Waiting => println!("已提交加入请求，等待管理设备批准。"),
+                NodeJoin::Confirming { code } => {
+                    println!("安全码：{code}。在管理设备上比对一致后允许。")
+                }
+                NodeJoin::Joined => {
+                    println!("已加入。这台电脑的 Vibeface 已开始同步，不用重启。");
+                    return Ok(());
+                }
+                NodeJoin::Failed { reason } => bail!(join_failure_text(reason)),
+                NodeJoin::Cancelled => bail!("这次加入已在这台电脑的网页上取消。"),
+            }
+            shown = Some(status);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Says why a join ended and what to do next, in the words the rest of `join` uses.
+fn join_failure_text(reason: &str) -> String {
+    const TABLE: [(&str, &str); 10] = [
+        (
+            "already been used",
+            "这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再运行新命令。",
+        ),
+        (
+            "expired",
+            "这条加入链接已过期。在管理设备上点“添加设备”重新生成，再运行新命令。",
+        ),
+        (
+            "Rejected",
+            "管理设备拒绝了这次加入。确认是自己的电脑后，在管理设备上重新生成链接再试。",
+        ),
+        (
+            "Withdrawn",
+            "这次加入已撤回。在管理设备上重新生成链接再试。",
+        ),
+        (
+            "approval timed out",
+            "等了很久也没有批准。在管理设备上重新生成链接再试。",
+        ),
+        (
+            "already belongs to a personal network",
+            "这台电脑已经在一个网络里了，不用再加入。",
+        ),
+        (
+            "another join is already running",
+            "这台电脑正在它的网页上加入。在网页上完成，或先在网页上取消。",
+        ),
+        (
+            "another join is in progress",
+            "这条链接上次用的是另一个名字。用上次的 --name 重新运行，会接着等批准。",
+        ),
+        (
+            "invite link",
+            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+        ),
+        (
+            "Vibeface ticket",
+            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+        ),
+    ];
+    TABLE
+        .iter()
+        .find(|(pattern, _)| reason.contains(pattern))
+        .map_or_else(
+            || {
+                format!(
+                    "没能加入：{reason}\n检查网络后再运行同一条命令，会接着上次的请求，不会重复提交。"
+                )
+            },
+            |(_, text)| (*text).to_owned(),
+        )
 }
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
@@ -2489,12 +2593,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_while_the_node_runs_says_what_to_do_instead() {
+    async fn join_while_the_node_runs_hands_the_link_to_it_and_explains_its_answer() {
         let dir = std::env::temp_dir().join(format!("vibeface-join-busy-{}", uuid::Uuid::new_v4()));
         prepare_start(&dir).unwrap();
-        let running = config::lock_data_dir(&dir).unwrap();
+        let node = Arc::new(Runtime::open(&dir).await.unwrap());
+        let server = tokio::spawn(maintenance::serve(node.clone(), dir.clone()));
+        let socket = maintenance::socket_path(&dir).unwrap();
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         let error = join(Join {
-            link: "not-an-invite".into(),
+            link: "https://gateway.example/join#not-a-ticket".into(),
             data: DataDir {
                 data_dir: dir.clone(),
             },
@@ -2502,9 +2614,15 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("正在运行"), "{error:#}");
-        assert!(error.to_string().contains("加入已有网络"), "{error:#}");
-        drop(running);
+        assert!(
+            error.to_string().contains("不是有效的加入链接"),
+            "the running Node read the link and its refusal reads as what to do: {error:#}"
+        );
+        server.abort();
+        let _ = server.await;
+        drop(node);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir_all(socket.parent().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 

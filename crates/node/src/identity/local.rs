@@ -58,6 +58,15 @@ pub struct JoinRequest {
     pub expires_at_ms: i64,
 }
 
+/// What opening a link may tell its holder before anything is sent to a manager.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    Open,
+    Used,
+    Expired,
+}
+
 /// The joining device's request; `commit` is `SHA256(device_id ‖ joiner_nonce)`.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -262,6 +271,36 @@ impl Store {
             load_request(tx, "join_id", &row.join_id)?
                 .context("join request vanished")?
                 .view(&view, now)
+        })
+    }
+
+    /// Whether `join` would still take this ticket from `device`, without taking it. Only the
+    /// secret's holder can ask, and the answer is what `join` itself would refuse with.
+    pub fn invite_state(&self, secret: &str, device: &str) -> Result<InviteState> {
+        let secret: [u8; 32] = hex::decode(secret)
+            .ok()
+            .and_then(|bytes| bytes.try_into().ok())
+            .context("invalid ticket secret")?;
+        let invite_hash = vibeface_secure::join::invite_hash(&secret);
+        let view = load_state(&self.connection)?.project()?;
+        let now = now_ms();
+        let Some(row) = load_request(&self.connection, "invite_hash", &invite_hash)? else {
+            return Ok(InviteState::Expired);
+        };
+        if row.status.is_none() {
+            return Ok(if row.expires_at_ms > now && row.epoch == view.epoch {
+                InviteState::Open
+            } else {
+                InviteState::Expired
+            });
+        }
+        let request = row.view(&view, now)?;
+        Ok(match request.status {
+            JoinStatus::Pending | JoinStatus::Confirming if request.device_id == device => {
+                InviteState::Open
+            }
+            JoinStatus::Expired => InviteState::Expired,
+            _ => InviteState::Used,
         })
     }
 

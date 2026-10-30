@@ -43,8 +43,8 @@ export const manualCopy = {
 }
 
 /**
- * 添加设备: a phone scans the code. Another computer opens the link on its own Vibeface page, or runs one command
- * there while its Vibeface is stopped; both ways show without opening the raw link.
+ * 添加设备: a phone scans the code. Another computer opens the link on its own Vibeface page, or runs one command there,
+ * running or not; both ways show without opening the raw link.
  */
 export const addDeviceCopy = {
   phone: '手机',
@@ -52,9 +52,8 @@ export const addDeviceCopy = {
   copyCommand: '复制命令',
   openThere: '在那台电脑的 Vibeface 网页选“加入已有网络”，粘贴',
   installThere: '那台电脑要先装好 Vibeface',
+  installHow: '怎么装',
   orCommand: '或在那台电脑的终端运行',
-  stopFirst: '先停止那台电脑上的 Vibeface',
-  runThere: '在另一台电脑的终端里运行',
   /** The browser could not write to the clipboard; the text below opens selected instead. */
   copyFailed: '没能复制，请手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
