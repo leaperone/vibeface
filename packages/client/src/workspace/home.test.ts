@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { backTo, byRecent, emptyHome, homeBot } from './home.ts'
+import { backTo, byRecent, emptyHome, homeBot, unreachable } from './home.ts'
 import type { BotRecord } from './types.ts'
 
 const bot = (id: string, at?: number): BotRecord => ({ bot_id: id, conversation_id: `c-${id}`, name: id, instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: id, last_message: at === undefined ? null : { text: 'hi', role: 'assistant', created_at_ms: at }, busy: null })
@@ -39,4 +39,11 @@ test('an empty list tells a network it cannot reach apart from one still loading
   assert.equal(emptyHome({ synced: false, link: { kind: 'offline', attempt: 1, retryInMs: 500, reason: '' } }), 'unreachable')
   assert.equal(emptyHome({ synced: false, link: { kind: 'connecting', attempt: 2 } }), 'unreachable')
   assert.equal(emptyHome({ synced: true, link: { kind: 'online', catchingUp: false } }), 'empty')
+})
+
+test('a network counts as unreachable from the first failed attempt until one gets through', () => {
+  assert.equal(unreachable({ kind: 'connecting', attempt: 0 }), false)
+  assert.equal(unreachable({ kind: 'offline', attempt: 1, retryInMs: 500, reason: '' }), true)
+  assert.equal(unreachable({ kind: 'connecting', attempt: 1 }), true)
+  assert.equal(unreachable({ kind: 'online', catchingUp: true }), false)
 })
