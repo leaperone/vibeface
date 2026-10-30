@@ -7,7 +7,7 @@ import { failureText, rawError, taskError } from '@vibeface/client/lib/errors.ts
 import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
-import { CopyableId, EmptyState, toneText, type Tone } from '@/components/kit'
+import { CopyableId, Details, EmptyState, toneText, type Tone } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
@@ -65,7 +65,7 @@ export default function TaskDetail() {
     </ActionButton> : null}
     {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="self-start" icon={RotateCw} disabled={!shared.writable}
       action={async () => { if (await shared.sendMessage(`再试一次「${work.title || '这个任务'}」`)) router.back() }}>让 Bot 再试</ActionButton> : null}
-    <Section title="详情">
+    <Details>
       {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
       {work.cwd ? <Detail label="文件夹" mono>{work.cwd}</Detail> : null}
@@ -73,7 +73,7 @@ export default function TaskDetail() {
         <Text className="text-meta text-muted-foreground">任务编号</Text>
         <CopyableId value={work.work_id} label="任务编号" />
       </View>
-    </Section>
+    </Details>
   </ScrollView>
 }
 

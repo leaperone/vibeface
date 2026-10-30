@@ -91,7 +91,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
-  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false, state: "off" })
+  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: true, state: "off" }) // disabled until the first permission check
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)

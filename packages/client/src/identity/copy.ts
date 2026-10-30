@@ -15,6 +15,9 @@ export const joinCopy = {
   deviceName: '这台设备的名字',
   join: '加入',
   joining: '加入中',
+  noComputer: '还没有电脑？',
+  installFirst: '先在电脑上安装 Vibeface',
+  installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
 }
 
 /** The computer this device reaches its network through does not answer; `name`: that computer as the person named it. */
@@ -163,4 +166,7 @@ export const waitingCopy = {
   secretHint: '自己设一串，外部聊天那边填同一串',
   forwardHelp: 'https://github.com/leaperone/vibeface/blob/main/docs/node.md#转发到外部聊天',
   outlets: { record: '只在待处理', both: '也发给外部聊天' },
+  /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
+  notifyTip: '会话等你时提醒你',
+  notifyOn: '打开通知',
 }
