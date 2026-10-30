@@ -176,34 +176,20 @@ impl Store {
     /// Sessions the device running them attributed to this conversation's bot, muted ones
     /// included, with the version a hand-over names, for the lines in its chat.
     pub fn attributed_sessions(&self, network: &str, scope: &str) -> Result<Vec<Value>> {
-        let mut statement = self.connection.prepare(
-            "SELECT node,session_id,attribution,muted,created_at_ms,rank FROM session_owners
-             WHERE network_id=? AND conversation_id=? AND attribution IS NOT NULL ORDER BY rank",
-        )?;
-        let rows: Vec<(String, String, String, bool, i64, String)> = statement
-            .query_map(params![network, scope], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        rows.into_iter()
-            .map(|(node, session, attribution, muted, created_at_ms, rank)| {
-                let mut row: Value = serde_json::from_str(&attribution)?;
-                row["node"] = json!(node);
-                row["session_id"] = json!(session);
-                row["muted"] = json!(muted);
-                row["created_at_ms"] = json!(created_at_ms);
-                row["version"] = json!(super::version(&rank));
-                row["rank"] = json!(rank);
-                Ok(row)
-            })
-            .collect()
+        attributed_sessions_from(
+            &self.connection,
+            "network_id=? AND conversation_id=? AND attribution IS NOT NULL",
+            params![network, scope],
+        )
+    }
+
+    /// All shared session handoffs in this network, for bounded read-only projections.
+    pub fn attributed_sessions_all(&self, network: &str) -> Result<Vec<Value>> {
+        attributed_sessions_from(
+            &self.connection,
+            "network_id=? AND attribution IS NOT NULL",
+            [network],
+        )
     }
 
     /// Whether its bot stopped following this session.
@@ -525,4 +511,43 @@ impl Store {
             receipt,
         })
     }
+}
+
+fn attributed_sessions_from(
+    connection: &Connection,
+    filter: &str,
+    values: impl rusqlite::Params,
+) -> Result<Vec<Value>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT conversation_id,node,session_id,attribution,muted,created_at_ms,rank FROM session_owners
+         WHERE {filter} ORDER BY rank"
+    ))?;
+    let rows: Vec<(String, String, String, String, bool, i64, String)> = statement
+        .query_map(values, |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter()
+        .map(
+            |(conversation, node, session, attribution, muted, created_at_ms, rank)| {
+                let mut row: Value = serde_json::from_str(&attribution)?;
+                row["conversation_id"] = json!(conversation);
+                row["node"] = json!(node);
+                row["session_id"] = json!(session);
+                row["muted"] = json!(muted);
+                row["created_at_ms"] = json!(created_at_ms);
+                row["version"] = json!(super::version(&rank));
+                row["rank"] = json!(rank);
+                Ok(row)
+            },
+        )
+        .collect()
 }

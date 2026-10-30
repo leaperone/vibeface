@@ -8,7 +8,7 @@
 
 个人网络使用 `NetworkState { genesis, checkpoints, events }`，保留所有根 checkpoint 和各 epoch 的管理事件，两份状态的合并是并集。根身份签署初始 `Genesis`，其中包含根公钥及初始 Node、客户端成员。每个 `RootCheckpoint` 带下一把恢复密钥 `recovery_key`，由上一把签名，第一把是根密钥。恢复私钥只在加密恢复文件里，Node 不持有。
 
-`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员，或用一条新的 `grant` 改变已加入客户端（浏览器或手机）的 `manage`。客户端成员不需要管理权限也能撤销自己（`issuer` 与被撤销设备相同），不能撤销其他设备；Node 成员不能撤销自己。取消管理或撤销都不能让网络失去最后一台管理设备，权限变化后该设备的订阅会断开重连以取得新权限；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 在 `forward` 模式决定是否运行 relay；`public_entry` 是不入网的公共入口，也可选择只发现而不转发业务的模式。两者都可显式启用独立的文件交付服务，服务权限不改变成员关系。
+`Member` 包含 `device_id`、`kind`、`name` 和 `manage`，没有角色。`kind` 为 `node` 或 `client`。任何管理设备都能授予或撤销成员，并可把 `manage` 授予新的客户端成员，或用一条新的 `grant` 改变已加入设备的 `name`（电脑、浏览器或手机）或客户端的 `manage`，`kind` 不变。客户端成员不需要管理权限也能撤销自己（`issuer` 与被撤销设备相同），不能撤销其他设备；Node 成员不能撤销自己。取消管理或撤销都不能让网络失去最后一台管理设备，权限变化后该设备的订阅会断开重连以取得新权限；Node 成员不能持有管理权限。Node 只有两种：成员 Node 承担网页、同步、调度和执行，`network.relay_listen` 在 `forward` 模式决定是否运行 relay；`public_entry` 是不入网的公共入口，也可选择只发现而不转发业务的模式。两者都可显式启用独立的文件交付服务，服务权限不改变成员关系。
 
 管理事件含 `version`、`network_id`、`epoch`、`parents`、`issuer`、`action` 和 `signature`。授权动作为 `grant`，撤销动作为 `revoke`，撤销带 `cutoff_seq` 和 `cutoff_hash`，即发起撤销时所连 Node 上该设备主分支的头，设备没写过时为 `0` 和 `null`。被撤销设备只有不超过这个上限的事件计入投影，超出的仍可入库但不计入。并发的授予与撤销冲突时撤销优先。根恢复由当前恢复密钥签名、epoch 加一的 checkpoint 建立新授权并换恢复密钥；`directory` 为空的 checkpoint 只换恢复密钥，目录沿用上一 epoch，立即生效；checkpoint 的 `retired` 列出没有保留的设备及其最终上限，旧 epoch 的事件不能放宽当前上限。
 
@@ -89,7 +89,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `delivery-wallet.json` | 独立加密 EVM 钱包，0600，不包含接收密钥 |
 | `delivery/service.sqlite3` | 订单、接收密钥、证明任务、续传偏移、nonce 和签名交易账本；不进入共享 DAG |
 | `delivery/objects/`、`delivery/private/` | 交付对象与本机私密材料，目录 0700、文件 0600；完整恢复需保留整个 `delivery/` |
-| `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
+| `join.json` | `vibeface join` 或本机网页进行中的加入请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
 | `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务会话的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
@@ -97,7 +97,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 
-运行中的 Node 用目录锁独占数据目录，并在私有维护 socket 上回答 `vibeface status`。`vibeface join` 遇到运行中的 Node 时，经同一 socket 发 `join { link, name }`，由 Node 自己完成加入，回复 `join` 为 `waiting`、`confirming`（带 `code`）、`joined`、`failed`（带 `reason`）或 `cancelled`。同一链接再发只读取进度，不新建请求；命令每秒发一次，直到结束。失败时 Node 保留 `join.json`，用同一链接和名称重跑会沿用原随机数，入口按原请求回答。换一条链接时，旧承诺作废。网页正在加入时，命令被拒绝。
+运行中的 Node 用目录锁独占数据目录，并在私有维护 socket 上回答 `vibeface status`。`vibeface join` 遇到运行中的 Node 时，经同一 socket 发 `join { link, name }`，由 Node 自己完成加入，回复 `join` 为 `waiting`、`confirming`（带 `code`）、`joined`、`failed`（带 `reason`）或 `cancelled`。同一链接再发只读取进度，不新建请求；命令每秒发一次，直到结束。失败时 Node 保留 `join.json`，用同一链接和名称重跑会沿用原随机数，入口按原请求回答；本机网页的 `node_join` 同样如此。换一条链接时，旧承诺作废。网页正在加入时，命令被拒绝。
 
 ## HTTP 与客户端通道
 
@@ -149,6 +149,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}`（`missing` 列出 Bot 缺程序的产品）和 `providers`。`providers` 只列 `supports` 非空的产品，每项为 `{provider, roles, supports, installed, state, issues, bin, app_server, env}`，`bin` 是它实际运行的程序，`installed` 说明这台电脑上找得到这个程序（同启动时的查找）：`roles` 是它现在的用途（运行 Bot 为 `agent`，执行派发的工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
 | `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型和工作目录，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
 | `configure_provider` | `provider`，可选 `bot`、`execution`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin`、`app_server.socket` 和 `env.CODEX_HOME` 开头的 `~` 按本机主目录展开。写入前补齐所开用途缺的路径（同启动时的查找），找不到 Codex 目录时报 `no Codex folder found`，什么都不写。`providers[]` 中 Codex 另带 `home`（`CODEX_HOME`）和 `sessions`（会话目录） |
+| `provider_models` | `provider` | 读取这个服务能列出的模型，回 `models` 为 `[{id, name, default}]`，`id` 填进 Bot 模型。目前只有 Codex 经已连接的 App Server `model/list` 列出，略去隐藏模型；其他服务或未连接时为 `null`，网页保留手填 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join_check` | `secret` | 打开链接时询问入口还收不收它，回 `invite` 为 `open`、`used` 或 `expired`，不占用链接。必须持有 secret 才能问。没登记过的 secret 与过期的回答相同，回答也不超出 `join` 拒绝时给的信息。本设备已提交且仍在等待的请求回 `open` |
@@ -156,12 +157,13 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `join_status` | 可选 `join_id`、`reveal` | 新设备查询或揭示随机数；不带 `join_id` 时管理设备列出所有入口上的待处理请求 |
 | `join_withdraw` | `join_id` | 新设备撤回自己仍在等待的加入请求，只认提交该请求的设备；请求已结束时原样返回当前状态。网页和手机点“取消”时经当前通道发一次，不重试，回复丢失时请求按期过期 |
 | `approve` | `join_id` 加 `admin_nonce`、`event` 或 `reject: true` | 管理设备推进或拒绝加入，请求在其他入口时转发过去 |
+| `grant` | `event` | 管理设备签名改已加入设备的名称或客户端的 `manage`，`kind` 须与现有成员一致，`epoch` 须是生效 epoch，之后须仍有管理设备；新设备只经 `approve` 加入。同一事件重发不新增记录 |
 | `revoke` | `event` | 管理设备签名撤销成员，或客户端成员签名撤销自己，`epoch` 须是生效 epoch，撤销后须仍有管理设备 |
 | `veto` | `event` | 管理设备签名否决正在等待的找回：签发者是本通道设备，`epoch` 是生效 epoch，`at_ms` 与 Node 时间相差不超过 10 分钟，目标须是当前 `pending`，且离生效至少还有 10 分钟；同一事件重复提交返回原结果 |
 | `recovery_state` | `expires_at_ms`、`signature`、`checkpoints`、`events` | 恢复密钥以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`；先合并恢复文件带来的 `checkpoints` 和 `events`；新 checkpoint 据此为没有保留的 Node 写 `retired`，并从 `state` 取签名 epoch 的管理事件 heads 写入 `heads` |
 | `recover` | `genesis`、`checkpoints`、`events`、`capability` | `checkpoints` 是完整链，最后一个是新 checkpoint，`events` 是恢复文件里的管理事件。空 Node 凭 `capability` 安装整条链和全部事件；已建网 Node 只取指向所带 checkpoint 的 `veto`，其余事件丢弃，最后一个 checkpoint 本机已有时什么也不改，否则合并后安装它。新的换目录 checkpoint 的 `issued_at_ms` 须在 Node 时间 10 分钟内（太早回 `this recovery was signed too long ago; start it again`，太晚回时钟偏差）；本机没有的旧 checkpoint 已作废的直接放过，仍会生效的同样检查 |
 
-未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器用它复算核对，签否决时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`configure_node` 和 `configure_provider` 另要求管理设备或本机会话，`invite`、`approve` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
+未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器用它复算核对，签否决时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`provider_models`、`configure_node` 和 `configure_provider` 另要求管理设备或本机会话，`invite`、`approve` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
 
 加入使用承诺加短码。管理设备生成 ticket（入口 `EndpointAddr` 和一次性 secret），以 `https://<gateway>/join#vibeface1…` 链接或二维码交给新设备。新设备提交 `commit = SHA256(public_key ‖ joiner_nonce)`，管理设备随后给出 `admin_nonce`，新设备再揭示 `joiner_nonce`，揭示值与承诺不符时请求作废。两端用双方公钥和随机数各自算出 6 位短码，本人核对一致后管理设备签名 `grant`。加入请求的视图带 `commit`。管理设备在发出 `admin_nonce` 前记下所见请求的设备公钥、`invite_id` 和 `commit`，揭示后自己核对承诺；新设备在揭示前记下 `network_id`、`admin_id` 和 `admin_nonce`。短码只用这些自己固定的值计算，入口之后改动任何一项，管理端不显示短码，新设备停止加入。ticket 默认 10 分钟过期，只能被一个加入请求消耗。
 

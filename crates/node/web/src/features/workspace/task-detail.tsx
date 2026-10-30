@@ -48,9 +48,9 @@ function inertAround(keep: Element) {
 
 /**
  * /b/:botId/work/:workId — side panel beside the chat on wide screens, an overlay on tablets, full screen on phones.
- * `from`: opened from 待处理, so leaving goes back there instead of to the chat.
+ * `from`: opened from 待处理 or 任务, so leaving returns to that list instead of to the chat.
  */
-export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" }) {
+export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
   const { directory, ready } = useDevice()
   const action = useAction()
@@ -69,7 +69,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   // Any entry forwards the stop; an unreachable device gets it when it is back.
   const canStop = work && state !== "awaiting_confirmation" && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
   const navigate = useNavigate()
-  const leave = from === "inbox" ? { to: "/inbox" as const } : { to: "/b/$botId" as const, params: { botId } }
+  const leave = from === "inbox" ? { to: "/inbox" as const } : from === "tasks" ? { to: "/tasks" as const } : { to: "/b/$botId" as const, params: { botId } }
   const close = () => void navigate(leave)
   const modal = !useSyncExternalStore(followWidth, () => window.matchMedia(WIDE).matches, () => true)
   const titleId = useId()
