@@ -81,10 +81,14 @@ test("questions and hand-offs sit where they happened in the chat", () => {
 })
 
 test("questions go to the web, or to the web and Grok; nothing else", () => {
-  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: false, codex_sessions: null, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 } })
+  const status = { budget: { day: "2026-10-30", used: 100, limit: 100, retry_at_ms: 1793404800000, paused_reason: "budget_exhausted" }, pending_events: 2, inflight_events: 0, unknown_events: 1 }
+  const settings = (default_outlet: string) => ({ default_outlet, projects: [], webhook_url: null, scan_codex_sessions: false, codex_sessions: null, webhook_secret_set: false, decision_url: "", device_id: "d", decision_tokens: [], outbox: { pending: 0, delivered: 0, dead: 0 }, status })
   assert.equal(parseTriageSettings(settings("both")).default_outlet, "both")
   assert.equal(parseTriageSettings(settings("record")).default_outlet, "record")
   for (const old of ["webhook", "off"]) assert.throws(() => parseTriageSettings(settings(old)), /无法识别/)
+  assert.deepEqual(parseTriageSettings(settings("record")).status, status)
+  assert.throws(() => parseTriageSettings({ ...settings("record"), status: { ...status, budget: { ...status.budget, paused_reason: "retry" } } }), /暂停原因无法识别/)
+  assert.throws(() => parseTriageSettings({ ...settings("record"), status: { ...status, unknown_events: -1 } }), /数字不对/)
 })
 
 test("an answer replaced by another side's says so instead of vanishing", () => {

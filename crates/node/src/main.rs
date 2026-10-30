@@ -932,7 +932,10 @@ fn utc_time(ms: i64) -> String {
     )
 }
 
-async fn post_triage(local: &LocalNode, body: serde_json::Value) -> Result<()> {
+async fn post_triage(local: &LocalNode, mut body: serde_json::Value) -> Result<()> {
+    if let Ok(attempt) = std::env::var("VIBEFACE_TRIAGE_ATTEMPT") {
+        body["_attempt"] = json!(attempt);
+    }
     let result = post_local(
         &local_node_url(local)?,
         "api/triage",

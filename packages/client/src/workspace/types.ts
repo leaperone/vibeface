@@ -225,4 +225,10 @@ export type TriageSettings = {
   device_id: string
   decision_tokens: { token_id: string; label: string; created_ms: number }[]
   outbox: { pending: number; delivered: number; dead: number }
+  status: {
+    budget: { day: string; used: number; limit: number; retry_at_ms: number; paused_reason: "budget_exhausted" | null }
+    pending_events: number
+    inflight_events: number
+    unknown_events: number
+  }
 }

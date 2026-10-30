@@ -697,9 +697,13 @@ impl Pi {
             "manager workspace must be an existing absolute directory"
         );
         let secrets = crate::manager::secret_values(config);
+        let start = std::sync::Mutex::new(crate::manager::StartEvidence::NotStarted);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
                 outcome,
+                start: *start
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 session_id: session.map(str::to_owned),
                 failure: ExecFailure {
                     detail: crate::manager::redact_string(failure.detail, &secrets),
@@ -813,12 +817,16 @@ impl Pi {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(config.timeout_secs);
         let within = PREFLIGHT.min(Duration::from_secs(config.timeout_secs));
         let prompt = json!({"type":"prompt","message":prompt});
+        *start.lock().unwrap() = crate::manager::StartEvidence::Unknown;
         let turn = match process
             .begin(after.as_deref(), prompt, within, &mut cancel)
             .await
         {
             Begin::Started(turn) => turn,
             Begin::Refused(failure) => {
+                if failure.kind == FailureKind::Rejected {
+                    *start.lock().unwrap() = crate::manager::StartEvidence::NotStarted;
+                }
                 let tail = process.end().await;
                 return Err(if *cancel.borrow() {
                     stopped(native)
@@ -835,6 +843,7 @@ impl Pi {
                 ));
             }
         };
+        *start.lock().unwrap() = crate::manager::StartEvidence::Started;
         let mut seen = Seen::default();
         lock(&self.live).insert(
             session.clone(),

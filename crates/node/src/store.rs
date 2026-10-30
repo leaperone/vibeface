@@ -22,6 +22,7 @@ pub(crate) mod questions;
 mod reduce;
 pub(crate) mod scheduler;
 mod sync;
+pub(crate) mod triage;
 pub use sync::{MAX_PULL_BYTES, MAX_PULL_EVENTS};
 #[cfg(test)]
 mod tests;

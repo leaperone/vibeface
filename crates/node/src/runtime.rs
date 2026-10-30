@@ -243,6 +243,7 @@ impl Runtime {
         .transpose()?;
         let identity = config::identity(dir)?;
         let mut store = Store::open(dir.join("node.sqlite3"))?;
+        store.recover_triage()?;
         store.attach_process_lock(process_lock.clone());
         let have_wakeup = Arc::new(tokio::sync::Notify::new());
         store.on_log_head_written({

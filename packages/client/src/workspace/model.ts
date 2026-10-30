@@ -442,7 +442,8 @@ function outlet(value: unknown): Outlet {
   return value
 }
 export function parseTriageSettings(value: unknown): TriageSettings {
-  const data = record(value), outbox = record(data.outbox)
+  const data = record(value), outbox = record(data.outbox), status = record(data.status), budget = record(status.budget)
+  if (budget.paused_reason !== null && budget.paused_reason !== "budget_exhausted") throw new Error("分诊暂停原因无法识别。")
   return {
     default_outlet: outlet(data.default_outlet),
     projects: list(data.projects).map((item) => { const project = record(item); return { prefix: text(project.prefix), outlet: outlet(project.outlet) } }),
@@ -451,5 +452,9 @@ export function parseTriageSettings(value: unknown): TriageSettings {
     webhook_secret_set: flag(data.webhook_secret_set), decision_url: text(data.decision_url), device_id: text(data.device_id),
     decision_tokens: list(data.decision_tokens).map((item) => { const token = record(item); return { token_id: text(token.token_id), label: text(token.label), created_ms: number(token.created_ms) } }),
     outbox: { pending: number(outbox.pending), delivered: number(outbox.delivered), dead: number(outbox.dead) },
+    status: {
+      budget: { day: text(budget.day), used: number(budget.used), limit: number(budget.limit), retry_at_ms: number(budget.retry_at_ms), paused_reason: budget.paused_reason },
+      pending_events: number(status.pending_events), inflight_events: number(status.inflight_events), unknown_events: number(status.unknown_events),
+    },
   }
 }

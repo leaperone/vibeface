@@ -781,9 +781,13 @@ impl Opencode {
             .filter(|_| config.workspace.is_absolute() && config.workspace.is_dir())
             .context("manager workspace must be an existing absolute directory")?;
         let secrets = manager::secret_values(config);
+        let start = std::sync::Mutex::new(manager::StartEvidence::NotStarted);
         let error = |outcome, session: Option<&str>, failure: ExecFailure| -> anyhow::Error {
             ManagerError {
                 outcome,
+                start: *start
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
                 session_id: session.map(str::to_owned),
                 failure: ExecFailure {
                     detail: manager::redact_string(failure.detail, &secrets),
@@ -931,14 +935,19 @@ impl Opencode {
         if *cancel.borrow() {
             return Err(stopped(native));
         }
+        *start.lock().unwrap() = manager::StartEvidence::Unknown;
         match self.send(&conn, &session, &first).await {
             Sent::Taken => {}
-            Sent::Refused(failure) => return Err(failed(native, failure)),
+            Sent::Refused(failure) => {
+                *start.lock().unwrap() = manager::StartEvidence::NotStarted;
+                return Err(failed(native, failure));
+            }
             Sent::Unknown(detail) => match self.received(&conn, &session, &message).await {
                 Ok(true) => {}
                 Ok(false) | Err(_) => return Err(unknown(native, &detail)),
             },
         }
+        *start.lock().unwrap() = manager::StartEvidence::Started;
         self.touch(&session);
         if let Some(turn) = &config.codex_turn
             && let Err(e) = (turn.record)(session.clone(), Some(message.clone())).await
