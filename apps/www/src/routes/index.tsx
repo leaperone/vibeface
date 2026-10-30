@@ -1,5 +1,4 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
-import { ThemeToggle } from '@/components/theme-toggle'
 
 export const Route = createFileRoute('/')({
   head: () => ({
@@ -25,7 +24,6 @@ function HomePage() {
           <a href="/download">下载</a>
           <a href="/community">社区</a>
           <a href="/security">安全</a>
-          <ThemeToggle />
         </nav>
       </header>
 
