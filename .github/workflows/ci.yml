@@ -20,9 +20,13 @@ on:
         description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
         type: boolean
         default: false
+      delivery_small_resume_run:
+        description: 'Optional explicit same-source small-experiment run ID to reuse verified public parts'
+        type: string
+        default: ''
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.delivery_small && 'delivery-small' || format('{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -622,9 +626,15 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
-  delivery-small:
+  delivery-small-prepare:
     if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.run.outputs.matrix }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -633,20 +643,87 @@ jobs:
         env:
           DELIVERY_LIVE: ${{ inputs.delivery_live }}
         run: test "$DELIVERY_LIVE" = false
-      - name: Generate genuine proofs and exercise settlement in the fixed sandbox
-        run: python3 scripts/check-delivery.py --sandbox --prove-small
-      - name: Preserve public experiment evidence
-        if: ${{ !cancelled() }}
+      - name: Rebuild the canonical profile and verify two actual fixture replays
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small prepare)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve validated public preparation evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: delivery-small-${{ github.sha }}
-          path: |
-            .artifacts/vdp/canonical/small/*/public/summary.json
-            .artifacts/vdp/canonical/small/*/public/resources.json
-            .artifacts/vdp/canonical/small/*/public/proofs/manifest.json
-            .artifacts/vdp/canonical/small/*/public/proofs/relation-*.json
-            .artifacts/vdp/canonical/small/*/public/proofs/relation-*.receipt
-          if-no-files-found: warn
+          name: delivery-small-prepare-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-proofs:
+    needs: delivery-small-prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.delivery-small-prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prove the selected relation or independently verify its saved part
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK_ITEM: ${{ matrix.item }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small "$WORK_ITEM")
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified public part or unqualified diagnostic
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-${{ matrix.item }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  delivery-small-accept:
+    needs: [delivery-small-prepare, delivery-small-proofs]
+    if: ${{ always() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.delivery_small && needs.delivery-small-prepare.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require all four qualified parts before the original money and recovery checks
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESUME_RUN: ${{ inputs.delivery_small_resume_run }}
+        run: |
+          args=(--sandbox --prove-small accept)
+          if [[ -n "$RESUME_RUN" ]]; then args+=(--resume-run "$RESUME_RUN"); fi
+          python3 scripts/check-delivery.py "${args[@]}"
+      - name: Preserve independently verified final public evidence
+        if: ${{ always() && steps.run.outputs.public-directory != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-accept-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.run.outputs.public-directory }}
+          if-no-files-found: error
           retention-days: 14
 
   delivery-android:

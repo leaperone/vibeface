@@ -81,18 +81,29 @@ python3 scripts/check-delivery.py --sandbox
 
 ## 手动生成真实付费交付证据
 
-`delivery_small` 是默认关闭的独立小实验。显式选中后仅运行 `delivery-small`，跳过常规计划和 aggregate gate，不构建 Android 或运行 full live。两个实验选项不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
+`delivery_small` 是默认关闭的独立小实验。显式选中后只运行 `delivery-small-prepare`、四关系证明 matrix 和 `delivery-small-accept`，跳过常规计划与 aggregate gate，不构建 Android 或运行 full live。两个实验选项不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
 
 ```sh
 gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false
-python3 scripts/check-delivery.py --sandbox --prove-small
+# 从明确的同源运行续用已合格的公开分项。
+gh workflow run ci.yml --ref <同一提交的分支> -f delivery_small=true -f delivery_live=false -f delivery_small_resume_run=<run-id>
+# 本机只运行准备控制，不生成证明或可复用分项证书。
+python3 scripts/check-delivery.py --sandbox --prove-small prepare
 ```
 
-小实验使用固定 sandbox、产品 profile、真实部署的普通 `DeliveryEscrow` 与 TestToken。矿工停止后固定实际部署、合成测试身份、4096 字节原文和订单条款，再串行生成四类真实 Groth16 receipt。Peer 身份和接收密钥沿用公开的固定 fixture 种子，不为生产保密背书。每份证明分别经过独立 host 验证、错误 journal 拒绝和正常 adapter 验真；完整九文件 bundle 可原样作为核心 fixture，在后续独立 CI 重编验证。
+`--prove-small` 必须指定 `prepare`、`relation-1` 至 `relation-4` 或 `accept`，不保留旧的无参数四证明入口。证明与续跑项要求真实 Actions 来源。`--resume-run` 仅供宿主选择一个明确的旧 run，不猜测分支最新运行。内部 `--resume-dir` 指向宿主已按 API、精确文件树和摘要检查的私有候选集合；容器中的 Python 用当前重编 host 验真全部合格候选后，才生成 Node 可读取的规范化目录。GH token 留在宿主，不进入容器环境、envfile 或新增挂载。
 
-同一 Held 快照分别验证正常 publish/open/withdraw、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
+小实验保持原来的 native Ubuntu x86_64 sandbox、11 GiB 内存、零 swap、64 PIDs、segment po2=20 和产品 profile。整个 small workflow 使用跨 ref 的串行 concurrency group，matrix `max-parallel: 1` 且 `fail-fast: false`。每项在 Docker build 前设置唯一绝对截止，所有子命令共用它，截止早于 hosted job 的六小时硬限，留出终止、清理和上传余量。该限制不保证任一证明能完成，也不续用证明中间的私密 checkpoint。
 
-结果在 `.artifacts/vdp/canonical/small/<run>/public/`。上传白名单只含摘要、cgroup 资源以及独立验真后复制的公开九文件 bundle，不含原文、E、witness、私钥、Succinct checkpoint 或原始日志。生成中的证明留在 `private/proofs/`；证明、结算或恢复验收失败时只导出安全诊断。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的 bundle。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`，宿主 CI 用户可读取白名单结果。CPU 是每个命令期间整个 sandbox 的增量，`memory.peak` 是容器生命周期累计峰值；两者不表示单个业务角色的独占消耗。任何证明、结算、恢复或资源检查失败都不能报告实验通过。
+`prepare` 使用封闭的公开测试部署配方，真实重建两个全新链与同一 4096 字节订单，逐字比较部署公开状态及四份 journal。它还完成四次 execute、八次空 stdin receipt decoder 控制和旧 image 的 PreTerms 反例。这些是非证明控制。四个证明项各自重建材料，只生成所选关系的一份真实 Groth16 receipt，或独立验真该关系已保存的合格分项。`accept` 不生成证明，先要求四份合格分项，再重放同一实际部署，完成正常 adapter 和原三条资金、恢复分支。缺项显式失败，不启动资金操作。
+
+公开 context 绑定当前干净 HEAD、实际 guest ELF/image/schema、原 profile 字节摘要、部署交易与区块、基线余额、订单和四份 journal。源码改变后不能自动续用旧分项。宿主通过当前仓库 Actions API 核对 workflow path、`workflow_dispatch`、head SHA、expiry、精确 artifact 名称、不可变 artifact ID 与 digest。允许同源 failed-job 重跑组合不同 producer attempt 的分项，不要求所有分项来自最新 attempt。相同关系的竞争候选全部独立验真后按固定来源顺序选择；冲突或声称合格但损坏的候选导致失败。只保留原 producer 与原证明资源，当前验证资源和导入 artifact ID 单独记录，不累计前驱图。
+
+同一 Held 快照分别验证正常 publish/open/withdraw 的 17 atoms、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。公开固定的测试种子不为生产保密背书。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
+
+结果在 `.artifacts/vdp/canonical/small/<work-id>/public/`，每个阶段单独上传精确白名单。`context.json`、`summary.json` 和 `resources.json` 之外，合格关系项只有 `partials/relation-N/part.json` 及实际 `.json`、`.receipt` 两个证明文件。`VERIFIED_PARTIAL` 要求当前 host 的二进制正验、Node 单一构造的 intended wrong-journal 拒绝、全部控制、Node 清理和最终 cgroup 无 OOM 观察通过。Node 后续失败或资源 UNKNOWN/OOM 时，只能保留当前 host 已按实际 profile/context 独立验真的证明对，标为 `UNQUALIFIED`，不写可复用证书，也不满足缺项。未验真的字节永不上传。prepare 的 `PREPARED` 和本机 `local-control` 均不代表证明成功。
+
+完整验收候选通过独立二进制检查后，`proofs/` 恰好保留原四关系的九个文件，manifest 和核心 loader 不放宽。最终资源检查失败仍判整轮实验失败，但保留此前已独立验真的完整 bundle，摘要将 `VERIFIED_BUNDLE` 与整体 `FAIL` 分开。公开目录和文件分别为 `0755/0644`，私有目录和文件保持 `0700/0600`。原文、恢复文件、E、witness、接收秘密、私钥、vectors、Succinct checkpoint、calldata 与原始日志均不上传。CPU 是整个 sandbox 区间增量，`memory.peak` 是容器生命周期累计峰值，复用验证耗用不替代原证明耗用。任何证明、结算、恢复、清理或资源检查失败都不能报告完整实验通过。
 
 现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
 
