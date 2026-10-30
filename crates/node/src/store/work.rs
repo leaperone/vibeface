@@ -585,6 +585,55 @@ impl Store {
         query_dispatches(&self.connection, "1", [])
     }
 
+    /// Whether the user closed this failed work or refused dispatch in 待处理.
+    pub fn closed_in_inbox(&self, network: &str, work_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notification_acks WHERE network_id=? AND notification_id=? AND client_id=?)",
+            params![network, work_id, crate::model::INBOX_CLIENT],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Whether this work in `scope` failed or was refused, so the user can close it in 待处理.
+    pub fn failed_work(&self, network: &str, scope: &str, work_id: &str) -> Result<bool> {
+        let failed = reduce::work_from(&self.connection, network, work_id)?.is_some_and(|work| {
+            work.conversation_id == scope
+                && matches!(
+                    work.outcome,
+                    Some(WorkOutcome::Failed | WorkOutcome::Rejected)
+                )
+        });
+        Ok(failed
+            || !query_dispatches(
+                &self.connection,
+                "work_id=?1 AND state='rejected' AND json_extract(spec,'$.conversation')=?2",
+                params![work_id, scope],
+            )?
+            .is_empty())
+    }
+
+    /// This Node's refused dispatches in `scope`, or every conversation, that still want the
+    /// user: not closed in 待处理 and not followed by a completed bot reply from the reply of
+    /// their report turn on.
+    pub fn open_dispatches(&self, network: &str, scope: Option<&str>) -> Result<Vec<Dispatch>> {
+        query_dispatches(
+            &self.connection,
+            "state='rejected' AND (?2 IS NULL OR json_extract(spec,'$.conversation')=?2)
+             AND NOT EXISTS(SELECT 1 FROM works w WHERE w.network_id=?1
+                AND w.work_id=work_dispatches.work_id AND w.dispatch IS NOT NULL)
+             AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=?1
+                AND a.notification_id=work_dispatches.work_id AND a.client_id=?3)
+             AND NOT EXISTS(SELECT 1 FROM scheduler_jobs j
+                JOIN messages report ON report.network_id=?1
+                    AND report.conversation_id=j.conversation_id AND report.message_id=j.message_id
+                JOIN messages m ON m.network_id=?1 AND m.conversation_id=j.conversation_id
+                    AND m.role='assistant' AND m.status='completed' AND m.rank>=report.rank
+                WHERE j.conversation_id=json_extract(work_dispatches.spec,'$.conversation')
+                    AND j.trigger='work:'||work_dispatches.work_id)",
+            params![network, scope, crate::model::INBOX_CLIENT],
+        )
+    }
+
     /// This conversation's dispatches the DAG does not name yet: waiting for their device,
     /// refused, unknown, or accepted but not synced back.
     pub fn undelivered_dispatches(&self, network: &str, scope: &str) -> Result<Vec<Dispatch>> {

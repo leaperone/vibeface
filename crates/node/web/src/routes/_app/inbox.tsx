@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { ChevronRight, Inbox, MessageCircle } from 'lucide-react'
+import { ChevronRight, Inbox, MessageCircle, X } from 'lucide-react'
 import { claimFocus, EmptyState, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useInbox } from '@/features/workspace/inbox'
@@ -8,6 +8,7 @@ import { QuestionCard } from '@/features/workspace/question-card'
 import { JoinCard } from '@/features/devices/join'
 import { WriteCard } from '@/features/workspace/write-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
+import { ActionButton } from '@/features/workspace/present'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/identity/recovery-controls'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 
@@ -36,12 +37,15 @@ function InboxPage() {
     if (items[index]) held.current = { key: items[index].key, index }
   }}>
     {items.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
-      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : <Link to={item.to} className="flex min-h-14 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-3">
-        <item.icon aria-hidden="true" className={`size-5 shrink-0 ${item.kind === 'failed' ? 'text-danger' : 'text-warning'}`} />
-        <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
-        {item.meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground" title={item.meta}>{item.meta}</span> : null}
-        <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-      </Link>}
+      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
+        <Link to={item.to} className="flex min-h-14 min-w-0 flex-1 items-center gap-3 interactive-row rounded-xl px-4 py-3">
+          <item.icon aria-hidden="true" className={`size-5 shrink-0 ${item.kind === 'failed' ? 'text-danger' : 'text-warning'}`} />
+          <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
+          {item.meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground" title={item.meta}>{item.meta}</span> : null}
+          <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+        </Link>
+        {item.kind === 'failed' ? <span className="pe-2"><ActionButton variant="ghost" label="关掉" disabled={!workspace.writable} action={() => workspace.dismissWork(item.work.conversation_id, item.work.work_id)}><X aria-hidden="true" /></ActionButton></span> : null}
+      </div>}
     </li>)}
   </ul>
 }

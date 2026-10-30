@@ -509,6 +509,7 @@ type WorkRow = (
     String,
     String,
     String,
+    String,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -520,11 +521,98 @@ pub(crate) fn works_from(
     network: &str,
     scope: &str,
 ) -> Result<Vec<WorkProjection>> {
-    let mut statement = connection.prepare(
-        "SELECT work_id,target_node,dispatch,progress,thread_id,turn_id,finish FROM works WHERE network_id=? AND conversation_id=? AND dispatch IS NOT NULL ORDER BY dispatch_rank",
+    works_query(
+        connection,
+        "FROM works w WHERE w.network_id=?1 AND w.conversation_id=?2",
+        params![network, scope],
+    )
+}
+
+/// One conversation's works, or every conversation's when `scope` is `None`, that want the user:
+/// those with no result yet or one only they can settle, and the newest ended work when it failed
+/// and nothing has followed it up. A later work ending, a completed bot reply after it, or the
+/// user closing it in 待处理 (an ack by [`INBOX_CLIENT`] naming the work) follows it up.
+pub(crate) fn open_works_from(
+    connection: &Connection,
+    network: &str,
+    scope: Option<&str>,
+) -> Result<Vec<WorkProjection>> {
+    // A failure stays until the bot answers after it: a reply to a message written after it ended,
+    // or its own report turn's reply. The dispatching turn's reply can land after the failure
+    // without having seen it, so a later rank alone does not count.
+    let works = works_query(
+        connection,
+        "FROM works w LEFT JOIN (SELECT conversation_id, max(dispatch_rank) AS newest FROM works
+            WHERE network_id=?1 AND (?2 IS NULL OR conversation_id=?2) AND dispatch IS NOT NULL
+            AND finish IS NOT NULL AND json_extract(finish,'$.outcome')<>'unverified'
+            GROUP BY conversation_id) ended ON ended.conversation_id=w.conversation_id
+         WHERE w.network_id=?1 AND (?2 IS NULL OR w.conversation_id=?2) AND (
+            w.finish IS NULL OR json_extract(w.finish,'$.outcome')='unverified'
+            OR json_extract(w.finish,'$.outcome') IN ('failed','rejected') AND w.dispatch_rank=ended.newest
+            AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=w.network_id
+                AND a.notification_id=w.work_id AND a.client_id=?3)
+            AND NOT EXISTS(SELECT 1 FROM messages r JOIN messages u ON u.network_id=r.network_id
+                AND u.conversation_id=r.conversation_id AND u.message_id=r.in_reply_to
+                WHERE r.network_id=w.network_id AND r.conversation_id=w.conversation_id
+                AND r.role='assistant' AND r.status='completed' AND u.role='user'
+                AND u.rank>substr(w.finish_rank,3)))",
+        params![network, scope, INBOX_CLIENT],
     )?;
+    let mut open = Vec::with_capacity(works.len());
+    for work in works {
+        let failed = matches!(
+            work.outcome,
+            Some(WorkOutcome::Failed | WorkOutcome::Rejected)
+        );
+        if !failed || !reported_from(connection, network, &work.conversation_id, &work.work_id)? {
+            open.push(work);
+        }
+    }
+    Ok(open)
+}
+
+/// Whether the bot's report turn for this work wrote a completed reply, on whichever owner ran it.
+fn reported_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+    work_id: &str,
+) -> Result<bool> {
+    let epoch: u64 = connection
+        .query_row(
+            "SELECT owner_epoch FROM conversations WHERE network_id=? AND conversation_id=?",
+            params![network, conversation],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let trigger = crate::scheduling::work_trigger(work_id);
+    for owner_epoch in 0..=epoch {
+        let reply = super::scheduler::reply_message_id(conversation, &trigger, owner_epoch);
+        let completed: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE network_id=? AND conversation_id=? AND message_id=?
+                AND role='assistant' AND status='completed')",
+            params![network, conversation, reply],
+            |r| r.get(0),
+        )?;
+        if completed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The works the `FROM … WHERE …` clause selects from `works w`, in dispatch order.
+fn works_query(
+    connection: &Connection,
+    from: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<WorkProjection>> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT w.work_id,w.conversation_id,w.target_node,w.dispatch,w.progress,w.thread_id,w.turn_id,w.finish {from} AND w.dispatch IS NOT NULL ORDER BY w.conversation_id,w.dispatch_rank"
+    ))?;
     let rows: Vec<WorkRow> = statement
-        .query_map(params![network, scope], |r| {
+        .query_map(params, |r| {
             Ok((
                 r.get(0)?,
                 r.get(1)?,
@@ -533,11 +621,14 @@ pub(crate) fn works_from(
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut works = Vec::with_capacity(rows.len());
-    for (work_id, target_node, dispatch, progress, thread_id, turn_id, finish) in rows {
+    for (work_id, conversation_id, target_node, dispatch, progress, thread_id, turn_id, finish) in
+        rows
+    {
         let EventBody::WorkDispatched {
             trigger,
             dispatcher,
@@ -571,7 +662,7 @@ pub(crate) fn works_from(
             };
         works.push(WorkProjection {
             work_id,
-            conversation_id: scope.into(),
+            conversation_id,
             target_node,
             trigger,
             dispatcher,
@@ -625,17 +716,10 @@ pub(crate) fn work_from(
     network: &str,
     work_id: &str,
 ) -> Result<Option<WorkProjection>> {
-    let scope: Option<String> = connection
-        .query_row(
-            "SELECT conversation_id FROM works WHERE network_id=? AND work_id=? AND dispatch IS NOT NULL",
-            params![network, work_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(scope) = scope else {
-        return Ok(None);
-    };
-    Ok(works_from(connection, network, &scope)?
-        .into_iter()
-        .find(|work| work.work_id == work_id))
+    Ok(works_query(
+        connection,
+        "FROM works w WHERE w.network_id=?1 AND w.work_id=?2",
+        params![network, work_id],
+    )?
+    .pop())
 }

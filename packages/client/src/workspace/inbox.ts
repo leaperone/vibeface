@@ -1,5 +1,6 @@
 import { recoveryCopy } from "../identity/copy.ts"
 import type { ClientPrincipal, JoinRequest } from "../lib/node.ts"
+import { failedWork } from "./labels.ts"
 import { botReadiness, workChecks } from "./model.ts"
 import { openQuestions } from "./questions.ts"
 import type { BotRecord, CoordinationCheck, NodeInfo, NotificationRecord, OpenWork, PendingCheck, Question, WriteStatus } from "./types.ts"
@@ -54,10 +55,10 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   })
   const checks = [...workChecks(workspace.openWorks, workspace.nodes), ...(workspace.data?.checks ?? []).map((check): PendingCheck => ({ kind: "process", check_id: check.check_id, detail: check.detail }))]
   for (const check of checks) items.push({ key: check.check_id, kind: "confirm", check, title: "待确认" })
-  // A failed task stays until a later task of its bot ends; its details say why and what to do next.
+  // The Node lists a failure until a later task ends, the bot replies after it or the person closes it.
   for (const work of workspace.openWorks) {
     const bot = workspace.bots.find((item) => item.conversation_id === work.conversation_id)
-    if (bot && (work.outcome === "failed" || work.outcome === "rejected")) items.push({ key: `failed:${work.work_id}`, kind: "failed", work, bot, title: work.title || "任务没有完成", meta: bot.name })
+    if (bot && failedWork(work)) items.push({ key: `failed:${work.work_id}`, kind: "failed", work, bot, title: work.title || "任务没有完成", meta: bot.name })
   }
   if (workspace.messagePending && !workspace.messageBusy) items.push({ key: "undelivered", kind: "undelivered", title: "消息可能没送达", meta: workspace.selectedBot?.name })
   for (const join of openJoins(device)) items.push({ key: `join:${join.join_id}`, kind: "join", join, title: `${join.name || "新设备"} 想加入` })

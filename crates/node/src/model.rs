@@ -687,6 +687,9 @@ impl BotChange {
     }
 }
 
+/// The `client_id` of an ack that closes a failed work in 待处理; see `NotificationAcked`.
+pub const INBOX_CLIENT: &str = "inbox";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EventBody {
@@ -781,6 +784,8 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
+    /// A client read the notification. With `client_id` [`INBOX_CLIENT`], `notification_id`
+    /// names a failed work or refused dispatch the user closed in 待处理 for every device.
     NotificationAcked {
         notification_id: String,
         client_id: String,

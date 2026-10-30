@@ -4,7 +4,6 @@ import { questionOpen } from "./questions.ts"
 import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
 
 const delivery = (item: WorkRecord) => item.state.startsWith("dispatch_")
-const open = (item: WorkRecord) => !delivery(item) && (item.outcome === null || item.outcome === "unverified")
 
 function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {
   const next = items.map((item) => changed.find((candidate) => key(candidate) === key(item)) ?? item)
@@ -37,15 +36,7 @@ export function mergeBots(bots: BotRecord[], records: ConversationRecords): BotR
   return bots.map((bot) => bot.conversation_id === records.conversation_id ? { ...bot, last_message: records.last_message ?? bot.last_message, busy: records.busy } : bot)
 }
 
-/**
- * Works no result has settled yet, across conversations, and each conversation's newest ended work when it failed, as
- * the Node lists them: a settled one leaves the list, and a failure leaves once a later work of its conversation ends.
- */
+/** The network's works that want the person, with this conversation's share replaced by what the Node lists now. */
 export function mergeOpenWorks(works: OpenWork[], records: ConversationRecords): OpenWork[] {
-  const changed = records.works.map((item) => ({ ...item, conversation_id: records.conversation_id }))
-  const merged = upsert(works, changed, (item) => item.work_id)
-  // The list keeps dispatch order, so its last ended work of the conversation is the one the Node calls newest.
-  const newest = merged.filter((item) => item.conversation_id === records.conversation_id && !delivery(item) && !open(item)).at(-1)?.work_id
-  return merged.filter((item) => open(item)
-    || !delivery(item) && (item.outcome === "failed" || item.outcome === "rejected") && (item.conversation_id !== records.conversation_id || item.work_id === newest))
+  return [...works.filter((item) => item.conversation_id !== records.conversation_id), ...records.open_works]
 }

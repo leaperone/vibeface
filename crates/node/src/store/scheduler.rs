@@ -472,7 +472,7 @@ fn hand_off_from(connection: &Connection, network: &str, conversation: &str) -> 
 
 /// A new owner answering a message the old one left unanswered writes its own reply, beside any
 /// status reply the old owner already wrote.
-fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
+pub(super) fn reply_message_id(conversation: &str, trigger: &str, owner_epoch: u64) -> String {
     format!(
         "reply-{}",
         crate::crypto::digest(

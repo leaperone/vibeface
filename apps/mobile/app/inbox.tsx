@@ -1,13 +1,15 @@
 import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, CircleAlert, CircleX, Copy, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
-import { useRef } from 'react'
+import { Bot, ChevronRight, CircleAlert, CircleX, Copy, LoaderCircle, X, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { useRef, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import Animated, { LayoutAnimationConfig } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
+import { ErrorText, useAction } from '@/components/action'
 import { EmptyState } from '@/components/kit'
+import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -91,5 +93,21 @@ function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replac
     {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
     {href ? <Icon as={ChevronRight} className="text-muted-foreground" /> : null}
   </>
-  return href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
+  const row = href ? <Link href={href} replace={replace} asChild><Pressable accessibilityRole="link" className={`${card} active:bg-muted`}>{body}</Pressable></Link> : <View className={card}>{body}</View>
+  return item.kind === 'failed' ? <Dismiss item={item}>{row}</Dismiss> : row
+}
+
+/** A failure the person has seen to leaves the list by hand; the bot's later reply also clears it. */
+function Dismiss({ item, children }: { item: Extract<Row, { kind: 'failed' }>; children: ReactNode }) {
+  const shared = useLive()
+  const { busy, error, run } = useAction()
+  return <View className="gap-1">
+    <View className="flex-row items-center gap-1">
+      <View className="min-w-0 flex-1">{children}</View>
+      <Button variant="ghost" size="icon" accessibilityLabel="关掉" disabled={!shared?.writable || busy !== null} onPress={() => void run('dismiss', () => shared!.dismissWork(item.work.conversation_id, item.work.work_id))}>
+        <Icon as={busy ? LoaderCircle : X} className="text-muted-foreground" />
+      </Button>
+    </View>
+    <ErrorText error={error} />
+  </View>
 }

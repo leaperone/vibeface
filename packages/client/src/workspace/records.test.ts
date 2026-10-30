@@ -24,7 +24,7 @@ const shown = parseConversation({
 const records = (extra: Record<string, unknown> = {}) => {
   const event = parseChanged({
     type: "records", conversation_id: "chat", messages: [], works: [], last_message: null, questions: [], notifications: [],
-    deliveries: [], checks: [], jobs: [], unanswered: [], sent: [], ...extra,
+    deliveries: [], checks: [], jobs: [], unanswered: [], sent: [], open_works: [], ...extra,
   })
   assert.equal(event.type, "records")
   return parseRecords(event.type === "records" ? event.value : null)
@@ -82,22 +82,22 @@ test("a work waits for confirmation only once its device cannot report it", () =
   assert.equal(confirmReason(running, node(true, false)), "disconnected")
   assert.equal(confirmReason({ ...running, kind: "task" }, node(true, false)), null, "a task does not need the App Server")
   assert.equal(confirmReason({ ...running, state: "unverified", outcome: "unverified" }, node(true, true)), "unverified")
-  let open = mergeOpenWorks([], records({ works: [work("w1")] }))
+  const open = mergeOpenWorks([], records({ open_works: [{ ...work("w1"), conversation_id: "chat" }] }))
   assert.deepEqual(workChecks(open, node(false)).map((item) => item.kind === "work" && [item.check_id, item.conversation_id, item.reason]), [["work:w1", "chat", "offline"]])
-  open = mergeOpenWorks(open, records({ works: [work("w1", { state: "finished", outcome: "interrupted" })] }))
-  assert.equal(open.length, 0, "a settled work leaves the list")
 })
 
-test("a failed work stays open until a later work of its conversation ends", () => {
-  let open = mergeOpenWorks([], records({ works: [work("w1", { state: "finished", outcome: "failed" })] }))
-  assert.deepEqual(open.map((item) => item.work_id), ["w1"], "nothing followed the failure up yet")
-  open = mergeOpenWorks(open, records({ works: [work("w2")] }))
-  assert.deepEqual(open.map((item) => item.work_id), ["w1", "w2"], "a work still running does not settle it")
-  open = mergeOpenWorks(open, records({ works: [work("w2", { state: "finished", outcome: "completed" })] }))
-  assert.equal(open.length, 0, "the later work ended, so the failure leaves")
-  open = mergeOpenWorks(mergeOpenWorks([], records({ works: [work("w3")] })), records({ works: [work("w4", { state: "finished", outcome: "failed" })] }))
-  open = mergeOpenWorks(open, records({ works: [work("w3", { state: "finished", outcome: "completed" })] }))
-  assert.deepEqual(open.map((item) => item.work_id), ["w4"], "an earlier work ending late does not settle a later failure")
+test("a push replaces its conversation's open works with the Node's list, whatever order works arrived in", () => {
+  const open = (id: string, conversation_id: string, extra: Record<string, unknown> = {}) => ({ ...work(id, extra), conversation_id })
+  const failed = { state: "finished", outcome: "failed" }
+  let list = mergeOpenWorks([], records({ open_works: [open("w2", "chat", failed)] }))
+  list = mergeOpenWorks(list, records({ conversation_id: "other", open_works: [open("x1", "other")] }))
+  // An earlier work's result synced late: the Node still lists the later failure, and the page keeps it.
+  list = mergeOpenWorks(list, records({ works: [work("w1", { state: "finished", outcome: "completed" })], open_works: [open("w2", "chat", failed)] }))
+  assert.deepEqual(list.map((item) => item.work_id), ["x1", "w2"])
+  list = mergeOpenWorks(list, records({ open_works: [open("w9", "chat", { state: "dispatch_rejected" })] }))
+  assert.deepEqual(list.map((item) => [item.work_id, item.state]), [["x1", "running"], ["w9", "dispatch_rejected"]], "a refused dispatch is listed like a failure")
+  list = mergeOpenWorks(list, records({ open_works: [] }))
+  assert.deepEqual(list.map((item) => item.work_id), ["x1"], "a closed or answered failure leaves")
 })
 
 test("works one offline device holds wait on one card; an unverified one keeps its own", () => {
@@ -105,9 +105,9 @@ test("works one offline device holds wait on one card; an unverified one keeps i
     { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [] } },
     { device_id: "mac", name: "", local: false, online: true, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [], codex_connected: false } },
   ]
-  const open = mergeOpenWorks([], records({ works: [
+  const open = mergeOpenWorks([], records({ open_works: [
     work("w1"), work("w2", { state: "unverified", outcome: "unverified" }), work("w3", { target_node: "mac" }), work("w4"), work("w5", { target_node: "mac" }),
-  ] }))
+  ].map((item) => ({ ...item, conversation_id: "chat" })) }))
   const checks = workChecks(open, nodes)
   assert.deepEqual(checks.map((item) => [item.check_id, item.kind === "device" ? item.works.map((one) => one.work_id) : item.kind]), [
     ["device:worker:offline", ["w1", "w4"]], ["work:w2", "work"], ["device:mac:disconnected", ["w3", "w5"]],

@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, RotateCw, SearchCheck, Server, X } from "lucide-react"
+import { ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Server, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
@@ -12,7 +12,7 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, uncheckedCopy } from "@vibeface/client/workspace/labels.ts"
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
 import { projectName, questionOpen } from "@vibeface/client/workspace/questions.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 
@@ -90,6 +90,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const result = failed ? cause || "这个任务没有成功。" : work?.result_text || cause
   // It may have done its writes anyway, so it is checked first; running it again could do them twice.
   const unknown = Boolean(work && (state === "dispatch_unverified" || outcomeUnknown(work.failure, work.failure_reason)))
+  const next = followUp(state ?? "", unknown)
   // App Server cannot withdraw one input steered into a turn, so stopping one stops every work sharing it.
   const sharing = work?.turn_id ? (workspace.data?.works ?? []).filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const stop = canStop ? () => workspace.interruptWork(work.work_id) : null
@@ -139,9 +140,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       {failed || unknown || state === "interrupted" ? <div className="grid gap-2">
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
         <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
-          const title = work.title || "这个任务"
-          if (await workspace.sendMessage(unknown ? uncheckedCopy.ask(title) : `再试一次「${title}」`)) void navigate({ to: "/b/$botId", params: { botId } })
-        })}><BusyIcon busy={action.busy === "retry"} icon={unknown ? SearchCheck : RotateCw} />{unknown ? uncheckedCopy.action : "让 Bot 再试"}</Button>
+          if (await workspace.sendMessage(followUpCopy[next].ask(work.title || "这个任务"))) void navigate({ to: "/b/$botId", params: { botId } })
+        })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{followUpCopy[next].action}</Button>
         <InlineError error={action.error} />
       </div> : null}
       <Details>
@@ -155,6 +155,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   </aside>
   </div>
 }
+
+const followUpIcons: Record<FollowUp, typeof Circle> = { check: SearchCheck, resume: Play, retry: RotateCw }
 
 // A plan's progress arrives as one line per step, marked done, current or to do.
 const steps: Record<string, { icon: typeof Circle; className: string; label: string }> = {

@@ -1018,6 +1018,11 @@ def fixture_codex(arguments):
                                 "command": "printf fixture-secret-command", "cwd": thread["cwd"],
                                 "availableDecisions": ["accept", "decline", "cancel"], "reason": "controlled request acceptance"}})
                             fixture_record(run, "codex-events.jsonl", {"connection": connection_id, "thread_id": thread_id, "event": "request"})
+                        if turn["status"] == "inProgress" and directive.get("fail") and identity in emitted:
+                            thread["status"] = {"type": "idle"}
+                            turn["status"] = "failed"
+                            turn["error"] = {"message": directive["fail"]}
+                            private_json(state_path, state)
                         terminal = (*identity, turn["status"])
                         if turn["status"] != "inProgress" and terminal not in emitted:
                             emitted.add(terminal)
@@ -1262,6 +1267,10 @@ def fixture_manager(run, initial, bot):
                   ("bot-alpha-instructions-sentinel", "bot-beta-instructions-sentinel") if marker in initial["history"]],
               "node_url": initial["tool_env"]["VIBEFACE_NODE_URL"]}
     fixture_record(run, "manager-invocations.jsonl", record)
+    # A held report keeps a failed task's result from being answered, so it waits on the person.
+    if autonomous and (run / "fixture-hold-report").exists():
+        bot.end("failed")
+        return
     schemas = set(initial["custom_tools"]) - set(context["trigger"].get("unavailable_tools", []))
     expected_tools = READ_TOOLS | WORK_TOOLS
     if kind != "agent_task":

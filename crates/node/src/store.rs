@@ -721,20 +721,10 @@ impl Store {
     pub fn works(&self, network: &str, scope: &str) -> Result<Vec<WorkProjection>> {
         reduce::works_from(&self.connection, network, scope)
     }
-    /// Works in every conversation that want the user: see [`unsettled`].
-    pub fn open_works(&self, network: &str) -> Result<Vec<WorkProjection>> {
-        let mut statement = self.connection.prepare(
-            "SELECT DISTINCT conversation_id FROM works WHERE network_id=? AND dispatch IS NOT NULL
-             AND (finish IS NULL OR json_extract(finish,'$.outcome') IN ('unverified','failed','rejected'))",
-        )?;
-        let scopes = statement
-            .query_map([network], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut open = Vec::new();
-        for scope in scopes {
-            open.extend(unsettled(self.works(network, &scope)?));
-        }
-        Ok(open)
+    /// Works in `scope`, or every conversation, that want the user: see
+    /// [`reduce::open_works_from`].
+    pub fn open_works(&self, network: &str, scope: Option<&str>) -> Result<Vec<WorkProjection>> {
+        reduce::open_works_from(&self.connection, network, scope)
     }
     /// This database file as the filesystem knows it: inode and creation time. Copying the data
     /// directory or restoring it from a backup writes a new file, so the values change.
@@ -1040,25 +1030,6 @@ pub(crate) fn authorize_node_from(
     device_id: &str,
 ) -> Result<Member> {
     membership_from(connection, network_id)?.node(device_id)
-}
-
-/// One conversation's works that want the user: those with no result yet or one only they can
-/// settle, and its newest ended work when that failed, since nothing has followed it up yet. A
-/// later work ending, even one that fails again, takes the old failure off the list.
-pub(crate) fn unsettled(works: Vec<WorkProjection>) -> Vec<WorkProjection> {
-    let newest = works
-        .iter()
-        .rposition(|work| work.outcome.is_some_and(|o| o != WorkOutcome::Unverified));
-    works
-        .into_iter()
-        .enumerate()
-        .filter(|(index, work)| match work.outcome {
-            None | Some(WorkOutcome::Unverified) => true,
-            Some(WorkOutcome::Failed | WorkOutcome::Rejected) => Some(*index) == newest,
-            Some(_) => false,
-        })
-        .map(|(_, work)| work)
-        .collect()
 }
 
 /// A unit enum's serde name, for a text column.

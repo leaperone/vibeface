@@ -1,10 +1,10 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
-import { FolderOpen, Laptop, Link2, ListChecks, RotateCw, SearchCheck, Server, Square, type LucideIcon } from 'lucide-react-native'
+import { FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Server, Square, type LucideIcon } from 'lucide-react-native'
 import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, uncheckedCopy } from '@vibeface/client/workspace/labels.ts'
+import { followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
 import { projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
@@ -46,6 +46,7 @@ export default function TaskDetail() {
   // Stopping one input steered into a turn stops every work sharing that turn.
   const sharing = work.turn_id ? data!.works.filter((item) => item.work_id !== work.work_id && !item.outcome && item.thread_id === work.thread_id && item.turn_id === work.turn_id) : []
   const active = taskActive(state)
+  const next = followUp(state, unknown)
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="gap-1">
@@ -74,11 +75,8 @@ export default function TaskDetail() {
     {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={unknown ? SearchCheck : RotateCw} disabled={!shared.writable}
-      action={async () => {
-        const title = work.title || '这个任务'
-        if (await shared.sendMessage(unknown ? uncheckedCopy.ask(title) : state === 'interrupted' ? interruptedCopy.ask(title) : `再试一次「${title}」`)) router.back()
-      }}>{unknown ? uncheckedCopy.action : state === 'interrupted' ? interruptedCopy.resume : '让 Bot 再试'}</ActionButton> : null}
+    {failed || unknown || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={followUpIcons[next]} disabled={!shared.writable}
+      action={async () => { if (await shared.sendMessage(followUpCopy[next].ask(work.title || '这个任务'))) router.back() }}>{followUpCopy[next].action}</ActionButton> : null}
     <Details>
       {failed && work.result_text ? <Detail label="已有输出">{work.result_text}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
@@ -90,6 +88,8 @@ export default function TaskDetail() {
     </Details>
   </ScrollView>
 }
+
+const followUpIcons: Record<FollowUp, LucideIcon> = { check: SearchCheck, resume: Play, retry: RotateCw }
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return <View className="gap-2">

@@ -92,11 +92,18 @@ export const taskLabel = (state: string) => taskStates[state] ?? stateNames[stat
 export const taskStale = (state: string, connected: boolean) => !connected && taskActive(state)
 export const staleTaskLabel = "状态未知"
 /** A task that stopped without a cause of its own: stopped by hand, or its device or app went away mid-turn. Nothing redoes it. */
-export const interruptedCopy = { reason: "中途停下了，不会自动重做", resume: "让 Bot 接着做", ask: (title: string) => `接着做「${title}」` }
+export const interruptedCopy = { reason: "中途停下了，不会自动重做" }
 /** A task sent to a device that is offline starts once that device is back. */
 export const taskCopy = { away: "离线，上线后开始" }
-/** A task whose outcome is unknown may have done its writes, so the bot checks it rather than running it again. */
-export const uncheckedCopy = { action: "让 Bot 查结果", ask: (title: string) => `看看「${title}」做完了没有，先不要重做` }
+/** What the person asks the bot after a task ended badly, in both apps. */
+export type FollowUp = "check" | "resume" | "retry"
+export const followUpCopy: Record<FollowUp, { action: string; ask: (title: string) => string }> = {
+  check: { action: "让 Bot 查结果", ask: (title) => `看看「${title}」做完了没有，先不要重做` },
+  resume: { action: "让 Bot 接着做", ask: (title) => `接着做「${title}」` },
+  retry: { action: "让 Bot 再试", ask: (title) => `再试一次「${title}」` },
+}
+/** An unknown outcome may have done its writes, so the bot checks it rather than running it again; a stopped task goes on. */
+export const followUp = (state: string, unknown: boolean): FollowUp => unknown ? "check" : state === "interrupted" ? "resume" : "retry"
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {
@@ -112,3 +119,17 @@ export const progressLabel = (status: string) => progressStates[status] ?? (/[\u
 export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
+
+/** A failed work, or a dispatch its device refused: the person sees it until something follows it up. */
+export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.outcome === "failed" || work.outcome === "rejected" || work.state === "dispatch_rejected"
+
+/** Where a task card sits on the tasks page, in both apps. */
+export type TaskGroup = "attention" | "working" | "waiting"
+export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
+/** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
+export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
+  work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
+export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
+/** A task that failed or was never taken needs the person; one out of their hands or held on them waits; the rest work. */
+export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>
+  needsLook(state) ? "attention" : state === "unverified" || state === "awaiting_confirmation" || heldOnPerson || !taskActive(state) ? "waiting" : "working"

@@ -137,7 +137,7 @@ function Live({ children }: { children: ReactNode }) {
     const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
     // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
     const folded = foldAnswers(data.messages, data.questions)
-    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers))
+    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers) && shared.fresh.has(`question:${question.question_id}`))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
       return detail ? { ...message, detail } : message
