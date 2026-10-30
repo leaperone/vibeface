@@ -340,13 +340,13 @@ type Names = { computer: string; browser: string }
 
 /** Two equal ways on for a computer not set up yet: a second computer joins the first instead of starting another network. */
 function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void }) {
-  const option = (Icon: typeof Link2, title: string, note: string, onClick: () => void) => <Button type="button" variant="outline" className="h-auto min-h-24 flex-col items-start justify-start gap-3 whitespace-normal p-4 text-start" onClick={onClick}>
+  const option = (id: string, Icon: typeof Link2, title: string, note: string, onClick: () => void) => <Button type="button" variant="outline" aria-label={title} aria-describedby={id} className="h-auto min-h-24 flex-col items-start justify-start gap-3 whitespace-normal p-4 text-start" onClick={onClick}>
     <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-5" /></span>
-    <span className="grid gap-0.5"><span className="text-heading font-semibold">{title}</span><span className="text-meta font-normal text-muted-foreground">{note}</span></span>
+    <span className="grid gap-0.5"><span className="text-heading font-semibold">{title}</span><span id={id} className="text-meta font-normal text-muted-foreground">{note}</span></span>
   </Button>
   return <div role="group" aria-label="开始使用" className="grid gap-3 sm:grid-cols-2">
-    {option(CirclePlus, startCopy.create, startCopy.createNote, onCreate)}
-    {option(Link2, startCopy.join, startCopy.joinNote, onJoin)}
+    {option('start-create-note', CirclePlus, startCopy.create, startCopy.createNote, onCreate)}
+    {option('start-join-note', Link2, startCopy.join, startCopy.joinNote, onJoin)}
   </div>
 }
 
