@@ -205,6 +205,12 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
     } catch { /* the shown error already says what failed */ }
   }
   useEffect(() => { setResponse(null); void load(); return () => { sequence.current += 1 } }, [ready])
+  // A provider gets installed outside this page, so coming back to the page reads the device again.
+  useEffect(() => {
+    const back = () => void reconcile()
+    window.addEventListener("focus", back)
+    return () => window.removeEventListener("focus", back)
+  }, [ready])
   async function test(): Promise<AppServerLink | null> {
     if (!ready?.isCurrent()) return null
     try {

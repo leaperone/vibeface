@@ -1,10 +1,10 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router'
-import { FolderOpen, Laptop, Link2, ListChecks, RotateCw, Server, Square, type LucideIcon } from 'lucide-react-native'
+import { FolderOpen, Laptop, Link2, ListChecks, RotateCw, SearchCheck, Server, Square, type LucideIcon } from 'lucide-react-native'
 import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { failureText, rawError, taskError } from '@vibeface/client/lib/errors.ts'
-import { interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
+import { interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, uncheckedCopy } from '@vibeface/client/workspace/labels.ts'
 import { projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
@@ -36,7 +36,11 @@ export default function TaskDetail() {
   const device = work.target_node
   const progress = shared.liveProgress.find((item) => item.kind === 'native' && item.work_id === workId && item.target_node === device)
   const canStop = state !== 'awaiting_confirmation' && !work.outcome && !work.stop && ['accepted', 'running'].includes(work.state)
-  const result = work.result_text || failureText(work.failure) || (work.failure_reason ? taskError(work.failure_reason) : state === 'completed' ? '没有返回文字' : state === 'interrupted' ? interruptedCopy.reason : '')
+  // A failed task's text is what it said before failing, so its cause leads and that text waits in 详细信息.
+  const failed = ['failed', 'rejected', 'dispatch_rejected', 'dispatch_unverified'].includes(state)
+  const result = failed ? workFailure(work) || '这个任务没有成功。' : work.result_text || workFailure(work) || (state === 'completed' ? '没有返回文字' : state === 'interrupted' ? interruptedCopy.reason : '')
+  // It may have done its writes anyway, so it is checked first; running it again could do them twice.
+  const unknown = state === 'dispatch_unverified' || outcomeUnknown(work.failure, work.failure_reason)
   // The request this task waits on is answered here, as on the web, so the chat's task card only says it waits.
   const asking = work.thread_id && !work.outcome ? data!.questions.find((question) => questionOpen(question) && question.about.request_id && question.about.session_id === work.thread_id) : undefined
   // Stopping one input steered into a turn stops every work sharing that turn.
@@ -56,7 +60,8 @@ export default function TaskDetail() {
         <Text selectable className="font-mono text-meta">{progress.text}</Text>
       </ScrollView> : null}
     </View>
-    {result && !active ? <Section title={work.result_text || state === 'completed' ? '结果' : '原因'}><Text selectable>{result}</Text></Section> : null}
+    {work.prompt ? <Section title="交代的事"><Text selectable numberOfLines={6}>{work.prompt}</Text></Section> : null}
+    {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
     {state === 'awaiting_confirmation' ? <Text className="text-muted-foreground">
       {confirmText({ reason: confirmReason(work, shared.nodes) ?? 'unverified', detail: work.failure_reason ?? '' }, nodeName(device, lookup))}请在对话或待处理里确认它做完了没有。
     </Text> : null}
@@ -69,13 +74,13 @@ export default function TaskDetail() {
     {canStop ? <ActionButton variant="outline" className="self-start" icon={Square} iconClassName="fill-foreground" disabled={!shared.writable} action={() => shared.interruptWork(work.work_id)}>
       {sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : '停止任务'}
     </ActionButton> : null}
-    {['failed', 'interrupted', 'rejected'].includes(state) ? <ActionButton variant="outline" className="self-start" icon={RotateCw} disabled={!shared.writable}
+    {failed || state === 'interrupted' ? <ActionButton variant="outline" className="self-start" icon={unknown ? SearchCheck : RotateCw} disabled={!shared.writable}
       action={async () => {
         const title = work.title || '这个任务'
-        if (await shared.sendMessage(state === 'interrupted' ? interruptedCopy.ask(title) : `再试一次「${title}」`)) router.back()
-      }}>{state === 'interrupted' ? interruptedCopy.resume : '让 Bot 再试'}</ActionButton> : null}
+        if (await shared.sendMessage(unknown ? uncheckedCopy.ask(title) : state === 'interrupted' ? interruptedCopy.ask(title) : `再试一次「${title}」`)) router.back()
+      }}>{unknown ? uncheckedCopy.action : state === 'interrupted' ? interruptedCopy.resume : '让 Bot 再试'}</ActionButton> : null}
     <Details>
-      {work.prompt ? <Detail label="交代的事">{work.prompt}</Detail> : null}
+      {failed && work.result_text ? <Detail label="已有输出">{work.result_text}</Detail> : null}
       {work.failure_reason && rawError(work.failure_reason) ? <Detail label="原始错误">{work.failure_reason}</Detail> : null}
       {work.cwd ? <Detail label="文件夹" mono>{work.cwd}</Detail> : null}
       <View className="gap-0.5">

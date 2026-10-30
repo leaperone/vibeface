@@ -88,6 +88,15 @@ test("a work waits for confirmation only once its device cannot report it", () =
   assert.equal(open.length, 0, "a settled work leaves the list")
 })
 
+test("a failed work stays open until a later work of its conversation ends", () => {
+  let open = mergeOpenWorks([], records({ works: [work("w1", { state: "finished", outcome: "failed" })] }))
+  assert.deepEqual(open.map((item) => item.work_id), ["w1"], "nothing followed the failure up yet")
+  open = mergeOpenWorks(open, records({ works: [work("w2")] }))
+  assert.deepEqual(open.map((item) => item.work_id), ["w1", "w2"], "a work still running does not settle it")
+  open = mergeOpenWorks(open, records({ works: [work("w2", { state: "finished", outcome: "completed" })] }))
+  assert.equal(open.length, 0, "the later work ended, so the failure leaves")
+})
+
 test("works one offline device holds wait on one card; an unverified one keeps its own", () => {
   const nodes: NodeInfo[] = [
     { device_id: "worker", name: "", local: false, online: false, revoked: false, capabilities: { manager: null, manager_state: null, relay: false, roots: [] } },

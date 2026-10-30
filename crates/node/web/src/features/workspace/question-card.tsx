@@ -2,7 +2,7 @@
 
 import { useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
+import { ChevronRight, CircleAlert, CircleCheck, CircleSlash, CircleX, FolderOpen, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, RotateCw, SendHorizontal, Server, TriangleAlert, type LucideIcon } from "lucide-react"
 import { ActionCard, BusyIcon, InlineError, claimFocus, toast, useAction, type Tone } from "@/components/app/kit"
 import { BotFace } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -40,8 +40,8 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   // The first line asks; lines after it list what the answer applies to.
   const [ask = question.text, ...lines] = question.text.split(/\r?\n/).filter((line) => line.trim())
   if (settled) return <Settled ask={ask} lines={lines} focus={answering.current} role={standing === undefined || settled.elsewhere ? "status" : undefined}
-    mark={settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
-    <span className="text-foreground">{settled.elsewhere ? "已由另一端回答：" : "已回答 · "}{settled.text}</span>
+    mark={settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(settled.text) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
+    <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</span>
   </Settled>
 
   if (question.closed) return <Settled ask={ask} lines={lines} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>

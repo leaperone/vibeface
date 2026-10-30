@@ -37,8 +37,13 @@ export function mergeBots(bots: BotRecord[], records: ConversationRecords): BotR
   return bots.map((bot) => bot.conversation_id === records.conversation_id ? { ...bot, last_message: records.last_message ?? bot.last_message, busy: records.busy } : bot)
 }
 
-/** Works no result has settled yet, across conversations: a settled one leaves the list. */
+/**
+ * Works no result has settled yet, across conversations, and each conversation's newest ended work when it failed, as
+ * the Node lists them: a settled one leaves the list, and a failure leaves once a later work of its conversation ends.
+ */
 export function mergeOpenWorks(works: OpenWork[], records: ConversationRecords): OpenWork[] {
   const changed = records.works.map((item) => ({ ...item, conversation_id: records.conversation_id }))
-  return upsert(works, changed, (item) => item.work_id).filter(open)
+  const newest = changed.filter((item) => !delivery(item) && !open(item)).at(-1)?.work_id
+  return upsert(works, changed, (item) => item.work_id).filter((item) => open(item)
+    || !delivery(item) && (item.outcome === "failed" || item.outcome === "rejected") && (item.conversation_id !== records.conversation_id || !newest || item.work_id === newest))
 }

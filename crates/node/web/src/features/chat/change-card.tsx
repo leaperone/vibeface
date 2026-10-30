@@ -1,5 +1,5 @@
 import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, Trash2, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
@@ -160,7 +160,9 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
     <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
-      {!after.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />已暂停</span>
+      {/* A repeating schedule no longer listed was deleted since; one listed says whether it is paused now, not then. */}
+      {!once && !current ? <span className="inline-flex items-center gap-1"><Trash2 aria-hidden="true" className="size-4" />现已删除</span>
+        : !(current ?? after).enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />{current && after.enabled ? '现已暂停' : '已暂停'}</span>
         : next !== null ? <span>{once ? '' : '下次 '}{formatWhen(next)}</span> : null}
     </p>
     {detail ? <Details label="要做的事"><p className="whitespace-pre-wrap text-foreground [word-break:normal] [overflow-wrap:anywhere]">{detail}</p></Details> : null}

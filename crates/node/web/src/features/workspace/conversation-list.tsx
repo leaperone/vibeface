@@ -3,7 +3,6 @@ import { Bot, Plus, WifiOff, type LucideIcon } from "lucide-react"
 import type { ReactNode } from "react"
 import { CountBadge, EmptyState, PrimaryMark, Skeleton } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
-import { moodLabel } from "@vibeface/client/avatar/mood.ts"
 import { Button } from "@/components/ui/button"
 import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
@@ -14,7 +13,7 @@ import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { terms } from "@/lib/glossary"
 import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
 import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
-import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
+import { ConnectionCapsule, MoodTag, useCreateBot } from "./workspace-shell"
 
 /** The phone's home: 待处理 first, then every bot by its newest message. */
 export function ConversationList() {
@@ -31,7 +30,7 @@ export function ConversationList() {
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
       <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace bot={bot} mood={mood} size={44} />} unread={unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
-        name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</>} />
+        name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}<MoodTag mood={mood} /></>} />
     </li>
   })}</ul>
   else if (!workspace.connectionOnline) list = <EmptyState icon={WifiOff} title="正在重连" />
@@ -39,6 +38,7 @@ export function ConversationList() {
   else list = <EmptyState icon={Bot} title="还没有 Bot" action={workspace.writable ? <Button type="button" onClick={create}><Plus aria-hidden="true" />新 Bot</Button> : undefined} />
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-2 max-md:-mx-3 max-md:w-auto">
     <Row to="/inbox" icon={terms.inbox.icon} name={terms.inbox.label} unread={open.length} preview={open[0]?.title ?? ""} />
+    <Row to="/tasks" icon={terms.task.icon} name={terms.task.label} unread={0} preview="" />
     <div className="flex items-center justify-between px-3">
       <h2 className="text-meta font-medium text-muted-foreground">Bot</h2>
       <Button type="button" variant="ghost" size="icon" className="-me-2.5 max-md:-me-3.5 max-md:size-11" aria-label="新 Bot" title="新 Bot" disabled={!workspace.writable && !workspace.pendingBot} onClick={create}><Plus aria-hidden="true" /></Button>
@@ -48,7 +48,7 @@ export function ConversationList() {
   </div>
 }
 
-type RowProps = { icon: LucideIcon; avatar?: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string } & ({ to: "/inbox"; params?: never } | { to: "/b/$botId"; params: { botId: string } })
+type RowProps = { icon: LucideIcon; avatar?: ReactNode; name: string; mark?: ReactNode; preview: string; unread: number; time?: string } & ({ to: "/inbox" | "/tasks"; params?: never } | { to: "/b/$botId"; params: { botId: string } })
 
 function Row({ icon: Icon, avatar, name, mark, preview, unread, time, ...link }: RowProps) {
   return <Link {...link} className="flex min-h-16 items-center gap-3 interactive-row rounded-xl px-3 py-2.5">

@@ -223,6 +223,7 @@ type OverviewTaskCommon = {
   turn_id: string | null
   phase: WorkPhase | null
   reason: string | null
+  failure?: FailureKind
   node: OverviewNode | null
   navigation: OverviewNavigation | null
   source: "event" | "dag" | "local_dispatch" | "local_check" | "remote_owner"

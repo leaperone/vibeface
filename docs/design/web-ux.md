@@ -99,6 +99,6 @@
 
 **禁用词。** 下列词只能出现在 `Details` 里，或出现在 CLI 和文档中。
 
-节点、Node、Gateway、网关、入口、Relay、中继、同步角色、调度、Peer ID、设备编号、公钥、私钥、根私钥、Noise、握手、capability、凭证、签名、成员目录、授权记录、个人网络、恢复包、口令、管理 Agent、协调 Agent、原生工作、原生会话、Agent 任务、Provider、SDK、sidecar、待核对、核对（安全码和核对码除外）、复查、本人、证据、轮次、投递、localhost、JSON、十六进制、epoch、角色。
+节点、Node、Gateway、网关、入口、Relay、中继、同步角色、调度、Peer ID、设备编号、公钥、私钥、根私钥、Noise、握手、capability、凭证、签名、成员目录、授权记录、个人网络、恢复包、口令、管理 Agent、协调 Agent、原生工作、原生会话、Agent 任务、Provider、SDK、sidecar、待核对、核对（安全码和核对码除外）、复查、本人、证据、轮次、投递、localhost、JSON、十六进制、epoch、角色、工作台。
 
 `crates/node/web/src/lib/copy.test.ts` 检查 JSX 文案中的禁用词，由 `pnpm run test` 执行。

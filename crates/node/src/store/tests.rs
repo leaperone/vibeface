@@ -4899,6 +4899,23 @@ fn a_bot_thinks_until_its_reply_runs_and_rests_once_it_ends() -> Result<()> {
 }
 
 #[test]
+fn a_task_running_in_a_bots_conversation_does_not_make_the_bot_reply() -> Result<()> {
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    super::scheduler::admit_from(
+        &store.connection,
+        &net.network,
+        "c",
+        "task:w1",
+        TriggerKind::AgentTask,
+        "w1",
+    )?;
+    assert_eq!(store.busy_conversations()?.get("c"), None);
+    Ok(())
+}
+
+#[test]
 fn last_messages_preview_each_bots_newest_message() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
@@ -6854,6 +6871,48 @@ fn the_prompt_never_carries_the_users_device_signature() -> Result<()> {
     assert!(
         !page.to_string().contains(&signature),
         "nor in what context reads"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_failure_wants_the_user_until_a_later_work_of_its_conversation_ends() -> Result<()> {
+    let work = |id: &str, outcome: Value| -> Result<WorkProjection> {
+        Ok(serde_json::from_value(json!({
+            "work_id":id, "conversation_id":"c", "target_node":"b", "trigger":"message:m", "dispatcher":"a",
+            "kind":"task", "cwd":"/w", "title":"", "prompt":"", "call_ref":id, "continues":null, "parent":null,
+            "thread":null, "phase":null, "summary":"", "thread_id":null, "turn_id":null, "outcome":outcome,
+            "result_text":"", "failure_reason":null, "failure":null,
+            "state":if outcome.is_null() { "running" } else { "finished" },
+        }))?)
+    };
+    let ids = |works: Vec<WorkProjection>| {
+        works
+            .into_iter()
+            .map(|work| work.work_id)
+            .collect::<Vec<_>>()
+    };
+    let failed = || work("w1", json!("failed"));
+    assert_eq!(ids(super::unsettled(vec![failed()?])), ["w1"]);
+    assert_eq!(
+        ids(super::unsettled(vec![failed()?, work("w2", Value::Null)?])),
+        ["w1", "w2"],
+        "a work still running does not follow the failure up"
+    );
+    assert_eq!(
+        ids(super::unsettled(vec![
+            failed()?,
+            work("w2", json!("completed"))?
+        ])),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ids(super::unsettled(vec![
+            failed()?,
+            work("w2", json!("rejected"))?
+        ])),
+        ["w2"],
+        "only the newest failure stays"
     );
     Ok(())
 }

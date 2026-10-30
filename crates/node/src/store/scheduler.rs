@@ -1340,9 +1340,10 @@ impl Store {
     }
 
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
+    /// An agent task runs in its bot's conversation but is that work, not a reply in the chat.
     pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
         let mut statement = self.connection.prepare(
-            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering')
+            "SELECT conversation_id,state FROM scheduler_jobs WHERE state IN ('queued','claimed','running','cancelling','steering') AND kind<>'agent_task'
              UNION ALL SELECT conversation_id,'queued' FROM scheduler_outbox",
         )?;
         let rows =
