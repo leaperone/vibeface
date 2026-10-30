@@ -155,13 +155,14 @@ impl Provider {
         }
     }
 
-    /// What the runtime can run on each provider: the Cursor bridge runs only bots.
+    /// What the runtime can run on each provider.
     pub fn supports(self) -> &'static [Role] {
         match self {
-            Provider::Codex | Provider::Claude | Provider::Pi | Provider::Opencode => {
-                &[Role::Agent, Role::Execution]
-            }
-            Provider::Cursor => &[Role::Agent],
+            Provider::Codex
+            | Provider::Cursor
+            | Provider::Claude
+            | Provider::Pi
+            | Provider::Opencode => &[Role::Agent, Role::Execution],
         }
     }
 
@@ -178,7 +179,7 @@ impl Provider {
         }
     }
 
-    /// What a work on the provider can ask for; Cursor runs none.
+    /// What a work on the provider can ask for.
     pub fn work(self) -> WorkCapabilities {
         match self {
             Provider::Codex => WorkCapabilities {
@@ -717,8 +718,8 @@ mod tests {
         assert!(local.codex_target(false) == CodexTarget::Off);
         local.switches.execution.insert(Provider::Cursor);
         assert!(
-            local.validate(true).is_err(),
-            "only a provider that executes work joins the set"
+            local.validate(true).is_ok(),
+            "Cursor can execute dispatched work"
         );
         assert!(
             serde_json::from_value::<Providers>(serde_json::json!({

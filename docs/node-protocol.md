@@ -32,8 +32,8 @@
 | `public_entry` | `true` 表示不加入个人网络。默认提供网页、relay 和密文转发；`discovery-only` 时仅提供发现服务和可选静态网页；两种模式都可另行启用独立文件交付服务 |
 | `roots` | 本机 Agent 和工作可选择的绝对项目目录 |
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
-| `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex` 或 `cursor`），关闭时为 `null` |
-| `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（现在只有 `codex`，由 Codex App Server 执行）；为空时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
+| `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
+| `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。Codex Bot 独立控制其所需的 App Server 连接 |
 | `providers.codex_app_server` | `{mode, socket}`：`system` 要求 `socket`；`spawn` 时 Node 自行托管，要求 Provider 环境设置 `CODEX_HOME`。用到 Codex 而缺失时，`init`、启动和 `configure_provider` 从本机找出并写入，见[部署配置](deployment.md#配置-sdk-与-app-server) |
 | `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
@@ -67,7 +67,9 @@
 
 `provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、pi 与 opencode 支持 steer，Cursor 与 Claude Code 的消息继续排队。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
 
-Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
+Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。任务也使用独立进程和存储，续接同一本机任务会话时复用原有 owner。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
+
+Cursor 执行器在发送前保存 Agent ID，流首次给出 Run ID 时记录该运行。工作进度和结果使用既有工作状态与事件；取消只在 Provider 终态确认后结算。断流或重启后按已知 Agent ID、Run ID 和原有私有存储调用 `GetRun`；缺少运行 ID 或读取失败时保持待核对，绝不按最新运行猜测或重新发送。任务回读不改变 Bot 的 `run_reconcile=false` 能力声明。
 
 Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工具进程环境。Node 不再通过插件修改 Shell 环境；发送提示前必须成功设置该轮的工具凭证。读取消息和待处理 inbox 后才判断发送结果，不重发结果未知的请求。取消会删除本轮仍在 inbox 中的输入；只有没有待处理输入时才结清待核对，新的回合也不能唤醒残留队列。外部 CLI 会话的 hook 插件不在此适配范围内。
 
@@ -90,7 +92,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `join.json` | `vibeface join` 进行中的请求，重试时沿用同一请求 |
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
-| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot 或 coordination Agent 的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
+| `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务会话的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
+| `cursor/work-owners.json` | 本机 Cursor 任务到原生 Agent、会话 owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
 

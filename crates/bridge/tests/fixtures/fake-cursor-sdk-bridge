@@ -60,6 +60,15 @@ def agent_file(agent):
     return os.path.join(local_store["rootDir"], agent + ".jsonl")
 
 
+def stored_run(agent, run):
+    try:
+        with open(agent_file(agent)) as history_file:
+            rows = [json.loads(line) for line in history_file]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return next((row for row in reversed(rows) if row.get("run_id") == run), None)
+
+
 def frame(flags, message):
     body = json.dumps(message).encode()
     return bytes([flags]) + len(body).to_bytes(4, "big") + body
@@ -69,6 +78,10 @@ def finished(agent, run, text):
     status = "RUN_LIFECYCLE_STATUS_FINISHED"
     inner = {"agentId": agent, "runId": run, "status": status, "result": text}
     return {"result": {"agentId": agent, "runId": run, "status": status, "result": inner}}
+
+
+def run_status(run):
+    return os.environ.get("FAKE_BRIDGE_GET_RUN_STATUS", "RUN_LIFECYCLE_STATUS_CANCELLED")
 
 
 class Bridge(BaseHTTPRequestHandler):
@@ -93,8 +106,8 @@ class Bridge(BaseHTTPRequestHandler):
         if method == "Send":
             message = json.loads(request[5:])
             agent, run = message["agentId"], "run-" + uuid.uuid4().hex
-            runs[run] = agent
             text = message["message"]["text"]
+            runs[run] = {"agent": agent, "result": "done: " + text}
             try:
                 with open(agent_file(agent)) as history_file:
                     history = [json.loads(line) for line in history_file]
@@ -106,6 +119,21 @@ class Bridge(BaseHTTPRequestHandler):
             if gate_dir:
                 while not os.path.exists(os.path.join(gate_dir, text.split("-", 1)[0])):
                     time.sleep(0.01)
+            if "hang" in text and "unknown" not in text:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/connect+json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                initial = frame(0, {"sdkMessage": {"type": "status", "message": {
+                    "agentId": agent, "runId": run, "status": "RUN_LIFECYCLE_STATUS_RUNNING"}}})
+                self.wfile.write(f"{len(initial):X}\r\n".encode() + initial + b"\r\n")
+                self.wfile.flush()
+                while (runs.get(run) or {}).get("status") != "RUN_LIFECYCLE_STATUS_CANCELLED":
+                    time.sleep(0.01)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                return
             if "hang" in text:
                 time.sleep(3600)
             if delay_ms:
@@ -113,6 +141,9 @@ class Bridge(BaseHTTPRequestHandler):
             answer = "done: " + text
             if text == "recall":
                 answer = "remembered: " + next(row["prompt"] for row in reversed(history) if "prompt" in row)
+            runs[run]["result"] = answer
+            with open(agent_file(agent), "a") as history_file:
+                history_file.write(json.dumps({"run_id": run, "status": "RUN_LIFECYCLE_STATUS_FINISHED", "result": answer}) + "\n")
             stream = (frame(0, finished(agent, run, answer))
                       + frame(0, {"done": {"agentId": agent, "runId": run}}) + frame(2, {}))
             return self.answer(200, stream, "application/connect+json")
@@ -131,11 +162,23 @@ class Bridge(BaseHTTPRequestHandler):
             elif not os.path.isfile(agent_file(agent)):
                 return self.answer(404, b'{"message":"agent not found in private store"}')
             return self.answer(200, json.dumps({"agentId": agent}).encode())
+        if method == "CancelRun":
+            run = runs.get(body.get("runId"))
+            if run:
+                run["status"] = "RUN_LIFECYCLE_STATUS_CANCELLED"
+                with open(agent_file(run["agent"]), "a") as history_file:
+                    history_file.write(json.dumps({"run_id": body.get("runId"), "status": "RUN_LIFECYCLE_STATUS_CANCELLED"}) + "\n")
+            return self.answer(200, b"{}")
+        requested_agent = body.get("options", {}).get("agentId")
+        stored = stored_run(requested_agent, body.get("runId")) if requested_agent else None
+        snapshot = runs.get(body.get("runId")) or stored or {}
         replies = {
             "Ping": {"message": "pong"},
             "GetVersion": {"protocolVersion": "sdk.v1"},
-            "GetRun": {"run": {"agentId": runs.get(body.get("runId")), "runId": body.get("runId"),
-                               "status": "RUN_LIFECYCLE_STATUS_CANCELLED"}},
+            "GetRun": {"run": {"agentId": snapshot.get("agent", requested_agent),
+                               "runId": body.get("runId"),
+                               "status": snapshot.get("status", run_status(body.get("runId"))),
+                               "result": snapshot.get("result", os.environ.get("FAKE_BRIDGE_GET_RUN_RESULT"))}},
         }
         if method == "Shutdown":
             threading.Timer(0.1, os._exit, [0]).start()
