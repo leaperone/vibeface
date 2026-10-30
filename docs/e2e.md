@@ -138,6 +138,20 @@ python3 scripts/verify-node.py --delivery-ui-selfcheck \
 
 原生验收使用已有 e2e mobile 引擎，必须指定当前任务构建的 `.app`、Node、匹配 WASM，以及专用模拟器的 UUID。该入口会重新安装本任务应用并清除该专用模拟器的钥匙串。不要指定其他任务正在使用的模拟器。
 
+先在任务 worktree 根目录构建模拟器 `.app`，命令与 `.github/workflows/mobile.yml` 一致，只把产物放进 `.artifacts/native/`：
+
+```sh
+scripts/build-mobile-secure.sh ios
+(cd apps/mobile && npx expo prebuild --platform ios && \
+  xcodebuild -workspace ios/Vibeface.xcworkspace -scheme Vibeface -configuration Release \
+    -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' ARCHS=arm64 \
+    -derivedDataPath ../../.artifacts/native/ios-build \
+    CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build)
+cp -R .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app .artifacts/native/
+```
+
+必须带 `CODE_SIGN_IDENTITY=-`（ad-hoc 签名）：没有它，未签名的构建会因为签名失败而中断。ad-hoc 签名还会把模拟器 entitlements 写进二进制，缺少它们时钥匙串会拒绝 SecureStore。
+
 ```sh
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
 VIBEFACE_E2E_SIMULATOR="$TASK_SIMULATOR_UUID" \
