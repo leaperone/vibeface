@@ -235,7 +235,6 @@ function AssistantDetails({ manager, models, working, save }: { manager: Manager
   const input = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Input accessibilityLabel={label} className={key === 'model' ? 'min-w-0 flex-1' : 'font-mono'} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
     value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
   return <View className="gap-3">
-    <Text className="text-meta font-medium text-muted-foreground">Bot</Text>
     <Field label={copy.label}>
       {models && !typing
         ? <ModelPicker models={models} value={draft.model} working={working} pick={(model) => setDraft({ ...draft, model })} other={() => { setTyping(true); setDraft({ ...draft, model: '' }) }} />
@@ -265,12 +264,12 @@ function ModelPicker({ models, value, working, pick, other }: { models: ModelCho
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" />
     </Pressable>
     {open ? <View accessibilityRole="radiogroup">
-      {options.map(([id, name]) => <Pressable key={id || 'default'} accessibilityRole="radio" accessibilityState={{ checked: id === value }}
+      {options.map(([id, name]) => <Pressable key={id || 'default'} accessibilityRole="radio" accessibilityState={{ checked: id === value, disabled: working }} disabled={working}
         className="min-h-11 flex-row items-center gap-3 border-t border-border px-3 active:bg-muted" onPress={() => choose(() => pick(id))}>
         <Text numberOfLines={1} className="min-w-0 flex-1">{name}</Text>
         {id === value ? <Icon as={Check} className="size-4" /> : null}
       </Pressable>)}
-      <Pressable accessibilityRole="radio" accessibilityState={{ checked: false }} className="min-h-11 flex-row items-center border-t border-border px-3 active:bg-muted" onPress={() => choose(other)}>
+      <Pressable accessibilityRole="button" accessibilityState={{ disabled: working }} disabled={working} className="min-h-11 flex-row items-center border-t border-border px-3 active:bg-muted" onPress={() => choose(other)}>
         <Text className="min-w-0 flex-1">{copy.other}</Text>
       </Pressable>
     </View> : null}

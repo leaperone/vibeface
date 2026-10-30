@@ -19,9 +19,10 @@ const CURSOR_KEY: &str = "CURSOR_API_KEY";
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
 /// the Node watches. Its methods say most of what the runtime needs to know about the product;
 /// the code that speaks a provider's protocol also matches on it: its `Executor` and the resident
-/// process the runtime keeps for it, its bot turn's `Sdk` and its hook parser. Outside them only
-/// Codex's App Server is named: the capabilities a Node offers report its connection and whether
-/// Codex executes work on it, which no other provider has.
+/// process the runtime keeps for it, its bot turn's `Sdk` and its hook parser. What only Codex has
+/// also names it: its folder (discovery, its hook file), its App Server (whose connection, and
+/// whether Codex executes work, the capabilities a Node offers report), and its being the default
+/// provider of a new bot.
 #[derive(
     Clone,
     Copy,

@@ -1943,16 +1943,27 @@ async fn hook(options: Hook) -> Result<()> {
 
 /// The home folder `vibeface hooks` edits and Codex's folder in it. `--home` holds every file,
 /// Codex's too; without it, `$HOME`, and Codex's folder is found as Codex finds it: `CODEX_HOME`,
-/// else `$HOME/.codex`.
+/// which must be an existing folder, else `$HOME/.codex`.
 fn hook_homes(home: Option<&Path>, host: &vibeface::discovery::Host) -> Result<(PathBuf, PathBuf)> {
     if let Some(home) = home {
         return Ok((home.to_owned(), home.join(".codex")));
     }
-    let home = host.home.clone().context("HOME is not set; pass --home")?;
-    let codex_home = host
-        .codex_home
+    let home = host
+        .home
         .clone()
-        .unwrap_or_else(|| home.join(".codex"));
+        .filter(|home| home.is_absolute())
+        .context("HOME is not an absolute path; pass --home")?;
+    let codex_home = match host.codex_home.clone() {
+        Some(codex_home) => {
+            ensure!(
+                codex_home.is_absolute() && codex_home.is_dir(),
+                "CODEX_HOME {} is not an existing absolute folder",
+                codex_home.display()
+            );
+            codex_home
+        }
+        None => home.join(".codex"),
+    };
     Ok((home, codex_home))
 }
 
@@ -2895,6 +2906,14 @@ mod tests {
             !codex.exists() && !home.exists(),
             "--home keeps CODEX_HOME and $HOME untouched"
         );
+        assert!(
+            run(env(home.clone(), Some(codex.clone())), None)
+                .await
+                .is_err()
+                && !home.exists(),
+            "a CODEX_HOME that does not exist is refused before anything is written"
+        );
+        fs::create_dir_all(&codex).unwrap();
         run(env(home.clone(), Some(codex.clone())), None)
             .await
             .unwrap();

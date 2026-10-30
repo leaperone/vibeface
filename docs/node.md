@@ -137,7 +137,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 回答本人自己开的会话
 
-`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。文件默认在 `$HOME` 下，Codex 的在 Codex 目录（`CODEX_HOME`，没设时 `~/.codex`）。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
+`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。文件默认在 `$HOME` 下，Codex 的在 Codex 目录（`CODEX_HOME`，须是已有目录；没设时 `~/.codex`）。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
 | 产品 | 写入 | Bot 能回答 |
 |---|---|---|

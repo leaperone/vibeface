@@ -628,7 +628,6 @@ pub struct HookFile {
     pub events: &'static [&'static str],
 }
 
-/// The hook files under `home`; Codex's is in `codex_home` when it has one.
 /// The hook files under `home`, Codex's under `codex_home`.
 pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
     Provider::ALL
