@@ -82,14 +82,11 @@ npm 包内含完整平台程序和服务脚本，不在 postinstall 阶段下载
 
 ### 首次启动
 
-先按[部署配置](docs/deployment.md)选择本机目录和要启用的集成。
-
 ```sh
-export VIBEFACE_DATA_DIR='<数据目录的绝对路径>'
-vibeface --data-dir "$VIBEFACE_DATA_DIR"
+vibeface
 ```
 
-首次运行只在指定的空数据目录初始化，并监听 `127.0.0.1:4790`。然后：
+数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](docs/deployment.md)。首次运行只在空目录或不存在的目录初始化，并监听 `127.0.0.1:4790`。然后：
 
 1. 在本机浏览器打开 `http://localhost:4790`（保存密钥需要安全上下文，请固定用 `localhost`）。
 2. 填写浏览器名称和恢复包口令，下载并保存加密恢复包，创建个人网络。
@@ -102,7 +99,6 @@ vibeface --data-dir "$VIBEFACE_DATA_DIR"
 
 ```sh
 vibeface init \
-	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects \
 	--manager codex \
 	--codex-socket '<App Server socket 的绝对路径>' \
@@ -173,9 +169,8 @@ bash scripts/build-web-crypto.sh
 bash scripts/build-web.sh
 bash scripts/package-node.sh
 ./target/release/vibeface init \
-	--data-dir "$VIBEFACE_DATA_DIR" \
 	--root /absolute/path/to/projects
-./target/release/vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
+./target/release/vibeface serve
 ```
 
 `init` 要求数据目录为空或不存在。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和 `node.sqlite3`，运行日志写在 `node.log`。`serve` 和 `join` 用目录锁独占数据目录。

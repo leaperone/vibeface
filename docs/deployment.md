@@ -4,13 +4,15 @@
 
 ## 指定数据目录
 
+默认数据目录是 `~/.vibeface`。要使用其他目录，在命令中传入 `--data-dir '<数据目录的绝对路径>'`，或设置环境变量：
+
 ```sh
 export VIBEFACE_DATA_DIR='<数据目录的绝对路径>'
-vibeface init --data-dir "$VIBEFACE_DATA_DIR"
-vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
+vibeface init
+vibeface serve
 ```
 
-所有读取或写入 Node 数据的命令都要求 `--data-dir` 或 `VIBEFACE_DATA_DIR`。直接运行 `vibeface` 也要求这个配置，并只在明确指定的空目录初始化。程序不使用当前目录或用户 home 作为兜底。
+读取或写入 Node 数据的命令依次使用 `--data-dir`、`VIBEFACE_DATA_DIR` 和 `~/.vibeface`，路径必须是绝对路径。取不到 `HOME` 时报错，需显式指定目录。直接运行 `vibeface` 只在所选目录为空或不存在时初始化。程序不使用当前目录。
 
 默认只监听回环地址，不开放项目目录，不启用执行 Provider，也不扫描其他应用的会话。要允许访问项目，在初始化时重复传入 `--root '<项目的绝对路径>'`，或在有管理权限的设备设置中配置。
 
@@ -19,7 +21,7 @@ vibeface serve --data-dir "$VIBEFACE_DATA_DIR"
 在建网页面填写设备名称。加入已有网络时显式指定名称：
 
 ```sh
-vibeface join '<加入链接>' --name '<设备显示名称>' --data-dir "$VIBEFACE_DATA_DIR"
+vibeface join '<加入链接>' --name '<设备显示名称>'
 ```
 
 程序不读取系统主机名。未授权连接只能取得通用 Node 信息；实际名称、网络 ID 和入口信息要求有效成员身份或本机会话。
@@ -85,8 +87,8 @@ Provider 的其他认证环境通过设备设置或服务配置填写。不要�
 安装 hooks 时也必须明确选择被修改的配置所在 home，写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
-vibeface hooks install --data-dir "$VIBEFACE_DATA_DIR" --home '<包含各 Agent 配置的目录>'
-vibeface hooks status --data-dir "$VIBEFACE_DATA_DIR" --home '<同一个目录>'
+vibeface hooks install --home '<包含各 Agent 配置的目录>'
+vibeface hooks status --home '<同一个目录>'
 ```
 
 本地执行保留所需的真实路径。共享事件和 webhook 使用工作区相对标识，日志隐藏已配置的私有目录。诊断导出提供配置摘要，不输出本机配置文件全文。
@@ -110,8 +112,8 @@ bash install.sh --channel nightly --install-root "$VIBEFACE_INSTALL_ROOT" --bin-
 使用受管更新或原生后台服务前，登记安装目录：
 
 ```sh
-vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
-vibeface service install --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
+vibeface service install
 ```
 
 服务使用部署时选定的程序和数据目录。不要依赖交互式 shell 的 PATH；后台 Provider 建议使用绝对程序路径。macOS 使用当前用户的 LaunchAgent，Linux 使用当前用户的 systemd 服务，服务管理器的标准目录由平台决定。

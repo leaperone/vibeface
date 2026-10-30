@@ -7,8 +7,8 @@ use vibeface::{config, update};
 #[derive(Args)]
 pub struct Service {
     /// Data directory bound to this user's single installed node service.
-    #[arg(long, global = true, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
-    data_dir: Option<PathBuf>,
+    #[arg(long, global = true, env = "VIBEFACE_DATA_DIR", value_parser = config::data_dir, default_value_os_t = config::default_data_dir())]
+    data_dir: PathBuf,
     #[command(subcommand)]
     action: Action,
 }
@@ -92,11 +92,7 @@ fn command(root: &Path, data: &Path, executable: &Path, action: Action) -> Resul
 }
 
 pub async fn run(options: Service) -> Result<()> {
-    let data_dir = options
-        .data_dir
-        .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
-    ensure!(data_dir.is_absolute(), "--data-dir must be absolute");
-    let data = std::fs::canonicalize(data_dir)
+    let data = std::fs::canonicalize(options.data_dir)
         .context("initialized data directory is required; run vibeface init first")?;
     config::identity(&data)?;
     let executable = std::env::current_exe()?;

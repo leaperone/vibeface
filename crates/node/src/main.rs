@@ -36,7 +36,8 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// Data directory for direct startup. Subcommands accept their own --data-dir.
+    /// Data directory for direct startup; defaults to VIBEFACE_DATA_DIR, then ~/.vibeface.
+    /// Subcommands accept their own --data-dir.
     #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     /// Disable browser access for this run; local tools and hooks remain available.
@@ -136,7 +137,7 @@ enum CodexCommand {
 
 #[derive(Args)]
 struct DataDir {
-    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::data_dir, default_value_os_t = config::default_data_dir())]
     data_dir: PathBuf,
 }
 
@@ -437,17 +438,30 @@ struct Join {
     name: String,
 }
 
+fn direct_data_dir(
+    argument: Option<PathBuf>,
+    env: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let dir = argument
+        .or_else(|| env.map(PathBuf::from))
+        .unwrap_or_else(|| config::home_data_dir(home));
+    ensure!(!dir.as_os_str().is_empty(), config::NO_HOME);
+    ensure!(dir.is_absolute(), "specify an absolute data directory");
+    Ok(dir)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let command = match cli.command {
         Some(command) => command,
         None => {
-            let data_dir = cli
-                .data_dir
-                .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
-                .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
-            ensure!(data_dir.is_absolute(), "specify an absolute data directory");
+            let data_dir = direct_data_dir(
+                cli.data_dir,
+                std::env::var_os("VIBEFACE_DATA_DIR"),
+                std::env::var_os("HOME"),
+            )?;
             if !data_dir.join("config.json").exists() {
                 check_ports(
                     DEFAULT_LISTEN,
@@ -2018,6 +2032,7 @@ async fn triage(options: Triage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn receiving_key_commands_require_an_explicit_stable_intent() {
@@ -2147,6 +2162,67 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!read.contains("codex send"), "{read}");
+    }
+
+    #[test]
+    fn data_directory_defaults_to_home_unless_named() {
+        let home = || Some("/home/me".into());
+        let direct = |argument: Option<&str>, env: Option<&str>, home| {
+            direct_data_dir(argument.map(PathBuf::from), env.map(Into::into), home)
+        };
+        assert_eq!(
+            direct(Some("/arg"), Some("/env"), home()).unwrap(),
+            Path::new("/arg")
+        );
+        assert_eq!(
+            direct(None, Some("/env"), home()).unwrap(),
+            Path::new("/env")
+        );
+        assert_eq!(
+            direct(None, None, home()).unwrap(),
+            Path::new("/home/me/.vibeface")
+        );
+        for home in [None, Some("relative".into())] {
+            assert_eq!(
+                direct(None, None, home).unwrap_err().to_string(),
+                config::NO_HOME
+            );
+        }
+        assert!(direct(None, Some("relative"), home()).is_err());
+        assert_eq!(config::data_dir("").unwrap_err(), config::NO_HOME);
+
+        fn data_dir_commands(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+            if let Some(arg) = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "data_dir")
+                && arg.get_env().is_some()
+            {
+                assert_eq!(arg.get_env().unwrap(), "VIBEFACE_DATA_DIR", "{path}");
+                assert_eq!(
+                    arg.get_default_values(),
+                    [config::default_data_dir().as_os_str()],
+                    "{path}"
+                );
+                found.push(path.to_owned());
+            }
+            for sub in command.get_subcommands() {
+                data_dir_commands(sub, &format!("{path} {}", sub.get_name()), found);
+            }
+        }
+        let mut cli = Cli::command();
+        cli.build();
+        let mut found = Vec::new();
+        data_dir_commands(&cli, "vibeface", &mut found);
+        for expected in [
+            "vibeface serve",
+            "vibeface join",
+            "vibeface status",
+            "vibeface update apply",
+            "vibeface service install",
+            "vibeface hooks",
+        ] {
+            assert!(found.iter().any(|path| path == expected), "{expected}");
+        }
     }
 
     #[test]

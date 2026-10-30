@@ -1,6 +1,6 @@
 # 安装与管理节点
 
-本文的命令使用[部署配置](deployment.md)中显式设置的 `VIBEFACE_DATA_DIR`、`VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`。先设置所需变量，再执行对应步骤。
+本文的命令默认使用数据目录 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定其他绝对路径，见[部署配置](deployment.md)。涉及安装的步骤还使用 `VIBEFACE_INSTALL_ROOT` 和 `VIBEFACE_BIN_DIR`，先设置这两个变量。
 
 Vibeface 的主程序是 Rust 二进制 CLI `vibeface`，网页随程序内嵌分发。支持 macOS Apple Silicon、Linux x64 和 Linux ARM64；Linux 包需要 glibc。macOS 发布包的程序使用 Developer ID 签名并通过 Apple notarization。系统设置保持默认的“自动允许下载的已签名软件接收传入连接”且未阻止所有传入连接时，应用防火墙直接放行，安装和更新后不再询问。
 
@@ -86,11 +86,11 @@ vibeface --help
 vibeface
 ```
 
-先按[部署配置](deployment.md)设置 `VIBEFACE_DATA_DIR`。首次仅在指定的空目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
+数据目录默认为 `~/.vibeface`，可用 `--data-dir` 或 `VIBEFACE_DATA_DIR` 指定，见[部署配置](deployment.md)。首次仅在空目录或不存在的目录中创建本机身份与配置，监听 `127.0.0.1:4790`，不开放局域网，不允许执行目录，不启用管理 Agent，不配置 relay 或公共入口。已有配置按原身份启动；损坏、非空未初始化或符号链接目录不会被重置。启动不自动输出配对秘密。
 
 保持进程运行，在本机可信浏览器打开 `http://localhost:4790`。填写浏览器名称及恢复包口令，下载并确认保存加密恢复包后创建个人网络，不需要复制终端邀请。已有网络的节点会尝试核验当前浏览器；新浏览器可使用本机自动访问，永久成员授权仍需原有成员邀请或恢复包。使用恢复包时，本机入口和初始化授权自动选取。
 
-另一台节点加入已有个人网络时，先在它上面执行 `vibeface init`，不要在它的本机网页上建网。然后在管理设备的**添加设备**里生成加入链接，在新节点上执行 `vibeface join <链接> --name <设备显示名称>`，终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
+另一台节点加入已有个人网络时，先在它上面执行 `vibeface init`，不要在它的本机网页上建网。然后在管理设备的**添加设备**里生成加入链接，在新节点上执行 `vibeface join '<加入链接>' --name '<设备显示名称>'`，终端显示 6 位安全码，在管理设备上核对一致后点**一致，允许**。中断后用同一链接和目录重试，沿用原请求。见 [添加自己的设备](node.md#添加自己的设备)。`vibeface access` 保留为本机网页的备用入口。
 
 使用签名管理身份或可信本机会话进入工作区后，在**设置**中选择管理 Agent、模型和允许 Agent 访问的项目目录。默认 Agent 工作目录在首次保存时自动创建，无需编辑配置文件或重启 Node。编码执行和管理 Agent 仍需事先安装并登录对应 Provider，角色授权也必须满足要求。见 [配置管理 Agent](node.md#配置管理-agent)。
 
@@ -153,22 +153,22 @@ vibeface service uninstall
 首次下载渠道与运行时更新策略分别配置。更新器没有默认策略，必须明确指定渠道、是否自动更新及安装根目录。Nightly 安装初始化后配置：
 
 ```sh
-vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
-vibeface update status --data-dir "$VIBEFACE_DATA_DIR"
-vibeface update check --data-dir "$VIBEFACE_DATA_DIR"
-vibeface update apply --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update configure --channel nightly --automatic false --install-root "$VIBEFACE_INSTALL_ROOT"
+vibeface update status
+vibeface update check
+vibeface update apply
 ```
 
 手动应用更新需已安装并运行用户服务，更新器才可取得维护租约并确认重启健康状态。希望在空闲时自动更新：
 
 ```sh
-vibeface update configure --channel nightly --automatic true --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update configure --channel nightly --automatic true --install-root "$VIBEFACE_INSTALL_ROOT"
 ```
 
 将来改用正式版：
 
 ```sh
-vibeface update configure --channel stable --automatic true --install-root "$VIBEFACE_INSTALL_ROOT" --data-dir "$VIBEFACE_DATA_DIR"
+vibeface update configure --channel stable --automatic true --install-root "$VIBEFACE_INSTALL_ROOT"
 ```
 
 Stable 不存在时不会切换 Nightly，更新器也不自动降级。每次 `update configure` 都必须传入实际安装根目录的绝对路径。更新行为、维护检查和备份边界见 [构建与发布](releasing.md#更新渠道)。

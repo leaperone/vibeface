@@ -5,7 +5,7 @@
 ## 看状态
 
 ```sh
-vibeface status --data-dir "$VIBEFACE_DATA_DIR"
+vibeface status
 ```
 
 Node 在运行时输出类似：

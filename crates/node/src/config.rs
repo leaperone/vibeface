@@ -2,6 +2,7 @@ use crate::crypto::LocalIdentity;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsString,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -22,6 +23,28 @@ pub const DEFAULT_LOCAL_LISTEN: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4791);
 
 pub const UNNAMED_NODE: &str = "Node";
+
+pub const NO_HOME: &str = "HOME is unset or not absolute; pass --data-dir or set VIBEFACE_DATA_DIR";
+
+/// `$HOME/.vibeface`, or empty when HOME is unset or relative so that `data_dir` reports it.
+pub fn default_data_dir() -> PathBuf {
+    home_data_dir(std::env::var_os("HOME"))
+}
+
+pub fn home_data_dir(home: Option<OsString>) -> PathBuf {
+    home.map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".vibeface"))
+        .unwrap_or_default()
+}
+
+pub fn data_dir(value: &str) -> std::result::Result<PathBuf, String> {
+    if value.is_empty() {
+        Err(NO_HOME.into())
+    } else {
+        absolute_path(value)
+    }
+}
 
 pub fn absolute_path(value: &str) -> std::result::Result<PathBuf, String> {
     let path = PathBuf::from(value);
