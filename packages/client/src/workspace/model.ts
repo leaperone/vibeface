@@ -3,7 +3,7 @@ import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
-  BotChange, BotChangeRecord, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
+  BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
 } from "./types.ts"
 import { answerId } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
@@ -213,6 +213,7 @@ export function parseConversation(value: unknown, expectedId?: string): Conversa
     checks: list(data.checks).map(coordinationCheck),
     local_node: text(data.local_node),
     changes: list(data.changes).map(changeRecord),
+    overwritten: list(data.overwritten).map(overwritten),
     bot_settings: botSettings(data.bot_settings),
     questions: list(data.questions).map(question),
     sessions: list(data.sessions).map(sessionHandoff),
@@ -280,6 +281,17 @@ function changeRecord(value: unknown): BotChangeRecord {
   const data = record(value)
   const cause = data.cause == null ? null : record(data.cause)
   return { change_id: text(data.change_id), conversation_id: text(data.conversation_id), cause: cause && { conversation_id: text(cause.conversation_id), message_id: text(cause.message_id) }, event_hash: text(data.event_hash), created_at_ms: number(data.created_at_ms), change: botChange(data.change) }
+}
+function overwritten(value: unknown): Overwritten {
+  const data = record(value)
+  const base = { change_id: text(data.change_id), by: text(data.by) }
+  switch (data.field) {
+    case "name": case "instructions": return { ...base, field: data.field, value: text(data.value) }
+    case "model": return { ...base, field: "model", provider: provider(data.provider), value: text(data.value) }
+    case "skills": return { ...base, field: "skills", value: skillSet(data.value) }
+    case "avatar": return { ...base, field: "avatar", value: avatar(data.value) }
+    default: throw new Error("被覆盖的设置无法识别。")
+  }
 }
 function botSettings(value: unknown): BotSettings {
   const data = record(value)

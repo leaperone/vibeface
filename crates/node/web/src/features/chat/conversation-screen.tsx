@@ -95,7 +95,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
   const changes = data?.changes ?? []
   const placedChanges = placeChanges(data?.messages ?? [], changes)
-  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} /> })
+  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={data?.bot_settings?.schedules ?? []} overwritten={data?.overwritten ?? []} /> })
 
   // Questions, hand-offs and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []

@@ -1890,6 +1890,107 @@ fn a_bot_change_must_follow_the_users_signed_message() -> Result<()> {
 }
 
 #[test]
+fn a_bot_setting_two_devices_changed_at_once_names_the_change_that_lost() -> Result<()> {
+    use bot_settings::{Overwritten, Setting};
+    let net = net()?;
+    let (mut a_side, _) = bot_with_message(&net)?;
+    let mut b_side = store(&net)?;
+    sync(&a_side, &mut b_side, &net)?;
+    b_side.append_event(&net.b, &net.network, "c", user(&net, "m2", "y"), vec![], 4)?;
+    let rename_on = |store: &mut Store, identity, trigger, call_ref, name, at| {
+        store.change_bot(
+            identity,
+            &net.network,
+            "c",
+            trigger,
+            call_ref,
+            rename(name),
+            Provider::Codex,
+            at,
+        )
+    };
+    let (alpha, _) = rename_on(&mut a_side, &net.a, "message:m1", "r1", "Alpha", 5)?;
+    let (beta, _) = rename_on(&mut b_side, &net.b, "message:m2", "r1", "Beta", 5)?;
+    sync(&a_side, &mut b_side, &net)?;
+    sync(&b_side, &mut a_side, &net)?;
+
+    let stands = a_side.bots(&net.network)?[0].name.clone();
+    let (lost, won, winner) = if stands == "Beta" {
+        (alpha, "Beta", &net.b)
+    } else {
+        (beta, "Alpha", &net.a)
+    };
+    let expected = vec![Overwritten {
+        change_id: lost.change_id.clone(),
+        setting: Setting::Name,
+        by: winner.device_id()?,
+        value: json!(won),
+    }];
+    for side in [&a_side, &b_side] {
+        assert_eq!(
+            side.bots(&net.network)?[0].name,
+            won,
+            "the larger rank still wins"
+        );
+        assert_eq!(side.overwritten(&net.network, "c")?, expected);
+    }
+
+    let replayed = b_side.ingest_events(
+        &net.network,
+        &a_side.events_from(&net.network, &net.a.device_id()?, 1, 500)?,
+    )?;
+    assert!(
+        replayed
+            .statuses
+            .iter()
+            .all(|status| *status == IngestStatus::Duplicate)
+    );
+    assert_eq!(
+        b_side.overwritten(&net.network, "c")?,
+        expected,
+        "a replay adds nothing"
+    );
+    a_side.connection.execute(
+        "UPDATE events SET effective=0 WHERE network_id=?",
+        [&net.network],
+    )?;
+    reduce::clear(&a_side.connection, &net.network)?;
+    log::recompute(
+        &a_side.connection,
+        &membership_from(&a_side.connection, &net.network)?,
+    )?;
+    assert_eq!(
+        a_side.overwritten(&net.network, "c")?,
+        expected,
+        "a rebuild adds nothing"
+    );
+    let mut late = store(&net)?;
+    sync(&b_side, &mut late, &net)?;
+    assert_eq!(
+        late.overwritten(&net.network, "c")?,
+        expected,
+        "a new replica agrees"
+    );
+
+    let (loser_side, loser, trigger, mine) = if won == "Beta" {
+        (&mut a_side, &net.a, "message:m1", "Alpha")
+    } else {
+        (&mut b_side, &net.b, "message:m2", "Beta")
+    };
+    rename_on(loser_side, loser, trigger, "r2", mine, 9)?;
+    sync(&a_side, &mut b_side, &net)?;
+    sync(&b_side, &mut a_side, &net)?;
+    for side in [&a_side, &b_side] {
+        assert_eq!(side.bots(&net.network)?[0].name, mine);
+        assert!(
+            side.overwritten(&net.network, "c")?.is_empty(),
+            "a change over the one that stood ends it"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     let net = net()?;
     let mut origin = store(&net)?;
@@ -2007,6 +2108,10 @@ fn bot_changes_converge_and_retries_write_once() -> Result<()> {
     )?;
     let expected = bot_projection(&origin, &net)?;
     assert_eq!(expected["bots"][0]["name"], "Orion");
+    assert!(
+        origin.overwritten(&net.network, "c")?.is_empty(),
+        "a change that saw the one before it replaced nothing unseen"
+    );
     assert_eq!(expected["skills"], serde_json::json!([]));
     assert_eq!(expected["schedules"], serde_json::json!([]));
     assert_eq!(expected["changes"].as_array().map(Vec::len), Some(8));

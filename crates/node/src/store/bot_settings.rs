@@ -951,6 +951,10 @@ impl Store {
         rows.map(|row| with_change(row?)).collect()
     }
 
+    pub fn overwritten(&self, network: &str, scope: &str) -> Result<Vec<Overwritten>> {
+        overwritten_from(&self.connection, network, scope)
+    }
+
     pub fn skills(&self, network: &str) -> Result<Vec<SkillEntry>> {
         skills_from(&self.connection, network)
     }
@@ -1139,4 +1143,171 @@ impl Store {
         tx.commit()?;
         Ok(Some(event.hash))
     }
+}
+
+/// A profile setting a chat change or the user's face pick writes; a model is per provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum Setting {
+    Name,
+    Instructions,
+    Skills,
+    Avatar,
+    Model { provider: Provider },
+}
+
+/// What a write built on: the value its writer saw, or, for the user's face pick, the version.
+#[derive(Debug, PartialEq)]
+enum Saw {
+    Value(serde_json::Value),
+    Version(Option<String>),
+}
+
+/// One write to a setting.
+#[derive(Debug)]
+struct SettingWrite {
+    change_id: Option<String>,
+    hash: String,
+    by: String,
+    saw: Saw,
+    after: serde_json::Value,
+}
+
+/// A chat change another device replaced without seeing it; `value` is the setting now, set by `by`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Overwritten {
+    pub change_id: String,
+    #[serde(flatten)]
+    pub setting: Setting,
+    pub by: String,
+    pub value: serde_json::Value,
+}
+
+/// `writes` are one setting's, in rank order; the last stands, as the projection has it. Walking
+/// back from it, each write the next did not build on was replaced unseen, until one that was.
+/// A write by the device whose write stands, or already at the value that stands, lost nothing.
+fn overwritten_in(setting: Setting, writes: &[SettingWrite]) -> Vec<Overwritten> {
+    let Some(stands) = writes.last() else {
+        return vec![];
+    };
+    let mut lost = Vec::new();
+    for pair in writes.windows(2).rev() {
+        let (earlier, later) = (&pair[0], &pair[1]);
+        let built_on = match &later.saw {
+            Saw::Value(value) => *value == earlier.after,
+            Saw::Version(version) => {
+                version.as_deref() == Some(super::version(&earlier.hash).as_str())
+            }
+        };
+        if built_on {
+            break;
+        }
+        if let Some(change_id) = &earlier.change_id
+            && earlier.by != stands.by
+            && earlier.after != stands.after
+        {
+            lost.push(Overwritten {
+                change_id: change_id.clone(),
+                setting,
+                by: stands.by.clone(),
+                value: stands.after.clone(),
+            });
+        }
+    }
+    lost.reverse();
+    lost
+}
+
+/// The chat changes of `scope`'s bot that another device replaced unseen. Read from the events
+/// that count, so every replica holding them agrees and a replay or rebuild adds nothing.
+pub(crate) fn overwritten_from(
+    connection: &Connection,
+    network: &str,
+    scope: &str,
+) -> Result<Vec<Overwritten>> {
+    let mut statement = connection.prepare(
+        "SELECT hash,envelope FROM events WHERE network_id=? AND scope_id=? AND effective=1
+         AND kind IN ('bot_changed','bot_avatar_set') ORDER BY lamport,created_at_ms,hash",
+    )?;
+    let rows = statement.query_map(params![network, scope], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    fn json(value: impl serde::Serialize) -> serde_json::Result<serde_json::Value> {
+        serde_json::to_value(value)
+    }
+    let mut writes = std::collections::BTreeMap::<Setting, Vec<SettingWrite>>::new();
+    for row in rows {
+        let (hash, envelope) = row?;
+        let envelope: SignedEvent = serde_json::from_str(&envelope)?;
+        let event: Event = serde_json::from_str(&envelope.canonical_body)?;
+        let edits = match &event.body {
+            EventBody::BotChanged {
+                change_id,
+                change:
+                    BotChange::Profile {
+                        name,
+                        instructions,
+                        model,
+                        skills,
+                        avatar,
+                    },
+                ..
+            } => [
+                name.as_ref()
+                    .map(|edit| (Setting::Name, json(&edit.before), json(&edit.after))),
+                instructions
+                    .as_ref()
+                    .map(|edit| (Setting::Instructions, json(&edit.before), json(&edit.after))),
+                model.as_ref().map(|edit| {
+                    let setting = Setting::Model {
+                        provider: edit.provider,
+                    };
+                    (setting, json(&edit.before), json(&edit.after))
+                }),
+                skills
+                    .as_ref()
+                    .map(|edit| (Setting::Skills, json(&edit.before), json(&edit.after))),
+                avatar
+                    .as_ref()
+                    .map(|edit| (Setting::Avatar, json(edit.before), json(edit.after))),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(setting, before, after)| {
+                Ok((
+                    setting,
+                    Some(change_id.clone()),
+                    Saw::Value(before?),
+                    after?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+            EventBody::BotAvatarSet {
+                version, avatar, ..
+            } => vec![(
+                Setting::Avatar,
+                None,
+                Saw::Version(version.clone()),
+                json(avatar)?,
+            )],
+            _ => continue,
+        };
+        let by = event
+            .body
+            .attestation()
+            .map_or(&event.author, |attestation| &attestation.device_id);
+        for (setting, change_id, saw, after) in edits {
+            writes.entry(setting).or_default().push(SettingWrite {
+                change_id,
+                hash: hash.clone(),
+                by: by.clone(),
+                saw,
+                after,
+            });
+        }
+    }
+    Ok(writes
+        .into_iter()
+        .flat_map(|(setting, writes)| overwritten_in(setting, &writes))
+        .collect())
 }
