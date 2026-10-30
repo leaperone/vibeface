@@ -1508,6 +1508,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 
 async fn join(options: Join) -> Result<()> {
     prepare_start(&options.data.data_dir)?;
+    ensure_stopped_for_join(&options.data.data_dir)?;
     let state =
         vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
             .await?;
@@ -1516,6 +1517,31 @@ async fn join(options: Join) -> Result<()> {
         state.genesis.network_id
     );
     Ok(())
+}
+
+/// `join` changes pairing state the running Node owns. Its progress lines are in Chinese, so
+/// the one refusal people meet by following the web's command says what to do in the same words.
+fn ensure_stopped_for_join(dir: &Path) -> Result<()> {
+    // Without an identity no Node runs here, and opening the data directory says so itself.
+    if !dir.join("identity.json").exists() {
+        return Ok(());
+    }
+    match config::lock_data_dir(dir) {
+        Ok(_lock) => Ok(()),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<fs::TryLockError>(),
+                Some(fs::TryLockError::WouldBlock)
+            ) =>
+        {
+            bail!(
+                "这台电脑上的 Vibeface 正在运行，不能用这条命令加入。\n\
+                 改在它的网页里选“加入已有网络”，粘贴加入链接；\n\
+                 或先停止它（后台服务用 vibeface service stop，前台运行就按 Ctrl-C），再运行这条命令。"
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
@@ -2460,6 +2486,26 @@ mod tests {
         assert!(attempt(uninitialized.clone()).await.is_err());
         assert!(!uninitialized.join("identity.json").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_while_the_node_runs_says_what_to_do_instead() {
+        let dir = std::env::temp_dir().join(format!("vibeface-join-busy-{}", uuid::Uuid::new_v4()));
+        prepare_start(&dir).unwrap();
+        let running = config::lock_data_dir(&dir).unwrap();
+        let error = join(Join {
+            link: "not-an-invite".into(),
+            data: DataDir {
+                data_dir: dir.clone(),
+            },
+            name: "我的电脑".into(),
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("正在运行"), "{error:#}");
+        assert!(error.to_string().contains("加入已有网络"), "{error:#}");
+        drop(running);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

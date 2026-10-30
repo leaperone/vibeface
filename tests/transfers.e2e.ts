@@ -9,6 +9,7 @@ import { deliveryTest as test } from './fixtures';
 type Page = Pick<TestFixtures, 'screen'> & { browser: Browser };
 async function createNetwork({ screen, browser }: Page, url: string, name: string) {
   await browser.goto(url);
+  await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这台电脑叫什么？').fill(name);
   await screen.getByRole('button', '下一步').click();
   await expect(screen.getByRole('heading', '设置恢复密码')).toBeVisible();
