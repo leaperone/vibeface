@@ -44,7 +44,7 @@ export function TasksOverview() {
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-7">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${attention.length + tasks.length} 项未完成任务` : "没有未完成任务"}</p>
     {attention.length ? <OverviewSection title="需要留意" count={attention.length}>
-      {attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox /> : <ConfirmCard check={item.check} inbox />}</div>)}
+      {attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>)}
     </OverviewSection> : null}
     {groups.working.length ? <OverviewSection title="进行中" count={groups.working.length}>
       {groups.working.map((work) => <TaskOverviewCard key={work.work_id} work={work} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />)}

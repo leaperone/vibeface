@@ -38,7 +38,7 @@ export function BackOnline({ device }: { device: string }) {
  * "待确认": the person says whether a work its device cannot report finished, or that a leftover process stopped. Nothing is re-run.
  * `inbox`: also names the bot and links to its chat.
  */
-export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inbox?: boolean }) {
+export function ConfirmCard({ check, inbox = false, from }: { check: PendingCheck; inbox?: boolean; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
   const { directory } = useDevice()
   const id = useId()
@@ -61,7 +61,10 @@ export function ConfirmCard({ check, inbox = false }: { check: PendingCheck; inb
   const botOf = (work: WorkCheck) => inbox ? workspace.bots.find((item) => item.conversation_id === work.conversation_id) : undefined
   // In the chat this card stands in for the task, so its title opens the task.
   const chatBot = inbox ? undefined : workspace.selectedBot
-  const taskLink = (work: WorkCheck, title: ReactNode, className = "") => chatBot ? <Link to="/b/$botId/work/$workId" params={{ botId: chatBot.bot_id, workId: work.work_id }} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
+  const taskLink = (work: WorkCheck, title: ReactNode, className = "") => {
+    const bot = botOf(work) ?? chatBot
+    return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={from === "tasks" ? { from: "tasks" } : from === "inbox" || inbox ? { from: "inbox" } : {}} className={`rounded-sm underline-offset-4 hover:underline ${className}`}>{title}</Link> : title
+  }
   if (check.kind === "device") return <ActionCard
     icon={confirmIcons[check.reason]}
     title={`待确认 · ${check.works.length} 个任务`}
