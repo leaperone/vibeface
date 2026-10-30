@@ -130,7 +130,7 @@ pub struct Runtime {
     pub delivery: crate::delivery::Delivery,
     pub(crate) data_dir: PathBuf,
     settings: std::sync::Mutex<NodeSettings>,
-    providers: std::sync::Mutex<crate::providers::Local>,
+    providers: Arc<std::sync::Mutex<crate::providers::Local>>,
     /// Where this computer keeps what the providers need, as the Node's environment says.
     pub(crate) host: crate::discovery::Host,
     /// Provider paths a bot proposed, by the question that asks the user; kept until restart.
@@ -158,7 +158,8 @@ pub struct Runtime {
     observation: std::sync::Mutex<observation::ObservationState>,
     pub tool_url: std::sync::OnceLock<String>,
     /// The resident Cursor SDK bridge, created with the tool listener it calls back to.
-    pub(crate) cursor: std::sync::OnceLock<Arc<vibeface_bridge::agent::SdkBridge>>,
+    pub(crate) cursor: Arc<std::sync::OnceLock<Arc<vibeface_bridge::agent::SdkBridge>>>,
+    cursor_executor: cursor::CursorExecutor,
     cursor_callback_token: String,
     pub maintenance: Arc<Gate>,
     pub(crate) codex: Arc<codex_server::CodexServer>,
@@ -254,27 +255,33 @@ impl Runtime {
         let (events, _) = broadcast::channel(256);
         let (tx, rx) = mpsc::unbounded_channel();
         vibeface_bridge::agent::SdkBridge::kill_orphan(&dir.join(cursor::PIDFILE));
-        let providers = crate::providers::Local {
+        let providers = Arc::new(std::sync::Mutex::new(crate::providers::Local {
             switches: config.providers.clone(),
             bins: config.bins.clone(),
             env: crate::providers::ProviderEnv::load(dir)?,
-        };
+        }));
         let codex_agent = config
             .manager
             .as_ref()
             .is_some_and(|manager| manager.provider.on_app_server());
-        providers.validate(codex_agent)?;
-        let claude = claude::Claude::open(dir, providers.env.get(Provider::Claude));
+        let local = providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        local.validate(codex_agent)?;
+        let claude_env = local.env.get(Provider::Claude).clone();
+        let claude = claude::Claude::open(dir, &claude_env);
+        let codex_target = local.codex_target(codex_agent);
         let codex = Arc::new(codex_server::CodexServer::open(
-            providers.codex_target(codex_agent),
+            codex_target,
             &identity,
             dir,
             tx,
         )?);
         let opencode = Arc::new(opencode::Opencode::open(
             dir,
-            providers.bin(Provider::Opencode),
-            providers.env.get(Provider::Opencode).clone(),
+            local.bin(Provider::Opencode),
+            local.env.get(Provider::Opencode).clone(),
         )?);
         let local_access = Arc::new(crate::local_access::LocalAccess::open(
             dir,
@@ -282,6 +289,13 @@ impl Runtime {
         )?);
         let triage = triage::TriageState::new(config.triage.clone());
         let delivery = crate::delivery::Delivery::open(dir, identity.clone())?;
+        let cursor = Arc::new(std::sync::OnceLock::new());
+        let cursor_executor = cursor::CursorExecutor::new(
+            cursor.clone(),
+            providers.clone(),
+            dir.to_owned(),
+            config.timeout_secs,
+        )?;
         let node = Self {
             delivery,
             data_dir: dir.to_owned(),
@@ -289,7 +303,7 @@ impl Runtime {
                 roots: config.roots.clone(),
                 manager: config.manager.clone(),
             }),
-            providers: std::sync::Mutex::new(providers),
+            providers: providers.clone(),
             host,
             provider_proposals: Mutex::new(HashMap::new()),
             config_save: Mutex::new(()),
@@ -312,7 +326,8 @@ impl Runtime {
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),
             tool_url: std::sync::OnceLock::new(),
-            cursor: std::sync::OnceLock::new(),
+            cursor,
+            cursor_executor,
             cursor_callback_token: hex::encode(rand::random::<[u8; 32]>()),
             maintenance: Arc::new(Gate::new(dir.join("update-pending.json").try_exists()?)),
             codex,

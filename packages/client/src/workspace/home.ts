@@ -44,6 +44,7 @@ export function backTo(pathname: string, bot?: string): string | null {
   const work = /^(\/b\/[^/]+)\/work\//.exec(pathname)
   if (work) return work[1]
   if (/^\/devices\/[^/]+/.test(pathname)) return "/devices"
+  if (pathname.startsWith("/settings/lab/")) return "/settings/lab"
   if (pathname.startsWith("/settings/")) return "/settings"
   return "/"
 }

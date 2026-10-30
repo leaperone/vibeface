@@ -104,9 +104,7 @@ impl Runtime {
             Provider::Claude => Ok(&self.claude),
             Provider::Pi => Ok(self.pi.as_ref()),
             Provider::Opencode => Ok(self.opencode.as_ref()),
-            Provider::Cursor => {
-                bail!("{} runs no work on this device yet", provider.label())
-            }
+            Provider::Cursor => Ok(&self.cursor_executor),
         }
     }
 
