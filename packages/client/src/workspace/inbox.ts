@@ -14,7 +14,7 @@ export type InboxItem = { key: string; title: string; meta?: string } & (
   | { kind: "question"; question: Question; done: boolean }
   | { kind: "confirm"; check: PendingCheck }
   | { kind: "join"; join: JoinRequest }
-  | { kind: "attention"; bot: BotRecord }
+  | { kind: "attention"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "session"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "failed"; work: OpenWork; bot: BotRecord }
   | { kind: "setup"; device: string | undefined }
@@ -66,7 +66,7 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   for (const note of workspace.notifications) {
     const bot = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
     if (!bot) continue
-    if (note.kind === "manager_attention") items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
+    if (note.kind === "manager_attention") items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, notification: note, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
     else if (isSessionNotification(note)) items.push({ key: `session:${note.notification_id}`, kind: "session", bot, notification: note, title: "接手了一个外部会话", meta: bot.name })
   }
   const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
