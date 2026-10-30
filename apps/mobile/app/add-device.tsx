@@ -4,7 +4,7 @@ import { Check, CircleCheck, Clock, Copy, Download, Link2, Monitor, Plus, ScanEy
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
-import { addDeviceCopy, joinCopy } from '@vibeface/client/identity/copy.ts'
+import { addDeviceCopy, deviceCopy, joinCopy } from '@vibeface/client/identity/copy.ts'
 import { ErrorText } from '@/components/action'
 import { EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -31,7 +31,7 @@ export default function AddDevice() {
     return () => clearTimeout(timer)
   }, [copied])
   const [result, setResult] = useState<Invitation | null>(null)
-  const [added, setAdded] = useState<string | null>(null)
+  const [added, setAdded] = useState<{ name: string; manage: boolean } | null>(null)
   const requests = useOpenJoins().length > 0
   // A link is single-use: once a device has answered it, it is spent.
   const [used, setUsed] = useState(false)
@@ -66,14 +66,14 @@ export default function AddDevice() {
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {added && !requests ? <View className="gap-3">
-      <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>
+      <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</Text></View>
       <Button variant="outline" className="self-start" disabled={busy !== null} onPress={generate}><Icon as={Plus} /><Text>{busy === 'create' ? '生成中' : '再添加一台'}</Text></Button>
     </View> : !result || used && !requests ? requests ? <Button variant="outline" className="self-start" disabled={busy !== null} onPress={generate}>
       <Icon as={Link2} /><Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button> : <EmptyState icon={Link2} title="让新设备扫码加入" action={<Button disabled={busy !== null} onPress={generate}>
       <Text>{busy === 'create' ? '生成中' : '生成链接'}</Text>
     </Button>} /> : null}
-    <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null) }} />
+    <JoinRequests issuing={result !== null} onAllowed={(name, manage) => { setAdded({ name, manage }); setResult(null) }} />
     {result && !used ? <View className="gap-4">
       <Segmented options={kinds} value={kind} onChange={(next) => { setKind(next); setCopied(null) }} />
       {kind === 'phone' ? <>

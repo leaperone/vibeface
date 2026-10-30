@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import type { Invitation } from "@vibeface/client/identity/context.tsx"
-import { addDeviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
+import { addDeviceCopy, deviceCopy, joinCopy } from "@vibeface/client/identity/copy.ts"
 import { messageOf } from "@vibeface/client/lib/node.ts"
 import { JoinRequests, useOpenJoins } from "./join"
 
@@ -38,7 +38,7 @@ export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind;
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
   // This page allowed the device, so it says so where the link was rather than only in a toast.
-  const [added, setAdded] = useState<string | null>(null)
+  const [added, setAdded] = useState<{ name: string; manage: boolean } | null>(null)
   // "已复制" shows for a moment on the button that copied.
   const [copied, setCopied] = useState<"link" | "command" | null>(null)
   // The browser refused the clipboard: the raw text opens, selected, for a manual copy.
@@ -117,9 +117,9 @@ export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind;
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} onAllowed={(name) => { setAdded(name); setResult(null); setError(""); setCopyFailed(false) }} />
+          <JoinRequests issuing={result !== null} onAllowed={(name, manage) => { setAdded({ name, manage }); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
-            <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added}>已添加「{added}」</span></p>
+            <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
             <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>
           </div> : !result || (used && !requests) ? <Button type="button" variant={requests ? "outline" : "default"} className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Link2} />生成链接</Button> : null}
           {result && !used ? <div className="grid gap-3">
@@ -131,7 +131,7 @@ export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind;
             </> : <>
               <ol className="grid gap-3">
                 <li className="flex min-w-0 items-center gap-3"><Step n={1} />{copyButton("link", result.link, "复制链接", true)}</li>
-                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Monitor aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0">{addDeviceCopy.openThere}</span></li>
+                <li className="flex min-w-0 items-start gap-3"><Step n={2} /><Monitor aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" /><span className="min-w-0 [overflow-wrap:anywhere]">{addDeviceCopy.openThere}</span></li>
               </ol>
               <p className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-muted-foreground">
                 <Download aria-hidden="true" className="size-4 shrink-0" />{addDeviceCopy.installThere}

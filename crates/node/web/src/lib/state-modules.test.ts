@@ -5,6 +5,8 @@ import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/cl
 import { joinTabs } from './tabs.ts'
 import { candidates, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
+import { joinCopy } from '@vibeface/client/identity/copy.ts'
+import { passphrase, passwordStrength } from '@vibeface/client/lib/secure.ts'
 import { failureKinds, failureText, humanError, outcomeUnknown, rawError, spentInvite, spentInviteText, workFailure } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
@@ -175,7 +177,17 @@ test('a spent join link reads the same, and clears the field the same, whether t
     assert.ok(spentInvite.test(raw), raw)
     assert.equal(humanError(raw), spentInviteText)
   }
-  assert.equal(spentInvite.test('这次加入被拒绝了。要再试，请在已有设备上重新添加。'), false)
+  assert.equal(spentInvite.test(joinCopy.rejected), false)
+})
+
+test('a recovery password is refused when it is short, common, a run, or short and one kind', () => {
+  for (const [password, problem] of [['abc12', 'short'], ['12345678', 'common'], ['Password123', 'common'], ['qwertyuiop', 'common'], ['aaaabbbb', 'common'], ['abcdefgz', 'simple'], ['80417263', 'simple']] as const) {
+    assert.deepEqual(passwordStrength(password), { level: 'weak', problem }, password)
+    assert.throws(() => passphrase(password), password)
+  }
+  assert.equal(passwordStrength('tiger7lamp').level, 'fair')
+  assert.equal(passwordStrength('river stone 42 lamp').level, 'strong')
+  assert.equal(passphrase('tiger7lamp'), 'tiger7lamp')
 })
 
 test('this computer\'s join failure reads as the terminal says it, and a spent link clears the field the same', async () => {

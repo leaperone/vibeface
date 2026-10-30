@@ -26,5 +26,5 @@ export function useRun() {
     } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
     finally { if (pending.current === owner) pending.current = null; setActive((current) => current?.generation === owner ? null : current) }
   }
-  return { busy: active?.generation === generation ? active.key : null, error, status, run }
+  return { busy: active?.generation === generation ? active.key : null, error, status, run, clear: () => setError('') }
 }

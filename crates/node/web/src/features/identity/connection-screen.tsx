@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Archive, ArchiveRestore, Camera, CircleCheck, CirclePlus, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, MonitorSmartphone, MonitorX, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
-import { cn } from '@/lib/utils'
 import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -8,7 +7,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
 import { spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
-import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
+import { passphrase, passwordStrength, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
@@ -19,7 +18,7 @@ import { webPlatform } from '@/lib/platform'
 
 const NOT_JOINED = notJoined(webPlatform.self)
 const BROWSER_REMOVED = removedText(webPlatform.self)
-import { RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
+import { PasswordStrength, RecoveryControls, RecoveryReview, RecoveryWaiting, SaveRecoveryFile } from './recovery-controls'
 import { CopyDiagnostics } from './device-controls'
 import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
@@ -191,7 +190,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     if (!checkable) return
     let live = true
     void device.checkInvite(invitation).then((state) => {
-      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+      // A join that just ended spent the link too; its own reason (say, 拒绝) stays, not 已用过.
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError((current) => current || spentInviteText) }
     })
     return () => { live = false }
   }, [invitation, checkable, thisComputer])
@@ -244,7 +244,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => { if (setup) setCreating(true); chooseLane('local') }}>{setup ? <CirclePlus aria-hidden="true" /> : <Laptop aria-hidden="true" />}{setup ? startCopy.create : local === 'open' ? computerName : localCopy.manage}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
       {active !== 'invite' && !choosing ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
-      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
+      {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回<span className="text-meta font-normal">{recoveryCopy.whenLost}</span></Button> : null}
     </div>
   </div> : null
 
@@ -382,24 +382,28 @@ type Run = (action: () => Promise<void>) => Promise<void>
 /** Step 2: the recovery password; the file is sealed with it right away. */
 function PasswordStep({ busy, disabled, names, onBack, run }: { busy: boolean; disabled: boolean; names: Names; onBack(): void; run: Run }) {
   const device = useDevice()
-  const [short, setShort] = useState(false)
+  const [password, setPassword] = useState('')
+  const [tried, setTried] = useState(false)
+  const weak = passwordStrength(password).level === 'weak'
   return <Panel icon={KeyRound} title="设置恢复密码">
     <p className="-mt-2 flex items-center gap-2 text-meta text-muted-foreground"><LifeBuoy aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.passwordWhy}</p>
     <form className="grid gap-4" noValidate onSubmit={(event) => {
       event.preventDefault()
       const form = event.currentTarget
       const input = form.elements.namedItem('password') as HTMLInputElement
-      if ([...input.value].length < 8) { setShort(true); input.focus(); return }
+      if (passwordStrength(input.value).level === 'weak') { setTried(true); input.focus(); return }
       void run(async () => {
         try { await device.createLocalNetwork(names.browser, passphrase(value(form, 'password')), names.computer) }
-        finally { form.reset() }
+        finally { form.reset(); setPassword('') }
       })
     }}>
       <fieldset disabled={busy || disabled} className="grid gap-4">
-        <Field label="恢复密码">
-          <PasswordInput name="password" autoComplete="new-password" aria-invalid={short || undefined} aria-describedby="password-hint" onChange={() => setShort(false)} />
-          <span id="password-hint" className={cn('font-normal', short ? 'text-danger' : 'text-muted-foreground')}>至少 8 个字符</span>
-        </Field>
+        <div className="grid gap-1.5">
+          <Field label="恢复密码">
+            <PasswordInput name="password" autoComplete="new-password" aria-invalid={tried && weak || undefined} aria-describedby="password-hint" onChange={(event) => { setPassword(event.target.value); setTried(false) }} />
+          </Field>
+          <PasswordStrength id="password-hint" password={password} tried={tried} />
+        </div>
         <div className="flex justify-between gap-2">
           <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
           <Button type="submit" aria-busy={busy || undefined}>{busy ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}下一步</Button>

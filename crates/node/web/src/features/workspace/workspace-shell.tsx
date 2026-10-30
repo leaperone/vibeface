@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, ShieldAlert, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
@@ -15,6 +15,7 @@ import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { ConversationScreen } from "@/features/chat/conversation-screen"
+import { RecoveryAlert } from "@/features/identity/recovery-controls"
 import { Button } from "@/components/ui/button"
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent, SidebarGroupLabel, SidebarHeader,
@@ -65,6 +66,8 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   const workspace = useWorkspace()
   // A question answered here stays on screen, collapsed, until the next read; it no longer counts.
   const waiting = waitingItems(useInbox()).length
+  // A recovery about to take over outranks every other waiting item, so 待处理 shows a red shield instead of a count.
+  const recovering = Boolean(useDevice().pendingRecovery)
   const { setOpenMobile, isMobile, open: sidebarOpen } = useSidebar()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const chatRoute = pathname.startsWith("/b/")
@@ -120,7 +123,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
           <SidebarGroup className="pb-0">
             <SidebarMenu>
               <NavItem to="/tasks" icon={terms.task.icon} label={terms.task.label} active={pathname === "/tasks"} />
-              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} />
+              <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} alert={recovering} />
             </SidebarMenu>
           </SidebarGroup>
           <SidebarGroup>
@@ -185,14 +188,15 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             </Button>
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
           </div> : inboxInHeader ? <Button asChild variant="ghost" size="icon" className="relative -me-3">
-            <Link to="/inbox" aria-label={waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
+            <Link to="/inbox" aria-label={recovering ? `${terms.inbox.label}，有人在找回` : waiting ? `${terms.inbox.label} ${waiting}` : terms.inbox.label} title={terms.inbox.label}>
               <terms.inbox.icon aria-hidden="true" />
-              {waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
+              {recovering ? <ShieldAlert aria-hidden="true" className="absolute top-0.5 right-0.5 size-4! rounded-full bg-background text-danger md:-top-0.5 md:-right-0.5" /> : waiting ? <CountBadge key={waiting} count={waiting} className="absolute top-0.5 right-0.5 h-4 min-w-4 px-1 ring-2 ring-background animate-in zoom-in-50 duration-200 ease-out md:-top-0.5 md:-right-0.5" /> : null}
             </Link>
           </Button> : null}
           </div>
         </header>
         {workspace.joined ? null : <LocalSession onJoin={() => void navigate({ to: "/join" })} />}
+        {pathname === "/inbox" ? null : <RecoveryAlert />}
         {workspace.data && workspace.incomplete ? <div role="progressbar" aria-label="同步中" className="h-0.5 shrink-0 overflow-hidden bg-info-soft"><div className="h-full w-1/3 animate-pulse bg-info" /></div> : null}
         {/* Kept laid out while hidden so the chat keeps its scroll position across pages. */}
         <div className={cn("flex min-h-0 min-w-0 flex-1", !chatRoute && "invisible absolute inset-x-0 top-14 bottom-0")} inert={!chatRoute} aria-hidden={!chatRoute || undefined}>
@@ -210,13 +214,13 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
   )
 }
 
-function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean }) {
+function NavItem({ to, icon: Icon, label, active, badge, dot, alert }: { to: string; icon: LucideIcon; label: string; active: boolean; badge?: number; dot?: boolean; alert?: boolean }) {
   return <SidebarMenuItem>
     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
       <Link to={to} aria-current={active ? "page" : undefined}>
         <Icon aria-hidden="true" />
         <span className="flex-1">{label}</span>
-        {badge ? <CountBadge count={badge} /> : null}
+        {alert ? <span className="flex items-center gap-1 text-meta font-medium text-danger"><ShieldAlert aria-hidden="true" className="size-4!" />找回</span> : badge ? <CountBadge count={badge} /> : null}
         {/* A shape, not only a color, so it reads without telling colors apart. */}
         {dot ? <CircleAlert role="img" aria-label="需要留意" className="size-4! text-warning" /> : null}
       </Link>

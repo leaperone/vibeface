@@ -19,7 +19,6 @@ import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
 import { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
-import { RecoveryAlert } from '@/features/identity/recovery-controls'
 import { providerIcons } from '@/features/devices/ai-settings'
 import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { ChangeCard } from './change-card'
@@ -252,7 +251,6 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   return (
     <section className="conversation-screen" aria-label="对话">
-      <RecoveryAlert />
       <Chat
         key={conversationId}
         entries={entries}

@@ -11,6 +11,8 @@ export const joinCopy = {
   paste: '或粘贴加入链接',
   pasteFirst: '粘贴加入链接',
   linkFilled: '已填入加入链接',
+  /** A manager turned this join down; the link it came with is spent. */
+  rejected: '管理设备拒绝了这次加入。确认是自己的设备后，在管理设备上重新生成链接再试。',
   notLink: '这不是有效的加入链接',
   deviceName: '这台设备的名字',
   join: '加入',
@@ -127,7 +129,7 @@ export function whenText(at: number, now = Date.now()) {
 }
 
 export const recoveryCopy = {
-  scope: '只找回设备和管理权限，不含对话',
+  scope: '找回后，对话会从你的其他电脑同步过来',
   whichLost: '哪台设备丢了？',
   delay: '2 天后生效，期间你的其他设备可以拦下',
   cancelLate: '如果已经提交，取消不会撤回。',
@@ -148,11 +150,15 @@ export const recoveryCopy = {
   left: (at: number, now = Date.now()) => at > now ? `剩余 ${hoursUntil(at, now)} 小时` : '马上生效',
   autoEnter: '生效后自动进入',
   managersSee: '你的管理设备会看到提醒',
+  closeOk: '可以关掉页面，到时在这个网址打开',
+  samePassword: '密码不变，生效后旧文件作废',
   stopped: '这次找回被拦下了',
   stoppedNote: '新恢复文件用不了，旧文件仍然有效',
   saveNew: '保存新的恢复文件',
   recovered: '已找回，旧文件已作废',
   why: '设备都丢了时，用它和恢复密码找回',
+  /** Beside 用恢复文件找回 on the way in: a browser that only cleared its data joins again by link instead. */
+  whenLost: '设备都丢了时',
   passwordWhy: '设备都丢了时，用它和恢复文件找回',
   onlyCopy: '只能在这一步下载，之后补不回',
   keptApart: '已把文件和密码分开保存',
@@ -160,7 +166,9 @@ export const recoveryCopy = {
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
   added: '新设备',
-  itsMe: '是我在找回',
+  itsMe: '是我，收起提醒',
+  /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
+  itsMeDone: (at: number, now = Date.now()) => `已收起提醒。找回仍会在${whenText(at, now)} 生效`,
   stop: '拦下',
   stopAsk: '拦下这次找回？',
   stopNote: '拦下后对方的新恢复文件用不了，设备保持不变',
@@ -187,6 +195,14 @@ export function recoveryChanges(pending: PendingRecovery, current: Member[]) {
 export const deviceCopy = {
   offline: '确认它开着，并且已联网',
   manageHint: '能添加、移除设备，改设置，拦下找回',
+  /** Turning management off waits for a confirmation; `left`: management devices after it. */
+  unmanageAsk: (name: string) => `取消「${name}」的管理权限？`,
+  unmanageNote: (left: number) => left === 1 ? '之后只剩 1 台管理设备。它丢了或清了数据，就只能用恢复文件找回' : `之后还有 ${left} 台管理设备`,
+  unmanage: '取消管理',
+  /** Under a request's safety code, on the web and the phone alike. */
+  compareCode: '和新设备上的比对，不一致就拒绝，可能不是你的设备',
+  rejected: (name: string) => `已拒绝「${name}」`,
+  addedManager: (name: string) => `已添加「${name}」为管理设备`,
   /** 可用文件夹: what it is, and during setup that it can wait. */
   folders: (later: boolean) => later ? 'Bot 能读写的项目文件夹，可稍后添加' : 'Bot 能读写的项目文件夹',
   /** A computer's bot as `botReadiness` reports it; `null`: it has none set up. */
@@ -195,7 +211,8 @@ export const deviceCopy = {
   botState: (bot: 'ready' | 'starting' | 'needs_setup' | null | undefined, online: boolean | undefined) => bot ?? (online === false ? 'unknown' as const : 'none' as const),
   /** This computer has a provider installed but no use of any turned on, as a computer that just joined starts. */
   aiOff: '这台电脑的 AI 还没开',
-  removeNotice: (bot: boolean) => ['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，'),
+  /** Ends on what removal cannot do: whatever already reached that device stays there. */
+  removeNotice: (bot: boolean) => `${['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，')}。它已经拿到的内容删不掉。`,
   /**
    * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
    * above the providers; `hint` says it again for one provider's control.
@@ -223,4 +240,24 @@ export const waitingCopy = {
   /** The home tip after joining: one tap asks the system, closing it keeps it closed. */
   notifyTip: '会话等你时提醒你',
   notifyOn: '打开通知',
+}
+
+/** Settings → 安全: how many devices can manage, whether a recovery waits, when the recovery password last changed. */
+export const securityCopy = {
+  title: '安全',
+  managers: '管理设备',
+  managerCount: (count: number) => `${count} 台`,
+  recovery: '找回',
+  noRecovery: '无待生效',
+  recoveryIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
+  password: '恢复密码',
+  changedOn: (at: number) => `${new Date(at).toLocaleDateString('zh-CN')} 设置`,
+}
+
+/** The strength line under a new recovery password; `weak` ones are refused. */
+export const passwordCopy = {
+  label: { weak: '太弱', fair: '可用', strong: '较强' },
+  short: '至少 8 个字符',
+  common: '太常见了，换一个',
+  simple: '少于 12 个字符时，要混用字母、数字或符号',
 }

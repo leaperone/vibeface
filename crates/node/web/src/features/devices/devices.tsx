@@ -166,6 +166,8 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const navigate = useNavigate()
   const action = useAction()
   const [removing, setRemoving] = useState(false)
+  // Taking management away asks first; giving it does not.
+  const [unmanaging, setUnmanaging] = useState(false)
   const row = rows.find((item) => item.id === deviceId)
   const entryName = rows.find((item) => item.entry)?.name
   const copied = writeState.conflicts.some((item) => item.author === deviceId) || Boolean(row?.entry && writeState.state === "forked")
@@ -229,10 +231,16 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
           <DetailRow label="设备编号" value={row.id} mono />
         </div>
       </SettingsDisclosure>
-      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={terms.admin.label} description={deviceCopy.manageHint}>
-        <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
+      {canManage && row.member?.kind === "client" && !row.browser ? <SettingsRow icon={terms.admin.icon} label={unmanaging ? deviceCopy.unmanageAsk(row.name) : terms.admin.label} tone={unmanaging ? "danger" : undefined} stacked={unmanaging}
+        description={unmanaging ? deviceCopy.unmanageNote(rows.filter((item) => item.admin && item.id !== row.id).length) : deviceCopy.manageHint}>
+        {unmanaging ? <>
+          <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setUnmanaging(false)}>取消</Button>
+          <Button type="button" size="sm" variant="destructive" disabled={action.busy !== null} aria-busy={action.busy === "manage" || undefined} onClick={() => void action.run("manage", async () => { await device.setManage(row.id, false); setUnmanaging(false) }, "已取消管理")}>
+            <BusyIcon busy={action.busy === "manage"} />{deviceCopy.unmanage}
+          </Button>
+        </> : <input type="checkbox" role="switch" className="switch" aria-label={terms.admin.label} checked={row.admin}
           disabled={action.busy !== null || row.admin && !rows.some((item) => item.admin && item.id !== row.id)}
-          onChange={(event) => { const manage = event.target.checked; void action.run("manage", () => device.setManage(row.id, manage), "已保存") }} />
+          onChange={(event) => { if (!event.target.checked) setUnmanaging(true); else void action.run("manage", () => device.setManage(row.id, true), "已设为管理设备") }} />}
       </SettingsRow> : null}
       {action.errorKey === "manage" ? <div className="px-4 py-3"><InlineError error={action.error} /></div> : null}
       {canManage && row.member && !row.entry && !row.browser ? <SettingsRow icon={RemoveIcon} tone="danger" label={terms.remove.label} description={removing ? deviceCopy.removeNotice(Boolean(row.bot)) : undefined} stacked onClick={removing ? undefined : () => setRemoving(true)}>

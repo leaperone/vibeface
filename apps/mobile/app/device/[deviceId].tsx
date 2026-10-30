@@ -1,7 +1,7 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router'
 import { ArrowRightLeft, Bot, Check, Crown, MonitorSmartphone, Pencil, Sparkles, Trash2, X } from 'lucide-react-native'
 import { useState } from 'react'
-import { Pressable, ScrollView, View } from 'react-native'
+import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
 import { ErrorText } from '@/components/action'
@@ -55,7 +55,14 @@ export default function DeviceDetail() {
     {manageable || removable ? <SettingsGroup>
       {manageable ? <SettingsRow icon={Crown} label="管理设备" description={deviceCopy.manageHint}>
         <Switch accessibilityLabel="管理设备" value={member.admin} disabled={busy !== null || member.admin && !members.some((item) => item.admin && item.device_id !== member.device_id)}
-          onValueChange={(manage) => void run('manage', () => device.setManage(member.device_id, manage))} />
+          onValueChange={(manage) => {
+            if (manage) return void run('manage', () => device.setManage(member.device_id, true))
+            // Taking management away asks first, and says how many are left; giving it does not.
+            Alert.alert(deviceCopy.unmanageAsk(member.name), deviceCopy.unmanageNote(members.filter((item) => item.admin && item.device_id !== member.device_id).length), [
+              { text: '取消', style: 'cancel' },
+              { text: deviceCopy.unmanage, style: 'destructive', onPress: () => void run('manage', () => device.setManage(member.device_id, false)) },
+            ])
+          }} />
         {error && busy === null && !removing ? <View className="basis-full ps-11"><ErrorText error={error} /></View> : null}
       </SettingsRow> : null}
       {removable ? <SettingsRow icon={Trash2} tone="danger" label="移除设备" onPress={removing ? undefined : () => setRemoving(true)}>

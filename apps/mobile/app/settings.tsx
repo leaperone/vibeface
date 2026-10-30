@@ -1,11 +1,11 @@
 import * as Haptics from 'expo-haptics'
 import { Link } from 'expo-router'
-import { ArrowRightLeft, BellRing, Bot, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, Sun, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { ArrowRightLeft, BellRing, Bot, Crown, FileKey, FlaskConical, KeyRound, LogOut, MessageSquareShare, Monitor, Moon, Palette, Plus, RotateCcw, ShieldAlert, ShieldCheck, Sun, TriangleAlert, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Appearance, Platform, ScrollView, useWindowDimensions, View, type ScrollViewInstance } from 'react-native'
 import { Uniwind, useUniwind } from 'uniwind'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { addOnManager, eraseSoleManagerText, exitCopy, onlyManagerText, recoveryCopy, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
@@ -57,6 +57,7 @@ export default function Settings() {
       <Notifications />
       {manager ? <SettingsRow href="/external-chat" icon={MessageSquareShare} label={waitingCopy.forward} /> : null}
     </SettingsGroup> : null}
+    {manager ? <SecurityStatus /> : null}
     {manager ? <SettingsGroup title="找回">
       <CurrentRecoveryFile />
       <SettingsRow href="/recovery" icon={KeyRound} label={recoveryCopy.rotate} />
@@ -112,14 +113,33 @@ export default function Settings() {
   </ScrollView>
 }
 
-/** The file that still works, as on the web: the code its name carries, and the day it was made. */
+/** The file that still works, as on the web: the code its name carries. */
 function CurrentRecoveryFile() {
-  const { directory, recoverySince } = useDevice()
+  const { directory } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   if (!code) return null
-  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={`${recoveryCopy.codeLabel} ${code}`}>
-    {recoverySince ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{recoveryCopy.day(recoverySince)}</Text> : null}
-  </SettingsRow>
+  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={`${recoveryCopy.codeLabel} ${code}`} />
+}
+
+/** 安全 at a glance, as on the web: management devices, a waiting recovery (also after 是我 hid it), and when the password was set. */
+function SecurityStatus() {
+  const { directory, recoverySince, nodeClockOffset } = useDevice()
+  if (!directory) return null
+  const managers = directory.members.filter((member) => member.manage).length
+  const pending = directory.pending
+  const tabular = { fontVariant: ['tabular-nums' as const] }
+  return <SettingsGroup title={securityCopy.title}>
+    <SettingsRow icon={Crown} label={securityCopy.managers}>
+      <View className="flex-row items-center gap-1">
+        {managers === 1 ? <Icon as={TriangleAlert} className="size-4 text-warning" /> : null}
+        <Text className={managers === 1 ? 'text-meta text-warning' : 'text-meta text-muted-foreground'} style={tabular}>{securityCopy.managerCount(managers)}</Text>
+      </View>
+    </SettingsRow>
+    {pending ? <SettingsRow href="/inbox" icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
+      <Text className="text-meta text-danger" style={tabular}>{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</Text>
+    </SettingsRow> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}><Text className="text-meta text-muted-foreground">{securityCopy.noRecovery}</Text></SettingsRow>}
+    {recoverySince ? <SettingsRow icon={KeyRound} label={securityCopy.password}><Text className="text-meta text-muted-foreground" style={tabular}>{securityCopy.changedOn(recoverySince)}</Text></SettingsRow> : null}
+  </SettingsGroup>
 }
 
 /** Rendered only while connected: the shared workspace exists exactly then. */
