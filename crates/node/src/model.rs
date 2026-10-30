@@ -151,7 +151,8 @@ pub struct Subject {
     /// The provider's thread or session ID.
     pub session_id: String,
     pub cwd: String,
-    /// One line: what the session last said.
+    /// One line: what the session said in the event this subject comes from. A session's
+    /// attribution keeps the line from when it was claimed; later turns do not update it.
     pub summary: String,
     /// The request `node` holds until the question is answered: an App Server's, or one a
     /// session's hook, plugin or extension waits on.

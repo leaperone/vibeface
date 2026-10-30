@@ -17,9 +17,11 @@ const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
-/// the Node watches. Its methods say what the runtime needs to know about the product; besides
-/// them, only the code that speaks a provider's protocol matches on it: its `Executor`, its bot
-/// turn's `Sdk` and its hook parser.
+/// the Node watches. Its methods say most of what the runtime needs to know about the product;
+/// the code that speaks a provider's protocol also matches on it: its `Executor`, its bot turn's
+/// `Sdk` and its hook parser. A few checks outside them still name a provider: the scheduler
+/// gives a Cursor bot turn its own store and a fresh tool token, and the capabilities a Node
+/// offers report whether Codex executes work.
 #[derive(
     Clone,
     Copy,

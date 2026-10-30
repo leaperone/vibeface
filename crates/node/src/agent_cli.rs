@@ -17,7 +17,8 @@ use vibeface_protocol::now_ms;
 /// the registration that created the work sends, and only inside its window. `ready` names the
 /// provider the Node runs the work on, after waiting for the Node's own App Server
 /// connection when that is Codex, so a send right after the Node starts is not refused while
-/// the App Server comes up.
+/// the App Server comes up. A send into a thread fails, with nothing registered, when `ready`
+/// cannot be asked: without the answer it would skip reading the thread.
 pub async fn dispatch<T, TF, B, BF, R, RF>(
     args: &Value,
     track: T,
@@ -31,14 +32,16 @@ where
     B: Fn(String, StartReport) -> BF,
     BF: Future<Output = Result<Value>>,
     R: Fn(Value) -> RF,
-    RF: Future<Output = Option<String>>,
+    RF: Future<Output = Result<Option<String>>>,
 {
     let mut args = args.clone();
     let existing = args["thread"].as_str().map(str::to_owned);
     // A Codex send reads its thread before registering, so a missing thread leaves nothing
     // behind. The Node checks the session another provider would take the work in.
     let readied = match &existing {
-        Some(_) => Some(ready(args.clone()).await),
+        Some(thread) => Some(ready(args.clone()).await.with_context(|| {
+            format!("cannot ask the Node which agent has thread {thread}; nothing was registered or sent, so the send can be retried")
+        })?),
         None => None,
     };
     if let (Some(thread), Some(Some("codex"))) = (&existing, readied.as_ref().map(Option::as_deref))
@@ -88,8 +91,9 @@ where
         .to_owned();
     let report = |report| bind(work_id.clone(), report);
     let fail = |failure: ExecFailure| report(StartReport::Rejected(failure));
+    // Only a wait for the App Server; the send below reports whatever it meets.
     if readied.is_none() {
-        ready(args.clone()).await;
+        let _ = ready(args.clone()).await;
     }
     let mut session = match DirectSession::connect(socket).await {
         Ok(session) => session,
@@ -268,7 +272,7 @@ mod tests {
             &args,
             track,
             |_, _| async { Ok(json!({})) },
-            |_| async { Some("codex".to_owned()) },
+            |_| async { Ok(Some("codex".to_owned())) },
             &socket,
         )
         .await;
@@ -285,6 +289,28 @@ mod tests {
                 .is_some_and(|method| method.starts_with("turn/") || method == "thread/resume")),
             "nothing was sent into the thread"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_send_into_a_thread_fails_when_the_node_cannot_say_who_has_it() -> Result<()> {
+        let tracked = Arc::new(Mutex::new(false));
+        let track = |_| {
+            *tracked.lock().unwrap() = true;
+            async { Ok(json!({"may_send":true,"work_id":"w"})) }
+        };
+        let args = json!({"thread":"t-1","prompt":"p","title":"t","call_ref":"r"});
+        let failed = dispatch(
+            &args,
+            track,
+            |_, _| async { Ok(json!({})) },
+            |_| async { bail!("the Node did not answer") },
+            Path::new("/nonexistent/app.sock"),
+        )
+        .await;
+        let failed = failed.expect_err("an unanswered ready is not a skipped read");
+        assert!(failed.to_string().contains("can be retried"), "{failed:#}");
+        assert!(!*tracked.lock().unwrap(), "no work was registered");
         Ok(())
     }
 }

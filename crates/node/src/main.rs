@@ -1569,8 +1569,8 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
         },
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
-            let ready = post_tool("wait_work", asked, call_id).await;
-            ready.ok()?["agent"].as_str().map(str::to_owned)
+            let ready = post_tool("wait_work", asked, call_id).await?;
+            Ok(ready["agent"].as_str().map(str::to_owned))
         },
         socket,
     )
