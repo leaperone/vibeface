@@ -308,7 +308,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Explicit home directory holding the coding agents' hook and extension files.
+    /// Home directory holding the coding agents' hook and extension files, Codex's included;
+    /// defaults to `$HOME`, with Codex's in `$CODEX_HOME` when set.
     #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
@@ -580,7 +581,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Action::Hooks(options) => hooks(options).await,
+        Action::Hooks(options) => hooks(options, vibeface::discovery::Host::current()).await,
         Action::Triage(options) => triage(options).await,
         Action::Log(options) => log_record(options).await,
         Action::Logs(options) => logs(options).await,
@@ -1940,7 +1941,22 @@ async fn hook(options: Hook) -> Result<()> {
     Ok(())
 }
 
-async fn hooks(options: Hooks) -> Result<()> {
+/// The home folder `vibeface hooks` edits and Codex's folder in it. `--home` holds every file,
+/// Codex's too; without it, `$HOME`, and Codex's folder is found as Codex finds it: `CODEX_HOME`,
+/// else `$HOME/.codex`.
+fn hook_homes(home: Option<&Path>, host: &vibeface::discovery::Host) -> Result<(PathBuf, PathBuf)> {
+    if let Some(home) = home {
+        return Ok((home.to_owned(), home.join(".codex")));
+    }
+    let home = host.home.clone().context("HOME is not set; pass --home")?;
+    let codex_home = host
+        .codex_home
+        .clone()
+        .unwrap_or_else(|| home.join(".codex"));
+    Ok((home, codex_home))
+}
+
+async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
     use vibeface::triage;
     if let HooksAction::Test = options.action {
         let result = post_local(
@@ -1957,10 +1973,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let home = options
-        .home
-        .as_ref()
-        .context("--home is required for hook configuration")?;
+    let (home, codex_home) = hook_homes(options.home.as_deref(), &host)?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
@@ -1969,13 +1982,7 @@ async fn hooks(options: Hooks) -> Result<()> {
     let stamp = vibeface::runtime::now_ms();
     // Every file is read and checked before any is written: one that cannot change leaves all.
     let mut planned = Vec::new();
-    let codex_home = vibeface::discovery::Host {
-        home: Some(home.clone()),
-        ..vibeface::discovery::Host::current()
-    }
-    .codex_home()
-    .ok();
-    for file in triage::hook_files(home, codex_home.as_deref()) {
+    for file in triage::hook_files(&home, &codex_home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -2004,7 +2011,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         };
         planned.push((file.path, settings, changed, command));
     }
-    let extensions = extensions(&options, home, &program, &data_dir)?;
+    let extensions = extensions(&options, &home, &program, &data_dir)?;
     for (path, settings, changed, command) in planned {
         if changed.is_empty() {
             println!("{}: unchanged", path.display());
@@ -2051,7 +2058,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         }
     }
     if let HooksAction::Install = options.action {
-        let config = home.join(".codex/config.toml");
+        let config = codex_home.join("config.toml");
         let enabled = fs::read_to_string(&config)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -2822,7 +2829,7 @@ mod tests {
             let Some(Action::Hooks(options)) = parsed.command else {
                 panic!("expected hooks")
             };
-            hooks(options).await
+            hooks(options, Default::default()).await
         };
         let extensions = home.join(".pi/agent/extensions");
         let path = extensions.join("vibeface.ts");
@@ -2853,6 +2860,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hooks_install_finds_codex_as_codex_does_and_home_holds_every_file() {
+        use vibeface::discovery::Host;
+        let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
+        let (home, codex, data) = (dir.join("home"), dir.join("codex"), dir.join("data"));
+        let run = async |host: Host, home: Option<&Path>| {
+            let mut args = vec![
+                "vibeface",
+                "hooks",
+                "install",
+                "--data-dir",
+                data.to_str().unwrap(),
+            ];
+            if let Some(home) = home {
+                args.extend(["--home", home.to_str().unwrap()]);
+            }
+            let Some(Action::Hooks(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected hooks")
+            };
+            hooks(options, host).await
+        };
+        let env = |home: PathBuf, codex_home: Option<PathBuf>| Host {
+            home: Some(home),
+            codex_home,
+            path: None,
+        };
+        let given = dir.join("given");
+        run(env(home.clone(), Some(codex.clone())), Some(&given))
+            .await
+            .unwrap();
+        assert!(given.join(".codex/hooks.json").is_file());
+        assert!(given.join(".claude/settings.json").is_file());
+        assert!(
+            !codex.exists() && !home.exists(),
+            "--home keeps CODEX_HOME and $HOME untouched"
+        );
+        run(env(home.clone(), Some(codex.clone())), None)
+            .await
+            .unwrap();
+        assert!(codex.join("hooks.json").is_file());
+        assert!(home.join(".claude/settings.json").is_file());
+        assert!(
+            !home.join(".codex").exists(),
+            "CODEX_HOME moves Codex's files"
+        );
+        let plain = dir.join("plain");
+        run(env(plain.clone(), None), None).await.unwrap();
+        assert!(plain.join(".codex/hooks.json").is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn hooks_install_writes_the_opencode_plugin_once() {
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let (home, data) = (dir.join("home"), dir.join("data"));
@@ -2870,7 +2928,7 @@ mod tests {
             let Some(Action::Hooks(options)) = parsed.command else {
                 panic!("expected hooks")
             };
-            hooks(options).await
+            hooks(options, Default::default()).await
         };
         let path = home.join(".config/opencode/plugins/vibeface.ts");
         run("install").await.unwrap();

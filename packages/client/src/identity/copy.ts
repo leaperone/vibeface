@@ -204,6 +204,8 @@ export const deviceCopy = {
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },
+  /** The bot's model: a choice from the list its provider gives, with 其他… and 从列表选 switching to and from typing it. */
+  botModel: { label: 'Bot 模型', default: '默认', other: '其他…', pick: '从列表选' },
 }
 
 /** Settings → 会话等你时: how a session that needs the person reaches them. `outlets`: where it shows by default. */

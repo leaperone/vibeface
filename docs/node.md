@@ -137,11 +137,11 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 回答本人自己开的会话
 
-`vibeface hooks install --home <home>` 写入各产品的监听入口，已打开的会话重启后加载：
+`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。文件默认在 `$HOME` 下，Codex 的在 Codex 目录（`CODEX_HOME`，没设时 `~/.codex`）。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
 | 产品 | 写入 | Bot 能回答 |
 |---|---|---|
-| Codex | `.codex/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
+| Codex | `<Codex 目录>/hooks.json` | 只上报；App Server 上的请求由 Bot 直接回答 |
 | Claude Code | `.claude/settings.json` 的 hooks | 权限请求和提问 |
 | pi | `.pi/agent/extensions/vibeface.ts` | 一轮结束后替本人发下一条消息；本人已接着输入时丢弃 |
 | opencode | `.config/opencode/plugins/vibeface.ts` | 权限请求和提问 |

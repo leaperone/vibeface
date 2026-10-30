@@ -629,14 +629,15 @@ pub struct HookFile {
 }
 
 /// The hook files under `home`; Codex's is in `codex_home` when it has one.
-pub fn hook_files(home: &Path, codex_home: Option<&Path>) -> Vec<HookFile> {
+/// The hook files under `home`, Codex's under `codex_home`.
+pub fn hook_files(home: &Path, codex_home: &Path) -> Vec<HookFile> {
     Provider::ALL
         .into_iter()
         .filter_map(|agent| match agent.watch()? {
             Watch::Hooks { file, events } => Some(HookFile {
                 agent,
-                path: match (agent, codex_home) {
-                    (Provider::Codex, Some(codex_home)) => codex_home.join("hooks.json"),
+                path: match agent {
+                    Provider::Codex => codex_home.join(file),
                     _ => home.join(file),
                 },
                 events,
@@ -937,17 +938,14 @@ mod tests {
     #[test]
     fn hook_install_appends_once_and_removes_only_its_own_entries() {
         let home = Path::new("/home/u");
-        let [codex, claude] = &hook_files(home, None)[..] else {
-            panic!("Codex and Claude Code take hooks");
-        };
-        assert_eq!(codex.path, home.join(".codex/hooks.json"));
         let codex_home = Path::new("/srv/codex");
-        let [own, other] = &hook_files(home, Some(codex_home))[..] else {
+        let [codex, claude] = &hook_files(home, codex_home)[..] else {
             panic!("Codex and Claude Code take hooks");
         };
-        assert_eq!(own.path, codex_home.join("hooks.json"));
+        assert_eq!(codex.path, codex_home.join("hooks.json"));
         assert_eq!(
-            other.path, claude.path,
+            claude.path,
+            home.join(".claude/settings.json"),
             "CODEX_HOME moves only Codex's hooks"
         );
         let command = hook_command(

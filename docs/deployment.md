@@ -89,11 +89,11 @@ Provider 的其他认证环境通过设备设置或服务配置填写。不要�
 }
 ```
 
-安装 hooks 时也必须明确选择被修改的配置所在 home，写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
+安装 hooks 默认改 `$HOME` 下的配置，Codex 的按 Codex 自己的规则找（`CODEX_HOME`，没设时 `~/.codex`）。改别的目录时用 `--home`，所有文件都落在该目录下，包括 Codex 的。写入的文件见 [回答本人自己开的会话](node.md#回答本人自己开的会话)：
 
 ```sh
-vibeface hooks install --home '<包含各 Agent 配置的目录>'
-vibeface hooks status --home '<同一个目录>'
+vibeface hooks install [--home '<包含各 Agent 配置的目录>']
+vibeface hooks status [--home '<同一个目录>']
 ```
 
 本地执行保留所需的真实路径。共享事件和 webhook 使用工作区相对标识，日志隐藏已配置的私有目录。诊断导出提供配置摘要，不输出本机配置文件全文。

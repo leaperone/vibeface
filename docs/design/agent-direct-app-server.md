@@ -213,10 +213,10 @@ Grok Bot 用 HTTPS 调公共入口：`POST https://<入口>/api/decision`，`Aut
 ## 6. 安装 hook
 
 ```sh
-vibeface hooks install --data-dir <数据目录> --home <目录> [--dry-run]
-vibeface hooks status --data-dir <数据目录> --home <目录>
+vibeface hooks install --data-dir <数据目录> [--home <目录>] [--dry-run]
+vibeface hooks status --data-dir <数据目录> [--home <目录>]
 vibeface hooks test --data-dir <数据目录>
-vibeface hooks uninstall --data-dir <数据目录> --home <目录> [--dry-run]
+vibeface hooks uninstall --data-dir <数据目录> [--home <目录>] [--dry-run]
 ```
 
-`install` 要求 `--home`，只修改明确指定目录下的 `.codex/hooks.json` 和 `.claude/settings.json`。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。
+`install` 只修改 home 下各产品的 hook 与扩展文件（`.claude/settings.json`、pi 和 opencode 的扩展）以及 Codex 目录下的 `hooks.json`。不给 `--home` 时 home 是 `$HOME`，Codex 目录是 `CODEX_HOME`，没设时 `$HOME/.codex`；给 `--home` 时 Codex 目录是 `<目录>/.codex`。先备份原文件，只追加本工具的条目，重复执行不会重复添加。`uninstall` 只删本工具的条目。`--dry-run` 展示将要修改的内容。`test` 仅向明确指定的 Node 发送测试事件。Codex 的 hook 功能仍须由部署者在配置中开启。
