@@ -1,9 +1,9 @@
-import { Link, createFileRoute, useNavigate } from '@tanstack/react-router'
+import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
-import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow, toast } from '@/components/app/kit'
+import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -12,8 +12,6 @@ import { onlyManagerText, soleManager, waitingCopy } from '@vibeface/client/iden
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
 import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
-import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
-import { webPlatform } from '@/lib/platform'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
 import { readTheme, setTheme, type Theme } from '@/lib/theme'
 
@@ -26,12 +24,10 @@ const themes: Array<{ value: Theme; label: string; icon: LucideIcon }> = [{ valu
 function SettingsPage() {
   const workspace = useWorkspace()
   const device = useDevice()
-  const navigate = useNavigate()
   const [theme, setThemeState] = useState(readTheme)
   const [leaving, setLeaving] = useState(false)
   const [range, setRange] = useState(86_400_000)
   const [exported, setExported] = useState<'idle' | 'busy' | 'done'>('idle')
-  const [experiments, setExperiments] = useExperiments(webPlatform.storage)
   useEffect(() => {
     if (exported !== 'done') return
     const timer = setTimeout(() => setExported('idle'), 2000)
@@ -63,13 +59,10 @@ function SettingsPage() {
       <PhoneRecovery />
       <RecoveryControls />
     </SettingsGroup> : null}
-    <SettingsGroup title={experimentsCopy.group}>
-      <SettingsRow icon={FlaskConical} label={experimentsCopy.label} description={experiments ? experimentsCopy.on : experimentsCopy.hint}>
-        <input type="checkbox" role="switch" className="switch" aria-label={experimentsCopy.label} checked={experiments} onChange={(event) => {
-          setExperiments(event.target.checked)
-          if (event.target.checked) toast(experimentsCopy.on, { tone: 'success', icon: FlaskConical, action: { label: experimentsCopy.open, onClick: () => void navigate({ to: '/transfers' }) } })
-        }} />
-      </SettingsRow>
+    <SettingsGroup title="高级">
+      <Link to="/settings/lab" className="interactive-row block">
+        <SettingsRow icon={FlaskConical} label="实验室" description="付费传输等测试功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
+      </Link>
     </SettingsGroup>
     {operator ? <SettingsGroup title="问题排查" footer="诊断包不含登录信息和加入链接">
       <Link to="/settings/logs" className="interactive-row block">

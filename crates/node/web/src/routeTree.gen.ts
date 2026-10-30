@@ -19,6 +19,7 @@ import { Route as AppTransfersRouteImport } from './routes/_app/transfers'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
+import { Route as AppSettingsLabRouteImport } from './routes/_app/settings_.lab'
 import { Route as AppSettingsLogsRouteImport } from './routes/_app/settings_.logs'
 import { Route as AppBBotIdWorkWorkIdRouteImport } from './routes/_app/b.$botId.work.$workId'
 
@@ -71,6 +72,11 @@ const AppDevicesDeviceIdRoute = AppDevicesDeviceIdRouteImport.update({
   path: '/devices/$deviceId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSettingsLabRoute = AppSettingsLabRouteImport.update({
+  id: '/settings_/lab',
+  path: '/settings/lab',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppSettingsLogsRoute = AppSettingsLogsRouteImport.update({
   id: '/settings_/logs',
   path: '/settings/logs',
@@ -91,6 +97,7 @@ export interface FileRoutesByFullPath {
   '/transfers': typeof AppTransfersRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/devices/': typeof AppDevicesIndexRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -104,6 +111,7 @@ export interface FileRoutesByTo {
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/devices': typeof AppDevicesIndexRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -119,6 +127,7 @@ export interface FileRoutesById {
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
+  '/_app/settings_/lab': typeof AppSettingsLabRoute
   '/_app/settings_/logs': typeof AppSettingsLogsRoute
   '/_app/devices/': typeof AppDevicesIndexRoute
   '/_app/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
@@ -134,6 +143,7 @@ export interface FileRouteTypes {
     | '/transfers'
     | '/b/$botId'
     | '/devices/$deviceId'
+    | '/settings/lab'
     | '/settings/logs'
     | '/devices/'
     | '/b/$botId/work/$workId'
@@ -147,6 +157,7 @@ export interface FileRouteTypes {
     | '/'
     | '/b/$botId'
     | '/devices/$deviceId'
+    | '/settings/lab'
     | '/settings/logs'
     | '/devices'
     | '/b/$botId/work/$workId'
@@ -161,6 +172,7 @@ export interface FileRouteTypes {
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/devices/$deviceId'
+    | '/_app/settings_/lab'
     | '/_app/settings_/logs'
     | '/_app/devices/'
     | '/_app/b/$botId/work/$workId'
@@ -244,6 +256,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppDevicesDeviceIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings_/lab': {
+      id: '/_app/settings_/lab'
+      path: '/settings/lab'
+      fullPath: '/settings/lab'
+      preLoaderRoute: typeof AppSettingsLabRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/settings_/logs': {
       id: '/_app/settings_/logs'
       path: '/settings/logs'
@@ -280,6 +299,7 @@ interface AppRouteChildren {
   AppIndexRoute: typeof AppIndexRoute
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
+  AppSettingsLabRoute: typeof AppSettingsLabRoute
   AppSettingsLogsRoute: typeof AppSettingsLogsRoute
   AppDevicesIndexRoute: typeof AppDevicesIndexRoute
 }
@@ -291,6 +311,7 @@ const AppRouteChildren: AppRouteChildren = {
   AppIndexRoute: AppIndexRoute,
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
+  AppSettingsLabRoute: AppSettingsLabRoute,
   AppSettingsLogsRoute: AppSettingsLogsRoute,
   AppDevicesIndexRoute: AppDevicesIndexRoute,
 }
