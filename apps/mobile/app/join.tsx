@@ -12,7 +12,6 @@ import { useCSSVariable } from 'uniwind'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { joinCopy } from '@vibeface/client/identity/copy.ts'
 import { recoveryTarget } from '@vibeface/client/identity/recovery-link.ts'
-import { joinTicket } from '@vibeface/client/lib/transport.ts'
 import { ErrorText } from '@/components/action'
 import { Panel, SafetyCode, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
@@ -94,13 +93,13 @@ function JoinForm() {
   const device = useDevice()
   const url = useLinkingURL()
   const [invitation, setInvitation] = useState('')
-  // An error belongs to the link it was about: a new one, typed, pasted or scanned, starts clean.
+  // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
   const [edited, setEdited] = useState(false)
   const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
   // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
     const link = openedLink(url)
-    if (link && link !== spent) setInvitation(link)
+    if (link && link !== spent) edit(link)
   }, [url])
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
@@ -115,8 +114,9 @@ function JoinForm() {
     finally { setBusy(false) }
   }
   if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
-  // Checked as it changes, as on the web: only a real join link counts as filled; typing or other text keeps the field.
-  const ready = joinTicket(invitation) !== null
+  // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
+  // or any other text keeps the field.
+  const ready = device.linkTarget(invitation) !== null
   const invalid = !ready && invitation.trim() !== ''
   // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
   const failure = error || (edited ? '' : device.error)
