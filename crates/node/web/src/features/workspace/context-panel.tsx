@@ -7,6 +7,7 @@ import { Details, SettingsGroup, SettingsRow, StatusPill, type Tone } from "@/co
 import { formatWhen, changeTitle } from "@vibeface/client/workspace/bot-settings.ts"
 import { nodeName, shownState, taskLabel } from "@vibeface/client/workspace/labels.ts"
 import type { BotChange, BotRecord, ConversationPayload, CoordinationCheck, NodeInfo, Question, WorkRecord } from "@vibeface/client/workspace/types.ts"
+import { CollaborationPanel } from "./collaboration-panel"
 
 type ContextPanelProps = {
   bot: Pick<BotRecord, "bot_id" | "name">
@@ -94,6 +95,11 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
         <ul className="grid gap-2">{checks.map((check) => <CheckSummary key={check.check_id} check={check} />)}</ul>
       </Details> : null}
     </SettingsGroup>
+
+    <section className="grid gap-3" aria-label="协作与队列">
+      <h3 className="px-1 text-meta font-medium text-muted-foreground">协作与队列</h3>
+      <CollaborationPanel data={data} botId={bot.bot_id} className="gap-4" showWork={false} showQuestions={false} />
+    </section>
 
     <p className="px-1 text-meta text-muted-foreground">本面板只显示当前快照里的摘要。任务操作仍在任务详情中进行。</p>
   </div>

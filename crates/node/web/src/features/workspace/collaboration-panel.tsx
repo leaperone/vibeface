@@ -14,7 +14,7 @@ import type { ConversationPayload, ManagerJob, Question, SessionHandoff, SentBot
 import { cn } from "@/lib/utils"
 
 /** A read-only view of this conversation's local scheduler and Bot-to-Bot records. */
-export type CollaborationPanelProps = { data?: ConversationPayload | null; botId?: string; className?: string }
+export type CollaborationPanelProps = { data?: ConversationPayload | null; botId?: string; className?: string; showWork?: boolean; showQuestions?: boolean }
 
 const schedulerLabels: Record<string, string> = {
   queued: "排队中",
@@ -236,7 +236,7 @@ function CollaborationMessages({ data, botNames }: { data: ConversationPayload; 
   </Section>
 }
 
-export function CollaborationPanel({ data: supplied, botId: suppliedBotId, className }: CollaborationPanelProps = {}) {
+export function CollaborationPanel({ data: supplied, botId: suppliedBotId, className, showWork = true, showQuestions = true }: CollaborationPanelProps = {}) {
   const workspace = useWorkspace()
   const data = supplied === undefined ? workspace.data : supplied
   const botId = suppliedBotId ?? workspace.selectedBot?.bot_id
@@ -251,9 +251,9 @@ export function CollaborationPanel({ data: supplied, botId: suppliedBotId, class
     {scheduler ? <Section title="会话队列" count={jobs.length}>
       {jobs.length ? <ul className="grid gap-2">{jobs.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">当前会话没有排队项目。</CardContent></Card>}
     </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />队列状态暂不可见。</CardContent></Card>}
-    {works.length ? <Section title="执行工作" count={works.length}><ul className="grid gap-2">{works.map((work) => <WorkRow key={work.work_id} work={work} botId={botId} nodes={workspace.nodes} />)}</ul></Section> : null}
+    {showWork && works.length ? <Section title="执行工作" count={works.length}><ul className="grid gap-2">{works.map((work) => <WorkRow key={work.work_id} work={work} botId={botId} nodes={workspace.nodes} />)}</ul></Section> : null}
     <Unanswered ids={scheduler?.unanswered ?? []} data={data} botId={botId} />
-    <QuestionRows questions={questions} botId={botId} />
+    {showQuestions ? <QuestionRows questions={questions} botId={botId} /> : null}
     <SessionRows sessions={data.sessions} nodes={workspace.nodes} />
     <CollaborationMessages data={data} botNames={botNames} />
   </div>
