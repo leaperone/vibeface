@@ -15,6 +15,7 @@ import { Route as JoinRouteImport } from './routes/join'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
+import { Route as AppTasksRouteImport } from './routes/_app/tasks'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
@@ -50,6 +51,11 @@ const AppInboxRoute = AppInboxRouteImport.update({
 const AppSettingsRoute = AppSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppTasksRoute = AppTasksRouteImport.update({
+  id: '/tasks',
+  path: '/tasks',
   getParentRoute: () => AppRoute,
 } as any)
 const AppBBotIdRoute = AppBBotIdRouteImport.update({
@@ -94,6 +100,7 @@ export interface FileRoutesByFullPath {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
+  '/tasks': typeof AppTasksRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/lab': typeof AppSettingsLabRoute
@@ -107,6 +114,7 @@ export interface FileRoutesByTo {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
+  '/tasks': typeof AppTasksRoute
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
@@ -123,6 +131,7 @@ export interface FileRoutesById {
   '/join': typeof JoinRoute
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
+  '/_app/tasks': typeof AppTasksRoute
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
@@ -140,6 +149,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
+    | '/tasks'
     | '/b/$botId'
     | '/devices/$deviceId'
     | '/settings/lab'
@@ -153,6 +163,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
+    | '/tasks'
     | '/'
     | '/b/$botId'
     | '/devices/$deviceId'
@@ -168,6 +179,7 @@ export interface FileRouteTypes {
     | '/join'
     | '/_app/inbox'
     | '/_app/settings'
+    | '/_app/tasks'
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/devices/$deviceId'
@@ -226,6 +238,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof AppSettingsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/_app/tasks': {
+      id: '/_app/tasks'
+      path: '/tasks'
+      fullPath: '/tasks'
+      preLoaderRoute: typeof AppTasksRouteImport
       parentRoute: typeof AppRoute
     }
     '/_app/b/$botId': {
@@ -295,6 +314,7 @@ const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
 interface AppRouteChildren {
   AppInboxRoute: typeof AppInboxRoute
   AppSettingsRoute: typeof AppSettingsRoute
+  AppTasksRoute: typeof AppTasksRoute
   AppIndexRoute: typeof AppIndexRoute
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
@@ -307,6 +327,7 @@ interface AppRouteChildren {
 const AppRouteChildren: AppRouteChildren = {
   AppInboxRoute: AppInboxRoute,
   AppSettingsRoute: AppSettingsRoute,
+  AppTasksRoute: AppTasksRoute,
   AppIndexRoute: AppIndexRoute,
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
@@ -326,12 +347,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { createStart } from '@tanstack/react-start'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-  }
-}
