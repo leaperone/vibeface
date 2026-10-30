@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { spentInvite } from '@vibeface/client/lib/errors.ts'
+import { spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
@@ -184,6 +184,17 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     if (device.joining) wasJoining.current = true
     else if (wasJoining.current) { wasJoining.current = false; if (!device.ready) setInvitation('') }
   }, [device.joining, device.ready])
+
+  // A used or expired link says so as it opens, before the name and 加入; no answer leaves the form as it is.
+  const checkable = purpose === 'link' && usable && !device.joining && !device.nodeJoining
+  useEffect(() => {
+    if (!checkable) return
+    let live = true
+    void device.checkInvite(invitation).then((state) => {
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+    })
+    return () => { live = false }
+  }, [invitation, checkable, thisComputer])
 
   function chooseLane(next: Lane) {
     if (!device.entry || next !== 'recovery') device.disconnect()

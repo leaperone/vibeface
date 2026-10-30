@@ -1,5 +1,5 @@
 use crate::runtime::Runtime;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -25,6 +25,16 @@ impl std::fmt::Display for Busy {
     }
 }
 impl std::error::Error for Busy {}
+
+/// The Node answered and turned the request down; sending it again gets the same answer.
+#[derive(Debug)]
+pub struct Refused(pub String);
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Refused {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -195,6 +205,11 @@ enum Command {
     Commit,
     /// Turn local browser access without confirmation on or off.
     LocalAccess(bool),
+    /// Start this Node's join with an invite link, or read how far the same join got.
+    Join {
+        link: String,
+        name: String,
+    },
     DeliveryWallet(crate::delivery::wallet::WalletCommand),
     DeliveryConfig(Box<crate::delivery::DeliveryConfig>),
     DeliveryKeyOperation {
@@ -229,6 +244,8 @@ struct Response {
     wallet: Option<crate::delivery::wallet::WalletStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    join: Option<crate::client::NodeJoin>,
 }
 
 async fn read_packet<T: for<'de> Deserialize<'de>>(stream: &mut UnixStream) -> Result<T> {
@@ -320,11 +337,14 @@ async fn request(data_dir: &Path, command: Command) -> Result<(UnixStream, Respo
             let error = response.error.unwrap_or_else(|| "active work".into());
             return Err(Busy(error.trim_start_matches("node is busy: ").to_owned()).into());
         }
-        Status::Error => bail!(
-            response
-                .error
-                .unwrap_or_else(|| "maintenance request failed".into())
-        ),
+        Status::Error => {
+            return Err(Refused(
+                response
+                    .error
+                    .unwrap_or_else(|| "maintenance request failed".into()),
+            )
+            .into());
+        }
         _ => {}
     }
     Ok((stream, response))
@@ -369,6 +389,20 @@ pub async fn set_local_access(data_dir: &Path, enabled: bool) -> Result<()> {
         "node did not apply local browser access"
     );
     Ok(())
+}
+
+/// Hands `vibeface join` to the running Node. The same link again only reads the join's state,
+/// so a request whose reply was lost is safe to send again.
+pub async fn join(data_dir: &Path, link: &str, name: &str) -> Result<crate::client::NodeJoin> {
+    let (_, response) = request(
+        data_dir,
+        Command::Join {
+            link: link.to_owned(),
+            name: name.to_owned(),
+        },
+    )
+    .await?;
+    response.join.context("node did not report its join")
 }
 
 pub async fn delivery_wallet(
@@ -465,6 +499,7 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
         error: None,
         wallet: None,
         delivery: None,
+        join: None,
     };
     match request.command {
         Command::Probe => write_packet(&mut stream, &response).await?,
@@ -511,6 +546,33 @@ async fn connection(runtime: Arc<Runtime>, pending: PathBuf, mut stream: UnixStr
                 Ok(value) => response.delivery = Some(value),
                 Err(error) => {
                     response.status = Status::Error;
+                    response.error = Some(error.to_string());
+                }
+            }
+            write_packet(&mut stream, &response).await?;
+        }
+        Command::Join { link, name } => {
+            let link = Zeroizing::new(link);
+            let result = match runtime.maintenance.enter() {
+                Ok(_guard) => {
+                    crate::client::start_node_join(
+                        &runtime,
+                        &link,
+                        &name,
+                        crate::client::JoinOwner::Terminal,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(status) => response.join = Some(status),
+                Err(error) => {
+                    response.status = if error.downcast_ref::<Busy>().is_some() {
+                        Status::Busy
+                    } else {
+                        Status::Error
+                    };
                     response.error = Some(error.to_string());
                 }
             }
@@ -577,6 +639,7 @@ mod tests {
         config::{self, Config},
         crypto::LocalIdentity,
     };
+    use anyhow::bail;
 
     #[test]
     fn device_id_health_uses_only_the_current_field() -> Result<()> {
@@ -728,6 +791,103 @@ mod tests {
         let socket = socket_path(&dir)?;
         std::fs::remove_file(&socket)?;
         std::fs::remove_dir_all(socket.parent().unwrap())?;
+        std::fs::remove_dir_all(&dir)?;
+        result
+    }
+
+    #[tokio::test]
+    async fn a_terminal_join_runs_in_the_running_node_and_asking_again_only_reads_it() -> Result<()>
+    {
+        use crate::client::{JoinOwner, NodeJoin, start_node_join};
+        use vibeface_secure::join::Ticket;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("maintenance-join-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let dir = dir.canonicalize()?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        Config::local("127.0.0.1:4794".parse()?, vec![], false).save(&dir)?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let server = tokio::spawn(serve(node.clone(), dir.clone()));
+        let link = |secret: u8| -> Result<String> {
+            let mut ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+            ticket.entry.direct_addrs = vec!["127.0.0.1:9".parse()?];
+            Ok(ticket.encode()?)
+        };
+        let nonce = || -> Result<(String, String)> {
+            let pending: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
+            Ok((
+                pending["link"].as_str().unwrap_or_default().to_owned(),
+                pending["nonce"].as_str().unwrap_or_default().to_owned(),
+            ))
+        };
+        let committed = || async {
+            for _ in 0..100 {
+                if dir.join("join.json").exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let result = async {
+            for _ in 0..100 {
+                if socket_path(&dir)?.exists() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let first = link(7)?;
+            assert_eq!(join(&dir, &first, "工作室 Mac").await?, NodeJoin::Waiting);
+            committed().await;
+            let (_, sent) = nonce()?;
+            assert_eq!(
+                join(&dir, &first, "工作室 Mac").await?,
+                NodeJoin::Waiting,
+                "the same link again reads the join"
+            );
+            assert_eq!(nonce()?.1, sent, "and sends no second request");
+            assert!(
+                start_node_join(
+                    &node,
+                    &link(8)?,
+                    "工作室 Mac",
+                    JoinOwner::Page(capability.capability.clone())
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another join is already running"),
+                "the page does not cut off the terminal's join"
+            );
+            let second = link(9)?;
+            assert_eq!(join(&dir, &second, "工作室 Mac").await?, NodeJoin::Waiting);
+            committed().await;
+            let (kept, replaced) = nonce()?;
+            assert!(
+                kept.ends_with(&second) && replaced != sent,
+                "a new link from the terminal starts over"
+            );
+            let refused = join(&dir, "not a link", "工作室 Mac").await.unwrap_err();
+            assert!(refused.downcast_ref::<Refused>().is_some(), "{refused:#}");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.abort();
+        let _ = server.await;
+        drop(node);
+        let socket = socket_path(&dir)?;
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir_all(socket.parent().unwrap());
         std::fs::remove_dir_all(&dir)?;
         result
     }

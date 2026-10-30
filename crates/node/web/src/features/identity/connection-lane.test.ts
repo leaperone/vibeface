@@ -8,6 +8,7 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import type { ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -59,6 +60,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
   const managed = { value: [] as Record<string, unknown>[] }
+  const inviteState = { value: 'open' }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   // As the Node sends it.
@@ -92,7 +94,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   let key = subject
   let initialized = !bootstrap && local !== 'fresh'
   const transport = {
-    validTarget: (value: string) => value, validEndpoint: (value: string) => value,
+    validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket,
     initClient: async () => ({ deviceId: key }), signClient: async () => 'signature',
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
     parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
@@ -120,6 +122,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'authenticate' && removed && key === subject) return { principal: null, initialized: true, network_id: network, revoked: true }
         if (method === 'authenticate') { initialized = true; authorized = true }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
+        if (method === 'join_check' || method === 'node_join_check') return { invite: inviteState.value }
         if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
@@ -195,7 +198,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, secure, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -428,6 +431,35 @@ test('joining commits first, reveals only after the manager nonce, then shows th
     assert.equal(app.stored.get('vibeface.pending-join'), 'null')
     assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
     assert.equal(app.calls.includes('replace-key'), false)
+  } finally { app.close() }
+})
+
+test('opening a used link says so before 加入, on its own channel, and sends no join request', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    const phase = app.render().phase
+    app.inviteState.value = 'used'
+    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'used')
+    assert.deepEqual(plain(app.requests.filter(request => request.method === 'join_check').map(request => request.params)), [{ secret: 'one-time-secret' }])
+    assert.equal(app.requests.some(request => request.method === 'join'), false, 'checking takes nothing')
+    assert.equal(app.sockets.length, 1)
+    assert.equal(app.render().phase, phase, 'the screen keeps its connection state')
+    app.inviteState.value = 'open'
+    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    assert.equal(app.render().joining?.status, 'pending', 'an open link still goes through the approval')
+  } finally { app.close() }
+})
+
+test('this computer asks its own Node about a link, with the page capability, and never joins to find out', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  try {
+    app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
+    app.inviteState.value = 'expired'
+    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'expired')
+    const check = app.requests.find(request => request.method === 'node_join_check')
+    assert.deepEqual(plain(check?.params), { capability: localCapability, link: 'https://node.example/join#vibeface1ticket' })
+    assert.equal(app.requests.some(request => request.method === 'node_join'), false)
   } finally { app.close() }
 })
 

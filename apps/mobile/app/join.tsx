@@ -1,7 +1,7 @@
 import * as Clipboard from 'expo-clipboard'
 import { openURL, useLinkingURL } from 'expo-linking'
 import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, X } from 'lucide-react-native'
-import { humanError } from '@vibeface/client/lib/errors.ts'
+import { humanError, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
@@ -129,10 +129,19 @@ function JoinForm() {
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
-  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
   // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
   // or any other text keeps the field.
   const ready = device.linkTarget(invitation) !== null
+  // A used or expired link says so as it opens, before the name and 加入; no answer leaves the form as it is.
+  useEffect(() => {
+    if (!ready) return
+    let live = true
+    void device.checkInvite(invitation.trim()).then((state) => {
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+    })
+    return () => { live = false }
+  }, [invitation, ready])
+  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
   const invalid = !ready && invitation.trim() !== ''
   // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
   const failure = error || (edited ? '' : device.error)
