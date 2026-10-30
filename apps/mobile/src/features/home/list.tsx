@@ -1,6 +1,6 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star } from 'lucide-react-native'
-import type { ReactNode } from 'react'
+import { BellRing, Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star, X } from 'lucide-react-native'
+import { useState, type ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -13,14 +13,18 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useInbox, useLive } from '@/data/live'
 import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
 import { emptyHome } from '@vibeface/client/workspace/home.ts'
+import { storageOf } from '@vibeface/client/workspace/storage.ts'
+import { ErrorText } from '@/components/action'
 import { listTime } from '@/lib/time'
+import { useRun } from '@/lib/use-run'
 import { cn } from '@/lib/utils'
+import { mobilePlatform } from '@/platform'
 
 const Item = withUniwind(Animated.View)
 // A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
@@ -67,6 +71,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
         </Pressable>
       </Link>
     </Item> : null}
+    <NotifyTip />
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
@@ -85,6 +90,26 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} /></View>}
   </ScrollView></LayoutAnimationConfig>
+}
+
+const tipClosed = 'notify-tip-closed'
+
+/** Until system notifications are on for this network, one closable card offers them; the system asks only after its button. */
+function NotifyTip() {
+  const shared = useLive()
+  const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
+  const [closed, setClosed] = useState(() => readStorage(tipClosed, false))
+  const { busy, error, run } = useRun()
+  if (closed || !shared?.synced || shared.notificationButton.state !== 'off') return null
+  return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
+    <View className="min-h-16 flex-row items-center gap-3 rounded-2xl border border-border bg-card py-2.5 ps-3 pe-1">
+      <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
+      <Text className="min-w-0 flex-1 font-medium">{waitingCopy.notifyTip}</Text>
+      <Button size="sm" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
+    </View>
+    {error ? <View className="px-3"><ErrorText error={error} /></View> : null}
+  </Item>
 }
 
 function Row({ href, replace, active, avatar, name, mark, label, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; label?: string; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {
