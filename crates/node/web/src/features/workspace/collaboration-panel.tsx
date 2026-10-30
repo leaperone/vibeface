@@ -48,10 +48,10 @@ function schedulerTone(state: string): Tone {
 function triggerKind(trigger: string) {
   if (trigger.startsWith("bot_message:")) return { label: "Bot 协作消息", detail: "message_bot" }
   if (trigger.startsWith("task:")) return { label: "执行工作", detail: "dispatch_work" }
-  if (trigger.startsWith("work:")) return { label: "工作结果", detail: "调度记录" }
+  if (trigger.startsWith("work:")) return { label: "工作结果", detail: "结果记录" }
   if (trigger.startsWith("schedule:")) return { label: "定时任务", detail: "schedule" }
   if (trigger.startsWith("message:")) return { label: "用户消息", detail: "普通消息" }
-  return { label: "调度项", detail: "未知触发" }
+  return { label: "队列项目", detail: "未知触发" }
 }
 
 function when(ms: number) {
@@ -93,7 +93,7 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
     <CardContent className="grid gap-3">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {reachable === false ? <Unplug aria-hidden="true" className="size-4 shrink-0 text-warning" /> : owner === data.local_node ? <Laptop aria-hidden="true" className="size-4 shrink-0 text-success" /> : <Server aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
-        <span className="min-w-0 flex-1 font-medium">调度 owner</span>
+        <span className="min-w-0 flex-1 font-medium">运行 owner</span>
         <StatusPill tone={tone}>{label}</StatusPill>
       </div>
       <p className="text-meta text-muted-foreground">
@@ -117,8 +117,8 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
       <StatusPill tone={schedulerTone(job.state)}>{schedulerLabel(job.state)}</StatusPill>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
-      <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "远端 owner" : "本机调度"}</span>
-      {job.pending_check ? <StatusPill tone="warning" icon={CircleQuestionMark}>待核对</StatusPill> : null}
+      <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "远端 owner" : "本机排队"}</span>
+      {job.pending_check ? <StatusPill tone="warning" icon={CircleQuestionMark}>需要确认</StatusPill> : null}
       {job.failure ? <span className="min-w-0 truncate text-danger" title={job.failure.detail}>{job.failure.detail}</span> : null}
     </div>
     {targetBotId ? <Link to="/b/$botId" params={{ botId: targetBotId }} className="hit-area relative w-fit text-meta font-medium text-foreground underline-offset-4 hover:underline">打开对话</Link> : null}
@@ -189,7 +189,7 @@ function QuestionRows({ questions, botId }: { questions: Question[]; botId?: str
 
 function SessionRows({ sessions, nodes }: { sessions: SessionHandoff[]; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
   if (!sessions.length) return null
-  return <Section title="Provider 会话交接" count={sessions.length}>
+  return <Section title="会话交接" count={sessions.length}>
     <Card size="sm"><CardContent className="grid gap-3">
       {sessions.map((session) => {
         const Icon = providerIcons[session.agent]
@@ -249,8 +249,8 @@ export function CollaborationPanel({ data: supplied, botId: suppliedBotId, class
   return <div className={cn("grid min-w-0 gap-5", className)}>
     <OwnerCard data={data} nodes={workspace.nodes} />
     {scheduler ? <Section title="本机会话队列" count={jobs.length}>
-      {jobs.length ? <ul className="grid gap-2">{jobs.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">当前会话没有调度项。</CardContent></Card>}
-    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />调度状态暂不可见。</CardContent></Card>}
+      {jobs.length ? <ul className="grid gap-2">{jobs.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">当前会话没有排队项目。</CardContent></Card>}
+    </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />队列状态暂不可见。</CardContent></Card>}
     {works.length ? <Section title="执行工作" count={works.length}><ul className="grid gap-2">{works.map((work) => <WorkRow key={work.work_id} work={work} botId={botId} nodes={workspace.nodes} />)}</ul></Section> : null}
     <Unanswered ids={scheduler?.unanswered ?? []} data={data} botId={botId} />
     <QuestionRows questions={questions} botId={botId} />
