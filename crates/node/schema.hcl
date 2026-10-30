@@ -42,6 +42,10 @@ table "events" {
     null = false
     type = integer
   }
+  column "seen_at_ms" {
+    null = false
+    type = integer
+  }
   column "envelope" {
     null = false
     type = text
