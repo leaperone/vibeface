@@ -253,7 +253,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       </details></li> : null}
     </ul>
     </div>
-    {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding && !botOn ? <BotHint /> : <Folders later={onboarding} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -326,7 +326,37 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const addName = newName.trim().toUpperCase()
   // The Codex folder shows with the App Server above.
   const env = item.env.filter((row) => row.name !== "CODEX_HOME")
+  // The keys a provider needs show by default; the rest of its variables wait under 高级.
+  const keys = env.filter((row) => row.required), others = env.filter((row) => !row.required)
+  const advancedIssue = Boolean(issue && issue.code !== "env_missing")
 
+  // `friendly`: a key the provider needs, named after its service in the default view; any other variable shows as it is named.
+  const envRow = (row: (typeof env)[number], friendly: boolean) => {
+    const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
+    return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
+              <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
+                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
+                {friendly ? <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-meta" title={row.name}><terms.secret.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />{keyName(row.name)}</span>
+                  : <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>}
+                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
+                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
+                  data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
+                {!row.set ? null : deleting === row.name ? <>
+                  <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
+                  <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
+                </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
+                  onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}
+              </div>
+              {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
+                event.preventDefault()
+                void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
+              }}>
+                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
+                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
+                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
+              </form> : null}
+            </li>
+  }
   return <li>
     <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
       <div className="flex items-center gap-3">
@@ -362,38 +392,22 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
+        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["model"]} manager={manager} display={display} working={working}
+          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
+        {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
+
+        {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}
+        <Details label="高级" open={advancedIssue || undefined}>
+        <div className="grid gap-4 pt-1 text-foreground">
         {serverSettings}
 
-        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} working={working}
+        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["workspace"]} manager={manager} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
           <p className="text-meta font-medium text-muted-foreground">环境变量</p>
-          {env.length ? <ul className="grid gap-1">{env.map((row) => {
-            const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
-            return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
-              <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
-                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
-                <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
-                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
-                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
-                  data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
-                {!row.set ? null : deleting === row.name ? <>
-                  <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
-                  <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
-                </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
-                  onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}
-              </div>
-              {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
-                event.preventDefault()
-                void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
-              }}>
-                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
-                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
-                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
-              </form> : null}
-            </li>
-          })}</ul> : null}
+          {others.length ? <ul className="grid gap-1">{others.map((row) => envRow(row, false))}</ul> : null}
+
           <form className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)_auto]" onSubmit={(event) => {
             event.preventDefault()
             void setVariable("add", addName, newValue).then((ok) => { if (ok) { setNewName(""); setNewValue("") } })
@@ -407,6 +421,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
           <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
           {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
+        </div>
+        </Details>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>
     </details>}
@@ -450,10 +466,10 @@ function BotHint() {
 const botFields = ["model", "workspace"] as const
 
 /** The bot's model and folder, inside the settings of the provider it runs on. */
-function BotDetails({ manager, display, working, busy, save }: { manager: ManagerSettings; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+function BotDetails({ fields, manager, display, working, busy, save }: { fields: (typeof botFields)[number][]; manager: ManagerSettings; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
   const cursor = manager.provider === "cursor"
-  const dirty = botFields.some((key) => draft[key] !== manager[key])
+  const dirty = fields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
@@ -463,18 +479,20 @@ function BotDetails({ manager, display, working, busy, save }: { manager: Manage
     event.preventDefault()
     void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim() })
   }}>
-    <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
-    {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
-    {field("workspace", folderLabels.botRun)}
+    {fields.includes("model") ? field("model", "Bot 模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true }) : null}
+    {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }
 
-function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
+function Folders({ later, roots, suggested, display, busy, save }: { later: boolean; roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
-    <h3 className="px-1 text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
+    <div className="grid gap-0.5 px-1">
+      <h3 className="text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
+      <p className="text-meta text-muted-foreground">{deviceCopy.folders(later)}</p>
+    </div>
     <div className="grid gap-2 rounded-xl border bg-card p-3 shadow-xs">
     {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />

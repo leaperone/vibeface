@@ -1,6 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Check, Copy, Wifi, WifiOff, X } from 'lucide-react'
-import { cn } from '@/lib/utils'
 import { terms } from '@/lib/glossary'
 import { Details, InlineError, SettingsDisclosure } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -25,8 +24,9 @@ export function CopyDiagnostics({ lines }: { lines: Array<[string, ReactNode]> }
 }
 
 /**
- * Settings → 连接: one row for where this browser connects, its status as the sidebar shows it. Folded under it, the saved
- * addresses to drop (switching lives in the sidebar), the ids support asks for, and adding an address by hand.
+ * Settings → 高级 → 连接: where this browser connects, named once; the sidebar already shows it and whether it is online.
+ * Folded under it, the saved addresses to drop (switching lives in the sidebar), the ids support asks for, and adding an
+ * address by hand.
  */
 export function ConnectionSettings() {
   const device = useDevice()
@@ -37,8 +37,7 @@ export function ConnectionSettings() {
   const current = entryKey(ready.entry)
   const others = entries.filter((entry) => entryKey(entry) !== current)
   const name = (entry: ConnectionEntry) => device.entryName(entry) || addressName(entryAddress(entry))
-  return <SettingsDisclosure icon={terms.thisComputer.icon} label={<span title={entryAddress(ready.entry)}>{name(ready.entry)}</span>}
-    value={<span className={cn('flex items-center gap-1.5', connectionOnline ? 'text-success' : 'text-muted-foreground')}>{connectionOnline ? <Wifi aria-hidden="true" className="size-4" /> : <WifiOff aria-hidden="true" className="size-4" />}{connectionOnline ? '在线' : '离线'}</span>}>
+  return <SettingsDisclosure icon={connectionOnline ? Wifi : WifiOff} label="连接" value={<span title={entryAddress(ready.entry)}>{name(ready.entry)}</span>}>
     <p className="flex min-w-0 items-center justify-between gap-3 text-meta"><span className="shrink-0 text-muted-foreground">{terms.address.label}</span><span className="truncate" title={entryAddress(ready.entry)}>{hostOf(entryAddress(ready.entry)) || entryAddress(ready.entry)}</span></p>
     {others.length ? <ul className="grid gap-1" aria-label="用过的地址">{others.map((entry) => <li key={entryKey(entry)} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3 text-meta">
       <span className="min-w-0 flex-1 truncate" title={entryAddress(entry)}>{name(entry)}</span>
