@@ -137,7 +137,7 @@ const failures: Record<FailureKind, string> = {
   writer_busy: '另一个进程正在写这个会话。等它结束后再试。',
   rejected: 'AI 服务拒绝了这次请求，没有执行。',
   transport: '连不上 AI 服务，或连接中途断了。稍后再试。',
-  timed_out: 'AI 服务没有及时响应。',
+  timed_out: 'AI 服务没有及时响应，结果未知。',
   restarted: '设备在中途重启了，这次没有重做。',
   lost: '执行的进程意外结束，不确定做完了没有。先看看有没有改动，再决定要不要重发。',
   unknown: '',
@@ -157,4 +157,17 @@ export function replyFailure(kind: FailureKind | null | undefined, detail?: stri
 export function rawError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error ?? '')
   return chinese.test(raw) ? '' : raw
+}
+
+/** Why a task failed, in one line: its kind's words, else the translated cause; empty when nothing says. */
+export function workFailure(work: { failure?: FailureKind; failure_reason: string | null }): string {
+  return failureText(work.failure) || (work.failure_reason ? taskError(work.failure_reason).split('\n').at(-1) ?? '' : '')
+}
+
+/**
+ * Whether a failure may still have done its work: the AI service or device stopped answering, or its process ended
+ * unseen. Writes are not repeated on an unknown outcome, so the next step is checking the result, never a plain retry.
+ */
+export function outcomeUnknown(kind: FailureKind | null | undefined, detail?: string | null): boolean {
+  return kind === 'timed_out' || kind === 'lost' || /outcome may be unknown|timed out/i.test(detail ?? '')
 }

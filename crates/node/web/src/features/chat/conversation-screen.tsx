@@ -7,13 +7,13 @@ import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Button } from '@/components/ui/button'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
-import { failureText, taskError } from '@vibeface/client/lib/errors.ts'
+import { failureText, outcomeUnknown, taskError, workFailure } from '@vibeface/client/lib/errors.ts'
 import { terms } from '@/lib/glossary'
 import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskCopy, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
@@ -33,8 +33,6 @@ import './chat.css'
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
 // The translated cause alone: an unknown one reads as its own first line, not the generic sentence above it.
 const failureReason = (raw: string) => taskError(raw).split('\n').at(-1) ?? ''
-// A named kind reads as its own words; otherwise the original text is all there is.
-const workCause = (work: WorkRecord) => failureText(work.failure) || (work.failure_reason ? failureReason(work.failure_reason) : '')
 // The owner wrote the reply but it has not synced here yet; its streamed text stands in until it lands.
 const streamingStates = [...busyStates, 'publishing']
 
@@ -82,7 +80,9 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const tasks: TaskRow[] = works.map((work, index) => {
     const state = shownState(work, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
-    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: work.summary, trigger: work.trigger, work, joined: joined?.title }
+    // A task another device's bot runs reports no summary; its newest streamed line stands in, as a provider's does.
+    const streamed = workspace.liveProgress.find((item) => item.kind === 'native' && item.work_id === work.work_id && item.target_node === work.target_node)?.text.trim().split('\n').at(-1) ?? ''
+    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: work.summary || streamed, trigger: work.trigger, work, joined: joined?.title }
   })
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting')
   const placed = new Set<string>()
@@ -90,7 +90,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     placed.add(task.id)
     // A task held on an approval or waiting for confirmation shows as that card, which names and links the task.
     if (task.state === 'waiting' || task.state === 'awaiting_confirmation') return []
-    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} /> }] : []
+    const away = task.state === 'dispatch_waiting' && workspace.nodes.some((node) => node.device_id === task.device && !node.online)
+    return bot ? [{ key: `task:${task.id}`, node: <TaskCard task={task} botId={bot.bot_id} device={nodeName(task.device, lookup)} here={task.device === ready?.entry.device_id} open={openTasks.includes(task)} live={workspace.connectionOnline} away={away} /> }] : []
   }
 
   // What a turn changed in the bot shows after its reply, or after the message while no reply exists.
@@ -110,7 +111,9 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   // When the newest reply failed, its message can go out again as is, unless it carried files.
   const newest = data?.messages.at(-1)
-  const failedAsk = newest?.status === 'failed' ? data?.messages.find((message) => message.role === 'user' && message.message_id === newest.in_reply_to && !message.attachments?.length) : undefined
+  // A reply whose outcome is unknown may have done its work, so it is checked, not sent again.
+  const newestUnknown = jobs.some((job) => job.reply_message_id === newest?.message_id && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+  const failedAsk = newest?.status === 'failed' && !newestUnknown ? data?.messages.find((message) => message.role === 'user' && message.message_id === newest.in_reply_to && !message.attachments?.length) : undefined
   const retry = failedAsk && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(failedAsk.text) } : undefined
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
@@ -120,6 +123,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
   const entries: ChatEntry[] = placedChanges.first.map(changeRow)
   const waiting: ChatEntry[] = []
+  const announced = new Map<string, ChatEntry[]>()
   for (const message of timeline.messages) {
     const start = entries.length
     for (const aside of timeline.before.get(message.message_id) ?? []) entries.push(aside)
@@ -130,12 +134,16 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       entries.push({ key: message.message_id, message, schedule: scheduleName(schedule, data?.bot_settings, changes), detail })
       for (const task of tasks) if (task.trigger === message.in_reply_to && !placed.has(task.id)) entries.push(...taskRows(task))
     } else if (!folded.hidden.has(message.message_id)) entries.push({ ...pendingRow(merged.has(message.message_id) ? { ...message, state: 'merged', merged: merged.get(message.message_id) } : message, message.message_id === newest?.message_id ? retry : undefined), detail })
+    entries.push(...announced.get(message.message_id) ?? [])
     for (const job of jobs) {
       if (job.message_id !== message.message_id) continue
-      for (const task of tasks) if (task.trigger === job.trigger) entries.push(...taskRows(task))
+      // Tasks follow the reply that started them once it is here, so the cause reads before its effect.
+      const started = tasks.filter((task) => task.trigger === job.trigger).flatMap(taskRows)
+      if (job.reply_message_id && replied.has(job.reply_message_id) && message.role === 'user') announced.set(job.reply_message_id, started)
+      else entries.push(...started)
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
       // Only a click sends it again, as a new message; once it is sent this message is no longer the newest.
-      const again = message.role === 'user' && message.message_id === newest?.message_id && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
+      const again = message.role === 'user' && message.message_id === newest?.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail) && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
     }
     for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
@@ -312,23 +320,26 @@ function useOffscreen(id: string | null, revision: number) {
 type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord; joined?: string }
 
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
-function TaskCard({ task, botId, device, here, open, live }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean }) {
+/** `away`: its device is offline, so it waits for that device rather than spinning. */
+function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskRow; botId: string; device: string; here: boolean; open: boolean; live: boolean; away: boolean }) {
   const failed = task.state === 'failed' || task.state === 'rejected' || task.state === 'dispatch_rejected'
-  const result = task.work.result_text ? firstLine(task.work.result_text) : workCause(task.work)
+  // A failed task's text is what it said before failing, so its cause leads.
+  const result = failed ? workFailure(task.work) : task.work.result_text ? firstLine(task.work.result_text) : workFailure(task.work)
   const title = task.work.title || '任务'
   const stale = taskStale(task.state, live)
   // The reason wraps on its own line, so a phone shows why a task stopped.
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
-  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 w-fit max-w-full items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
+  if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
     {task.state === 'dispatch_unverified' ? <CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
   return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
     {task.state === 'waiting' ? <terms.approval.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
       : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
+      : away ? <WifiOff aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} className="text-meta" /></span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
         : taskActive(task.state) && !stale && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />

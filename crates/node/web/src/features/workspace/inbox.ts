@@ -1,4 +1,4 @@
-import { Copy, KeyRound, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
+import { CircleX, Copy, KeyRound, MessageCircleQuestionMark, MonitorSmartphone, ShieldAlert, Sparkles, MessageSquareWarning, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -15,6 +15,7 @@ function presented(item: InboxItem, chat: string): { icon: LucideIcon; to: strin
     case "undelivered": return { icon: terms.undelivered.icon, to: chat }
     case "join": return { icon: MonitorSmartphone, to: "/devices" }
     case "attention": return { icon: MessageSquareWarning, to: `/b/${item.bot.bot_id}` }
+    case "failed": return { icon: CircleX, to: `/b/${item.bot.bot_id}/work/${item.work.work_id}` }
     case "setup": return { icon: Sparkles, to: item.device ? `/devices/${item.device}` : "/devices" }
   }
 }

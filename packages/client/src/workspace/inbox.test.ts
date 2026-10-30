@@ -36,6 +36,14 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.deepEqual(inboxItems(starting).find((item) => item.kind === 'setup'), { key: 'setup', kind: 'setup', device: 'pc', title: '运行 Bot 的设备需设置' }, 'one device starting does not hide another that needs setup')
 })
 
+test('a failed task waits in 待处理 under its bot until something follows it up', () => {
+  const failed = source(false)
+  const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'pc', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
+  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }]
+  failed.workspace.bots = [{ bot_id: 'b', conversation_id: 'c', name: '助手' } as never]
+  assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', '助手']])
+})
+
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {
   assert.equal(formName[deviceForm('client', join('pending').name)], '手机')
   assert.equal(formName[deviceForm('client', 'Chrome')], '浏览器')

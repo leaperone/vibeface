@@ -24,8 +24,8 @@ function share(invitation: Invitation): Share {
 const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Monitor }] as const
 type Kind = (typeof kinds)[number]["value"]
 
-/** "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code. `opening`: arrived from a hint that asked for it. */
-export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
+/** "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code. `opening`: arrived from a hint that asked for it, for that kind of device. */
+export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind; onOpened?(): void; onOpenChange?(open: boolean): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
@@ -100,6 +100,7 @@ export function AddDevice({ opening = false, onOpened, onOpenChange }: { opening
   const show = () => { setOpen(true); if (!result && !requests) generate() }
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
+    setKind(opening)
     show()
     onOpened?.()
   }, [opening, ready])

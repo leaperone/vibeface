@@ -47,7 +47,7 @@ export default function DeviceDetail() {
     {/* The AI page sets up the computer this phone connects through; any other computer shows how its bot stands, as on the web. */}
     {member.kind === 'node' ? <SettingsGroup>
       {member.entry && device.ready?.principal.can_manage ? <SettingsRow href="/ai" icon={Sparkles} label="Bot 与任务" />
-        : <SettingsRow icon={Bot} label={deviceCopy.botStatus[member.bot ?? 'none']} />}
+        : <SettingsRow icon={Bot} label={deviceCopy.botStatus[deviceCopy.botState(member.bot, member.online)]} />}
       {!member.entry && device.ready?.principal.can_manage && saved ? <SettingsRow icon={ArrowRightLeft} label="切换到它" disabled={switching.busy !== null} onPress={() => void switching.run('switch', () => device.connect(saved))}>
         {switching.error ? <View className="basis-full ps-11"><ErrorText error={switching.error} /></View> : null}
       </SettingsRow> : null}

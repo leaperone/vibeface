@@ -3,8 +3,8 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
-import { ArrowUp, CircleCheck, CircleSlash, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, Server, TriangleAlert, type LucideIcon } from 'lucide-react-native'
+import { answerLabel, declined, questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
+import { ArrowUp, CircleCheck, CircleSlash, CircleX, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, Server, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
 import { ErrorText } from '@/components/action'
@@ -38,7 +38,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
   const settled = question.answer?.text ?? answer
-  if (settled !== undefined) return <Settled icon={CircleCheck} className="text-success" ask={question.text}>{settled}</Settled>
+  if (settled !== undefined) return <Settled icon={declined(settled) ? CircleX : CircleCheck} className={declined(settled) ? 'text-danger' : 'text-success'} ask={question.text}>{declined(settled) ? answerLabel(settled) : settled}</Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={question.text}>已失效</Settled>
 
   const send = async (key: string, value: string) => {

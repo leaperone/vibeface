@@ -39,7 +39,7 @@ export function SecondDeviceHint({ className }: { className?: string }) {
     listeners.forEach((listener) => listener())
   }
   return <div className={cn("flex min-w-0 items-center rounded-lg text-meta text-muted-foreground hover:bg-muted/50", className)}>
-    <Link to="/devices" search={{ add: true }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 hover:text-foreground max-md:min-h-11">
+    <Link to="/devices" search={{ add: localOnly ? "computer" : true }} className="flex min-h-10 min-w-0 flex-1 items-center gap-2 ps-2 hover:text-foreground max-md:min-h-11">
       <Icon aria-hidden="true" className="size-4 shrink-0" /><span className="truncate">{localOnly ? "在另一台电脑上使用" : "在手机或其他电脑上使用"}</span>
     </Link>
     <Button type="button" variant="ghost" size="icon-sm" className="shrink-0 hover:bg-transparent max-md:size-11" aria-label="不再提示" title="不再提示" onClick={dismiss}><X aria-hidden="true" /></Button>
