@@ -133,6 +133,12 @@ export type BotChange =
 type ChangeCause = { conversation_id: string; message_id: string }
 /** A change to the bot of `conversation_id`, applied from `cause`; null when the bot's own turn made it with no message behind it. */
 export type BotChangeRecord = { change_id: string; conversation_id: string; cause: ChangeCause | null; event_hash: string; created_at_ms: number; change: BotChange }
+/** A chat change another device replaced without seeing it; `value` is the setting now, which `by` set. */
+export type Overwritten = { change_id: string; by: string } & (
+  | { field: "name" | "instructions"; value: string }
+  | { field: "model"; provider: ProviderId; value: string }
+  | { field: "skills"; value: SkillSet }
+  | { field: "avatar"; value: Avatar | null })
 type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
@@ -147,6 +153,7 @@ export type ConversationPayload = {
   local_node: string
   /** Oldest first. */
   changes: BotChangeRecord[]
+  overwritten: Overwritten[]
   bot_settings: BotSettings
   /** This chat's questions, answered ones included. */
   questions: Question[]

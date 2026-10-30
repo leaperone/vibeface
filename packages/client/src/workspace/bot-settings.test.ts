@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { formatIn, formatWhen, lineDiff, placeChanges, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
+import { formatIn, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleDetail, scheduleFrequency, scheduleName, scheduleTrigger, sortSchedules } from "./bot-settings.ts"
 import { parseBots, parseConversation } from "./model.ts"
 import type { BotChangeRecord } from "./types.ts"
 
@@ -83,7 +83,7 @@ test("conversation snapshots parse bot changes strictly", () => {
   const base = {
     conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [],
     works: [], deliveries: [], checks: [], local_node: "n", questions: [], sessions: [],
-    sent: [],
+    sent: [], overwritten: [],
     bot_settings: {
       skills: [{ skill_id: "s", name: "发布", description: "发版步骤" }],
       schedules: [
@@ -126,6 +126,29 @@ test("conversation snapshots parse bot changes strictly", () => {
   assert.throws(() => parseConversation({ ...base, changes: [{ ...base.changes[1], change: { kind: "skill", skill_id: "s", before: null, after: null } }] }, "chat"))
   assert.deepEqual(parseConversation({ ...base, sent: [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }] }, "chat").sent,
     [{ message_id: "bm", to: "ops", text: "看看备份", created_at_ms: 7 }])
+})
+
+test("a change another device replaced reads as one line and asks for it back the usual way", () => {
+  const base = {
+    conversation: { conversation_id: "chat", title: "t", owner: null, owner_epoch: 0 }, messages: [], works: [], deliveries: [], checks: [], local_node: "n",
+    questions: [], sessions: [], sent: [], changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] },
+  }
+  assert.deepEqual(parseConversation(base, "chat").overwritten, [])
+  const item = (value: Record<string, unknown>) => parseConversation({ ...base, overwritten: [{ change_id: "c1", by: "dev-b", ...value }] }, "chat").overwritten[0]!
+  const name = item({ field: "name", value: "Beta" })
+  assert.equal(overwriteCopy.line(name, "Ops", "Mac mini"), "Mac mini 把 Ops 的名称改成了「Beta」")
+  assert.deepEqual(restoreRequest(name, { kind: "profile", name: { before: "Ops", after: "Alpha" } }), { text: "把名称改回「Alpha」" })
+  const model = item({ field: "model", provider: "codex", value: "" })
+  assert.equal(overwriteCopy.line(model, "Ops", "Mac mini"), "Mac mini 把 Ops 的 Codex 模型改成了设备默认")
+  assert.deepEqual(restoreRequest(model, { kind: "profile", model: { provider: "codex", before: "", after: "gpt-x" } }), { text: "把 Codex 模型改回「gpt-x」" })
+  assert.equal(overwriteCopy.line(item({ field: "skills", value: null }), "Ops", "Mac mini"), "Mac mini 把 Ops 的 Skill 改成了全部可用")
+  assert.equal(overwriteCopy.line(item({ field: "instructions", value: "\n  先读 README 再动手，改完跑一遍测试再回复我\n第二行" }), "Ops", "Mac mini"),
+    "Mac mini 把 Ops 的说明改成了「先读 README 再动手，改完跑一遍测试再回复…」")
+  const face = { outline: "cloud", eyes: "wide", hue: 285 } as const
+  assert.deepEqual(restoreRequest(item({ field: "avatar", value: null }), { kind: "profile", avatar: { before: null, after: face } }), { avatar: face })
+  assert.equal(restoreRequest(name, { kind: "profile", instructions: { before: "", after: "x" } }), null)
+  assert.throws(() => item({ field: "project", value: null }))
+  assert.throws(() => parseConversation({ ...base, overwritten: undefined }, "chat"))
 })
 
 test("a reminder whose note is its name shows the sentence once", () => {

@@ -1,17 +1,23 @@
 import { useId, type ReactNode } from 'react'
-import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, Smile, type LucideIcon } from 'lucide-react'
+import { AlarmClock, ArrowRight, BookOpen, Bot, CircleCheck, CirclePause, Cpu, Minus, NotebookPen, Plus, Repeat, ScrollText, Smile, TriangleAlert, Undo2, type LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { Details } from '@/components/app/kit'
 import { BotFace } from '@/components/app/bot-face'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { nodeName } from '@vibeface/client/workspace/labels.ts'
+import { ActionButton } from '@/features/workspace/present'
 import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import { changeTitle, formatWhen, lineDiff, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
-import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
+import { changeTitle, formatWhen, lineDiff, overwriteCopy, restoreRequest, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, Overwritten, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
-/** What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now. */
-export function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
+/**
+ * What one turn of the conversation changed, item by item, before → after. `schedules` are the conversation's schedules now;
+ * `overwritten` the changes another device replaced without seeing them.
+ */
+export function ChangeCard({ records, schedules, overwritten }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
   const id = useId()
   const changes = records.map((record) => record.change)
   return <section aria-labelledby={id} className="grid gap-3 rounded-xl border bg-card shadow-xs p-4">
@@ -20,22 +26,49 @@ export function ChangeCard({ records, schedules }: { records: BotChangeRecord[];
       <h3 id={id} className="text-meta font-medium text-muted-foreground">{changeTitle(changes)}</h3>
     </header>
     <ul className="grid gap-4">
-      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules} />)}
+      {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules}
+        overwritten={overwritten.filter((item) => item.change_id === record.change_id)} />)}
     </ul>
   </section>
 }
 
-function ChangeRows({ change, conversationId, schedules }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[] }) {
-  if (change.kind === 'profile') return <>
-    {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></Row> : null}
-    {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} /></Row> : null}
-    {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} /></Row> : null}
-    {change.skills ? <Row icon={BookOpen} label='Skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} /></Row> : null}
-    {change.avatar ? <Row icon={Smile} label='长相'><AvatarChange edit={change.avatar} conversationId={conversationId} /></Row> : null}
-  </>
+function ChangeRows({ change, conversationId, schedules, overwritten }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
+  if (change.kind === 'profile') {
+    const note = (field: Overwritten['field']) => {
+      const item = overwritten.find((entry) => entry.field === field)
+      return item ? <OverwrittenNote item={item} change={change} conversationId={conversationId} /> : null
+    }
+    return <>
+      {change.name ? <Row icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} />{note('name')}</Row> : null}
+      {change.instructions ? <Row icon={ScrollText} label="说明"><DiffLines lines={lineDiff(change.instructions.before, change.instructions.after)} />{note('instructions')}</Row> : null}
+      {change.model ? <Row icon={Cpu} label='模型' tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} />{note('model')}</Row> : null}
+      {change.skills ? <Row icon={BookOpen} label='Skill'><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} />{note('skills')}</Row> : null}
+      {change.avatar ? <Row icon={Smile} label='长相'><AvatarChange edit={change.avatar} conversationId={conversationId} />{note('avatar')}</Row> : null}
+    </>
+  }
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
   if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
   return <ScheduleRow before={change.before} after={change.after} current={schedules.find((schedule) => schedule.schedule_id === change.schedule_id)} />
+}
+
+/** Another device's write replaced this setting without seeing it: what it is now, and setting it back the usual way. */
+function OverwrittenNote({ item, change, conversationId }: { item: Overwritten; change: BotChange; conversationId: string }) {
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
+  const bot = workspace.bots.find((entry) => entry.conversation_id === conversationId)
+  const request = restoreRequest(item, change)
+  const restore = async () => {
+    if (!bot || !request) return
+    if ('avatar' in request) await workspace.setBotAvatar(conversationId, bot.avatar_version, request.avatar)
+    else await workspace.sendMessage(request.text)
+  }
+  return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
+    <p className="flex min-w-0 items-start gap-1.5 text-warning [overflow-wrap:anywhere]">
+      <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
+      {overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: workspace.nodes, directory }))}
+    </p>
+    {bot && request ? <ActionButton variant="ghost" className="h-7 px-2 text-meta max-md:h-11" action={restore}><Undo2 aria-hidden="true" />{overwriteCopy.restore}</ActionButton> : null}
+  </div>
 }
 
 const skillCount = (set: SkillSet) => set === null ? '全部' : `${set.length} 个`

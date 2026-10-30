@@ -1,16 +1,16 @@
 import { Link } from 'expo-router'
-import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Cpu, Laptop, Link2, LoaderCircle, NotebookPen, Repeat, ScrollText, Smile, TriangleAlert, Undo2, Unplug, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { changeTitle, formatWhen, lineDiff, placeChanges, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
+import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, PendingCheck, ScheduleView, WorkRecord } from '@vibeface/client/workspace/types.ts'
+import type { AvatarEdit, BotChange, BotChangeRecord, ManagerJob, Overwritten, PendingCheck, ScheduleView, SkillSet, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { ActionButton } from '@/components/action'
 import { ActionCard, providerIcons } from '@/components/kit'
@@ -69,7 +69,7 @@ export function useChatExtras(conversationId: string, botId: string) {
   }
   const changes = placeChanges(data.messages, data.changes)
   const schedules = data.bot_settings.schedules
-  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} /> })
+  const changeRow = (records: BotChangeRecord[]) => ({ key: `change:${records[0].change_id}`, node: <ChangeCard records={records} schedules={schedules} overwritten={data.overwritten} /> })
   for (const [at, turns] of changes.after) for (const records of turns) add(at, changeRow(records))
   const first = changes.first.map(changeRow)
 
@@ -171,26 +171,36 @@ export function ConfirmCard({ check }: { check: PendingCheck }) {
   </ActionCard>
 }
 
-/** What one turn changed in the bot, item by item. */
-function ChangeCard({ records, schedules }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[] }) {
+/** What one turn changed in the bot, item by item; `overwritten` the changes another device replaced without seeing them. */
+function ChangeCard({ records, schedules, overwritten }: { records: BotChangeRecord[]; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
   return <View className="gap-3 rounded-xl border border-border bg-card p-4 shadow-xs dark:border-line-strong">
     <View className="flex-row items-center gap-2">
       <Icon as={CircleCheck} className="size-4 text-success" />
       <Text role="heading" className="text-meta font-medium text-muted-foreground">{changeTitle(records.map((record) => record.change))}</Text>
     </View>
-    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules} />)}
+    {records.map((record) => <ChangeRows key={record.change_id} change={record.change} conversationId={record.conversation_id} schedules={schedules}
+      overwritten={overwritten.filter((item) => item.change_id === record.change_id)} />)}
   </View>
 }
 
-function ChangeRows({ change, conversationId, schedules }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[] }) {
-  if (change.kind === 'profile') return <>
-    {change.name ? <ChangeRow icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} /></ChangeRow> : null}
-    {change.instructions ? <ChangeRow icon={ScrollText} label="说明">
-      {lineDiff(change.instructions.before, change.instructions.after).slice(0, 6).map((line, index) =>
-        <Text key={index} className={cn('text-meta', line.kind === 'added' ? 'text-foreground' : 'text-muted-foreground line-through')}>{line.kind === 'added' ? '+ ' : '- '}{line.text}</Text>)}
-    </ChangeRow> : null}
-    {change.avatar ? <ChangeRow icon={Smile} label="长相"><AvatarChange edit={change.avatar} conversationId={conversationId} /></ChangeRow> : null}
-  </>
+function ChangeRows({ change, conversationId, schedules, overwritten }: { change: BotChange; conversationId: string; schedules: readonly ScheduleView[]; overwritten: readonly Overwritten[] }) {
+  if (change.kind === 'profile') {
+    const note = (field: Overwritten['field']) => {
+      const item = overwritten.find((entry) => entry.field === field)
+      return item ? <OverwrittenNote item={item} change={change} conversationId={conversationId} /> : null
+    }
+    return <>
+      {change.name ? <ChangeRow icon={Bot} label="名称"><BeforeAfter before={change.name.before} after={change.name.after} />{note('name')}</ChangeRow> : null}
+      {change.instructions ? <ChangeRow icon={ScrollText} label="说明">
+        {lineDiff(change.instructions.before, change.instructions.after).slice(0, 6).map((line, index) =>
+          <Text key={index} className={cn('text-meta', line.kind === 'added' ? 'text-foreground' : 'text-muted-foreground line-through')}>{line.kind === 'added' ? '+ ' : '- '}{line.text}</Text>)}
+        {note('instructions')}
+      </ChangeRow> : null}
+      {change.model ? <ChangeRow icon={Cpu} label="模型" tag={providerNames[change.model.provider]}><BeforeAfter before={change.model.before || '设备默认'} after={change.model.after || '设备默认'} />{note('model')}</ChangeRow> : null}
+      {change.skills ? <ChangeRow icon={BookOpen} label="Skill"><BeforeAfter before={skillCount(change.skills.before)} after={skillCount(change.skills.after)} />{note('skills')}</ChangeRow> : null}
+      {change.avatar ? <ChangeRow icon={Smile} label="长相"><AvatarChange edit={change.avatar} conversationId={conversationId} />{note('avatar')}</ChangeRow> : null}
+    </>
+  }
   if (change.kind === 'skill') {
     const skill = change.after ?? change.before!
     return <ChangeRow icon={BookOpen} label={skill.name} tag={!change.before ? '新 Skill' : !change.after ? '已删除' : '已更新'} removed={!change.after}>
@@ -215,6 +225,28 @@ function ChangeRows({ change, conversationId, schedules }: { change: BotChange; 
     <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{[scheduleFrequency(next), next.enabled ? when : '已暂停'].filter(Boolean).join(' · ')}</Text>
     <Text numberOfLines={2} className="text-meta text-muted-foreground">{next.prompt}</Text>
   </ChangeRow>
+}
+
+const skillCount = (set: SkillSet) => set === null ? '全部' : `${set.length} 个`
+
+/** Another device's write replaced this setting without seeing it: what it is now, and setting it back the usual way. */
+function OverwrittenNote({ item, change, conversationId }: { item: Overwritten; change: BotChange; conversationId: string }) {
+  const shared = useLive()
+  const { directory } = useDevice()
+  const bot = shared?.bots.find((entry) => entry.conversation_id === conversationId)
+  const request = restoreRequest(item, change)
+  const restore = async () => {
+    if (!shared || !bot || !request) return
+    if ('avatar' in request) await shared.setBotAvatar(conversationId, bot.avatar_version, request.avatar)
+    else await shared.sendMessage(request.text)
+  }
+  return <View className="gap-1">
+    <View className="flex-row gap-1.5">
+      <Icon as={TriangleAlert} className="mt-0.5 size-4 text-warning" />
+      <Text className="min-w-0 flex-1 text-meta text-warning">{overwriteCopy.line(item, bot?.name ?? '这个 Bot', nodeName(item.by, { nodes: shared?.nodes ?? [], directory }))}</Text>
+    </View>
+    {bot && request ? <ActionButton variant="ghost" size="sm" className="self-start" icon={Undo2} disabled={!shared?.writable} action={restore}>{overwriteCopy.restore}</ActionButton> : null}
+  </View>
 }
 
 /** The face before and after, drawn and read out in words; spacing and tilt come from the bot's id, so a deleted bot's is a guess. */

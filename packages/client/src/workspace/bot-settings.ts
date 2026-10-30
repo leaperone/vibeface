@@ -1,6 +1,9 @@
 import type { TranscriptMessage } from "../chat/types.ts"
 import { projectName } from "./questions.ts"
-import type { BotChange, BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, ScheduleView, SkillSet } from "./types.ts"
+import type { BotChange, BotChangeRecord, BotProject, BotSchedule, BotSettings, NodeInfo, Overwritten, ScheduleView, SkillSet } from "./types.ts"
+import type { Avatar } from "../avatar/face.ts"
+import { avatarWords } from "../avatar/pick.ts"
+import { providerNames } from "../lib/node.ts"
 
 /** A bot's project folder and the folder a device runs its bots in are different places, so they never share a name. */
 export const folderLabels = { project: "项目文件夹", botRun: "Bot 运行目录" } as const
@@ -23,6 +26,46 @@ export function changeTitle(changes: readonly BotChange[]): string {
   if (kind === "skill") return added ? "已存为 Skill" : removed ? "已删除 Skill" : "已更新 Skill"
   if (kind === "memory") return added ? "已记下" : removed ? "已忘记" : "已更新笔记"
   return added ? "已设定定时任务" : removed ? "已删除定时任务" : "已更新定时任务"
+}
+
+const settingNames = { name: "名称", instructions: "说明", skills: "Skill", avatar: "长相" } as const
+const settingName = (item: Overwritten) => item.field === "model" ? `${providerNames[item.provider]} 模型` : settingNames[item.field]
+
+function settingWords(item: Overwritten): string {
+  switch (item.field) {
+    case "name": return `「${item.value}」`
+    case "instructions": {
+      const line = item.value.split("\n").map((text) => text.trim()).find(Boolean)
+      return line ? `「${line.length > 24 ? `${line.slice(0, 24)}…` : line}」` : "空白"
+    }
+    case "model": return item.value ? `「${item.value}」` : "设备默认"
+    case "skills": return item.value === null ? "全部可用" : `${item.value.length} 个`
+    case "avatar": return item.value ? avatarWords(item.value) : "默认长相"
+  }
+}
+
+/** A change another device replaced without seeing it: one line under it, and the button that sets it back. */
+export const overwriteCopy = {
+  restore: "改回我的",
+  line: (item: Overwritten, bot: string, device: string) => {
+    const name = settingName(item).replace(/^(?=[A-Za-z])/, " ").replace(/(?<=[A-Za-z])$/, " ")
+    return `${device} 把 ${bot} 的${name}改成了${settingWords(item)}`
+  },
+}
+
+/**
+ * How "改回我的" writes the setting the usual way: the face through the face picker, any other setting by asking this
+ * bot in its chat, as the change was made. `null` when the change did not set that field.
+ */
+export function restoreRequest(item: Overwritten, change: BotChange): { avatar: Avatar | null } | { text: string } | null {
+  if (change.kind !== "profile") return null
+  switch (item.field) {
+    case "name": return change.name ? { text: `把名称改回「${change.name.after}」` } : null
+    case "instructions": return change.instructions ? { text: `把说明改回下面这段：\n\n${change.instructions.after}` } : null
+    case "model": return change.model ? { text: `把 ${providerNames[change.model.provider]} 模型改回${change.model.after ? `「${change.model.after}」` : "设备默认"}` } : null
+    case "skills": return change.skills ? { text: change.skills.after === null ? "把 Skill 改回全部可用" : `把 Skill 改回这几个：${change.skills.after.join("、")}` } : null
+    case "avatar": return change.avatar ? { avatar: change.avatar.after } : null
+  }
 }
 
 /** A bot's project folder by its name; the device is named too when it is not the one running the bot. */

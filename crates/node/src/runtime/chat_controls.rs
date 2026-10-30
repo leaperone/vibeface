@@ -171,6 +171,7 @@ impl Runtime {
         let bot = store.bot_for_conversation(network, scope)?;
         let messages = store.messages(network, scope)?;
         let changes = store.bot_changes(network, scope)?;
+        let overwritten = store.overwritten(network, scope)?;
         let sent = store.sent_bot_messages(network, scope)?;
         let questions = store.conversation_questions(network, scope)?;
         let sessions = store.attributed_sessions(network, scope)?;
@@ -208,6 +209,7 @@ impl Runtime {
             "works":works,
             "deliveries":deliveries,
             "changes":changes,
+            "overwritten":overwritten,
             "sent":sent,
             "questions":questions,
             "sessions":sessions,

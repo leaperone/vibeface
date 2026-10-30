@@ -18,7 +18,7 @@ const shown = parseConversation({
   conversation: { conversation_id: "chat", title: "", owner: "gateway", owner_epoch: 1 },
   messages: [message("m1", 1), message("m3", 3)], works: [work("w1"), work("w2")],
   deliveries: [{ state: "dispatch_waiting", work_id: "w9", target_node: "worker", cwd: "/w" }, { state: "stop_waiting", work_id: "w1", target_node: "worker" }],
-  scheduler: { jobs: [{ trigger: "a", state: "queued" }], unanswered: ["m1"] }, checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
+  scheduler: { jobs: [{ trigger: "a", state: "queued" }], unanswered: ["m1"] }, checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [],
   questions: [], sessions: [],
 }, "chat")
 const records = (extra: Record<string, unknown> = {}) => {
@@ -47,7 +47,7 @@ test("a pushed message lands in rank order and the push replaces deliveries, che
 test("the owner's jobs stay through a push of this device's records and replace its undelivered copy", () => {
   const away = parseConversation({
     conversation: { conversation_id: "chat", title: "", owner: "owner", owner_epoch: 1 },
-    messages: [], works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
+    messages: [], works: [], deliveries: [], checks: [], local_node: "gateway", changes: [], overwritten: [], bot_settings: { skills: [], schedules: [], memory: [] }, sent: [], questions: [], sessions: [],
     scheduler: { jobs: [{ trigger: "message:m1", state: "running", source_node: "owner" }], unanswered: [], remote: { owner: "owner", reachable: true } },
   }, "chat")
   assert.deepEqual(away.scheduler?.remote, { owner: "owner", reachable: true })
