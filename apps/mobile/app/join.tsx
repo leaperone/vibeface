@@ -158,11 +158,19 @@ function JoinForm() {
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
         className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
       {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
-      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => edit((await Clipboard.getStringAsync()).trim())}>
-        <Icon as={ClipboardPaste} /><Text>粘贴</Text>
-      </Button>
+      <Paste onText={(text) => edit(text.trim())} />
     </View>
   </View>
+}
+
+/** iOS's own paste control reads the clipboard without asking each time; elsewhere a button reads it. */
+function Paste({ onText }: { onText: (text: string) => void }) {
+  const [fill, ink] = useCSSVariable(['--muted', '--foreground']) as [string, string]
+  if (Clipboard.isPasteButtonAvailable) return <Clipboard.ClipboardPasteButton acceptedContentTypes={['plain-text', 'url']} backgroundColor={fill} foregroundColor={ink}
+    cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') onText(data.text) }} />
+  return <Button variant="ghost" className="-ms-3 self-start" onPress={async () => onText(await Clipboard.getStringAsync())}>
+    <Icon as={ClipboardPaste} /><Text>粘贴</Text>
+  </Button>
 }
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {

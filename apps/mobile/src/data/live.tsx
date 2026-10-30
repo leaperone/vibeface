@@ -12,7 +12,7 @@ import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { BotRecord } from '@vibeface/client/workspace/types.ts'
-import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
+import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
@@ -135,7 +135,9 @@ function Live({ children }: { children: ReactNode }) {
     // sending, or else the latest in the history.
     const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
     const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
-    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered))
+    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
+    const folded = foldAnswers(data.messages, data.questions)
+    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers))
     const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
       return detail ? { ...message, detail } : message
@@ -146,7 +148,7 @@ function Live({ children }: { children: ReactNode }) {
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
-      messages, before: timeline.before, rest: timeline.rest, works: data.works,
+      messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
       unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.

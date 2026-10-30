@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import { Check, CircleCheck, Clock, Copy, Link2, Monitor, Plus, ScanEye, Share2, ShieldAlert, Smartphone, SquareTerminal } from 'lucide-react-native'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
 import { addDeviceCopy } from '@vibeface/client/identity/copy.ts'
@@ -42,9 +42,8 @@ export default function AddDevice() {
     const timer = setInterval(() => { device.refreshDirectory().catch(() => {}) }, 3000)
     return () => clearInterval(timer)
   }, [result, ready])
-  if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理设备能添加设备" />
-
   const generate = () => {
+    if (!ready) return
     setResult(null); setUsed(false); setAdded(null)
     const connection = ready
     void run('create', async () => {
@@ -52,6 +51,15 @@ export default function AddDevice() {
       if (connection.isCurrent()) setResult(invitation)
     })
   }
+  // As on the web, opening the page makes the link and its code at once, unless a device is already asking to join; once per connection.
+  const opened = useRef<object | null>(null)
+  useEffect(() => {
+    if (!ready?.principal.can_manage || requests || opened.current === ready) return
+    opened.current = ready
+    generate()
+  }, [ready])
+  if (!ready?.principal.can_manage) return <EmptyState icon={ShieldAlert} title="只有管理设备能添加设备" />
+
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     {added && !requests ? <View className="gap-3">
       <View role="status" className="flex-row items-center gap-2"><Icon as={CircleCheck} className="size-4 text-success" /><Text numberOfLines={1} className="flex-1 text-success">已添加「{added}」</Text></View>

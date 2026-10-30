@@ -1,17 +1,16 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, FolderOpen, Inbox, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Server, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
-import { messageOf } from '@vibeface/client/lib/node.ts'
+import { asProvider, messageOf, providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import type { BotProject, BotRecord } from '@vibeface/client/workspace/types.ts'
 import { useAvatarPick } from '@vibeface/client/avatar/pick.ts'
-import type { Mood } from '@vibeface/client/avatar/face.ts'
 import { AvatarPicker } from '@/components/avatar-picker'
 import { cn } from '@/lib/utils'
 import { ActionButton } from '@/components/action'
 import { botMood, BotFace } from '@/components/bot-face'
-import { EmptyState } from '@/components/kit'
+import { Details, EmptyState, providerIcons, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
@@ -20,31 +19,56 @@ import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
-/** A bot as the web's bot panel shows it: its face, primary or not, what it does, its schedules, notes and the shared skills. The face and project are picked here; the rest changes by asking it in the chat. */
+/**
+ * A bot as the web's bot panel shows it: where it runs and on which model first, then its project, face, what it does, its schedules,
+ * notes and the shared skills. The face and project are picked here; the rest changes by asking it in the chat.
+ */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
-  const workspace = useWorkspace()
-  const { directory } = useDevice()
   const bot = shared?.bots.find((item) => item.bot_id === botId)
   if (!shared || !bot) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
+  return <About bot={bot} shared={shared} />
+}
+
+function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType<typeof useLive>> }) {
+  const workspace = useWorkspace()
+  const { directory, ready } = useDevice()
+  const look = useAvatarPick(bot, (version, avatar) => shared.setBotAvatar(bot.conversation_id, version, avatar), (error) => Alert.alert('没换成', messageOf(error)))
   const view = shared.conversationId === bot.conversation_id ? shared.data?.bot_settings : undefined
   const schedules = sortSchedules(view?.schedules ?? [])
   const empty = view && !bot.project && !bot.instructions.trim() && !schedules.length && !view.memory.length && !view.skills.length
   const lookup = { nodes: shared.nodes, directory }
   const choices = projectChoices(shared.nodes, (node, index) => nodeName(node.device_id, lookup, `设备 ${index + 1}`))
   const projectNow = bot.project ? projectKey(bot.project) : ''
-  const place = bot.project ? projectPlace(bot.project, shared.data?.conversation?.owner, (id) => nodeName(id, lookup)) : ''
+  const owner = shared.conversationId === bot.conversation_id ? shared.data?.conversation?.owner : undefined
+  const ownerNode = shared.nodes.find((node) => node.device_id === owner)
+  // The provider the bot runs on now, with its model; without one known, every model the bot chose.
+  const running = asProvider(ownerNode?.capabilities?.manager)
+  const models = running ? [[running, bot.models[running] ?? '']] as [ProviderId, string][] : Object.entries(bot.models) as [ProviderId, string][]
+  const place = bot.project ? projectPlace(bot.project, owner, (id) => nodeName(id, lookup)) : ''
   const options: { key: string; project: BotProject | null; label: string }[] = [{ key: '', project: null, label: '不选' },
     ...(bot.project && !choices.some((item) => item.key === projectNow) ? [{ key: projectNow, project: bot.project, label: place }] : []), ...choices]
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
     <Stack.Screen options={{ title: bot.name }} />
-    <View className="items-start gap-3">
-      <FacePicker bot={bot} mood={botMood(bot, workspace, shared)} writable={shared.writable} write={(version, avatar) => shared.setBotAvatar(bot.conversation_id, version, avatar)} />
-      {shared.primary === bot.conversation_id
-        ? <View accessible accessibilityHint={botCopy.primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
-        : <ActionButton variant="outline" className="self-start" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
+    <View className="flex-row items-center gap-3">
+      <BotFace bot={{ bot_id: bot.bot_id, avatar: look.avatar }} mood={botMood(bot, workspace, shared)} size={48} />
+      <View className="min-w-0 flex-1 items-start gap-1">
+        {shared.primary === bot.conversation_id
+          ? <View accessible accessibilityHint={botCopy.primaryHint} className="flex-row items-center gap-1"><Icon as={Star} className="size-3.5 fill-muted-foreground text-muted-foreground" /><Text className="text-meta text-muted-foreground">主 Bot</Text></View>
+          : <ActionButton variant="outline" size="sm" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
+        <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
+      </View>
     </View>
+    {owner || models.length ? <SettingsGroup>
+      {owner ? <SettingsRow icon={owner === ready?.entry.device_id ? Laptop : Server} label="运行设备">
+        {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}
+        <Text numberOfLines={1} className="max-w-[50%] text-muted-foreground">{nodeName(owner, lookup)}</Text>
+      </SettingsRow> : null}
+      {models.length ? models.map(([provider, model]) => <SettingsRow key={provider} icon={providerIcons[provider]} label={providerNames[provider]}>
+        <Text numberOfLines={1} className={cn('max-w-[50%] text-muted-foreground', model && 'font-mono text-meta')}>{model || '设备默认'}</Text>
+      </SettingsRow>) : <SettingsRow icon={Cpu} label="模型"><Text className="text-muted-foreground">设备默认</Text></SettingsRow>}
+    </SettingsGroup> : null}
     {empty ? <View className="flex-row items-center gap-2"><Icon as={Inbox} className="size-4 text-muted-foreground" /><Text className="text-meta text-muted-foreground">{botCopy.empty}</Text></View> : null}
     {bot.project || choices.length ? <Section icon={FolderOpen} title={folderLabels.project}>
       {shared.writable && choices.length ? <View accessibilityRole="radiogroup" className="overflow-hidden rounded-xl border border-border">
@@ -58,6 +82,9 @@ export default function BotAbout() {
         })}
       </View> : <Text selectable>{place}</Text>}
     </Section> : null}
+    <Details label="换长相">
+      <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!shared.writable} busy={look.pending} pick={look.pick} />
+    </Details>
     {bot.instructions.trim() ? <Section icon={ScrollText} title="说明"><Text selectable>{bot.instructions}</Text></Section> : null}
     {schedules.length ? <Section icon={CalendarClock} title="定时任务" count={schedules.length}>
       {schedules.map((schedule) => <View key={schedule.schedule_id} className="flex-row items-start gap-3">
@@ -91,18 +118,7 @@ export default function BotAbout() {
         {skill.description ? <Text className="text-meta text-muted-foreground">{skill.description}</Text> : null}
       </View>)}
     </Section> : null}
-    <Text className="text-meta text-muted-foreground">在聊天里说一声就能改</Text>
   </ScrollView>
-}
-
-
-/** The face as it will look, with the picker under it; a pick shows before it is written and goes back if the write fails. Only the big face moves. */
-function FacePicker({ bot, mood, writable, write }: { bot: BotRecord; mood: Mood; writable: boolean; write: Parameters<typeof useAvatarPick>[1] }) {
-  const look = useAvatarPick(bot, write, (error) => Alert.alert('没换成', messageOf(error)))
-  return <>
-    <BotFace bot={{ bot_id: bot.bot_id, avatar: look.avatar }} mood={mood} size={80} />
-    <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!writable} busy={look.pending} pick={look.pick} />
-  </>
 }
 
 function Section({ icon, title, count, children }: { icon: LucideIcon; title: string; count?: number; children: ReactNode }) {

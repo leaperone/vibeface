@@ -47,6 +47,9 @@ export const addDeviceCopy = {
 /** Where a device without management goes to add one; `managers`: the names of the management devices. */
 export const addOnManager = (managers: readonly string[]) => managers.length === 1 ? `在管理设备「${managers[0]}」上添加` : '在管理设备上添加'
 
+/** Settings' two red rows each say what they cost before either is tapped. */
+export const exitCopy = { leave: '要用加入链接才能回来', reset: '清除本机数据，回到欢迎页' }
+
 /** Leaving needs another management device first; `self` names this one (这台手机, 这个浏览器). */
 export const onlyManagerText = (self: string) => `${self}是唯一的管理设备，先把另一台设为管理设备再断开`
 /** An erase takes this device's management with it; the phone warns before clearing itself. */
