@@ -464,10 +464,14 @@ async fn main() -> Result<()> {
             })
         }
     };
-    vibeface::logging::init(match &command {
-        Action::Serve(options) => Some(options.data.data_dir.as_path()),
-        _ => None,
-    });
+    let quiet_libraries = !matches!(command, Action::Serve(_) | Action::Update(_));
+    vibeface::logging::init(
+        match &command {
+            Action::Serve(options) => Some(options.data.data_dir.as_path()),
+            _ => None,
+        },
+        quiet_libraries,
+    );
     match command {
         Action::Init(options) => {
             check_ports(
