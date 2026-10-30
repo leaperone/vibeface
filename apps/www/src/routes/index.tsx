@@ -77,7 +77,7 @@ function HomePage() {
           <div className="system-details">
             <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。复用自己电脑上的 Codex 或 Claude Code，各自准备程序、登录和项目。</p></article>
             <article><h3>共享 Bot 历史</h3><div><p>带签名和因果依赖的 DAG 同步 Bot 聊天、设置、任务阶段和结果。项目、依赖、登录与原生 SDK 状态不会自动迁移，完整逐字进度不作为共享历史保存。</p><a className="text-link" href="/docs/history-sync">了解同步范围 <ArrowRight size={16} aria-hidden="true" /></a></div></article>
-            <article><h3>换台电脑接着处理</h3><p>另一台 Node 先同步，再由你选择“交给这台设备处理”，用共享记录建立本机 Agent 上下文。历史回放不会启动旧工作，断网时仍需核对任务状态。</p></article>
+            <article><h3>换台电脑继续</h3><p>另一台 Node 先同步，再由你选择“交给这台设备处理”，用共享记录建立本机 Agent 上下文。历史回放不会启动旧工作，断网时仍需核对任务状态。</p></article>
           </div>
         </section>
 

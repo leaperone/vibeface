@@ -135,6 +135,8 @@ a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline
 
 @media (min-width: 961px) and (max-height: 650px) {
   .landing-hero { align-items: start; padding-block: 24px 32px; }
+  .landing h1 { font-size: clamp(48px, 5.4vw, 64px); }
+  .visual-node-left { top: 70%; }
 }
 @media (max-width: 1100px) {
   .landing-hero { gap: 40px; }
