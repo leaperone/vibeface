@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
-import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
+import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, MessagesSquare, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
@@ -18,6 +18,7 @@ import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { ActionButton } from "./present"
 import { AvatarPicker } from "./avatar-picker"
+import { ContextPanel } from "./context-panel"
 import { useAvatarPick } from "@vibeface/client/avatar/pick.ts"
 import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 
@@ -38,6 +39,7 @@ export function BotPanelButton() {
   const [gaps, setGaps] = useState<Gap[]>([])
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [contextOpen, setContextOpen] = useState(false)
   // 去聊天里说 closes the panel onto the composer instead of the title button that opened it.
   const toComposer = useRef(false)
   const navigate = useNavigate()
@@ -84,7 +86,7 @@ export function BotPanelButton() {
       <span className="min-w-0 truncate">{bot.name}</span>
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
-    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false) }}>
+    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false); setContextOpen(false) }}>
       <SheetContent className="!w-full max-sm:!border-l-0 gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => {
         if (!toComposer.current) return
         toComposer.current = false
@@ -98,7 +100,7 @@ export function BotPanelButton() {
             <SheetDescription className="text-meta">在聊天里说一声就能改</SheetDescription>
           </span>
         </SheetHeader>
-        {view ? <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+        {view ? contextOpen && workspace.data ? <ContextPanel bot={bot} data={workspace.data} nodes={workspace.nodes} onBack={() => { refocus.current = "context"; setContextOpen(false) }} /> : <div className="grid gap-6 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           <SettingsGroup>
             <AvatarPicker botId={bot.bot_id} avatar={look.avatar} face={look.face} disabled={!workspace.writable} busy={look.pending} pick={look.pick} />
           </SettingsGroup>
@@ -120,6 +122,11 @@ export function BotPanelButton() {
             <SettingsRow icon={terms.primaryBot.icon} label={terms.primaryBot.label} description={botCopy.primaryHint}>
               {workspace.primary === bot.conversation_id ? <span className="inline-flex items-center gap-1 text-foreground"><Check aria-hidden="true" className="size-4 text-brand" />是</span>
                 : <ActionButton disabled={!workspace.writable} action={() => workspace.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
+            </SettingsRow>
+          </SettingsGroup>
+          <SettingsGroup>
+            <SettingsRow ref={returnFocus("context")} icon={MessagesSquare} label="上下文和会话" description="查看聊天、工作和会话摘要" onClick={() => setContextOpen(true)}>
+              <span aria-hidden="true">查看</span>
             </SettingsRow>
           </SettingsGroup>
           {empty ? <EmptyState icon={NotebookPen} className="py-4" title={botCopy.empty}
