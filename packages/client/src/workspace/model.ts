@@ -133,14 +133,22 @@ function workKind(value: unknown): WorkRecord["kind"] {
   if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
   throw new Error("任务类型无法识别。")
 }
+function optionalWorkFields(data: Record<string, unknown>): Partial<WorkRecord> {
+  const fields: Partial<WorkRecord> = {}
+  for (const key of ["dispatcher", "call_ref", "continues", "parent", "thread", "thread_id", "turn_id"] as const) {
+    if (data[key] != null) fields[key] = text(data[key])
+  }
+  const kind = workKind(data.kind)
+  if (kind !== undefined) fields.kind = kind
+  if (data.phase != null) fields.phase = workPhase(data.phase)
+  return fields
+}
 function work(value: unknown): WorkRecord {
   const data = record(value)
   return {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
-    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), kind: workKind(data.kind),
-    dispatcher: optionalText(data.dispatcher), call_ref: optionalText(data.call_ref), continues: optionalText(data.continues), parent: optionalText(data.parent), thread: optionalText(data.thread), phase: optionalPhase(data.phase),
-    thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), ...optionalWorkFields(data),
   }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
@@ -149,8 +157,7 @@ export function withDeliveries(works: WorkRecord[], value: unknown): WorkRecord[
   for (const item of list(value)) {
     const data = record(item), state = data.state, work_id = text(data.work_id), target_node = text(data.target_node)
     if (state === "dispatch_waiting" || state === "dispatch_rejected" || state === "dispatch_unverified") {
-      rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason), ...failure(data.failure),
-        dispatcher: optionalText(data.dispatcher), call_ref: optionalText(data.call_ref), continues: optionalText(data.continues), parent: optionalText(data.parent), thread: optionalText(data.thread), phase: optionalPhase(data.phase), kind: workKind(data.kind), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id) })
+      rows.push({ work_id, trigger: "", target_node, cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: "", state, summary: "", outcome: null, result_text: "", failure_reason: data.reason == null ? null : text(data.reason), ...failure(data.failure) })
     } else if (state === "stop_waiting" || state === "stop_timed_out") {
       const index = rows.findIndex((row) => row.work_id === work_id)
       if (index >= 0) rows[index] = { ...rows[index], stop: state }
