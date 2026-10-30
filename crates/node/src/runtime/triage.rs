@@ -3893,7 +3893,10 @@ pub(super) mod tests {
                 node.executor(Provider::Codex)?,
                 &*node.codex
             ));
-            assert!(node.executor(Provider::Cursor).is_err());
+            assert!(std::ptr::addr_eq(
+                node.executor(Provider::Cursor)?,
+                &node.cursor_executor
+            ));
             with_agent(&node);
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;

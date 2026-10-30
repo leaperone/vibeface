@@ -2,10 +2,9 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, FlaskConical, RefreshCw, type LucideIcon } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { acceptanceOptions, canRestart, changeMode, deadlineRows, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
-import { useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
@@ -24,8 +23,6 @@ export function Transfers() {
 function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
   const delivery = useDelivery(connection, webPlatform)
   const { directory } = useDevice()
-  // Paid delivery and its test chain stay out of sight unless 实验功能 is on in settings.
-  const [experiments] = useExperiments(webPlatform.storage)
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
   const [file, setFile] = useState<TransferFile | null>(null)
   // Feedback shows next to the control that caused it, not at the top of a long page.
@@ -39,16 +36,13 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
     if (status) void delivery.configure({ enabled: status.enabled, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled, ...patch })
   }
   const feedback = (where: typeof origin) => origin === where ? <Feedback error={delivery.error} notice={delivery.notice} /> : null
-  // Paid already on at this Node stays visible, so it can be seen and turned off.
-  const paid = experiments || !!status?.paid_enabled
-  const sending = draftFor(draft, paid)
   const mine = receiverChoices(directory?.members ?? [], status?.node_peer ?? '')
   const picked = mine.some(item => item.device_id === draft.receiver_peer)
   // Once a pasted ID shows its field, clearing it must not fold the field shut mid-edit.
   const other = useRef(false)
   if (!picked && draft.receiver_peer) other.current = true
   const receiverId = <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={picked ? '' : draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required={!picked} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
-  const unusable = working || !file || !draft.receiver_peer || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
+  const unusable = working || !status?.enabled || !file || !draft.receiver_peer || status.max_file_bytes === 0 || draft.mode === 'charity' && !status.charity_enabled || draft.mode === 'paid' && !status.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
     {!status ? <p role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</p> : <>
@@ -58,22 +52,20 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
           {status.enabled ? <>
             <Toggle label={transferCopy.charity} checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-            {paid ? <Toggle label={transferCopy.paid} icon={FlaskConical} checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
+            <Toggle label={transferCopy.paid} icon={FlaskConical} checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} />
           </> : null}
         </div>
         {status.enabled ? <ConnectionId value={status.node_peer} /> : <p className="text-meta text-muted-foreground">{transferCopy.off}</p>}
         {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />{transferCopy.adminOnly}</p> : null}
-        {paid ? <>
-          {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
-          {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
-          <Details>
-            {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
-            {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
-            <p>{transferCopy.walletDetails}</p>
-          </Details>
-        </> : null}
+        {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
+        {status.wallet.state === 'unavailable' ? <p role="alert" className="text-meta text-warning">{status.wallet.reason}</p> : null}
+        <Details>
+          {status.wallet.address ? <Info label="设备钱包" value={status.wallet.address} /> : null}
+          {status.receiver_key ? <><Info label="当前接收密钥 ID" value={status.receiver_key.key_id} /><Info label="当前接收密钥序号" value={status.receiver_key.serial.toString()} /></> : null}
+          <p>{transferCopy.walletDetails}</p>
+        </Details>
       </section>
-      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) { setOrigin('form'); void delivery.prepare(sending, file) } }}>
+      {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file && !unusable) { setOrigin('form'); void delivery.prepare(draft, file) } }}>
         <h2 className="text-heading font-semibold">发送文件</h2>
         {mine.length ? <>
           <Field><FieldLabel htmlFor="transfer-to">{transferCopy.sendTo}</FieldLabel>
@@ -85,8 +77,8 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Details label={transferCopy.otherDevice} open={other.current || undefined}>{receiverId}</Details>
         </> : receiverId}
         <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
-        {paid ? <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
-        {sending.mode === 'paid' ? <>
+        <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} />
+        {draft.mode === 'paid' ? <>
           <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
           <Field><FieldLabel htmlFor="transfer-service-cap">{transferCopy.serviceCap}</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
           <Field><FieldLabel htmlFor="transfer-gas-cap">{transferCopy.gasCap}</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
@@ -99,10 +91,10 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         {file && file.size > status.max_file_bytes ? <p role="alert" className="text-meta text-danger">{transferCopy.tooLarge(status.max_file_bytes)}</p> : null}
         {feedback('form')}
         <div className="flex flex-wrap gap-2">
-          <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(sending.mode)}</Button>
-          {selected && canRestart(selected) && (paid || selected.mode === 'charity') ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
+          <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(draft.mode)}</Button>
+          {selected && canRestart(selected) ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file && !unusable) { setOrigin('form'); void delivery.prepare(draft, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
         </div>
-        <Details><p>{transferCopy.prepareDetails}</p>{sending.mode === 'paid' ? <p>{transferCopy.units}</p> : null}</Details>
+        <Details><p>{transferCopy.prepareDetails}</p>{draft.mode === 'paid' ? <p>{transferCopy.units}</p> : null}</Details>
       </form> : null}
     </>}
     <section aria-labelledby="transfer-orders" className="grid gap-3">
@@ -121,13 +113,13 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
         </button></li>
       })}</ul> : <EmptyState icon={ArrowRightLeft} title={transferCopy.noRecords} />}
     </section>
-    {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} walletReady={status?.wallet.state === 'unlocked'} feedback={feedback('order')}
+    {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} enabled={!!status?.enabled && (selected.mode === 'paid' ? status.paid_enabled : status.charity_enabled)} walletReady={status?.wallet.state === 'unlocked'} feedback={feedback('order')}
       confirm={() => { setOrigin('order'); void delivery.confirm(selected) }} accept={() => { setOrigin('order'); void delivery.accept(selected) }}
       reconcile={() => { setOrigin('order'); void delivery.reconcile(selected) }} save={() => { setOrigin('order'); void delivery.save(selected) }} /> : null}
   </div>
 }
 
-function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; walletReady: boolean; feedback: ReactNode; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
+function OrderDetails({ order, busy, canManage, enabled, walletReady, feedback, confirm, accept, reconcile, save }: { order: DeliveryOrder; busy: boolean; canManage: boolean; enabled: boolean; walletReady: boolean; feedback: ReactNode; confirm(): void; accept(): void; reconcile(): void; save(): void }) {
   const heading = useRef<HTMLHeadingElement>(null)
   useEffect(() => { heading.current?.focus() }, [])
   const paid = order.mode === 'paid'
@@ -145,11 +137,12 @@ function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, 
     {order.error ? <p role="alert" className="text-meta text-danger">{order.error}</p> : null}
     {feedback}
     <div className="flex flex-wrap gap-2">
-      {can.confirm ? <Button type="button" disabled={busy || !canManage || paid && !walletReady} onClick={confirm}>{transferCopy.confirm(order.mode)}</Button> : null}
-      {can.accept ? <Button type="button" disabled={busy || !canManage} onClick={accept}>接收文件</Button> : null}
+      {can.confirm ? <Button type="button" disabled={busy || !canManage || !enabled || paid && !walletReady} onClick={confirm}>{transferCopy.confirm(order.mode)}</Button> : null}
+      {can.accept ? <Button type="button" disabled={busy || !canManage || !enabled} onClick={accept}>接收文件</Button> : null}
       {can.save ? <Button type="button" variant={order.role === 'receiver' ? 'default' : 'outline'} disabled={busy} onClick={save}><ArrowDownToLine aria-hidden="true" />保存文件</Button> : null}
-      <Button type="button" variant="outline" disabled={busy || !canManage} onClick={reconcile}>检查进度</Button>
+      <Button type="button" variant="outline" disabled={busy || !canManage || !enabled} onClick={reconcile}>检查进度</Button>
     </div>
+    {!enabled ? <p className="text-meta text-muted-foreground">文件传输或此传输方式已关闭。开启后可继续原订单，已收到的文件仍可保存。</p> : null}
     {paid && order.phase === 'prepared' && !walletReady ? <p className="text-meta text-warning">{transferCopy.walletFirst}</p> : null}
     {order.payment.state === 'unknown' || order.phase === 'reconciling' ? <p className="text-meta text-warning">{transferCopy.unknownPayment}</p> : null}
     <Details>

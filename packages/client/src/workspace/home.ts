@@ -14,13 +14,15 @@ export function homeBot({ narrow, conversation, bots, current }: Home): BotRecor
   return bots.find((bot) => bot.conversation_id === current) ?? bots[0] ?? null
 }
 
-/**
- * What a list with no bot rows shows: placeholders while the first read is on its way, an unreachable network once a
- * connect attempt has failed (so a stopped Node never looks like an endless load), else no bots yet.
- */
+/** A connect attempt has failed and the next one has not got through yet, so a stopped Node never looks like an endless load. */
+export function unreachable(link: Link): boolean {
+  return link.kind === "offline" || (link.kind === "connecting" && link.attempt > 0)
+}
+
+/** What a list with no bot rows shows: placeholders while the first read is on its way, an unreachable network, else no bots yet. */
 export function emptyHome({ synced, link }: { synced: boolean; link: Link }): "loading" | "unreachable" | "empty" {
   if (synced) return "empty"
-  return link.kind === "offline" || (link.kind === "connecting" && link.attempt > 0) ? "unreachable" : "loading"
+  return unreachable(link) ? "unreachable" : "loading"
 }
 
 /** Bots by their newest message, newest first; ones without messages keep their order at the end. */
@@ -44,6 +46,7 @@ export function backTo(pathname: string, bot?: string): string | null {
   const work = /^(\/b\/[^/]+)\/work\//.exec(pathname)
   if (work) return work[1]
   if (/^\/devices\/[^/]+/.test(pathname)) return "/devices"
+  if (pathname.startsWith("/settings/lab/")) return "/settings/lab"
   if (pathname.startsWith("/settings/")) return "/settings"
   return "/"
 }

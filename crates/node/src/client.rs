@@ -2531,7 +2531,7 @@ mod tests {
                 read["providers"][1]["issues"].clone()
             ),
             (json!("off"), json!([])),
-            "Cursor runs nothing until the bot uses it"
+            "Cursor runs nothing until a role is enabled"
         );
         assert_eq!(codex["app_server"]["mode"], "system");
         assert_eq!(read["providers"][1]["app_server"], Value::Null);
@@ -2606,7 +2606,7 @@ mod tests {
         );
 
         for invalid in [
-            json!({"provider":"cursor","execution":true}),
+            json!({"provider":"unknown","execution":true}),
             json!({"provider":"codex","roles":["agent"]}),
             json!({"provider":"codex","enabled":false}),
             json!({"provider":"codex","env":{"VIBEFACE_DATA_DIR":"/elsewhere"}}),
@@ -2617,6 +2617,31 @@ mod tests {
                     .is_err()
             );
         }
+        let cursor_enabled = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":true}),
+        )
+        .await?;
+        assert_eq!(
+            cursor_enabled["providers"][1]["roles"],
+            json!(["execution"])
+        );
+        assert!(
+            Config::load(&dir)?
+                .providers
+                .execution
+                .contains(&Provider::Cursor)
+        );
+        let cursor_disabled = dispatch(
+            &node,
+            &mut owner,
+            "configure_provider",
+            json!({"provider":"cursor","execution":false}),
+        )
+        .await?;
+        assert_eq!(cursor_disabled["providers"][1]["roles"], json!([]));
         let off = dispatch(
             &node,
             &mut owner,

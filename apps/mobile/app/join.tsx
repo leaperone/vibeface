@@ -93,10 +93,13 @@ function JoinForm() {
   const device = useDevice()
   const url = useLinkingURL()
   const [invitation, setInvitation] = useState('')
+  // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
+  const [edited, setEdited] = useState(false)
+  const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
   // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
     const link = openedLink(url)
-    if (link && link !== spent) setInvitation(link)
+    if (link && link !== spent) edit(link)
   }, [url])
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
@@ -110,16 +113,19 @@ function JoinForm() {
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
-  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
-  const ready = invitation.trim() !== ''
+  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
+  // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
+  // or any other text keeps the field.
+  const ready = device.linkTarget(invitation) !== null
+  const invalid = !ready && invitation.trim() !== ''
   // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
-  const failure = error || device.error
+  const failure = error || (edited ? '' : device.error)
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
     <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={Link2} className="text-muted-foreground" />
       <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
-      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => edit('')}><Icon as={X} /></Button>
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
@@ -134,8 +140,9 @@ function JoinForm() {
     <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
-        className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
+        className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
+      {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
+      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => edit((await Clipboard.getStringAsync()).trim())}>
         <Icon as={ClipboardPaste} /><Text>粘贴</Text>
       </Button>
     </View>
