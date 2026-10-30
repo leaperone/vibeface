@@ -260,7 +260,7 @@ export type OverviewJob = {
   unknown_reason: string | null
 }
 
-export type OverviewRemoteOwner = { owner: string; reachable: boolean; reason: string | null }
+export type OverviewRemoteOwner = { owner: string | null; reachable: boolean | null; reason: string | null }
 export type OverviewCoverage = {
   source: "open_works" | "workspace_overview"
   complete: boolean

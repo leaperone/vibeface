@@ -423,7 +423,7 @@ function parseOverviewJob(value: unknown): OverviewJob {
 }
 function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency, truncated: boolean, generatedAt: number | null, networkEpoch: number | null): OverviewCoverage {
   const data = value == null ? {} : record(value)
-  const remote = list(data.remote_owners ?? []).map((item) => { const owner = record(item); return { owner: text(owner.owner), reachable: owner.reachable === true, reason: nullableText(owner.reason) } })
+  const remote = list(data.remote_owners ?? []).map((item) => { const owner = record(item); return { owner: nullableText(owner.owner), reachable: owner.reachable == null ? null : owner.reachable === true, reason: nullableText(owner.reason) } })
   const unreachable = list(data.unreachable_nodes ?? []).map(text)
   return {
     source: data.source === "workspace_overview" ? "workspace_overview" : "open_works", complete: data.complete === true, bounded: data.bounded !== false,
