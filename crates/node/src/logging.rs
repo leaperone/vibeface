@@ -337,10 +337,12 @@ pub fn write(record: &Record) {
     }
 }
 
-/// Info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A serving Node
-/// writes structured records to `node.log` and copies text to stderr only on a terminal, so a
-/// service's own stderr file keeps just crashes.
-pub fn init(data_dir: Option<&Path>) {
+/// Info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. `quiet_libraries`
+/// turns library logs off for commands that report their own outcome, such as `join`, whose
+/// transient iroh warnings and errors read as failures. A serving Node writes structured records
+/// to `node.log` and copies text to stderr only on a terminal, so a service's own stderr file
+/// keeps just crashes.
+pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
     let sink = data_dir.and_then(|dir| {
@@ -348,12 +350,12 @@ pub fn init(data_dir: Option<&Path>) {
         SINK.set(sink.clone()).ok()?;
         Some(sink)
     });
+    let libraries = if quiet_libraries { "off" } else { "warn" };
     let terminal = sink.is_none() || std::io::stderr().is_terminal();
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,vibeface=info,vibeface_bridge=info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("{libraries},vibeface=info,vibeface_bridge=info"))
+        }))
         .with(sink.map(|sink| Layer { sink }))
         .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
         .init();
