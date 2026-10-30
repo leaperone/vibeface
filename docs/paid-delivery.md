@@ -145,7 +145,7 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 
 ## 小文件证明与结算实验
 
-实验从 4 KiB 单窗口合成文件开始，使用一次性 S、R、P 身份、本机 `31337` 测试链和 TestToken。先生成并独立验证当前 image 的 KeyBinding、Source、Hold、Open 真实 receipt，再检验正常交付与资金状态。用于付款的证明必须绑定本次实际部署地址、条款和 manifest，生成后不能改写订单。
+实验从 4 KiB 单窗口合成文件开始，使用固定合成 S、R、P 测试身份、本机 `31337` 测试链和 TestToken。测试身份与接收密钥由公开 fixture 种子产生，不验证生产密钥保密。先生成并独立验证当前 image 的 KeyBinding、Source、Hold、Open 真实 receipt，再检验正常交付与资金状态。用于付款的证明必须绑定本次实际部署地址、条款和 manifest，生成后不能改写订单。
 
 对抗用例在发布交易仍待确认时，从公开 calldata 提取完整 E；随后让交易超时回滚或撤销发布块，检查退款、服务收入与 R 离线恢复原文件的实际结果。文件长度、SHA-256、交易回执和原链余额分别记录，不能用其中一项推断其他项。
 

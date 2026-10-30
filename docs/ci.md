@@ -37,7 +37,7 @@ Linux 制品还使用 [e2e](e2e.md) 启动隔离 Node，在 Chromium 中验证�
 
 `scripts/check-delivery.py` 读取 `proofs/delivery/fixtures/manifest.json` 和四种关系的公开 Groth16 receipt。它通过规范入口重新编译 guest，核对 image ID、ELF SHA-256、唯一 `Statement.sol` 的 schema hash 和 47 槽 journal，再用本次构建的 host 验证 receipt。验证还要求 host 导出的 Groth16 seal 与对应公开 fixture 逐字一致，拒绝缺失或额外字段。旧 image、过期 schema、错误 journal、缺文件、dev mode 和跳过 guest 构建都会失败。
 
-现状：这 13 个证明夹具需要在 x86_64 大内存机器上生成，CI 的 11 GiB runner 和 ARM Mac 都生成不了，仓库暂不包含 `proofs/delivery/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败。
+核心 fixture 要求四种关系各一份证明，共九个公开文件。下文完整 live 流程的十三份唯一证明是另一项验收。仓库暂不包含 `proofs/delivery/fixtures/`。目录不存在时，检查打印 `skipped: no public proof fixture`，跳过 receipt 验证和 `verify-delivery.mjs`，guest 重编、profile、跨语言向量和其余合约检查照常运行。目录一旦提交就恢复完整验证，目录存在但内容不全仍然失败。固定 11 GiB 环境是否能生成当前证明须以真实运行结果判断，文件较小不保证 Groth16 压缩所需内存较小。
 
 所有 receipt 还必须绑定产品的 `proofs/delivery/profile.json`。检查要求该文件与重编 guest 的 image、schema 相同，并固定为两个窗口、每窗 65,536 字节、总共 131,072 字节、64,000,000 cycles 和 16 GiB 内存上限。Rust fixture 命令显式读取该文件，以同一 ABI 生成 profile ID，再逐项核对 receipt；默认的 16 窗口测试 profile 不属于产品信任根。guest 不读取产品 profile 文件，避免 image 自引用。
 
@@ -71,6 +71,19 @@ python3 scripts/check-delivery.py --sandbox
 公益进程验收与 paid proof 任务各自必须通过。公益收据不代表链上交付或结算。Preflight 对 probe 和相关服务改动单独运行 fmt 与最小 locked build，不把这一构建当作进程验收。
 
 ## 手动生成真实付费交付证据
+
+`delivery_small` 是默认关闭的独立小实验。显式选中后仅运行 `delivery-small`，跳过常规计划和 aggregate gate，不构建 Android 或运行 full live。两个实验选项不能同时选中。该次手动运行的成功不替代普通 PR 的最终 HEAD 检查。
+
+```sh
+gh workflow run ci.yml --ref <实验分支> -f delivery_small=true -f delivery_live=false
+python3 scripts/check-delivery.py --sandbox --prove-small
+```
+
+小实验使用固定 sandbox、产品 profile、真实部署的普通 `DeliveryEscrow` 与 TestToken。矿工停止后固定实际部署、合成测试身份、4096 字节原文和订单条款，再串行生成四类真实 Groth16 receipt。Peer 身份和接收密钥沿用公开的固定 fixture 种子，不为生产保密背书。每份证明分别经过独立 host 验证、错误 journal 拒绝和正常 adapter 验真；完整九文件 bundle 可原样作为核心 fixture，在后续独立 CI 重编验证。
+
+同一 Held 快照分别验证正常 publish/open/withdraw、pending E 后超期失败并退款、成功 publish 后受控回滚并退款。每条分支记录实际 Token 余额、事件、交易回执和原生 gas，并由独立恢复程序只接收 Hold 与交易中实际观察到的 E，核对原文件字节和 SHA-256。恢复程序没有链参数，这不等于操作系统网络或文件访问隔离。快照分支不能相加为最终链上收入，Ganache 回滚不代表公网共识攻击。
+
+结果在 `.artifacts/vdp/canonical/small/<run>/public/`。上传白名单只含摘要、cgroup 资源以及公开九文件 bundle，不含原文、E、witness、私钥、Succinct checkpoint 或原始日志。CPU 是每个命令期间整个 sandbox 的增量，`memory.peak` 是容器生命周期累计峰值；两者不表示单个业务角色的独占消耗。任何证明、结算、恢复或资源检查失败都不能报告实验通过。
 
 现有 `ci` 的手动入口提供 `delivery_live` 布尔选项，默认关闭。只有 `workflow_dispatch` 显式选中它时才运行 `delivery-live`，并额外要求该任务成功。普通 PR、push、定时检查和节点默认付费开关沿用原规则。
 

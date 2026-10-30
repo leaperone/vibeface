@@ -142,13 +142,17 @@ def sandbox_commands(context, small=False):
     for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
     if small:
-        container.extend(["--env", "TOKIO_WORKER_THREADS=2"])
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        hex_bytes(commit, 20)
+        container.extend(["--env", "TOKIO_WORKER_THREADS=2", "--env", "VIBEFACE_DELIVERY_SOURCE_COMMIT=" + commit])
     container.extend([image, "bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py" + (" --prove-small" if small else "")])
     return build, container
 
 
 def sandbox(small=False):
     optional_fixtures()
+    if small and subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT).strip():
+        raise ValueError("Small experiments require a clean committed source checkout")
     for name in ("cargo", "risc0", "canonical"):
         (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="sandbox-build-", dir=ARTIFACTS) as directory:
@@ -367,6 +371,14 @@ def self_test():
             pass
         else:
             raise AssertionError("A broken fixture must stop sandbox dispatch")
+        operation.assert_not_called()
+    with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.subprocess.check_output", return_value=b" M uncommitted-source"), patch(f"{__name__}.run") as operation:
+        try:
+            sandbox(small=True)
+        except ValueError as error:
+            assert "clean committed source" in str(error)
+        else:
+            raise AssertionError("Uncommitted sources must not be attributed to HEAD in a proof experiment")
         operation.assert_not_called()
     print("Delivery fixture, product profile, receipt export and sandbox command self-tests passed; no Docker job or cryptographic proof ran")
 

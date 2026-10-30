@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { artifact, requireDependency, root } from './compile.mjs';
@@ -24,12 +24,13 @@ const membership = fs.readFileSync('/proc/self/cgroup', 'utf8').split('\n').find
 const cgroup = path.join('/sys/fs/cgroup', membership);
 const counters = () => Object.fromEntries(['cpu.stat', 'memory.current', 'memory.peak', 'memory.events', 'pids.current']
   .filter(name => fs.existsSync(path.join(cgroup, name))).map(name => [name, fs.readFileSync(path.join(cgroup, name), 'utf8').trim()]));
-const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.resolve(root, '../..'), encoding: 'utf8' }).trim();
+const sourceCommit = process.env.VIBEFACE_DELIVERY_SOURCE_COMMIT;
+assert.match(sourceCommit ?? '', /^[0-9a-f]{40}$/, 'the sandbox launcher must bind the exact source commit');
 const result = { schemaVersion: 1, sourceCommit, status: 'RUNNING', stage: 'deploy', guest: compiled,
   file: null, proofs: [], branches: [], transactions: [], processes: [],
   limits: { memoryBytes: 11 * 1024 ** 3, swapBytes: 0, pids: 64 },
   resourceScope: 'CPU deltas cover each entire sandbox interval; memory.peak is cumulative sandbox lifetime, not per-process RSS',
-  coverage: 'synthetic raw 4096-byte file and controlled Ganache branches; no product Node, UI, mobile, real asset, or public-chain finality' };
+  coverage: 'synthetic raw 4096-byte file, deterministic public test keys and controlled Ganache branches; no production confidentiality, product Node, UI, mobile, real asset, or public-chain finality' };
 function progress(stage) {
   result.stage = stage;
   fs.writeFileSync(path.join(publicDir, 'summary.json'), encode(result), { mode: 0o600 });

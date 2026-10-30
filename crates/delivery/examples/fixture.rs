@@ -51,8 +51,7 @@ fn experiment_fixture(
             context.payer,
             context.provider_wallet,
         ]
-        .iter()
-        .any(|address| *address == [0; 20])
+        .contains(&[0; 20])
         || context.payer == context.provider_wallet
     {
         return Err("invalid small experiment context or file".into());

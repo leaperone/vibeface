@@ -57,8 +57,8 @@ Generate a bounded private ProofInput with the domain fixture example using this
 
 ```sh
 export RISC0_SERVER_PATH=/absolute/path/to/verified/r0vm
-"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" execute < .artifacts/delivery-proof/source.private.json
-"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" prove .artifacts/delivery-proof/source.receipt < .artifacts/delivery-proof/source.private.json
+/artifacts/proof-target/release/vibeface-delivery-prover execute < .artifacts/delivery-proof/source.private.json
+/artifacts/proof-target/release/vibeface-delivery-prover prove .artifacts/delivery-proof/source.receipt < .artifacts/delivery-proof/source.private.json
 ```
 
 The host directly constructs ExternalProver with this trusted local binary. It never selects Bonsai or an automatic remote backend. It rejects RISC0_DEV_MODE, Fake receipts, unsuccessful execution, unresolved assumptions, wrong image and wrong journal. `execute` reports cycles and `proved=false`. `prove` verifies a real succinct receipt, compresses it to Groth16, verifies again and exports a public seal with the verifier selector.
@@ -70,7 +70,7 @@ At startup the host sets its process umask to `077`, before starting any child p
 The normal two-argument `prove <new-receipt-path>` command and its eight public output fields are unchanged. For a diagnostic run, an explicit optional flag saves the verified Succinct receipt before Groth16 compression:
 
 ```sh
-"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" prove .artifacts/delivery-proof/source.receipt --succinct-receipt .artifacts/delivery-proof/source.succinct.receipt < .artifacts/delivery-proof/source.private.json
+/artifacts/proof-target/release/vibeface-delivery-prover prove .artifacts/delivery-proof/source.receipt --succinct-receipt .artifacts/delivery-proof/source.succinct.receipt < .artifacts/delivery-proof/source.private.json
 ```
 
 Both output paths must be new and distinct. The checkpoint is atomically published with mode `0600`, after verification against this build's image and the exact statement journal. It remains available if compression fails. The Node's default call does not request this checkpoint or allocate additional intermediate storage.
@@ -78,7 +78,7 @@ Both output paths must be new and distinct. The checkpoint is atomically publish
 Retry only compression from an existing checkpoint with its expected public statement journal:
 
 ```sh
-"$CARGO_TARGET_DIR/release/vibeface-delivery-prover" compress .artifacts/delivery-proof/source.retry.receipt "<expected-public-journal-hex>" < .artifacts/delivery-proof/source.succinct.receipt
+/artifacts/proof-target/release/vibeface-delivery-prover compress .artifacts/delivery-proof/source.retry.receipt "<expected-public-journal-hex>" < .artifacts/delivery-proof/source.succinct.receipt
 ```
 
 `compress` reads a bincode Receipt on stdin, limited to 16 MiB with trailing bytes rejected. It accepts only a genuine Succinct receipt for this compiled image, successful execution without unresolved assumptions, and the specified canonical statement journal. It rejects Fake, Groth16, corrupted or mismatched input before invoking the local compression prover. The new Groth16 receipt is verified and atomically published with mode `0600`; an existing destination, including a symlink, is never overwritten.
@@ -107,4 +107,10 @@ Only add genuinely generated receipts under `fixtures/`. When no fixtures are pr
 }
 ```
 
-Require all four relations. Additional window fixtures use unique basenames. Public JSON is the host prove output with mode, kind, imageId, profileId, relation, journal, journalHash and seal. CI rebuilds the guest, compares manifest metadata to host info, and passes each expected public journal to the rebuilt host's verify command with its receipt on stdin. It must reject stale image, schema, ELF, journal and changed proof. Keep private inputs outside this directory.
+Require exactly four entries with fixed basenames `relation-1` through `relation-4`, each with `.receipt` and `.json`, plus `manifest.json`. Additional window bundles belong outside this fixed core fixture directory. Public JSON is the host prove output with mode, kind, imageId, profileId, relation, journal, journalHash and seal. CI rebuilds the guest, compares manifest metadata to host info, and passes each expected public journal to the rebuilt host's verify command with its receipt on stdin. It must reject stale image, schema, ELF, journal and changed proof. Keep private inputs outside this directory.
+
+## Small-file proof and settlement experiment
+
+`python3 scripts/check-delivery.py --sandbox --prove-small` explicitly generates four real proofs for one deployed order and tests normal settlement, late inclusion after pending capsule disclosure, and a controlled publish rollback followed by refund. It uses the existing 11 GiB, zero-swap, 64-PID sandbox and the fixed product profile. Default checks do not generate new proofs. See [CI instructions](../../docs/ci.md#手动生成真实付费交付证据) for the public output and coverage limits.
+
+The example's `public <length> <count> [image_hex] [profile.json]` and `input <length> <count> <image_hex> <relation> <index> <new-private-output> <profile.json>` accept an explicit product profile. Omitting it uses the test profile. The experiment creates its four inputs from actual deployment context and file bytes through `fixture experiment <context.json> <4096.bin> <new-private-dir> <profile.json>`. `fixture recover <hold.json> <observed-E.bin> <new-output.bin>` requires a valid Hold witness, accepts the capsule separately and publishes a new private file only after successful authenticated recovery.
