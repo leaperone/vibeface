@@ -1,3 +1,4 @@
+import { byRank } from "../chat/timeline.ts"
 import { withDeliveries } from "./model.ts"
 import { questionOpen } from "./questions.ts"
 import type { BotRecord, ConversationPayload, ConversationRecords, NotificationRecord, OpenWork, Question, WorkRecord } from "./types.ts"
@@ -12,8 +13,7 @@ function upsert<T>(items: T[], changed: T[], key: (item: T) => string): T[] {
 
 /** The open conversation with one pushed change merged in, in the shared message order. */
 export function mergeConversation(shown: ConversationPayload, records: ConversationRecords): ConversationPayload {
-  const messages = upsert(shown.messages, records.messages, (item) => item.message_id)
-  if (messages.every((item) => item.rank)) messages.sort((a, b) => (a.rank! < b.rank! ? -1 : a.rank! > b.rank! ? 1 : 0))
+  const messages = byRank(upsert(shown.messages, records.messages, (item) => item.message_id))
   const works = upsert(shown.works.filter((item) => !delivery(item)).map(({ stop: _, ...item }) => item), records.works, (item) => item.work_id)
   // A push carries this device's jobs only; the owner's stay until the conversation is read again.
   const remote = shown.scheduler?.jobs.filter((job) => job.source_node) ?? []

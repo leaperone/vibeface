@@ -17,25 +17,18 @@ const rise = FadeInDown.duration(180).easing(easeOut).withInitialValues({ transf
 
 const ended: Record<string, string> = { stopped: '已中断', interrupted: '已中断', failed: '失败' }
 
-function shortTime(at: number) {
-  const when = new Date(at)
-  const pad = (value: number) => String(value).padStart(2, '0')
-  const clock = `${pad(when.getHours())}:${pad(when.getMinutes())}`
-  return when.toDateString() === new Date().toDateString() ? clock : `${when.getMonth() + 1}/${when.getDate()} ${clock}`
-}
-
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
  * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
  */
-export function Message({ message, bot, last, offline }: { message: ChatMessage; bot: FaceBot; last: boolean; offline: boolean }) {
+export function Message({ message, bot, time: shown, offline }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean }) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
   const cause = failed ? replyFailure(message.failure, message.detail) : failureText(message.failure)
   const raw = failed && message.detail ? rawError(message.detail) : ''
   const entering = message.created_at_ms > Date.now() - 2000 ? rise : undefined
-  const time = last && message.created_at_ms ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shortTime(message.created_at_ms)}</Text> : null
+  const time = shown ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
     <View className="rounded-2xl rounded-br-md bg-secondary px-4 py-2 ring-1 ring-border/60">
       <Text selectable className="text-secondary-foreground">{message.text}</Text>

@@ -12,7 +12,8 @@ import { byRecent, listTime } from "@vibeface/client/workspace/home.ts"
 import { useInbox } from "./inbox"
 import { waitingItems } from "@vibeface/client/workspace/inbox.ts"
 import { terms } from "@/lib/glossary"
-import { openQuestions } from "@vibeface/client/workspace/questions.ts"
+import { awaitsAnswer } from "@vibeface/client/workspace/questions.ts"
+import { unreadCounts } from "@vibeface/client/chat/timeline.ts"
 import { ConnectionCapsule, useCreateBot } from "./workspace-shell"
 
 /** The phone's home: 待处理 first, then every bot by its newest message. */
@@ -20,17 +21,16 @@ export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
   const open = waitingItems(useInbox())
-  const questions = openQuestions(workspace.questions)
+  const unread = unreadCounts(workspace.notifications, workspace.questions.filter((item) => awaitsAnswer(item, workspace.answered)))
   const now = Date.now()
   const bots = byRecent(workspace.bots)
   let list: ReactNode
   if (bots.length) list = <ul className="grid gap-0.5">{bots.map((bot) => {
     const notes = workspace.notifications.filter((item) => item.conversation_id === bot.conversation_id)
-    const unread = notes.length + questions.filter((item) => item.conversation_id === bot.conversation_id && !(item.question_id in workspace.answered)).length
     const last = bot.last_message, mood = botMood(bot, workspace)
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
-      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace bot={bot} mood={mood} size={44} />} unread={unread} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
+      <Row to="/b/$botId" params={{ botId: bot.bot_id }} icon={Bot} avatar={<BotFace bot={bot} mood={mood} size={44} />} unread={unread[bot.conversation_id] ?? 0} time={last ? listTime(last.created_at_ms, now) : undefined} preview={preview}
         name={bot.name} mark={<>{workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</>} />
     </li>
   })}</ul>
