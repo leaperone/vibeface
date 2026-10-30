@@ -172,7 +172,7 @@ bash scripts/package-node.sh
 ./target/release/vibeface serve
 ```
 
-`init` 要求数据目录为空或不存在。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和 `node.sqlite3`，运行日志写在 `node.log`。`serve` 和 `join` 用目录锁独占数据目录。
+`init` 要求数据目录为空或不存在。它写入 `identity.json`、`config.json`、一次性 `bootstrap.json`、`data-epoch.json` 和 `node.sqlite3`，运行日志写在 `node.log`。`serve` 和 `join` 用目录锁独占数据目录；`join` 遇到正在运行的 Node 时不抢锁，交给它加入。
 
 `bash scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，输出到 `.artifacts/packages/`。
 
