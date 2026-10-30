@@ -1,28 +1,34 @@
 import { Link } from '@tanstack/react-router'
-import { ArrowRightLeft, FlaskConical, ShieldAlert } from 'lucide-react'
-import { useExperiments } from '@vibeface/client/lib/experiments.ts'
+import { ArrowRightLeft, FlaskConical } from 'lucide-react'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { useDelivery } from '@vibeface/client/delivery/client.ts'
+import { needsRefresh } from '@vibeface/client/delivery/model.ts'
 import { Button } from '@/components/ui/button'
-import { SettingsGroup, SettingsRow } from '@/components/app/kit'
+import { EmptyState, InlineError, SettingsGroup, SettingsRow } from '@/components/app/kit'
 import { webPlatform } from '@/lib/platform'
 
-/** The single place where browser-only experimental features are exposed. */
 export function Lab() {
-  const [experiments, setExperiments] = useExperiments(webPlatform.storage)
+  const { ready } = useDevice()
+  return ready ? <ConnectedLab key={`${ready.generation}:${ready.entry.device_id}`} connection={ready} /> : <EmptyState icon={FlaskConical} title="设备暂时离线" description="重新连接后可查看实验设置和传输记录。" />
+}
+
+function ConnectedLab({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
+  const delivery = useDelivery(connection, webPlatform)
+  const status = delivery.status
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <section className="grid gap-2 rounded-xl border bg-card p-4">
-      <h2 className="text-heading font-semibold">实验室</h2>
-      <p className="text-meta text-muted-foreground">这里的功能还在测试。关闭实验室后，消息、设备、发现、同步和普通公益传输不受影响。</p>
-    </section>
-    <SettingsGroup title="实验开关" footer="开关只保存在这个浏览器，不会改变这台设备的身份或连接设置。">
-      <SettingsRow icon={FlaskConical} label="启用实验功能" description={experiments ? '已开启，实验功能会在对应页面出现' : '默认关闭，普通功能保持不变'}>
-        <input type="checkbox" role="switch" className="switch" aria-label="启用实验功能" checked={experiments} onChange={(event) => setExperiments(event.target.checked)} />
+    <p className="text-meta text-muted-foreground">这里集中放置还在试用的功能，默认关闭。消息、聊天附件、设备连接和同步沿用原来的设置。</p>
+    {delivery.error ? <InlineError error={delivery.error} /> : null}
+    <SettingsGroup title="文件传输" footer="只控制当前连接的电脑。关闭会暂停传输和中转，保留传输记录与已保存的文件。">
+      <SettingsRow icon={FlaskConical} label="文件传输实验" description="加密免费转发与付费测试，付费部分只使用本地测试代币">
+        {status ? <input type="checkbox" role="switch" className="switch" aria-label="文件传输实验" checked={status.enabled} disabled={!delivery.canManage || delivery.busy !== null} onChange={(event) => {
+          void delivery.configure({ enabled: event.target.checked, charity_enabled: status.charity_enabled, paid_enabled: status.paid_enabled })
+        }} /> : <span role="status">正在读取设置</span>}
+      </SettingsRow>
+      <SettingsRow icon={ArrowRightLeft} label="发送、接收和传输记录" description="关闭后仍可查看记录、保存已收到的文件">
+        <Button asChild size="sm" variant="outline"><Link to="/settings/lab/transfers">打开文件传输</Link></Button>
       </SettingsRow>
     </SettingsGroup>
-    <SettingsGroup title="当前实验" footer="实验功能可能只支持本地测试链，不代表正式付款或生产服务。">
-      <SettingsRow icon={ArrowRightLeft} label="付费传输（本地测试）" description={experiments ? '已在文件传输页面显示' : '开启实验功能后显示'}>
-        {experiments ? <Button asChild type="button" size="sm" variant="outline"><Link to="/transfers">打开</Link></Button> : <span>已关闭</span>}
-      </SettingsRow>
-      <SettingsRow icon={ShieldAlert} label="实验边界" description="付费传输仍受设备权限和本地测试链设置控制" />
-    </SettingsGroup>
+    {status && !delivery.canManage ? <p className="text-meta text-muted-foreground">只有管理设备能更改实验设置。</p> : null}
+    {delivery.orders.some(needsRefresh) ? <p className="text-meta text-warning">还有未完成的传输。关闭会暂停处理，付费订单仍按原截止时间结算。重新开启后可继续检查原订单。</p> : null}
   </div>
 }

@@ -2,6 +2,8 @@
 
 VDP-1 为本人文件增加独立的免费传输和付费传输。传输默认关闭。节点发现不收费，不需要钱包，也不授予个人网络成员权限。普通会话同步和附件仍使用原来的私人网络协议。
 
+网页从“设置 → 实验室”进入，独立的免费与付费传输页面位于 `/settings/lab/transfers`，页面代码集中在 `crates/node/web/src/features/lab/`。实验室的“文件传输实验”开关对应当前连接 Node 的 `enabled`，需要管理成员权限。开启只恢复原免费/付费方式配置，不自动开启付费、创建钱包或发起链上密钥注册。关闭暂停传输和中转，订单、旧密钥与已保存文件保留；历史记录和具备读取条件的文件仍可查看。未完成订单需重新开启相应服务后继续，原链交易与截止时间不会撤销。移动端仍沿用原实验显示开关和传输页面。
+
 当前付费实现只接受字面回环 HTTP 地址上的 `chain_id=31337` 测试链。仓库提供 `TestToken`，不接入真实 USDT、主网、法币或平台币。此实验不提供长期存储证明。
 
 ## 角色与信任
@@ -139,4 +141,4 @@ vibeface wallet --data-dir <目录> revoke-key --intent-id <UUID> --gas-cap <原
 
 规范 ABI 为 [`crates/delivery/abi/Statement.sol`](../crates/delivery/abi/Statement.sol)，Rust 关系和字节约定见 [领域 API](../crates/delivery/API.md)。规范构建与真实证明入口见 [proof 构建说明](../proofs/delivery/README.md)。合约、只读结算观察器和本地部署工具见 [合约说明](../contracts/delivery/README.md)。
 
-`deploy-local.mjs` 只在字面回环地址启动独立测试链，部署正常 escrow、固定 verifier 和 TestToken，输出公开配置，不输出私钥。完整 Node 验收使用 [e2e 的付费模式](e2e.md#验证付费交付和实际结算)，在同一受限 Linux 环境生成真实证明、完成双窗口结算并只读复核原链。缺失真实 fixtures 必须使 proof gate 失败，不能换成 always-true verifier 或旧 image 的证明。
+`deploy-local.mjs` 只在字面回环地址启动独立测试链，部署正常 escrow、固定 verifier 和 TestToken，输出公开配置，不输出私钥。完整 Node 验收使用 [e2e 的付费模式](e2e.md#验证付费交付和实际结算)，在同一受限 Linux 环境生成真实证明、完成双窗口结算并只读复核原链。当前核心 CI 在整个 fixture 目录缺失时会跳过 receipt 验证并成功退出，这属于未完成的 proof 验收，不能用绿色 CI、always-true verifier 或其他 image 的证明替代。实际跳过范围见 [CI 说明](ci.md#可验证交付的核心检查)。

@@ -15,12 +15,12 @@ import { Route as JoinRouteImport } from './routes/join'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppInboxRouteImport } from './routes/_app/inbox'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
-import { Route as AppTransfersRouteImport } from './routes/_app/transfers'
 import { Route as AppBBotIdRouteImport } from './routes/_app/b.$botId'
 import { Route as AppDevicesIndexRouteImport } from './routes/_app/devices.index'
 import { Route as AppDevicesDeviceIdRouteImport } from './routes/_app/devices.$deviceId'
 import { Route as AppSettingsLabRouteImport } from './routes/_app/settings_.lab'
 import { Route as AppSettingsLogsRouteImport } from './routes/_app/settings_.logs'
+import { Route as AppSettingsLabTransfersRouteImport } from './routes/_app/settings_.lab_.transfers'
 import { Route as AppBBotIdWorkWorkIdRouteImport } from './routes/_app/b.$botId.work.$workId'
 
 const AppRoute = AppRouteImport.update({
@@ -52,11 +52,6 @@ const AppSettingsRoute = AppSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => AppRoute,
 } as any)
-const AppTransfersRoute = AppTransfersRouteImport.update({
-  id: '/transfers',
-  path: '/transfers',
-  getParentRoute: () => AppRoute,
-} as any)
 const AppBBotIdRoute = AppBBotIdRouteImport.update({
   id: '/b/$botId',
   path: '/b/$botId',
@@ -82,6 +77,11 @@ const AppSettingsLogsRoute = AppSettingsLogsRouteImport.update({
   path: '/settings/logs',
   getParentRoute: () => AppRoute,
 } as any)
+const AppSettingsLabTransfersRoute = AppSettingsLabTransfersRouteImport.update({
+  id: '/settings_/lab_/transfers',
+  path: '/settings/lab/transfers',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppBBotIdWorkWorkIdRoute = AppBBotIdWorkWorkIdRouteImport.update({
   id: '/work/$workId',
   path: '/work/$workId',
@@ -94,12 +94,12 @@ export interface FileRoutesByFullPath {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
-  '/transfers': typeof AppTransfersRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/devices/': typeof AppDevicesIndexRoute
+  '/settings/lab/transfers': typeof AppSettingsLabTransfersRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesByTo {
@@ -107,13 +107,13 @@ export interface FileRoutesByTo {
   '/join': typeof JoinRoute
   '/inbox': typeof AppInboxRoute
   '/settings': typeof AppSettingsRoute
-  '/transfers': typeof AppTransfersRoute
   '/': typeof AppIndexRoute
   '/b/$botId': typeof AppBBotIdRouteWithChildren
   '/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/settings/lab': typeof AppSettingsLabRoute
   '/settings/logs': typeof AppSettingsLogsRoute
   '/devices': typeof AppDevicesIndexRoute
+  '/settings/lab/transfers': typeof AppSettingsLabTransfersRoute
   '/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRoutesById {
@@ -123,13 +123,13 @@ export interface FileRoutesById {
   '/join': typeof JoinRoute
   '/_app/inbox': typeof AppInboxRoute
   '/_app/settings': typeof AppSettingsRoute
-  '/_app/transfers': typeof AppTransfersRoute
   '/_app/': typeof AppIndexRoute
   '/_app/b/$botId': typeof AppBBotIdRouteWithChildren
   '/_app/devices/$deviceId': typeof AppDevicesDeviceIdRoute
   '/_app/settings_/lab': typeof AppSettingsLabRoute
   '/_app/settings_/logs': typeof AppSettingsLogsRoute
   '/_app/devices/': typeof AppDevicesIndexRoute
+  '/_app/settings_/lab_/transfers': typeof AppSettingsLabTransfersRoute
   '/_app/b/$botId/work/$workId': typeof AppBBotIdWorkWorkIdRoute
 }
 export interface FileRouteTypes {
@@ -140,12 +140,12 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
-    | '/transfers'
     | '/b/$botId'
     | '/devices/$deviceId'
     | '/settings/lab'
     | '/settings/logs'
     | '/devices/'
+    | '/settings/lab/transfers'
     | '/b/$botId/work/$workId'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -153,13 +153,13 @@ export interface FileRouteTypes {
     | '/join'
     | '/inbox'
     | '/settings'
-    | '/transfers'
     | '/'
     | '/b/$botId'
     | '/devices/$deviceId'
     | '/settings/lab'
     | '/settings/logs'
     | '/devices'
+    | '/settings/lab/transfers'
     | '/b/$botId/work/$workId'
   id:
     | '__root__'
@@ -168,13 +168,13 @@ export interface FileRouteTypes {
     | '/join'
     | '/_app/inbox'
     | '/_app/settings'
-    | '/_app/transfers'
     | '/_app/'
     | '/_app/b/$botId'
     | '/_app/devices/$deviceId'
     | '/_app/settings_/lab'
     | '/_app/settings_/logs'
     | '/_app/devices/'
+    | '/_app/settings_/lab_/transfers'
     | '/_app/b/$botId/work/$workId'
   fileRoutesById: FileRoutesById
 }
@@ -228,13 +228,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsRouteImport
       parentRoute: typeof AppRoute
     }
-    '/_app/transfers': {
-      id: '/_app/transfers'
-      path: '/transfers'
-      fullPath: '/transfers'
-      preLoaderRoute: typeof AppTransfersRouteImport
-      parentRoute: typeof AppRoute
-    }
     '/_app/b/$botId': {
       id: '/_app/b/$botId'
       path: '/b/$botId'
@@ -270,6 +263,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppSettingsLogsRouteImport
       parentRoute: typeof AppRoute
     }
+    '/_app/settings_/lab_/transfers': {
+      id: '/_app/settings_/lab_/transfers'
+      path: '/settings/lab/transfers'
+      fullPath: '/settings/lab/transfers'
+      preLoaderRoute: typeof AppSettingsLabTransfersRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/_app/b/$botId/work/$workId': {
       id: '/_app/b/$botId/work/$workId'
       path: '/work/$workId'
@@ -295,25 +295,25 @@ const AppBBotIdRouteWithChildren = AppBBotIdRoute._addFileChildren(
 interface AppRouteChildren {
   AppInboxRoute: typeof AppInboxRoute
   AppSettingsRoute: typeof AppSettingsRoute
-  AppTransfersRoute: typeof AppTransfersRoute
   AppIndexRoute: typeof AppIndexRoute
   AppBBotIdRoute: typeof AppBBotIdRouteWithChildren
   AppDevicesDeviceIdRoute: typeof AppDevicesDeviceIdRoute
   AppSettingsLabRoute: typeof AppSettingsLabRoute
   AppSettingsLogsRoute: typeof AppSettingsLogsRoute
   AppDevicesIndexRoute: typeof AppDevicesIndexRoute
+  AppSettingsLabTransfersRoute: typeof AppSettingsLabTransfersRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppInboxRoute: AppInboxRoute,
   AppSettingsRoute: AppSettingsRoute,
-  AppTransfersRoute: AppTransfersRoute,
   AppIndexRoute: AppIndexRoute,
   AppBBotIdRoute: AppBBotIdRouteWithChildren,
   AppDevicesDeviceIdRoute: AppDevicesDeviceIdRoute,
   AppSettingsLabRoute: AppSettingsLabRoute,
   AppSettingsLogsRoute: AppSettingsLogsRoute,
   AppDevicesIndexRoute: AppDevicesIndexRoute,
+  AppSettingsLabTransfersRoute: AppSettingsLabTransfersRoute,
 }
 
 const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)

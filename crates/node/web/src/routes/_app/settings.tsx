@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { ArrowRightLeft, Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
@@ -51,9 +51,6 @@ function SettingsPage() {
       </SettingsRow>
     </SettingsGroup>
     <SettingsGroup title="连接"><ConnectionSettings /></SettingsGroup>
-    <SettingsGroup title="文件传输">
-      <Link to="/transfers" className="interactive-row block"><SettingsRow icon={ArrowRightLeft} label="发送和接收文件"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow></Link>
-    </SettingsGroup>
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回">
       <CurrentRecoveryFile />
       <PhoneRecovery />
@@ -61,7 +58,7 @@ function SettingsPage() {
     </SettingsGroup> : null}
     <SettingsGroup title="高级">
       <Link to="/settings/lab" className="interactive-row block">
-        <SettingsRow icon={FlaskConical} label="实验室" description="付费传输等测试功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
+        <SettingsRow icon={FlaskConical} label="实验室" description="开启或关闭文件传输等试用功能"><ChevronRight aria-hidden="true" className="size-4" /></SettingsRow>
       </Link>
     </SettingsGroup>
     {operator ? <SettingsGroup title="问题排查" footer="诊断包不含登录信息和加入链接">
