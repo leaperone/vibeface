@@ -843,7 +843,7 @@ const parityShared = () => ({
   generation: 1, isCurrent: () => true, synced: true, connectionOnline: true, conversationId: 'chat', data: paritySnapshot(context),
   bots: [parityBot], selectedBot: parityBot, nodes: [parityNode], openWorks: [{ ...parityWork(), conversation_id: 'chat' }],
   overview: workspaceModel.parseWorkspaceOverview({}), questions: [] as ReturnType<typeof parseConversation>['questions'], answered: {} as Record<string, string>, liveProgress: [], writable: true,
-  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], messagePending: null, messageBusy: false,
+  writeState: { state: 'writable' as const, conflicts: [] }, notifications: [], ignoredNotifications: new Set<string>(), messagePending: null, messageBusy: false,
   setView(_view: string) {}, selectBot: async (_bot: typeof parityBot) => {}, interruptWork: async (_work: string) => {}, sendMessage: async () => true,
 })
 
