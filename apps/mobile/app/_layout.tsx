@@ -78,6 +78,7 @@ function Screens() {
             <Stack.Screen name="b/[botId]" options={{ title: '', ...root }} />
             <Stack.Screen name="b/[botId]/about" options={{ title: '' }} />
             <Stack.Screen name="b/[botId]/work/[workId]" options={{ title: '任务' }} />
+            <Stack.Screen name="tasks" options={{ title: '任务', ...root }} />
             <Stack.Screen name="new-bot" options={{ title: '新 Bot', presentation: 'modal', headerLeft: Close }} />
             {/* Opened from the new bot sheet it is a sheet too, with no back button of its own. */}
             <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />

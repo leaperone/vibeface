@@ -1334,6 +1334,11 @@ impl Store {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
     }
 
+    /// All local scheduler rows for bounded, read-only workspace projections.
+    pub fn scheduler_jobs_all(&self) -> Result<Vec<SchedulerJob>> {
+        query_jobs(&self.connection, "1", [])
+    }
+
     /// Each busy conversation on this device; a reply running outranks messages still waiting.
     pub fn busy_conversations(&self) -> Result<std::collections::BTreeMap<String, Busy>> {
         let mut statement = self.connection.prepare(
