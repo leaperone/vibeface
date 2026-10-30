@@ -86,7 +86,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
-  /** Replies of the open chat that were unread when it came on screen, by event hash; the chat marks where they start. */
+  /**
+   * What was on the open chat when it came on screen: its unread replies by event hash and its questions as `question:<id>`.
+   * The chat marks where the unread ones start; a question asked while the chat is open is seen as it arrives.
+   */
   const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set<string>())
   /** The chat on screen and the connection it was read over; another connection is another visit. */
   const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
@@ -189,7 +192,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
     else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
       onScreen.current = { id, connection }
-      setFresh(new Set(notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id)))
+      setFresh(new Set([...notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id), ...next.questions.map((question) => `question:${question.question_id}`)]))
     }
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
@@ -355,6 +358,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (state === "superseded" && current()) setNoticeText(faceSuperseded)
       return state !== "unsent"
     }
+    // Only what still wants the person is listed, so a missing one is closed or answered either way.
+    if (item.method === "dismiss_work") return !parseOpenWorks(await connection.rpc("open_works")).some((work) => work.work_id === item.params.work_id)
     if (item.method === "answer") return !parseQuestions(await connection.rpc("questions")).some((question) => question.question_id === item.params.question_id)
     const id = String(item.params.conversation_id)
     const context = parseConversation(await connection.rpc("conversation", { conversation_id: id }), id)
@@ -697,6 +702,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       requireCurrent()
       setNoticeText(`已换到 ${nodes.find((node) => node.device_id === scheduler)?.name || "另一台电脑"}`)
       if (activeId.current === id) await refreshRef.current()
+    }),
+    /** Closes a failed task in 待处理 on every device; a retry of the same close writes nothing more. */
+    dismissWork: (conversationId: string, workId: string) => withMutation(`dismiss:${workId}`, async () => {
+      const attestation = await attest(conversationId, { type: "notification_acked", notification_id: workId, client_id: "inbox" })
+      await signedWrite("dismiss", workId, "dismiss_work", { conversation_id: conversationId, work_id: workId, attestation })
+      requireCurrent()
+      openWorksRef.current = openWorksRef.current.filter((item) => item.work_id !== workId)
+      setOpenWorks(openWorksRef.current)
+      if (viewRef.current === "tasks") scheduleRefresh()
     }),
     interruptWork: (workId: string) => withMutation(`work-control:${workId}`, async () => {
       const id = activeId.current, context = requireBotContext(id)

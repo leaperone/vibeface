@@ -39,9 +39,9 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
 test('a failed task waits in 待处理 under its bot until something follows it up', () => {
   const failed = source(false)
   const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'pc', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
-  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }]
+  failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
   failed.workspace.bots = [{ bot_id: 'b', conversation_id: 'c', name: '助手' } as never]
-  assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', '助手']])
+  assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', '助手'], ['failed:w3', '任务没有完成', '助手']], 'a refused dispatch waits like a failure')
 })
 
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {

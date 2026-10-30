@@ -834,7 +834,7 @@ impl Runtime {
                 shown.extend(if include_finished {
                     works.clone()
                 } else {
-                    crate::store::unsettled(works.clone())
+                    store.open_works(network, Some(&conversation.conversation_id))?
                 });
                 all.extend(works);
                 Ok::<_, anyhow::Error>((all, shown))
@@ -854,9 +854,21 @@ impl Runtime {
                     && scope_filter.is_none_or(|scope| scope == dispatch.spec.conversation)
             })
             .collect::<Vec<_>>();
+        // A refusal the user closed or the bot answered is finished like a failed work.
+        let open_refusals: BTreeSet<_> = store
+            .open_dispatches(network, None)?
+            .into_iter()
+            .map(|dispatch| dispatch.spec.work_id)
+            .collect();
         let mut deliveries = Vec::new();
         for dispatch in &dispatches {
             let spec = &dispatch.spec;
+            if !include_finished
+                && matches!(dispatch.state, crate::work::DispatchState::Rejected { .. })
+                && !open_refusals.contains(&spec.work_id)
+            {
+                continue;
+            }
             let state = dispatch.state.name();
             let waiting_sync = dispatch.state == crate::work::DispatchState::Accepted
                 && !work_ids.contains(spec.work_id.as_str());
@@ -1281,7 +1293,8 @@ impl Runtime {
             "conversation" => self.conversation_snapshot(&access, &input).await,
             "open_works" => {
                 ensure!(access.human, "only clients list open works");
-                Ok(json!({"works":self.store.lock().await.open_works(network)?}))
+                let store = self.store.lock().await;
+                Ok(json!({"works":chat_controls::open_works(&store, network, None)?}))
             }
             "workspace_overview" => self.workspace_overview(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
@@ -1317,6 +1330,30 @@ impl Runtime {
             "notifications" => Ok(
                 json!({"notifications":self.store.lock().await.pending_notifications(network,field(&input,"client_id")?)?}),
             ),
+            "dismiss_work" => {
+                ensure!(access.human, "only clients close failed works");
+                let scope = scope.context("conversation_id is required")?;
+                let work_id = id(&input, "work_id")?;
+                let failed = {
+                    let store = self.store.lock().await;
+                    if store.closed_in_inbox(network, &work_id)? {
+                        return Ok(json!({"dismissed":true}));
+                    }
+                    store.failed_work(network, &scope, &work_id)?
+                };
+                ensure!(failed, "这个任务没有失败，不用关掉");
+                self.append(
+                    network,
+                    &scope,
+                    EventBody::NotificationAcked {
+                        notification_id: work_id,
+                        client_id: INBOX_CLIENT.into(),
+                        attestation: Some(attestation(&input)?),
+                    },
+                )
+                .await?;
+                Ok(json!({"dismissed":true}))
+            }
             "ack" => {
                 ensure!(access.human, "only clients acknowledge notifications");
                 let notification = id(&input, "notification_id")?;

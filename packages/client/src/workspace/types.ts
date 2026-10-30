@@ -112,6 +112,8 @@ export type ConversationRecords = {
   jobs: ManagerJob[]
   unanswered: string[]
   sent: SentBotMessage[]
+  /** The conversation's works that want the person, as the Node lists them now; replaces its share of `open_works`. */
+  open_works: OpenWork[]
 }
 /**
  * What only the person can settle; nothing is resent.

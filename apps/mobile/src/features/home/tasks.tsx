@@ -5,7 +5,8 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
@@ -32,6 +33,9 @@ export function TasksScreen() {
   const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview) : works
   const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
   const bot = workspace.bots[0]
+  const held = new Set((shared?.questions ?? []).filter((question) => awaitsAnswer(question, shared?.answered ?? {}) && question.about.request_id).map((question) => question.about.session_id))
+  const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
+  for (const work of visibleWorks) groups[taskGroup(cardState(work, lookup.nodes, projected.get(work.work_id)?.state), held.has(work.thread_id ?? ''))].push(work)
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
@@ -39,10 +43,10 @@ export function TasksScreen() {
         <Skeleton className="size-8 rounded-lg" />
         <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-2/3 rounded-full" /><Skeleton className="h-3 w-1/2 rounded-full" /></View>
       </View>)}
-    </View> : visibleWorks.length ? <View className="gap-2">{visibleWorks.map((work) => {
-      const bot = workspace.bots.find((item) => item.conversation_id === work.conversation_id)
-      return <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={bot} lookup={lookup} connected={Boolean(shared?.connectionOnline)} />
-    })}</View> : <MobileEmpty bot={bot} />}
+    </View> : visibleWorks.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
+      <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
+      {groups[group].map((work) => <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline)} />)}
+    </View> : null) : <MobileEmpty bot={bot} />}
   </ScrollView>
 }
 
@@ -54,9 +58,8 @@ type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['dire
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
 function TaskRow({ work, projected, bot, lookup, connected }: { work: OpenWork; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean }) {
-  // The overview names a failed work only as finished; its outcome says how.
-  const rawState = work.outcome === 'failed' || work.outcome === 'rejected' ? work.outcome : projected?.state ?? shownState(work, lookup.nodes)
-  const failed = ['failed', 'rejected', 'dispatch_rejected'].includes(rawState)
+  const rawState = cardState(work, lookup.nodes, projected?.state)
+  const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
   const stale = taskStale(rawState, connected)
   const state = stale ? staleTaskLabel : taskLabel(rawState)
   const active = taskActive(rawState) && !stale

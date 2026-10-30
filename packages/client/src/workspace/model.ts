@@ -2,7 +2,7 @@ import type { Attachment, TranscriptMessage } from "../chat/types.ts"
 import type { ReplyStatus } from "../chat/types.ts"
 import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
-  SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
+  SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
 } from "./types.ts"
@@ -104,9 +104,10 @@ function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
     remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
   }
 }
-function workState(value: unknown): WorkState {
+function workState(value: unknown): WorkState | DispatchState {
   switch (value) {
-    case "accepted": case "running": case "interrupting": case "finished": case "unverified": return value
+    case "accepted": case "running": case "interrupting": case "finished": case "unverified":
+    case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": return value
     default: throw new Error("任务状态无法识别。")
   }
 }
@@ -207,8 +208,9 @@ export function workChecks(works: readonly OpenWork[], nodes: readonly NodeInfo[
     return [{ kind: "device", check_id: key!, detail: "", target_node: check.target_node, reason: check.reason as "offline" | "disconnected", works: same }]
   })
 }
+const openWork = (item: unknown): OpenWork => ({ ...work(item), conversation_id: text(record(item).conversation_id) })
 export function parseOpenWorks(value: unknown): OpenWork[] {
-  return list(record(value).works).map((item) => ({ ...work(item), conversation_id: text(record(item).conversation_id) }))
+  return list(record(value).works).map(openWork)
 }
 
 export type WorkspaceOverviewInput = {
@@ -534,7 +536,7 @@ export function parseRecords(value: unknown): ConversationRecords {
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
-    sent: list(data.sent).map(sentBotMessage),
+    sent: list(data.sent).map(sentBotMessage), open_works: list(data.open_works).map(openWork),
   }
 }
 export function parseConversation(value: unknown, expectedId?: string): ConversationPayload {

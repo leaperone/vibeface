@@ -11,7 +11,7 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
-import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from "@vibeface/client/workspace/labels.ts"
+import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
@@ -20,7 +20,6 @@ import { ConfirmCard } from "./task-activity"
 import { QuestionCard } from "./question-card"
 import { useCreateBot } from "./workspace-shell"
 
-type TaskGroup = "attention" | "working" | "waiting"
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
 
 const stateTone = (state: string): Tone => state === "failed" || state === "dispatch_rejected" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified", "unknown", "accepted_waiting_sync", "dispatch_unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
@@ -48,7 +47,7 @@ export function TasksOverview() {
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
   const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
-  for (const work of tasks) groups[taskGroup(work, workspace.nodes, waitingSessions, projected.get(work.work_id))].push(work)
+  for (const work of tasks) groups[taskGroup(cardState(work, workspace.nodes, projected.get(work.work_id)?.state), waitingSessions.has(work.thread_id ?? ""))].push(work)
   const noticed = attention.length + groups.attention.length
   const hasContent = noticed > 0 || groups.working.length > 0 || groups.waiting.length > 0
   const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />
@@ -57,12 +56,13 @@ export function TasksOverview() {
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${attention.length + tasks.length} 项任务` : "没有未完成的任务"}</p>
-    {noticed ? <OverviewSection title="需要留意" count={noticed}>
-      {attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>)}
-      {groups.attention.map(card)}
-    </OverviewSection> : null}
-    {groups.working.length ? <OverviewSection title="进行中" count={groups.working.length}>{groups.working.map(card)}</OverviewSection> : null}
-    {groups.waiting.length ? <OverviewSection title="等待中" count={groups.waiting.length}>{groups.waiting.map(card)}</OverviewSection> : null}
+    {taskGroups.map(({ group, title }) => {
+      const count = group === "attention" ? noticed : groups[group].length
+      return count ? <OverviewSection key={group} title={title} count={count}>
+        {group === "attention" ? attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
+        {groups[group].map(card)}
+      </OverviewSection> : null
+    })}
     {!hasContent ? <WorkspaceEmpty bot={bot} onCreate={createBot} /> : null}
   </div>
 }
@@ -70,16 +70,6 @@ export function TasksOverview() {
 function WorkspaceEmpty({ bot, onCreate }: { bot?: { bot_id: string; name: string }; onCreate: () => void }) {
   return <EmptyState icon={ListChecks} title="没有未完成的任务" action={bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}><MessageCircle aria-hidden="true" />打开 {bot.name}</Link></Button> : <Button type="button" onClick={onCreate}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
-
-/** A task that failed or was never taken needs the person; one still out of their hands waits or works. */
-function taskGroup(work: OpenWork, nodes: NodeInfo[], waitingSessions: ReadonlySet<string>, projected?: ProjectedWork): TaskGroup {
-  const state = cardState(work, nodes, projected)
-  if (needsLook(state)) return "attention"
-  return state === "unverified" || state === "awaiting_confirmation" || waitingSessions.has(work.thread_id ?? "") || !taskActive(state) ? "waiting" : "working"
-}
-// The overview names a failed work only as finished; its outcome says how.
-const cardState = (work: OpenWork, nodes: NodeInfo[], projected?: ProjectedWork) => work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected?.state ?? shownState(work, nodes)
-const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
 
 function OverviewSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
   return <section className="grid gap-3" aria-labelledby={`tasks-${title}`}>
@@ -89,7 +79,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
 }
 
 function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean }) {
-  const state = cardState(work, lookup.nodes, projected)
+  const state = cardState(work, lookup.nodes, projected?.state)
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
   const label = stale || state === "unknown" ? staleTaskLabel : taskLabel(state)

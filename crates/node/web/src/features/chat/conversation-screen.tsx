@@ -171,8 +171,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <><CircleStop aria-hidden="true" className="size-4" />正在停止…</>
     : <>{bot ? <BotFace bot={bot} mood={workspace.connectionOnline ? 'thinking' : 'asleep'} size={24} /> : null}{status ? progressLabel(status) : '思考中'}</>}</p> })
   entries.push(...waiting)
-  // The replies and questions this chat's badge counted start under 新消息.
-  const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true)
+  // The replies and questions this chat's badge counted when it came on screen start under 新消息.
+  const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true && workspace.fresh.has(aside.key))
   const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
   if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-meta text-primary before:h-px before:flex-1 before:bg-primary/40 after:h-px after:flex-1 after:bg-primary/40">新消息</p> })
 

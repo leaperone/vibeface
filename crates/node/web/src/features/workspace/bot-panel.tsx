@@ -1,9 +1,10 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { useNavigate } from "@tanstack/react-router"
 import { AlarmClock, BookOpen, Check, ChevronDown, CirclePause, Cpu, FolderOpen, Laptop, MessageCircle, MessagesSquare, NotebookPen, Pause, Play, Repeat, Server, Trash2, WifiOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
 import { EmptyState, SettingsGroup, SettingsRow, toast } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { terms } from "@/lib/glossary"
@@ -26,6 +27,10 @@ import type { ScheduleView } from "@vibeface/client/workspace/types.ts"
 type Gap = { conversation_id: string; schedule: ScheduleView; index: number }
 const GAP_MS = 4000
 
+// The one title button on screen; a schedule card in the chat opens its panel on that schedule.
+let showSchedule: ((id: string) => void) | null = null
+export const openSchedule = (id: string) => showSchedule?.(id)
+
 /** The chat route's title: the bot's avatar and name as one button that opens a view of the bot where its face can be picked, schedules paused, resumed or deleted and the bot itself deleted (docs/design/bot-config.md section 5). */
 export function BotPanelButton() {
   const workspace = useWorkspace()
@@ -40,6 +45,9 @@ export function BotPanelButton() {
   const [confirming, setConfirming] = useState<string | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [contextOpen, setContextOpen] = useState(false)
+  const [shownSchedule, setShownSchedule] = useState<string | null>(null)
+  useEffect(() => { showSchedule = (id) => { order.current = []; setShownSchedule(id); setOpen(true) }; return () => { showSchedule = null } }, [])
+  useEffect(() => { if (open && shownSchedule) requestAnimationFrame(() => document.getElementById(`schedule-${shownSchedule}`)?.scrollIntoView({ block: "center" })) }, [open, shownSchedule])
   // 去聊天里说 closes the panel onto the composer instead of the title button that opened it.
   const toComposer = useRef(false)
   const navigate = useNavigate()
@@ -86,7 +94,7 @@ export function BotPanelButton() {
       <span className="min-w-0 truncate">{bot.name}</span>
       <ChevronDown aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
     </button>
-    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setConfirming(null); setDeleting(false); setContextOpen(false) }}>
+    <Sheet open={open && Boolean(view)} onOpenChange={(next) => { setOpen(next); setShownSchedule(null); setConfirming(null); setDeleting(false); setContextOpen(false) }}>
       <SheetContent className="!w-full max-sm:!border-l-0 gap-0 overflow-y-auto bg-sidebar sm:!max-w-md" onCloseAutoFocus={(event) => {
         if (!toComposer.current) return
         toComposer.current = false
@@ -140,7 +148,7 @@ export function BotPanelButton() {
               const detail = scheduleDetail(schedule)
               const name = detail ? schedule.name : schedule.prompt
               if (deleted) return <SettingsRow key={schedule.schedule_id} icon={Trash2} className="text-muted-foreground" label={<span role="status"><span className="line-through">{schedule.name}</span> 已删除</span>} />
-              return <SettingsRow key={schedule.schedule_id} icon={once ? AlarmClock : Repeat} className={schedule.enabled ? undefined : "text-muted-foreground"}
+              return <SettingsRow key={schedule.schedule_id} id={`schedule-${schedule.schedule_id}`} icon={once ? AlarmClock : Repeat} className={cn(!schedule.enabled && "text-muted-foreground", shownSchedule === schedule.schedule_id && "bg-brand/10")}
                 label={<span title={name}>{name}</span>}
                 description={<span className="flex flex-wrap items-center gap-x-1.5 tabular-nums">
                   {!schedule.enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-3.5" />已暂停</span>

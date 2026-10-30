@@ -204,6 +204,7 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `read_artifact` | `conversation_id`、`blob_hash`、可选 `offset`、`limit`、`binary` | 分页读取该会话实际引用的附件 |
 | `notifications` | `client_id` | 该客户端尚未确认的通知 |
 | `ack` | `notification_id`、`client_id`、`attestation` | 写入 `NotificationAcked` |
+| `dismiss_work` | `conversation_id`、`work_id`、`attestation` | 本人从待处理关掉一个失败、被拒或未接收的工作：在该会话写 `NotificationAcked { notification_id: work_id, client_id: "inbox" }`（签名事件体 `{"type":"notification_acked", notification_id, client_id}`），不建表；已关掉时不写，重试只读回。工作没有失败时拒绝。返回 `{ dismissed: true }` |
 
 `bot_id`、`message_id`、`conversation_id` 和 `call_ref` 标识业务写入。重试保留原身份和内容，同 ID 换内容会被拒绝。协调 Agent 的 token 只能调用 `nodes`。
 
@@ -469,7 +470,7 @@ VDP-1 服务默认关闭，与私人 DAG、附件同步和 Agent 工作分开。
 
 ## 通知和自动后续
 
-加密通道推送 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress`、`write_state` 与失效提醒。本机签名成员目录有变化时（加入、撤销、自行离开、权限变化或同步合并来的新事件），Node 推送一条不带会话的 `changed`，客户端据此重读 `directory`。本机持有的加入请求被提交、揭示随机数、批准、拒绝或撤回时，Node 推送同样不带内容的 `changed`，不含 `join_id` 或状态；管理设备重读 `join_status`，其他成员只重读 `directory`。保存请求的 Node 同时向同步未失败的其他成员 Node 发 `join_changed`，它们各自向本机客户端推送同样的 `changed`，所以连在任何一台 Node 上的管理设备都能立即重读到另一台 Node 持有的请求（`join_status` 不带 `join_id` 时经 `pending_joins` 汇总）。通知只发一次，不重试；当时连不上的 Node 在同步恢复时会推送 `changed`，客户端届时重读。加入请求按 Node 时钟过期，不推送；列表里每条请求都带保存它的 Node 给出的 `expires_at_ms`，客户端在最早的到期时间之后重读，仍未过期就每 5 秒再读，直到它消失。客户端读取 `notifications`，用稳定 `client_id` 确认 `notification_id`，不同浏览器各自确认。
+加密通道推送 `{ "type": "changed", "payload": ... }`。payload 区分历史变更、`manager_progress`、`native_progress`、`write_state` 与失效提醒。本机签名成员目录有变化时（加入、撤销、自行离开、权限变化或同步合并来的新事件），Node 推送一条不带会话的 `changed`，客户端据此重读 `directory`。本机持有的加入请求被提交、揭示随机数、批准、拒绝或撤回时，Node 推送同样不带内容的 `changed`，不含 `join_id` 或状态；管理设备重读 `join_status`，其他成员只重读 `directory`。保存请求的 Node 同时向同步未失败的其他成员 Node 发 `join_changed`，它们各自向本机客户端推送同样的 `changed`，所以连在任何一台 Node 上的管理设备都能立即重读到另一台 Node 持有的请求（`join_status` 不带 `join_id` 时经 `pending_joins` 汇总）。通知只发一次，不重试；当时连不上的 Node 在同步恢复时会推送 `changed`，客户端届时重读。加入请求按 Node 时钟过期，不推送；列表里每条请求都带保存它的 Node 给出的 `expires_at_ms`，客户端在最早的到期时间之后重读，仍未过期就每 5 秒再读，直到它消失。客户端读取 `notifications`，用稳定 `client_id` 确认 `notification_id`，不同浏览器各自确认。会话的历史变更带 `open_works`：Node 现算的该会话仍要本人看的工作，客户端用它整体替换这个会话在任务和待处理里的部分，不自己按到达顺序推断；跨设备同步晚到的旧工作因此不会让后来的失败消失。
 
 管理进度包含 `conversation_id`、`trigger`、`invocation_id`、`source_node`、递增 `sequence` 和 `progress`，`progress.type` 为 `text_delta`、`text_snapshot`、`status` 或 `tool`。原生进度包含 `conversation_id`、`work_id`、`target_node`、`sequence` 和 `progress`。临时进度不写入事件日志。客户端读取 `conversation` 时，入口为该会话建立有界的只读观察，经 `progress_read` 从负责人和执行节点读取进度。回合状态变化时，该设备在进度环里放一条只在环内的 `job_changed` 提示，观察方收到后让客户端重读会话；它不进事件日志，也不推给本机客户端。
 

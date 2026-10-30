@@ -6875,44 +6875,230 @@ fn the_prompt_never_carries_the_users_device_signature() -> Result<()> {
     Ok(())
 }
 
+/// Only what wants the user is read, however long the history: a failure stays until a later
+/// work ends, a completed bot reply follows it or the user closes it, and a refusal leaves the
+/// same way once the bot answered its report.
 #[test]
-fn a_failure_wants_the_user_until_a_later_work_of_its_conversation_ends() -> Result<()> {
-    let work = |id: &str, outcome: Value| -> Result<WorkProjection> {
-        Ok(serde_json::from_value(json!({
-            "work_id":id, "conversation_id":"c", "target_node":"b", "trigger":"message:m", "dispatcher":"a",
-            "kind":"task", "cwd":"/w", "title":"", "prompt":"", "call_ref":id, "continues":null, "parent":null,
-            "thread":null, "phase":null, "summary":"", "thread_id":null, "turn_id":null, "outcome":outcome,
-            "result_text":"", "failure_reason":null, "failure":null,
-            "state":if outcome.is_null() { "running" } else { "finished" },
-        }))?)
+fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
+    use crate::work::{Dispatch, DispatchState};
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m1",
+        "go",
+        vec![],
+        true,
+        signature(&net, "m1", "go")?,
+        2,
+    )?;
+    let local = net.a.device_id()?;
+    let mut at = 2;
+    let mut work = |store: &mut Store, id: &str, outcome: Option<WorkOutcome>| -> Result<()> {
+        at += 1;
+        let dispatched = EventBody::WorkDispatched {
+            work_id: id.into(),
+            trigger: message_trigger("m1"),
+            dispatcher: local.clone(),
+            call_ref: id.into(),
+            kind: WorkKind::Task,
+            cwd: "/w".into(),
+            title: id.into(),
+            prompt: "p".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+        };
+        store.append_event(&net.a, &net.network, "c", dispatched, vec![], at)?;
+        if let Some(outcome) = outcome {
+            let finished = EventBody::WorkFinished {
+                work_id: id.into(),
+                outcome,
+                result_text: String::new(),
+                failure_reason: None,
+                failure: None,
+                attestation: None,
+            };
+            store.append_event(&net.a, &net.network, "c", finished, vec![], at)?;
+        }
+        Ok(())
     };
-    let ids = |works: Vec<WorkProjection>| {
-        works
+    let open = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .open_works(&net.network, None)?
             .into_iter()
             .map(|work| work.work_id)
-            .collect::<Vec<_>>()
+            .collect())
     };
-    let failed = || work("w1", json!("failed"));
-    assert_eq!(ids(super::unsettled(vec![failed()?])), ["w1"]);
+    for n in 0..40 {
+        work(
+            &mut store,
+            &format!("done-{n}"),
+            Some(WorkOutcome::Completed),
+        )?;
+    }
+    work(&mut store, "failed", Some(WorkOutcome::Failed))?;
+    work(&mut store, "running", None)?;
+    assert_eq!(open(&store)?, ["failed", "running"]);
     assert_eq!(
-        ids(super::unsettled(vec![failed()?, work("w2", Value::Null)?])),
-        ["w1", "w2"],
-        "a work still running does not follow the failure up"
+        store.open_works(&net.network, Some("other"))?,
+        vec![],
+        "another conversation has none"
     );
+
+    let mut failed_reply = bot_reply("r0", "m1");
+    if let EventBody::MessagePosted { status, .. } = &mut failed_reply {
+        *status = Some(ReplyStatus::Failed);
+    }
+    store.append_event(&net.a, &net.network, "c", failed_reply, vec![], 50)?;
     assert_eq!(
-        ids(super::unsettled(vec![
-            failed()?,
-            work("w2", json!("completed"))?
-        ])),
-        Vec::<String>::new()
+        open(&store)?,
+        ["failed", "running"],
+        "a reply that failed follows nothing up"
     );
+    store.append_event(&net.a, &net.network, "c", bot_reply("r1", "m1"), vec![], 51)?;
     assert_eq!(
-        ids(super::unsettled(vec![
-            failed()?,
-            work("w2", json!("rejected"))?
-        ])),
-        ["w2"],
-        "only the newest failure stays"
+        open(&store)?,
+        ["failed", "running"],
+        "the dispatching turn's reply landed later without having seen it"
+    );
+    let report = super::scheduler::reply_message_id("c", &work_trigger("failed"), 0);
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        bot_reply(&report, "m1"),
+        vec![],
+        52,
+    )?;
+    assert_eq!(open(&store)?, ["running"], "the bot reported on it");
+
+    work(&mut store, "failed-4", Some(WorkOutcome::Failed))?;
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m2",
+        "retry",
+        vec![],
+        true,
+        signature(&net, "m2", "retry")?,
+        55,
+    )?;
+    assert_eq!(open(&store)?, ["running", "failed-4"]);
+    store.append_event(&net.a, &net.network, "c", bot_reply("r2", "m2"), vec![], 56)?;
+    assert_eq!(
+        open(&store)?,
+        ["running"],
+        "the bot answered a message written after it"
+    );
+
+    work(&mut store, "failed-2", Some(WorkOutcome::Rejected))?;
+    assert_eq!(open(&store)?, ["running", "failed-2"]);
+    let close = |work_id: &str| {
+        net.a.fixture_admin().attest(
+            &net.network,
+            "c",
+            EventBody::NotificationAcked {
+                notification_id: work_id.into(),
+                client_id: INBOX_CLIENT.into(),
+                attestation: None,
+            },
+        )
+    };
+    assert!(store.failed_work(&net.network, "c", "failed-2")?);
+    assert!(
+        !store.failed_work(&net.network, "c", "running")?,
+        "only a failure can be closed"
+    );
+    assert!(!store.failed_work(&net.network, "other", "failed-2")?);
+    assert!(!store.closed_in_inbox(&net.network, "failed-2")?);
+    store.append_event(&net.a, &net.network, "c", close("failed-2")?, vec![], 60)?;
+    assert!(store.closed_in_inbox(&net.network, "failed-2")?);
+    assert_eq!(open(&store)?, ["running"], "the user closed it");
+
+    work(&mut store, "failed-3", Some(WorkOutcome::Failed))?;
+    work(&mut store, "done-late", Some(WorkOutcome::Completed))?;
+    assert_eq!(
+        open(&store)?,
+        ["running"],
+        "a later work ending follows it up"
+    );
+
+    let trigger = message_trigger("m1");
+    let refused = |call: &str| -> Result<Dispatch> {
+        Ok(Dispatch {
+            spec: WorkSpec {
+                work_id: WorkSpec::id("c", &trigger, call),
+                conversation: "c".into(),
+                trigger: trigger.clone(),
+                target: net.b.device_id()?,
+                dispatcher: net.a.device_id()?,
+                call_ref: call.into(),
+                kind: WorkKind::Task,
+                cwd: "/w".into(),
+                title: call.into(),
+                prompt: "p".into(),
+                continues: None,
+                parent: None,
+                thread: None,
+            },
+            state: DispatchState::Pending,
+        })
+    };
+    let refusals = |store: &Store| -> Result<Vec<String>> {
+        Ok(store
+            .open_dispatches(&net.network, Some("c"))?
+            .into_iter()
+            .map(|dispatch| dispatch.spec.title)
+            .collect())
+    };
+    let no = DispatchState::Rejected {
+        reason: "no bot".into(),
+        failure: None,
+    };
+    for call in ["answered", "closed"] {
+        let dispatch = refused(call)?;
+        store.save_dispatch(&dispatch)?;
+        assert!(
+            !refusals(&store)?.contains(&call.to_owned()),
+            "a waiting dispatch is not a refusal"
+        );
+        store.answer_dispatch(
+            &net.network,
+            &local,
+            &dispatch.spec.work_id,
+            no.clone(),
+            true,
+        )?;
+    }
+    assert_eq!(refusals(&store)?, ["answered", "closed"]);
+    assert!(store.failed_work(&net.network, "c", &refused("closed")?.spec.work_id)?);
+    let report = store
+        .scheduler_job("c", &work_trigger(&refused("answered")?.spec.work_id))?
+        .context("report job")?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        bot_reply(&report.message_id, "m1"),
+        vec![],
+        70,
+    )?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        close(&refused("closed")?.spec.work_id)?,
+        vec![],
+        71,
+    )?;
+    assert!(
+        refusals(&store)?.is_empty(),
+        "one answered by its report, one closed"
     );
     Ok(())
 }
