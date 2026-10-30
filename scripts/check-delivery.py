@@ -7,8 +7,10 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import runpy
 import shutil
+import signal
 import subprocess
 import tempfile
 import uuid
@@ -171,7 +173,25 @@ def sandbox(small=False):
     name = "vdp-" + task + "-" + uuid.uuid4().hex
     container[2:2] = ["--name", name, "--label", "vibeface.task-root=" + str(ROOT)]
     print("Delivery sandbox owned by this task: " + name, flush=True)
-    run(container)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def interrupted(*_):
+        raise InterruptedError("Delivery sandbox interrupted")
+
+    try:
+        signal.signal(signal.SIGTERM, interrupted)
+        run(container)
+    finally:
+        try:
+            result = subprocess.run(["docker", "ps", "--all", "--no-trunc", "--filter", "name=^/" + re.escape(name) + "$",
+                "--filter", "label=vibeface.task-root=" + str(ROOT), "--format", "{{.ID}}"], capture_output=True, text=True, check=True, timeout=20)
+            container_id = result.stdout.strip()
+            if container_id:
+                if len(container_id) != 64 or any(character not in "0123456789abcdef" for character in container_id):
+                    raise ValueError("Delivery sandbox cleanup requires one full owned container ID")
+                subprocess.run(["docker", "stop", "--time", "10", container_id], capture_output=True, check=True, timeout=30)
+        finally:
+            signal.signal(signal.SIGTERM, previous_term)
 
 
 def check():
@@ -413,14 +433,67 @@ def self_test():
         else:
             raise AssertionError("Uncommitted sources must not be attributed to HEAD in a proof experiment")
         operation.assert_not_called()
-    with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run") as operation:
-        sandbox()
-        assert operation.call_count == 2
-        owned = operation.call_args.args[0]
-        name = owned[owned.index("--name") + 1]
-        assert name.startswith("vdp-") and len(name.rsplit("-", 1)[1]) == 32
-        assert owned[owned.index("--label") + 1] == "vibeface.task-root=" + str(ROOT)
-        assert owned.count("--name") == 1 and "--rm" in owned
+    owned_id = "a" * 64
+    failed = ValueError("sandbox failed")
+    interrupted = KeyboardInterrupt()
+    lookup_failed = subprocess.TimeoutExpired(["docker", "ps"], 20)
+    stop_failed = subprocess.CalledProcessError(1, ["docker", "stop"])
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def prior_term(*_):
+        raise AssertionError("The prior SIGTERM handler must remain inactive during sandbox dispatch")
+
+    signal.signal(signal.SIGTERM, prior_term)
+    try:
+        for failure, lookup, stop_error, expected in (
+            ("SIGTERM", owned_id, None, InterruptedError),
+            (interrupted, owned_id, None, interrupted),
+            (failed, owned_id, None, failed),
+            (failed, "", None, failed),
+            (None, "", None, None),
+            (None, owned_id, stop_failed, stop_failed),
+            ("SIGTERM", lookup_failed, None, lookup_failed),
+            (None, "invalid-owned-id", None, ValueError),
+        ):
+            def execute(command):
+                if command[:2] == ["docker", "run"]:
+                    if failure == "SIGTERM":
+                        handler = signal.getsignal(signal.SIGTERM)
+                        assert callable(handler) and handler is not prior_term
+                        handler(signal.SIGTERM, None)
+                    elif failure is not None:
+                        raise failure
+
+            result = lookup if isinstance(lookup, BaseException) else subprocess.CompletedProcess([], 0, stdout=lookup + "\n")
+            with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run", side_effect=execute) as operation, \
+                    patch("subprocess.run", side_effect=[result, stop_error or subprocess.CompletedProcess([], 0)]) as cleanup:
+                caught = None
+                try:
+                    sandbox()
+                except BaseException as error:
+                    caught = error
+                if isinstance(expected, type):
+                    assert isinstance(caught, expected), "Sandbox interruption or cleanup must propagate the expected failure"
+                else:
+                    assert caught is expected
+                assert signal.getsignal(signal.SIGTERM) is prior_term
+                assert operation.call_count == 2
+                owned = operation.call_args.args[0]
+                name = owned[owned.index("--name") + 1]
+                assert name.startswith("vdp-") and len(name.rsplit("-", 1)[1]) == 32
+                assert owned[owned.index("--label") + 1] == "vibeface.task-root=" + str(ROOT)
+                assert owned.count("--name") == 1 and "--rm" in owned
+                assert cleanup.call_args_list[0].args[0] == ["docker", "ps", "--all", "--no-trunc", "--filter", "name=^/" + re.escape(name) + "$",
+                    "--filter", "label=vibeface.task-root=" + str(ROOT), "--format", "{{.ID}}"]
+                assert cleanup.call_args_list[0].kwargs == {"capture_output": True, "text": True, "check": True, "timeout": 20}
+                if lookup == owned_id:
+                    assert cleanup.call_count == 2
+                    assert cleanup.call_args_list[1].args[0] == ["docker", "stop", "--time", "10", owned_id]
+                    assert cleanup.call_args_list[1].kwargs == {"capture_output": True, "check": True, "timeout": 30}
+                else:
+                    assert cleanup.call_count == 1
+    finally:
+        signal.signal(signal.SIGTERM, previous_term)
     with tempfile.TemporaryDirectory(prefix="public-export-self-test-", dir=ARTIFACTS) as directory:
         base = Path(directory) / "run"
         public = base / "public"

@@ -5,7 +5,7 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 # 按改动选择 CI
 
-`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
+`.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。常规 CI 触发时生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
 ## 每个 PR 的核心检查
 
