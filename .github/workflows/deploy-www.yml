@@ -11,69 +11,25 @@ on:
       - '.github/workflows/deploy-www.yml'
   workflow_dispatch:
 
-concurrency:
-  group: deploy-www-main
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
 jobs:
-  build:
+  request-release:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
-        with:
-          version: 11.9.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: |
-          pnpm --filter vibeface-www run typecheck
-          pnpm --filter vibeface-www run build
-          pnpm --filter vibeface-www run check:static
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: vibeface-www-${{ github.sha }}
-          path: apps/www/dist/client
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    environment: production
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: vibeface-www-${{ github.sha }}
-          path: dist
-      - name: Install deployment key and host verification
+      - name: Dispatch build and deployment to leaperone-releases
         env:
-          DEPLOY_KEY: ${{ secrets.VIBEFACE_DEPLOY_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.VIBEFACE_DEPLOY_KNOWN_HOSTS }}
+          GH_TOKEN: ${{ secrets.VIBEFACE_RELEASE_DISPATCH_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref_name }}
         run: |
-          install -m 700 -d "$HOME/.ssh"
-          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/vibeface_deploy"
-          chmod 600 "$HOME/.ssh/vibeface_deploy"
-          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 644 "$HOME/.ssh/known_hosts"
-      - name: Upload and activate release on de
-        env:
-          DEPLOY_HOST: ${{ secrets.VIBEFACE_DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.VIBEFACE_DEPLOY_USER }}
-          RELEASE: ${{ github.sha }}
-        run: |
-          ssh -i "$HOME/.ssh/vibeface_deploy" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "install -d -m 755 /var/www/vibeface.dev/releases/$RELEASE"
-          rsync -az --delete -e "ssh -i $HOME/.ssh/vibeface_deploy" dist/ \
-            "$DEPLOY_USER@$DEPLOY_HOST:/var/www/vibeface.dev/releases/$RELEASE/"
-          ssh -i "$HOME/.ssh/vibeface_deploy" "$DEPLOY_USER@$DEPLOY_HOST" \
-            "ln -sfn /var/www/vibeface.dev/releases/$RELEASE /var/www/vibeface.dev/current && test -f /var/www/vibeface.dev/current/index.html"
+          set -euo pipefail
+          test -n "$GH_TOKEN" || { echo 'VIBEFACE_RELEASE_DISPATCH_TOKEN is required' >&2; exit 1; }
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/leaperone/leaperone-releases/dispatches \
+            -d "{\"event_type\":\"deploy-vibeface-www\",\"client_payload\":{\"ref\":\"$SOURCE_REF\",\"source_sha\":\"$SOURCE_SHA\"}}"
