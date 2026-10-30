@@ -41,7 +41,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 总览默认读取 `open_works`，按 Bot conversation 分组。卡片显示 Bot、任务标题、目标 Node、`kind`、状态、最近摘要和是否需要核对。`dispatch_waiting` 不能显示为已接收，`unverified` 不能排到列表末尾或显示为已完成。
 
-详情按 `trigger` 和 `reply_to` 说明来源，按 scheduler job 展示排队、领取、执行、取消和回复状态，按 `summary` 与 `WorkProgress` 展示阶段摘要，再展示 `Question`、`PendingCheck`、结果和失败原因。审批卡只代表已有问题或核对记录，不新增绕过设备签名、Bot 轮次或 Node 授权的批准接口。原始命令、命令输出、文件 diff 和 Provider token 不进入工作区。
+详情按 `trigger` 和 `reply_to` 说明来源，按 scheduler job 展示排队、领取、执行、取消和回复状态，按 `summary` 与 `WorkProgress` 展示阶段摘要，再展示 `Question`、`PendingCheck`、结果和失败原因。审批卡只代表已有问题或核对记录，不新增绕过设备签名、Bot 轮次或 Node 授权的批准接口。工作区新增的步骤和状态卡只使用经过清理的摘要；Provider token、隐藏命令输出和原始 diff 不应由新增投影引入。当前已有任务详情仍会展示用户交代的 prompt、结果文本、失败原因和项目路径，设计不能把这些现有字段描述成完全不存在。
 
 ### 上下文和会话
 
