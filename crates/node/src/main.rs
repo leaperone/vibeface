@@ -36,7 +36,8 @@ const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
     args_conflicts_with_subcommands = true
 )]
 struct Cli {
-    /// Data directory for direct startup. Subcommands accept their own --data-dir.
+    /// Data directory for direct startup; defaults to VIBEFACE_DATA_DIR, then ~/.vibeface.
+    /// Subcommands accept their own --data-dir.
     #[arg(long, value_parser = config::absolute_path)]
     data_dir: Option<PathBuf>,
     /// Disable browser access for this run; local tools and hooks remain available.
@@ -136,7 +137,7 @@ enum CodexCommand {
 
 #[derive(Args)]
 struct DataDir {
-    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::absolute_path)]
+    #[arg(long, env = "VIBEFACE_DATA_DIR", value_parser = config::data_dir, default_value_os_t = config::default_data_dir())]
     data_dir: PathBuf,
 }
 
@@ -443,11 +444,11 @@ async fn main() -> Result<()> {
     let command = match cli.command {
         Some(command) => command,
         None => {
-            let data_dir = cli
-                .data_dir
-                .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from))
-                .context("set --data-dir or VIBEFACE_DATA_DIR to the Node's data directory")?;
-            ensure!(data_dir.is_absolute(), "specify an absolute data directory");
+            let data_dir = config::data_dir_or_home(
+                cli.data_dir
+                    .or_else(|| std::env::var_os("VIBEFACE_DATA_DIR").map(PathBuf::from)),
+                std::env::var_os("HOME"),
+            )?;
             if !data_dir.join("config.json").exists() {
                 check_ports(
                     DEFAULT_LISTEN,
@@ -1248,7 +1249,7 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         .to_string_lossy();
     let stamp = local_time_stamp();
     let archive = dir.with_file_name(format!("{name}-removed-{stamp}"));
-    let fresh = dir.with_file_name(format!(".{name}-fresh-{stamp}"));
+    let fresh = dir.with_file_name(format!(".{}-fresh-{stamp}", name.trim_start_matches('.')));
     ensure!(
         !archive.exists() && !fresh.exists(),
         "{} already exists",
@@ -1504,6 +1505,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 async fn join(options: Join) -> Result<()> {
+    prepare_start(&options.data.data_dir)?;
     let state =
         vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
             .await?;
@@ -2018,6 +2020,7 @@ async fn triage(options: Triage) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, FromArgMatches};
 
     #[test]
     fn receiving_key_commands_require_an_explicit_stable_intent() {
@@ -2147,6 +2150,94 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(!read.contains("codex send"), "{read}");
+    }
+
+    #[test]
+    fn data_directory_defaults_to_home_unless_named() {
+        let home = || Some("/home/me".into());
+        let direct = |argument: Option<&str>, env: Option<&str>, home| {
+            config::data_dir_or_home(argument.or(env).map(PathBuf::from), home)
+        };
+        assert_eq!(
+            direct(Some("/arg"), Some("/env"), home()).unwrap(),
+            Path::new("/arg")
+        );
+        assert_eq!(
+            direct(None, Some("/env"), home()).unwrap(),
+            Path::new("/env")
+        );
+        assert_eq!(
+            direct(None, None, home()).unwrap(),
+            Path::new("/home/me/.vibeface")
+        );
+        for home in [None, Some("relative".into())] {
+            assert_eq!(
+                direct(None, None, home).unwrap_err().to_string(),
+                config::NO_HOME
+            );
+        }
+        assert!(direct(None, Some("relative"), home()).is_err());
+
+        fn isolated(
+            command: clap::Command,
+            path: &str,
+            home: Option<&'static str>,
+        ) -> clap::Command {
+            let names: Vec<String> = command
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            let command = command.mut_args(|arg| {
+                if arg.get_id() != "data_dir" || path == "vibeface" {
+                    return arg;
+                }
+                assert_eq!(arg.get_env().unwrap(), "VIBEFACE_DATA_DIR", "{path}");
+                let arg = arg.env(None::<&'static str>);
+                match home {
+                    Some(value) if !arg.get_default_values().is_empty() => arg.default_value(value),
+                    _ => arg,
+                }
+            });
+            names.iter().fold(command, |command, name| {
+                command.mut_subcommand(name, |sub| isolated(sub, &format!("{path} {name}"), home))
+            })
+        }
+        let parse = |home, arguments: &[&str]| {
+            isolated(Cli::command(), "vibeface", home)
+                .try_get_matches_from(arguments)
+                .and_then(|matches| Cli::from_arg_matches(&matches))
+        };
+        let Some(Action::Serve(serve)) = parse(None, &["vibeface", "serve"]).unwrap().command
+        else {
+            panic!("serve");
+        };
+        assert_eq!(serve.data.data_dir, config::default_data_dir());
+
+        let no_home = Some("");
+        for arguments in [
+            &["vibeface", "status", "--data-dir", "/d"][..],
+            &["vibeface", "update", "status", "--data-dir", "/d"],
+            &[
+                "vibeface",
+                "join",
+                "vibeface1x",
+                "--name",
+                "n",
+                "--data-dir",
+                "/d",
+            ],
+            &["vibeface", "service", "status", "--data-dir", "/d"],
+            &["vibeface", "service", "--data-dir", "/d", "status"],
+        ] {
+            assert!(parse(no_home, arguments).is_ok(), "{arguments:?}");
+        }
+        for arguments in [
+            &["vibeface", "status"][..],
+            &["vibeface", "update", "status"],
+        ] {
+            let error = parse(no_home, arguments).err().unwrap().to_string();
+            assert!(error.contains(config::NO_HOME), "{arguments:?}: {error}");
+        }
     }
 
     #[test]
@@ -2340,6 +2431,35 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn join_initializes_missing_and_empty_directories_only() {
+        let root = std::env::temp_dir().join(format!("vibeface-join-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let attempt = |data_dir: PathBuf| {
+            join(Join {
+                link: "not-an-invite".into(),
+                data: DataDir { data_dir },
+                name: "我的电脑".into(),
+            })
+        };
+        fs::create_dir(root.join("empty")).unwrap();
+        for name in ["missing", "empty"] {
+            let dir = root.join(name);
+            let error = attempt(dir.clone()).await.unwrap_err();
+            assert!(
+                error.downcast_ref::<std::io::Error>().is_none(),
+                "{error:#}"
+            );
+            Runtime::open(&dir).await.unwrap();
+        }
+        let uninitialized = root.join("uninitialized");
+        fs::create_dir(&uninitialized).unwrap();
+        fs::write(uninitialized.join("existing-data"), b"preserve me").unwrap();
+        assert!(attempt(uninitialized.clone()).await.is_err());
+        assert!(!uninitialized.join("identity.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn cli_requires_one_invite_link_and_supports_accountless_flags() {
         assert!(Cli::try_parse_from(["vibeface", "join"]).is_err());
@@ -2366,7 +2486,6 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(Cli::try_parse_from(["vibeface", "serve"]).is_err());
         assert!(
             Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
                 .is_ok()
