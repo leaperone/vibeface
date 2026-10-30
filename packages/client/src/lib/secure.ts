@@ -94,8 +94,32 @@ export function secureKit(secure: SecureApi) {
   }
 }
 
+/** Passwords people pick first; a trailing run of digits or symbols does not make one new. */
+const COMMON = new Set(['password', 'passw0rd', 'p@ssw0rd', 'iloveyou', 'sunshine', 'princess', 'football', 'baseball', 'superman', 'welcome', 'letmein', 'monkey', 'dragon', 'master', 'admin', 'qwerty', 'abc123', 'woaini', 'woaini1314', 'vibeface', 'recovery'])
+/** Keyboard and counting runs; a password inside one, either way round, is a pattern, not a secret. */
+const RUNS = ['abcdefghijklmnopqrstuvwxyz', '01234567890', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm', '1qaz2wsx3edc4rfv5tgb', 'qazwsxedcrfvtgbyhn']
+export type PasswordProblem = 'short' | 'common' | 'simple'
+export type PasswordStrength = { level: 'weak'; problem: PasswordProblem } | { level: 'fair' | 'strong' }
+/**
+ * How hard a new recovery password is to guess offline, by the rule docs/node.md#备份与恢复 states: at least 8
+ * characters, not a common password or a keyboard, counting or repeated run, and under 12 characters it mixes letters,
+ * digits and other characters. 16 or more, or 12 or more mixing two kinds, is strong.
+ */
+export function passwordStrength(password: string): PasswordStrength {
+  const chars = [...password]
+  if (chars.length < 8) return { level: 'weak', problem: 'short' }
+  const lower = password.toLowerCase()
+  if (COMMON.has(lower) || COMMON.has(lower.replace(/[^a-z]+$/, '')) || new Set(chars).size <= 3 || RUNS.some((run) => run.includes(lower) || [...run].reverse().join('').includes(lower))) return { level: 'weak', problem: 'common' }
+  const kinds = [/[a-z]/i, /\d/, /[^a-z\d]/i].filter((kind) => kind.test(password)).length
+  if (chars.length < 12 && kinds < 2) return { level: 'weak', problem: 'simple' }
+  return { level: chars.length >= 16 || kinds >= 2 && chars.length >= 12 ? 'strong' : 'fair' }
+}
+const passwordProblems: Record<PasswordProblem, string> = { short: '恢复密码至少 8 个字符。', common: '这个恢复密码太常见了，换一个。', simple: '恢复密码少于 12 个字符时，要混用字母、数字或符号。' }
+/** A new recovery password, or the reason it is refused. */
 export function passphrase(password: string): string {
-  if ([...password].length < 8 || encoder.encode(password).length > 1024) throw new Error('恢复密码需要至少 8 个字符。')
+  if (encoder.encode(password).length > 1024) throw new Error('恢复密码太长了。')
+  const strength = passwordStrength(password)
+  if (strength.level === 'weak') throw new Error(passwordProblems[strength.problem])
   return password
 }
 /** The code a person matches between the settings page and a file name; never the key itself. */

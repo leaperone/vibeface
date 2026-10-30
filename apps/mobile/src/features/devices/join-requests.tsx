@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
@@ -9,6 +9,7 @@ import { deviceIcon } from './device-icon'
 import { ErrorText } from '@/components/action'
 import { ActionCard, SafetyCode, Skeleton } from '@/components/kit'
 import { Button } from '@/components/ui/button'
+import { Switch } from '@/components/ui/switch'
 import { Text } from '@/components/ui/text'
 import { useRun } from '@/lib/use-run'
 
@@ -20,7 +21,7 @@ export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
  * `issuing`: this screen just handed out a link, so it starts the comparison without a press.
  * `onAllowed`: the screen shows the added device itself.
  */
-export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(name: string): void }) {
+export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(name: string, manage: boolean): void }) {
   const device = useDevice()
   const joins = useOpenJoins()
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
@@ -38,7 +39,7 @@ export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean
 const started = new Set<string>()
 
 /** Starting the comparison claims the request for this admin, so only the screen that issued the link does it on its own. */
-function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: boolean; onAllowed?(name: string): void }) {
+function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: boolean; onAllowed?(name: string, manage: boolean): void }) {
   const device = useDevice()
   const { busy, error, run } = useRun()
   useEffect(() => {
@@ -49,18 +50,25 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
   // Only the admin that started the comparison can allow it (the Node enforces this too).
   const elsewhere = Boolean(request.admin_id && request.admin_id !== device.identity?.deviceId)
   const asking = request.status === 'pending' && !auto
-  const allow = (manage: boolean) => run(manage ? 'admin' : 'allow', async () => { await device.approveJoin(request.join_id, manage); onAllowed?.(request.name || '新设备') })
+  // As on the web: one 一致，允许 after the codes match, with 设为管理设备 as a switch beside the request.
+  const [manage, setManage] = useState(false)
+  const allow = () => run('allow', async () => { const asManager = request.kind === 'client' && manage; await device.approveJoin(request.join_id, asManager); onAllowed?.(request.name || '新设备', asManager) })
   return <ActionCard icon={deviceIcon({ kind: request.kind, name: request.name, current: false })} tone="info" title={`${request.name || '新设备'} 想加入`}
     meta={formName[deviceForm(request.kind, request.name)]} actions={<>
     <Button variant="ghost" disabled={busy !== null} onPress={() => void run('reject', () => device.rejectJoin(request.join_id))}><Text>拒绝</Text></Button>
     {asking ? <Button disabled={busy !== null} onPress={() => void run('start', () => device.startApproval(request.join_id))}><Text>{busy === 'start' ? '处理中' : '显示安全码'}</Text></Button> : <>
-      {request.kind === 'client' ? <Button variant="outline" disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(true)}><Text>{busy === 'admin' ? '处理中' : '允许，设为管理设备'}</Text></Button> : null}
-      <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow(false)}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
+      <Button disabled={!request.code || busy !== null || elsewhere} onPress={() => void allow()}><Text>{busy === 'allow' ? '处理中' : '一致，允许'}</Text></Button>
     </>}
   </>}>
-    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? '和新设备上的比对，不一致就拒绝' : '等新设备显示安全码'}</Text>
+    <Text className="text-meta text-muted-foreground">{elsewhere ? '正在另一台管理设备上处理' : asking ? '点“显示安全码”，新设备上会出现同样的码' : request.code ? deviceCopy.compareCode : '等新设备显示安全码'}</Text>
     {request.code ? <SafetyCode code={request.code} /> : asking ? null : <Skeleton className="h-8 w-40" />}
-    {request.kind === 'client' && !asking && !elsewhere ? <Text className="text-meta text-muted-foreground">管理设备{deviceCopy.manageHint}</Text> : null}
+    {request.kind === 'client' && !asking && !elsewhere ? <View className="flex-row items-center gap-3">
+      <View className="min-w-0 flex-1">
+        <Text>设为管理设备</Text>
+        <Text className="text-meta text-muted-foreground">{deviceCopy.manageHint}</Text>
+      </View>
+      <Switch accessibilityLabel="设为管理设备" value={manage} disabled={busy !== null} onValueChange={setManage} />
+    </View> : null}
     <ErrorText error={error} />
   </ActionCard>
 }

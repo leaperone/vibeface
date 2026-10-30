@@ -1,6 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
-import { Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, LogOut, Monitor, Moon, Palette, Plus, ScrollText, Sun, type LucideIcon } from 'lucide-react'
+import { Bell, BellOff, Check, ChevronRight, CircleCheck, Crown, Download, FlaskConical, KeyRound, LogOut, Monitor, Moon, Palette, Plus, ScrollText, ShieldAlert, ShieldCheck, Sun, TriangleAlert, type LucideIcon } from 'lucide-react'
 import { terms } from '@/lib/glossary'
 import { cn } from '@/lib/utils'
 import { BusyIcon, Segmented, SegmentedValue, SettingsGroup, SettingsRow } from '@/components/app/kit'
@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { onlyManagerText, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
+import { onlyManagerText, securityCopy, soleManager, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { ConnectionSettings } from '@/features/identity/device-controls'
 import { TriageSettings } from '@/features/devices/triage-settings'
 import { CurrentRecoveryFile, PhoneRecovery, RecoveredStep, RecoveryControls, RecoveryReview } from '@/features/identity/recovery-controls'
@@ -50,6 +50,7 @@ function SettingsPage() {
         <Segmented label="外观" value={theme} options={themes} onChange={(value) => { setTheme(value); setThemeState(value) }} />
       </SettingsRow>
     </SettingsGroup>
+    {principal?.can_manage ? <SecurityStatus /> : null}
     {principal?.can_manage ? device.review?.kind === 'recovery' ? <RecoveryReview /> : device.recovered ? <RecoveredStep /> : <SettingsGroup title="找回">
       <CurrentRecoveryFile />
       <PhoneRecovery />
@@ -106,6 +107,33 @@ function SettingsPage() {
       </SheetContent>
     </Sheet>
   </div>
+}
+
+/**
+ * 安全 at a glance: how many devices can manage, whether a recovery waits (also after 是我 hid its reminder), and when
+ * the recovery password was set, once the Node knows.
+ */
+function SecurityStatus() {
+  const { directory, recoverySince, nodeClockOffset } = useDevice()
+  if (!directory) return null
+  const managers = directory.members.filter((member) => member.manage).length
+  const pending = directory.pending
+  const link = 'interactive-row block'
+  return <SettingsGroup title={securityCopy.title}>
+    <Link to="/devices" className={link}>
+      <SettingsRow icon={terms.admin.icon} label={securityCopy.managers}>
+        <span className={cn('inline-flex items-center gap-1 tabular-nums', managers === 1 && 'text-warning')}>{managers === 1 ? <TriangleAlert aria-hidden="true" className="size-4" /> : null}{securityCopy.managerCount(managers)}</span>
+        <ChevronRight aria-hidden="true" className="size-4" />
+      </SettingsRow>
+    </Link>
+    {pending ? <Link to="/inbox" className={link}>
+      <SettingsRow icon={ShieldAlert} tone="danger" label={securityCopy.recovery}>
+        <span className="text-danger tabular-nums">{securityCopy.recoveryIn(pending.effective_at_ms - nodeClockOffset)}</span>
+        <ChevronRight aria-hidden="true" className="size-4" />
+      </SettingsRow>
+    </Link> : <SettingsRow icon={ShieldCheck} label={securityCopy.recovery}>{securityCopy.noRecovery}</SettingsRow>}
+    {recoverySince ? <SettingsRow icon={KeyRound} label={securityCopy.password}><time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{securityCopy.changedOn(recoverySince)}</time></SettingsRow> : null}
+  </SettingsGroup>
 }
 
 const notificationText = { on: '已开启', unsupported: '不支持', denied: '已拒绝' } as const

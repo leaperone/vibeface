@@ -830,7 +830,7 @@ test("a segmented control is one Tab stop whose arrow keys move and select, wrap
   assert.deepEqual(render().filter(({ props }) => props.role === 'radio').map(({ props }) => props.tabIndex), [0, -1, -1], "with nothing checked the first option takes the Tab stop")
 })
 
-for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
+for (const mode of ['restore']) test(`recovery ${mode} clears submitted passwords before waiting and keeps the chosen file and name`, async () => {
   let generation = 1, work = pendingResult()
   class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
   const fields = new Map(['bundle', 'password', 'old_password', 'confirmation', 'name', 'bootstrap', 'address', 'device_id', 'relay'].map(name => [name, new Input()]))
@@ -863,6 +863,32 @@ for (const mode of ['restore', 'passphrase']) test(`recovery ${mode} clears subm
     submit(); await settleComponent()
     assert.equal(password.value, '')
     assert.equal(render().find(({ props }) => props.error)?.props.error, '请选择恢复文件。')
+  } finally { app.close() }
+})
+
+test('changing the recovery password keeps what was typed when it fails, and clears it once the new file is made', async () => {
+  let work = pendingResult()
+  class Input { value = 'test-only-value'; files: object[] = [{}]; checked = false }
+  const fields = new Map(['bundle', 'password', 'old_password'].map(name => [name, new Input()]))
+  const passwords = ['password', 'old_password'].map(name => fields.get(name))
+  const form = { elements: { namedItem: (name: string) => fields.get(name) }, querySelectorAll: () => passwords }
+  const device = { connectionGeneration: () => 1, ready: null, review: null, entry: null, replaceRecoveryFile: () => work.promise }
+  const app = componentHarness('../identity/recovery-controls.tsx', {
+    '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/lib/node.ts': { parseEntry: (value: unknown) => value, messageOf: (cause: Error) => cause.message },
+    '@vibeface/client/lib/secure.ts': { passphrase: (value: string) => value, passwordStrength: () => ({ level: 'strong' }) }, '@/lib/device-name': { defaultBrowserName: () => 'browser' },
+  }, { HTMLInputElement: Input, HTMLTextAreaElement: Input })
+  const render = () => app.render('RecoveryControls', { only: 'passphrase' })
+  const form_ = () => render().find(({ type }) => type === 'form')?.props
+  const submit = () => form_()?.onSubmit?.({ preventDefault() {}, currentTarget: form })
+  try {
+    render(); submit()
+    work.reject(new Error('旧密码不对')); await settleComponent()
+    assert.ok(passwords.every(field => field?.value === 'test-only-value'), 'a failed try keeps both passwords')
+    assert.equal(render().find(({ props }) => props.error)?.props.error, '旧密码不对')
+    form_()?.onChange?.({})
+    assert.equal(render().some(({ props }) => props.error), false, 'a change takes the old error away')
+    work = pendingResult(); submit(); work.resolve(undefined); await settleComponent()
+    assert.ok(passwords.every(field => field?.value === ''), 'a new file clears both passwords')
   } finally { app.close() }
 })
 

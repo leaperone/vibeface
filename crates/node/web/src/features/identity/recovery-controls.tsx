@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Copy, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ScanLine, ShieldAlert, ShieldX, Smartphone, WifiOff, type LucideIcon } from 'lucide-react'
+import { ArchiveRestore, BellRing, CalendarClock, ChevronRight, CircleCheck, CircleMinus, CirclePlus, Copy, Download, FileKey, FileWarning, Hand, Hourglass, KeyRound, Laptop, LifeBuoy, ScanLine, Shield, ShieldAlert, ShieldCheck, ShieldX, Smartphone, WifiOff, type LucideIcon } from 'lucide-react'
 import qrcode from 'qrcode-generator'
 import { cn } from '@/lib/utils'
 import { ActionCard, BusyIcon, claimFocus, Details, FilePicker, InlineError, Panel, PasswordInput, SettingsDisclosure, SettingsRow, toast, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { entryAddress, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { passphrase, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
+import { passphrase, passwordStrength, recoveryFileStem } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName } from '@/lib/device-name'
 import { useDevice, useRecoveryCode } from '@vibeface/client/identity/context.tsx'
-import { recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
+import { passwordCopy, recoveryChanges, recoveryCopy, whenText } from '@vibeface/client/identity/copy.ts'
 import { recoveryEntry, recoveryLink } from '@vibeface/client/identity/recovery-link.ts'
 import { deviceIcon } from '@/features/devices/devices'
 
@@ -44,17 +44,28 @@ function useGenerationRun() {
     } catch (cause) { if (owner === device.connectionGeneration()) setError(messageOf(cause)) }
     finally { if (pending.current === owner) pending.current = null; setBusyGeneration((active) => active === owner ? null : active) }
   }
-  return { busy: busyGeneration === generation, error, status, run }
+  return { busy: busyGeneration === generation, error, status, run, clear: () => setError('') }
 }
 
-/** The file that still works: the code its name carries, and the day it was made. */
+/** The file that still works: the code its name carries; the day it was set shows under 安全. */
 export function CurrentRecoveryFile() {
-  const { directory, recoverySince } = useDevice()
+  const { directory } = useDevice()
   const code = useRecoveryCode(directory?.recovery_key)
   if (!code) return null
-  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={<span title={recoveryFileStem(code)}>{recoveryCopy.codeLabel} <span className="font-medium tracking-wide text-foreground">{code}</span></span>}>
-    {recoverySince ? <time className="tabular-nums" dateTime={new Date(recoverySince).toISOString()}>{recoveryCopy.day(recoverySince)}</time> : null}
-  </SettingsRow>
+  return <SettingsRow icon={FileKey} label={recoveryCopy.file} description={<span title={recoveryFileStem(code)}>{recoveryCopy.codeLabel} <span className="font-medium tracking-wide text-foreground">{code}</span></span>} />
+}
+
+/**
+ * Under a new recovery password: an icon and a word for how hard it is to guess, and why a weak one is refused.
+ * `tried`: a submit was refused, so a too-short one turns red too.
+ */
+export function PasswordStrength({ id, password, tried = false }: { id: string; password: string; tried?: boolean }) {
+  const strength = password ? passwordStrength(password) : null
+  if (!strength || strength.level === 'weak' && strength.problem === 'short' && !tried) return <span id={id} className={cn('text-meta font-normal', tried ? 'text-danger' : 'text-muted-foreground')}>{passwordCopy.short}</span>
+  const Icon = strength.level === 'weak' ? ShieldX : strength.level === 'strong' ? ShieldCheck : Shield
+  return <span id={id} className={cn('flex items-center gap-1.5 text-meta font-normal', strength.level === 'weak' ? 'text-danger' : strength.level === 'strong' ? 'text-success' : 'text-muted-foreground')}>
+    <Icon aria-hidden="true" className="size-4 shrink-0" />{passwordCopy.label[strength.level]}{strength.level === 'weak' ? <span className="min-w-0">· {passwordCopy[strength.problem]}</span> : null}
+  </span>
 }
 
 /** What a phone scans in its 用恢复文件找回 to know which computer to go through; it holds no key and lets no one in. */
@@ -101,7 +112,7 @@ export function RecoveryPendingCard() {
       toast(recoveryCopy.stopDone, { tone: 'success' })
     })}><BusyIcon busy={busy} icon={Hand} />{recoveryCopy.stop}</Button>
   </> : <>
-    <Button type="button" variant="ghost" onClick={device.dismissPendingRecovery}>{recoveryCopy.itsMe}</Button>
+    <Button type="button" variant="ghost" onClick={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset), { icon: Hourglass }) }}>{recoveryCopy.itsMe}</Button>
     <Button type="button" variant="destructive" onClick={() => setAsking(true)}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
   </>}>
     {asking || busy ? <div role="alert" className="grid gap-1 rounded-lg bg-danger-soft px-3 py-2">
@@ -123,7 +134,7 @@ export function RecoveryPendingCard() {
   </ActionCard>
 }
 
-/** Above the chat while a recovery waits: a manager sees it without opening 待处理, and one tap leads there. */
+/** Atop every page while a recovery waits: a manager sees it without opening 待处理, and one tap leads there. */
 export function RecoveryAlert() {
   const device = useDevice()
   const pending = device.pendingRecovery
@@ -206,9 +217,11 @@ export function RecoveryWaiting() {
       <p className="flex items-center gap-2 text-muted-foreground"><CalendarClock aria-hidden="true" className="size-4 shrink-0" /><time className="tabular-nums" dateTime={new Date(at).toISOString()}>{whenText(at)}</time>{recoveryCopy.autoEnter}</p>
     </>}
     <p className="flex items-center gap-2 text-muted-foreground"><BellRing aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.managersSee}</p>
+    <p className="flex items-center gap-2 text-muted-foreground"><Laptop aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.closeOk}</p>
     {/* Saving the new file is a separate thing to do now, not part of the wait. */}
     {unsavedRecovery ? <section ref={saving} className="grid gap-3 border-t pt-4">
       <h3 className="flex items-center gap-2 font-medium"><FileKey aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.saveNew}</h3>
+      <p className="flex items-center gap-2 text-meta text-muted-foreground"><KeyRound aria-hidden="true" className="size-4 shrink-0" />{recoveryCopy.samePassword}</p>
       <UnsavedRecoveryFile landing={() => saving.current?.parentElement?.querySelector('h2')} />
     </section> : null}
   </Panel>
@@ -270,7 +283,9 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const device = useDevice()
   const localEntry = device.localSetup?.entry
   const target = device.ready?.entry || device.entry || localEntry
-  const { busy, error, status, run } = useGenerationRun()
+  const { busy, error, status, run, clear } = useGenerationRun()
+  const [password, setPassword] = useState('')
+  const [tried, setTried] = useState(false)
   const [open, setOpen] = useState(only ?? (typeof location !== 'undefined' && location.hash === `#${PASSWORD_HASH}` ? 'passphrase' : undefined))
   // Opened from the reminder: the form may sit below the fold on a phone.
   useEffect(() => { if (open === 'passphrase' && !only) document.getElementById(PASSWORD_HASH)?.scrollIntoView({ block: 'center' }) }, [])
@@ -287,7 +302,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
   const frame = (icon: LucideIcon, title: string, body: ReactNode, id?: string) => only ? <Panel icon={icon} title={title}>{body}</Panel> : <section ref={fold} id={id} className="grid gap-4 px-4 pt-1 pb-4 sm:ps-15">{body}</section>
   const restoreForm = open === 'restore' ? frame(ArchiveRestore, '用恢复文件找回', <>
       <p className="text-meta text-muted-foreground">{recoveryCopy.scope}</p>
-      <form className="grid gap-4" noValidate onSubmit={(event) => {
+      <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           let work: Promise<void>
@@ -314,19 +329,24 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
     </>) : null
   const passphraseForm = open === 'passphrase' ? frame(KeyRound, '换恢复密码', <>
       <p className="text-meta text-muted-foreground">{recoveryCopy.replaceHint}</p>
-      <form className="grid gap-4" noValidate onSubmit={(event) => {
+      {/* A failed try keeps what was typed; a change to any field takes the old error away. */}
+      <form className="grid gap-4" noValidate onChange={clear} onSubmit={(event) => {
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
-          let work: Promise<void>
-          try { work = device.replaceRecoveryFile({ file: fileOf(form), oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) }) }
-          finally { clearPasswords(form) }
-          await work
+          const file = fileOf(form)
+          if (!field(form, 'old_password')) throw new Error('请输入旧密码。')
+          setTried(true)
+          await device.replaceRecoveryFile({ file, oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) })
+          clearPasswords(form); setPassword(''); setTried(false)
           if (!only) close()
         }, recoveryCopy.replaced)
       }}><fieldset disabled={busy || !!device.review} className="grid gap-4">
         <div className="grid gap-1.5 text-meta font-medium">恢复文件<FilePicker name="bundle" accept="application/json,.json" required /></div>
         <Label label="旧密码"><PasswordInput name="old_password" autoComplete="off" required /></Label>
-        <Label label="新密码（至少 8 个字符）"><PasswordInput name="password" minLength={8} autoComplete="new-password" required /></Label>
+        <div className="grid gap-1.5">
+          <Label label="新密码"><PasswordInput name="password" autoComplete="new-password" required aria-describedby="new-password-strength" onChange={(event) => setPassword(event.target.value)} /></Label>
+          <PasswordStrength id="new-password-strength" password={password} tried={tried} />
+        </div>
         <InlineError error={error || null} />
         <div className="flex flex-wrap justify-end gap-2">{!only ? <Button type="button" variant="ghost" onClick={close}>取消</Button> : null}<Button type="submit" aria-busy={busy || undefined}><BusyIcon busy={busy} icon={Download} />换密码并下载新文件</Button></div>
       </fieldset></form>

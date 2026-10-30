@@ -5,7 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
-import { nodeJoinCopy, nodeJoinFailure, onlyManagerText } from './copy.ts'
+import { joinCopy, nodeJoinCopy, nodeJoinFailure, onlyManagerText } from './copy.ts'
 import { linkTarget } from './switch-network.ts'
 import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
 import { spentInviteText } from '../lib/errors.ts'
@@ -926,7 +926,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
       finally { link.secret = '' }
       spend(linkText)
       if (response.invite_id !== link.inviteId || response.device_id !== me) throw new Error('加入结果和这条链接对不上，已停止。请重新生成加入链接。')
-      if (response.status === 'rejected' || response.status === 'expired') throw new Error(spentInviteText)
+      if (response.status === 'rejected' || response.status === 'expired') throw new Error(response.status === 'rejected' ? joinCopy.rejected : spentInviteText)
       setJoin({ entry: active.entry, join_id: response.join_id, invite_id: response.invite_id, nonce, name, status: response.status })
       await checkJoin()
     } catch (cause) { link.secret = ''; setError(messageOf(cause)); throw cause }
@@ -960,7 +960,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     if (status.status === 'rejected' || status.status === 'expired') {
       // The join is gone, so the poller can no longer tell it apart from a stale one; say why here.
-      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : '这次加入被拒绝了。要再试，请在已有设备上重新添加。')
+      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : joinCopy.rejected)
       setJoin(null); setError(failure.message)
       throw failure
     }
@@ -1350,7 +1350,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
   }, [joining])
   useEffect(() => {
     if (recovery?.status !== 'waiting') return
-    const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 30_000)
+    // A stop on another device shows here within seconds, without a reload.
+    const timer = setInterval(() => { const wait = loadWait(); if (wait && !session.current) void checkRecovery(wait).catch(() => {}) }, 10_000)
     return () => clearInterval(timer)
   }, [recovery?.status])
   useEffect(() => {
