@@ -1046,7 +1046,6 @@ impl Runtime {
         jobs.truncate(limit);
         let mut sessions = sessions;
         sessions.truncate(limit);
-        let mut deliveries = deliveries;
         deliveries.truncate(limit);
         relations.truncate(limit);
         let mut bots = bots;
@@ -1090,6 +1089,9 @@ impl Runtime {
             "deliveries": deliveries,
             "relations": relations,
             "coverage": {
+                "source": "workspace_overview",
+                "complete": false,
+                "bounded": true,
                 "local_heads": true,
                 "remote_owners": remote_owners,
                 "omitted_finished": omitted_finished,

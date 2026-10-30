@@ -78,7 +78,7 @@ test("a bounded overview parser retains unknown and unreachable states", () => {
     deliveries: [{ work_id: "stop-1", conversation_id: "chat", state: "stop_waiting", target_node: "worker" }],
     checks: [{ check_id: "check-1", conversation_id: "chat", trigger: "work:1", created_at_ms: 2 }],
     relations: [{ from_work: "child", to_work: "parent", kind: "parent" }],
-    coverage: { source: "workspace_overview", bounded: true, local_heads: true, remote_owners: [{ owner: "worker", reachable: false, reason: "offline" }] },
+    coverage: { bounded: true, local_heads: true, remote_owners: [{ owner: "worker", reachable: false, reason: "offline" }] },
   })
   assert.equal(overview.tasks[0]?.state, "unverified")
   assert.equal(overview.tasks[0]?.outcome, "unverified")
@@ -88,5 +88,6 @@ test("a bounded overview parser retains unknown and unreachable states", () => {
   assert.equal(overview.questions.length, 0)
   assert.equal(overview.jobs[0]?.state, "running")
   assert.equal(overview.coverage.remote_owners[0]?.reachable, false)
+  assert.equal(overview.coverage.source, "workspace_overview")
   assert.deepEqual(overview.relations, [{ from_work: "child", to_work: "parent", kind: "parent" }])
 })

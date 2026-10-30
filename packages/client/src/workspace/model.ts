@@ -455,7 +455,7 @@ function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency,
   })
   const unreachable = list(data.unreachable_nodes ?? []).map(text)
   return {
-    source: data.source === "workspace_overview" ? "workspace_overview" : "open_works", complete: data.complete === true, bounded: data.bounded !== false,
+    source: data.source === "workspace_overview" || data.local_heads === true ? "workspace_overview" : "open_works", complete: data.complete === true, bounded: data.bounded !== false,
     generated_at_ms: nullableNumber(data.generated_at_ms ?? generatedAt), network_epoch: nullableNumber(data.network_epoch ?? networkEpoch), consistency: overviewConsistency(data.consistency ?? consistency), truncated: data.truncated === true || truncated,
     local_heads: data.local_heads === true, remote_owners: remote, unreachable_nodes: unreachable,
     omitted_finished: nullableNumber(data.omitted_finished), omitted_sessions: nullableNumber(data.omitted_sessions), omitted_tasks: nullableNumber(data.omitted_tasks), omitted_questions: nullableNumber(data.omitted_questions), omitted_checks: nullableNumber(data.omitted_checks), omitted_dispatches: nullableNumber(data.omitted_dispatches), omitted_deliveries: nullableNumber(data.omitted_deliveries), omitted_relations: nullableNumber(data.omitted_relations), omitted_jobs: nullableNumber(data.omitted_jobs), omitted_live_progress: data.omitted_live_progress !== false,
