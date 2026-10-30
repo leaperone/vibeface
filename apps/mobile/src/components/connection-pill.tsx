@@ -1,9 +1,14 @@
-import { ArrowRightLeft, RefreshCw, ShieldCheck, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { ArrowRightLeft, RefreshCw, RotateCw, ShieldCheck, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Modal, Pressable, useWindowDimensions, View, type HostInstance } from 'react-native'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { offlineCopy } from '@vibeface/client/identity/copy.ts'
+import { unreachable } from '@vibeface/client/workspace/home.ts'
+import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { toneText, type Tone } from '@/components/kit'
+import { useWorkspace } from '@/data/context'
 import type { Connection } from '@/data/types'
 import { cn } from '@/lib/utils'
 
@@ -52,4 +57,20 @@ export function ConnectionMenu({ connection }: { connection: Connection }) {
       </View> : null}
     </Modal>
   </>
+}
+
+/**
+ * Once a connect attempt failed: which computer does not answer, and a retry that skips the wait. `chat`: above the
+ * composer, worded as the web's; elsewhere it adds what to check.
+ */
+export function OfflineBar({ chat, className }: { chat?: boolean; className?: string }) {
+  const device = useDevice()
+  const { connection } = useWorkspace()
+  if (!unreachable(device.link)) return null
+  const title = offlineCopy.title(connection.entry)
+  return <View role="status" className={cn('min-h-11 flex-row items-center gap-2 rounded-full border border-border bg-card ps-3 pe-1 shadow-sm', className)}>
+    <Icon as={WifiOff} className="size-4 text-muted-foreground" />
+    <Text numberOfLines={2} className={cn('min-w-0 text-meta font-medium', chat ? 'shrink' : 'flex-1')}>{chat ? title : `${title}，${offlineCopy.hint}`}</Text>
+    <Button variant="ghost" size="sm" className="min-h-11 rounded-full" onPress={device.retryNow}><Icon as={RotateCw} className="size-4" /><Text>{chat ? offlineCopy.retryConnect : offlineCopy.retry}</Text></Button>
+  </View>
 }

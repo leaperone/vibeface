@@ -11,9 +11,18 @@ export const joinCopy = {
   paste: '或粘贴加入链接',
   pasteFirst: '粘贴加入链接',
   linkFilled: '已填入加入链接',
+  notLink: '这不是有效的加入链接',
   deviceName: '这台设备的名字',
   join: '加入',
   joining: '加入中',
+}
+
+/** The computer this device reaches its network through does not answer; `name`: that computer as the person named it. */
+export const offlineCopy = {
+  title: (name: string) => `连不上${name || '你的电脑'}`,
+  hint: '确认它开着',
+  retry: '重试',
+  retryConnect: '重试连接',
 }
 
 /** 手动填写地址, under 详细信息: a device ID pins which computer answers there. */
