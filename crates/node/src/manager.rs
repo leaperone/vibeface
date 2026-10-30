@@ -28,6 +28,11 @@ pub enum CursorInstance {
         network: String,
         conversation: String,
     },
+    Work {
+        network: String,
+        conversation: String,
+        root_work: String,
+    },
     Coordination,
 }
 
@@ -41,6 +46,16 @@ impl CursorInstance {
                 "bot:{}:{network}:{}:{conversation}",
                 network.len(),
                 conversation.len()
+            ),
+            Self::Work {
+                network,
+                conversation,
+                root_work,
+            } => format!(
+                "work:{}:{network}:{}:{conversation}:{}:{root_work}",
+                network.len(),
+                conversation.len(),
+                root_work.len()
             ),
             Self::Coordination => "coordination".into(),
         }
@@ -249,6 +264,7 @@ where
                 custom_tools: config.custom_tools.clone(),
                 callback_token: config.tool_token.clone(),
                 process_started: config.process_started.clone(),
+                run_started: None,
             };
             bridge
                 .run(

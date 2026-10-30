@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
-use vibeface_bridge::agent::{AgentFailure, AgentRunError, SdkBridge, SdkTurn, ToolCallbackConfig};
+use vibeface_bridge::agent::{
+    AgentFailure, AgentRunError, NativeStatus, SdkBridge, SdkTurn, ToolCallbackConfig,
+};
 use vibeface_bridge::failure::FailureKind;
 
 fn starts(log: &Path) -> Vec<u32> {
@@ -118,6 +120,7 @@ async fn one_bridge_serves_consecutive_turns_and_is_replaced_when_it_dies() {
             recorder.lock().unwrap().push(group);
             Box::pin(async { Ok(()) })
         })),
+        run_started: None,
     };
 
     let (first, first_took) = reply(&bridge, &turn, "first").await;
@@ -248,6 +251,7 @@ async fn owners_have_private_bridges_and_one_crash_does_not_stop_the_other_fifte
                     .push((owner_for_callback.clone(), group));
                 Box::pin(async { Ok(()) })
             })),
+            run_started: None,
         });
     }
     let first: Vec<_> = turns
@@ -421,6 +425,7 @@ async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_af
         custom_tools: BTreeMap::new(),
         callback_token: Some(token_a.clone()),
         process_started: None,
+        run_started: None,
     };
     let first_bridge = bridge.clone();
     let first_turn = turn.clone();
@@ -515,5 +520,95 @@ async fn one_owner_serializes_attempt_callbacks_and_resumes_its_private_store_af
     for group in starts(&starts_log) {
         assert!(gone(group).await);
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_state() {
+    let root = std::env::temp_dir().join(format!(
+        "vibeface-cursor-run-query-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let executable =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-cursor-sdk-bridge");
+    let bridge = SdkBridge::new(
+        BTreeMap::new(),
+        ToolCallbackConfig {
+            url: "http://127.0.0.1:9".into(),
+            auth_token: "fixture-callback-token-".repeat(2),
+        },
+        Some(root.join("bridge.pid")),
+    )
+    .unwrap();
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let run_id = Arc::new(Mutex::new(None));
+    let starts_log = root.join("starts.log");
+    let callback_order = order.clone();
+    let callback_run = run_id.clone();
+    let turn = SdkTurn {
+        owner: "work:network:conversation:root".into(),
+        executable,
+        workspace: root.join("workspace"),
+        local_store_root: root.join("private-instance"),
+        api_key: "fixture-api-key".into(),
+        env: BTreeMap::from([
+            (
+                "FAKE_BRIDGE_GET_RUN_STATUS".into(),
+                "RUN_LIFECYCLE_STATUS_FINISHED".into(),
+            ),
+            ("FAKE_BRIDGE_REJECT_RESUME".into(), "1".into()),
+            ("FAKE_BRIDGE_LOG".into(), starts_log.display().to_string()),
+        ]),
+        model: "fixture-model".into(),
+        timeout_secs: 10,
+        custom_tools: BTreeMap::new(),
+        callback_token: None,
+        process_started: None,
+        run_started: Some(Arc::new(move |id| {
+            callback_order.lock().unwrap().push("run".into());
+            *callback_run.lock().unwrap() = Some(id);
+            Box::pin(async { Ok(()) })
+        })),
+    };
+    let progress_order = order.clone();
+    let result = bridge
+        .run(
+            &turn,
+            "query me",
+            None,
+            |_| async { Ok(()) },
+            watch::channel(false).1,
+            move |_| {
+                progress_order.lock().unwrap().push("progress".into());
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+    let run_id = run_id.lock().unwrap().clone().unwrap();
+    assert_eq!(result.output, "done: query me");
+    let order = order.lock().unwrap().clone();
+    assert_eq!(order.first().map(String::as_str), Some("run"));
+    bridge.retire_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let native = bridge
+        .probe(&turn, result.session_id.as_deref().unwrap(), &run_id)
+        .await
+        .unwrap();
+    assert_eq!(native.status, NativeStatus::Completed);
+    assert_eq!(native.output.as_deref(), Some("done: query me"));
+    assert!(
+        starts(&starts_log).len() >= 2,
+        "probe restarted the resident bridge"
+    );
+    bridge
+        .cancel(&turn, result.session_id.as_deref().unwrap(), &run_id)
+        .await
+        .unwrap();
+    bridge.stop().await;
     std::fs::remove_dir_all(root).unwrap();
 }

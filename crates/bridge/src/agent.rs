@@ -40,6 +40,11 @@ pub type ProcessStarted = std::sync::Arc<
     dyn Fn(u32) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
 >;
 
+/// Called after Cursor accepts a prompt and exposes its native run ID.
+pub type RunStarted = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
+>;
+
 /// One Cursor SDK turn on an owner-specific resident bridge.
 #[derive(Clone)]
 pub struct SdkTurn {
@@ -58,6 +63,8 @@ pub struct SdkTurn {
     /// The attempt bearer used by this turn's custom-tool callback.
     pub callback_token: Option<String>,
     pub process_started: Option<ProcessStarted>,
+    /// The work journal's callback. It runs before any progress from this native run is exposed.
+    pub run_started: Option<RunStarted>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -95,6 +102,25 @@ pub struct AgentRunError {
     pub outcome: AgentFailure,
     pub session_id: Option<String>,
     pub failure: ExecFailure,
+}
+
+/// The status a read of a known Cursor run can prove.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeStatus {
+    Running,
+    Completed,
+    Cancelled,
+    Failed { detail: String },
+    Unknown,
+}
+
+/// A native Cursor run read by its persisted agent and run IDs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeRun {
+    pub agent_id: String,
+    pub run_id: String,
+    pub status: NativeStatus,
+    pub output: Option<String>,
 }
 
 impl std::fmt::Display for AgentRunError {
@@ -628,7 +654,14 @@ impl SdkBridge {
             let mut pending_text = BTreeMap::new();
             let mut emit_progress =
                 |value| progress(redact_stream_progress(value, &secrets, &mut pending_text));
-            rpc.send(id, prompt, &mut state, &mut emit_progress).await?;
+            rpc.send(
+                id,
+                prompt,
+                &mut state,
+                &mut emit_progress,
+                turn.run_started.as_ref(),
+            )
+            .await?;
             let mut result = state.finish(id)?;
             result.output = redact_text(result.output, &secrets);
             result.usage = result.usage.map(|usage| redact_progress(usage, &secrets));
@@ -722,6 +755,84 @@ impl SdkBridge {
                 },
             }
         })
+    }
+
+    /// Reads one known native run without sending a prompt or selecting another run.
+    pub async fn probe(&self, turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<NativeRun> {
+        validate_control_turn(turn, agent_id, run_id)?;
+        let owner_slot = self.owner_slot(&turn.owner).await?;
+        let base_secrets = self.secrets(&turn.api_key, &turn.env, "");
+        let admission = self
+            .admit(
+                &owner_slot,
+                &turn.executable,
+                &turn.workspace,
+                &turn.local_store_root,
+                &turn.api_key,
+                &turn.env,
+            )
+            .await
+            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &base_secrets)))?;
+        let live = &admission.0;
+        let rpc = &live.rpc;
+        let mut secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
+        secrets.extend(turn.callback_token.as_deref());
+        let reply = rpc
+            .unary(
+                AGENT_SERVICE,
+                "GetRun",
+                json!({"runId":run_id,"options":run_options(turn, agent_id)}),
+            )
+            .await
+            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &secrets)))?;
+        let snapshot = reply
+            .get("run")
+            .context("Cursor SDK returned no run snapshot")?;
+        let mut identity = RunState {
+            run_id: Some(run_id.into()),
+            ..RunState::default()
+        };
+        identity.identity(snapshot, agent_id, true)?;
+        let snapshot_agent = snapshot
+            .get("agentId")
+            .or_else(|| snapshot.get("agent_id"))
+            .and_then(Value::as_str)
+            .context("Cursor SDK run snapshot has no agent id")?;
+        ensure!(
+            snapshot_agent == agent_id,
+            "Cursor SDK run belongs to a different agent"
+        );
+        Ok(native_run(snapshot, agent_id, run_id, &secrets))
+    }
+
+    /// Requests cancellation of one known native run. Terminal evidence is read separately.
+    pub async fn cancel(&self, turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<()> {
+        validate_control_turn(turn, agent_id, run_id)?;
+        let owner_slot = self.owner_slot(&turn.owner).await?;
+        let base_secrets = self.secrets(&turn.api_key, &turn.env, "");
+        let admission = self
+            .admit(
+                &owner_slot,
+                &turn.executable,
+                &turn.workspace,
+                &turn.local_store_root,
+                &turn.api_key,
+                &turn.env,
+            )
+            .await
+            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &base_secrets)))?;
+        let live = &admission.0;
+        let mut secrets = self.secrets(&turn.api_key, &turn.env, &live.rpc.bearer);
+        secrets.extend(turn.callback_token.as_deref());
+        live.rpc
+            .unary(
+                AGENT_SERVICE,
+                "CancelRun",
+                json!({"runId":run_id,"agentId":agent_id}),
+            )
+            .await
+            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &secrets)))?;
+        Ok(())
     }
 
     async fn owner_slot(&self, owner: &str) -> Result<Arc<OwnerSlot>> {
@@ -1277,6 +1388,74 @@ fn sdk_options(turn: &SdkTurn) -> Result<Value> {
             "store":{"type":"jsonl","rootDir":store_root}},"mcpServers":{}}))
 }
 
+fn run_options(turn: &SdkTurn, agent_id: &str) -> Value {
+    json!({
+        "runtime": "RUNTIME_LOCAL",
+        "cwd": turn.workspace,
+        "agentId": agent_id,
+        "apiKey": turn.api_key,
+    })
+}
+
+fn validate_control_turn(turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result<()> {
+    validate_owner(&turn.owner)?;
+    validate_sdk_id(agent_id)?;
+    validate_sdk_id(run_id)?;
+    validate_api_key(&turn.api_key)?;
+    ensure!(turn.timeout_secs > 0, "Cursor SDK timeout must be positive");
+    validate_launch_env(&turn.env)?;
+    validate_private_directory(&turn.local_store_root)?;
+    if let Some(token) = &turn.callback_token {
+        validate_callback_token(token)?;
+    }
+    validate_tools(&turn.custom_tools)?;
+    Ok(())
+}
+
+fn native_run(snapshot: &Value, agent_id: &str, run_id: &str, secrets: &[&str]) -> NativeRun {
+    let status = snapshot
+        .get("status")
+        .map(native_status)
+        .unwrap_or(NativeStatus::Unknown);
+    let status = match status {
+        NativeStatus::Failed { detail } => NativeStatus::Failed {
+            detail: redact_text(detail, secrets),
+        },
+        other => other,
+    };
+    let output = snapshot
+        .get("result")
+        .and_then(Value::as_str)
+        .map(|text| redact_text(text.to_owned(), secrets));
+    NativeRun {
+        agent_id: agent_id.into(),
+        run_id: run_id.into(),
+        status,
+        output,
+    }
+}
+
+fn native_status(status: &Value) -> NativeStatus {
+    let code = status.as_u64().or_else(|| match status.as_str()? {
+        "RUN_LIFECYCLE_STATUS_CREATING" => Some(1),
+        "RUN_LIFECYCLE_STATUS_RUNNING" => Some(2),
+        "RUN_LIFECYCLE_STATUS_FINISHED" => Some(3),
+        "RUN_LIFECYCLE_STATUS_ERROR" => Some(4),
+        "RUN_LIFECYCLE_STATUS_CANCELLED" => Some(5),
+        "RUN_LIFECYCLE_STATUS_EXPIRED" => Some(6),
+        _ => None,
+    });
+    match code {
+        Some(1 | 2) => NativeStatus::Running,
+        Some(3) => NativeStatus::Completed,
+        Some(5) => NativeStatus::Cancelled,
+        Some(4 | 6) => NativeStatus::Failed {
+            detail: format!("Cursor SDK run ended with status {status}"),
+        },
+        _ => NativeStatus::Unknown,
+    }
+}
+
 fn validate_sdk_id(id: &str) -> Result<()> {
     ensure!(
         !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control),
@@ -1439,6 +1618,7 @@ impl Rpc {
         text: &str,
         state: &mut RunState,
         progress: &mut P,
+        run_started: Option<&RunStarted>,
     ) -> Result<()>
     where
         P: FnMut(Value) -> PF,
@@ -1474,7 +1654,9 @@ impl Rpc {
                 "Cursor SDK run stream limit exceeded"
             );
             for (flags, message) in decoder.push(&chunk)? {
-                state.accept(flags, message, agent_id, progress).await?;
+                state
+                    .accept_with_run_started(flags, message, agent_id, progress, run_started)
+                    .await?;
             }
         }
         decoder.finish()?;
@@ -1553,6 +1735,21 @@ struct RunState {
     assistant_text: String,
 }
 impl RunState {
+    async fn identity_and_record(
+        &mut self,
+        message: &Value,
+        expected_agent: &str,
+        required: bool,
+        run_started: Option<&RunStarted>,
+    ) -> Result<()> {
+        let had_run = self.run_id.is_some();
+        self.identity(message, expected_agent, required)?;
+        if !had_run && let (Some(run_id), Some(callback)) = (&self.run_id, run_started) {
+            callback(run_id.clone()).await?;
+        }
+        Ok(())
+    }
+
     fn identity(&mut self, message: &Value, expected_agent: &str, required: bool) -> Result<()> {
         if let Some(agent_id) = message
             .get("agentId")
@@ -1585,12 +1782,29 @@ impl RunState {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn accept<P, PF>(
         &mut self,
         flags: u8,
         message: Value,
         expected_agent: &str,
         progress: &mut P,
+    ) -> Result<()>
+    where
+        P: FnMut(Value) -> PF,
+        PF: Future<Output = Result<()>>,
+    {
+        self.accept_with_run_started(flags, message, expected_agent, progress, None)
+            .await
+    }
+
+    async fn accept_with_run_started<P, PF>(
+        &mut self,
+        flags: u8,
+        message: Value,
+        expected_agent: &str,
+        progress: &mut P,
+        run_started: Option<&RunStarted>,
     ) -> Result<()>
     where
         P: FnMut(Value) -> PF,
@@ -1630,7 +1844,8 @@ impl RunState {
                 self.output.is_none(),
                 "Cursor SDK emitted duplicate terminal results"
             );
-            self.identity(result, expected_agent, true)?;
+            self.identity_and_record(result, expected_agent, true, run_started)
+                .await?;
             ensure!(
                 finished(result.get("status")),
                 "Cursor SDK run did not finish successfully"
@@ -1645,7 +1860,8 @@ impl RunState {
             let result = result
                 .get("result")
                 .context("Cursor SDK terminal envelope has no result")?;
-            self.identity(result, expected_agent, true)?;
+            self.identity_and_record(result, expected_agent, true, run_started)
+                .await?;
             ensure!(
                 finished(result.get("status")),
                 "Cursor SDK result did not finish successfully"
@@ -1675,7 +1891,8 @@ impl RunState {
             }
             progress(Value::Object(event)).await?;
         } else if let Some(done) = message.get("done") {
-            self.identity(done, expected_agent, true)?;
+            self.identity_and_record(done, expected_agent, true, run_started)
+                .await?;
             ensure!(
                 self.output.is_some(),
                 "Cursor SDK emitted done before a successful result"
@@ -1685,7 +1902,8 @@ impl RunState {
             let Some(event) = envelope.get("message") else {
                 return Ok(());
             };
-            self.identity(event, expected_agent, false)?;
+            self.identity_and_record(event, expected_agent, false, run_started)
+                .await?;
             if let Some(status) = event.get("status").and_then(Value::as_str) {
                 ensure!(
                     !matches!(
@@ -1727,7 +1945,8 @@ impl RunState {
             if kind == "text-delta"
                 && let Some(event) = envelope.get("update")
             {
-                self.identity(event, expected_agent, false)?;
+                self.identity_and_record(event, expected_agent, false, run_started)
+                    .await?;
                 if let Some(text) = event.get("text").and_then(safe_text) {
                     if !self.text_deltas {
                         self.text_deltas = true;
@@ -1986,6 +2205,44 @@ pub(crate) async fn bounded_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_snapshots_accept_numeric_and_named_lifecycle_statuses() {
+        let read = |status| native_run(&json!({"status": status}), "agent", "run", &[]).status;
+        for status in [
+            json!(1),
+            json!(2),
+            json!("RUN_LIFECYCLE_STATUS_CREATING"),
+            json!("RUN_LIFECYCLE_STATUS_RUNNING"),
+        ] {
+            assert_eq!(read(status), NativeStatus::Running);
+        }
+        for status in [json!(3), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
+            assert_eq!(read(status), NativeStatus::Completed);
+        }
+        for status in [json!(5), json!("RUN_LIFECYCLE_STATUS_CANCELLED")] {
+            assert_eq!(read(status), NativeStatus::Cancelled);
+        }
+        for status in [
+            json!(4),
+            json!(6),
+            json!("RUN_LIFECYCLE_STATUS_ERROR"),
+            json!("RUN_LIFECYCLE_STATUS_EXPIRED"),
+        ] {
+            assert!(matches!(read(status), NativeStatus::Failed { .. }));
+        }
+        for status in [
+            json!(0),
+            json!(7),
+            json!(-1),
+            json!(3.5),
+            json!(true),
+            Value::Null,
+            json!("UNFINISHED"),
+        ] {
+            assert_eq!(read(status), NativeStatus::Unknown);
+        }
+    }
     fn result(status: Value) -> Value {
         json!({"result": {"agentId": "a", "runId": "r", "status": status,
             "result": {"agentId": "a", "runId": "r", "status": status, "result": "Needs approval", "usage": {"inputTokens": "42", "outputTokens": "7"}}}})
@@ -2104,6 +2361,7 @@ mod tests {
             model: "fixture-model".into(),
             callback_token: Some("x".repeat(32)),
             process_started: None,
+            run_started: None,
             custom_tools: BTreeMap::from([(
                 "context".into(),
                 CustomToolConfig {

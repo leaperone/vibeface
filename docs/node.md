@@ -71,7 +71,7 @@ bash scripts/build-web.sh
 
 通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
-在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；除 Cursor 外，各行的任务图标开关本机执行任务。模型、Bot 工作文件夹和组件路径在 Bot 所在服务的**设置**里，允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
+在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择。模型、Bot 工作文件夹和组件路径在 Bot 所在服务的**设置**里，允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
 网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
@@ -94,7 +94,9 @@ bash scripts/build-web.sh
 
 Cursor 使用 SDK 原生自定义工具回调连接 Rust Node。产品链路不启动 MCP Server，也不要求 Bot 或浏览器支持 MCP。协调工具限定到当前个人网络及机器人聊天，本机工作使用 SDK 宿主工具。Agent 不能替本人授权自动后续。
 
-Node 只常驻一个 Cursor SDK Bridge 进程供各轮回复复用。已设置 `CURSOR_API_KEY` 时，Node 启动或保存 Cursor 设置后立即预热。Bridge 退出或无响应时，下一轮按 1 至 30 秒退避重启；某一轮结果未知时，Bridge 等其余轮次结束后退出，下一轮换新进程。启动超过 60 秒时这一轮不会开始，稍后再发即可。
+Cursor 的 Bot、协调 Agent 和任务会话分别使用独立的 SDK Bridge 进程与私有存储。任务通过 `dispatch_work` 的 `agent: "cursor"` 选择 Cursor，`continues` 或本机已有任务的 `thread` 可续接原会话；同一会话一次只运行一项工作。当前 Cursor 任务支持文本提示和模型选择，不支持图片、推理档位或运行中插话。
+
+已设置 `CURSOR_API_KEY` 且选择 Cursor 运行 Bot 时，Node 会预热协调 Agent；任务按需启动自己的 Bridge。启动失败按 1 至 30 秒退避，空闲进程会回收，原生会话仍保留。任务先保存原生 Agent ID，再发送提示，取得 Run ID 后立即保存。断流或重启后只按已知 Run ID 核对结果；无法确认的任务保持待核对，不重发提示。设置变更只影响后续操作，不回收正在运行的任务。
 
 ### 使用 Codex SDK
 
@@ -467,7 +469,7 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
 - **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。任何入口都能停止其他设备上的工作。停止请求先存在本机再发送，直到工作结束都不会放弃：目标离线时入口以 3 秒起、最长 1 分钟的间隔持续投递，设备上线后照样收到并停下；执行设备在 `turn/interrupt` 失败或重启后先读回合再重发，回合已结束就不再中断。页面显示“停止中”，30 秒仍未确认显示“还在尝试停止”。执行器接受中断后 30 秒回合仍未结束时再读一次：仍在运行就再发，读不到则进入待核对。
 
-Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“Bot 正在看这条补充”，并入后显示“已补充给 Bot”，该回复未正常完成时显示“补充后回复没完成”，无法确认时显示“不确定 Bot 看到了没有”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态或受管进程退出证据才能确认取消。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
+Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“Bot 正在看这条补充”，并入后显示“已补充给 Bot”，该回复未正常完成时显示“补充后回复没完成”，无法确认时显示“不确定 Bot 看到了没有”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态才能确认取消；本地进程退出时仍须核对结果。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 
