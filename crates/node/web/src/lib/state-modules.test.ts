@@ -165,3 +165,23 @@ test('a spent join link reads the same, and clears the field the same, whether t
   }
   assert.equal(spentInvite.test('这次加入被拒绝了。要再试，请在已有设备上重新添加。'), false)
 })
+
+test('this computer\'s join failure reads as the terminal says it, and a spent link clears the field the same', async () => {
+  const { nodeJoinCopy, nodeJoinFailure } = await import('@vibeface/client/identity/copy.ts')
+  assert.equal(nodeJoinFailure('ticket has already been used'), nodeJoinCopy.used)
+  assert.equal(nodeJoinFailure('join request Expired: expired'), nodeJoinCopy.expired)
+  assert.match(nodeJoinFailure('join request Rejected: rejected'), /管理设备拒绝了这次加入/)
+  assert.match(nodeJoinFailure('another join is in progress; delete join.json to abandon it'), /上次的名字/)
+  assert.equal(nodeJoinFailure('connection refused'), nodeJoinCopy.failed)
+  for (const text of [nodeJoinCopy.used, nodeJoinCopy.expired]) assert.ok(spentInvite.test(text), text)
+  assert.equal(spentInvite.test(nodeJoinCopy.failed), false)
+})
+
+test('a provider\'s model list keeps its order and default, and no list keeps the text field', async () => {
+  const { parseProviderModels } = await import('@vibeface/client/lib/node.ts')
+  assert.deepEqual(parseProviderModels({ models: [{ id: 'gpt-a', name: 'GPT A', default: true }, { id: 'gpt-b', name: 'gpt-b', default: false }] }),
+    [{ id: 'gpt-a', name: 'GPT A', default: true }, { id: 'gpt-b', name: 'gpt-b', default: false }])
+  assert.equal(parseProviderModels({ models: null }), null)
+  assert.equal(parseProviderModels({ models: [] }), null)
+  assert.throws(() => parseProviderModels({ models: [{ name: 'no id' }] }))
+})

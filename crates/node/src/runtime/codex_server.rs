@@ -798,6 +798,25 @@ impl CodexServer {
         }
     }
 
+    /// The models the connected App Server offers; `None` while it is off or not connected, so
+    /// the page keeps its text field. Only reads, so a lost answer is simply asked again.
+    pub(crate) async fn models(&self) -> Option<Vec<ModelChoice>> {
+        if self.client.status().await["connection"]["state"] != "connected" {
+            return None;
+        }
+        let mut models = vec![];
+        let mut params = json!({});
+        for _ in 0..MODEL_PAGES {
+            let page = self.client.request("model/list", params).await.ok()?;
+            models.extend(model_choices(&page));
+            match page["nextCursor"].as_str() {
+                Some(cursor) => params = json!({"cursor":cursor}),
+                None => break,
+            }
+        }
+        Some(models)
+    }
+
     /// Stops the App Server the Node started; called on SIGTERM before the Node exits. The
     /// system App Server is never stopped.
     pub(crate) async fn stop(&self) {
@@ -810,6 +829,38 @@ impl CodexServer {
         }
         let _ = std::fs::remove_file(&self.inner.pidfile);
     }
+}
+
+const MODEL_PAGES: usize = 5;
+
+/// A model the bot can be set to: `id` is what `thread/start` takes.
+#[derive(Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct ModelChoice {
+    pub id: String,
+    pub name: String,
+    pub default: bool,
+}
+
+/// One `model/list` page as choices, without the models the App Server hides.
+fn model_choices(page: &Value) -> Vec<ModelChoice> {
+    page["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|model| model["hidden"] != true)
+        .filter_map(|model| {
+            let id = model["model"].as_str().or(model["id"].as_str())?;
+            Some(ModelChoice {
+                id: id.into(),
+                name: model["displayName"]
+                    .as_str()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(id)
+                    .into(),
+                default: model["isDefault"] == true,
+            })
+        })
+        .collect()
 }
 
 impl Runtime {
@@ -830,6 +881,32 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_choices_take_the_name_thread_start_uses_and_skip_hidden_ones() {
+        let page = json!({"data":[
+            {"id":"a","model":"gpt-a","displayName":"GPT A","isDefault":true},
+            {"id":"b","model":"gpt-b","displayName":"","hidden":false},
+            {"id":"c","model":"gpt-c","displayName":"GPT C","hidden":true},
+            {"displayName":"no id"}
+        ],"nextCursor":null});
+        assert_eq!(
+            model_choices(&page),
+            vec![
+                ModelChoice {
+                    id: "gpt-a".into(),
+                    name: "GPT A".into(),
+                    default: true
+                },
+                ModelChoice {
+                    id: "gpt-b".into(),
+                    name: "gpt-b".into(),
+                    default: false
+                },
+            ]
+        );
+        assert!(model_choices(&json!({})).is_empty());
+    }
 
     #[test]
     fn a_steered_message_is_traced_only_from_what_its_thread_shows() {

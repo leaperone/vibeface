@@ -20,6 +20,31 @@ export const joinCopy = {
   installGuide: 'https://github.com/leaperone/vibeface/blob/main/docs/install.md',
 }
 
+/**
+ * Why this computer's join ended and what to do next, from the `reason` the Node reports. The patterns and words follow
+ * `join_failure_text` in crates/node/src/main.rs, which `vibeface join` prints; only the next step is the page's own.
+ */
+export const nodeJoinCopy = {
+  used: '这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再粘贴新链接。',
+  expired: '这条加入链接已过期。在管理设备上点“添加设备”重新生成，再粘贴新链接。',
+  failed: '没能加入。检查网络后再点“加入”，会接着上次的请求，不会重复提交。',
+  /** The page lost the computer's answer; the join may still be running there. */
+  unreachable: '连不上这台电脑上的 Vibeface。加入可能还在进行：确认它在运行后再点“加入”，会接着上次的请求，不会重复提交。',
+}
+const nodeJoinReasons: [string, string][] = [
+  ['already been used', nodeJoinCopy.used],
+  ['expired', nodeJoinCopy.expired],
+  ['Rejected', '管理设备拒绝了这次加入。确认是自己的电脑后，在管理设备上重新生成链接再试。'],
+  ['Withdrawn', '这次加入已撤回。在管理设备上重新生成链接再试。'],
+  ['approval timed out', '等了很久也没有批准。在管理设备上重新生成链接再试。'],
+  ['already belongs to a personal network', '这台电脑已经在一个网络里了，不用再加入。'],
+  ['another join is already running', '这台电脑正在用终端命令加入。等它结束后再试。'],
+  ['another join is in progress', '这条链接上次用的是另一个名字。改回上次的名字再加入，会接着等批准。'],
+  ['invite link', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
+  ['Vibeface ticket', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
+]
+export const nodeJoinFailure = (reason: string) => nodeJoinReasons.find(([pattern]) => reason.includes(pattern))?.[1] ?? nodeJoinCopy.failed
+
 /** A computer's own page before it belongs anywhere: two equal ways on, so a second computer does not start a second network. */
 export const startCopy = {
   create: '新建我的网络',

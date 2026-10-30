@@ -48,7 +48,7 @@ export function Onboarding() {
     {step === 4 ? <Panel icon={Bot} title="让这台电脑运行 Bot">
       <AiSettings onboarding onBot={setBotOn} />
       <div className="flex justify-between gap-2 border-t pt-4">
-        {botOn ? null : <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>}
+        <Button type="button" variant="ghost" className="-ms-3" onClick={() => setOnboardingStep(5)}>稍后设置</Button>
         <Button type="button" className="ms-auto" disabled={!botOn} onClick={() => setOnboardingStep(5)}>下一步</Button>
       </div>
     </Panel> : <Panel key="bot" icon={MessageSquarePlus} title="创建第一个 Bot">

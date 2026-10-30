@@ -5,7 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
-import { onlyManagerText } from './copy.ts'
+import { nodeJoinCopy, nodeJoinFailure, onlyManagerText } from './copy.ts'
 import { linkTarget } from './switch-network.ts'
 import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
 import { spentInviteText } from '../lib/errors.ts'
@@ -96,7 +96,7 @@ type DeviceContextValue = {
   linkTarget(link: string): 'current' | 'other' | null
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
-  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>
+  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>; renameDevice(deviceId: string, name: string): Promise<void>
   beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
   replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
@@ -125,6 +125,8 @@ const LAN_MS = 2000
 /** Not an error: the entry buttons below it are the way in. */
 export const notJoined = (self: string) => `${self}还没加入`
 export const removedText = (self: string) => `${self}已被移除，请在管理设备上重新添加`
+/** How many times the page asks its computer about a join before saying the answer is lost. */
+const NODE_JOIN_TRIES = 5
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。请用最近一次下载的恢复文件。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
@@ -595,12 +597,23 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const { capability, entry } = localSetup
     const active = await open(entry)
     setNodeJoining({ status: 'waiting' })
+    // The same link again only reads how far the join got, so an answer lost on the way is asked for again, never resent as a new request.
+    const ask = async () => {
+      for (let lost = 0; ; lost++) {
+        try { return record(await callSession(active, 'node_join', { capability, link, name })) } catch (cause) {
+          const said = nodeJoinFailure(cause instanceof Error ? cause.message : String(cause))
+          if (said !== nodeJoinCopy.failed && session.current === active) throw new Error(said)
+          if (session.current !== active || lost + 1 >= NODE_JOIN_TRIES) throw new Error(nodeJoinCopy.unreachable)
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
+      }
+    }
     try {
       for (;;) {
-        const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        const reply = await ask()
         spend(linkText)
         if (reply.status === 'cancelled') return 'cancelled'
-        if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
+        if (reply.status === 'failed') throw new Error(nodeJoinFailure(typeof reply.reason === 'string' ? reply.reason : ''))
         if (reply.status === 'joined') break
         if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
         setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined })
@@ -784,6 +797,30 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     finally { verified.free() }
     event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
     await request('grant', { event }); await refreshDirectory()
+  }
+  /**
+   * Renames one of my devices, this one included, with a manager's `grant` that keeps its kind and permission. The directory
+   * is read first, and again when the answer is lost, so a name that already landed is not signed again.
+   */
+  async function renameDevice(deviceId: string, nameValue: string) {
+    const connection = managing(), request = scoped()
+    const name = deviceName(nameValue)
+    const read = async () => {
+      const response = record(await request('directory'))
+      const verified = verifyState(response.state, connection.principal.network_id, nodeNow(response))
+      try {
+        const member = parseView(JSON.parse(verified.viewJson())).members.find(item => item.device_id === deviceId)
+        if (!member) throw new Error('找不到这个设备，请刷新后再试。')
+        if (member.name === name) return null
+        return JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'grant', member: { ...member, name } }))) as Record<string, unknown>
+      } finally { verified.free() }
+    }
+    const event = await read()
+    if (event) {
+      event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+      try { await request('grant', { event }) } catch (cause) { if (await read().catch(() => event)) throw cause }
+    }
+    await refreshDirectory()
   }
   /**
    * Stops the recovery `checkpoint` names. The directory is read first, and again when the answer is lost, so a veto
@@ -1344,7 +1381,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
     connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, checkInvite, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
-    startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
+    startApproval, approveJoin, rejectJoin, revoke, setManage, renameDevice, beginRecovery, replaceRecoveryFile,
     linkTarget(link) {
       const networkId = ready?.principal.network_id ?? loadAuthenticated()?.networkId
       const known = [...directory?.members ?? [], ...networkId ? [...savedEntries().filter(item => load(`network-for.${item.device_id}`) === networkId), ...loadEntrances(networkId)] : []]

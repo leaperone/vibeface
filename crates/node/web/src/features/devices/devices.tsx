@@ -1,9 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Monitor, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Monitor, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { addOnManager, anotherManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
@@ -127,6 +128,35 @@ function Section({ title, bare = false, children }: { title: string; bare?: bool
   </section>
 }
 
+/** The name heads the device page; a management device taps it to rename the device in place. */
+function DeviceTitle({ row, editable }: { row: DeviceRow; editable: boolean }) {
+  const device = useDevice()
+  const action = useAction()
+  const [draft, setDraft] = useState<string | null>(null)
+  const close = () => { setDraft(null); action.clear() }
+  if (draft === null) return <h2 className="min-w-0 text-title font-semibold">
+    {editable ? <button type="button" className="group flex max-w-full min-w-0 items-center gap-2 rounded-md text-start" title="改名" onClick={() => setDraft(row.name)}>
+      <span className="truncate">{row.name}</span>
+      <Pencil aria-hidden="true" className="size-4 shrink-0 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
+      <span className="sr-only">改名</span>
+    </button> : <span className="block truncate" title={row.name}>{row.name}</span>}
+  </h2>
+  const save = () => {
+    const name = draft.trim()
+    if (name === row.name) return close()
+    void action.run("rename", async () => { await device.renameDevice(row.id, name); setDraft(null) }, "已改名")
+  }
+  return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); save() }}>
+    <div className="flex min-w-0 items-center gap-1">
+      <Input aria-label="设备名称" autoFocus required maxLength={128} className="h-9 min-w-0 text-title font-semibold" value={draft} disabled={action.busy !== null}
+        onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") close() }} />
+      <Button type="submit" variant="ghost" size="icon" aria-label="保存" title="保存" disabled={action.busy !== null || !draft.trim()}><BusyIcon busy={action.busy === "rename"} icon={Check} /></Button>
+      <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" disabled={action.busy !== null} onClick={close}><X aria-hidden="true" /></Button>
+    </div>
+    {action.errorKey === "rename" ? <InlineError error={action.error} /> : null}
+  </form>
+}
+
 export function DeviceDetail({ deviceId }: { deviceId: string }) {
   const device = useDevice()
   const { ready } = device
@@ -151,7 +181,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     <header className="flex items-center gap-4">
       <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
-        <h2 className="truncate text-title font-semibold" title={row.name}>{row.name}</h2>
+        <DeviceTitle row={row} editable={canManage && Boolean(row.member)} />
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}
