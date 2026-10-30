@@ -268,6 +268,8 @@ function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskSta
 
 function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
   const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
+  const rawState = overviewState(work.stop ?? work.state)
+  const outcome = safeOverviewOutcome(work.outcome, rawState, node)
   return {
     item_id: itemId,
     work_id: work.work_id,
@@ -275,8 +277,8 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
     bot,
     title: work.title,
     summary: work.summary,
-    state: work.state === "finished" && work.outcome === null ? "unknown" : overviewState(work.stop ?? work.state),
-    outcome: safeOverviewOutcome(work.outcome, overviewState(work.stop ?? work.state), node),
+    state: outcome === "unverified" ? "unverified" : work.state === "finished" && work.outcome === null ? "unknown" : rawState,
+    outcome,
     target_node: work.target_node,
     dispatcher: work.dispatcher ?? null,
     call_ref: work.call_ref ?? null,

@@ -61,6 +61,7 @@ test("missing bots stay visible but cannot navigate, and unknown results stay un
   const [task, check] = overview.tasks
   assert.equal(task?.bot, null)
   assert.equal(task?.navigation, null)
+  assert.equal(task?.state, "unverified")
   assert.equal(task?.outcome, "unverified")
   assert.equal(check?.kind, "check")
   assert.equal(check?.state, "unknown")
