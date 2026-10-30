@@ -93,7 +93,7 @@ function TaskOverviewCard({ work, bot, lookup, readyDevice, connected }: { work:
           </div>
           <ChevronRight aria-hidden="true" className="mt-1 size-4 shrink-0 text-muted-foreground" />
         </div>
-        <p className="whitespace-pre-wrap break-words text-meta text-muted-foreground">{work.summary || work.prompt || "暂无进展"}</p>
+        <p className="whitespace-pre-wrap break-words text-meta text-muted-foreground">{work.summary || "暂无进展"}</p>
       </CardContent>
     </Card>
   return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: "tasks" }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{card}</Link> : card
