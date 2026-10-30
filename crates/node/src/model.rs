@@ -1095,7 +1095,7 @@ pub struct SkillEntry {
 }
 
 /// A schedule that is not removed, with its current pause state. `changed_at_ms` is when its
-/// definition or its pause state last changed, whichever is later.
+/// definition or its pause state was first stored on this Node, whichever is later.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ScheduleEntry {
     pub schedule_id: String,

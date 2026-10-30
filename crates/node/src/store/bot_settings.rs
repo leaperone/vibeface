@@ -343,7 +343,7 @@ pub(crate) fn skills_from(connection: &Connection, network: &str) -> Result<Vec<
 const SCHEDULE_COLUMNS: &str =
     "schedule_id,conversation_id,schedule,changed_at_ms,enabled,enabled_at_ms";
 
-/// The definition with the pause state that won on its own, and the later of the two changes.
+/// The definition with the pause state that won on its own, and the later local first-seen time.
 fn schedule_row(
     r: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(String, String, String, i64, bool, i64)> {
