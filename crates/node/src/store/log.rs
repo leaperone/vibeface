@@ -107,6 +107,7 @@ pub(crate) fn ingest_from(
     connection: &Connection,
     view: &AuthorizationView,
     envelope: &SignedEvent,
+    seen_at_ms: i64,
     placed: &mut Placed,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
@@ -133,9 +134,9 @@ pub(crate) fn ingest_from(
     if let Err(error) = verify_event_signature(envelope, &event.author) {
         return Ok(IngestStatus::Rejected(error.to_string()));
     }
-    let status = place(connection, view, envelope, &event, placed)?;
+    let status = place(connection, view, envelope, &event, seen_at_ms, placed)?;
     if matches!(status, IngestStatus::Accepted | IngestStatus::Conflict) {
-        cascade(connection, view, &envelope.hash, placed)?;
+        cascade(connection, view, &envelope.hash, seen_at_ms, placed)?;
     }
     Ok(status)
 }
@@ -144,6 +145,7 @@ fn cascade(
     connection: &Connection,
     view: &AuthorizationView,
     hash: &str,
+    seen_at_ms: i64,
     placed: &mut Placed,
 ) -> Result<()> {
     let mut ready = vec![hash.to_owned()];
@@ -158,7 +160,7 @@ fn cascade(
             let envelope: SignedEvent = serde_json::from_str(&envelope)?;
             let event: Event = serde_json::from_str(&envelope.canonical_body)?;
             if matches!(
-                place(connection, view, &envelope, &event, placed)?,
+                place(connection, view, &envelope, &event, seen_at_ms, placed)?,
                 IngestStatus::Accepted | IngestStatus::Conflict
             ) {
                 ready.push(envelope.hash);
@@ -199,6 +201,7 @@ fn place(
     view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
+    seen_at_ms: i64,
     placed: &mut Placed,
 ) -> Result<IngestStatus> {
     let network = view.network_id.as_str();
@@ -248,7 +251,7 @@ fn place(
         Some(prev) => *prev == head_hash,
         None => max == 0,
     };
-    placed.stale |= !insert_event(connection, view, envelope, event, main)?;
+    placed.stale |= !insert_event(connection, view, envelope, event, seen_at_ms, main)?;
     if !main {
         return Ok(IngestStatus::Conflict);
     }
@@ -415,6 +418,7 @@ fn insert_event(
     view: &AuthorizationView,
     envelope: &SignedEvent,
     event: &Event,
+    seen_at_ms: i64,
     main: bool,
 ) -> Result<bool> {
     let network = view.network_id.as_str();
@@ -444,9 +448,19 @@ fn insert_event(
         Some(serde_json::json!(event.body.kind())),
         "an event's stored kind is its type tag"
     );
+    let skew_ms = event.created_at_ms.abs_diff(seen_at_ms);
+    if skew_ms > 5 * 60_000 {
+        tracing::warn!(
+            event = "event.clock_skew",
+            author = %event.author,
+            hash = %envelope.hash,
+            skew_ms,
+            "event writer clock differs from this Node's first-seen clock"
+        );
+    }
     connection.execute(
-        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,envelope,main,effective,kind,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject()],
+        "INSERT INTO events(network_id,author,seq,hash,scope_id,lamport,created_at_ms,seen_at_ms,envelope,main,effective,kind,subject) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![network, event.author, event.seq, envelope.hash, event.scope_id, lamport, event.created_at_ms, seen_at_ms, serde_json::to_string(envelope)?, main, effective, event.body.kind(), event.body.subject()],
     )?;
     for blob in &event.blobs {
         connection.execute(
@@ -466,6 +480,7 @@ fn insert_event(
             network,
             &envelope.hash,
             event,
+            seen_at_ms,
             &rank(lamport, event.created_at_ms, &envelope.hash),
         )?;
     }
@@ -561,19 +576,20 @@ pub(crate) fn recompute(connection: &Connection, view: &AuthorizationView) -> Re
     }
     reduce::clear(connection, network)?;
     let mut statement = connection.prepare(
-        "SELECT hash,lamport,created_at_ms,envelope FROM events WHERE network_id=? AND effective=1
+        "SELECT hash,lamport,created_at_ms,seen_at_ms,envelope FROM events WHERE network_id=? AND effective=1
          ORDER BY lamport,created_at_ms,hash",
     )?;
     let mut rows = statement.query([network])?;
     while let Some(row) = rows.next()? {
         let hash: String = row.get(0)?;
-        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(3)?)?;
+        let envelope: SignedEvent = serde_json::from_str(&row.get::<_, String>(4)?)?;
         let event: Event = serde_json::from_str(&envelope.canonical_body)?;
         reduce::apply(
             connection,
             network,
             &hash,
             &event,
+            row.get(3)?,
             &rank(row.get(1)?, row.get(2)?, &hash),
         )?;
     }
@@ -680,7 +696,7 @@ pub(crate) fn append_from(
     authorize_cause(connection, network, &event)?;
     authorize_owner(connection, network, &event)?;
     ensure!(
-        insert_event(connection, &view, &envelope, &event, true)?,
+        insert_event(connection, &view, &envelope, &event, created_at_ms, true)?,
         "this Node's log has forked and it no longer writes"
     );
     Ok(envelope)
