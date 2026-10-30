@@ -466,7 +466,7 @@ def checked_counters(value, complete=False):
     if not isinstance(value, dict) or not required <= set(value) <= allowed:
         raise ValueError("Unexpected cgroup counter fields")
     for name, text in value.items():
-        pattern = r"(?:[a-z_]+ [0-9]+\n)*[a-z_]+ [0-9]+" if name in ("cpu.stat", "memory.events") else r"[0-9]+"
+        pattern = r"[a-z_]+(?:\.[a-z_]+)* [0-9]+(?:\n[a-z_]+(?:\.[a-z_]+)* [0-9]+)*" if name in ("cpu.stat", "memory.events") else r"[0-9]+"
         if not isinstance(text, str) or len(text) > 4096 or not re.fullmatch(pattern, text):
             raise ValueError("Invalid public cgroup counters")
     if complete and any(value[name] != expected for name, expected in (("memory.max", str(11 * 1024 ** 3)), ("memory.swap.max", "0"), ("pids.max", "64"))):
@@ -1468,6 +1468,9 @@ def continuation_self_test(manifest, compiled, profile, vectors, proofs):
     checked_context(context_data, compiled, vectors["profileId"], commit)
     checked_node_summary(node_summary, "prepare", context, commit)
     checked_resources(resources, require_pass=True)
+    checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec 0"})
+    must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\n.core_sched.force_idle_usec 0"}))
+    must_reject(lambda: checked_counters({"cpu.stat": "usage_usec 1\ncore_sched.force_idle_usec -1"}))
     checked_transaction({"label": "fund", "hash": "0x" + "1" * 64, "blockHash": "0x" + "2" * 64, "blockNumber": 5, "status": 1,
         "gasUsed": "1", "effectiveGasPrice": "2", "nativeCostWei": "2", "events": [{"name": "Funded", "args": ["0x" + "4" * 64, "0x" + "Ab" * 20, "17"]}]})
     for field, value in (("sourceCommit", "b" * 40), ("profileId", "f" * 64), ("profileSha256", "f" * 64), ("orderId", "0x" + "4" * 64), ("secret", "private")):
