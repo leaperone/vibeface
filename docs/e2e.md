@@ -150,7 +150,7 @@ scripts/build-mobile-secure.sh ios
 cp -R .artifacts/native/ios-build/Build/Products/Release-iphonesimulator/Vibeface.app .artifacts/native/
 ```
 
-必须带 `CODE_SIGN_IDENTITY=-`（ad-hoc 签名）：没有它，未签名的构建会因为签名失败而中断。ad-hoc 签名还会把模拟器 entitlements 写进二进制，缺少它们时钥匙串会拒绝 SecureStore。
+必须带 `CODE_SIGN_IDENTITY=-`：ad-hoc 签名会把模拟器 entitlements 写进二进制，缺少它们时钥匙串会拒绝 SecureStore。
 
 ```sh
 VIBEFACE_E2E_IOS_APP=/absolute/task/.artifacts/native/Vibeface.app \
