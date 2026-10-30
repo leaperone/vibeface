@@ -94,13 +94,13 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
 
 const tipClosed = 'notify-tip-closed'
 
-/** Until system notifications are on for this network, one closable card offers them; the system asks only after its button. */
+/** Until system notifications are on for this network, one closable card offers them; the system asks only after its button. Closing it hides it on every network. */
 function NotifyTip() {
   const shared = useLive()
   const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
   const [closed, setClosed] = useState(() => readStorage(tipClosed, false))
   const { busy, error, run } = useRun()
-  if (closed || !shared?.synced || shared.notificationButton.state !== 'off') return null
+  if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
   return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
     <View className="min-h-16 flex-row items-center gap-3 rounded-2xl border border-border bg-card py-2.5 ps-3 pe-1">
       <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
