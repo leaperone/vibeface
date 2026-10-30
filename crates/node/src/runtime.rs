@@ -108,6 +108,171 @@ pub struct Access {
     pub manager: Option<ManagerAccess>,
 }
 
+const WORKSPACE_OVERVIEW_SCHEMA: u32 = 1;
+const WORKSPACE_OVERVIEW_DEFAULT_LIMIT: usize = 256;
+const WORKSPACE_OVERVIEW_MAX_LIMIT: usize = 256;
+
+fn workspace_bounded(value: &str, limit: usize) -> String {
+    value.chars().take(limit).collect()
+}
+
+fn workspace_bounded_opt(value: Option<&str>, limit: usize) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| workspace_bounded(value, limit))
+}
+
+fn workspace_limit(input: &Value) -> Result<usize> {
+    let limit = input
+        .get("limit")
+        .map(|value| value.as_u64().context("limit must be an integer"))
+        .transpose()?
+        .unwrap_or(WORKSPACE_OVERVIEW_DEFAULT_LIMIT as u64);
+    ensure!(limit > 0, "limit must be greater than zero");
+    ensure!(
+        limit <= WORKSPACE_OVERVIEW_MAX_LIMIT as u64,
+        "limit exceeds the workspace overview maximum"
+    );
+    Ok(limit as usize)
+}
+
+fn workspace_bool(input: &Value, key: &str, default: bool) -> Result<bool> {
+    input
+        .get(key)
+        .map(|value| value.as_bool().context(format!("{key} must be a boolean")))
+        .transpose()
+        .map(|value| value.unwrap_or(default))
+}
+
+fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
+    let mut row = json!({
+        "work_id": work.work_id,
+        "conversation_id": work.conversation_id,
+        "trigger": work.trigger,
+        "title": workspace_bounded(&work.title, 256),
+        "summary": workspace_bounded(&work.summary, 512),
+        "state": work.state,
+        "outcome": work.outcome,
+        "kind": work.kind,
+        "target_node": work.target_node,
+        "dispatcher": work.dispatcher,
+        "parent": work.parent,
+        "continues": work.continues,
+        "thread": work.thread,
+        "thread_id": work.thread_id,
+        "turn_id": work.turn_id,
+        "source": source,
+    });
+    if let Some(reason) = workspace_bounded_opt(work.failure_reason.as_deref(), 512) {
+        row["failure_reason"] = json!(reason);
+    }
+    if work.outcome == Some(WorkOutcome::Unverified) {
+        row["unknown_reason"] = json!("work_result_unverified");
+    }
+    row
+}
+
+fn workspace_question_summary(question: &Value) -> Value {
+    let mut row = json!({});
+    for key in [
+        "question_id",
+        "conversation_id",
+        "bot",
+        "author",
+        "created_at_ms",
+        "severity",
+        "choices",
+    ] {
+        if let Some(value) = question.get(key) {
+            row[key] = value.clone();
+        }
+    }
+    if let Some(text) = question.get("text").and_then(Value::as_str) {
+        row["text"] = json!(workspace_bounded(text, 1024));
+    }
+    row
+}
+
+fn workspace_session_summary(session: &Value) -> Value {
+    let mut row = json!({});
+    for key in [
+        "node",
+        "session_id",
+        "agent",
+        "muted",
+        "created_at_ms",
+        "version",
+    ] {
+        if let Some(value) = session.get(key) {
+            row[key] = value.clone();
+        }
+    }
+    if let Some(cwd) = session.get("cwd").and_then(Value::as_str) {
+        row["cwd"] = json!(workspace_bounded(cwd, 512));
+    }
+    if let Some(summary) = session.get("summary").and_then(Value::as_str) {
+        row["summary"] = json!(workspace_bounded(summary, 512));
+    }
+    row
+}
+
+fn workspace_job_summary(
+    job: &crate::scheduling::SchedulerJob,
+    source_node: &str,
+    owner_epoch: u64,
+    pending_checks: &BTreeSet<String>,
+) -> Value {
+    json!({
+        "conversation_id": job.conversation_id,
+        "trigger": job.trigger,
+        "kind": job.kind,
+        "sequence": job.sequence,
+        "state": job.state.name(),
+        "message_id": job.message_id,
+        "source_node": source_node,
+        "owner_epoch": owner_epoch,
+        "unknown_reason": pending_checks.contains(&format!("{}\n{}", job.conversation_id, job.trigger))
+            .then_some("pending_check"),
+    })
+}
+
+#[cfg(test)]
+mod workspace_overview_tests {
+    use super::*;
+
+    #[test]
+    fn work_summary_does_not_expose_prompt_or_raw_result() {
+        let work = WorkProjection {
+            work_id: "work-1".into(),
+            conversation_id: "conversation-1".into(),
+            target_node: "node-1".into(),
+            trigger: "task:work-1".into(),
+            dispatcher: "node-2".into(),
+            kind: WorkKind::Task,
+            cwd: "/private/project".into(),
+            title: "title".into(),
+            prompt: "provider secret".into(),
+            call_ref: "call-ref".into(),
+            continues: None,
+            parent: None,
+            thread: None,
+            phase: None,
+            summary: "summary".into(),
+            thread_id: None,
+            turn_id: None,
+            outcome: Some(WorkOutcome::Completed),
+            result_text: "raw provider output".into(),
+            failure_reason: None,
+            failure: None,
+            state: WorkStatus::Finished,
+        };
+        let value = workspace_work_summary(&work, "dag");
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("result_text").is_none());
+        assert_eq!(value["title"], "title");
+    }
+}
+
 /// What changed in a conversation, so each client session can push the affected records.
 pub(crate) enum Changed<'a> {
     /// A stored event, by hash.
@@ -590,6 +755,346 @@ impl Runtime {
             payload,
         });
     }
+
+    /// A bounded, human-only projection of the facts this Node has locally.
+    async fn workspace_overview(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(
+            access.human,
+            "workspace overview is unavailable to Agent tokens"
+        );
+        ensure!(
+            input.get("cursor").is_none_or(Value::is_null),
+            "workspace overview cursor is not supported"
+        );
+        let limit = workspace_limit(input)?;
+        let include_finished = workspace_bool(input, "include_finished", false)?;
+        let include_sessions = workspace_bool(input, "include_sessions", true)?;
+        let requested_scope = input.get("conversation_id").and_then(Value::as_str);
+        let scope_filter = requested_scope.or(access.conversation_id.as_deref());
+        let current = self.membership_state().await?;
+        let network = &access.network_id;
+        let local = self.identity.device_id()?;
+        let owner_epoch = current.project()?.epoch;
+
+        let store = self.store.lock().await;
+        let active_bots = store.bots(network)?;
+        let active_scopes: BTreeSet<_> = active_bots
+            .iter()
+            .map(|bot| bot.conversation_id.as_str())
+            .collect();
+        let conversations = store
+            .conversations(network)?
+            .into_iter()
+            .filter(|conversation| {
+                active_scopes.contains(conversation.conversation_id.as_str())
+                    && scope_filter.is_none_or(|scope| scope == conversation.conversation_id)
+            })
+            .collect::<Vec<_>>();
+        let scope_ids: BTreeSet<_> = conversations
+            .iter()
+            .map(|conversation| conversation.conversation_id.as_str())
+            .collect();
+        let conversation_by_id: BTreeMap<_, _> = conversations
+            .iter()
+            .map(|conversation| (conversation.conversation_id.as_str(), conversation))
+            .collect();
+
+        let all_works = conversations
+            .iter()
+            .try_fold(Vec::new(), |mut all, conversation| {
+                all.extend(store.works(network, &conversation.conversation_id)?);
+                Ok::<_, anyhow::Error>(all)
+            })?;
+        let work_ids: BTreeSet<_> = all_works.iter().map(|work| work.work_id.as_str()).collect();
+        let mut tasks = all_works
+            .iter()
+            .filter(|work| {
+                include_finished
+                    || work.outcome.is_none()
+                    || work.outcome == Some(WorkOutcome::Unverified)
+            })
+            .map(|work| workspace_work_summary(work, "dag"))
+            .collect::<Vec<_>>();
+
+        let dispatches = store
+            .dispatches()?
+            .into_iter()
+            .filter(|dispatch| {
+                scope_ids.contains(dispatch.spec.conversation.as_str())
+                    && scope_filter.is_none_or(|scope| scope == dispatch.spec.conversation)
+            })
+            .collect::<Vec<_>>();
+        let mut deliveries = Vec::new();
+        for dispatch in &dispatches {
+            let spec = &dispatch.spec;
+            let state = dispatch.state.name();
+            let waiting_sync = dispatch.state == crate::work::DispatchState::Accepted
+                && !work_ids.contains(spec.work_id.as_str());
+            if waiting_sync || dispatch.state != crate::work::DispatchState::Accepted {
+                let unknown_reason = if waiting_sync {
+                    Some("accepted_waiting_sync")
+                } else if matches!(
+                    dispatch.state,
+                    crate::work::DispatchState::Unverified { .. }
+                ) {
+                    Some("dispatch_unverified")
+                } else {
+                    None
+                };
+                let mut task = json!({
+                    "work_id": spec.work_id,
+                    "conversation_id": spec.conversation,
+                    "trigger": spec.trigger,
+                    "title": workspace_bounded(&spec.title, 256),
+                    "summary": Value::Null,
+                    "state": if waiting_sync { "accepted_waiting_sync" } else { state },
+                    "outcome": Value::Null,
+                    "kind": spec.kind,
+                    "target_node": spec.target,
+                    "dispatcher": spec.dispatcher,
+                    "parent": spec.parent,
+                    "continues": spec.continues,
+                    "thread": spec.thread,
+                    "source": "local_dispatch",
+                    "unknown_reason": unknown_reason,
+                });
+                if let Some(reason) = dispatch.state.reason() {
+                    task["failure_reason"] = json!(workspace_bounded(reason, 512));
+                }
+                tasks.push(task);
+                deliveries.push(json!({
+                    "work_id": spec.work_id,
+                    "conversation_id": spec.conversation,
+                    "target_node": spec.target,
+                    "state": if waiting_sync { "dispatch_accepted" } else { state },
+                    "kind": spec.kind,
+                    "title": workspace_bounded(&spec.title, 256),
+                    "reason": dispatch.state.reason().map(|reason| workspace_bounded(reason, 512)),
+                }));
+            }
+        }
+        for stop in store.stop_requests()? {
+            if !scope_ids.contains(stop.conversation.as_str()) {
+                continue;
+            }
+            deliveries.push(json!({
+                "work_id": stop.work_id,
+                "conversation_id": stop.conversation,
+                "target_node": stop.target,
+                "state": if stop.timed_out { "stop_timed_out" } else { "stop_waiting" },
+                "requested_at_ms": stop.requested_at_ms,
+                "deadline_ms": stop.deadline_ms,
+            }));
+        }
+
+        let questions = store
+            .unanswered_questions(network)?
+            .into_iter()
+            .filter(|question| {
+                question["conversation_id"]
+                    .as_str()
+                    .is_some_and(|scope| scope_ids.contains(scope))
+            })
+            .map(|question| workspace_question_summary(&question))
+            .collect::<Vec<_>>();
+        let checks = store
+            .pending_checks()?
+            .into_iter()
+            .filter(|check| scope_ids.contains(check.conversation_id.as_str()))
+            .collect::<Vec<_>>();
+        let pending_jobs: BTreeSet<_> = checks
+            .iter()
+            .map(|check| format!("{}\n{}", check.conversation_id, check.trigger))
+            .collect();
+        let jobs = store
+            .scheduler_jobs_all()?
+            .into_iter()
+            .filter(|job| {
+                scope_ids.contains(job.conversation_id.as_str())
+                    && (include_finished || !job.state.terminal())
+            })
+            .map(|job| {
+                let epoch = conversation_by_id
+                    .get(job.conversation_id.as_str())
+                    .map_or(0, |conversation| conversation.owner_epoch);
+                workspace_job_summary(&job, &local, epoch, &pending_jobs)
+            })
+            .collect::<Vec<_>>();
+        let sessions = if include_sessions {
+            store
+                .attributed_sessions_all(network)?
+                .into_iter()
+                .filter(|session| {
+                    session["conversation_id"]
+                        .as_str()
+                        .is_some_and(|scope| scope_ids.contains(scope))
+                })
+                .map(|session| workspace_session_summary(&session))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let bots = active_bots
+            .into_iter()
+            .filter(|bot| {
+                scope_ids.contains(bot.conversation_id.as_str())
+                    && scope_filter.is_none_or(|scope| scope == bot.conversation_id)
+            })
+            .map(|bot| {
+                json!({
+                    "bot_id": bot.bot_id,
+                    "conversation_id": bot.conversation_id,
+                    "name": bot.name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let heads = store
+            .heads(network)?
+            .into_iter()
+            .map(|(device, (sequence, _))| (device, sequence))
+            .collect::<BTreeMap<_, _>>();
+        let mut remote_owners = Vec::new();
+        for conversation in &conversations {
+            match conversation.owner.as_deref() {
+                Some(owner) if owner != local => remote_owners.push(json!({
+                    "owner": owner,
+                    "reachable": Value::Null,
+                    "status": "unknown",
+                    "owner_epoch": conversation.owner_epoch,
+                    "reason": "remote_scheduler_not_queried",
+                })),
+                None => remote_owners.push(json!({
+                    "owner": Value::Null,
+                    "reachable": Value::Null,
+                    "status": "unknown",
+                    "owner_epoch": conversation.owner_epoch,
+                    "reason": "owner_unknown",
+                })),
+                _ => {}
+            }
+        }
+        let conversation_rows = conversations
+            .iter()
+            .map(|conversation| {
+                json!({
+                    "conversation_id": conversation.conversation_id,
+                    "title": workspace_bounded(&conversation.title, 256),
+                    "owner": conversation.owner,
+                    "owner_epoch": conversation.owner_epoch,
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(store);
+
+        let mut relations = Vec::new();
+        for work in &all_works {
+            if !include_finished
+                && work.outcome.is_some()
+                && work.outcome != Some(WorkOutcome::Unverified)
+            {
+                continue;
+            }
+            if let Some(parent) = &work.parent {
+                relations.push(json!({"from_work":work.work_id,"to_work":parent,"kind":"parent"}));
+                relations
+                    .push(json!({"from_work":parent,"to_work":work.work_id,"kind":"dispatches"}));
+            }
+            if let Some(continues) = &work.continues {
+                relations
+                    .push(json!({"from_work":work.work_id,"to_work":continues,"kind":"continues"}));
+            }
+        }
+
+        let omitted_tasks = tasks.len().saturating_sub(limit);
+        let omitted_questions = questions.len().saturating_sub(limit);
+        let omitted_jobs = jobs.len().saturating_sub(limit);
+        let omitted_sessions = sessions.len().saturating_sub(limit);
+        let omitted_deliveries = deliveries.len().saturating_sub(limit);
+        let omitted_relations = relations.len().saturating_sub(limit);
+        let omitted_finished = if include_finished {
+            0
+        } else {
+            all_works
+                .iter()
+                .filter(|work| {
+                    work.outcome.is_some() && work.outcome != Some(WorkOutcome::Unverified)
+                })
+                .count()
+        };
+        let truncated = omitted_tasks > 0
+            || omitted_questions > 0
+            || omitted_jobs > 0
+            || omitted_sessions > 0
+            || omitted_deliveries > 0
+            || omitted_relations > 0
+            || bots.len() > limit
+            || conversation_rows.len() > limit
+            || remote_owners.len() > limit
+            || checks.len() > limit;
+        tasks.truncate(limit);
+        let mut questions = questions;
+        questions.truncate(limit);
+        let mut jobs = jobs;
+        jobs.truncate(limit);
+        let mut sessions = sessions;
+        sessions.truncate(limit);
+        let mut deliveries = deliveries;
+        deliveries.truncate(limit);
+        relations.truncate(limit);
+        let mut bots = bots;
+        bots.truncate(limit);
+        let mut conversation_rows = conversation_rows;
+        conversation_rows.truncate(limit);
+        remote_owners.truncate(limit);
+        let omitted_checks = checks.len().saturating_sub(limit);
+        let mut checks = checks
+            .into_iter()
+            .map(|check| {
+                json!({
+                    "check_id": check.check_id,
+                    "conversation_id": check.conversation_id,
+                    "trigger": check.trigger,
+                    "created_at_ms": check.created_at_ms,
+                    "unknown_reason": "process_unconfirmed",
+                    "codex_turn": check.codex_turn.map(|turn| json!({
+                        "server": turn.server,
+                        "thread": turn.thread,
+                        "turn": turn.turn,
+                    })),
+                })
+            })
+            .collect::<Vec<_>>();
+        checks.truncate(limit);
+        Ok(json!({
+            "schema": WORKSPACE_OVERVIEW_SCHEMA,
+            "generated_at_ms": now_ms(),
+            "network_epoch": owner_epoch,
+            "heads": heads,
+            "consistency": if remote_owners.is_empty() { "local_snapshot" } else { "partial" },
+            "truncated": truncated,
+            "conversations": conversation_rows,
+            "bots": bots,
+            "tasks": tasks,
+            "questions": questions,
+            "checks": checks,
+            "jobs": jobs,
+            "sessions": sessions,
+            "deliveries": deliveries,
+            "relations": relations,
+            "coverage": {
+                "local_heads": true,
+                "remote_owners": remote_owners,
+                "omitted_finished": omitted_finished,
+                "omitted_sessions": omitted_sessions,
+                "omitted_tasks": omitted_tasks,
+                "omitted_questions": omitted_questions,
+                "omitted_jobs": omitted_jobs,
+                "omitted_checks": omitted_checks,
+                "omitted_deliveries": omitted_deliveries,
+                "omitted_relations": omitted_relations,
+            },
+        }))
+    }
     async fn require_scope(&self, access: &Access, scope: &str) -> Result<()> {
         let state = self.membership_state().await?;
         ensure!(
@@ -740,6 +1245,7 @@ impl Runtime {
                 ensure!(access.human, "only clients list open works");
                 Ok(json!({"works":self.store.lock().await.open_works(network)?}))
             }
+            "workspace_overview" => self.workspace_overview(&access, &input).await,
             "message" => self.accept_chat_message(&access, &input).await,
             "set_owner" => {
                 let scope = scope.context("conversation_id is required")?;
