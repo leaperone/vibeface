@@ -377,8 +377,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         let (persist_node, persist_conversation, persist_trigger, persist_attempt, persist_token) =
             (node.clone(), conversation.clone(), trigger.clone(), attempt.id.clone(), token.clone());
         let resumed_thread = claimed.previous_native_id.clone();
-        let (progress_node, progress_network, progress_conversation, progress_trigger, progress_attempt) =
-            (node.clone(), network.clone(), conversation.clone(), trigger.clone(), attempt.id.clone());
+        let (progress_node, progress_network, progress_job, progress_attempt, progress_source) =
+            (node.clone(), network.clone(), job.clone(), attempt.id.clone(), node.identity.device_id()?);
         let progress_text = partial.clone();
         let progress_sequence = std::sync::atomic::AtomicU64::new(0);
         node.store.lock().await.mark_started(&conversation, &trigger, &attempt.id)?;
@@ -410,11 +410,10 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             move |progress| {
                 progress_text.lock().expect("partial text").apply(&progress);
                 let sequence = progress_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                progress_node.publish_progress(&progress_network, json!({
-                    "type":"manager_progress", "conversation_id":progress_conversation,
-                    "trigger":progress_trigger, "invocation_id":progress_attempt,
-                    "source_node":progress_node.identity.device_id().ok(), "sequence":sequence, "progress":progress,
-                }));
+                progress_node.publish_progress(
+                    &progress_network,
+                    progress_event(&progress_job, &progress_attempt, &progress_source, sequence, progress),
+                );
                 async { Ok(()) }
             },
         )
@@ -529,6 +528,27 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     }
     node.publish_changed(&network, &conversation, Changed::Job(&job.trigger));
     final_result.map(Some)
+}
+
+/// What a turn streams. A reply streams into its chat; an agent task's turn is its work's progress,
+/// shown on that work's card and details, so no device takes it for the chat's reply.
+fn progress_event(
+    job: &SchedulerJob,
+    attempt: &str,
+    source: &str,
+    sequence: u64,
+    progress: Value,
+) -> Value {
+    if job.kind == TriggerKind::AgentTask {
+        return json!({
+            "type":"native_progress", "conversation_id":job.conversation_id, "work_id":job.reply_to,
+            "target_node":source, "source_node":source, "sequence":sequence, "progress":progress,
+        });
+    }
+    json!({
+        "type":"manager_progress", "conversation_id":job.conversation_id, "trigger":job.trigger,
+        "invocation_id":attempt, "source_node":source, "sequence":sequence, "progress":progress,
+    })
 }
 
 fn process_recorder(node: &Arc<Runtime>, attempt: &str) -> vibeface_bridge::agent::ProcessStarted {
@@ -1277,6 +1297,45 @@ pub fn tools(kind: TriggerKind) -> BTreeMap<String, CustomToolConfig> {
 mod tests {
     use super::*;
     use crate::tools::Effect;
+
+    #[test]
+    fn an_agent_task_streams_into_its_work_not_the_chat() {
+        let job = |kind, trigger: &str, reply_to: &str| SchedulerJob {
+            conversation_id: "c".into(),
+            trigger: trigger.into(),
+            kind,
+            sequence: 0,
+            basis: Default::default(),
+            reply_to: reply_to.into(),
+            message_id: "reply".into(),
+            state: JobState::Queued,
+        };
+        let text = json!({"type":"text_delta","text":"收到"});
+        let task = progress_event(
+            &job(TriggerKind::AgentTask, "task:w1", "w1"),
+            "a1",
+            "node-b",
+            3,
+            text.clone(),
+        );
+        assert_eq!(
+            task,
+            json!({"type":"native_progress","conversation_id":"c","work_id":"w1","target_node":"node-b",
+                "source_node":"node-b","sequence":3,"progress":text})
+        );
+        let reply = progress_event(
+            &job(TriggerKind::Human, "message:m1", "m1"),
+            "a2",
+            "node-a",
+            1,
+            text.clone(),
+        );
+        assert_eq!(
+            reply,
+            json!({"type":"manager_progress","conversation_id":"c","trigger":"message:m1","invocation_id":"a2",
+                "source_node":"node-a","sequence":1,"progress":text})
+        );
+    }
 
     #[test]
     fn partial_text_keeps_item_order_snapshots_and_deltas() {

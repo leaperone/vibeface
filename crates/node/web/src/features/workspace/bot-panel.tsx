@@ -169,7 +169,7 @@ export function BotPanelButton() {
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}
           <SettingsGroup>
-            <SettingsRow ref={returnFocus("bot")} icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录保留" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
+            <SettingsRow ref={returnFocus("bot")} icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录一并移除" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
               {deleting ? <>
                 <Button type="button" variant="ghost" autoFocus onClick={() => { refocus.current = "bot"; setDeleting(false) }}>取消</Button>
                 <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); toast(`已删除「${bot.name}」`, { tone: "success" }); setOpen(false); void navigate({ to: "/" }) }}>删除</ActionButton>

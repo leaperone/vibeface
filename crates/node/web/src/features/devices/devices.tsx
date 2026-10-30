@@ -198,7 +198,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
 
     {row.kind === "node" && !copied ? row.entry && (canManage || localSession) ? <Section title={terms.ai.label} bare><AiSettings /></Section> : <Section title={terms.ai.label}>
       <div className="grid gap-1">
-        <p>{deviceCopy.botStatus[row.bot ?? "none"]}</p>
+        <p>{deviceCopy.botStatus[deviceCopy.botState(row.bot, row.online)]}</p>
         <p className="text-meta text-muted-foreground">{canManage ? "连到它后才能修改" : `只有${terms.admin.label}能修改`}</p>
         {canManage && saved ? <Button type="button" variant="outline" className="mt-2 w-fit" disabled={action.busy !== null} onClick={() => void action.run("switch", () => device.connect(saved))}><ArrowRightLeft aria-hidden="true" />切换到它</Button> : null}
       </div>

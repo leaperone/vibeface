@@ -20,6 +20,11 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
   return { text, elsewhere: standing !== undefined && mine !== undefined && standing !== mine }
 }
 
+/** An answer that turns the request down, so it reads as refused, not agreed. */
+export const declined = (answer: string) => /^(拒绝|不允许|不同意|不行|不要|否|取消)|^(deny|decline|no)\b/i.test(answer.trim())
+/** How a settled answer reads: a bare refusal says only that; a refusal with words keeps them. */
+export const answerLabel = (answer: string) => declined(answer) ? /^(拒绝|不允许|不同意|不行|不要|否|取消|deny|decline|no)$/i.test(answer.trim()) ? "已拒绝" : `已拒绝 · ${answer}` : `已回答 · ${answer}`
+
 /** Nobody answered it and the device that asked did not close it. */
 export const questionOpen = (question: Question) => question.answer === null && question.closed === null
 

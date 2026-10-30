@@ -93,3 +93,18 @@ test("a bounded overview parser retains unknown and unreachable states", () => {
   assert.equal(overview.coverage.source, "workspace_overview")
   assert.deepEqual(overview.relations, [{ from_work: "child", to_work: "parent", kind: "parent" }])
 })
+
+test("an overview row the Node names only by its conversation shows that conversation's bot and opens its details", () => {
+  const overview = parseWorkspaceOverview({
+    bots: [{ bot_id: "bot-1", conversation_id: "chat", name: "助手" }],
+    tasks: [{ work_id: "work-1", conversation_id: "chat", kind: "task", state: "finished", outcome: "failed", target_node: "worker", failure_reason: "Codex management timed out" }],
+    deliveries: [{ work_id: "work-2", conversation_id: "chat", state: "dispatch_rejected", target_node: "worker", reason: "busy" }],
+  })
+  assert.deepEqual(overview.tasks.map((task) => task.bot?.name), ["助手", "助手"])
+  assert.deepEqual(overview.tasks[0]?.navigation, { bot_id: "bot-1", conversation_id: "chat", work_id: "work-1" })
+})
+
+test("a failed open work stays on the task page", () => {
+  const overview = overviewFromWorkspace({ openWorks: [work({ state: "finished", outcome: "failed", failure_reason: "boom" })], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
+  assert.deepEqual(overview.tasks.map((task) => [task.work_id, task.outcome]), [["work-1", "failed"]])
+})

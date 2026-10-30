@@ -2,13 +2,14 @@
 
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronLeft, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, ChevronLeft, CircleAlert, Hand, LoaderCircle, Plus, RefreshCw, RotateCw, Wifi, WifiOff, type LucideIcon } from "lucide-react"
 import { terms } from "@/lib/glossary"
 import { Popover } from "radix-ui"
 import { cn } from "@/lib/utils"
 import { claimFocus, CountBadge, Dot, EmptyState, PageActionsSlot, PrimaryMark, Skeleton, toast, Wordmark } from "@/components/app/kit"
 import { BotFace, botMood } from "@/components/app/bot-face"
 import { moodLabel } from "@vibeface/client/avatar/mood.ts"
+import type { Mood } from "@vibeface/client/avatar/face.ts"
 import { useOpenJoins } from "@/features/devices/join"
 import { AiOffHint } from "@/features/devices/ai-off-hint"
 import { SecondDeviceHint } from "@/features/devices/second-device"
@@ -45,6 +46,17 @@ export function WorkspaceShell({ children, landing = false }: { children: ReactN
 const CreateBot = createContext<() => void>(() => {})
 /** Opens the new-bot form from anywhere inside the workspace. */
 export const useCreateBot = () => useContext(CreateBot)
+
+const moodIcons: Partial<Record<Mood, LucideIcon>> = { thinking: LoaderCircle, replying: LoaderCircle, waiting: Hand }
+
+/** What a bot is doing beside its name, in words with an icon so the face's color is never the only sign. Idle and offline say nothing here; the face shows offline. */
+export function MoodTag({ mood }: { mood: Mood }) {
+  const Icon = moodIcons[mood]
+  if (!Icon) return moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null
+  return <span className={cn("flex shrink-0 items-center gap-1 text-meta", mood === "waiting" ? "text-warning" : "text-muted-foreground")}>
+    <span className="sr-only">，</span><Icon aria-hidden="true" className={cn("size-3.5", Icon === LoaderCircle && "animate-spin motion-reduce:animate-none")} />{moodLabel[mood]}
+  </span>
+}
 
 const JOINS_SEEN = "vibeface.joins-seen"
 const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
@@ -125,7 +137,8 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
                     <SidebarMenuButton asChild isActive={active} className="h-10 max-md:h-11">
                       <Link to="/b/$botId" params={{ botId: bot.bot_id }} aria-current={active ? "page" : undefined} title={bot.name}>
                         <BotFace bot={bot} mood={mood} size={28} className="size-7!" />
-                        <span className="min-w-0 flex-1 truncate">{bot.name}{moodLabel[mood] ? <span className="sr-only">，{moodLabel[mood]}</span> : null}</span>
+                        <span className="min-w-0 flex-1 truncate">{bot.name}</span>
+                        <MoodTag mood={mood} />
                         {workspace.primary === bot.conversation_id ? <PrimaryMark /> : null}
                         {marked ? <Dot label="有新进展" /> : null}
                       </Link>
@@ -167,7 +180,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
             <Button asChild variant="ghost" size="icon" className="relative">
               <Link to="/devices" aria-label={devicesAttention ? `${terms.myDevices.label}，需要留意` : terms.myDevices.label} title={terms.myDevices.label}>
                 <terms.myDevices.icon aria-hidden="true" />
-                {devicesAttention ? <Dot tone="warning" className="absolute top-1.5 right-1.5 ring-2 ring-background" /> : null}
+                {devicesAttention ? <CircleAlert aria-hidden="true" className="absolute top-1 right-1 size-3! rounded-full bg-background text-warning" /> : null}
               </Link>
             </Button>
             <Button asChild variant="ghost" size="icon"><Link to="/settings" aria-label={terms.settings.label} title={terms.settings.label}><terms.settings.icon aria-hidden="true" /></Link></Button>
@@ -204,7 +217,8 @@ function NavItem({ to, icon: Icon, label, active, badge, dot }: { to: string; ic
         <Icon aria-hidden="true" />
         <span className="flex-1">{label}</span>
         {badge ? <CountBadge count={badge} /> : null}
-        {dot ? <Dot tone="warning" label="需要留意" /> : null}
+        {/* A shape, not only a color, so it reads without telling colors apart. */}
+        {dot ? <CircleAlert role="img" aria-label="需要留意" className="size-4! text-warning" /> : null}
       </Link>
     </SidebarMenuButton>
   </SidebarMenuItem>

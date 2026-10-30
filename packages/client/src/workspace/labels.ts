@@ -93,6 +93,10 @@ export const taskStale = (state: string, connected: boolean) => !connected && ta
 export const staleTaskLabel = "状态未知"
 /** A task that stopped without a cause of its own: stopped by hand, or its device or app went away mid-turn. Nothing redoes it. */
 export const interruptedCopy = { reason: "中途停下了，不会自动重做", resume: "让 Bot 接着做", ask: (title: string) => `接着做「${title}」` }
+/** A task sent to a device that is offline starts once that device is back. */
+export const taskCopy = { away: "离线，上线后开始" }
+/** A task whose outcome is unknown may have done its writes, so the bot checks it rather than running it again. */
+export const uncheckedCopy = { action: "让 Bot 查结果", ask: (title: string) => `看看「${title}」做完了没有，先不要重做` }
 
 // Live progress reports provider words such as "running" or "awaiting_input"; anything unknown reads as plain progress.
 const progressStates: Record<string, string> = {
