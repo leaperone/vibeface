@@ -2610,12 +2610,32 @@ def chat_agent_acceptance(options):
         report["failure"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        cleanup_errors = []
         for node in reversed(nodes):
-            node.client.close()
-            node.stop()
-        stop_fixture_processes(run)
+            for operation, cleanup in (("client.close", node.client.close), ("node.stop", node.stop)):
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_errors.append({"node": node.name, "operation": operation,
+                                           "type": type(error).__name__, "message": str(error)})
+                    if operation == "node.stop" and node.process is not None:
+                        try:
+                            node.stop(crash=True)
+                        except BaseException as error:
+                            cleanup_errors.append({"node": node.name, "operation": "node.stop(crash=True)",
+                                                   "type": type(error).__name__, "message": str(error)})
+        try:
+            stop_fixture_processes(run)
+        except BaseException as error:
+            cleanup_errors.append({"operation": "stop_fixture_processes",
+                                   "type": type(error).__name__, "message": str(error)})
+        if cleanup_errors:
+            report["status"] = "failed"
+            report["cleanup_errors"] = cleanup_errors
         private_json(run / "report.json", report)
         print("REPORT " + str(run / "report.json"), flush=True)
+        if cleanup_errors and "failure" not in report:
+            raise RuntimeError("fixture cleanup failed; see " + str(run / "report.json"))
 
 
 def verify_dag(node, network):

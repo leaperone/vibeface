@@ -202,7 +202,7 @@ impl Store {
         Ok(())
     }
 
-    pub(crate) fn detach_triage_request(&mut self, request: &str) -> Result<()> {
+    pub(crate) fn finish_triage_request(&mut self, request: &str, reviewed: bool) -> Result<()> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -210,6 +210,13 @@ impl Store {
             .into_iter()
             .filter(|row| row.event.request_id.as_deref() == Some(request))
         {
+            if reviewed && row.claim.is_none() {
+                tx.execute(
+                    "DELETE FROM triage_queue WHERE ts_ms=? AND event_id=?",
+                    params![row.event.ts_ms.max(0), row.event.event_id],
+                )?;
+                continue;
+            }
             row.event.request_id = None;
             row.event.hold = None;
             save(&tx, &row)?;

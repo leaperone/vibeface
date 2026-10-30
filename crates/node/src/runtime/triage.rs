@@ -794,14 +794,10 @@ impl Runtime {
                 )
             }
         };
-        let mut store = self.store.lock().await;
-        if by == "fallback" {
-            store.detach_triage_request(request_id)?;
-        } else {
-            store
-                .connection
-                .execute("DELETE FROM triage_queue WHERE request_id=?", [request_id])?;
-        }
+        self.store
+            .lock()
+            .await
+            .finish_triage_request(request_id, by != "fallback")?;
         Ok(outcome)
     }
 
@@ -849,7 +845,7 @@ impl Runtime {
         let mut store = self.store.lock().await;
         for id in lost {
             tracing::info!(event = "request.lost", request = %id, "App Server request lost with its connection");
-            store.detach_triage_request(&id)?;
+            store.finish_triage_request(&id, false)?;
         }
         Ok(())
     }
@@ -1043,9 +1039,7 @@ impl Runtime {
     }
 
     /// Hands waiting events, each with the bot that owns its session, to one turn of the
-    /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`;
-    /// after a complete turn, unreviewed events leave the queue and unattended requests get
-    /// the fallback answer. Failed or unknown turns keep their claimed events fenced.
+    /// coordination Agent. It answers through `vibeface triage` and `vibeface respond`.
     async fn wake_agent(&self) -> Result<()> {
         let Ok(_turn) = self.triage.turn.try_lock() else {
             return Ok(());
@@ -2765,7 +2759,10 @@ pub(super) mod tests {
                 .unwrap()
                 .to_owned();
             let deadline = lock(&node.triage.requests)[&request_id].answer_by_ms;
-            node.store.lock().await.detach_triage_request(&request_id)?;
+            node.store
+                .lock()
+                .await
+                .finish_triage_request(&request_id, false)?;
             node.on_codex_request(&handed).await;
             assert_eq!(
                 lock(&node.triage.requests)[&request_id].answer_by_ms,
@@ -4938,11 +4935,38 @@ pub(super) mod tests {
             let raised = node.triage_command(current.clone()).await?;
             let mut current_response = respond.clone(); current_response["_attempt"] = json!(id);
             assert_eq!(node.triage_command(current_response).await?["answered"], true);
+            let retained = node.store.lock().await.triage_events(Some((&node.boot, &id)))?;
+            assert_eq!(retained.len(), 1, "respond keeps its claimed event until the turn is settled");
+            assert_eq!(retained[0].event_id, held["event_id"].as_str().unwrap());
+            assert!(retained[0].request_id.is_none() && retained[0].hold.is_none());
             assert_eq!(unanswered(&node).await?.len(), 1, "the active claim can ask its question");
             *lock(&node.triage.active) = None;
             assert_eq!(node.triage_command(current).await?, raised, "a late repeated action only reads its original result");
             assert_eq!(unanswered(&node).await?.len(), 1);
             node.store.lock().await.finish_triage(attempt, &Ok(()))?;
+            assert!(node.store.lock().await.unknown_triage_events(None)?.is_empty(), "a complete turn settles the retained response event");
+
+            let failed_response = node.ingest_agent_event(asks_permission("respond-before-failure")).await?;
+            let TriageAdmission::Claimed(attempt) = node.store.lock().await.admit_triage(&network, &node.boot, BATCH, 100, now_ms())? else { bail!("respond before failure claim"); };
+            let failed_id = attempt.id().to_owned();
+            *lock(&node.triage.active) = Some(failed_id.clone());
+            let response = json!({"action":"respond","_attempt":failed_id,"request_id":failed_response["request_id"],"result":{"behavior":"allow"}});
+            let answered = node.triage_command(response.clone()).await?;
+            assert_eq!(answered["answered"], true);
+            let failure = Err(manager::ManagerError {
+                outcome: manager::ManagerFailure::Failed,
+                start: manager::StartEvidence::Started,
+                session_id: Some("fixture-started-turn".into()),
+                failure: vibeface_bridge::failure::ExecFailure::new(vibeface_bridge::failure::FailureKind::Rejected, "fixture failed after responding"),
+            }.into());
+            node.store.lock().await.finish_triage(attempt, &failure)?;
+            *lock(&node.triage.active) = None;
+            let unknown_response = node.store.lock().await.unknown_triage_events(None)?;
+            assert_eq!(unknown_response.len(), 1, "a failed turn retains the already-sent response's claim");
+            assert_eq!(unknown_response[0].event_id, failed_response["event_id"].as_str().unwrap());
+            assert!(unknown_response[0].request_id.is_none() && unknown_response[0].hold.is_none());
+            assert_eq!(node.triage_command(response).await?, answered, "the same process only reads its first response result");
+            assert_eq!(node.triage_status().await?["budget"]["used"], 2, "a model failure after responding keeps its charge");
 
             let unknown = node.ingest_agent_event(turn("uncertain", "t", "/tmp")).await?;
             let held = node.ingest_agent_event(asks_permission("uncertain-request")).await?;
@@ -4957,7 +4981,7 @@ pub(super) mod tests {
                 json!({"action":"respond","request_id":held["request_id"],"_attempt":stale,"result":{"behavior":"allow"}}),
             ] { assert!(node.triage_command(action).await.is_err(), "Unknown rows are fenced even within the same boot"); }
             assert_eq!(unanswered(&node).await?.len(), 1);
-            assert_eq!(lock(&node.triage.answered).len(), 1);
+            assert_eq!(lock(&node.triage.answered).len(), 2);
             *lock(&node.triage.active) = None;
             Ok::<_, anyhow::Error>(())
         }.await;
@@ -4974,6 +4998,15 @@ pub(super) mod tests {
             bot(&node, &admin, "c", "前端", &[]).await?;
             let network = node.network_id().await?;
             let mut calls = coordination_app_server(&node)?;
+            let answered_request = node.ingest_agent_event(asks_permission("respond-before-crash")).await?;
+            let TriageAdmission::Claimed(answered_attempt) = node.store.lock().await.admit_triage(&network, &node.boot, 1, 100, now_ms())? else { bail!("response claim"); };
+            *lock(&node.triage.active) = Some(answered_attempt.id().into());
+            assert_eq!(node.triage_command(json!({"action":"respond","_attempt":answered_attempt.id(),"request_id":answered_request["request_id"],"result":{"behavior":"allow"}})).await?["answered"], true);
+            let retained = node.store.lock().await.triage_events(Some((&node.boot, answered_attempt.id())))?;
+            assert_eq!(retained.len(), 1, "a sent response keeps its durable claim before finish");
+            assert!(retained[0].request_id.is_none());
+            drop(answered_attempt);
+            *lock(&node.triage.active) = None;
             for session in ["before-send", "accepted", "action", "unreviewed", "pending"] {
                 node.ingest_agent_event(turn(session, "t", "/tmp")).await?;
             }
@@ -5013,22 +5046,25 @@ pub(super) mod tests {
             let action = json!({"action":"dismiss","event_id":event,"_attempt":after_action.id()});
             let dismissed = node.triage_command(action.clone()).await?;
             drop(after_action);
-            Ok::<_, anyhow::Error>((action, dismissed))
+            Ok::<_, anyhow::Error>((action, dismissed, answered_request))
         }
         .await;
         let _ = std::fs::remove_file(named_socket(&node));
         drop(node);
         let reopened = Arc::new(Runtime::reopen(&dir).await?);
         let result = async {
-            let (old_action, dismissed) = before?;
+            let (old_action, dismissed, answered_request) = before?;
             with_agent(&reopened);
             let mut calls = coordination_app_server(&reopened)?;
             let status = reopened.triage_status().await?;
-            assert_eq!(status["budget"]["used"], 3, "no crash restores refund authority");
-            assert_eq!(status["unknown_events"], 3, "reserve, accepted and action-before-finish crashes remain observable");
+            assert_eq!(status["budget"]["used"], 4, "no crash restores refund authority");
+            assert_eq!(status["unknown_events"], 4, "reserve, accepted, response and action-before-finish crashes remain observable");
             assert_eq!(status["pending_events"], 1);
             assert_eq!(reopened.triage_command(old_action).await?, dismissed, "a completed action is only read back");
             let unknown = reopened.triage_command(json!({"action":"events"})).await?["unknown_events"].as_array().unwrap().clone();
+            assert!(unknown.iter().any(|event| event["event_id"] == answered_request["event_id"] && event["request_id"].is_null()), "reopening retains the response claim without a reply transport");
+            assert!(lock(&reopened.triage.answered).is_empty());
+            assert!(reopened.triage_command(json!({"action":"respond","request_id":answered_request["request_id"],"result":{"behavior":"allow"}})).await.is_err(), "a restart does not resend the old response");
             for event in &unknown {
                 for action in [
                     json!({"action":"dismiss","event_id":event["event_id"]}),
@@ -5038,8 +5074,8 @@ pub(super) mod tests {
             reopened.wake_agent().await?;
             reopened.wake_agent().await?;
             assert_eq!(turn_starts(&mut calls).len(), 1, "only the positive Pending control starts");
-            assert_eq!(reopened.triage_status().await?["budget"]["used"], 4);
-            assert_eq!(reopened.triage_status().await?["unknown_events"], 3);
+            assert_eq!(reopened.triage_status().await?["budget"]["used"], 5);
+            assert_eq!(reopened.triage_status().await?["unknown_events"], 4);
             assert!(unanswered(&reopened).await?.is_empty(), "no previous action was replayed");
             Ok::<_, anyhow::Error>(())
         }.await;
