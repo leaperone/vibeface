@@ -337,9 +337,10 @@ pub fn write(record: &Record) {
     }
 }
 
-/// Info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. A serving Node
-/// writes structured records to `node.log` and copies text to stderr only on a terminal, so a
-/// service's own stderr file keeps just crashes.
+/// Info for vibeface unless `RUST_LOG` says otherwise. Libraries log at warn for a serving Node
+/// and at error for one-shot commands such as `join`, whose transient iroh warnings read as
+/// failures to the person at the terminal. A serving Node writes structured records to `node.log`
+/// and copies text to stderr only on a terminal, so a service's own stderr file keeps just crashes.
 pub fn init(data_dir: Option<&Path>) {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -348,12 +349,12 @@ pub fn init(data_dir: Option<&Path>) {
         SINK.set(sink.clone()).ok()?;
         Some(sink)
     });
+    let libraries = if data_dir.is_some() { "warn" } else { "error" };
     let terminal = sink.is_none() || std::io::stderr().is_terminal();
     tracing_subscriber::registry()
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,vibeface=info,vibeface_bridge=info")),
-        )
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new(format!("{libraries},vibeface=info,vibeface_bridge=info"))
+        }))
         .with(sink.map(|sink| Layer { sink }))
         .with(terminal.then(|| fmt::layer().with_writer(std::io::stderr)))
         .init();
