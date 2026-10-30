@@ -370,3 +370,56 @@ fn a_name_already_in_the_network_gets_the_next_number_and_a_retry_keeps_it() -> 
     assert!(numbered_from(&cut, &long));
     Ok(())
 }
+
+#[test]
+fn checking_a_link_tells_only_its_holder_whether_join_would_take_it_and_takes_nothing() -> Result<()>
+{
+    let fixture = fixture()?;
+    let joiner = LocalIdentity::generate();
+    let device = joiner.device_id()?;
+    let stranger = LocalIdentity::generate().device_id()?;
+    invite(&fixture, [8; 32])?;
+    let secret = hex::encode([8; 32]);
+    assert_eq!(
+        fixture.store.invite_state(&secret, &device)?,
+        InviteState::Open
+    );
+    assert_eq!(
+        fixture.store.invite_state(&secret, &device)?,
+        InviteState::Open,
+        "checking does not use the link"
+    );
+    assert_eq!(
+        fixture.store.invite_state(&hex::encode([9; 32]), &device)?,
+        InviteState::Expired,
+        "a secret nobody issued reads the same as an expired one"
+    );
+    assert!(fixture.store.invite_state("not-a-secret", &device).is_err());
+
+    let nonce = random_hex(32);
+    fixture
+        .store
+        .join(&request(&joiner, [8; 32], &nonce)?, &device)?;
+    assert_eq!(
+        fixture.store.invite_state(&secret, &device)?,
+        InviteState::Open,
+        "the device that sent the request may still wait on it"
+    );
+    assert_eq!(
+        fixture.store.invite_state(&secret, &stranger)?,
+        InviteState::Used
+    );
+
+    invite(&fixture, [10; 32])?;
+    fixture.store.connection.execute(
+        "UPDATE invites SET expires_at_ms=0 WHERE invite_hash=?",
+        [invite_hash(&[10; 32])],
+    )?;
+    assert_eq!(
+        fixture
+            .store
+            .invite_state(&hex::encode([10; 32]), &device)?,
+        InviteState::Expired
+    );
+    Ok(())
+}

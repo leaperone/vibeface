@@ -47,7 +47,7 @@ const CreateBot = createContext<() => void>(() => {})
 export const useCreateBot = () => useContext(CreateBot)
 
 const JOINS_SEEN = "vibeface.joins-seen"
-const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
+const titles: Record<string, string> = { "/": "消息", "/inbox": terms.inbox.label, "/tasks": terms.task.label, "/devices": terms.myDevices.label, "/settings": terms.settings.label, "/settings/logs": "日志", "/settings/lab": "实验室", "/settings/lab/transfers": "文件传输实验" }
 
 function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: boolean }) {
   const workspace = useWorkspace()
@@ -107,6 +107,7 @@ function WorkspaceLayout({ children, landing }: { children: ReactNode; landing: 
         <SidebarContent className="gap-1 pb-3">
           <SidebarGroup className="pb-0">
             <SidebarMenu>
+              <NavItem to="/tasks" icon={terms.task.icon} label={terms.task.label} active={pathname === "/tasks"} />
               <NavItem to="/inbox" icon={terms.inbox.icon} label={terms.inbox.label} active={pathname === "/inbox"} badge={waiting || undefined} />
             </SidebarMenu>
           </SidebarGroup>

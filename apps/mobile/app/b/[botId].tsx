@@ -9,9 +9,12 @@ import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-cont
 import { useUniwind, withUniwind } from 'uniwind'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { awaitsDevice, botReach, starters } from '@vibeface/client/chat/protocol.ts'
+import { messageTimes } from '@vibeface/client/chat/timeline.ts'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
+import { unreachable } from '@vibeface/client/workspace/home.ts'
 import { botMood, BotFace, ScreenFaces, type FaceBot } from '@/components/bot-face'
+import { OfflineBar } from '@/components/connection-pill'
 import { botTint, EmptyState } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -19,6 +22,7 @@ import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
 import { useLive } from '@/data/live'
 import type { Attachment, ChatMessage, Conversation } from '@/data/types'
+import type { Question } from '@vibeface/client/workspace/types.ts'
 import { Composer } from '@/features/chat/composer'
 import { Message } from '@/features/chat/message'
 import { QuestionCard } from '@/features/chat/question-card'
@@ -28,17 +32,17 @@ import { useWide } from '@/lib/layout'
 import { fadeIn } from '@/lib/motion'
 
 /** One row of the chat: a message, or a question or status line between them. */
-type Entry = { key: string; message: ChatMessage; last: boolean; grouped: boolean } | (Row & { attached?: boolean })
+type Entry = { key: string; message: ChatMessage; time?: string; grouped: boolean } | (Row & { attached?: boolean })
 
 const Fade = withUniwind(Animated.View)
 
 /**
- * Questions sit right before the first message written after them, tasks and changes right after the message that caused
+ * Questions sit right before the first message written after them, 新消息 above what the badge counted, tasks and changes right after the message that caused
  * them and what waits on the person last, as on the web; the newest entry is first for the inverted list.
  */
 function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, bot: FaceBot, offline: boolean): Entry[] {
   const rows: Entry[] = [...extras.first]
-  const questions = [...chat.questions].sort((a, b) => a.created_at_ms - b.created_at_ms)
+  const question = (item: Question): Entry => ({ key: `q:${item.question_id}`, node: <QuestionCard question={item} answer={chat.answers.get(item.question_id)} /> })
   // The streamed reply and the final one share a row key, so the row updates in place instead of remounting and fading in again.
   const turns = new Set<string>()
   const keyOf = (message: ChatMessage) => {
@@ -50,19 +54,17 @@ function entries(chat: Conversation, extras: ReturnType<typeof useChatExtras>, b
   const same = (a: string, b: string) => a.trim() !== '' && b.trim() !== '' && (a.trim().startsWith(b.trim()) || b.trim().startsWith(a.trim()))
   const messages = chat.messages.filter((message) => message.state !== 'streaming' || !message.in_reply_to || !chat.messages.some((other) => other.role === 'assistant'
     && other.state !== 'streaming' && other.in_reply_to === message.in_reply_to && same(other.text, message.text)))
-  messages.forEach((message, index) => {
-    while (questions.length && questions[0].created_at_ms < message.created_at_ms) {
-      const question = questions.shift()!
-      rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
-    }
-    const next = messages[index + 1]
-    // The time closes a burst: the newest message, or one followed by a quiet spell, not every turn.
+  const times = messageTimes(messages.filter((message) => !message.state && !chat.hidden.has(message.message_id)), Date.now())
+  for (const message of messages) {
+    rows.push(...(chat.before.get(message.message_id) ?? []).map(question))
     const previous = rows.at(-1)
-    const grouped = previous !== undefined && 'message' in previous && !previous.last && previous.message.role === message.role
-    rows.push({ key: keyOf(message), message, last: !next || next.created_at_ms - message.created_at_ms > 5 * 60_000, grouped })
+    const grouped = previous !== undefined && 'message' in previous && !previous.time && previous.message.role === message.role
+    if (!chat.hidden.has(message.message_id)) rows.push({ key: keyOf(message), message, time: times.get(message.message_id), grouped })
     rows.push(...(extras.after.get(message.message_id) ?? []).map((row) => ({ ...row, attached: true })))
-  })
-  for (const question of questions) rows.push({ key: `q:${question.question_id}`, node: <QuestionCard question={question} /> })
+  }
+  rows.push(...chat.rest.map(question))
+  const unreadAt = rows.findIndex((row) => ('message' in row ? row.message.message_id : row.key) === chat.unread)
+  if (unreadAt >= 0) rows.splice(unreadAt, 0, { key: 'unread', node: <View className="flex-row items-center gap-3"><View className="h-px flex-1 bg-primary/40" /><Text className="text-meta text-primary">新消息</Text><View className="h-px flex-1 bg-primary/40" /></View> })
   rows.push(...extras.rest)
   if (chat.replying && !chat.messages.some((message) => message.state === 'streaming')) rows.push({
     key: 'activity',
@@ -114,6 +116,13 @@ export default function ChatScreen() {
   }, [awaiting, starting]))
   const keyboard = useReanimatedKeyboardAnimation()
   const list = useRef<FlatList<ReturnType<typeof entries>[number]>>(null)
+  // Opening a chat with 新消息 brings it to the top of the screen, the unread under it.
+  const unreadIndex = useRef(-1)
+  const toUnread = (index: number) => list.current?.scrollToIndex({ index, viewPosition: 1, animated: false })
+  useEffect(() => {
+    const index = unreadIndex.current
+    if (index >= 0) requestAnimationFrame(() => toUnread(index))
+  }, [id, Boolean(chat?.unread)])
   // A failed send hands the draft back, but its outbox copy may still go out on its own; once it lands the draft is
   // cleared if untouched, so a second tap never posts it twice. Until then a resend reuses the pending message.
   const unsettled = useRef<{ text: string; seen: number } | null>(null)
@@ -128,7 +137,7 @@ export default function ChatScreen() {
   const above = useAnimatedStyle(() => ({ paddingBottom: Math.max(0, Math.abs(keyboard.height.value) - insets.bottom) }))
 
   if (!bot || !id) return <EmptyState icon={Bot} title={botCopy.notFound} className="flex-1 justify-center" />
-  const offline = workspace.connection.state === 'offline'
+  const offline = unreachable(device.link)
   const blocked = offline ? '离线，恢复后可发送' : chat?.blocked ?? (chat ? null : '稍等')
   const send = () => {
     const { text, files } = draft
@@ -140,6 +149,7 @@ export default function ChatScreen() {
     workspace.actions.send(id, text.trim(), files).catch(() => { unsettled.current = { text: text.trim(), seen: sent(text.trim()) }; setDraft({ text, files }) }).finally(() => setLaunching(false))
   }
   const rows = chat ? entries(chat, extras, bot, offline) : []
+  unreadIndex.current = rows.findIndex((row) => row.key === 'unread')
   const mood = offline ? 'asleep' : botMood(bot, workspace, live)
   // The bot's hue carries from its face into the send button and starter chips, so each chat reads as that bot's.
   const tint = botTint(faceOf(bot.bot_id, bot.avatar).hue, theme === 'dark')
@@ -168,6 +178,10 @@ export default function ChatScreen() {
       data={rows}
       inverted
       keyExtractor={(row) => row.key}
+      onScrollToIndexFailed={({ index, averageItemLength }) => {
+        list.current?.scrollToOffset({ offset: averageItemLength * index, animated: false })
+        setTimeout(() => toUnread(index), 100)
+      }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
       renderScrollComponent={(props) => <KeyboardChatScrollView {...props} inverted offset={insets.bottom} keyboardLiftBehavior="whenAtEnd" />}
@@ -176,7 +190,7 @@ export default function ChatScreen() {
       ListFooterComponent={<View style={{ height: header }} />}
       // Inverted, so the leading item is the lower one: a card caused by the message above it stays close to it.
       ItemSeparatorComponent={({ leadingItem }: { leadingItem: Entry }) => <View className={'grouped' in leadingItem && leadingItem.grouped ? 'h-2' : 'attached' in leadingItem && leadingItem.attached ? 'h-3' : 'h-6'} />}
-      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} last={item.last} offline={offline} /> : <>{item.node}</>}
+      renderItem={({ item }) => 'message' in item ? <Message message={item.message} bot={bot} time={item.time} offline={offline} /> : <>{item.node}</>}
     />
     {rows.length ? null : <Animated.View pointerEvents="box-none" style={[StyleSheet.absoluteFill, { paddingTop: header }, above]}>
       <View pointerEvents="box-none" className="flex-1 items-center justify-center gap-4 px-4">
@@ -201,6 +215,7 @@ export default function ChatScreen() {
     </View></ScreenFaces>
     <KeyboardStickyView offset={{ closed: 0, opened: insets.bottom }}>
       <View style={{ paddingBottom: insets.bottom }}>
+        <OfflineBar chat className="mx-4 mb-2 self-center" />
         <Composer value={draft.text} onChange={(text) => setDraft({ text })} files={draft.files} onFiles={(files) => setDraft({ files })}
           blocked={blocked} sending={launching || (chat?.sending ?? false)} onSend={send} onStop={chat?.stoppable ? () => void workspace.actions.stop(id) : undefined} tint={tint} />
       </View>

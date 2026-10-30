@@ -3571,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "vibeface-secure"
-version = "0.0.1-nightly.20261030.5"
+version = "0.0.1-nightly.20261031.3"
 dependencies = [
  "anyhow",
  "argon2",

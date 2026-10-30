@@ -734,7 +734,7 @@ pub(crate) fn chain_depth(
     Ok(MAX_CHAIN_DEPTH)
 }
 
-/// A time this long before a schedule's last change still runs, so "starting now" runs now;
+/// A time this long before a schedule's first local observation still runs, so "starting now" runs;
 /// anything older waits for the next time, so resuming never runs a missed one.
 const LATE_START_MS: i64 = 5 * 60_000;
 
@@ -777,7 +777,7 @@ fn taken_over_at(
         return Ok(None);
     }
     let mut statement = connection.prepare(
-        "SELECT created_at_ms,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='conversation_owner'",
+        "SELECT seen_at_ms,envelope FROM events WHERE network_id=? AND scope_id=? AND kind='conversation_owner' AND effective=1",
     )?;
     let mut rows = statement.query(params![network, conversation])?;
     let mut since: Option<i64> = None;
@@ -1332,6 +1332,11 @@ impl Store {
 
     pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
         query_jobs(&self.connection, "conversation_id=?", [conversation])
+    }
+
+    /// All local scheduler rows for bounded, read-only workspace projections.
+    pub fn scheduler_jobs_all(&self) -> Result<Vec<SchedulerJob>> {
+        query_jobs(&self.connection, "1", [])
     }
 
     /// Each busy conversation on this device; a reply running outranks messages still waiting.

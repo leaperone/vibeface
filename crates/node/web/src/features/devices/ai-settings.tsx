@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { botOnChange, folderSuggestions, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -215,6 +216,16 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       return null
     }
   }
+  // The bot's provider may list its models; until it answers, or when it cannot, the model stays a text field.
+  const [models, setModels] = useState<{ provider: ProviderId; list: ModelChoice[] } | null>(null)
+  const botProvider = response?.providers.find((item) => item.roles.includes("agent"))
+  useEffect(() => {
+    if (!ready?.isCurrent() || botProvider?.state !== "ready") return
+    let live = true
+    const provider = botProvider.provider
+    ready.request("provider_models", { provider }).then(parseProviderModels).then((list) => { if (live) setModels(list ? { provider, list } : null) }, () => {})
+    return () => { live = false }
+  }, [ready, botProvider?.provider, botProvider?.state])
   const starting = response?.providers.some((item) => item.state === "starting")
   const botOn = response?.providers.some((item) => item.roles.includes("agent")) ?? false
   useEffect(() => { onBot?.(botOn) }, [botOn])
@@ -231,7 +242,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
   if (!response) return error ? <InlineError error={error.cause} action={{ label: "重试", onClick: () => void load() }} /> : <div className="grid gap-2"><Skeleton className="h-14" /><Skeleton className="h-14" /></div>
   const { roots, manager } = response.settings
   const { shown, folded } = providerGroups(response.providers)
-  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy}
+  const card = (item: ProviderStatus) => <ProviderCard key={item.provider} item={item} response={response} onboarding={onboarding} busy={busy} models={models?.provider === item.provider ? models.list : null}
     error={error?.at === item.provider ? error.cause : null} test={test} reconcile={reconcile}
     change={(key, value) => call(`${item.provider}:${key}`, item.provider, "configure_provider", { provider: item.provider, ...value })}
     saveBot={(next) => call(`${item.provider}:bot_details`, item.provider, "configure_node", { roots, manager: next })} />
@@ -253,7 +264,7 @@ export function AiSettings({ onboarding = false, onBot }: { onboarding?: boolean
       </details></li> : null}
     </ul>
     </div>
-    {onboarding && !botOn ? <BotHint /> : <Folders roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
+    {onboarding && !botOn ? <BotHint /> : <Folders later={onboarding} roots={roots} suggested={folderSuggestions(response)} display={response.display_paths} busy={busy !== ""} save={(next) => void call("roots", "roots", "configure_node", { roots: next, manager })} />}
     {error && (error.at === "roots" || error.at === null) ? <InlineError error={error.cause} /> : null}
   </div>
 }
@@ -283,8 +294,8 @@ function RoleToggle({ role, name, pressed, busy, disabled, onClick }: { role: ke
   </Button>
 }
 
-function ProviderCard({ item, response, onboarding, busy, error, change, saveBot, test, reconcile }: {
-  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; error: unknown
+function ProviderCard({ item, response, onboarding, busy, models, error, change, saveBot, test, reconcile }: {
+  item: ProviderStatus; response: NodeSettingsResponse; onboarding: boolean; busy: string; models: ModelChoice[] | null; error: unknown
   change(key: string, value: Omit<Change, "provider">): Promise<boolean>; saveBot(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>; reconcile(): Promise<void>
 }) {
   const name = providerNames[item.provider], Icon = providerIcons[item.provider]
@@ -326,7 +337,37 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
   const addName = newName.trim().toUpperCase()
   // The Codex folder shows with the App Server above.
   const env = item.env.filter((row) => row.name !== "CODEX_HOME")
+  // The keys a provider needs show by default; the rest of its variables wait under 高级.
+  const keys = env.filter((row) => row.required), others = env.filter((row) => !row.required)
+  const advancedIssue = Boolean(issue && issue.code !== "env_missing")
 
+  // `friendly`: a key the provider needs, named after its service in the default view; any other variable shows as it is named.
+  const envRow = (row: (typeof env)[number], friendly: boolean) => {
+    const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
+    return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
+              <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
+                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
+                {friendly ? <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-meta" title={row.name}><terms.secret.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />{keyName(row.name)}</span>
+                  : <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>}
+                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
+                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
+                  data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
+                {!row.set ? null : deleting === row.name ? <>
+                  <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
+                  <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
+                </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
+                  onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}
+              </div>
+              {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
+                event.preventDefault()
+                void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
+              }}>
+                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
+                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
+                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
+              </form> : null}
+            </li>
+  }
   return <li>
     <div className="flex min-h-14 flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2">
       <div className="flex items-center gap-3">
@@ -362,38 +403,22 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
+        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["model"]} manager={manager} models={models} display={display} working={working}
+          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
+        {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
+
+        {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}
+        <Details label="高级" open={advancedIssue || undefined}>
+        <div className="grid gap-4 pt-1 text-foreground">
         {serverSettings}
 
-        {manager ? <BotDetails key={JSON.stringify(manager)} manager={manager} display={display} working={working}
+        {manager ? <BotDetails key={JSON.stringify(manager)} fields={["workspace"]} manager={manager} display={display} working={working}
           busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
 
         <div className="grid gap-2">
           <p className="text-meta font-medium text-muted-foreground">环境变量</p>
-          {env.length ? <ul className="grid gap-1">{env.map((row) => {
-            const missing = item.state === "needs_setup" && !row.set && !row.inherited && row.required
-            return <li key={row.name} className="grid gap-2 rounded-lg bg-muted/60 py-1 ps-3 pe-1">
-              <div className="flex min-h-8 min-w-0 flex-wrap items-center gap-x-2">
-                {deleting === row.name && row.set ? <span className="order-first basis-full pt-2 text-meta text-foreground">删除后 Bot 用不到它</span> : null}
-                <span className="min-w-0 flex-1 truncate font-mono text-meta" title={row.name}>{row.name}</span>
-                <span className={cn("shrink-0 text-meta", missing ? "text-warning" : "text-muted-foreground")}>{row.set ? "••••••" : row.inherited ? "沿用本机" : "未填"}</span>
-                {deleting === row.name && row.set ? null : <Button type="button" variant="ghost" size="icon" aria-label={`${row.set ? "替换" : "填写"} ${row.name}`} title={row.set ? "替换" : "填写"} disabled={working}
-                  data-fix={missing ? "" : undefined} onClick={() => { setEditing(row.name); setValue("") }}><Pencil aria-hidden="true" /></Button>}
-                {!row.set ? null : deleting === row.name ? <>
-                  <Button type="button" size="sm" variant="ghost" autoFocus onClick={() => setDeleting(null)}>取消</Button>
-                  <Button type="button" size="sm" variant="destructive" disabled={working} onClick={() => { setDeleting(null); void setVariable(`env:${row.name}`, row.name, null) }}>删除</Button>
-                </> : <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${row.name}`} title="删除" disabled={working}
-                  onClick={() => setDeleting(row.name)}><Trash2 aria-hidden="true" /></Button>}
-              </div>
-              {editing === row.name ? <form className="flex min-w-0 gap-2" onSubmit={(event) => {
-                event.preventDefault()
-                void setVariable(`env:${row.name}`, row.name, value).then((ok) => { if (ok) { setEditing(null); setValue("") } })
-              }}>
-                <Input type="password" autoComplete="off" autoFocus aria-label={`${row.name} 的值`} className="min-w-0 bg-background" maxLength={4096} value={value} onChange={(event) => setValue(event.target.value)} />
-                <Button type="submit" variant="outline" disabled={working || !value}><BusyIcon busy={busy === `${item.provider}:env:${row.name}`} />保存</Button>
-                <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" onClick={() => { setEditing(null); setValue("") }}><X aria-hidden="true" /></Button>
-              </form> : null}
-            </li>
-          })}</ul> : null}
+          {others.length ? <ul className="grid gap-1">{others.map((row) => envRow(row, false))}</ul> : null}
+
           <form className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,11rem)_minmax(0,1fr)_auto]" onSubmit={(event) => {
             event.preventDefault()
             void setVariable("add", addName, newValue).then((ok) => { if (ok) { setNewName(""); setNewValue("") } })
@@ -407,6 +432,8 @@ function ProviderCard({ item, response, onboarding, busy, error, change, saveBot
           <p className="text-meta text-muted-foreground">只存在这台电脑上，保存后看不到原值</p>
           {item.app_server?.mode === "system" ? <p className="text-meta text-muted-foreground">用已在运行的 Codex 时，这些变量不生效</p> : null}
         </div>
+        </div>
+        </Details>
         {issue?.code === "launch_failed" ? <Details label="启动失败原因"><code className="font-mono">{issue.detail}</code></Details> : null}
       </div>
     </details>}
@@ -448,12 +475,18 @@ function BotHint() {
 }
 
 const botFields = ["model", "workspace"] as const
+/** The model option that opens the text field; no provider names a model this way. */
+const other = "\u0000other"
 
 /** The bot's model and folder, inside the settings of the provider it runs on. */
-function BotDetails({ manager, display, working, busy, save }: { manager: ManagerSettings; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
+function BotDetails({ fields, manager, models = null, display, working, busy, save }: { fields: (typeof botFields)[number][]; manager: ManagerSettings; models?: ModelChoice[] | null; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
+  const copy = deviceCopy.botModel
+  // A model the list does not have stays typed in; 其他 opens the same field.
+  const [chosen, setTyping] = useState<boolean | null>(null)
+  const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const dirty = botFields.some((key) => draft[key] !== manager[key])
+  const dirty = fields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
       onChange: (event: ChangeEvent<HTMLInputElement>) => setDraft({ ...draft, [key]: event.target.value }) }
@@ -463,18 +496,31 @@ function BotDetails({ manager, display, working, busy, save }: { manager: Manage
     event.preventDefault()
     void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim() })
   }}>
-    <p className="text-meta font-medium text-muted-foreground">{terms.bot.label}</p>
-    {field("model", "模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}
-    {field("workspace", folderLabels.botRun)}
+    {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
+      <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
+        onChange={(event) => { const model = event.target.value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model }) }}>
+        <NativeSelectOption value="">{copy.default}</NativeSelectOption>
+        {models.map((model) => <NativeSelectOption key={model.id} value={model.id}>{model.name}</NativeSelectOption>)}
+        <NativeSelectOption value={other}>{copy.other}</NativeSelectOption>
+      </NativeSelect>
+    </label> : <div className="flex min-w-0 items-end gap-2">
+      <div className="min-w-0 flex-1">{field("model", copy.label, { placeholder: cursor ? "auto" : copy.default, required: cursor, plain: true })}</div>
+      {models ? <Button type="button" variant="ghost" size="icon" aria-label={copy.pick} title={copy.pick} disabled={working}
+        onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
+    </div> : null}
+    {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
     {dirty ? <Button type="submit" variant="outline" className="w-fit" disabled={working}><BusyIcon busy={busy} />保存</Button> : null}
   </form>
 }
 
-function Folders({ roots, suggested, display, busy, save }: { roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
+function Folders({ later, roots, suggested, display, busy, save }: { later: boolean; roots: string[]; suggested: { path: string; label: string }[]; display: Display; busy: boolean; save(roots: string[]): void }) {
   const [folder, setFolder] = useState("")
   const add = () => { const path = folder.trim(); setFolder(""); if (path && !roots.includes(path)) save([...roots, path]) }
   return <section className="grid gap-2">
-    <h3 className="px-1 text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
+    <div className="grid gap-0.5 px-1">
+      <h3 className="text-meta font-medium text-muted-foreground">{terms.folders.label}</h3>
+      <p className="text-meta text-muted-foreground">{deviceCopy.folders(later)}</p>
+    </div>
     <div className="grid gap-2 rounded-xl border bg-card p-3 shadow-xs">
     {roots.length ? <ul className="grid gap-1">{roots.map((root) => <li key={root} className="flex min-h-9 min-w-0 items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <FolderOpen aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />

@@ -323,6 +323,25 @@ impl Store {
         network_id: &str,
         envelopes: &[SignedEvent],
     ) -> Result<Ingested> {
+        self.ingest_events_with_seen_at(network_id, envelopes, crate::runtime::now_ms())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingest_events_at(
+        &mut self,
+        network_id: &str,
+        envelopes: &[SignedEvent],
+        seen_at_ms: i64,
+    ) -> Result<Ingested> {
+        self.ingest_events_with_seen_at(network_id, envelopes, seen_at_ms)
+    }
+
+    fn ingest_events_with_seen_at(
+        &mut self,
+        network_id: &str,
+        envelopes: &[SignedEvent],
+        seen_at_ms: i64,
+    ) -> Result<Ingested> {
         ensure!(envelopes.len() <= 1024, "event batch is too large");
         let tx = self
             .connection
@@ -331,7 +350,7 @@ impl Store {
         let mut placed = log::Placed::default();
         let statuses = envelopes
             .iter()
-            .map(|envelope| log::ingest_from(&tx, &view, envelope, &mut placed))
+            .map(|envelope| log::ingest_from(&tx, &view, envelope, seen_at_ms, &mut placed))
             .collect::<Result<Vec<_>>>()?;
         let rebuilt = placed.stale && log::recompute(&tx, &view)?;
         tx.commit()?;

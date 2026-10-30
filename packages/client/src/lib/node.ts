@@ -237,6 +237,17 @@ function parseIssue(value: unknown): ProviderIssue {
     default: throw new Error('AI 状态格式不对。')
   }
 }
+/** A model a provider offers; `id` is what the bot's model setting stores. */
+export type ModelChoice = { id: string; name: string; default: boolean }
+/** `provider_models`: the provider's own list, or `null` when it lists none, so the field stays free text. */
+export function parseProviderModels(value: unknown): ModelChoice[] | null {
+  const v = record(value, '模型列表')
+  if (v.models === null || v.models === undefined) return null
+  const models = array(v.models).map((item) => { const model = record(item, '模型'); return { id: text(model.id), name: text(model.name), default: model.default === true } })
+  return models.length ? models : null
+}
+/** Whether `model` is typed rather than picked: it is set and the list does not have it. */
+export const modelTyped = (model: string, models: ModelChoice[] | null) => Boolean(model) && !models?.some((choice) => choice.id === model)
 export function parseAppServerLink(value: unknown): AppServerLink {
   const v = record(value, 'App Server 状态')
   switch (v.state) {

@@ -17,9 +17,12 @@ const MAX_VARIABLES: usize = 64;
 const CURSOR_KEY: &str = "CURSOR_API_KEY";
 
 /// A coding agent product: what a bot runs on, what dispatched work runs on, or whose session
-/// the Node watches. Its methods say what the runtime needs to know about the product; besides
-/// them, only the code that speaks a provider's protocol matches on it: its `Executor`, its bot
-/// turn's `Sdk` and its hook parser.
+/// the Node watches. Its methods say most of what the runtime needs to know about the product;
+/// the code that speaks a provider's protocol also matches on it: its `Executor` and the resident
+/// process the runtime keeps for it, its bot turn's `Sdk` and its hook parser. What only Codex has
+/// also names it: its folder (discovery, its hook file), its App Server (whose connection, and
+/// whether Codex executes work, the capabilities a Node offers report), and its being the default
+/// provider of a new bot.
 #[derive(
     Clone,
     Copy,
@@ -55,7 +58,7 @@ pub enum Role {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Watch {
     /// `vibeface hook <provider>` on these events of a JSON hook file, relative to the home
-    /// directory.
+    /// directory; Codex's is relative to its own folder.
     Hooks {
         file: &'static str,
         events: &'static [&'static str],
@@ -166,6 +169,18 @@ impl Provider {
         }
     }
 
+    /// A bot on the provider runs only on a model it is given; the others have a default.
+    pub fn needs_model(self) -> bool {
+        self == Provider::Cursor
+    }
+
+    /// Each bot on the provider runs in a resident instance of its own, with a private store under
+    /// the data directory (see `CursorInstance`), and each of its turns takes a new tool token
+    /// rather than the one its previous turn had.
+    pub fn instance_per_bot(self) -> bool {
+        self == Provider::Cursor
+    }
+
     /// A Codex bot runs its turns on this Node's App Server, which must be up first.
     pub fn on_app_server(self) -> bool {
         self.sessions() == Sessions::AppServer
@@ -254,7 +269,7 @@ impl Provider {
     pub fn watch(self) -> Option<Watch> {
         match self {
             Provider::Codex => Some(Watch::Hooks {
-                file: ".codex/hooks.json",
+                file: "hooks.json",
                 events: &["Stop", "PermissionRequest"],
             }),
             Provider::Claude => Some(Watch::Hooks {

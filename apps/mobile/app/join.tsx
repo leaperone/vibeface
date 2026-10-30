@@ -1,9 +1,9 @@
 import * as Clipboard from 'expo-clipboard'
-import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
-import { humanError } from '@vibeface/client/lib/errors.ts'
+import { openURL, useLinkingURL } from 'expo-linking'
+import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { humanError, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
-import { View } from 'react-native'
+import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import Animated from 'react-native-reanimated'
 import { SafeAreaView } from 'react-native-safe-area-context'
@@ -53,10 +53,13 @@ export default function JoinScreen() {
         : session.phase === 'joining' ? <Waiting code={session.code} onCancel={workspace.actions.cancelJoin} />
         : lane === 'recovery' ? <Panel icon={ArchiveRestore} title="用恢复文件找回"><RecoveryRestore link={url} /></Panel>
         : <JoinForm />}
-      {choosing ? <View className="border-t border-border pt-4">
+      {choosing ? <View className="gap-1 border-t border-border pt-4">
         {lane === 'recovery'
           ? <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('invite')}><Icon as={Link2} /><Text>{joinCopy.byLink}</Text></Button>
-          : <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>}
+          : <>
+            <NoComputer />
+            <Button variant="ghost" className="-ms-3 self-start" onPress={() => setLane('recovery')}><Icon as={ArchiveRestore} /><Text>用恢复文件找回</Text></Button>
+          </>}
       </View> : null}
     </KeyboardAwareScrollView>
   </SafeAreaView>
@@ -72,6 +75,19 @@ function Wordmark() {
     </Svg>
     <Text role="heading" className="text-title font-semibold tracking-tight">Vibeface</Text>
   </View>
+}
+
+/** A first phone with no computer yet: Vibeface runs on a computer first, and its 添加设备 brings the phone in. */
+function NoComputer() {
+  return <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})}
+    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-accent">
+    <Icon as={Laptop} />
+    <View className="min-w-0 flex-1">
+      <Text className="font-medium">{joinCopy.noComputer}</Text>
+      <Text className="text-meta text-muted-foreground">{joinCopy.installFirst}</Text>
+    </View>
+    <Icon as={ExternalLink} className="size-4 text-muted-foreground" />
+  </Pressable>
 }
 
 /** The phone's device key is gone; starting over makes a new one, then it joins again by link or recovery file. */
@@ -93,10 +109,13 @@ function JoinForm() {
   const device = useDevice()
   const url = useLinkingURL()
   const [invitation, setInvitation] = useState('')
+  // An error belongs to the link it was about: a new one, typed, pasted, scanned or opened, starts clean.
+  const [edited, setEdited] = useState(false)
+  const edit = (text: string) => { setInvitation(text); setError(''); setEdited(true) }
   // Every new `vibeface://join?link=` refills the field, also the one a network switch erased the phone for.
   useEffect(() => {
     const link = openedLink(url)
-    if (link && link !== spent) setInvitation(link)
+    if (link && link !== spent) edit(link)
   }, [url])
   const [name, setName] = useState(defaultName)
   const [scanning, setScanning] = useState(false)
@@ -110,16 +129,28 @@ function JoinForm() {
     catch (caught) { setError(humanError(caught instanceof Error ? caught.message : '', undefined, '这次加入')) }
     finally { setBusy(false) }
   }
-  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { setInvitation(link); setScanning(false) }} />
-  const ready = invitation.trim() !== ''
+  // Checked as it changes, as on the web, down to a ticket that decodes: only a real join link counts as filled, so typing
+  // or any other text keeps the field.
+  const ready = device.linkTarget(invitation) !== null
+  // A used or expired link says so as it opens, before the name and 加入; no answer leaves the form as it is.
+  useEffect(() => {
+    if (!ready) return
+    let live = true
+    void device.checkInvite(invitation.trim()).then((state) => {
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+    })
+    return () => { live = false }
+  }, [invitation, ready])
+  if (scanning) return <Scanner title={joinCopy.scan} onCancel={() => setScanning(false)} onScanned={(link) => { edit(link); setScanning(false) }} />
+  const invalid = !ready && invitation.trim() !== ''
   // A join that fails after it started remounts this form, so its own error is gone; the shared one says why, as on the web.
-  const failure = error || device.error
+  const failure = error || (edited ? '' : device.error)
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
     <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
       <Icon as={Link2} className="text-muted-foreground" />
       <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
-      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => edit('')}><Icon as={X} /></Button>
     </View>
     <View className="gap-2">
       <Text className="text-meta font-medium text-muted-foreground">{joinCopy.deviceName}</Text>
@@ -134,12 +165,21 @@ function JoinForm() {
     <Button onPress={() => setScanning(true)}><Icon as={Camera} /><Text>{joinCopy.scan}</Text></Button>
     <View className="gap-2">
       <Textarea accessibilityLabel="加入链接" placeholder={joinCopy.paste} autoCapitalize="none" autoCorrect={false} numberOfLines={4}
-        className="min-h-20 font-mono text-meta" value={invitation} onChangeText={setInvitation} />
-      <Button variant="ghost" className="-ms-3 self-start" onPress={async () => setInvitation((await Clipboard.getStringAsync()).trim())}>
-        <Icon as={ClipboardPaste} /><Text>粘贴</Text>
-      </Button>
+        className="min-h-20 font-mono text-meta" value={invitation} onChangeText={edit} />
+      {invalid ? <ErrorText error={joinCopy.notLink} /> : null}
+      <Paste onText={(text) => edit(text.trim())} />
     </View>
   </View>
+}
+
+/** iOS's own paste control reads the clipboard without asking each time; elsewhere a button reads it. */
+function Paste({ onText }: { onText: (text: string) => void }) {
+  const [fill, ink] = useCSSVariable(['--muted', '--foreground']) as [string, string]
+  if (Clipboard.isPasteButtonAvailable) return <Clipboard.ClipboardPasteButton acceptedContentTypes={['plain-text', 'url']} backgroundColor={fill} foregroundColor={ink}
+    cornerStyle="medium" style={{ alignSelf: 'flex-start', height: 44, width: 104 }} onPress={(data) => { if (data.type === 'text') onText(data.text) }} />
+  return <Button variant="ghost" className="-ms-3 self-start" onPress={async () => onText(await Clipboard.getStringAsync())}>
+    <Icon as={ClipboardPaste} /><Text>粘贴</Text>
+  </Button>
 }
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {

@@ -17,7 +17,7 @@ import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLa
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
-import { agentName, awaitsAnswer, foldAnswers, placeByTime, projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
+import { agentName, awaitsAnswer, foldAnswers, questionOpen, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { firstLine } from '@/lib/markdown'
 import { RecoveryAlert } from '@/features/identity/recovery-controls'
 import { providerIcons } from '@/features/devices/ai-settings'
@@ -26,7 +26,8 @@ import { ChangeCard } from './change-card'
 import { Chat, type ChatEntry } from './elements/chat'
 import type { ChatMessage } from './elements/message'
 import { PromptInput } from './elements/prompt-input'
-import { awaitsDevice, botReach, canSend, composerHint, starters, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, starters } from '@vibeface/client/chat/protocol.ts'
+import { chatTimeline, firstUnread } from '@vibeface/client/chat/timeline.ts'
 import './chat.css'
 
 const busyStates = ['pending_delivery', 'queued', 'steering', 'claimed', 'running', 'cancelling']
@@ -100,8 +101,9 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   // Questions, hand-offs and messages to other bots sit where they happened as rows, not bubbles; an answer shows inside its question.
   const questions = data?.questions ?? []
   const folded = foldAnswers(data?.messages ?? [], questions)
-  const asides = placeByTime(data?.messages ?? [], [
-    ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
+  const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
+  const timeline = chatTimeline(data?.messages ?? [], [
+    ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
     ...(data?.sessions ?? []).map((session) => ({ key: `session:${session.node}:${session.session_id}`, created_at_ms: session.created_at_ms, node: <SessionRow session={session} /> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
   ])
@@ -116,12 +118,11 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const queued = new Set(replying ? jobs.filter((job) => job.message_id && ['pending_delivery', 'queued', 'steering'].includes(job.state)).map((job) => job.message_id) : [])
   // Steering already went into the running reply; it only settles once that reply ends.
   const merging = new Set(jobs.filter((job) => job.state === 'steering').map((job) => job.message_id))
-  const merged = new Map(jobs.filter((job) => job.state === 'steered').map((job) => [job.message_id, job.outcome]))
   const entries: ChatEntry[] = placedChanges.first.map(changeRow)
   const waiting: ChatEntry[] = []
-  for (const message of threadReplies(data?.messages ?? [], merged)) {
+  for (const message of timeline.messages) {
     const start = entries.length
-    for (const aside of asides.before.get(message.message_id) ?? []) entries.push(aside)
+    for (const aside of timeline.before.get(message.message_id) ?? []) entries.push(aside)
     const schedule = message.role === 'assistant' ? scheduleTrigger(message.in_reply_to) : null
     const detail = jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail
     if (schedule) {
@@ -141,7 +142,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
     for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
     if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
-  entries.push(...asides.rest)
+  entries.push(...timeline.rest)
   for (const reply of workspace.interrupted) if (!reply.after || !data?.messages.some((message) => message.message_id === reply.after)) entries.push(pendingRow(interruptedRow(reply)))
   for (const task of tasks) if (!placed.has(task.id)) entries.push(...taskRows(task))
   if (messagePending && !data?.messages.some((message) => message.message_id === messagePending.message_id)) entries.push(pendingRow({ message_id: messagePending.message_id, event_hash: messagePending.message_id, role: 'user', text: messagePending.text, created_at_ms: 0, state: 'sending' }))
@@ -162,6 +163,10 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   if (botBusy && !live.length && !asked) entries.push({ key: 'activity', node: <p role="status" className="flex min-h-7 items-center gap-2 text-meta text-muted-foreground">{stopping ? <><CircleStop aria-hidden="true" className="size-4" />正在停止…</>
     : <>{bot ? <BotFace bot={bot} mood={workspace.connectionOnline ? 'thinking' : 'asleep'} size={24} /> : null}{status ? progressLabel(status) : '思考中'}</>}</p> })
   entries.push(...waiting)
+  // The replies and questions this chat's badge counted start under 新消息.
+  const unread = firstUnread(timeline, workspace.fresh, (aside) => 'waiting' in aside && aside.waiting === true)
+  const unreadAt = unread ? entries.findIndex((entry) => entry.key === ('key' in unread ? unread.key : unread.message_id)) : -1
+  if (unreadAt >= 0) entries.splice(unreadAt, 0, { key: 'unread', node: <p className="flex items-center gap-3 text-meta text-primary before:h-px before:flex-1 before:bg-primary/40 after:h-px after:flex-1 after:bg-primary/40">新消息</p> })
 
   // Everything waiting on the person ends the conversation, so it scrolls with it instead of covering it.
   const cards = [
@@ -347,13 +352,15 @@ function TaskMeta({ device, here, label, agent, quiet = false, className = '' }:
 
 /** A session no bot started that this bot looks after. Bots hand sessions to each other themselves; the row only shows it. */
 function SessionRow({ session }: { session: SessionHandoff }) {
+  const { nodes } = useWorkspace()
   const Icon = providerIcons[session.agent]
+  const project = sharedProject(session.cwd, session.node, nodes)
   return <div className={`flex min-w-0 items-center gap-3 rounded-xl border border-dashed px-3 py-2 ${session.muted ? 'text-muted-foreground' : ''}`}>
     <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>
     <span className="grid min-w-0 flex-1">
       <span className="truncate text-meta font-medium">{session.muted ? '不再关注' : '接手'} {agentName(session.agent)} 会话</span>
-      <span className="truncate text-meta text-muted-foreground" title={[session.cwd, session.summary].filter(Boolean).join('\n')}>
-        <span className="sr-only">项目 </span>{projectName(session.cwd)}{session.summary ? ` · ${session.summary}` : ''}
+      <span className="truncate text-meta text-muted-foreground" title={[project.path, session.summary].filter(Boolean).join('\n')}>
+        <span className="sr-only">项目 </span>{project.name}{session.summary ? ` · ${session.summary}` : ''}
       </span>
     </span>
   </div>

@@ -5,7 +5,7 @@ import type { DeviceChannel, JoinLink } from '../lib/transport.ts'
 import { array, boolean, deviceName, entryJson, entryKey, messageOf, nodeNow, parseEntry, parseInfo, parseJoinRequest, parseView, record, same, text } from '../lib/node.ts'
 import type { ConnectionEntry, EntryInfo, JoinRequest, LocalSetup, Member, MembershipView, PendingRecovery, PublicIdentity, ReadyConnection } from '../lib/node.ts'
 import { shouldAutoConnect } from './connection-lane.ts'
-import { onlyManagerText } from './copy.ts'
+import { nodeJoinCopy, nodeJoinFailure, onlyManagerText } from './copy.ts'
 import { linkTarget } from './switch-network.ts'
 import { hideRecovery, recoveryHidden } from './recovery-notice.ts'
 import { spentInviteText } from '../lib/errors.ts'
@@ -47,6 +47,12 @@ type ApprovalPin = { nonce: string; device_id: string; invite_id: string; commit
  * A fresh invitation; `qr` is what a phone scans: `link` itself when its camera can open it (`publicEntry`),
  * otherwise `vibeface://join?link=<ticket>` for the Vibeface app, which joins over the LAN.
  */
+/** `open`: 加入 may go ahead; `used` or `expired`: the link's computer would refuse it. */
+export type InviteState = 'open' | 'used' | 'expired'
+const inviteState = (value: unknown): InviteState | null => {
+  const state = record(value).invite
+  return state === 'open' || state === 'used' || state === 'expired' ? state : null
+}
 export type Invitation = { link: string; qr: string; publicEntry: boolean; expiresAt: number }
 /** What tabs of this origin tell each other: the leader's new entrance, or that the outbox changed. */
 type TabMessage = { type: 'entrance'; networkId: string; entry: ConnectionEntry } | { type: 'outbox'; networkId: string }
@@ -84,11 +90,13 @@ type DeviceContextValue = {
   rejoin(): Promise<void>; joinThisComputer(link: string, name: string): Promise<'joined' | 'cancelled'>; cancelNodeJoin(): Promise<void>
   connect(entry: ConnectionEntry): Promise<void>; entryName(entry: ConnectionEntry): string; disconnect(): void; leave(): Promise<void>; factoryReset(): Promise<void>; retryNow(): void; saveEntry(entry: ConnectionEntry): void; removeEntry(entry: ConnectionEntry): void
   replaceLostKey(): Promise<void>; join(link: string, name: string): Promise<void>; checkJoin(): Promise<void>; cancelJoin(): void
+  /** Whether the link's computer would still take it, asked before the person names this device; null: no answer, so the form stays. */
+  checkInvite(link: string): Promise<InviteState | null>
   /** Whether a join link leads into this device's own network, reachable or not, or another one; null: no join link. */
   linkTarget(link: string): 'current' | 'other' | null
   createLocalNetwork(name: string, password: string, nodeName?: string): Promise<void>; openLocalAccess(): Promise<void>
   refreshDirectory(): Promise<void>; createInvitation(): Promise<Invitation>
-  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>
+  startApproval(joinId: string): Promise<void>; approveJoin(joinId: string, manage: boolean): Promise<void>; rejectJoin(joinId: string): Promise<void>; revoke(deviceId: string): Promise<void>; setManage(deviceId: string, manage: boolean): Promise<void>; renameDevice(deviceId: string, name: string): Promise<void>
   beginRecovery(input: { file: RecoveryFile; password: string; name: string; entry: ConnectionEntry }): Promise<void>
   replaceRecoveryFile(input: { file: RecoveryFile; oldPassword: string; password: string }): Promise<void>
   downloadBackup(): Promise<void>; confirmBootstrap(saved: boolean): Promise<void>; confirmRecovery(members: Member[]): Promise<void>; cancelSensitive(): void
@@ -117,6 +125,8 @@ const LAN_MS = 2000
 /** Not an error: the entry buttons below it are the way in. */
 export const notJoined = (self: string) => `${self}还没加入`
 export const removedText = (self: string) => `${self}已被移除，请在管理设备上重新添加`
+/** How many times the page asks its computer about a join before saying the answer is lost. */
+const NODE_JOIN_TRIES = 5
 const changed = () => new Error('设备连接已切换。原操作结果需要确认，不会自动重发。')
 const superseded = () => new Error('这个恢复文件已作废。请用最近一次下载的恢复文件。')
 const hex = (bytes: Uint8Array) => [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
@@ -587,12 +597,23 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const { capability, entry } = localSetup
     const active = await open(entry)
     setNodeJoining({ status: 'waiting' })
+    // The same link again only reads how far the join got, so an answer lost on the way is asked for again, never resent as a new request.
+    const ask = async () => {
+      for (let lost = 0; ; lost++) {
+        try { return record(await callSession(active, 'node_join', { capability, link, name })) } catch (cause) {
+          const said = nodeJoinFailure(cause instanceof Error ? cause.message : String(cause))
+          if (said !== nodeJoinCopy.failed && session.current === active) throw new Error(said)
+          if (session.current !== active || lost + 1 >= NODE_JOIN_TRIES) throw new Error(nodeJoinCopy.unreachable)
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        }
+      }
+    }
     try {
       for (;;) {
-        const reply = record(await callSession(active, 'node_join', { capability, link, name }))
+        const reply = await ask()
         spend(linkText)
         if (reply.status === 'cancelled') return 'cancelled'
-        if (reply.status === 'failed') throw new Error('没能加入。链接可能已过期或被拒绝，请在已有设备上重新添加。')
+        if (reply.status === 'failed') throw new Error(nodeJoinFailure(typeof reply.reason === 'string' ? reply.reason : ''))
         if (reply.status === 'joined') break
         if (reply.status !== 'waiting' && reply.status !== 'confirming') throw new Error('这台电脑返回了未知的加入状态。')
         setNodeJoining({ status: reply.status, code: typeof reply.code === 'string' ? reply.code : undefined })
@@ -778,6 +799,30 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await request('grant', { event }); await refreshDirectory()
   }
   /**
+   * Renames one of my devices, this one included, with a manager's `grant` that keeps its kind and permission. The directory
+   * is read first, and again when the answer is lost, so a name that already landed is not signed again.
+   */
+  async function renameDevice(deviceId: string, nameValue: string) {
+    const connection = managing(), request = scoped()
+    const name = deviceName(nameValue)
+    const read = async () => {
+      const response = record(await request('directory'))
+      const verified = verifyState(response.state, connection.principal.network_id, nodeNow(response))
+      try {
+        const member = parseView(JSON.parse(verified.viewJson())).members.find(item => item.device_id === deviceId)
+        if (!member) throw new Error('找不到这个设备，请刷新后再试。')
+        if (member.name === name) return null
+        return JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'grant', member: { ...member, name } }))) as Record<string, unknown>
+      } finally { verified.free() }
+    }
+    const event = await read()
+    if (event) {
+      event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+      try { await request('grant', { event }) } catch (cause) { if (await read().catch(() => event)) throw cause }
+    }
+    await refreshDirectory()
+  }
+  /**
    * Stops the recovery `checkpoint` names. The directory is read first, and again when the answer is lost, so a veto
    * that landed is not signed again and a recovery that got stopped is told apart from one that took effect.
    */
@@ -815,19 +860,51 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     remind()
     await refreshDirectory()
   }
+  /**
+   * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned
+   * code's address is only a hint, the device key is the check.
+   */
+  function joinWays(link: JoinLink): ConnectionEntry[] {
+    const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
+    return [
+      ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
+      ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
+    ]
+  }
+  /**
+   * One question on a channel of its own, so the screen's connection stays as it is. The secret goes only to the
+   * computer the link names; asking takes nothing, and the approval and safety code still follow 加入.
+   */
+  async function checkInvite(linkText: string): Promise<InviteState | null> {
+    const ask = async (way: ConnectionEntry, method: string, params: Record<string, unknown>) => {
+      const channel = await connectDevice(way, { timeoutMs: way.kind === 'lan' ? LAN_MS : 10000 })
+      try {
+        if (channel.deviceId !== way.device_id) return null
+        return inviteState(await channel.request(method, params))
+      } finally { channel.close() }
+    }
+    try {
+      if (localSetup?.kind === 'uninitialized') {
+        const found = joinTicket(linkText), origin = found?.origin ?? page?.origin
+        if (!found || !origin) return null
+        return await ask(localSetup.entry, 'node_join_check', { capability: localSetup.capability, link: `${origin}/join#${found.ticket}` })
+      }
+      const link = await parseJoinLink(linkText)
+      try {
+        for (const way of joinWays(link)) {
+          try { return await ask(way, 'join_check', { secret: link.secret }) } catch {}
+        }
+      } finally { link.secret = '' }
+    } catch {}
+    return null
+  }
   /** Joins through a ticket link: commit, wait for the manager's nonce, reveal, show the short code. */
   async function join(linkText: string, nameValue: string) {
     const name = deviceName(nameValue)
     const link: JoinLink = await parseJoinLink(linkText)
     // Joining opens a new connection, so the screen drops this failure as stale; keep it here.
     try {
-      // The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a
-      // scanned code's address is only a hint, the device key is the check.
-      const addresses = [...new Set([...page ? [page.origin] : [], ...link.origin ? [link.origin] : []])]
-      const ways: ConnectionEntry[] = [
-        ...platform.lan && link.direct.length ? [{ kind: 'lan' as const, addrs: link.direct, device_id: link.entryId }] : [],
-        ...addresses.map(address => ({ kind: 'gateway' as const, address, device_id: link.entryId })),
-      ]
+      const ways = joinWays(link)
       let active: Session | null = null
       for (const [index, way] of ways.entries()) {
         const last = index === ways.length - 1
@@ -1303,8 +1380,8 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     connectionGeneration: () => generation.current, link, entrances, tabs,
     identity, ready, entries, phase, error, entry, info, directory, recoverySince, joins, joining, review, initialInvitation, localSetup, localAutoAccess, setLocalAutoAccess,
     removedLocally: phase === 'removed' && removedFrom?.kind === 'local', rejoined, nodeJoining, rejoin, joinThisComputer, cancelNodeJoin,
-    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
-    startApproval, approveJoin, rejectJoin, revoke, setManage, beginRecovery, replaceRecoveryFile,
+    connect: async (item) => { await connect(item) }, entryName: (item) => { const name = load(`name-for.${item.device_id}`); return typeof name === 'string' ? name : '' }, disconnect, leave, factoryReset, retryNow, saveEntry, removeEntry, replaceLostKey, join, checkJoin, cancelJoin, checkInvite, createLocalNetwork, openLocalAccess, refreshDirectory, createInvitation,
+    startApproval, approveJoin, rejectJoin, revoke, setManage, renameDevice, beginRecovery, replaceRecoveryFile,
     linkTarget(link) {
       const networkId = ready?.principal.network_id ?? loadAuthenticated()?.networkId
       const known = [...directory?.members ?? [], ...networkId ? [...savedEntries().filter(item => load(`network-for.${item.device_id}`) === networkId), ...loadEntrances(networkId)] : []]

@@ -7,6 +7,7 @@ import { expect, secrets } from 'e2e';
 
 test('creates a persistent Bot without a model and shows triage budget state', async ({ app, node, screen, browser }) => {
   await app.open(node.url);
+  await screen.getByRole('button', '新建我的网络').click();
   await screen.getByLabel('这台电脑叫什么？').fill('E2E Node');
   await screen.getByRole('button', '下一步').click();
   await expect(screen.getByRole('heading', '设置恢复密码')).toBeVisible();

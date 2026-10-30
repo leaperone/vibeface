@@ -2228,6 +2228,86 @@ fn a_schedule_runs_its_latest_time_once() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_schedule_uses_the_receiver_seen_time_when_the_writer_clock_is_fast() -> Result<()> {
+    let net = net()?;
+    let mut origin = store(&net)?;
+    conversation(&mut origin, &net)?;
+    origin.append_event(&net.a, &net.network, "c", user(&net, "m1", "x"), vec![], 2)?;
+    let (saved, _) = origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "r1",
+        save_schedule(None, "Digest", 5),
+        Provider::Codex,
+        3_600_000,
+    )?;
+    let BotChange::Schedule { schedule_id, .. } = saved.change else {
+        panic!("schedule change")
+    };
+    let events = origin.events_from(&net.network, &net.a.device_id()?, 1, 100)?;
+    let mut received = store(&net)?;
+    received.ingest_events_at(&net.network, &events, 10_000)?;
+    let seen: i64 = received.connection.query_row(
+        "SELECT seen_at_ms FROM events WHERE network_id=? AND subject IS NULL AND kind='bot_changed'",
+        [&net.network],
+        |row| row.get(0),
+    )?;
+    assert_eq!(seen, 10_000);
+
+    let every = 5 * 60_000;
+    let slot = 1_000 + 3 * every;
+    assert_eq!(
+        received.admit_due_schedules(&net.a, &net.network, slot + 10)?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, slot))]
+    );
+    received.ingest_events_at(&net.network, &events, 20_000)?;
+    let stored_seen: i64 = received.connection.query_row(
+        "SELECT seen_at_ms FROM events WHERE network_id=? AND subject IS NULL AND kind='bot_changed'",
+        [&net.network],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        stored_seen, 10_000,
+        "duplicate sync must not reset first-seen time"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_takeover_grace_uses_the_receiver_seen_time_when_the_writer_clock_is_slow() -> Result<()> {
+    let net = net()?;
+    let (mut a_side, mut b_side, schedule_id) = scheduled_on_both(&net, 5)?;
+    let handover = a_side.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        owner(&net, &net.b, 2)?,
+        vec![],
+        0,
+    )?;
+    b_side.ingest_events_at(&net.network, &[handover], 600_000)?;
+    let slot = 1_000 + 2 * 5 * 60_000;
+    assert!(
+        b_side
+            .admit_due_schedules(&net.b, &net.network, slot + 10)?
+            .is_empty(),
+        "a slow writer timestamp must not consume the receiver's takeover grace"
+    );
+    assert!(b_side.scheduler_jobs("c")?.is_empty());
+    assert_eq!(
+        b_side.admit_due_schedules(
+            &net.b,
+            &net.network,
+            600_000 + crate::store::scheduler::TAKEOVER_GRACE_MS + 1,
+        )?,
+        vec![("c".to_owned(), schedule_trigger(&schedule_id, slot))]
+    );
+    Ok(())
+}
+
 fn bot_with_message(net: &Net) -> Result<(Store, String)> {
     let mut store = store(net)?;
     conversation(&mut store, net)?;
@@ -2367,7 +2447,7 @@ fn scheduled_on_both(net: &Net, every_minutes: u32) -> Result<(Store, Store, Str
         panic!("schedule change")
     };
     let mut b_side = store(net)?;
-    sync(&a_side, &mut b_side, net)?;
+    sync_at(&a_side, &mut b_side, net, 3)?;
     Ok((a_side, b_side, schedule_id))
 }
 
@@ -4187,13 +4267,17 @@ fn answer_signature(net: &Net, scope: &str, question: &str, text: &str) -> Resul
 }
 
 fn sync(from: &Store, to: &mut Store, net: &Net) -> Result<()> {
+    sync_at(from, to, net, crate::runtime::now_ms())
+}
+
+fn sync_at(from: &Store, to: &mut Store, net: &Net, seen_at_ms: i64) -> Result<()> {
     let envelopes: Vec<SignedEvent> = from
         .connection
         .prepare("SELECT envelope FROM events WHERE network_id=? ORDER BY author,seq")?
         .query_map([&net.network], |r| r.get::<_, String>(0))?
         .map(|row| Ok(serde_json::from_str(&row?)?))
         .collect::<Result<_>>()?;
-    to.ingest_events(&net.network, &envelopes)?;
+    to.ingest_events_at(&net.network, &envelopes, seen_at_ms)?;
     Ok(())
 }
 

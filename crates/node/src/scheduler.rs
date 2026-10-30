@@ -246,15 +246,16 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
         &provider.tools_for(TriggerKind::Human),
         &thread_instructions(),
     );
+    let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
+        network: network.clone(),
+        conversation: conversation.clone(),
+    });
     let sdk_config = session_key(
         &settings,
         thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
-        (provider == crate::providers::Provider::Cursor).then(|| {
-            node.cursor_store_root(&CursorInstance::Bot {
-                network: network.clone(),
-                conversation: conversation.clone(),
-            })
-        }),
+        instance
+            .as_ref()
+            .map(|instance| node.cursor_store_root(instance)),
     )?;
     let claimed = {
         let mut store = node.store.lock().await;
@@ -286,7 +287,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     tracing::info!(event = "agent.turn.started", trigger, attempt = attempt.id, kind = ?job.kind, provider = ?provider, "agent turn started");
     // A resumed Codex thread keeps the Shell environment it was created with, so its token
     // carries over; it acts only while an attempt has it registered.
-    let token = if provider == crate::providers::Provider::Cursor {
+    let token = if instance.is_some() {
         uuid::Uuid::new_v4().to_string()
     } else {
         claimed
@@ -351,17 +352,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             codex_turn: Some(turn_recorder(&node, &attempt.id, &server, shown.clone(), fresh_prompt)),
             ..node.manager_config(settings)?
         };
-        if provider == crate::providers::Provider::Cursor {
-            config = config.for_cursor_instance(
-                CursorInstance::Bot {
-                    network: network.clone(),
-                    conversation: conversation.clone(),
-                },
-                node.cursor_store_root(&CursorInstance::Bot {
-                    network: network.clone(),
-                    conversation: conversation.clone(),
-                }),
-            );
+        if let Some(instance) = &instance {
+            config = config.for_cursor_instance(instance.clone(), node.cursor_store_root(instance));
         }
         config.tool_env.extend([
             ("VIBEFACE_NODE_URL".into(), local_url),

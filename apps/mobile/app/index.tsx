@@ -1,6 +1,6 @@
 import { Link, Stack } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { MessageSquare, Plus, Settings } from 'lucide-react-native'
+import { ListChecks, MessageSquare, Plus, Settings } from 'lucide-react-native'
 import { View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { ConnectionMenu } from '@/components/connection-pill'
@@ -31,6 +31,7 @@ export default function Home() {
       headerShown: true,
       headerLeft: () => <ConnectionMenu connection={workspace.connection} />,
       headerRight: () => <View className="flex-row">
+        <Link href="/tasks" asChild><Button variant="ghost" size="icon" accessibilityLabel="任务"><Icon as={ListChecks} /></Button></Link>
         <Link href="/new-bot" asChild><Button variant="ghost" size="icon" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
         <Link href="/settings" asChild><Button variant="ghost" size="icon" accessibilityLabel="设置"><Icon as={Settings} className="size-5" /></Button></Link>
       </View>,

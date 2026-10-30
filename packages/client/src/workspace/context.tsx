@@ -7,10 +7,11 @@ import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
+import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
-  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, attachmentName, signedOrder, attachmentLimit,
+  parseArtifactPage, parseBinaryPage, parseWriteStatus, parseQuestions, parseAnswer, parseOpenWorks, parseRecords, parseWorkspaceOverview, attachmentName, signedOrder, attachmentLimit,
 } from "./model.ts"
 import type { Attachment } from "../chat/types.ts"
 import type { Avatar } from "../avatar/face.ts"
@@ -20,7 +21,7 @@ import { answerBody, answerId } from "./questions.ts"
 import { networkKey, newId, storageOf } from "./storage.ts"
 import type {
   AnswerResult, ConversationPayload, NodeInfo, NotificationRecord, PendingAnswer, Question,
-  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction,
+  PendingMessage, WorkspaceView, BotRecord, CreateBotRequest, PendingBot, BotProject, PendingCheck, WriteState, WriteStatus, OpenWork, ScheduleAction, WorkspaceOverview,
 } from "./types.ts"
 
 const writeNotices: Record<Exclude<WriteState, "writable">, string> = {
@@ -72,6 +73,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [questions, setQuestions] = useState<Question[]>([])
   const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
   const openWorksRef = useRef<OpenWork[]>([])
+  const [overview, setOverview] = useState<WorkspaceOverview | null>(null)
   /** Answers this browser saw land, by question, until the network's own reads show them. */
   const [answered, setAnswered] = useState<Readonly<Record<string, string>>>({})
   const [pendingAnswers, setPendingAnswers] = useState<PendingAnswer[]>([])
@@ -84,9 +86,13 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
+  /** Replies of the open chat that were unread when it came on screen, by event hash; the chat marks where they start. */
+  const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set<string>())
+  /** The chat on screen and the connection it was read over; another connection is another visit. */
+  const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
-  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false, state: "off" })
+  const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: true, state: "off" }) // disabled until the first permission check
   const alive = useRef(true)
   const activeId = useRef("")
   const dataRef = useRef<ConversationPayload | null>(null)
@@ -155,6 +161,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     activeId.current = id
     readSequence.current += 1
     dataRef.current = null
+    onScreen.current = null
+    setFresh(new Set<string>())
     setConversationId(id)
     setData(null)
     setLiveProgress([])
@@ -174,10 +182,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const shown = dataRef.current
     if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id) {
       const missing = shown.messages.filter((message) => !next.messages.some((item) => item.message_id === message.message_id))
-      if (missing.length) next.messages = [...next.messages, ...missing].sort((a, b) => a.created_at_ms - b.created_at_ms)
+      if (missing.length) next.messages = byRank([...next.messages, ...missing])
     }
     dataRef.current = next
     setData(next)
+    if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
+    else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
+      onScreen.current = { id, connection }
+      setFresh(new Set(notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id)))
+    }
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
     const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id)))
@@ -259,13 +272,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     refreshingConnection.current = connection
     setRefreshing(true)
     try {
-      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks] = await Promise.all([
+      const [rawNodes, rawNotifications, rawBots, rawWrite, rawQuestions, rawWorks, rawOverview] = await Promise.all([
         connection.rpc("nodes"), connection.rpc("notifications"), connection.rpc("bots"), connection.request("write_state"), connection.rpc("questions"), connection.rpc("open_works"),
+        viewRef.current === "tasks" ? connection.rpc("workspace_overview") : null,
       ])
       requireCurrent()
       const nextNodes = parseNodes(rawNodes), nextNotifications = unreadSince(parseNotifications(rawNotifications), true)
       const nextBots = parseBots(rawBots), nextQuestions = parseQuestions(rawQuestions)
       openWorksRef.current = parseOpenWorks(rawWorks)
+      if (rawOverview !== null) setOverview(parseWorkspaceOverview(rawOverview))
       setNodes(nextNodes); setNotifications(nextNotifications); setBots(nextBots); setPrimary(parsePrimary(rawBots)); setWriteState(parseWriteStatus(rawWrite)); setQuestions(nextQuestions); setOpenWorks(openWorksRef.current)
       if (botCreationRef.current && nextBots.some((item) => item.bot_id === botCreationRef.current?.bot_id)) clearPendingBot()
       notificationsRef.current = nextNotifications
@@ -293,7 +308,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   /** One pushed change merged in place; a full read only when a read races it or it does not parse. */
   const applyRecords = async (value: Record<string, unknown>) => {
     const parsed = parseRecords(value), records = { ...parsed, notifications: unreadSince(parsed.notifications) }, id = records.conversation_id
-    if (refreshingRef.current) scheduleRefresh()
+    if (refreshingRef.current || viewRef.current === "tasks") scheduleRefresh()
     setQuestions((previous) => mergeQuestions(previous, records))
     setBots((previous) => mergeBots(previous, records))
     openWorksRef.current = mergeOpenWorks(openWorksRef.current, records)
@@ -307,6 +322,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   }
   /** A change the Node pushed without its records: the bot list, and the conversation if it is open. */
   const reloadScope = async (id: string) => {
+    if (viewRef.current === "tasks") scheduleRefresh()
     const rawBots = await connection.rpc("bots")
     requireCurrent()
     setBots(parseBots(rawBots)); setPrimary(parsePrimary(rawBots))
@@ -542,7 +558,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, openWorks, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => {
+      viewRef.current = next; setView(next); clearMessages()
+      if (next === "chat" || next === "tasks") scheduleRefresh()
+      else { onScreen.current = null; setFresh(new Set<string>()) }
+    }, nodes, conversationId, data, fresh, notifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",

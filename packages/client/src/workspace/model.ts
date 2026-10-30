@@ -4,8 +4,9 @@ import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
+  WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
 } from "./types.ts"
-import { answerId } from "./questions.ts"
+import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
 import { failureKinds, type FailureKind } from "../lib/errors.ts"
 import { EYES, HUES, OUTLINES, type Avatar } from "../avatar/face.ts"
@@ -112,21 +113,42 @@ function workState(value: unknown): WorkState {
 function workOutcome(value: unknown): WorkOutcome | null {
   switch (value) {
     case undefined: case null: return null
-    case "completed": case "failed": case "interrupted": case "rejected": case "unverified": return value
+    case "completed": return "completed"
+    case "failed": return "failed"
+    case "interrupted": return "interrupted"
+    case "rejected": return "rejected"
+    case "unverified": return "unverified"
     default: throw new Error("任务结果无法识别。")
   }
 }
+function workPhase(value: unknown): WorkPhase {
+  switch (value) {
+    case "started": case "running": case "interrupting": case "finishing": return value
+    default: throw new Error("任务阶段无法识别。")
+  }
+}
+function optionalPhase(value: unknown): WorkPhase | undefined { return value == null ? undefined : workPhase(value) }
 function workKind(value: unknown): WorkRecord["kind"] {
   if (value == null) return undefined
   if (value === "task" || providerIds.includes(value as ProviderId)) return value as WorkRecord["kind"]
   throw new Error("任务类型无法识别。")
+}
+function optionalWorkFields(data: Record<string, unknown>): Partial<WorkRecord> {
+  const fields: Partial<WorkRecord> = {}
+  for (const key of ["dispatcher", "call_ref", "continues", "parent", "thread", "thread_id", "turn_id"] as const) {
+    if (data[key] != null) fields[key] = text(data[key])
+  }
+  const kind = workKind(data.kind)
+  if (kind !== undefined) fields.kind = kind
+  if (data.phase != null) fields.phase = workPhase(data.phase)
+  return fields
 }
 function work(value: unknown): WorkRecord {
   const data = record(value)
   return {
     work_id: text(data.work_id), trigger: text(data.trigger), target_node: text(data.target_node), cwd: text(data.cwd), title: data.title == null ? "" : text(data.title), prompt: text(data.prompt),
     state: workState(data.state), summary: text(data.summary), outcome: workOutcome(data.outcome), result_text: text(data.result_text),
-    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), kind: workKind(data.kind), thread_id: optionalText(data.thread_id), turn_id: optionalText(data.turn_id),
+    failure_reason: data.failure_reason == null ? null : text(data.failure_reason), ...failure(data.failure), ...optionalWorkFields(data),
   }
 }
 /** Requests this device still carries: an untaken dispatch shows as its own task row, a stop marks its work. */
@@ -152,7 +174,7 @@ function coordinationCheck(value: unknown): CoordinationCheck {
  * its device is known to be offline, or its App Server disconnected for a Codex turn; an unknown device is not judged.
  * A task runs in its device's bot, which reports without the App Server, so only offline applies to it.
  */
-export function confirmReason(item: WorkRecord, nodes: NodeInfo[]): ConfirmReason | null {
+export function confirmReason(item: WorkRecord, nodes: readonly NodeInfo[]): ConfirmReason | null {
   if (item.state === "unverified") return "unverified"
   if (item.outcome || item.state === "finished" || item.state.startsWith("dispatch_")) return null
   const node = nodes.find((candidate) => candidate.device_id === item.target_node)
@@ -170,7 +192,7 @@ export function pendingChecks(data: Pick<ConversationPayload, "works" | "checks"
 }
 export type WorkCheck = Extract<PendingCheck, { kind: "work" }>
 /** Each work waiting for confirmation; works one offline device or one disconnected Codex holds share one card, where the first of them stood. */
-export function workChecks(works: OpenWork[], nodes: NodeInfo[]): PendingCheck[] {
+export function workChecks(works: readonly OpenWork[], nodes: readonly NodeInfo[]): PendingCheck[] {
   const checks = works.flatMap((item): WorkCheck[] => {
     const reason = confirmReason(item, nodes)
     return reason ? [{ kind: "work", check_id: `work:${item.work_id}`, detail: item.failure_reason ?? "", work_id: item.work_id, target_node: item.target_node, conversation_id: item.conversation_id, title: item.title, reason }] : []
@@ -188,6 +210,313 @@ export function workChecks(works: OpenWork[], nodes: NodeInfo[]): PendingCheck[]
 export function parseOpenWorks(value: unknown): OpenWork[] {
   return list(record(value).works).map((item) => ({ ...work(item), conversation_id: text(record(item).conversation_id) }))
 }
+
+export type WorkspaceOverviewInput = {
+  openWorks: readonly OpenWork[]
+  bots: readonly BotRecord[]
+  questions: readonly Question[]
+  nodes: readonly NodeInfo[]
+}
+
+const overviewBot = (bot: Pick<BotRecord, "bot_id" | "conversation_id" | "name">): OverviewBot => ({ bot_id: bot.bot_id, conversation_id: bot.conversation_id, name: bot.name })
+const overviewNode = (node: NodeInfo): OverviewNode => ({ device_id: node.device_id, name: node.name, online: node.online, revoked: node.revoked, local: node.local })
+const nullableText = (value: unknown): string | null => value == null ? null : text(value)
+const nullableNumber = (value: unknown): number | null => value == null ? null : number(value)
+
+function overviewConsistency(value: unknown): OverviewConsistency {
+  return value === "local_snapshot" || value === "mixed_remote" || value === "partial" ? value : "partial"
+}
+function overviewState(value: unknown): OverviewTaskState {
+  switch (value) {
+    case "accepted": case "running": case "interrupting": case "finished": case "unverified":
+    case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": case "stop_waiting": case "stop_timed_out": case "accepted_waiting_sync": case "unknown": return value
+    default: return "unknown"
+  }
+}
+function overviewOutcome(value: unknown): WorkOutcome | null {
+  if (value == null) return null
+  switch (value) {
+    case "completed": return "completed"
+    case "failed": return "failed"
+    case "interrupted": return "interrupted"
+    case "rejected": return "rejected"
+    case "unverified": return "unverified"
+    default: return "unverified"
+  }
+}
+function overviewSource(value: unknown): OverviewTask["source"] {
+  return value === "local_dispatch" || value === "local_check" || value === "remote_owner" || value === "event" || value === "dag" ? value : "event"
+}
+function overviewDispatchState(value: unknown): OverviewDeliveryState {
+  switch (value) {
+    case "dispatch_waiting": case "dispatch_rejected": case "dispatch_unverified": return value
+    case "dispatch_accepted": case "stop_waiting": case "stop_timed_out": return value
+    case "accepted_waiting_sync": return "dispatch_accepted"
+    default: return "dispatch_unverified"
+  }
+}
+function overviewWorkKind(value: unknown): ProviderId | "task" | null {
+  if (value === "task") return value
+  return providerIds.find((provider) => provider === value) ?? null
+}
+function overviewNodeFromValue(value: unknown): OverviewNode | null {
+  if (value == null) return null
+  const data = record(value)
+  return {
+    device_id: text(data.device_id), name: data.name == null ? "" : text(data.name),
+    online: data.online === true, revoked: data.revoked === true, local: data.local === true,
+  }
+}
+
+function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskState, node: OverviewNode | null): WorkOutcome | null {
+  const unreachable = node !== null && (!node.online || node.revoked)
+  return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync" || unreachable) ? "unverified" : outcome
+}
+
+function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
+  const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
+  const rawState = overviewState(work.stop ?? work.state)
+  const outcome = safeOverviewOutcome(work.outcome, rawState, node)
+  return {
+    item_id: itemId,
+    work_id: work.work_id,
+    conversation_id: work.conversation_id,
+    bot,
+    title: work.title,
+    summary: work.summary,
+    cwd: work.cwd,
+    state: outcome === "unverified" ? "unverified" : work.state === "finished" && work.outcome === null ? "unknown" : rawState,
+    outcome,
+    target_node: work.target_node,
+    dispatcher: work.dispatcher ?? null,
+    call_ref: work.call_ref ?? null,
+    work_kind: work.kind ?? null,
+    parent: work.parent ?? null,
+    continues: work.continues ?? null,
+    thread: work.thread ?? null,
+    thread_id: work.thread_id ?? null,
+    turn_id: work.turn_id ?? null,
+    phase: work.phase ?? null,
+    reason: work.failure_reason,
+    node,
+    navigation,
+    source,
+  }
+}
+
+function openOverviewWork(work: OpenWork, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask | null {
+  const bot = bots.get(work.conversation_id) ?? null, node = nodes.get(work.target_node) ?? null
+  const unsafeCompleted = work.outcome === "completed" && (work.state === "unverified" || (node !== null && (!node.online || node.revoked)))
+  if (work.outcome && work.outcome !== "unverified" && !unsafeCompleted) return null
+  if (work.state === "finished" && work.outcome !== "unverified" && !unsafeCompleted) return null
+  if (work.state === "dispatch_waiting" || work.state === "dispatch_rejected" || work.state === "dispatch_unverified") {
+    return { ...overviewTaskBase(work, bot, node, "local_dispatch"), kind: "dispatch", delivery_state: work.state }
+  }
+  return { ...overviewTaskBase(work, bot, node, "event"), kind: "work" }
+}
+
+function overviewCheck(check: PendingCheck, workById: ReadonlyMap<string, OpenWork>, bots: ReadonlyMap<string, OverviewBot>, nodes: ReadonlyMap<string, OverviewNode>): OverviewTask {
+  const works = check.kind === "device" ? check.works.flatMap((item) => { const work = workById.get(item.work_id); return work ? [work] : [] }) : check.kind === "work" ? [workById.get(check.work_id)].filter((work): work is OpenWork => Boolean(work)) : []
+  const first = works[0]
+  const fallback: OpenWork = first ?? {
+    work_id: check.kind === "work" ? check.work_id : "",
+    conversation_id: check.kind === "work" ? check.conversation_id : "",
+    title: check.kind === "work" ? check.title : "待确认",
+    summary: "",
+    state: "unverified",
+    outcome: "unverified",
+    target_node: check.kind === "work" || check.kind === "device" ? check.target_node : "",
+    cwd: "", prompt: "", trigger: "", result_text: "", failure_reason: check.detail,
+  }
+  const bot = fallback.conversation_id ? bots.get(fallback.conversation_id) ?? null : null
+  const node = fallback.target_node ? nodes.get(fallback.target_node) ?? null : null
+  const base = overviewTaskBase(fallback, bot, node, "local_check", check.check_id)
+  const checkReason: ConfirmReason = check.kind === "process" ? "unverified" : check.reason
+  return {
+    ...base,
+    kind: "check",
+    check_id: check.check_id,
+    work_ids: works.map((work) => work.work_id),
+    state: "unknown",
+    outcome: checkReason === "unverified" ? "unverified" : null,
+    reason: check.detail || checkReason,
+    navigation: check.kind === "device" || !bot ? (bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null) : base.navigation,
+  }
+}
+
+/**
+ * Derive the finite, shared workspace view available from the already loaded lists.
+ * `open_works` is intentionally incomplete, so coverage says so instead of implying a global queue.
+ */
+export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: WorkspaceOverviewInput): WorkspaceOverview {
+  const botRows = bots.map(overviewBot)
+  const botByConversation = new Map(botRows.map((bot) => [bot.conversation_id, bot]))
+  const nodeById = new Map(nodes.map((node) => [node.device_id, overviewNode(node)]))
+  const workById = new Map(openWorks.map((work) => [work.work_id, work]))
+  const tasks = openWorks.flatMap((work) => {
+    const row = openOverviewWork(work, botByConversation, nodeById)
+    return row ? [row] : []
+  })
+  const checks = workChecks(openWorks, nodes).map((check) => overviewCheck(check, workById, botByConversation, nodeById))
+  const overviewQuestions = questions.filter(questionOpen).map((question): OverviewQuestion => {
+    const bot = botByConversation.get(question.conversation_id) ?? null
+    const related = question.about.request_id ? openWorks.find((work) => work.thread_id === question.about.session_id && !work.outcome) : undefined
+    return {
+      kind: "question", question_id: question.question_id, conversation_id: question.conversation_id, bot,
+      text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
+      request_id: question.about.request_id ?? null, work_id: related?.work_id ?? null, about: question.about, created_at_ms: question.created_at_ms,
+      state: "unanswered", navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
+    }
+  })
+  const remoteOwners: OverviewCoverage["remote_owners"] = nodes.filter((node) => !node.local).map((node) => ({
+    owner: node.device_id, reachable: node.online && !node.revoked, reason: node.revoked ? "revoked" : node.online ? null : "unreachable",
+  }))
+  const unreachable = nodes.filter((node) => !node.local && (!node.online || node.revoked)).map((node) => node.device_id)
+  const consistency: OverviewConsistency = unreachable.length ? "partial" : "local_snapshot"
+  const coverage: OverviewCoverage = {
+    source: "open_works", complete: false, bounded: true, generated_at_ms: null, network_epoch: null, consistency,
+    truncated: false, local_heads: false, remote_owners: remoteOwners, unreachable_nodes: unreachable,
+    omitted_finished: null, omitted_sessions: null, omitted_tasks: null, omitted_questions: null, omitted_checks: null, omitted_dispatches: null, omitted_deliveries: null, omitted_relations: null, omitted_jobs: null, omitted_live_progress: true,
+  }
+  return {
+    schema: null, generated_at_ms: null, network_epoch: null, heads: {}, consistency, bots: botRows, conversations: [],
+    tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], relations: [], sessions: [], coverage, truncated: false, next_cursor: null,
+  }
+}
+
+export const workspaceOverview = overviewFromWorkspace
+
+function parseOverviewBot(value: unknown): OverviewBot {
+  const data = record(value)
+  return { bot_id: text(data.bot_id), conversation_id: text(data.conversation_id), name: data.name == null ? "" : text(data.name) }
+}
+function parseOverviewTask(value: unknown): OverviewTask {
+  const data = record(value)
+  const rawKind = data.item_kind ?? data.kind
+  const rawState = data.state
+  const itemKind = rawKind === "check" ? "check" : rawKind === "dispatch" || data.source === "local_dispatch" || rawState === "accepted_waiting_sync" || rawState === "dispatch_waiting" || rawState === "dispatch_rejected" || rawState === "dispatch_unverified" || rawState === "dispatch_accepted" || rawState === "stop_waiting" || rawState === "stop_timed_out" ? "dispatch" : "work"
+  const workId = nullableText(data.work_id)
+  const conversationId = text(data.conversation_id)
+  const bot = data.bot == null ? null : parseOverviewBot(data.bot)
+  const state = overviewState(data.state)
+  const node = overviewNodeFromValue(data.node) ?? (data.remote_reachable === false ? { device_id: nullableText(data.target_node) ?? "", name: "", online: false, revoked: false, local: false } : null)
+  const outcome = safeOverviewOutcome(overviewOutcome(data.outcome), state, node)
+  const common = {
+    item_id: nullableText(data.item_id) ?? nullableText(data.check_id) ?? workId ?? `${conversationId}:${text(data.trigger ?? "")}`,
+    work_id: workId, conversation_id: conversationId, bot, title: data.title == null ? "" : text(data.title), summary: data.summary == null ? "" : text(data.summary), cwd: data.cwd == null ? "" : text(data.cwd),
+    state: outcome === "unverified" ? "unverified" : state === "finished" && outcome === null ? "unknown" : state, outcome,
+    target_node: nullableText(data.target_node), dispatcher: nullableText(data.dispatcher), call_ref: nullableText(data.call_ref),
+    work_kind: overviewWorkKind(data.work_kind) ?? overviewWorkKind(data.kind),
+    parent: nullableText(data.parent), continues: nullableText(data.continues), thread: nullableText(data.thread), thread_id: nullableText(data.thread_id), turn_id: nullableText(data.turn_id),
+    phase: data.phase == null ? null : optionalPhase(data.phase) ?? null, reason: nullableText(data.reason ?? data.failure_reason), node, source: overviewSource(data.source),
+    navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, ...(workId ? { work_id: workId } : {}) } : null,
+  }
+  if (itemKind === "dispatch") return { ...common, kind: "dispatch", delivery_state: overviewDispatchState(data.delivery_state ?? data.state) }
+  if (itemKind === "check") return { ...common, kind: "check", check_id: text(data.check_id ?? common.item_id), work_ids: list(data.work_ids ?? (workId ? [workId] : [])).map(text), reason: data.reason === "offline" || data.reason === "disconnected" || data.reason === "unverified" ? data.reason : "unverified", state: "unknown", outcome: data.reason === "unverified" ? "unverified" : null }
+  return { ...common, kind: "work" }
+}
+function parseOverviewQuestion(value: unknown): OverviewQuestion {
+  const data = record(value), bot = data.bot == null ? null : parseOverviewBot(data.bot)
+  const about = data.about == null ? null : subject(data.about)
+  return {
+    kind: "question", question_id: text(data.question_id), conversation_id: text(data.conversation_id), bot,
+    text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
+    request_id: nullableText(data.request_id ?? about?.request_id), work_id: nullableText(data.work_id), about, created_at_ms: number(data.created_at_ms), state: "unanswered",
+    navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
+  }
+}
+function parseOverviewJob(value: unknown): OverviewJob {
+  const data = record(value), conversationId = nullableText(data.conversation_id), trigger = data.trigger == null ? "" : text(data.trigger), messageId = nullableText(data.message_id), unknownReason = nullableText(data.unknown_reason)
+  const state = data.remote_reachable === false || unknownReason ? "unknown" : data.state == null ? "unknown" : text(data.state)
+  return {
+    job_id: nullableText(data.job_id) ?? `${conversationId ?? ""}:${trigger}:${messageId ?? ""}`, conversation_id: conversationId, trigger, state,
+    message_id: messageId, reply_message_id: nullableText(data.reply_message_id), source_node: nullableText(data.source_node), pending_check: data.pending_check === true,
+    outcome: state === "unknown" ? "unknown" : data.outcome === "answered" || data.outcome === "unfinished" || data.outcome === "unknown" ? data.outcome : null,
+    unknown_reason: unknownReason, kind: nullableText(data.kind), sequence: nullableNumber(data.sequence), owner_epoch: nullableNumber(data.owner_epoch),
+  }
+}
+function parseOverviewConversation(value: unknown): OverviewConversation {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), title: data.title == null ? "" : text(data.title), owner: nullableText(data.owner), owner_epoch: number(data.owner_epoch) }
+}
+function parseOverviewSession(value: unknown): OverviewSession {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), node: text(data.node), session_id: text(data.session_id), agent: provider(data.agent), muted: data.muted === true, created_at_ms: number(data.created_at_ms), version: text(data.version), cwd: data.cwd == null ? "" : text(data.cwd), summary: data.summary == null ? "" : text(data.summary) }
+}
+function parseOverviewCheck(value: unknown): OverviewTask {
+  const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
+  return {
+    kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot: null,
+    title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), cwd: "", state: "unknown", outcome: "unverified",
+    target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
+    reason, node: null, navigation: null, source: "local_check",
+  }
+}
+function parseOverviewRelation(value: unknown): OverviewRelation {
+  const data = record(value), kind = data.kind
+  if (kind !== "parent" && kind !== "continues" && kind !== "dispatches") throw new Error("任务关系无法识别。")
+  return { from_work: text(data.from_work), to_work: text(data.to_work), kind }
+}
+function parseOverviewCoverage(value: unknown, consistency: OverviewConsistency, truncated: boolean, generatedAt: number | null, networkEpoch: number | null): OverviewCoverage {
+  const data = value == null ? {} : record(value)
+  const remote = list(data.remote_owners ?? []).map((item) => {
+    const owner = record(item)
+    return { owner: nullableText(owner.owner), reachable: owner.reachable == null ? null : owner.reachable === true, reason: nullableText(owner.reason), ...(owner.status == null ? {} : { status: text(owner.status) }) }
+  })
+  const unreachable = list(data.unreachable_nodes ?? []).map(text)
+  return {
+    source: data.source === "workspace_overview" || data.local_heads === true ? "workspace_overview" : "open_works", complete: data.complete === true, bounded: data.bounded !== false,
+    generated_at_ms: nullableNumber(data.generated_at_ms ?? generatedAt), network_epoch: nullableNumber(data.network_epoch ?? networkEpoch), consistency: overviewConsistency(data.consistency ?? consistency), truncated: data.truncated === true || truncated,
+    local_heads: data.local_heads === true, remote_owners: remote, unreachable_nodes: unreachable,
+    omitted_finished: nullableNumber(data.omitted_finished), omitted_sessions: nullableNumber(data.omitted_sessions), omitted_tasks: nullableNumber(data.omitted_tasks), omitted_questions: nullableNumber(data.omitted_questions), omitted_checks: nullableNumber(data.omitted_checks), omitted_dispatches: nullableNumber(data.omitted_dispatches), omitted_deliveries: nullableNumber(data.omitted_deliveries), omitted_relations: nullableNumber(data.omitted_relations), omitted_jobs: nullableNumber(data.omitted_jobs), omitted_live_progress: data.omitted_live_progress !== false,
+  }
+}
+
+/** Parse a future bounded `workspace_overview` response without claiming unknown state is complete. */
+export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
+  const data = record(value), consistency = overviewConsistency(data.consistency), generatedAt = nullableNumber(data.generated_at_ms), networkEpoch = nullableNumber(data.network_epoch), truncated = data.truncated === true
+  const heads = data.heads == null ? {} : Object.fromEntries(Object.entries(record(data.heads)).map(([key, head]) => [key, number(head)]))
+  const tasks = list(data.tasks ?? []).map(parseOverviewTask)
+  const deliveries = list(data.deliveries ?? []).map((delivery) => parseOverviewTask({ ...record(delivery), item_kind: "dispatch" }))
+  const stops = new Map(deliveries.filter((delivery) => delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out")).map((delivery) => [delivery.work_id, delivery]))
+  const mergedTasks = tasks.map((task) => {
+    const stop = task.work_id ? stops.get(task.work_id) : undefined
+    return stop && task.kind !== "check" ? { ...task, state: stop.state, outcome: stop.outcome, reason: stop.reason ?? task.reason, cwd: task.cwd || stop.cwd } : task
+  })
+  const extraDeliveries = deliveries.filter((delivery) => {
+    if (!delivery.work_id) return true
+    const existing = tasks.some((task) => task.work_id === delivery.work_id && (delivery.state === "stop_waiting" || delivery.state === "stop_timed_out" || task.kind === "dispatch"))
+    return !existing
+  })
+  return {
+    schema: nullableNumber(data.schema), generated_at_ms: generatedAt, network_epoch: networkEpoch, heads, consistency,
+    bots: list(data.bots ?? []).map(parseOverviewBot), conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...mergedTasks, ...extraDeliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
+      const raw = record(question)
+      return raw.answer == null && raw.closed == null && raw.state !== "answered" && raw.state !== "closed"
+    }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),
+    relations: list(data.relations ?? []).map(parseOverviewRelation), sessions: list(data.sessions ?? []).map(parseOverviewSession), coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
+  }
+}
+
+/** Adapt bounded overview work rows for existing task cards and inbox checks. */
+export function openWorksFromOverview(overview: WorkspaceOverview): OpenWork[] {
+  return overview.tasks.flatMap((task): OpenWork[] => {
+    if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) return []
+    const state: WorkRecord["state"] = task.state === "accepted_waiting_sync" ? "dispatch_waiting"
+      : task.state === "unknown" ? "unverified"
+        : task.state === "stop_waiting" || task.state === "stop_timed_out" ? "accepted"
+          : task.state
+    const outcome = task.outcome === "completed" && state === "unverified" ? "unverified" : task.outcome
+    return [{
+      work_id: task.work_id, conversation_id: task.conversation_id, trigger: "", target_node: task.target_node ?? "", cwd: task.cwd, title: task.title, prompt: "",
+      state, summary: task.summary, outcome, result_text: "", failure_reason: task.reason, kind: task.work_kind ?? undefined,
+      dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
+      thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
+      ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
+    }]
+  })
+}
+
 /** A pushed change: the records it touched, or null when it carries none. */
 export function parseRecords(value: unknown): ConversationRecords {
   const data = record(value)

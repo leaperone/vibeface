@@ -151,7 +151,8 @@ pub struct Subject {
     /// The provider's thread or session ID.
     pub session_id: String,
     pub cwd: String,
-    /// One line: what the session last said.
+    /// One line: what the session said in the event this subject comes from. A session's
+    /// attribution keeps the line from when it was claimed; later turns do not update it.
     pub summary: String,
     /// The request `node` holds until the question is answered: an App Server's, or one a
     /// session's hook, plugin or extension waits on.
@@ -1095,7 +1096,7 @@ pub struct SkillEntry {
 }
 
 /// A schedule that is not removed, with its current pause state. `changed_at_ms` is when its
-/// definition or its pause state last changed, whichever is later.
+/// definition or its pause state was first stored on this Node, whichever is later.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ScheduleEntry {
     pub schedule_id: String,

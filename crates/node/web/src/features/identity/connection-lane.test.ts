@@ -8,6 +8,7 @@ import { JsxEmit, ModuleKind, transpileModule } from 'typescript'
 import type { ConnectionEntry } from '@vibeface/client/lib/node.ts'
 import { primaryLane, shouldAutoConnect } from '@vibeface/client/identity/connection-lane.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
+import { joinTicket } from '@vibeface/client/lib/transport.ts'
 
 test('one saved entry connects itself, and several entries stay listed', () => {
   assert.equal(shouldAutoConnect({ hasInvitation: false, savedCount: 1 }), true)
@@ -59,6 +60,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   const setupRequests: { path: string; options: RequestInit }[] = []
   const joinStatus = { value: joining ? joinRequest(joining) : joinRequest('pending') } as { value: Record<string, unknown> }
   const managed = { value: [] as Record<string, unknown>[] }
+  const inviteState = { value: 'open' }
   const holds = new Map<string, ReturnType<typeof deferred>>()
   const sockets: { entry: ConnectionEntry; close(): void; drop(): void }[] = []
   // As the Node sends it.
@@ -92,7 +94,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
   let key = subject
   let initialized = !bootstrap && local !== 'fresh'
   const transport = {
-    validTarget: (value: string) => value, validEndpoint: (value: string) => value,
+    validTarget: (value: string) => value, validEndpoint: (value: string) => value, joinTicket,
     initClient: async () => ({ deviceId: key }), signClient: async () => 'signature',
     replaceClient: async () => { calls.push('replace-key'); key = freshKey; return { deviceId: key } },
     parseJoinLink: async () => ({ origin: entry.address, entryId: target, inviteId, inviteHash: 'h'.repeat(64), secret: 'one-time-secret' }),
@@ -120,6 +122,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
         if (method === 'authenticate' && removed && key === subject) return { principal: null, initialized: true, network_id: network, revoked: true }
         if (method === 'authenticate') { initialized = true; authorized = true }
         if (method === 'local_access') { localState.enabled = false; return { enabled: false } }
+        if (method === 'join_check' || method === 'node_join_check') return { invite: inviteState.value }
         if (method === 'join') return joinRequest('pending', { device_id: params.public_key })
         if (method === 'join_status' && !params.join_id) return { requests: managed.value }
         if (method === 'approve') return joinRequest('confirming', { device_id: remote, admin_id: subject, admin_nonce: params.admin_nonce })
@@ -195,7 +198,7 @@ function deviceHarness({ joining = '', bootstrap = false, saved = false, local =
     afterRender.splice(0).forEach(run => run())
     return props.value
   }
-  return { render, secure, calls, requests, setupRequests, joinStatus, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
+  return { render, secure, calls, requests, setupRequests, joinStatus, inviteState, managed, holds, sockets, stored, timers, location, openHash, localState, navigations, verifications: () => verifications, released: () => released, close() { for (const effect of effects.values()) effect.cleanup?.() } }
 }
 
 const notMember = { principal: null, initialized: true, network_id: network, revoked: false }
@@ -428,6 +431,79 @@ test('joining commits first, reveals only after the manager nonce, then shows th
     assert.equal(app.stored.get('vibeface.pending-join'), 'null')
     assert.equal(app.requests.filter(request => request.method === 'join').length, 1)
     assert.equal(app.calls.includes('replace-key'), false)
+  } finally { app.close() }
+})
+
+test('opening a used link says so before 加入, on its own channel, and sends no join request', async () => {
+  const app = deviceHarness()
+  try {
+    app.render(); await settle()
+    const phase = app.render().phase
+    app.inviteState.value = 'used'
+    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'used')
+    assert.deepEqual(plain(app.requests.filter(request => request.method === 'join_check').map(request => request.params)), [{ secret: 'one-time-secret' }])
+    assert.equal(app.requests.some(request => request.method === 'join'), false, 'checking takes nothing')
+    assert.equal(app.sockets.length, 1)
+    assert.equal(app.render().phase, phase, 'the screen keeps its connection state')
+    app.inviteState.value = 'open'
+    await app.render().join('https://node.example/join#vibeface1ticket', 'browser')
+    assert.equal(app.render().joining?.status, 'pending', 'an open link still goes through the approval')
+  } finally { app.close() }
+})
+
+test('this computer asks its own Node about a link, with the page capability, and never joins to find out', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  try {
+    app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
+    app.inviteState.value = 'expired'
+    assert.equal(await app.render().checkInvite('https://node.example/join#vibeface1ticket'), 'expired')
+    const check = app.requests.find(request => request.method === 'node_join_check')
+    assert.deepEqual(plain(check?.params), { capability: localCapability, link: 'https://node.example/join#vibeface1ticket' })
+    assert.equal(app.requests.some(request => request.method === 'node_join'), false)
+  } finally { app.close() }
+})
+
+test('this computer\'s join asks again after a lost answer and explains a failure as the terminal does', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  try {
+    app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
+    const lost = deferred(); app.holds.set('node_join', lost)
+    const joining = app.render().joinThisComputer('https://node.example/join#vibeface1ticket', '工作室 Mac')
+    await until(() => app.requests.some(request => request.method === 'node_join'))
+    const before = new Set(app.timers.keys())
+    app.holds.set('node_join', { promise: Promise.resolve({ status: 'failed', reason: 'join request Rejected: rejected' }), resolve() {}, reject() {} })
+    lost.reject(new Error('request timed out'))
+    await until(() => [...app.timers.keys()].some(id => !before.has(id)))
+    for (const [id, run] of app.timers) if (!before.has(id)) { app.timers.delete(id); run() }
+    await assert.rejects(joining, /管理设备拒绝了这次加入/)
+    const asked = app.requests.filter(request => request.method === 'node_join').map(request => plain(request.params))
+    assert.equal(asked.length, 2)
+    assert.deepEqual(asked[1], asked[0], 'the same link again only reads how far the join got')
+  } finally { app.close() }
+})
+
+for (const landed of [true, false]) test(`a lost rename reply reads the name back ${landed ? 'and counts it' : 'and reports the failure'}, never signing twice`, async () => {
+  const app = deviceHarness({ management: true, saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    await app.render().refreshDirectory()
+    let name = 'node'
+    const verify = app.secure.verifyState
+    app.secure.verifyState = () => ({ ...verify(), viewJson: () => JSON.stringify({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: true }, { device_id: target, kind: 'node', name, manage: false }] }) })
+    const reply = deferred(); app.holds.set('grant', reply)
+    const renaming = app.render().renameDevice(target, ' 工作室 Mac ')
+    await until(() => app.requests.some(request => request.method === 'grant'))
+    if (landed) name = '工作室 Mac'
+    reply.reject(new Error('connection lost'))
+    if (landed) await renaming
+    else await assert.rejects(renaming, /connection lost/)
+    const grants = app.requests.filter(request => request.method === 'grant').map(request => plain(request.params.event))
+    assert.equal(grants.length, 1)
+    assert.deepEqual(grants[0].action, { type: 'grant', member: { device_id: target, kind: 'node', name: '工作室 Mac', manage: false } }, 'a rename keeps the kind and permission')
+    if (landed) {
+      await app.render().renameDevice(target, '工作室 Mac')
+      assert.equal(app.requests.filter(request => request.method === 'grant').length, 1, 'a name already in place is not signed again')
+    }
   } finally { app.close() }
 })
 

@@ -308,7 +308,8 @@ struct Hooks {
     action: HooksAction,
     #[command(flatten)]
     local: LocalNode,
-    /// Explicit home directory holding the coding agents' hook and extension files.
+    /// Home directory holding the coding agents' hook and extension files, Codex's included;
+    /// defaults to `$HOME`, with Codex's in `$CODEX_HOME` when set.
     #[arg(long, value_name = "DIR", value_parser = config::absolute_path)]
     home: Option<PathBuf>,
     /// Show what would change without writing.
@@ -580,7 +581,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Action::Hooks(options) => hooks(options).await,
+        Action::Hooks(options) => hooks(options, vibeface::discovery::Host::current()).await,
         Action::Triage(options) => triage(options).await,
         Action::Log(options) => log_record(options).await,
         Action::Logs(options) => logs(options).await,
@@ -1511,6 +1512,9 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 
 async fn join(options: Join) -> Result<()> {
     prepare_start(&options.data.data_dir)?;
+    if node_running(&options.data.data_dir)? {
+        return join_through_running_node(&options).await;
+    }
     let state =
         vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
             .await?;
@@ -1519,6 +1523,133 @@ async fn join(options: Join) -> Result<()> {
         state.genesis.network_id
     );
     Ok(())
+}
+
+fn node_running(dir: &Path) -> Result<bool> {
+    // Without an identity no Node runs here, and opening the data directory says so itself.
+    if !dir.join("identity.json").exists() {
+        return Ok(false);
+    }
+    match config::lock_data_dir(dir) {
+        Ok(_lock) => Ok(false),
+        Err(error)
+            if matches!(
+                error.downcast_ref::<fs::TryLockError>(),
+                Some(fs::TryLockError::WouldBlock)
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The running Node owns this computer's pairing state, so it runs the join; this command asks
+/// it to start and then follows along. Every ask carries the same link, which the Node reads as
+/// "how far is it", never as a second request.
+async fn join_through_running_node(options: &Join) -> Result<()> {
+    use vibeface::client::NodeJoin;
+    const UNREACHABLE_TRIES: u32 = 5;
+    let dir = &options.data.data_dir;
+    let mut shown = None;
+    let mut unreachable = 0;
+    println!("这台电脑上的 Vibeface 正在运行，交给它来加入。");
+    loop {
+        let status = match maintenance::join(dir, &options.link, &options.name).await {
+            Ok(status) => status,
+            Err(error) if error.downcast_ref::<maintenance::Busy>().is_some() => {
+                bail!("Vibeface 正在更新。等它重新启动后，再运行同一条命令。")
+            }
+            Err(error) if error.downcast_ref::<maintenance::Refused>().is_some() => {
+                bail!(join_failure_text(&error.to_string()))
+            }
+            Err(error) => {
+                unreachable += 1;
+                if unreachable < UNREACHABLE_TRIES {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                bail!(
+                    "连不上正在运行的 Vibeface（{error}）。\n\
+                     加入可能还在进行：确认它在运行后，再运行同一条命令，会接着上次的请求，不会重复提交。"
+                )
+            }
+        };
+        unreachable = 0;
+        if shown.as_ref() != Some(&status) {
+            match &status {
+                NodeJoin::Waiting => println!("已提交加入请求，等待管理设备批准。"),
+                NodeJoin::Confirming { code } => {
+                    println!("安全码：{code}。在管理设备上比对一致后允许。")
+                }
+                NodeJoin::Joined => {
+                    println!("已加入。这台电脑的 Vibeface 已开始同步，不用重启。");
+                    return Ok(());
+                }
+                NodeJoin::Failed { reason } => bail!(join_failure_text(reason)),
+                NodeJoin::Cancelled => bail!("这次加入已在这台电脑的网页上取消。"),
+            }
+            shown = Some(status);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Says why a join ended and what to do next, in the words the rest of `join` uses.
+fn join_failure_text(reason: &str) -> String {
+    const TABLE: [(&str, &str); 10] = [
+        (
+            "already been used",
+            "这条加入链接已经用过了。在管理设备上点“添加设备”重新生成，再运行新命令。",
+        ),
+        (
+            "expired",
+            "这条加入链接已过期。在管理设备上点“添加设备”重新生成，再运行新命令。",
+        ),
+        (
+            "Rejected",
+            "管理设备拒绝了这次加入。确认是自己的电脑后，在管理设备上重新生成链接再试。",
+        ),
+        (
+            "Withdrawn",
+            "这次加入已撤回。在管理设备上重新生成链接再试。",
+        ),
+        (
+            "approval timed out",
+            "等了很久也没有批准。在管理设备上重新生成链接再试。",
+        ),
+        (
+            "already belongs to a personal network",
+            "这台电脑已经在一个网络里了，不用再加入。",
+        ),
+        (
+            "another join is already running",
+            "这台电脑正在它的网页上加入。在网页上完成，或先在网页上取消。",
+        ),
+        (
+            "another join is in progress",
+            "这条链接上次用的是另一个名字。用上次的 --name 重新运行，会接着等批准。",
+        ),
+        (
+            "invite link",
+            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+        ),
+        (
+            "Vibeface ticket",
+            "这不是有效的加入链接。请从管理设备的“添加设备”重新复制。",
+        ),
+    ];
+    TABLE
+        .iter()
+        .find(|(pattern, _)| reason.contains(pattern))
+        .map_or_else(
+            || {
+                format!(
+                    "没能加入：{reason}\n检查网络后再运行同一条命令，会接着上次的请求，不会重复提交。"
+                )
+            },
+            |(_, text)| (*text).to_owned(),
+        )
 }
 
 async fn call_tool(name: String, arguments: String, call_ref: Option<String>) -> Result<()> {
@@ -1572,8 +1703,8 @@ async fn dispatch_work(arguments: &Value, call_id: &str, socket: &Path) -> Resul
         },
         |args| async move {
             let asked = json!({"agent":args["agent"],"thread":args["thread"],"continues":args["continues"]});
-            let ready = post_tool("wait_work", asked, call_id).await;
-            ready.ok()?["agent"].as_str().map(str::to_owned)
+            let ready = post_tool("wait_work", asked, call_id).await?;
+            Ok(ready["agent"].as_str().map(str::to_owned))
         },
         socket,
     )
@@ -1813,7 +1944,33 @@ async fn hook(options: Hook) -> Result<()> {
     Ok(())
 }
 
-async fn hooks(options: Hooks) -> Result<()> {
+/// The home folder `vibeface hooks` edits and Codex's folder in it. `--home` holds every file,
+/// Codex's too; without it, `$HOME`, and Codex's folder is found as Codex finds it: `CODEX_HOME`,
+/// which must be an existing folder, else `$HOME/.codex`.
+fn hook_homes(home: Option<&Path>, host: &vibeface::discovery::Host) -> Result<(PathBuf, PathBuf)> {
+    if let Some(home) = home {
+        return Ok((home.to_owned(), home.join(".codex")));
+    }
+    let home = host
+        .home
+        .clone()
+        .filter(|home| home.is_absolute())
+        .context("HOME is not an absolute path; pass --home")?;
+    let codex_home = match host.codex_home.clone() {
+        Some(codex_home) => {
+            ensure!(
+                codex_home.is_absolute() && codex_home.is_dir(),
+                "CODEX_HOME {} is not an existing absolute folder",
+                codex_home.display()
+            );
+            codex_home
+        }
+        None => home.join(".codex"),
+    };
+    Ok((home, codex_home))
+}
+
+async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
     use vibeface::triage;
     if let HooksAction::Test = options.action {
         let result = post_local(
@@ -1830,10 +1987,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         println!("Node received the test event {}", result["event_id"]);
         return Ok(());
     }
-    let home = options
-        .home
-        .as_ref()
-        .context("--home is required for hook configuration")?;
+    let (home, codex_home) = hook_homes(options.home.as_deref(), &host)?;
     let program = std::env::current_exe()?;
     let data_dir = match options.local.data.data_dir.canonicalize() {
         Ok(dir) => dir,
@@ -1842,13 +1996,7 @@ async fn hooks(options: Hooks) -> Result<()> {
     let stamp = vibeface::runtime::now_ms();
     // Every file is read and checked before any is written: one that cannot change leaves all.
     let mut planned = Vec::new();
-    let codex_home = vibeface::discovery::Host {
-        home: Some(home.clone()),
-        ..vibeface::discovery::Host::current()
-    }
-    .codex_home()
-    .ok();
-    for file in triage::hook_files(home, codex_home.as_deref()) {
+    for file in triage::hook_files(&home, &codex_home) {
         let mut settings: Value = match fs::read(&file.path) {
             Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Null,
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
@@ -1877,7 +2025,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         };
         planned.push((file.path, settings, changed, command));
     }
-    let extensions = extensions(&options, home, &program, &data_dir)?;
+    let extensions = extensions(&options, &home, &program, &data_dir)?;
     for (path, settings, changed, command) in planned {
         if changed.is_empty() {
             println!("{}: unchanged", path.display());
@@ -1924,7 +2072,7 @@ async fn hooks(options: Hooks) -> Result<()> {
         }
     }
     if let HooksAction::Install = options.action {
-        let config = home.join(".codex/config.toml");
+        let config = codex_home.join("config.toml");
         let enabled = fs::read_to_string(&config)
             .ok()
             .and_then(|text| text.parse::<toml::Table>().ok())
@@ -2465,6 +2613,40 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn join_while_the_node_runs_hands_the_link_to_it_and_explains_its_answer() {
+        let dir = std::env::temp_dir().join(format!("vibeface-join-busy-{}", uuid::Uuid::new_v4()));
+        prepare_start(&dir).unwrap();
+        let node = Arc::new(Runtime::open(&dir).await.unwrap());
+        let server = tokio::spawn(maintenance::serve(node.clone(), dir.clone()));
+        let socket = maintenance::socket_path(&dir).unwrap();
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let error = join(Join {
+            link: "https://gateway.example/join#not-a-ticket".into(),
+            data: DataDir {
+                data_dir: dir.clone(),
+            },
+            name: "我的电脑".into(),
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("不是有效的加入链接"),
+            "the running Node read the link and its refusal reads as what to do: {error:#}"
+        );
+        server.abort();
+        let _ = server.await;
+        drop(node);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir_all(socket.parent().unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn cli_requires_one_invite_link_and_supports_accountless_flags() {
         assert!(Cli::try_parse_from(["vibeface", "join"]).is_err());
@@ -2661,7 +2843,7 @@ mod tests {
             let Some(Action::Hooks(options)) = parsed.command else {
                 panic!("expected hooks")
             };
-            hooks(options).await
+            hooks(options, Default::default()).await
         };
         let extensions = home.join(".pi/agent/extensions");
         let path = extensions.join("vibeface.ts");
@@ -2692,6 +2874,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hooks_install_finds_codex_as_codex_does_and_home_holds_every_file() {
+        use vibeface::discovery::Host;
+        let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
+        let (home, codex, data) = (dir.join("home"), dir.join("codex"), dir.join("data"));
+        let run = async |host: Host, home: Option<&Path>| {
+            let mut args = vec![
+                "vibeface",
+                "hooks",
+                "install",
+                "--data-dir",
+                data.to_str().unwrap(),
+            ];
+            if let Some(home) = home {
+                args.extend(["--home", home.to_str().unwrap()]);
+            }
+            let Some(Action::Hooks(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected hooks")
+            };
+            hooks(options, host).await
+        };
+        let env = |home: PathBuf, codex_home: Option<PathBuf>| Host {
+            home: Some(home),
+            codex_home,
+            path: None,
+        };
+        let given = dir.join("given");
+        run(env(home.clone(), Some(codex.clone())), Some(&given))
+            .await
+            .unwrap();
+        assert!(given.join(".codex/hooks.json").is_file());
+        assert!(given.join(".claude/settings.json").is_file());
+        assert!(
+            !codex.exists() && !home.exists(),
+            "--home keeps CODEX_HOME and $HOME untouched"
+        );
+        assert!(
+            run(env(home.clone(), Some(codex.clone())), None)
+                .await
+                .is_err()
+                && !home.exists(),
+            "a CODEX_HOME that does not exist is refused before anything is written"
+        );
+        fs::create_dir_all(&codex).unwrap();
+        run(env(home.clone(), Some(codex.clone())), None)
+            .await
+            .unwrap();
+        assert!(codex.join("hooks.json").is_file());
+        assert!(home.join(".claude/settings.json").is_file());
+        assert!(
+            !home.join(".codex").exists(),
+            "CODEX_HOME moves Codex's files"
+        );
+        let plain = dir.join("plain");
+        run(env(plain.clone(), None), None).await.unwrap();
+        assert!(plain.join(".codex/hooks.json").is_file());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn hooks_install_writes_the_opencode_plugin_once() {
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let (home, data) = (dir.join("home"), dir.join("data"));
@@ -2709,7 +2950,7 @@ mod tests {
             let Some(Action::Hooks(options)) = parsed.command else {
                 panic!("expected hooks")
             };
-            hooks(options).await
+            hooks(options, Default::default()).await
         };
         let path = home.join(".config/opencode/plugins/vibeface.ts");
         run("install").await.unwrap();

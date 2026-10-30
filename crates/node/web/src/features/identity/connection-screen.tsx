@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { Archive, ArchiveRestore, Camera, CircleCheck, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, Monitor, MonitorSmartphone, MonitorX, Pencil, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
+import { Archive, ArchiveRestore, Camera, CircleCheck, CirclePlus, FileKey, Hourglass, KeyRound, Laptop, LifeBuoy, Link2, LoaderCircle, LogIn, MessageSquareLock, MonitorSmartphone, MonitorX, QrCode, RotateCcw, Settings2, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AuthPage, Details, EmptyState, InlineError, Panel, PasswordInput, claimFocus, SafetyCode, Skeleton, Steps, WaitingDot } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
@@ -7,13 +7,13 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { addressName, hostOf } from '@vibeface/client/workspace/labels.ts'
 import { entryAddress, entryKey, messageOf, parseEntry } from '@vibeface/client/lib/node.ts'
-import { spentInvite } from '@vibeface/client/lib/errors.ts'
+import { spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { passphrase, recoveryCode } from '@vibeface/client/lib/secure.ts'
 import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrowserName } from '@/lib/device-name'
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy, manualCopy, recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { joinCopy, manualCopy, recoveryCopy, startCopy } from '@vibeface/client/identity/copy.ts'
 import { localCopy } from '@/features/workspace/local-session'
 import { webPlatform } from '@/lib/platform'
 
@@ -155,6 +155,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const [invitation, setInvitation] = useState(device.initialInvitation)
   const [lane, setLane] = useState<Lane | null>(firstLane ?? null)
   const [names, setNames] = useState<Names | null>(null)
+  // A computer not set up yet first asks whether it starts a network or joins one.
+  const [creating, setCreating] = useState(false)
   // Going back from the password keeps what was typed.
   const [draftNames, setDraftNames] = useState<Names | null>(null)
   const [scanning, setScanning] = useState(false)
@@ -182,6 +184,17 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     if (device.joining) wasJoining.current = true
     else if (wasJoining.current) { wasJoining.current = false; if (!device.ready) setInvitation('') }
   }, [device.joining, device.ready])
+
+  // A used or expired link says so as it opens, before the name and 加入; no answer leaves the form as it is.
+  const checkable = purpose === 'link' && usable && !device.joining && !device.nodeJoining
+  useEffect(() => {
+    if (!checkable) return
+    let live = true
+    void device.checkInvite(invitation).then((state) => {
+      if (live && (state === 'used' || state === 'expired')) { setInvitation(''); setError(spentInviteText) }
+    })
+    return () => { live = false }
+  }, [invitation, checkable, thisComputer])
 
   function chooseLane(next: Lane) {
     if (!device.entry || next !== 'recovery') device.disconnect()
@@ -224,12 +237,13 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
     : quiet ? <p role="status" className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-2 text-meta text-muted-foreground">{quiet === membership ? <MonitorX aria-hidden="true" className="size-4 shrink-0" /> : null}{quiet}</p> : null
   const focused = Boolean(device.review || device.joining || device.nodeJoining || device.recovery)
   const setup = device.localSetup?.kind === 'uninitialized'
-  const step = active === 'local' && setup && !focused ? (names ? 2 : 1) : device.review?.kind === 'bootstrap' ? 3 : null
-  const other = !focused && usable && !(active === 'local' && setup && names) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
+  const choosing = active === 'local' && setup && !names && !creating
+  const step = active === 'local' && setup && !focused ? (names ? 2 : creating ? 1 : null) : device.review?.kind === 'bootstrap' ? 3 : null
+  const other = !focused && usable && !(active === 'local' && setup && (names || creating)) ? <div role="group" aria-label="其他方式" className="border-t pt-4">
     <div className="-ms-3 flex flex-wrap gap-x-2 text-muted-foreground">
-      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => chooseLane('local')}><Laptop aria-hidden="true" />{setup ? '设置这台电脑' : local === 'open' ? computerName : localCopy.manage}</Button> : null}
+      {active !== 'local' && device.localSetup ? <Button variant="ghost" type="button" onClick={() => { if (setup) setCreating(true); chooseLane('local') }}>{setup ? <CirclePlus aria-hidden="true" /> : <Laptop aria-hidden="true" />}{setup ? startCopy.create : local === 'open' ? computerName : localCopy.manage}</Button> : null}
       {active !== 'saved' && device.entries.length > 0 && !removed ? <Button variant="ghost" type="button" onClick={() => chooseLane('saved')}><MonitorSmartphone aria-hidden="true" />用过的地址</Button> : null}
-      {active !== 'invite' ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
+      {active !== 'invite' && !choosing ? <Button variant="ghost" type="button" onClick={() => chooseLane('invite')}><Link2 aria-hidden="true" />{joinCopy.byLink}</Button> : null}
       {active !== 'recovery' ? <Button variant="ghost" type="button" onClick={() => chooseLane('recovery')}><ArchiveRestore aria-hidden="true" />用恢复文件找回</Button> : null}
     </div>
   </div> : null
@@ -251,7 +265,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   else if (device.review?.kind === 'bootstrap') body = <RecoveryStep busy={busy} run={run} />
   else if (device.review) body = <RecoveryReview />
   else if (device.joining) body = <BrowserJoin />
-  else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} />
+  else if (choosing) body = <StartChoice onCreate={() => setCreating(true)} onJoin={() => chooseLane('invite')} />
+  else if (active === 'local' && setup && !names) body = <NamesStep initial={draftNames} onNext={setNames} onBack={() => setCreating(false)} />
   else if (active === 'local' && setup && names) body = <PasswordStep busy={busy || linking} disabled={!usable} names={names} onBack={() => { setDraftNames(names); setNames(null) }} run={run} />
   else if (active === 'local' && device.localSetup) body = <Panel icon={Laptop} title={device.localSetup.kind === 'initialized' ? computerName : '这台电脑'}>
     {device.localSetup.kind !== 'initialized' ? <p className="text-muted-foreground">用已有设备的加入链接，或恢复文件</p>
@@ -334,22 +349,30 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
 
 type Names = { computer: string; browser: string }
 
-/** The browser's suggested name is usually fine, so only the computer's name asks for a thought. */
-function NamesStep({ computer, initial, onNext }: { computer?: string; initial: Names | null; onNext(names: Names): void }) {
-  const [browser, setBrowser] = useState(initial?.browser ?? defaultBrowserName())
-  const [renaming, setRenaming] = useState(false)
+/** Two equal ways on for a computer not set up yet: a second computer joins the first instead of starting another network. */
+function StartChoice({ onCreate, onJoin }: { onCreate(): void; onJoin(): void }) {
+  const option = (id: string, Icon: typeof Link2, title: string, note: string, onClick: () => void) => <Button type="button" variant="outline" aria-label={title} aria-describedby={id} className="h-auto min-h-24 flex-col items-start justify-start gap-3 whitespace-normal p-4 text-start" onClick={onClick}>
+    <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-muted text-muted-foreground ring-1 ring-border"><Icon aria-hidden="true" className="size-5" /></span>
+    <span className="grid gap-0.5"><span className="text-heading font-semibold">{title}</span><span id={id} className="text-meta font-normal text-muted-foreground">{note}</span></span>
+  </Button>
+  return <div role="group" aria-label="开始使用" className="grid gap-3 sm:grid-cols-2">
+    {option('start-create-note', CirclePlus, startCopy.create, startCopy.createNote, onCreate)}
+    {option('start-join-note', Link2, startCopy.join, startCopy.joinNote, onJoin)}
+  </div>
+}
+
+/** Only the computer's name asks for a thought; the browser takes its suggested name unless someone opens it. */
+function NamesStep({ computer, initial, onNext, onBack }: { computer?: string; initial: Names | null; onNext(names: Names): void; onBack(): void }) {
   return <Panel icon={Laptop} title="给这台电脑起名">
-    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: browser.trim() || defaultBrowserName() }) }}>
+    <form className="grid gap-4" onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; onNext({ computer: value(form, 'computer').trim(), browser: value(form, 'browser').trim() || defaultBrowserName() }) }}>
       <Input key={computer} name="computer" aria-label="这台电脑叫什么？" required maxLength={128} autoComplete="off" defaultValue={initial?.computer || computer || defaultComputerName()} />
-      {renaming
-        ? <Field label="这个浏览器叫什么？"><Input name="browser" required maxLength={128} autoComplete="off" autoFocus value={browser} onChange={(event) => setBrowser(event.target.value)} /></Field>
-        : <p className="flex min-w-0 items-center gap-2 text-meta text-muted-foreground">
-          <Monitor aria-hidden="true" className="size-4 shrink-0" />
-          <span className="shrink-0 rounded-md bg-muted px-1.5">这个浏览器</span>
-          <span className="min-w-0 truncate" title={browser}>{browser}</span>
-          <Button type="button" variant="ghost" size="icon" className="-my-2" aria-label="改浏览器名称" title="改浏览器名称" onClick={() => setRenaming(true)}><Pencil aria-hidden="true" /></Button>
-        </p>}
-      <Button type="submit" className="w-fit justify-self-end">下一步</Button>
+      <Details label="这个浏览器的名字">
+        <Input name="browser" aria-label="这个浏览器叫什么？" maxLength={128} autoComplete="off" className="text-foreground" defaultValue={initial?.browser ?? defaultBrowserName()} />
+      </Details>
+      <div className="flex justify-between gap-2">
+        <Button type="button" variant="ghost" className="-ms-3" onClick={onBack}>上一步</Button>
+        <Button type="submit">下一步</Button>
+      </div>
     </form>
   </Panel>
 }

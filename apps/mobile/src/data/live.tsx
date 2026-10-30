@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
-import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { botReach, composerHint } from '@vibeface/client/chat/protocol.ts'
+import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
@@ -8,8 +9,10 @@ import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from 
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
-import { botReadiness } from '@vibeface/client/workspace/model.ts'
-import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
+import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
+import { storageOf } from '@vibeface/client/workspace/storage.ts'
+import type { BotRecord } from '@vibeface/client/workspace/types.ts'
+import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
 import type { ChatMessage, Connection, Conversation, Member, Session, Workspace, WorkspaceActions } from './types'
@@ -17,6 +20,25 @@ import type { ChatMessage, Connection, Conversation, Member, Session, Workspace,
 const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
 const empty = { bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
+
+/**
+ * What this phone last saw of its network, so a cold start that cannot reach it still lists its bots and devices.
+ * `me`: this phone's device ID then; leaving or a reset gives the phone a new one, which retires the record, and a removal
+ * or a join keeping the ID erases it, so another network never shows this one's.
+ */
+type LastSeen = { me: string; entry: string; bots: BotRecord[]; primary: string | null; members: Member[] }
+
+const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
+
+function lastSeen(me: string | undefined): LastSeen | null {
+  const value = readStorage<Record<string, unknown> | null>('last-seen', null)
+  if (!me || !value || value.me !== me || !Array.isArray(value.members)) return null
+  try {
+    const members = value.members.filter((member): member is Member => typeof member?.device_id === 'string' && typeof member.name === 'string' && (member.kind === 'node' || member.kind === 'client'))
+      .map((member) => ({ ...member, current: member.device_id === me, online: undefined }))
+    return { me, entry: typeof value.entry === 'string' ? value.entry : '', bots: parseBots(value), primary: parsePrimary(value), members }
+  } catch { return null }
+}
 
 type Shared = ReturnType<typeof useShared>
 const SharedContext = createContext<Shared | null>(null)
@@ -65,6 +87,10 @@ function Device({ children }: { children: ReactNode }) {
 function Offline({ children }: { children: ReactNode }) {
   const device = useDevice()
   const { session, connection } = useConnection()
+  const me = device.identity?.deviceId
+  const seen = useMemo(() => session.phase === 'ready' ? lastSeen(me) : null, [session.phase, me])
+  const gone = device.phase === 'removed' || session.phase === 'joining'
+  useEffect(() => { if (gone) writeStorage('last-seen', null) }, [gone])
   const actions = useMemo<WorkspaceActions>(() => ({
     join: (invitation, name) => device.join(invitation, name),
     cancelJoin: device.cancelJoin,
@@ -74,7 +100,9 @@ function Offline({ children }: { children: ReactNode }) {
     answer: async () => { throw new Error('还没连上') },
     leave: device.leave,
   }), [device])
-  return <WorkspaceProvider value={{ ...empty, session, connection, actions }}>{children}</WorkspaceProvider>
+  // The entry it last reached is the one that does not answer now, so it alone shows as offline.
+  const kept = seen ? { bots: seen.bots, primary: seen.primary, members: seen.members.map((member) => member.entry ? { ...member, online: false } : member) } : {}
+  return <WorkspaceProvider value={{ ...empty, ...kept, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, actions }}>{children}</WorkspaceProvider>
 }
 
 function Live({ children }: { children: ReactNode }) {
@@ -85,6 +113,8 @@ function Live({ children }: { children: ReactNode }) {
   latest.current = shared
   const me = device.identity?.deviceId
   const { data, conversationId, nodes, questions, notifications, answered } = shared
+  // Until the first read lands the list keeps what the phone last saw instead of going blank.
+  const seen = useMemo(() => lastSeen(me), [me])
 
   const conversations: Record<string, Conversation> = {}
   if (data && conversationId) {
@@ -104,7 +134,11 @@ function Live({ children }: { children: ReactNode }) {
     // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
     // sending, or else the latest in the history.
     const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
-    const messages: ChatMessage[] = threadReplies(data.messages).map((message) => {
+    const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
+    // An answer is a user message, shown inside its question instead of as a bubble, as on the web.
+    const folded = foldAnswers(data.messages, data.questions)
+    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered, folded.answers))
+    const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
       return detail ? { ...message, detail } : message
     })
@@ -114,7 +148,8 @@ function Live({ children }: { children: ReactNode }) {
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
-      messages, questions: data.questions, works: data.works,
+      messages, before: timeline.before, rest: timeline.rest, answers: folded.answers, hidden: folded.hidden, works: data.works,
+      unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
       replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
@@ -127,11 +162,9 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread: Record<string, number> = {}
-  for (const item of notifications) unread[item.conversation_id] = (unread[item.conversation_id] ?? 0) + 1
-  for (const question of questions) if (question.conversation_id && awaitsAnswer(question, answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
+  const unread = unreadCounts(notifications, questions.filter((question) => awaitsAnswer(question, answered)))
 
-  const members: Member[] = (device.directory?.members ?? []).map((member) => {
+  const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
@@ -140,20 +173,30 @@ function Live({ children }: { children: ReactNode }) {
     }
   })
 
+  const select = async (id: string) => {
+    const workspace = latest.current
+    const bot = workspace.bots.find((item) => item.conversation_id === id)
+    if (!bot) throw new Error(botCopy.notFound)
+    if (workspace.conversationId !== id) await workspace.selectBot(bot)
+  }
+  // A chat opened from the kept list before the first read finds no bot yet; it is selected once its bot arrives.
+  const waiting = useRef<string | null>(null)
+  const arrived = waiting.current !== null && shared.bots.some((bot) => bot.conversation_id === waiting.current)
+  useEffect(() => {
+    const id = waiting.current
+    if (!arrived || !id) return
+    waiting.current = null
+    void select(id).catch(() => {})
+  }, [arrived])
   const actions = useMemo<WorkspaceActions>(() => {
-    const select = async (id: string) => {
-      const workspace = latest.current
-      const bot = workspace.bots.find((item) => item.conversation_id === id)
-      if (!bot) throw new Error(botCopy.notFound)
-      if (workspace.conversationId !== id) await workspace.selectBot(bot)
-    }
     return {
       join: (invitation, name) => device.join(invitation, name),
       cancelJoin: device.cancelJoin,
       open(id) {
+        let closed = false
         latest.current.setView('chat')
-        void select(id).catch(() => {})
-        return () => latest.current.setView('other')
+        void select(id).catch((cause) => { if (!closed && cause instanceof Error && cause.message === botCopy.notFound) waiting.current = id })
+        return () => { closed = true; waiting.current = null; latest.current.setView('other') }
       },
       async send(id, text, attachments) {
         await select(id)
@@ -171,8 +214,15 @@ function Live({ children }: { children: ReactNode }) {
 
   useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
 
+  const fresh = shared.synced || shared.bots.length > 0
+  const bots = fresh || !seen ? shared.bots : seen.bots, primary = fresh || !seen ? shared.primary : seen.primary
+  const members = device.directory || !seen ? directory : seen.members
+  const snapshot = me && shared.synced && device.directory ? { me, entry: connection.entry, bots: shared.bots.map((bot) => ({ ...bot, busy: null })), primary: shared.primary, members: directory } : null
+  const record = snapshot && JSON.stringify(snapshot)
+  useEffect(() => { if (snapshot) writeStorage('last-seen', snapshot) }, [record])
+
   const value: Workspace = {
-    session, connection, bots: shared.bots, primary: shared.primary, unread, questions, members, conversations, actions,
+    session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
   }
   return <SharedContext.Provider value={shared}><WorkspaceProvider value={value}>{children}</WorkspaceProvider></SharedContext.Provider>
 }

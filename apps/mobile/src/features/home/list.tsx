@@ -1,11 +1,11 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, RefreshCw, Settings, ShieldAlert, Star, WifiOff } from 'lucide-react-native'
-import type { ReactNode } from 'react'
+import { BellRing, Bot, ChevronRight, Inbox, ListChecks, Plus, Settings, ShieldAlert, Star, X } from 'lucide-react-native'
+import { useState, type ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { ConnectionMenu } from '@/components/connection-pill'
+import { ConnectionMenu, OfflineBar } from '@/components/connection-pill'
 import { botMood, BotFace } from '@/components/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Badge, botTint, EmptyState, Skeleton } from '@/components/kit'
@@ -13,14 +13,18 @@ import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { recoveryCopy, waitingCopy } from '@vibeface/client/identity/copy.ts'
 import { moodLabel } from '@vibeface/client/avatar/mood.ts'
 import { useWorkspace } from '@/data/context'
 import { useInbox, useLive } from '@/data/live'
 import { waitingItems } from '@vibeface/client/workspace/inbox.ts'
 import { emptyHome } from '@vibeface/client/workspace/home.ts'
+import { storageOf } from '@vibeface/client/workspace/storage.ts'
+import { ErrorText } from '@/components/action'
 import { listTime } from '@/lib/time'
+import { useRun } from '@/lib/use-run'
 import { cn } from '@/lib/utils'
+import { mobilePlatform } from '@/platform'
 
 const Item = withUniwind(Animated.View)
 // A bot lifted to the top by a new message, or rows closing over the 待处理 card, glide instead of jumping.
@@ -54,9 +58,11 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {sidebar ? <View className="mb-2 flex-row items-center ps-3 pt-2">
       <Text role="heading" className="flex-1 text-title font-semibold">消息</Text>
       <ConnectionMenu connection={workspace.connection} />
+      <Link href="/tasks" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('size-11 rounded-full', active('/tasks') && 'bg-muted')} accessibilityLabel="任务" accessibilityState={{ selected: active('/tasks') }}><Icon as={ListChecks} /></Button></Link>
       <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
+    <OfflineBar className="mx-1 mb-2 mt-1" />
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
         <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
@@ -66,6 +72,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
         </Pressable>
       </Link>
     </Item> : null}
+    <NotifyTip />
     {bots.length ? bots.map((bot, index) => {
       const last = bot.last_message, mood = botMood(bot, workspace, shared), primary = workspace.primary === bot.conversation_id
       return <Item key={bot.bot_id} layout={move}>
@@ -76,8 +83,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
         {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
       </Item>
-    }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title="连不上你的网络，正在重试"
-      action={<Button variant="outline" className="min-h-11" onPress={device.retryNow}><Icon as={RefreshCw} /><Text>重试</Text></Button>} /></View>
+    }) : empty === 'unreachable' ? null
     : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
       <Skeleton className="size-11 rounded-full" />
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-full" /><Skeleton className="h-3 w-2/3 rounded-full" /></View>
@@ -85,6 +91,26 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Button className="min-h-11"><Icon as={Plus} /><Text>新 Bot</Text></Button>
     </Link> : undefined} /></View>}
   </ScrollView></LayoutAnimationConfig>
+}
+
+const tipClosed = 'notify-tip-closed'
+
+/** Until system notifications are on for this network, one closable card offers them; the system asks only after its button. Closing it hides it on every network. */
+function NotifyTip() {
+  const shared = useLive()
+  const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
+  const [closed, setClosed] = useState(() => readStorage(tipClosed, false))
+  const { busy, error, run } = useRun()
+  if (closed || !shared?.synced || shared.notificationButton.state !== 'off' || shared.notificationButton.disabled) return null
+  return <Item key="notify" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1 gap-1">
+    <View className="min-h-16 flex-row items-center gap-3 rounded-2xl border border-border bg-card py-2.5 ps-3 pe-1">
+      <View className="size-11 items-center justify-center rounded-full bg-brand/10"><Icon as={BellRing} className="text-brand" /></View>
+      <Text className="min-w-0 flex-1 font-medium">{waitingCopy.notifyTip}</Text>
+      <Button size="sm" disabled={busy !== null} onPress={() => void run('notify', shared.enableNotifications)}><Text>{waitingCopy.notifyOn}</Text></Button>
+      <Button variant="ghost" size="icon" accessibilityLabel="关闭" onPress={() => { writeStorage(tipClosed, true); setClosed(true) }}><Icon as={X} className="text-muted-foreground" /></Button>
+    </View>
+    {error ? <View className="px-3"><ErrorText error={error} /></View> : null}
+  </Item>
 }
 
 function Row({ href, replace, active, avatar, name, mark, label, preview, unread, time, tint }: { href: Href; replace: boolean; active: boolean; avatar: ReactNode; name: string; mark?: ReactNode; label?: string; preview: string; unread: number; time?: string; tint: { fill: string; ink: string } }) {

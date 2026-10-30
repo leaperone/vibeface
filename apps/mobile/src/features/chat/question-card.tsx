@@ -3,7 +3,7 @@ import { Link } from 'expo-router'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
-import { projectName, questionMeta } from '@vibeface/client/workspace/questions.ts'
+import { questionMeta, sharedProject } from '@vibeface/client/workspace/questions.ts'
 import { ArrowUp, CircleCheck, CircleSlash, FolderOpen, Hand, Info, ListChecks, LoaderCircle, MessageCircleQuestionMark, PencilLine, Server, TriangleAlert, type LucideIcon } from 'lucide-react-native'
 import { useState } from 'react'
 import { Pressable, TextInput, View } from 'react-native'
@@ -25,15 +25,20 @@ const looks: Record<Question['severity'], { icon: LucideIcon; tone: Tone }> = {
   info: { icon: Info, tone: 'info' },
 }
 
-/** One numbered choice per row and a free answer as the last row, as on the web; answered or closed, it folds to one line. */
-export function QuestionCard({ question }: { question: Question }) {
+/**
+ * One numbered choice per row and a free answer as the last row, as on the web; a request to allow something only takes its choices.
+ * Answered or closed, it folds to one line. `answer`: the chat's message answering it, which shows here instead of as a bubble.
+ * `inTask`: inside the task's own page, which already names the task, device and folder.
+ */
+export function QuestionCard({ question, answer, inTask = false }: { question: Question; answer?: string; inTask?: boolean }) {
   const workspace = useWorkspace()
   const shared = useLive()
   const { ready } = useDevice()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
-  if (question.answer) return <Settled icon={CircleCheck} className="text-success" ask={question.text}>{question.answer.text}</Settled>
+  const settled = question.answer?.text ?? answer
+  if (settled !== undefined) return <Settled icon={CircleCheck} className="text-success" ask={question.text}>{settled}</Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={question.text}>已失效</Settled>
 
   const send = async (key: string, value: string) => {
@@ -55,9 +60,10 @@ export function QuestionCard({ question }: { question: Question }) {
   }
   const { approval, task, local } = questionMeta(question, shared?.openWorks ?? [], workspace.bots, ready?.entry.device_id)
   const member = workspace.members.find((item) => item.device_id === question.about.node)
+  const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, shared?.nodes ?? []) : null
   const { icon, tone } = looks[question.severity]
   return <ActionCard icon={approval ? Hand : icon} tone={tone} title={question.text}>
-    <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+    {inTask ? null : <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
       {task ? <Link href={`/b/${task.bot_id}/work/${task.work_id}`} asChild>
         <Pressable accessibilityRole="link" accessibilityLabel={`任务 ${task.title}`} hitSlop={8} className="min-w-0 flex-row items-center gap-1 active:opacity-60">
           <Icon as={ListChecks} className="size-4 text-muted-foreground" />
@@ -65,9 +71,9 @@ export function QuestionCard({ question }: { question: Question }) {
         </Pressable>
       </Link> : null}
       {question.about.agent ? <Meta icon={providerIcons[question.about.agent]} label="来自">{providerNames[question.about.agent]}</Meta> : null}
-      {question.about.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(question.about.cwd)}</Meta> : null}
+      {project ? <Meta icon={FolderOpen} label="项目">{project.name}</Meta> : null}
       {local ? null : <Meta icon={member ? deviceIcon(member) : Server} label="设备">{member?.name ?? '另一台设备'}</Meta>}
-    </View>
+    </View>}
     <View accessibilityRole="radiogroup" accessibilityLabel="选一个回答" className="gap-2">
       {question.choices.map((choice, index) => {
         const key = `choice:${choice.label}`

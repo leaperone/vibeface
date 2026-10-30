@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, awaitsAnswer, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer } from "./questions.ts"
+import { answerBody, awaitsAnswer, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -78,6 +78,11 @@ test("questions and hand-offs sit where they happened in the chat", () => {
   assert.deepEqual(rest.map((item) => item.id), ["late"])
   assert.equal(projectName("/path/to/web/"), "web")
   assert.equal(projectName("C:\\code\\api"), "api")
+  const nodes = [{ device_id: "mac", capabilities: { manager: null, manager_state: null, relay: false, roots: ["/Users/me/demo-project/", "/srv/api"] } }]
+  assert.deepEqual(sharedProject("workspace-1/", "mac", nodes), { name: "demo-project", path: "/Users/me/demo-project/" }, "a device's own folder shows by its name")
+  assert.deepEqual(sharedProject("workspace-2/web/src", "mac", nodes), { name: "src", path: "/srv/api/web/src" })
+  assert.equal(sharedProject("workspace-3/x", "mac", nodes).name, "x", "a folder the device no longer lists keeps the shared path")
+  assert.equal(sharedProject("workspace-1", "other", nodes).name, "workspace-1")
 })
 
 test("questions go to the web, or to the web and Grok; nothing else", () => {

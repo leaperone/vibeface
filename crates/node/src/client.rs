@@ -397,8 +397,10 @@ pub async fn serve_join(node: Arc<Runtime>, connection: Connection, remote: Stri
         async move {
             let method = text(&request, "method")?;
             ensure!(
-                matches!(method, "join" | "join_status" | "join_withdraw")
-                    && request["params"].is_object(),
+                matches!(
+                    method,
+                    "join_check" | "join" | "join_status" | "join_withdraw"
+                ) && request["params"].is_object(),
                 "a join connection only joins"
             );
             let mut session = Session {
@@ -554,14 +556,16 @@ async fn serve_session(
 }
 
 /// Methods a device that is not (or no longer) a member may call.
-const GUEST_METHODS: [&str; 10] = [
+const GUEST_METHODS: [&str; 12] = [
     "info",
     "authenticate",
+    "join_check",
     "join",
     "join_status",
     "join_withdraw",
     "recovery_state",
     "recover",
+    "node_join_check",
     "node_join",
     "node_join_cancel",
     "rejoin",
@@ -587,7 +591,9 @@ async fn dispatch(
             | "authenticate"
             | "directory"
             | "node_settings"
+            | "provider_models"
             | "subscribe"
+            | "join_check"
             | "join_status"
             | "recovery_state"
             | "entrances"
@@ -724,6 +730,15 @@ async fn dispatch(
             node_operator(node, session).await?;
             Ok(json!(node.codex.test().await))
         }
+        "provider_models" => {
+            node_operator(node, session).await?;
+            let models = match params["provider"].as_str() {
+                Some("codex") => node.codex.models().await,
+                Some(_) => None,
+                None => bail!("provider is required"),
+            };
+            Ok(json!({"models":models}))
+        }
         "triage_settings" => {
             node_operator(node, session).await?;
             node.triage_settings().await
@@ -834,6 +849,14 @@ async fn dispatch(
             let principal = principal(node, session).await?;
             Ok(json!({"entrances":node.entrances(&principal.network_id).await?}))
         }
+        "join_check" => {
+            let state = node
+                .store
+                .lock()
+                .await
+                .invite_state(text(&params, "secret")?, &session.device_id)?;
+            Ok(json!({"invite":state}))
+        }
         "join" => {
             let join: Join = serde_json::from_value(params).context("invalid join request")?;
             ensure!(
@@ -931,9 +954,11 @@ async fn dispatch(
                 event.issuer == session.device_id && event.epoch == view.epoch,
                 "invalid grant signer or action"
             );
-            // New devices join through `approve`; this only changes a current client's permission.
+            // New devices join through `approve`; this only renames a current device or changes
+            // a client's permission.
             ensure!(
-                view.client(&member.device_id).is_ok(),
+                view.member(&member.device_id)
+                    .is_ok_and(|current| current.kind == member.kind),
                 "device is not a member of this personal network"
             );
             let mut state = node.membership_state().await?;
@@ -1023,6 +1048,7 @@ async fn dispatch(
             recover(node, session, &params).await?;
             authentication(node, session).await
         }
+        "node_join_check" => check_link_for_local_page(node, &params).await,
         "node_join" => Ok(serde_json::to_value(
             join_from_local_page(node, &params).await?,
         )?),
@@ -1438,7 +1464,8 @@ fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
     )?)
 }
 
-/// Saved so an interrupted `vibeface join` resumes with the same commitment.
+/// Saved so an interrupted join, from the terminal or the local page, resumes with the same
+/// commitment.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingJoin {
@@ -1531,14 +1558,15 @@ pub async fn join_network(dir: &Path, link: &str, name: &str) -> Result<NetworkS
     join_as_node(&node, link, name, report, &tokio::sync::Notify::new()).await
 }
 
-/// How far this Node's own join has come; the local page shows it while the manager approves.
-#[derive(Clone, Serialize)]
+/// How far this Node's own join has come; the local page and `vibeface join` show it while the
+/// manager approves.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub(crate) enum NodeJoin {
+pub enum NodeJoin {
     Waiting,
     Confirming { code: String },
     Joined,
-    Failed,
+    Failed { reason: String },
     Cancelled,
 }
 
@@ -1552,41 +1580,26 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
-/// The join this Node runs for its own local page, one at a time.
+/// Who started this Node's join: its local page, by the capability it holds, or `vibeface join`
+/// through the maintenance socket only this computer's owner can reach.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum JoinOwner {
+    Page(String),
+    Terminal,
+}
+
+/// The join this Node runs for its own local page or terminal, one at a time.
 pub(crate) struct NodeJoinTask {
     link: String,
-    /// The local setup capability that started it; joining installs the network and retires it.
-    capability: String,
+    owner: JoinOwner,
     status: NodeJoin,
     task: tokio::task::AbortHandle,
     cancel: Arc<tokio::sync::Notify>,
 }
 
-/// Starts, or reports, this fresh Node's join from its local page. A new link replaces an
-/// unfinished join; its commitment was never revealed for the new invite.
-async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
-    let capability = text(params, "capability")?.to_owned();
-    // Every form of one invite is the same join.
-    let link = parse_join_link(text(params, "link")?)?.encode()?;
-    let name = text(params, "name")?.to_owned();
-    ensure!(name.chars().count() <= 128, "device name is too long");
-    {
-        let mut slot = node
-            .node_join
-            .lock()
-            .map_err(|_| anyhow!("join state unavailable"))?;
-        // An end without joining is reported once; asking again after that starts over.
-        if let Some(current) = slot.as_ref()
-            && current.link == link
-            && current.capability == capability
-        {
-            let status = current.status.clone();
-            if matches!(status, NodeJoin::Failed | NodeJoin::Cancelled) {
-                *slot = None;
-            }
-            return Ok(status);
-        }
-    }
+/// Asks the invite's Node whether it would still take this link, before this Node commits to it
+/// and before the page asks for a name. Only the page holding the setup capability may ask.
+async fn check_link_for_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Value> {
     ensure!(
         !node.has_membership().await?,
         "this Node already belongs to a personal network"
@@ -1594,7 +1607,69 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
     node.store
         .lock()
         .await
-        .verify_bootstrap_capability(&capability)?;
+        .verify_bootstrap_capability(text(params, "capability")?)?;
+    let ticket = parse_join_link(text(params, "link")?)?;
+    let link = JoinLink::open(node, &ticket).await?;
+    let reply = link
+        .call("join_check", json!({"secret":hex::encode(ticket.secret)}))
+        .await;
+    link.net.close().await;
+    reply
+}
+
+async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<NodeJoin> {
+    let owner = JoinOwner::Page(text(params, "capability")?.to_owned());
+    start_node_join(node, text(params, "link")?, text(params, "name")?, owner).await
+}
+
+/// Starts, or reports, this fresh Node's join. Asking again with the same link only reads how
+/// far it got, so a caller unsure whether its last ask arrived simply asks again. A new link
+/// from the same owner replaces an unfinished join; its commitment was never revealed for the
+/// new invite. A join someone else started is left alone.
+pub(crate) async fn start_node_join(
+    node: &Arc<Runtime>,
+    link: &str,
+    name: &str,
+    owner: JoinOwner,
+) -> Result<NodeJoin> {
+    // Every form of one invite is the same join.
+    let link = parse_join_link(link)?.encode()?;
+    let name = name.to_owned();
+    ensure!(name.chars().count() <= 128, "device name is too long");
+    {
+        let mut slot = node
+            .node_join
+            .lock()
+            .map_err(|_| anyhow!("join state unavailable"))?;
+        if let Some(current) = slot.as_ref() {
+            let ended = matches!(
+                current.status,
+                NodeJoin::Failed { .. } | NodeJoin::Cancelled
+            );
+            // An end without joining is reported once; asking again after that starts over.
+            if current.link == link && current.owner == owner {
+                let status = current.status.clone();
+                if ended {
+                    *slot = None;
+                }
+                return Ok(status);
+            }
+            ensure!(
+                ended || current.owner == owner,
+                "another join is already running on this computer"
+            );
+        }
+    }
+    ensure!(
+        !node.has_membership().await?,
+        "this Node already belongs to a personal network"
+    );
+    if let JoinOwner::Page(capability) = &owner {
+        node.store
+            .lock()
+            .await
+            .verify_bootstrap_capability(capability)?;
+    }
     let mut slot = node
         .node_join
         .lock()
@@ -1603,6 +1678,8 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
     }
+    // A commitment kept for another link belongs to a join nobody waits on any more.
+    forget_join_for_another_link(&node.data_dir, &link)?;
     let runner = node.clone();
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
@@ -1623,21 +1700,37 @@ async fn join_from_local_page(node: &Arc<Runtime>, params: &Value) -> Result<Nod
                 report(NodeJoin::Cancelled);
             }
             Err(error) => {
-                tracing::warn!(event = "join.local_failed", %error, "joining from the local page failed");
-                let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
-                report(NodeJoin::Failed);
+                tracing::warn!(event = "join.local_failed", %error, "this Node's join failed");
+                // The entry may already hold the request, so the commitment stays: asking again
+                // with the same link resumes it instead of sending a second one.
+                let mut reason = error.to_string();
+                reason.truncate(reason.floor_char_boundary(512));
+                report(NodeJoin::Failed { reason });
             }
         }
     })
     .abort_handle();
     *slot = Some(NodeJoinTask {
         link,
-        capability,
+        owner,
         status: NodeJoin::Waiting,
         task,
         cancel,
     });
     Ok(NodeJoin::Waiting)
+}
+
+fn forget_join_for_another_link(dir: &std::path::Path, link: &str) -> Result<()> {
+    let path = dir.join("join.json");
+    let pending = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<PendingJoin>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if parse_join_link(&pending.link)?.encode()? != link {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
 }
 
 /// Withdraws this Node's join for the page holding its local setup capability. Only waiting is
@@ -1650,7 +1743,7 @@ fn cancel_node_join(node: &Runtime, params: &Value) -> Result<NodeJoin> {
         .map_err(|_| anyhow!("join state unavailable"))?;
     let current = slot
         .as_ref()
-        .filter(|current| current.capability == capability)
+        .filter(|current| current.owner == JoinOwner::Page(capability.to_owned()))
         .context("no join from this page is running")?;
     current.cancel.notify_one();
     Ok(current.status.clone())
@@ -2925,6 +3018,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_page_join_keeps_its_commitment_so_asking_again_resumes_it() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-failed-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            // No address and no discovery: the join fails after it committed, before reaching anyone.
+            let link = |secret: u8| -> Result<String> {
+                let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+                Ok(format!("http://127.0.0.1:4795/join#{}", ticket.encode()?))
+            };
+            let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            let nonce = || -> Result<String> {
+                let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
+                Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
+            };
+            let mut node_join = async |link: &str| -> Result<Value> {
+                for _ in 0..100 {
+                    let reply = dispatch(&node, &mut page, "node_join", params(link)).await?;
+                    if reply["status"] == "failed" {
+                        return Ok(reply);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                bail!("the join never failed")
+            };
+            let first = link(7)?;
+            let failed = node_join(&first).await?;
+            assert!(
+                failed["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+                "a failure says why: {failed}"
+            );
+            let sent = nonce()?;
+            node_join(&first).await?;
+            assert_eq!(
+                nonce()?,
+                sent,
+                "asking again with the same link resumes the request the entry may hold"
+            );
+            node_join(&link(8)?).await?;
+            assert_ne!(nonce()?, sent, "a new link drops the old commitment");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
     async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
     -> Result<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -3299,6 +3460,13 @@ mod tests {
             assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            let view = node.membership_state().await?.project()?;
+            let rename = GovernanceEvent::grant(&admin, &view, Member::node(&node.identity, "工作室 Mac")?)?;
+            manager.call("grant", json!({"event":rename})).await?;
+            assert_eq!(node.membership_state().await?.project()?.node(&node_id)?.name, "工作室 Mac", "a manager renames a computer");
+            let view = node.membership_state().await?.project()?;
+            let as_client = GovernanceEvent::grant(&admin, &view, Member::new(&node_id, IdentityKind::Client, "工作室 Mac", false)?)?;
+            assert!(manager.call("grant", json!({"event":as_client})).await.is_err(), "a rename keeps the kind");
 
             let view = node.membership_state().await?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;

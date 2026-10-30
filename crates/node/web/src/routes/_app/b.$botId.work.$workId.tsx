@@ -2,7 +2,7 @@ import { createFileRoute } from '@tanstack/react-router'
 import { TaskDetail } from '@/features/workspace/task-detail'
 
 export const Route = createFileRoute('/_app/b/$botId/work/$workId')({
-  validateSearch: (search: Record<string, unknown>): { from?: 'inbox' } => search.from === 'inbox' ? { from: 'inbox' } : {},
+  validateSearch: (search: Record<string, unknown>): { from?: 'inbox' | 'tasks' } => search.from === 'inbox' || search.from === 'tasks' ? { from: search.from } : {},
   component: WorkRoute,
 })
 

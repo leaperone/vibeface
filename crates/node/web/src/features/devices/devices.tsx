@@ -1,11 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ArrowRightLeft, ChevronRight, Copy, Info, Monitor, ShieldAlert, Smartphone, Tablet, type LucideIcon } from "lucide-react"
+import { ArrowRightLeft, Check, ChevronRight, Copy, Info, Monitor, Pencil, ShieldAlert, Smartphone, Tablet, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, DetailRow, EmptyState, InlineError, SettingsDisclosure, SettingsGroup, SettingsRow, Skeleton, toast, useAction } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
-import { addOnManager, deviceCopy } from "@vibeface/client/identity/copy.ts"
+import { addOnManager, anotherManager, deviceCopy, soleBrowserManagerText } from "@vibeface/client/identity/copy.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { deviceForm, deviceOnline, isLoopback } from "@vibeface/client/workspace/labels.ts"
 import { terms } from "@/lib/glossary"
@@ -28,7 +29,8 @@ export function useDeviceRows(): DeviceRow[] {
   const members = directory?.members ?? []
   const removed = new Set(directory?.revoked.map((item) => item.device_id))
   const ids = [...new Set([...members.map((member) => member.device_id), ...nodes.filter((node) => !node.revoked).map((node) => node.device_id)])].filter((id) => !removed.has(id))
-  const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : 3
+  // Every device lists the same way: the one in hand first, then computers, phones and tablets, browsers.
+  const rank = (row: DeviceRow) => row.browser ? 0 : row.entry ? 1 : row.kind === "node" ? 2 : deviceForm(row.kind, row.name) === "browser" ? 4 : 3
   return ids.map((id): DeviceRow => {
     const member = members.find((item) => item.device_id === id), node = nodes.find((item) => item.device_id === id)
     const kind = member?.kind ?? "node", entry = id === ready?.entry.device_id
@@ -91,10 +93,31 @@ export function DevicesPage({ joins = true }: { joins?: boolean }) {
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link></li>
       })}</ul>}
+    <SoleBrowserManager rows={rows} />
     {device.ready && !device.ready.principal.can_manage && rows.length ? <p className="flex min-w-0 items-center gap-1.5 px-1 text-meta text-muted-foreground">
       <terms.admin.icon aria-hidden="true" className="size-4 shrink-0" /><span className="min-w-0 truncate">{addOnManager(rows.filter((row) => row.admin).map((row) => row.name))}</span>
     </p> : null}
   </div>
+}
+
+/**
+ * One line while the only management device is a browser: clearing its site data takes management with it. A manager
+ * is led to the device to promote, or to 添加设备 when there is none yet.
+ */
+function SoleBrowserManager({ rows }: { rows: DeviceRow[] }) {
+  const { ready } = useDevice()
+  const admins = rows.filter((row) => row.admin)
+  const sole = admins.length === 1 ? admins[0] : null
+  if (!sole || sole.kind !== "client" || deviceForm(sole.kind, sole.name) !== "browser") return null
+  const next = rows.find((row) => row.kind === "client" && !row.admin)
+  const link = "hit-area relative shrink-0 font-medium text-foreground underline underline-offset-4"
+  return <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-1 text-meta text-warning">
+    <ShieldAlert aria-hidden="true" className="size-4 shrink-0" />
+    <span className="min-w-0">{soleBrowserManagerText(sole.browser ? "这个浏览器" : `「${sole.name}」`)}</span>
+    {ready?.principal.can_manage ? next
+      ? <Link to="/devices/$deviceId" params={{ deviceId: next.id }} className={link}>{anotherManager}</Link>
+      : <Link to="/devices" search={{ add: true }} className={link}>{anotherManager}</Link> : null}
+  </p>
 }
 
 /** Captioned like a settings group, so a device reads the same as 设置. `bare`: the content brings its own cards. */
@@ -103,6 +126,35 @@ function Section({ title, bare = false, children }: { title: string; bare?: bool
     <h3 className="px-1 text-meta font-medium text-muted-foreground">{title}</h3>
     {bare ? children : <div className="grid gap-4 rounded-xl border bg-card p-4 shadow-xs">{children}</div>}
   </section>
+}
+
+/** The name heads the device page; a management device taps it to rename the device in place. */
+function DeviceTitle({ row, editable }: { row: DeviceRow; editable: boolean }) {
+  const device = useDevice()
+  const action = useAction()
+  const [draft, setDraft] = useState<string | null>(null)
+  const close = () => { setDraft(null); action.clear() }
+  if (draft === null) return <h2 className="min-w-0 text-title font-semibold">
+    {editable ? <button type="button" className="group flex max-w-full min-w-0 items-center gap-2 rounded-md text-start" title="改名" onClick={() => setDraft(row.name)}>
+      <span className="truncate">{row.name}</span>
+      <Pencil aria-hidden="true" className="size-4 shrink-0 text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100" />
+      <span className="sr-only">改名</span>
+    </button> : <span className="block truncate" title={row.name}>{row.name}</span>}
+  </h2>
+  const save = () => {
+    const name = draft.trim()
+    if (name === row.name) return close()
+    void action.run("rename", async () => { await device.renameDevice(row.id, name); setDraft(null) }, "已改名")
+  }
+  return <form className="grid gap-1" onSubmit={(event) => { event.preventDefault(); save() }}>
+    <div className="flex min-w-0 items-center gap-1">
+      <Input aria-label="设备名称" autoFocus required maxLength={128} className="h-9 min-w-0 text-title font-semibold" value={draft} disabled={action.busy !== null}
+        onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") close() }} />
+      <Button type="submit" variant="ghost" size="icon" aria-label="保存" title="保存" disabled={action.busy !== null || !draft.trim()}><BusyIcon busy={action.busy === "rename"} icon={Check} /></Button>
+      <Button type="button" variant="ghost" size="icon" aria-label="取消" title="取消" disabled={action.busy !== null} onClick={close}><X aria-hidden="true" /></Button>
+    </div>
+    {action.errorKey === "rename" ? <InlineError error={action.error} /> : null}
+  </form>
 }
 
 export function DeviceDetail({ deviceId }: { deviceId: string }) {
@@ -129,7 +181,7 @@ export function DeviceDetail({ deviceId }: { deviceId: string }) {
     <header className="flex items-center gap-4">
       <span className="grid size-12 shrink-0 place-items-center rounded-2xl bg-muted ring-1 ring-border"><Icon aria-hidden="true" className="size-6" /></span>
       <div className="grid min-w-0 gap-1">
-        <h2 className="truncate text-title font-semibold" title={row.name}>{row.name}</h2>
+        <DeviceTitle row={row} editable={canManage && Boolean(row.member)} />
         <div className="flex flex-wrap items-center gap-2">
           {row.online !== undefined ? <Online online={row.online} /> : null}
           {row.browser ? <Tag>这个浏览器</Tag> : row.entry ? <Tag>{entryLabel}</Tag> : null}

@@ -105,6 +105,7 @@ pub(crate) fn apply(
     network: &str,
     hash: &str,
     event: &Event,
+    seen_at_ms: i64,
     rank: &str,
 ) -> Result<()> {
     let scope = event.scope_id.as_str();
@@ -378,7 +379,7 @@ pub(crate) fn apply(
                 } => {
                     connection.execute(
                         "INSERT INTO schedules(network_id,schedule_id,conversation_id,schedule,rank,changed_at_ms,enabled,enabled_rank,enabled_at_ms,removed) VALUES(?1,?2,?3,?4,?5,?6,?7,?5,?6,0) ON CONFLICT(network_id,schedule_id) DO UPDATE SET schedule=excluded.schedule,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE removed=0 AND conversation_id=excluded.conversation_id AND excluded.rank>rank",
-                        params![network, schedule_id, scope, serde_json::to_string(after)?, rank, event.created_at_ms, after.enabled],
+                        params![network, schedule_id, scope, serde_json::to_string(after)?, rank, seen_at_ms, after.enabled],
                     )?;
                     set_schedule_enabled(
                         connection,
@@ -387,21 +388,14 @@ pub(crate) fn apply(
                         scope,
                         after.enabled,
                         rank,
-                        event.created_at_ms,
+                        seen_at_ms,
                     )?;
                 }
                 BotChange::Schedule {
                     schedule_id,
                     after: None,
                     ..
-                } => remove_schedule(
-                    connection,
-                    network,
-                    schedule_id,
-                    scope,
-                    rank,
-                    event.created_at_ms,
-                )?,
+                } => remove_schedule(connection, network, schedule_id, scope, rank, seen_at_ms)?,
                 BotChange::Memory {
                     memory_id, after, ..
                 } => {
@@ -444,16 +438,11 @@ pub(crate) fn apply(
                 scope,
                 *action == ScheduleAction::Resume,
                 rank,
-                event.created_at_ms,
+                seen_at_ms,
             )?,
-            ScheduleAction::Delete => remove_schedule(
-                connection,
-                network,
-                schedule_id,
-                scope,
-                rank,
-                event.created_at_ms,
-            )?,
+            ScheduleAction::Delete => {
+                remove_schedule(connection, network, schedule_id, scope, rank, seen_at_ms)?
+            }
         },
         EventBody::ScheduleRunClaimed {
             schedule_id,
