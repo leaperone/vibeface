@@ -13,7 +13,7 @@ export type InboxItem = { key: string; title: string; meta?: string } & (
   | { kind: "question"; question: Question; done: boolean }
   | { kind: "confirm"; check: PendingCheck }
   | { kind: "join"; join: JoinRequest }
-  | { kind: "attention"; bot: BotRecord }
+  | { kind: "attention"; bot: BotRecord; notification: NotificationRecord }
   | { kind: "setup"; device: string | undefined }
 )
 
@@ -58,7 +58,7 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   for (const note of workspace.notifications) {
     if (note.kind !== "manager_attention") continue
     const bot = workspace.bots.find((item) => item.conversation_id === note.conversation_id)
-    if (bot) items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
+    if (bot) items.push({ key: `attention:${note.notification_id}`, kind: "attention", bot, notification: note, title: note.text.trim() || "Bot 需要你看看", meta: bot.name })
   }
   const unready = workspace.nodes.find((node) => botReadiness(node) === "needs_setup")
   // Only an admin, or this computer's own page, may set one up; elsewhere the item would lead nowhere.
