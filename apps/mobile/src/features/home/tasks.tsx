@@ -12,7 +12,7 @@ import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
-import { useLive } from '@/data/live'
+import { useInbox, useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 
 /** The personal task projection; only open and unsettled work is available without loading every Bot conversation. */
@@ -20,6 +20,7 @@ export function TasksScreen() {
   const shared = useLive()
   const workspace = useWorkspace()
   const { directory } = useDevice()
+  const inbox = useInbox()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
   const works = shared?.openWorks ?? []
   const loading = Boolean(shared && !shared.synced && !works.length)
@@ -35,7 +36,7 @@ export function TasksScreen() {
     return taskActive(state) && !taskStale(state, Boolean(shared?.connectionOnline))
   }).length
   const waiting = Math.max(0, visibleWorks.length - working)
-  const attention = shared?.questions.filter((question) => !question.answer && !question.closed).length ?? 0
+  const attention = inbox.filter((item) => item.kind === 'confirm' || item.kind === 'question' && !item.done).length
   const bot = workspace.bots[0]
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
