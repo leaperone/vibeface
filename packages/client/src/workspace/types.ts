@@ -177,7 +177,7 @@ export type ConversationPayload = {
 }
 export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
 /** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
-export type WorkspaceView = "chat" | "other"
+export type WorkspaceView = "chat" | "tasks" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
 export type ConflictVersion = { hash: string; scope_id: string; created_at_ms: number; body: Record<string, unknown> }
 type LogConflict = { author: string; seq: number; kept: ConflictVersion | null; other: ConflictVersion }
@@ -209,6 +209,7 @@ type OverviewTaskCommon = {
   bot: OverviewBot | null
   title: string
   summary: string
+  cwd: string
   state: OverviewTaskState
   outcome: WorkOutcome | null
   target_node: string | null
@@ -291,7 +292,7 @@ export type OverviewCoverage = {
 
 export type OverviewRelation = { from_work: string; to_work: string; kind: "parent" | "continues" | "dispatches" }
 export type OverviewConversation = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
-export type OverviewSession = { conversation_id: string; node: string; session_id: string; agent: ProviderId; muted: boolean; created_at_ms: number; version: number; cwd: string; summary: string }
+export type OverviewSession = { conversation_id: string; node: string; session_id: string; agent: ProviderId; muted: boolean; created_at_ms: number; version: string; cwd: string; summary: string }
 
 /** A finite read-only projection. It never implies a complete global queue. */
 export type WorkspaceOverview = {

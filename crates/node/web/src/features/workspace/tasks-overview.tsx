@@ -8,7 +8,7 @@ import { CountBadge, EmptyState, Skeleton, StatusPill, type Tone } from "@/compo
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
-import { overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
+import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
 import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from "@vibeface/client/workspace/labels.ts"
 import { projectName } from "@vibeface/client/workspace/questions.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
@@ -28,7 +28,9 @@ export function TasksOverview() {
   const inbox = useInbox()
   type InboxItem = (typeof inbox)[number]
   const lookup = { nodes: workspace.nodes, directory }
-  const overview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
+  const localOverview = overviewFromWorkspace({ openWorks: workspace.openWorks, bots: workspace.bots, questions: workspace.questions, nodes: workspace.nodes })
+  const overview = workspace.overview ?? localOverview
+  const overviewWorks = workspace.overview ? openWorksFromOverview(workspace.overview) : workspace.openWorks
   const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
   const attentionWorkIds = new Set<string>()
   for (const item of attention) {
@@ -39,7 +41,7 @@ export function TasksOverview() {
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
   const waitingSessions = new Set(openQuestions.filter((question) => question.about.request_id).map((question) => question.about.session_id))
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
-  const tasks = workspace.openWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
+  const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
   const groups: Record<TaskGroup, OpenWork[]> = { working: [], waiting: [] }
   for (const work of tasks) groups[taskGroup(work, workspace.nodes, waitingSessions, projected.get(work.work_id))].push(work)
   const hasContent = attention.length > 0 || groups.working.length > 0 || groups.waiting.length > 0
@@ -51,10 +53,10 @@ export function TasksOverview() {
       {attention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>)}
     </OverviewSection> : null}
     {groups.working.length ? <OverviewSection title="进行中" count={groups.working.length}>
-      {groups.working.map((work) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />)}
+      {groups.working.map((work) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} detailAvailable={workspace.openWorks.some((item) => item.work_id === work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />)}
     </OverviewSection> : null}
     {groups.waiting.length ? <OverviewSection title="等待中" count={groups.waiting.length}>
-      {groups.waiting.map((work) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />)}
+      {groups.waiting.map((work) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} detailAvailable={workspace.openWorks.some((item) => item.work_id === work.work_id)} lookup={lookup} readyDevice={ready?.entry.device_id} connected={workspace.connectionOnline} />)}
     </OverviewSection> : null}
     {!hasContent ? <EmptyState icon={ListChecks} title="没有未完成任务" description="Bot 开始工作后，任务会出现在这里。" /> : null}
   </div>
@@ -72,7 +74,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
   </section>
 }
 
-function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean }) {
+function TaskOverviewCard({ work, projected, detailAvailable, lookup, readyDevice, connected }: { work: OpenWork; projected?: ProjectedWork; detailAvailable: boolean; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean }) {
   const state = projected?.state ?? shownState(work, lookup.nodes)
   const stale = taskStale(state, connected)
   const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
@@ -101,5 +103,6 @@ function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: {
         <p className="whitespace-pre-wrap break-words text-meta text-muted-foreground">{work.summary || "暂无进展"}</p>
       </CardContent>
     </Card>
-  return projected?.navigation?.work_id ? <Link to="/b/$botId/work/$workId" params={{ botId: projected.navigation.bot_id, workId: projected.navigation.work_id }} search={{ from: "tasks" }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{card}</Link> : card
+  return detailAvailable && projected?.navigation?.work_id ? <Link to="/b/$botId/work/$workId" params={{ botId: projected.navigation.bot_id, workId: projected.navigation.work_id }} search={{ from: "tasks" }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{card}</Link>
+    : projected?.navigation?.bot_id ? <Link to="/b/$botId" params={{ botId: projected.navigation.bot_id }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{card}</Link> : card
 }

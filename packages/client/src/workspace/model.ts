@@ -273,7 +273,7 @@ function safeOverviewOutcome(outcome: WorkOutcome | null, state: OverviewTaskSta
   return outcome === "completed" && (state === "unknown" || state === "unverified" || state === "dispatch_unverified" || state === "accepted_waiting_sync" || unreachable) ? "unverified" : outcome
 }
 
-function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
+function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "title" | "summary" | "cwd" | "state" | "outcome" | "target_node" | "dispatcher" | "call_ref" | "parent" | "continues" | "thread" | "thread_id" | "turn_id" | "phase" | "failure_reason" | "kind" | "stop">, bot: OverviewBot | null, node: OverviewNode | null, source: OverviewTask["source"], itemId = work.work_id) {
   const navigation = bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id, work_id: work.work_id } : null
   const rawState = overviewState(work.stop ?? work.state)
   const outcome = safeOverviewOutcome(work.outcome, rawState, node)
@@ -284,6 +284,7 @@ function overviewTaskBase(work: Pick<OpenWork, "work_id" | "conversation_id" | "
     bot,
     title: work.title,
     summary: work.summary,
+    cwd: work.cwd,
     state: outcome === "unverified" ? "unverified" : work.state === "finished" && work.outcome === null ? "unknown" : rawState,
     outcome,
     target_node: work.target_node,
@@ -402,7 +403,7 @@ function parseOverviewTask(value: unknown): OverviewTask {
   const outcome = safeOverviewOutcome(overviewOutcome(data.outcome), state, node)
   const common = {
     item_id: nullableText(data.item_id) ?? nullableText(data.check_id) ?? workId ?? `${conversationId}:${text(data.trigger ?? "")}`,
-    work_id: workId, conversation_id: conversationId, bot, title: data.title == null ? "" : text(data.title), summary: data.summary == null ? "" : text(data.summary),
+    work_id: workId, conversation_id: conversationId, bot, title: data.title == null ? "" : text(data.title), summary: data.summary == null ? "" : text(data.summary), cwd: data.cwd == null ? "" : text(data.cwd),
     state: outcome === "unverified" ? "unverified" : state === "finished" && outcome === null ? "unknown" : state, outcome,
     target_node: nullableText(data.target_node), dispatcher: nullableText(data.dispatcher), call_ref: nullableText(data.call_ref),
     work_kind: overviewWorkKind(data.work_kind) ?? overviewWorkKind(data.kind),
@@ -440,13 +441,13 @@ function parseOverviewConversation(value: unknown): OverviewConversation {
 }
 function parseOverviewSession(value: unknown): OverviewSession {
   const data = record(value)
-  return { conversation_id: text(data.conversation_id), node: text(data.node), session_id: text(data.session_id), agent: provider(data.agent), muted: data.muted === true, created_at_ms: number(data.created_at_ms), version: number(data.version), cwd: data.cwd == null ? "" : text(data.cwd), summary: data.summary == null ? "" : text(data.summary) }
+  return { conversation_id: text(data.conversation_id), node: text(data.node), session_id: text(data.session_id), agent: provider(data.agent), muted: data.muted === true, created_at_ms: number(data.created_at_ms), version: text(data.version), cwd: data.cwd == null ? "" : text(data.cwd), summary: data.summary == null ? "" : text(data.summary) }
 }
 function parseOverviewCheck(value: unknown): OverviewTask {
   const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
   return {
     kind: "check", item_id: checkId, check_id: checkId, work_ids: [], work_id: null, conversation_id: conversationId, bot: null,
-    title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), state: "unknown", outcome: "unverified",
+    title: "待确认", summary: data.trigger == null ? "" : text(data.trigger), cwd: "", state: "unknown", outcome: "unverified",
     target_node: null, dispatcher: null, call_ref: null, work_kind: null, parent: null, continues: null, thread: null, thread_id: null, turn_id: null, phase: null,
     reason, node: null, navigation: null, source: "local_check",
   }
@@ -489,6 +490,25 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
     }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),
     relations: list(data.relations ?? []).map(parseOverviewRelation), sessions: list(data.sessions ?? []).map(parseOverviewSession), coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
   }
+}
+
+/** Adapt bounded overview work rows for existing task cards and inbox checks. */
+export function openWorksFromOverview(overview: WorkspaceOverview): OpenWork[] {
+  return overview.tasks.flatMap((task): OpenWork[] => {
+    if ((task.kind !== "work" && task.kind !== "dispatch") || !task.work_id) return []
+    const state: WorkRecord["state"] = task.state === "accepted_waiting_sync" ? "dispatch_waiting"
+      : task.state === "unknown" ? "unverified"
+        : task.state === "stop_waiting" || task.state === "stop_timed_out" ? "accepted"
+          : task.state
+    const outcome = task.outcome === "completed" && state === "unverified" ? "unverified" : task.outcome
+    return [{
+      work_id: task.work_id, conversation_id: task.conversation_id, trigger: "", target_node: task.target_node ?? "", cwd: task.cwd, title: task.title, prompt: "",
+      state, summary: task.summary, outcome, result_text: "", failure_reason: task.reason, kind: task.work_kind ?? undefined,
+      dispatcher: task.dispatcher ?? undefined, call_ref: task.call_ref ?? undefined, continues: task.continues ?? undefined, parent: task.parent ?? undefined,
+      thread: task.thread ?? undefined, thread_id: task.thread_id ?? undefined, turn_id: task.turn_id ?? undefined, phase: task.phase ?? undefined,
+      ...(task.state === "stop_waiting" || task.state === "stop_timed_out" ? { stop: task.state } : {}),
+    }]
+  })
 }
 
 /** A pushed change: the records it touched, or null when it carries none. */
