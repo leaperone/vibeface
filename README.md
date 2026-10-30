@@ -21,7 +21,7 @@
 - 🤖 **聊天驱动的 bot**。创建有名称、职责和项目目录的 bot，在它的长期聊天里提要求。协调 Agent 用自己的 Shell 和文件工具读写本机，把改代码的任务派给本机或其他设备的 Agent。
 - 🌐 **个人设备网络**。所有设备运行同一个 `vibeface` Node，经 iroh QUIC 直连或经 relay 互通。A 设备上的 bot 可以把任务派给 B 设备执行。
 - 🔁 **换设备接着干**。任务、进度、审批和结果写进签名事件日志并同步到每台 Node。A 离线时，在 C 打开同一会话就能接手，已执行的副作用不会重放。
-- 🔐 **端到端加密入口**。浏览器和手机 App 用不可导出的设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
+- 🔐 **端到端加密入口**。浏览器和手机 App 用本机设备密钥与 Node 建立 Noise 通道。公网入口只转发密文，不加入个人网络。
 - 📦 **单个二进制**。网页是 React + TanStack Start 静态 SPA，内嵌在 Rust 程序里，生产环境不需要 Node.js Web 服务。
 - 📱 **原生移动端**。Expo iOS/Android 客户端复用同一套 client 协议、恢复包和加入链接，设备密钥保存在系统安全存储。
 
@@ -56,7 +56,7 @@ flowchart LR
 几条设计约束值得先知道：
 
 - 每个人管理自己的设备网络，网络之间完全隔离。公网服务器只是 Node 的一种部署方式，可以作为成员加入网络，也可以只当公共入口。
-- 公共入口默认不保存个人网络数据；显式启用文件交付后，独立 `delivery/` 只暂存交付密文与服务账本，不授予成员权限。
+- 公共入口默认不保存个人网络数据；显式启用文件交付后，独立 `delivery/` 保存交付对象、服务账本和本机恢复材料，可能含私钥及私密证明材料，须按凭证保管。启用交付不授予个人网络成员权限，见[文件交付实验参考](docs/paid-delivery.md#接收密钥和恢复材料)。
 - bot 定义和共享聊天历史独立于本机 SDK 缓存。创建 bot 不会启动模型。
 - 写操作结果未知时先核对实际结果，不换 ID 或设备重发。
 - 数据目录带数据格式 epoch，程序只打开同一 epoch 的目录，不升级数据库。同一网络里的节点使用同一版本。
@@ -182,7 +182,7 @@ bash scripts/package-node.sh
 
 `bash scripts/package-node.sh` 生成当前平台的压缩包和 SHA256 文件，输出到 `.artifacts/packages/`。
 
-移动端先用 `bash scripts/build-mobile-secure.sh ios|android` 构建原生安全模块，再按 `apps/mobile` 的 Expo 脚本构建对应平台。
+移动端先用 `bash scripts/build-mobile-secure.sh ios` 或 `bash scripts/build-mobile-secure.sh android` 构建原生安全模块，再按 `apps/mobile` 的 Expo 脚本构建对应平台。
 
 ## 📁 目录结构
 
