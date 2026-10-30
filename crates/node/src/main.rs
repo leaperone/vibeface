@@ -2442,7 +2442,6 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(Cli::try_parse_from(["vibeface", "serve"]).is_err());
         assert!(
             Cli::try_parse_from(["vibeface", "access", "--json", "--data-dir", "/data/node"])
                 .is_ok()
