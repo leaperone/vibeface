@@ -13,7 +13,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { ChatSkeleton, useCreateBot } from '@/features/workspace/workspace-shell'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { QuestionCard } from '@/features/workspace/question-card'
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskCopy, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import type { BotChangeRecord, ManagerJob, SentBotMessage, SessionHandoff, WorkRecord } from '@vibeface/client/workspace/types.ts'
 import { botCopy, placeChanges, scheduleName, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
 import { botReadiness, pendingChecks } from '@vibeface/client/workspace/model.ts'
@@ -79,9 +79,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const tasks: TaskRow[] = works.map((work, index) => {
     const state = shownState(work, workspace.nodes)
     const joined = work.turn_id ? works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id) : undefined
-    // A task another device's bot runs reports no summary; its newest streamed line stands in, as a provider's does.
-    const streamed = workspace.liveProgress.find((item) => item.kind === 'native' && item.work_id === work.work_id && item.target_node === work.target_node)?.text.trim().split('\n').at(-1) ?? ''
-    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: work.summary || streamed, trigger: work.trigger, work, joined: joined?.title }
+    return { id: work.work_id, state: state === 'running' && work.thread_id && asking.has(work.thread_id) ? 'waiting' : state, device: work.target_node, summary: taskProgress(work, workspace.liveProgress), agent: taskAgent(work, workspace.nodes), trigger: work.trigger, work, joined: joined?.title }
   })
   const openTasks = tasks.filter((task) => taskActive(task.state) || task.state === 'waiting')
   const placed = new Set<string>()
@@ -315,7 +313,7 @@ function useOffscreen(id: string | null, revision: number) {
   return hidden
 }
 
-type TaskRow = { id: string; state: string; device: string; summary: string; trigger: string; work: WorkRecord; joined?: string }
+type TaskRow = { id: string; state: string; device: string; summary: string; agent: ProviderId | null; trigger: string; work: WorkRecord; joined?: string }
 
 /** Running tasks get a full card; finished ones shrink to one line that still opens the details. */
 /** `away`: its device is offline, so it waits for that device rather than spinning. */
@@ -329,7 +327,7 @@ function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskR
   // Breaks by the chat column, which a task panel beside it narrows, not by the window.
   if (!open) return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="-mx-2 flex min-h-9 items-start gap-2 rounded-lg px-2 py-2 text-meta text-muted-foreground hover:bg-muted/60 hover:text-foreground active:bg-muted max-md:min-h-11 max-md:py-3">
     {task.state === 'dispatch_unverified' ? <CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /> : task.state === 'interrupted' ? <CircleStop aria-hidden="true" className="size-4 shrink-0" /> : failed ? <CircleX aria-hidden="true" className="size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:gap-1"><span className="truncate">{title}</span><TaskMeta device={device} here={here} label={taskLabel(task.state)} agent={task.agent} quiet={task.state === 'completed' || failed && Boolean(result)} /></span>{result ? <span className={`block break-words ${failed ? 'text-danger' : ''}`}>{result}</span> : null}</span>
     <ChevronRight aria-hidden="true" className="size-4 shrink-0" />
   </Link></div>
   return <div className="@container"><Link to="/b/$botId/work/$workId" params={{ botId, workId: task.id }} className="flex min-h-12 items-center gap-3 interactive-row rounded-xl border bg-card shadow-xs px-4 py-2">
@@ -337,7 +335,7 @@ function TaskCard({ task, botId, device, here, open, live, away }: { task: TaskR
       : stale ? <CircleQuestionMark aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : away ? <WifiOff aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />
       : taskActive(task.state) ? <LoaderCircle aria-hidden="true" className="size-5 shrink-0 animate-spin text-info" /> : <ListChecks aria-hidden="true" className="size-5 shrink-0 text-muted-foreground" />}
-    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.work.kind === 'task' ? null : task.work.kind ?? null} className="text-meta" /></span>
+    <span className="min-w-0 flex-1"><span className="flex min-w-0 flex-col @sm:flex-row @sm:items-baseline @sm:gap-1"><span className="truncate font-medium">{title}</span><TaskMeta device={device} here={here} label={stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(task.state)} agent={task.agent} className="text-meta" /></span>
       {task.joined ? <span className="flex min-w-0 items-center gap-1 text-meta text-muted-foreground"><Link2 aria-hidden="true" className="size-3.5 shrink-0" /><span className="truncate">补充到「{task.joined}」</span></span>
         : taskActive(task.state) && !stale && task.summary ? <span className="block truncate text-meta text-muted-foreground">{task.summary}</span> : null}</span>
     <ChevronRight aria-label="详情" className="size-4 shrink-0 text-muted-foreground" />

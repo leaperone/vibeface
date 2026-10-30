@@ -4,9 +4,9 @@ import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
-import { providerNames } from '@vibeface/client/lib/node.ts'
+import { providerNames, type ProviderId } from '@vibeface/client/lib/node.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskCopy, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskAgent, taskCopy, taskLabel, taskProgress, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
@@ -61,7 +61,7 @@ export function useChatExtras(conversationId: string, botId: string) {
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
     const scheduledReply = data.messages.find((message) => message.role !== 'user' && scheduleTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
     const cause = scheduledReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
-    add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} /> })
+    add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} agent={taskAgent(work, shared.nodes)} progress={taskProgress(work, shared.liveProgress)} /> })
   })
   for (const job of jobs) {
     if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(job.message_id, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
@@ -84,13 +84,12 @@ export function useChatExtras(conversationId: string, botId: string) {
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */
 /** `away`: its device is offline, so it waits for that device rather than spinning. */
-function TaskCard({ work, state, stale, away, joined, botId, device }: { work: WorkRecord; state: string; stale: boolean; away: boolean; joined?: string; botId: string; device: string }) {
+function TaskCard({ work, state, stale, away, joined, botId, device, agent, progress }: { work: WorkRecord; state: string; stale: boolean; away: boolean; joined?: string; botId: string; device: string; agent: ProviderId | null; progress: string }) {
   const title = work.title || '任务'
   const active = taskActive(state)
   const open = active || state === 'waiting' || state === 'awaiting_confirmation'
   const failed = state === 'failed' || state === 'rejected' || state === 'dispatch_rejected'
   const href = `/b/${botId}/work/${work.work_id}` as const
-  const agent = work.kind === 'task' ? null : work.kind ?? null
   const meta = <View className="min-w-0 flex-row items-center gap-1">
     {agent ? <>
       <Icon as={providerIcons[agent]} className="size-3.5 text-muted-foreground" />
@@ -124,7 +123,7 @@ function TaskCard({ work, state, stale, away, joined, botId, device }: { work: W
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}
         {joined ? <View className="flex-row items-center gap-1"><Icon as={Link2} className="size-3.5 text-muted-foreground" /><Text numberOfLines={1} className="shrink text-meta text-muted-foreground">补充到「{joined}」</Text></View>
-          : active && !stale && work.summary ? <Text numberOfLines={1} className="text-meta text-muted-foreground">{work.summary}</Text> : null}
+          : active && !stale && progress ? <Text numberOfLines={1} className="text-meta text-muted-foreground">{progress}</Text> : null}
       </View>
       <Icon as={ChevronRight} accessibilityLabel="详情" className="size-4 text-muted-foreground" />
     </Pressable>

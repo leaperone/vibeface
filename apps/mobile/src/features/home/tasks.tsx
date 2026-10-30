@@ -5,7 +5,7 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
+import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
@@ -65,7 +65,7 @@ function TaskRow({ work, projected, bot, lookup, connected }: { work: OpenWork; 
   const active = taskActive(rawState) && !stale
   const unknown = !failed && (stale || rawState === 'unverified' || rawState === 'awaiting_confirmation' || rawState === 'unknown' || rawState === 'dispatch_unverified' || rawState === 'accepted_waiting_sync')
   const icon: LucideIcon = failed ? CircleX : unknown ? CircleQuestionMark : rawState === 'interrupted' ? CircleStop : active ? LoaderCircle : CircleCheck
-  const agent = work.kind && work.kind !== 'task' ? work.kind : null
+  const agent = taskAgent(work, lookup.nodes)
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined

@@ -24,12 +24,17 @@ function share(invitation: Invitation): Share {
 const kinds = [{ value: "phone", label: addDeviceCopy.phone, icon: Smartphone }, { value: "computer", label: addDeviceCopy.computer, icon: Monitor }] as const
 type Kind = (typeof kinds)[number]["value"]
 
-/** "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code. `opening`: arrived from a hint that asked for it, for that kind of device. */
-export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind; onOpened?(): void; onOpenChange?(open: boolean): void }) {
+/**
+ * "添加设备": one link the new device opens (a QR for phones, a command for computers), then both sides compare the safety code.
+ * `opening`: arrived from a hint that asked for it, for that kind of device; `manage`: that hint asked for another management device.
+ */
+export function AddDevice({ opening, manage, onOpened, onOpenChange }: { opening?: Kind; manage?: boolean; onOpened?(): void; onOpenChange?(open: boolean): void }) {
   const device = useDevice()
   const { ready } = device
   const generation = device.connectionGeneration()
   const [open, setOpen] = useState(false)
+  // Kept for this opening only: the hint's search is cleared once the sheet is up.
+  const [asManager, setAsManager] = useState(false)
   useEffect(() => onOpenChange?.(open), [open])
   const [result, setResult] = useState<Share | null>(null)
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
@@ -101,6 +106,7 @@ export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind;
   useEffect(() => {
     if (!opening || !ready?.principal.can_manage) return
     setKind(opening)
+    setAsManager(Boolean(manage))
     show()
     onOpened?.()
   }, [opening, ready])
@@ -111,13 +117,13 @@ export function AddDevice({ opening, onOpened, onOpenChange }: { opening?: Kind;
       <Button type="button" variant="ghost" size="icon" className="md:hidden" aria-label="添加设备" title="添加设备" onClick={show}><Plus aria-hidden="true" /></Button>
       <Button type="button" variant={requests ? "outline" : "default"} className="max-md:hidden" onClick={show}><Plus aria-hidden="true" />添加设备</Button>
     </PageActions>
-    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) setAdded(null) }}>
+    <Sheet open={open} onOpenChange={(next) => { setOpen(next); if (!next) { setAdded(null); setAsManager(false) } }}>
       {/* A waiting request leads the sheet; its first control is 设为管理设备, which should not take focus on its own. */}
       <SheetContent ref={sheet} className="!w-full max-sm:!border-l-0 overflow-y-auto sm:!max-w-md" onOpenAutoFocus={(event) => { if (requests) { event.preventDefault(); sheet.current?.focus() } }}>
         <SheetHeader className="pr-14"><SheetTitle tabIndex={-1} className="outline-none">添加设备</SheetTitle><SheetDescription className="sr-only">在新设备上打开链接，安全码一致后允许</SheetDescription></SheetHeader>
         <div className="grid gap-6 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           {/* A device already asking is the next thing to act on, so it comes before a new link. */}
-          <JoinRequests issuing={result !== null} onAllowed={(name, manage) => { setAdded({ name, manage }); setResult(null); setError(""); setCopyFailed(false) }} />
+          <JoinRequests issuing={result !== null} manage={asManager} onAllowed={(name, manage) => { setAdded({ name, manage }); setResult(null); setError(""); setCopyFailed(false) }} />
           {added && !requests ? <div className="grid gap-3">
             <p role="status" className="flex min-w-0 items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" /><span className="truncate" title={added.name}>{added.manage ? deviceCopy.addedManager(added.name) : `已添加「${added.name}」`}</span></p>
             <Button type="button" variant="outline" className="w-fit" disabled={busy} onClick={generate}><BusyIcon busy={busy} icon={Plus} />再添加一台</Button>

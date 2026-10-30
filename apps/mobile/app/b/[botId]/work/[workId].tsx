@@ -4,11 +4,12 @@ import { useEffect, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { outcomeUnknown, rawError, workFailure } from '@vibeface/client/lib/errors.ts'
-import { followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
+import { followUp, followUpCopy, interruptedCopy, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, type FollowUp } from '@vibeface/client/workspace/labels.ts'
+import { providerNames } from '@vibeface/client/lib/node.ts'
 import { projectName, questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { confirmReason } from '@vibeface/client/workspace/model.ts'
 import { ActionButton } from '@/components/action'
-import { CopyableId, Details, EmptyState, toneText, type Tone } from '@/components/kit'
+import { CopyableId, Details, EmptyState, providerIcons, toneText, type Tone } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useLive } from '@/data/live'
@@ -34,6 +35,7 @@ export default function TaskDetail() {
   const lookup = { nodes: shared.nodes, directory }
   const state = shownState(work, shared.nodes)
   const device = work.target_node
+  const agent = taskAgent(work, shared.nodes)
   const progress = shared.liveProgress.find((item) => item.kind === 'native' && item.work_id === workId && item.target_node === device)
   const canStop = state !== 'awaiting_confirmation' && !work.outcome && !work.stop && ['accepted', 'running'].includes(work.state)
   // A failed task's text is what it said before failing, so its cause leads and that text waits in 详细信息.
@@ -51,7 +53,8 @@ export default function TaskDetail() {
     <Stack.Screen options={{ title: work.title || '任务' }} />
     <View className="gap-1">
       {taskStale(state, shared.connectionOnline) ? <Text className="font-medium text-muted-foreground">{staleTaskLabel}</Text> : <Text className={cn('font-medium', toneText[tone(state)])}>{taskLabel(state)}</Text>}
-      {device || work.cwd ? <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+      {device || work.cwd || agent ? <View className="flex-row flex-wrap items-center gap-x-3 gap-y-1">
+        {agent ? <Meta icon={providerIcons[agent]} label="AI">{providerNames[agent]}</Meta> : null}
         {device ? <Meta icon={device === ready?.entry.device_id ? Laptop : Server} label="设备">{nodeName(device, lookup)}</Meta> : null}
         {work.cwd ? <Meta icon={FolderOpen} label="项目">{projectName(work.cwd)}</Meta> : null}
       </View> : null}

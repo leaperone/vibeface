@@ -1,4 +1,5 @@
-import type { MembershipView } from "../lib/node.ts"
+import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
+import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
 import type { NodeInfo, WorkRecord } from "./types.ts"
 
@@ -111,6 +112,22 @@ const progressStates: Record<string, string> = {
   unknown: "结果未知", awaiting_input: "待处理", declined: "已拒绝",
 }
 export const progressLabel = (status: string) => progressStates[status] ?? (/[\u4e00-\u9fff]/.test(status) ? status : "进行中")
+
+/**
+ * Who runs a task, the same on every card: a provider names itself; an agent task runs as its device's bot turn, so
+ * it names the provider that bot runs on there.
+ */
+export const taskAgent = (work: Pick<WorkRecord, "kind" | "target_node">, nodes: readonly NodeInfo[]): ProviderId | null =>
+  work.kind === "task" ? asProvider(nodes.find((node) => node.device_id === work.target_node)?.capabilities?.manager) : work.kind ?? null
+/** A task's newest step: what it recorded, else the last line or status its device streams, as another device's bot records none. */
+export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | "summary">, live: readonly LiveProgress[]) {
+  if (work.summary) return work.summary
+  const stream = live.find((item) => item.kind === "native" && item.work_id === work.work_id && item.target_node === work.target_node)
+  const line = stream?.text.trim().split("\n").at(-1) ?? ""
+  if (line) return line
+  const status = stream?.status ? progressLabel(stream.status) : ""
+  return status === "进行中" ? "" : status
+}
 
 /**
  * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop not yet

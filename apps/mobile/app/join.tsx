@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import { openURL, useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, ExternalLink, Hourglass, Laptop, Link2, ShieldAlert, ShieldCheck, X } from 'lucide-react-native'
 import { humanError, spentInviteText } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { Pressable, View } from 'react-native'
@@ -184,6 +184,7 @@ function Paste({ onText }: { onText: (text: string) => void }) {
 
 function Waiting({ code, onCancel }: { code: string | null; onCancel: () => void }) {
   return <Panel icon={Hourglass} title={joinCopy.waiting}>
+    <View className="flex-row items-center gap-2"><Icon as={ShieldCheck} className="size-4 text-success" /><Text className="text-meta text-muted-foreground">{joinCopy.reached}</Text></View>
     <Text role="status" className="text-muted-foreground">{code ? joinCopy.compareCode : joinCopy.showCode}</Text>
     {code ? <SafetyCode code={code} /> : <Skeleton className="h-8 w-40" />}
     <Button variant="ghost" className="-ms-3 self-start" onPress={onCancel}><Text>取消</Text></Button>

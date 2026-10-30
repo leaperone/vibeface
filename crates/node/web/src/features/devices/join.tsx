@@ -18,7 +18,8 @@ export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
  * `issuing`: this page just handed out a link, so it starts the comparison without a click.
  * `onAllowed`: the page shows the added device itself instead of a toast.
  */
-export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean; onAllowed?(name: string, manage: boolean): void }) {
+/** `manage`: the sheet was opened to add a management device, so a computer or phone asking starts ticked as one. */
+export function JoinRequests({ issuing = false, manage = false, onAllowed }: { issuing?: boolean; manage?: boolean; onAllowed?(name: string, manage: boolean): void }) {
   const device = useDevice()
   const joins = useOpenJoins()
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
@@ -49,7 +50,7 @@ export function JoinRequests({ issuing = false, onAllowed }: { issuing?: boolean
     // Focus moved on to something else (say the sheet over this page), so a card leaving later is not this list's to answer.
     if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) held.current = null
   }}>
-    {joins.map((request) => <div key={request.join_id} tabIndex={-1} className="min-w-0 outline-none"><JoinCard request={request} auto={issuing} onAllowed={onAllowed} /></div>)}
+    {joins.map((request) => <div key={request.join_id} tabIndex={-1} className="min-w-0 outline-none"><JoinCard request={request} auto={issuing} manage={manage} onAllowed={onAllowed} /></div>)}
   </section>
 }
 
@@ -60,10 +61,10 @@ const started = new Set<string>()
  * Starting the comparison claims the request for this admin, so only the page that issued the link does it
  * on its own; every other admin page asks first.
  */
-export function JoinCard({ request, auto = false, onAllowed }: { request: JoinRequest; auto?: boolean; onAllowed?(name: string, manage: boolean): void }) {
+export function JoinCard({ request, auto = false, manage: asManager = false, onAllowed }: { request: JoinRequest; auto?: boolean; manage?: boolean; onAllowed?(name: string, manage: boolean): void }) {
   const device = useDevice()
   const action = useAction()
-  const [manage, setManage] = useState(false)
+  const [manage, setManage] = useState(asManager)
   // Opening the card is the admin's commitment; the new device then reveals and both sides show the code.
   useEffect(() => {
     if (!auto || request.status !== "pending" || started.has(request.join_id)) return

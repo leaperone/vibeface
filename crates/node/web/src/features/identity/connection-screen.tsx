@@ -26,9 +26,10 @@ type Lane = 'local' | 'invite' | 'saved' | 'recovery'
 type Purpose = 'empty' | 'link' | 'invalid'
 const value = (form: HTMLFormElement, key: string) => { const field = form.elements.namedItem(key); return field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.value : '' }
 
-function purposeOf(invitation: string): Purpose {
+/** `decodes`: whether the ticket in it reads as one, checked as it is pasted, as on the phone. */
+function purposeOf(invitation: string, decodes: (link: string) => boolean): Purpose {
   if (!invitation.trim()) return 'empty'
-  return joinTicket(invitation) ? 'link' : 'invalid'
+  return joinTicket(invitation) && decodes(invitation) ? 'link' : 'invalid'
 }
 
 type Detector = { detect(source: HTMLVideoElement): Promise<Array<{ rawValue: string }>> }
@@ -106,6 +107,7 @@ function NodeJoin() {
   const [cancelling, setCancelling] = useState(false)
   return <Panel icon={Hourglass} title={joining.status === 'joined' ? '已加入' : joinCopy.waiting}>
     {joining.status === 'joined' ? <p className="flex items-center gap-2 text-success"><CircleCheck aria-hidden="true" className="size-4 shrink-0" />正在打开这台电脑</p> : <>
+      <Reached />
       <JoinCode code={joining.code} />
       <Button type="button" variant="ghost" className="-ms-3 w-fit" disabled={cancelling} onClick={() => { setCancelling(true); device.cancelNodeJoin().catch(() => setCancelling(false)) }}>
         {cancelling ? <LoaderCircle aria-hidden="true" className="animate-spin" /> : null}{cancelling ? '正在取消' : '取消'}
@@ -170,7 +172,8 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const local = !localSetup ? 'none' : localSetup.kind === 'uninitialized' || memberHere ? 'open' : 'join'
   const suggested = primaryLane({ hasInvitation: Boolean(device.initialInvitation), savedCount: device.entries.length, local, rejoined: device.rejoined, removed })
   const active = lane ?? suggested
-  const purpose = purposeOf(invitation)
+  // The ticket decoder loads with this browser's key; until then only the link's shape is checked.
+  const purpose = purposeOf(invitation, (link) => !device.identity || device.linkTarget(link) !== null)
   const usable = !!device.identity && !['blocked', 'key_lost', 'initializing', 'removed', 'restarting'].includes(device.phase)
   const thisComputer = device.localSetup?.kind === 'uninitialized'
   const linking = busy || ['connecting', 'reconnecting'].includes(device.phase)
@@ -301,7 +304,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
           {purpose !== 'link' && scanFirst ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
             <Textarea ref={scanFirst ? undefined : claimFocus} className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
-            {purpose === 'invalid' ? <InlineError error="这不是有效的加入链接" /> : null}
+            {purpose === 'invalid' ? <InlineError error={joinCopy.notLink} /> : null}
             {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
             <Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
@@ -440,10 +443,15 @@ function BrowserJoin() {
   const device = useDevice()
   const joining = device.joining!
   return <Panel icon={Hourglass} title="等待批准">
-    {device.info ? <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />已连上你的设备</p> : null}
+    {device.info ? <Reached /> : null}
     <JoinCode code={joining.code} />
     {device.phase === 'reconnecting' ? <p role="status" className="flex items-center gap-2 text-meta text-info"><LoaderCircle aria-hidden="true" className="size-4 animate-spin" />正在重连，请求还在</p> : null}
     <Button type="button" variant="ghost" className="-ms-3 w-fit" onClick={device.cancelJoin}>取消</Button>
     <Details><CopyDiagnostics lines={[['这个浏览器', device.identity?.deviceId], ['加入请求', joining.join_id]]} /></Details>
   </Panel>
+}
+
+/** The request reached one of the person's devices; both join pages say it the same way. */
+function Reached() {
+  return <p className="flex items-center gap-2 text-meta text-muted-foreground"><ShieldCheck aria-hidden="true" className="size-4 shrink-0 text-success" />{joinCopy.reached}</p>
 }

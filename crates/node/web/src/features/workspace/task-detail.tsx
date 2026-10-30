@@ -12,7 +12,10 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
+import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
+import { providerNames } from "@vibeface/client/lib/node.ts"
+import { providerIcons } from "@/features/devices/ai-settings"
+import { CopyDiagnostics } from "@/features/identity/device-controls"
 import { projectName, questionOpen } from "@vibeface/client/workspace/questions.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 
@@ -66,6 +69,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
   const check = work && state === "awaiting_confirmation" ? workChecks([{ ...work, conversation_id: workspace.data?.conversation?.conversation_id ?? "" }], workspace.nodes).find((item): item is WorkCheck => item.kind === "work") : undefined
   const settle = (choice: "completed" | "interrupted") => async () => { if (!check) return; await workspace.resolveCheck(check, choice, ""); toast(choice === "completed" ? "已记为做完" : "已记为没做完", { tone: "success" }) }
   const device = work?.target_node ?? ""
+  const agent = work ? taskAgent(work, workspace.nodes) : null
+  const AgentIcon = agent ? providerIcons[agent] : null
   const progress = workspace.liveProgress.find((item) => item.kind === "native" && item.work_id === workId && item.target_node === device)
   // Any entry forwards the stop; an unreachable device gets it when it is back.
   const canStop = work && state !== "awaiting_confirmation" && !work.outcome && !work.stop && ["accepted", "running"].includes(work.state)
@@ -108,7 +113,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       <Button asChild variant="ghost" size="icon" className="max-md:hidden"><Link {...leave} aria-label="关闭" title="关闭"><X aria-hidden="true" /></Link></Button>
     </header>
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
-      {device || work.cwd ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
+      {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
+        {agent && AgentIcon ? <span className="flex shrink-0 items-center gap-1.5"><AgentIcon aria-hidden="true" className="size-4 shrink-0" />{providerNames[agent]}</span> : null}
         {device ? <span className="flex min-w-0 items-center gap-1.5">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
@@ -147,9 +153,8 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
       <Details>
         {failed && work.result_text ? <DetailRow label="已有输出" value={<span className="whitespace-pre-wrap break-words">{work.result_text}</span>} /> : null}
         {work.failure_reason && (check || rawError(work.failure_reason)) ? <DetailRow label={check ? "说明" : "原始错误"} value={<span className="break-words">{work.failure_reason}</span>} /> : null}
-        <DetailRow label="任务编号" value={work.work_id} mono />
         {work.cwd ? <DetailRow label="文件夹" value={work.cwd} mono /> : null}
-        {device ? <DetailRow label="设备编号" value={device} mono /> : null}
+        <CopyDiagnostics label="复制编号" lines={[["任务编号", work.work_id], ["设备编号", device]]} />
       </Details>
     </div>}
   </aside>

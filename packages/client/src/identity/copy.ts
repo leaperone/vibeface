@@ -3,6 +3,8 @@ import type { Member, PendingRecovery } from '../lib/node.ts'
 /** Join, recovery and device copy the web and the phone show word for word. */
 export const joinCopy = {
   waiting: '等待批准',
+  /** The join request reached one of the person's devices. */
+  reached: '已连上你的设备',
   showCode: '正在生成安全码…',
   compareCode: '两边的安全码一致，就在那边点允许',
   linkSource: (from = '已有设备') => `链接来自${from}上的“添加设备”`,
