@@ -24,7 +24,11 @@ export type ChatMessage = TranscriptMessage & { state?: 'sending' | 'streaming' 
  */
 export type Conversation = {
   messages: ChatMessage[]
-  questions: Question[]
+  /** Questions before the message written after them, and those asked after the last. */
+  before: ReadonlyMap<string, Question[]>
+  rest: Question[]
+  /** The row 新消息 sits above: what this chat's badge counted, from its first in the order shown. */
+  unread: string | null
   works: WorkRecord[]
   replying: boolean
   status: string | null
@@ -45,7 +49,7 @@ type WorkspaceSnapshot = {
   bots: BotRecord[]
   /** The primary bot's conversation. */
   primary: string | null
-  /** Unread notifications and open questions per conversation. */
+  /** Unread replies and questions waiting on the person, per conversation. */
   unread: Record<string, number>
   /** Every question this network holds, answered ones included. */
   questions: Question[]

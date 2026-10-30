@@ -17,12 +17,6 @@ export type ChatMessage = TranscriptMessage & { state?: 'streaming' | 'interrupt
 
 const mergedLabels: Record<SteerOutcome, string> = { answered: '已补充给 Bot', unfinished: '补充后回复没完成', unknown: '不确定 Bot 看到了没有' }
 
-/** Today shows the time only; older messages also show the day. */
-function shortTime(when: Date) {
-  const today = when.toDateString() === new Date().toDateString()
-  return when.toLocaleString('zh-CN', today ? { hour: '2-digit', minute: '2-digit' } : { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-}
-
 /** A long message shows its first lines until expanded. */
 function isLong(text: string) {
   return text.length > 600 || text.split('\n').length > 12
@@ -45,11 +39,11 @@ export function FoldedText({ text }: { text: string }) {
 
 /**
  * One message: the person's in a bubble, the bot's as plain text across the full width, another bot's in a
- * card under its name. `last` marks the end of a run from the same sender, where the time shows. `schedule` names
+ * card under its name. `time` shows under the last message of each minute. `schedule` names
  * the schedule whose run produced this reply. `retry` sends the person's message again after this reply failed.
  */
 /** `detail`: the device's own words for a failed reply, folded under its cause. */
-export function Message({ message, schedule, last = true, retry, detail }: { message: ChatMessage; schedule?: string; last?: boolean; retry?: () => Promise<void>; detail?: string }) {
+export function Message({ message, schedule, time: shown, retry, detail }: { message: ChatMessage; schedule?: string; time?: string; retry?: () => Promise<void>; detail?: string }) {
   const { connectionOnline, data, selectedBot } = useWorkspace()
   const owner = data?.conversation?.owner
   const user = message.role === 'user'
@@ -60,7 +54,7 @@ export function Message({ message, schedule, last = true, retry, detail }: { mes
   const failed = ended === '失败'
   const cause = failed ? replyFailure(message.failure, detail) : failureText(message.failure)
   const raw = failed && detail ? rawError(detail) : ''
-  const time = when ? <time dateTime={when.toISOString()} className={last ? `${user ? 'px-1 ' : ''}text-meta text-muted-foreground` : 'sr-only'}>{last ? shortTime(when) : full}</time> : null
+  const time = when ? <time dateTime={when.toISOString()} className={shown ? `${user ? 'px-1 ' : ''}text-meta text-muted-foreground` : 'sr-only'}>{shown ?? full}</time> : null
   if (user) return <div className="flex min-w-0 flex-col items-end gap-1" data-message-id={messageKey(message)}>
     <div title={full} className="min-w-0 max-w-[85%] rounded-2xl rounded-br-md bg-secondary px-4 py-2 text-secondary-foreground ring-1 ring-border/60 [overflow-wrap:anywhere] sm:max-w-[75%] data-[sending]:opacity-70" data-sending={message.state === 'sending' || message.state === 'queued' || message.state === 'merging' || undefined}><span className="sr-only">你：</span><FoldedText text={message.text} /></div>
     {message.attachments?.map((file) => <div key={file.hash} className="w-full min-w-0 max-w-[85%] sm:max-w-[75%]"><Artifact file={file} /></div>)}

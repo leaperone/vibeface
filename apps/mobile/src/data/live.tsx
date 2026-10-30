@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { File } from 'expo-file-system'
-import { botReach, composerHint, threadReplies } from '@vibeface/client/chat/protocol.ts'
+import { botReach, composerHint } from '@vibeface/client/chat/protocol.ts'
+import { chatTimeline, firstUnread, unreadCounts } from '@vibeface/client/chat/timeline.ts'
 import { accessOf } from '@vibeface/client/identity/access.ts'
 import { DeviceProvider, useDevice } from '@vibeface/client/identity/context.tsx'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
@@ -133,7 +134,9 @@ function Live({ children }: { children: ReactNode }) {
     // The user message it answers, as the final reply's in_reply_to names it, so the two share a row: the one still
     // sending, or else the latest in the history.
     const liveTrigger = live && (sending ? shared.messagePending?.message_id : data.messages.findLast((message) => message.role === 'user')?.message_id)
-    const messages: ChatMessage[] = threadReplies(data.messages).map((message) => {
+    const timeline = chatTimeline(data.messages, data.questions, new Set(jobs.filter((job) => job.state === 'steered').map((job) => job.message_id)))
+    const unread = firstUnread(timeline, shared.fresh, (question) => awaitsAnswer(question, answered))
+    const messages: ChatMessage[] = timeline.messages.map((message) => {
       const detail = message.status === 'failed' ? jobs.find((job) => job.reply_message_id === message.message_id)?.failure?.detail : undefined
       return detail ? { ...message, detail } : message
     })
@@ -143,7 +146,8 @@ function Live({ children }: { children: ReactNode }) {
     if (live) messages.push({ message_id: `live:${live.key}`, event_hash: `live:${live.key}`, role: 'assistant', text: live.text, created_at_ms: Date.now(), state: 'streaming', in_reply_to: liveTrigger })
     const stopJob = jobs.find((job) => data.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
     conversations[conversationId] = {
-      messages, questions: data.questions, works: data.works,
+      messages, before: timeline.before, rest: timeline.rest, works: data.works,
+      unread: unread ? 'question_id' in unread ? `q:${unread.question_id}` : unread.message_id : null,
       // A finished job whose reply has not synced yet still counts, so the activity row hands over to the reply instead of
       // vanishing a frame early; its trigger being shown, even still sending, means the newer reply is on its way, not paged out.
       replying: Boolean(live) || !handedOver && jobs.some((job) => busyStates.includes(job.state) && !(job.reply_message_id && data.messages.some((message) => message.message_id === job.reply_message_id))
@@ -156,9 +160,7 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread: Record<string, number> = {}
-  for (const item of notifications) unread[item.conversation_id] = (unread[item.conversation_id] ?? 0) + 1
-  for (const question of questions) if (question.conversation_id && awaitsAnswer(question, answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
+  const unread = unreadCounts(notifications, questions.filter((question) => awaitsAnswer(question, answered)))
 
   const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
