@@ -1,6 +1,6 @@
 import { Link, type Href } from 'expo-router'
 import { useHeaderHeight } from 'expo-router/react-navigation'
-import { Bot, ChevronRight, CircleAlert, Copy, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
+import { Bot, ChevronRight, CircleAlert, CircleX, Copy, Inbox as InboxIcon, Lock, MessageSquareWarning, Sparkles, type LucideIcon } from 'lucide-react-native'
 import { useRef } from 'react'
 import { Pressable, View } from 'react-native'
 import { useSafeAreaFrame, useSafeAreaInsets } from 'react-native-safe-area-context'
@@ -24,8 +24,8 @@ import { RecoveryPendingCard, RotateHintCard } from '@/features/recovery/recover
 // An answered card leaves at once and what was below glides up into its space, so nothing passes over anything.
 const Group = withUniwind(Animated.View)
 
-type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' }>
-const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles }
+type Row = Extract<InboxItem, { kind: 'write' | 'undelivered' | 'attention' | 'setup' | 'failed' }>
+const rowIcons: Record<Row['kind'], LucideIcon> = { write: Copy, undelivered: CircleAlert, attention: MessageSquareWarning, setup: Sparkles, failed: CircleX }
 
 /**
  * The items the web lists: a recovery to stop first, cards to act on here, rows leading to where the rest is settled, join
@@ -58,7 +58,7 @@ export default function Inbox() {
     {items.map((item) => item.kind === 'recovery' ? <RecoveryPendingCard key={item.key} />
       : item.kind === 'rotate' ? <RotateHintCard key={item.key} />
       : item.kind === 'confirm' ? <ConfirmCard key={item.key} check={item.check} />
-      : item.kind === 'write' || item.kind === 'undelivered' || item.kind === 'attention' || item.kind === 'setup' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
+      : item.kind === 'write' || item.kind === 'undelivered' || item.kind === 'attention' || item.kind === 'setup' || item.kind === 'failed' ? <ItemRow key={item.key} item={item} href={rowHref(item, shared?.selectedBot?.bot_id, device.ready?.entry.device_id)} replace={wide} />
       : null)}
     {items.some((item) => item.kind === 'join') ? <JoinRequests /> : null}
     {open.length ? open.map((questions) => <Group key={questions[0].bot?.bot_id ?? ''} layout={move} className="gap-2">
@@ -77,6 +77,7 @@ export default function Inbox() {
 /** Where a row leads on the phone; the phone cannot settle a copied or read-only computer, so that row only says it. */
 function rowHref(item: Row, chat: string | undefined, entry: string | undefined): Href | null {
   if (item.kind === 'attention') return `/b/${item.bot.bot_id}`
+  if (item.kind === 'failed') return `/b/${item.bot.bot_id}/work/${item.work.work_id}`
   if (item.kind === 'undelivered') return chat ? `/b/${chat}` : null
   if (item.kind === 'setup') return !item.device || item.device === entry ? '/ai' : `/device/${item.device}`
   return null
@@ -85,7 +86,7 @@ function rowHref(item: Row, chat: string | undefined, entry: string | undefined)
 function ItemRow({ item, href, replace }: { item: Row; href: Href | null; replace: boolean }) {
   const card = 'min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-xs dark:border-line-strong'
   const body = <>
-    <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className="size-5 text-warning" />
+    <Icon as={item.kind === 'write' && item.write === 'read_only' ? Lock : rowIcons[item.kind]} className={item.kind === 'failed' ? 'size-5 text-danger' : 'size-5 text-warning'} />
     <Text numberOfLines={2} className="min-w-0 flex-1 font-medium">{item.title}</Text>
     {item.meta ? <Text numberOfLines={1} className="max-w-[40%] text-meta text-muted-foreground">{item.meta}</Text> : null}
     {href ? <Icon as={ChevronRight} className="text-muted-foreground" /> : null}

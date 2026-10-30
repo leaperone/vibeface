@@ -3,10 +3,10 @@ import { AlarmClock, ArrowRight, ArrowRightLeft, BookOpen, Bot, ChevronRight, Ci
 import { useState, type ReactNode } from 'react'
 import { Pressable, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
-import { failureText, taskError, type FailureKind } from '@vibeface/client/lib/errors.ts'
+import { failureText, taskError, workFailure, type FailureKind } from '@vibeface/client/lib/errors.ts'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { changeTitle, formatWhen, lineDiff, overwriteCopy, placeChanges, restoreRequest, scheduleFrequency, scheduleTrigger } from '@vibeface/client/workspace/bot-settings.ts'
-import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { interruptedCopy, nodeName, shownState, staleTaskLabel, taskActive, taskCopy, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { pendingChecks, type WorkCheck } from '@vibeface/client/workspace/model.ts'
 import { questionOpen } from '@vibeface/client/workspace/questions.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
@@ -24,7 +24,6 @@ export type Row = { key: string; node: ReactNode }
 
 /** Why a reply or task failed: its kind's words, else the first line of its original text. */
 const cause = (kind: FailureKind | undefined, raw: string | null | undefined) => failureText(kind) || (raw ? taskError(raw).split('\n').at(-1) ?? '' : '')
-const workCause = (work: WorkRecord) => cause(work.failure, work.failure_reason)
 
 /** Plain-language reason a work needs the person; the device's own words stay out of the card. */
 export function confirmText(check: Pick<WorkCheck, 'reason' | 'detail'>, device: string): string {
@@ -62,7 +61,7 @@ export function useChatExtras(conversationId: string, botId: string) {
     const joined = work.turn_id ? data.works.slice(0, index).find((item) => item.thread_id === work.thread_id && item.turn_id === work.turn_id)?.title : undefined
     const scheduledReply = data.messages.find((message) => message.role !== 'user' && scheduleTrigger(message.in_reply_to) && message.in_reply_to === work.trigger)
     const cause = scheduledReply?.message_id ?? jobs.find((job) => job.trigger === work.trigger)?.message_id
-    add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} /> })
+    add(cause && shown.has(cause) ? cause : undefined, { key: `task:${work.work_id}`, node: <TaskCard work={work} state={shownAs} stale={taskStale(shownAs, shared.connectionOnline)} away={shownAs === 'dispatch_waiting' && shared.nodes.some((node) => node.device_id === work.target_node && !node.online)} joined={joined} botId={botId} device={nodeName(work.target_node, lookup)} /> })
   })
   for (const job of jobs) {
     if ((job.state === 'failed' || job.state === 'rejected') && job.message_id && shown.has(job.message_id) && !shown.has(job.reply_message_id ?? '')) add(job.message_id, { key: `job:${job.trigger}`, node: <JobLine job={job} /> })
@@ -84,7 +83,8 @@ export function useChatExtras(conversationId: string, botId: string) {
 }
 
 /** Running tasks get a card; finished ones shrink to one line. Both open the details. */
-function TaskCard({ work, state, stale, joined, botId, device }: { work: WorkRecord; state: string; stale: boolean; joined?: string; botId: string; device: string }) {
+/** `away`: its device is offline, so it waits for that device rather than spinning. */
+function TaskCard({ work, state, stale, away, joined, botId, device }: { work: WorkRecord; state: string; stale: boolean; away: boolean; joined?: string; botId: string; device: string }) {
   const title = work.title || '任务'
   const active = taskActive(state)
   const open = active || state === 'waiting' || state === 'awaiting_confirmation'
@@ -98,10 +98,11 @@ function TaskCard({ work, state, stale, joined, botId, device }: { work: WorkRec
     </> : null}
     <Icon as={Laptop} className="size-3.5 text-muted-foreground" />
     <Text numberOfLines={1} className="shrink text-meta text-muted-foreground">{device}</Text>
-    <Text className="text-meta text-muted-foreground">· {stale ? staleTaskLabel : taskLabel(state)}</Text>
+    <Text className="text-meta text-muted-foreground">· {stale ? staleTaskLabel : away ? taskCopy.away : taskLabel(state)}</Text>
   </View>
   if (!open) {
-    const result = work.result_text ? work.result_text.split('\n')[0] : workCause(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
+    // A failed task's text is what it said before failing, so its cause leads.
+    const result = failed ? workFailure(work) : work.result_text ? work.result_text.split('\n')[0] : workFailure(work) || (state === 'interrupted' ? interruptedCopy.reason : '')
     const icon = state === 'interrupted' ? CircleStop : failed ? CircleX : CircleCheck
     return <Link href={href} asChild>
       <Pressable accessibilityRole="link" className="-mx-2 min-h-11 flex-row items-start gap-2 rounded-lg px-2 py-2 active:bg-muted">
@@ -118,7 +119,7 @@ function TaskCard({ work, state, stale, joined, botId, device }: { work: WorkRec
   return <Link href={href} asChild>
     <Pressable accessibilityRole="link" className="min-h-14 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2 shadow-xs active:bg-muted dark:border-line-strong">
       {/* Waiting on an answer, it only says so: the question card below asks. */}
-      <Icon as={state === 'waiting' ? Hand : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
+      <Icon as={state === 'waiting' ? Hand : away ? WifiOff : active && !stale ? LoaderCircle : CircleQuestionMark} className={cn('size-5', stale ? 'text-muted-foreground' : active ? 'text-foreground' : 'text-warning')} />
       <View className="min-w-0 flex-1 gap-0.5">
         <Text numberOfLines={1} className="font-medium">{title}</Text>
         {meta}

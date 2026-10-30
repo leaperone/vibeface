@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { parseAnswer, parseConversation, parseOpenWorks, parsePrimary, parseQuestions, parseTriageSettings } from "./model.ts"
-import { answerBody, awaitsAnswer, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
+import { answerBody, answerLabel, awaitsAnswer, declined, foldAnswers, openQuestions, placeByTime, projectName, questionMeta, settledAnswer, sharedProject } from "./questions.ts"
 
 const about = { node: "worker", agent: "codex", session_id: "s", cwd: "/path/to/web/", summary: "改登录" }
 const row = (question_id: string, created_at_ms: number, extra: Record<string, unknown> = {}) => ({
@@ -122,4 +122,12 @@ test("an approval card names the task its request holds and leaves the device th
   assert.deepEqual(questionMeta(approval, works, bots, "gateway"), { approval: true, task: { bot_id: "bot", work_id: "w1", title: "任务" }, local: false })
   assert.equal(questionMeta(approval, works, [], "worker").task, null, "a task whose bot is gone has nowhere to link")
   assert.deepEqual(questionMeta(question, works, bots, "gateway"), { approval: false, task: null, local: false }, "a plain question holds no task")
+})
+
+test("a refused request reads as refused, never as agreed", () => {
+  for (const answer of ["拒绝", "不允许", "No", "deny", "拒绝，先别改"]) assert.ok(declined(answer), answer)
+  for (const answer of ["允许", "同意", "nothing to add", "继续"]) assert.ok(!declined(answer), answer)
+  assert.equal(answerLabel("拒绝"), "已拒绝")
+  assert.equal(answerLabel("拒绝，先别改"), "已拒绝 · 拒绝，先别改")
+  assert.equal(answerLabel("允许"), "已回答 · 允许")
 })

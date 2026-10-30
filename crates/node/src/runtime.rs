@@ -169,6 +169,9 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
     if let Some(reason) = workspace_bounded_opt(work.failure_reason.as_deref(), 512) {
         row["failure_reason"] = json!(reason);
     }
+    if let Some(failure) = work.failure {
+        row["failure"] = json!(failure);
+    }
     if work.outcome == Some(WorkOutcome::Unverified) {
         row["unknown_reason"] = json!("work_result_unverified");
     }
@@ -824,20 +827,22 @@ impl Runtime {
             .map(|conversation| (conversation.conversation_id.as_str(), conversation))
             .collect();
 
-        let all_works = conversations
-            .iter()
-            .try_fold(Vec::new(), |mut all, conversation| {
-                all.extend(store.works(network, &conversation.conversation_id)?);
-                Ok::<_, anyhow::Error>(all)
-            })?;
+        let (all_works, shown_works) = conversations.iter().try_fold(
+            (Vec::new(), Vec::new()),
+            |(mut all, mut shown), conversation| {
+                let works = store.works(network, &conversation.conversation_id)?;
+                shown.extend(if include_finished {
+                    works.clone()
+                } else {
+                    crate::store::unsettled(works.clone())
+                });
+                all.extend(works);
+                Ok::<_, anyhow::Error>((all, shown))
+            },
+        )?;
         let work_ids: BTreeSet<_> = all_works.iter().map(|work| work.work_id.as_str()).collect();
-        let mut tasks = all_works
+        let mut tasks = shown_works
             .iter()
-            .filter(|work| {
-                include_finished
-                    || work.outcome.is_none()
-                    || work.outcome == Some(WorkOutcome::Unverified)
-            })
             .map(|work| workspace_work_summary(work, "dag"))
             .collect::<Vec<_>>();
 

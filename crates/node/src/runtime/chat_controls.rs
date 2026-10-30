@@ -319,7 +319,8 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
         let spec = &dispatch.spec;
         deliveries.push(
             json!({"work_id":spec.work_id,"target_node":spec.target,"state":dispatch.state.name(),
-            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason()}),
+            "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason(),
+            "trigger":spec.trigger,"prompt":spec.prompt}),
         );
     }
     for stop in store.stop_requests()? {

@@ -5,7 +5,7 @@ import { enqueue, settle, type OutboxItem, type OutboxStore } from '@vibeface/cl
 import { joinTabs } from './tabs.ts'
 import { candidates, isPublicUrl, markReached, mergeEntrances, storedEntrances, verifiedEntrances } from '@vibeface/client/lib/entrances.ts'
 import { entryAddress } from '@vibeface/client/lib/node.ts'
-import { failureKinds, failureText, humanError, rawError, spentInvite, spentInviteText } from '@vibeface/client/lib/errors.ts'
+import { failureKinds, failureText, humanError, outcomeUnknown, rawError, spentInvite, spentInviteText, workFailure } from '@vibeface/client/lib/errors.ts'
 
 test('the link moves through join, connect, catch-up, loss and revocation', () => {
   let link: Link = { kind: 'booting' }
@@ -156,6 +156,18 @@ test('backend English and gateway refusal codes reach the page as plain Chinese'
   assert.equal(humanError('something nobody mapped', undefined, '读取最新内容'), '读取最新内容没有成功，请再试一次。')
   assert.equal(rawError(new Error('conversation not found')), 'conversation not found')
   assert.equal(rawError(new Error('已断开')), '')
+})
+
+test('a failed task leads with its cause, and one whose outcome is unknown is checked, not run again', () => {
+  assert.equal(workFailure({ failure: 'timed_out', failure_reason: 'Codex management timed out' }), failureText('timed_out'))
+  assert.equal(workFailure({ failure_reason: 'Codex management timed out' }), '设备没有及时回复，结果未知。请先确认结果，不要重复提交。')
+  assert.equal(workFailure({ failure_reason: null }), '')
+  assert.ok(outcomeUnknown('timed_out'))
+  assert.ok(outcomeUnknown('lost'))
+  assert.ok(outcomeUnknown(undefined, 'Codex management timed out'))
+  assert.ok(outcomeUnknown('unknown', 'client response timed out; outcome may be unknown'))
+  assert.ok(!outcomeUnknown('quota', 'quota exceeded'))
+  assert.ok(!outcomeUnknown('rejected'))
 })
 
 test('a spent join link reads the same, and clears the field the same, whether the Node or the page says so', () => {
