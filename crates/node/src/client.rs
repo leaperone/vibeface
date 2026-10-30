@@ -591,6 +591,7 @@ async fn dispatch(
             | "authenticate"
             | "directory"
             | "node_settings"
+            | "provider_models"
             | "subscribe"
             | "join_check"
             | "join_status"
@@ -728,6 +729,15 @@ async fn dispatch(
         "test_codex_app_server" => {
             node_operator(node, session).await?;
             Ok(json!(node.codex.test().await))
+        }
+        "provider_models" => {
+            node_operator(node, session).await?;
+            let models = match params["provider"].as_str() {
+                Some("codex") => node.codex.models().await,
+                Some(_) => None,
+                None => bail!("provider is required"),
+            };
+            Ok(json!({"models":models}))
         }
         "triage_settings" => {
             node_operator(node, session).await?;
@@ -944,9 +954,11 @@ async fn dispatch(
                 event.issuer == session.device_id && event.epoch == view.epoch,
                 "invalid grant signer or action"
             );
-            // New devices join through `approve`; this only changes a current client's permission.
+            // New devices join through `approve`; this only renames a current device or changes
+            // a client's permission.
             ensure!(
-                view.client(&member.device_id).is_ok(),
+                view.member(&member.device_id)
+                    .is_ok_and(|current| current.kind == member.kind),
                 "device is not a member of this personal network"
             );
             let mut state = node.membership_state().await?;
@@ -1452,7 +1464,8 @@ fn parse_join_link_within(link: &str, nest: bool) -> Result<Ticket> {
     )?)
 }
 
-/// Saved so an interrupted `vibeface join` resumes with the same commitment.
+/// Saved so an interrupted join, from the terminal or the local page, resumes with the same
+/// commitment.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PendingJoin {
@@ -1665,15 +1678,12 @@ pub(crate) async fn start_node_join(
         previous.task.abort();
         let _ = std::fs::remove_file(node.data_dir.join("join.json"));
     }
-    if owner == JoinOwner::Terminal {
-        // A commitment kept for another link belongs to a join nobody waits on any more.
-        forget_join_for_another_link(&node.data_dir, &link)?;
-    }
+    // A commitment kept for another link belongs to a join nobody waits on any more.
+    forget_join_for_another_link(&node.data_dir, &link)?;
     let runner = node.clone();
     let joining = link.clone();
     let cancel = Arc::new(tokio::sync::Notify::new());
     let cancelled = cancel.clone();
-    let terminal = owner == JoinOwner::Terminal;
     let task = tokio::spawn(async move {
         let report = |status: NodeJoin| {
             if let Ok(mut slot) = runner.node_join.lock()
@@ -1691,11 +1701,8 @@ pub(crate) async fn start_node_join(
             }
             Err(error) => {
                 tracing::warn!(event = "join.local_failed", %error, "this Node's join failed");
-                // The terminal keeps the commitment so running the same command again resumes
-                // the request the entry may already hold instead of sending a second one.
-                if !terminal {
-                    let _ = std::fs::remove_file(runner.data_dir.join("join.json"));
-                }
+                // The entry may already hold the request, so the commitment stays: asking again
+                // with the same link resumes it instead of sending a second one.
                 let mut reason = error.to_string();
                 reason.truncate(reason.floor_char_boundary(512));
                 report(NodeJoin::Failed { reason });
@@ -3011,6 +3018,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_page_join_keeps_its_commitment_so_asking_again_resumes_it() -> Result<()> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("node-join-failed-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        crate::config::Config::local("127.0.0.1:4795".parse()?, vec![], false).save(&dir)?;
+        crate::config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        crate::config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+        let capability =
+            crate::store::Store::open(dir.join("node.sqlite3"))?.bootstrap_capability()?;
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let result = async {
+            // No address and no discovery: the join fails after it committed, before reaching anyone.
+            let link = |secret: u8| -> Result<String> {
+                let ticket = Ticket::new(&LocalIdentity::generate().device_id()?, [secret; 32])?;
+                Ok(format!("http://127.0.0.1:4795/join#{}", ticket.encode()?))
+            };
+            let params = |link: &str| json!({"capability": capability.capability, "link": link, "name": "工作室 Mac"});
+            let mut page = Session {
+                device_id: LocalIdentity::generate().device_id()?,
+                cookie: None,
+                subscribed: None,
+                observation: None,
+            };
+            let nonce = || -> Result<String> {
+                let pending: Value = serde_json::from_slice(&std::fs::read(dir.join("join.json"))?)?;
+                Ok(pending["nonce"].as_str().unwrap_or_default().to_owned())
+            };
+            let mut node_join = async |link: &str| -> Result<Value> {
+                for _ in 0..100 {
+                    let reply = dispatch(&node, &mut page, "node_join", params(link)).await?;
+                    if reply["status"] == "failed" {
+                        return Ok(reply);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                bail!("the join never failed")
+            };
+            let first = link(7)?;
+            let failed = node_join(&first).await?;
+            assert!(
+                failed["reason"].as_str().is_some_and(|reason| !reason.is_empty()),
+                "a failure says why: {failed}"
+            );
+            let sent = nonce()?;
+            node_join(&first).await?;
+            assert_eq!(
+                nonce()?,
+                sent,
+                "asking again with the same link resumes the request the entry may hold"
+            );
+            node_join(&link(8)?).await?;
+            assert_ne!(nonce()?, sent, "a new link drops the old commitment");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        result
+    }
+
+    #[tokio::test]
     async fn local_browser_access_requires_a_launcher_and_preserves_membership_permissions()
     -> Result<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -3385,6 +3460,13 @@ mod tests {
             assert!(format!("{error:#}").contains(LAST_MANAGER), "{error:#}");
             manager.call("grant", json!({"event":set_manage(&admin, &view, &phone, "phone", true)?})).await?;
             assert_eq!(joiner.call("authenticate", json!({})).await?["principal"]["can_manage"], true);
+            let view = node.membership_state().await?.project()?;
+            let rename = GovernanceEvent::grant(&admin, &view, Member::node(&node.identity, "工作室 Mac")?)?;
+            manager.call("grant", json!({"event":rename})).await?;
+            assert_eq!(node.membership_state().await?.project()?.node(&node_id)?.name, "工作室 Mac", "a manager renames a computer");
+            let view = node.membership_state().await?.project()?;
+            let as_client = GovernanceEvent::grant(&admin, &view, Member::new(&node_id, IdentityKind::Client, "工作室 Mac", false)?)?;
+            assert!(manager.call("grant", json!({"event":as_client})).await.is_err(), "a rename keeps the kind");
 
             let view = node.membership_state().await?.project()?;
             let revoke = GovernanceEvent::revoke(&admin, &view, Revocation::new(&phone.device_id()?, None)?)?;

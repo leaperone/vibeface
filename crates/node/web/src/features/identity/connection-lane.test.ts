@@ -463,6 +463,50 @@ test('this computer asks its own Node about a link, with the page capability, an
   } finally { app.close() }
 })
 
+test('this computer\'s join asks again after a lost answer and explains a failure as the terminal does', async () => {
+  const app = deviceHarness({ local: 'fresh' })
+  try {
+    app.render(); await until(() => app.render().localSetup?.kind === 'uninitialized')
+    const lost = deferred(); app.holds.set('node_join', lost)
+    const joining = app.render().joinThisComputer('https://node.example/join#vibeface1ticket', '工作室 Mac')
+    await until(() => app.requests.some(request => request.method === 'node_join'))
+    const before = new Set(app.timers.keys())
+    app.holds.set('node_join', { promise: Promise.resolve({ status: 'failed', reason: 'join request Rejected: rejected' }), resolve() {}, reject() {} })
+    lost.reject(new Error('request timed out'))
+    await until(() => [...app.timers.keys()].some(id => !before.has(id)))
+    for (const [id, run] of app.timers) if (!before.has(id)) { app.timers.delete(id); run() }
+    await assert.rejects(joining, /管理设备拒绝了这次加入/)
+    const asked = app.requests.filter(request => request.method === 'node_join').map(request => plain(request.params))
+    assert.equal(asked.length, 2)
+    assert.deepEqual(asked[1], asked[0], 'the same link again only reads how far the join got')
+  } finally { app.close() }
+})
+
+for (const landed of [true, false]) test(`a lost rename reply reads the name back ${landed ? 'and counts it' : 'and reports the failure'}, never signing twice`, async () => {
+  const app = deviceHarness({ management: true, saved: true })
+  try {
+    app.render(); await settle(); app.render()
+    await app.render().refreshDirectory()
+    let name = 'node'
+    const verify = app.secure.verifyState
+    app.secure.verifyState = () => ({ ...verify(), viewJson: () => JSON.stringify({ ...membership, members: [{ device_id: subject, kind: 'client', name: 'browser', manage: true }, { device_id: target, kind: 'node', name, manage: false }] }) })
+    const reply = deferred(); app.holds.set('grant', reply)
+    const renaming = app.render().renameDevice(target, ' 工作室 Mac ')
+    await until(() => app.requests.some(request => request.method === 'grant'))
+    if (landed) name = '工作室 Mac'
+    reply.reject(new Error('connection lost'))
+    if (landed) await renaming
+    else await assert.rejects(renaming, /connection lost/)
+    const grants = app.requests.filter(request => request.method === 'grant').map(request => plain(request.params.event))
+    assert.equal(grants.length, 1)
+    assert.deepEqual(grants[0].action, { type: 'grant', member: { device_id: target, kind: 'node', name: '工作室 Mac', manage: false } }, 'a rename keeps the kind and permission')
+    if (landed) {
+      await app.render().renameDevice(target, '工作室 Mac')
+      assert.equal(app.requests.filter(request => request.method === 'grant').length, 1, 'a name already in place is not signed again')
+    }
+  } finally { app.close() }
+})
+
 test('a removed browser joins again as a new device and never offers its revoked key', async () => {
   const app = deviceHarness({ removed: true })
   try {
