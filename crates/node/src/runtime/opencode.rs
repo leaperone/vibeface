@@ -981,8 +981,13 @@ impl Opencode {
                 event = events.recv(), if streaming => match event {
                     Some(event) => {
                         let event = manager::redact(event, &secrets);
-                        if let Some(update) = seen.apply(&event) {
-                            progress(update).await.map_err(|e| unknown(native, &e.to_string()))?;
+                        if let Some(update) = seen.apply(&event)
+                            && let Err(e) = progress(update).await
+                        {
+                            // Not knowing what was shown, the run must not go on unseen.
+                            let last = self.close(&session);
+                            self.stop_run(&conn, &session, &last).await;
+                            break Err(unknown(native, &e.to_string()));
                         }
                         matches!(
                             event["type"].as_str(),
@@ -2590,6 +2595,32 @@ mod tests {
             .downcast_ref::<ManagerError>()
             .context("a manager error")?;
         assert!(error.cancelled(), "{error}");
+        assert!(place.fake.lock().unwrap().aborts >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_bot_turn_whose_progress_fails_stops_its_run_before_reading_unknown() -> Result<()> {
+        let place = Place::new().await?;
+        let server = place.opencode()?;
+        let turns = Turns::default();
+        let config = bot(&place, &server, "attempt-1", &turns);
+        let result = run_manager(
+            &config,
+            "hello",
+            None,
+            |_| async { anyhow::Ok(()) },
+            watch::channel(false).1,
+            |_| async { Err(anyhow::anyhow!("the progress could not be written")) },
+        )
+        .await;
+        let Err(error) = result else {
+            bail!("a turn whose progress failed has no reply");
+        };
+        let error = error
+            .downcast_ref::<ManagerError>()
+            .context("a manager error")?;
+        assert_eq!(error.outcome, ManagerFailure::Unknown, "{error}");
         assert!(place.fake.lock().unwrap().aborts >= 1);
         Ok(())
     }
