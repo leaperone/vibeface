@@ -184,7 +184,7 @@ CI 固定的 Chromium 用例覆盖指定 Web 流程；任务特定的页面验�
 
 Linux x64 制品任务使用 pnpm 缓存，并按 runner、架构和 `pnpm-lock.yaml` 缓存 Chromium 二进制。浏览器的系统依赖从 Ubuntu 官方镜像下载，沿用签名仓库配置。每次仍执行冻结依赖安装、浏览器与系统依赖安装以及完整浏览器用例。缓存只包含浏览器文件，不包含测试结果、Node 数据或下载的恢复文件。
 
-`ci` 工作流中的 Rust 缓存调用在各个 ref 上都读取缓存，仅在 `refs/heads/main` 保存缓存；PR、tag 和其他 ref 不写入缓存，新增的测试 profile 或缓存 key 在主分支写入前可能保持冷缓存。
+`ci` 工作流中的 Rust 缓存仅在 `refs/heads/main` 或显式 `workflow_dispatch` 时保存；PR 和自动 tag push 只读取缓存。手动运行可以预热自身分支的缓存，不会为其他分支或 PR 预热；新增 profile 或缓存 key 在首次保存前需要冷构建。
 
 Android 使用官方 Gradle 缓存动作和 Gradle build cache，保留 `arm64-v8a` 与 `x86_64` 的 release 构建。PR 只读 Gradle 缓存；手动运行可以写入其 Git ref 的缓存。缓存命中仍需执行原构建和制品检查，不能替代本次提交的验收。
 
