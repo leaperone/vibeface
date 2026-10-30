@@ -1432,7 +1432,6 @@ fn validate_control_turn(turn: &SdkTurn, agent_id: &str, run_id: &str) -> Result
 fn native_run(snapshot: &Value, agent_id: &str, run_id: &str, secrets: &[&str]) -> NativeRun {
     let status = snapshot
         .get("status")
-        .and_then(Value::as_str)
         .map(native_status)
         .unwrap_or(NativeStatus::Unknown);
     let status = match status {
@@ -1453,12 +1452,21 @@ fn native_run(snapshot: &Value, agent_id: &str, run_id: &str, secrets: &[&str]) 
     }
 }
 
-fn native_status(status: &str) -> NativeStatus {
-    match status {
-        "RUN_LIFECYCLE_STATUS_CREATING" | "RUN_LIFECYCLE_STATUS_RUNNING" => NativeStatus::Running,
-        "RUN_LIFECYCLE_STATUS_FINISHED" => NativeStatus::Completed,
-        "RUN_LIFECYCLE_STATUS_CANCELLED" => NativeStatus::Cancelled,
-        "RUN_LIFECYCLE_STATUS_ERROR" | "RUN_LIFECYCLE_STATUS_EXPIRED" => NativeStatus::Failed {
+fn native_status(status: &Value) -> NativeStatus {
+    let code = status.as_u64().or_else(|| match status.as_str()? {
+        "RUN_LIFECYCLE_STATUS_CREATING" => Some(1),
+        "RUN_LIFECYCLE_STATUS_RUNNING" => Some(2),
+        "RUN_LIFECYCLE_STATUS_FINISHED" => Some(3),
+        "RUN_LIFECYCLE_STATUS_ERROR" => Some(4),
+        "RUN_LIFECYCLE_STATUS_CANCELLED" => Some(5),
+        "RUN_LIFECYCLE_STATUS_EXPIRED" => Some(6),
+        _ => None,
+    });
+    match code {
+        Some(1 | 2) => NativeStatus::Running,
+        Some(3) => NativeStatus::Completed,
+        Some(5) => NativeStatus::Cancelled,
+        Some(4 | 6) => NativeStatus::Failed {
             detail: format!("Cursor SDK run ended with status {status}"),
         },
         _ => NativeStatus::Unknown,
@@ -2214,6 +2222,44 @@ pub(crate) async fn bounded_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_snapshots_accept_numeric_and_named_lifecycle_statuses() {
+        let read = |status| native_run(&json!({"status": status}), "agent", "run", &[]).status;
+        for status in [
+            json!(1),
+            json!(2),
+            json!("RUN_LIFECYCLE_STATUS_CREATING"),
+            json!("RUN_LIFECYCLE_STATUS_RUNNING"),
+        ] {
+            assert_eq!(read(status), NativeStatus::Running);
+        }
+        for status in [json!(3), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
+            assert_eq!(read(status), NativeStatus::Completed);
+        }
+        for status in [json!(5), json!("RUN_LIFECYCLE_STATUS_CANCELLED")] {
+            assert_eq!(read(status), NativeStatus::Cancelled);
+        }
+        for status in [
+            json!(4),
+            json!(6),
+            json!("RUN_LIFECYCLE_STATUS_ERROR"),
+            json!("RUN_LIFECYCLE_STATUS_EXPIRED"),
+        ] {
+            assert!(matches!(read(status), NativeStatus::Failed { .. }));
+        }
+        for status in [
+            json!(0),
+            json!(7),
+            json!(-1),
+            json!(3.5),
+            json!(true),
+            Value::Null,
+            json!("UNFINISHED"),
+        ] {
+            assert_eq!(read(status), NativeStatus::Unknown);
+        }
+    }
     fn result(status: Value) -> Value {
         json!({"result": {"agentId": "a", "runId": "r", "status": status,
             "result": {"agentId": "a", "runId": "r", "status": status, "result": "Needs approval", "usage": {"inputTokens": "42", "outputTokens": "7"}}}})
