@@ -80,7 +80,7 @@ function Wordmark() {
 /** A first phone with no computer yet: Vibeface runs on a computer first, and its 添加设备 brings the phone in. */
 function NoComputer() {
   return <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})}
-    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-3 py-2 active:bg-accent">
+    className="-mx-3 min-h-14 flex-row items-center gap-2 rounded-lg px-4 py-2 active:bg-accent">
     <Icon as={Laptop} />
     <View className="min-w-0 flex-1">
       <Text className="font-medium">{joinCopy.noComputer}</Text>
