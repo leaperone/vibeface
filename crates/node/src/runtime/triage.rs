@@ -1060,7 +1060,6 @@ impl Runtime {
             )
         };
         if let Err(error) = reserved {
-            self.settle_offered(&fresh).await?;
             return Err(error.context("no coordination turn"));
         }
         let turn = self
@@ -4368,7 +4367,14 @@ pub(super) mod tests {
                 "the last turn of the day runs"
             );
 
-            let deferred = turn("s-deferred", "t-deferred", "/tmp");
+            let mut deferred = turn("s-deferred", "t-deferred", "/tmp");
+            deferred.event_id = AgentEvent::id_for(
+                &node.identity.device_id()?,
+                deferred.agent,
+                &deferred.session_id,
+                &deferred.turn_id,
+                deferred.event,
+            );
             let deferred_id = deferred.event_id.clone();
             node.ingest_agent_event(deferred).await?;
             let held = node.ingest_agent_event(asks_permission("s2")).await?;
