@@ -6,7 +6,7 @@ test('portal serves docs and searches Chinese content', async ({ app, screen, br
   await app.open('/')
   await expect(screen.getByRole('heading', '把 Agent 带回你自己的设备。')).toBeVisible()
 
-  await app.open('/docs/install/')
+  await screen.getByRole('link', { name: '开始安装' }).click()
   await expect(screen.getByRole('heading', '安装与管理节点')).toBeVisible()
   await screen.getByRole('button', { name: '打开文档搜索' }).first().click()
   await screen.getByRole('combobox').fill('恢复包')

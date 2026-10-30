@@ -4,7 +4,7 @@ export function PortalHeader({ label }: { label?: string }) {
   return (
     <header className="site-header">
       <a className="brand" href="/" aria-label="Vibeface 首页">
-        <img className="brand-mark" src="/logo.svg" alt="" />
+        <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
         <span>Vibeface</span>
       </a>
       <nav aria-label="主导航">
