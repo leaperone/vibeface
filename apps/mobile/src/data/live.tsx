@@ -162,7 +162,7 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread = unreadCounts(notifications, questions.filter((question) => awaitsAnswer(question, answered)))
+  const unread = unreadCounts(notifications.filter((item) => !shared.ignoredNotifications.has(item.notification_id)), questions.filter((question) => awaitsAnswer(question, answered)))
 
   const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id

@@ -70,6 +70,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [conversationId, setConversationId] = useState("")
   const [data, setData] = useState<ConversationPayload | null>(null)
   const [notifications, setNotifications] = useState<NotificationRecord[]>([])
+  const [ignoredNotifications, setIgnoredNotifications] = useState<ReadonlySet<string>>(new Set())
   const [questions, setQuestions] = useState<Question[]>([])
   const [openWorks, setOpenWorks] = useState<OpenWork[]>([])
   const openWorksRef = useRef<OpenWork[]>([])
@@ -101,6 +102,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const messagesRef = useRef<PendingMessage[]>([])
   const botCreationRef = useRef<PendingBot | null>(null)
   const notificationsRef = useRef<NotificationRecord[]>([])
+  const ignoredNotificationsRef = useRef<ReadonlySet<string>>(new Set())
   const inFlight = useRef(new Set<string>())
   const refreshingRef = useRef(false)
   const refreshingConnection = useRef<ReadyConnection | null>(null)
@@ -177,6 +179,12 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (sequence !== readSequence.current) return next
     return showConversation(id, next)
   }
+  const acknowledgeNotification = async (notification: NotificationRecord) => {
+    await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
+    requireCurrent()
+    notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
+    setNotifications(notificationsRef.current)
+  }
   const showConversation = async (id: string, next: ConversationPayload) => {
     // While the entry catches up, what the page already showed stays on screen.
     const shown = dataRef.current
@@ -217,12 +225,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     if (joined && current() && readConnection.current === connection && viewRef.current === "chat" && platform.foreground()) {
       const seen = notificationsRef.current.filter((item) => item.conversation_id === id)
       for (const notification of seen) {
-        try {
-          await signedWrite("ack", notification.notification_id, "ack", { notification_id: notification.notification_id, attestation: await attest(notification.conversation_id, { type: "notification_acked", notification_id: notification.notification_id, client_id: clientId }) })
-          requireCurrent()
-          notificationsRef.current = notificationsRef.current.filter((item) => item.notification_id !== notification.notification_id)
-          setNotifications(notificationsRef.current)
-        } catch (caught) { showError(caught, "标记已读"); break }
+        try { await acknowledgeNotification(notification) } catch (caught) { showError(caught, "标记已读"); break }
       }
     }
     return next
@@ -290,7 +293,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       if (activeId.current) await readConversation(activeId.current)
       requireCurrent()
       readConnection.current = connection
-      void notify(nextNotifications)
+      void notify(nextNotifications.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
       void refreshNotificationButton()
     } catch (caught) {
       // What the page shows stays; writes wait for the next full read.
@@ -316,7 +319,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const fresh = records.notifications.filter((item) => !notificationsRef.current.some((known) => known.notification_id === item.notification_id))
     notificationsRef.current = mergeNotifications(notificationsRef.current, records)
     setNotifications(notificationsRef.current)
-    void notify(fresh)
+    void notify(fresh.filter((item) => !ignoredNotificationsRef.current.has(item.notification_id)))
     const shown = dataRef.current
     if (id === activeId.current && readConnection.current === connection && shown?.conversation?.conversation_id === id) await showConversation(id, mergeConversation(shown, records))
   }
@@ -393,6 +396,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     inFlight.current = new Set()
     setMessageBusy(false); setLiveProgress([]); setError(null); setNoticeText("")
     try {
+      const rawIgnored = readStorage<unknown>(scoped("ignored-inbox"), [])
+      const nextIgnored = new Set(Array.isArray(rawIgnored) ? rawIgnored.filter((item): item is string => typeof item === "string") : [])
+      ignoredNotificationsRef.current = nextIgnored
+      setIgnoredNotifications(nextIgnored)
       if (initialBot) writeStorage(scoped("selected-bot"), initialBot)
       activeId.current = ""
       setConversationId(activeId.current)
@@ -451,6 +458,23 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       reportLog({ level: "warn", event: "web.action_failed", message: messageOf(caught), fields: { action: label } })
       showError(caught, label)
     }
+  }
+  const ignoreNotifications = (ids: readonly string[]) => {
+    const allowed = new Set(notificationsRef.current.filter((item) => item.kind === "manager_attention" && ids.includes(item.notification_id)).map((item) => item.notification_id))
+    if (!allowed.size) return
+    const next = new Set(ignoredNotificationsRef.current)
+    for (const id of allowed) next.add(id)
+    // shortcut: keep the latest 200 local reminder IDs, revisit when ignored history needs to be unbounded.
+    const saved = [...next].slice(-200)
+    writeStorage(scoped("ignored-inbox"), saved, true)
+    ignoredNotificationsRef.current = new Set(saved)
+    setIgnoredNotifications(ignoredNotificationsRef.current)
+  }
+  const markNotificationsRead = async (ids: readonly string[]) => {
+    requireCurrent()
+    if (!joined) throw new Error("本机管理不能标记网络提醒。用加入链接加入后再操作。")
+    const selected = notificationsRef.current.filter((item) => ids.includes(item.notification_id))
+    for (const notification of selected) await acknowledgeNotification(notification)
   }
   /** After a failed write: a refusal only rereads; an unknown outcome also pauses writes until the reread. */
   const requireControlRefresh = (caught: unknown) => {
@@ -562,7 +586,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
       viewRef.current = next; setView(next); clearMessages()
       if (next === "chat" || next === "tasks") scheduleRefresh()
       else { onScreen.current = null; setFresh(new Set<string>()) }
-    }, nodes, conversationId, data, fresh, notifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    }, nodes, conversationId, data, fresh, notifications, ignoredNotifications, questions, openWorks, overview, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
@@ -572,7 +596,7 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     logs: async (filter: LogFilter) => { requireCurrent(); return parseLogs(await connection.request("logs", filter)) },
     confirmWritable: async () => { requireCurrent(); setWriteState(parseWriteStatus(await connection.request("confirm_writable"))); scheduleRefresh() },
     syncText: !data ? "发一条消息开始对话。" : "已加载这台电脑上的记录。",
-    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton,
+    refresh, run, announce: (notice: string) => { if (current()) setNoticeText(notice) }, notificationButton, ignoreNotifications, markNotificationsRead,
     selectBot,
     createBot: (input: { name: string; instructions: string; project?: BotProject }) => withMutation("create-bot", async () => {
       const name = inputText(input.name, "Bot 名称", 512), instructions = input.instructions.trim()

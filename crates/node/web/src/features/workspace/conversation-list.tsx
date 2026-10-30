@@ -21,12 +21,13 @@ export function ConversationList() {
   const workspace = useWorkspace()
   const create = useCreateBot()
   const open = waitingItems(useInbox())
-  const unread = unreadCounts(workspace.notifications, workspace.questions.filter((item) => awaitsAnswer(item, workspace.answered)))
+  const notifications = workspace.notifications.filter((item) => !workspace.ignoredNotifications.has(item.notification_id))
+  const unread = unreadCounts(notifications, workspace.questions.filter((item) => awaitsAnswer(item, workspace.answered)))
   const now = Date.now()
   const bots = byRecent(workspace.bots)
   let list: ReactNode
   if (bots.length) list = <ul className="grid gap-0.5">{bots.map((bot) => {
-    const notes = workspace.notifications.filter((item) => item.conversation_id === bot.conversation_id)
+    const notes = notifications.filter((item) => item.conversation_id === bot.conversation_id)
     const last = bot.last_message, mood = botMood(bot, workspace)
     const preview = notes.at(-1)?.text.trim() || (last ? `${last.role === "user" ? "你：" : ""}${last.text}` : "还没有消息")
     return <li key={bot.bot_id}>
