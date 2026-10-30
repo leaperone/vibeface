@@ -560,6 +560,7 @@ async fn run_id_callback_precedes_progress_and_known_run_probe_reads_terminal_st
                 "FAKE_BRIDGE_GET_RUN_STATUS".into(),
                 "RUN_LIFECYCLE_STATUS_FINISHED".into(),
             ),
+            ("FAKE_BRIDGE_REJECT_RESUME".into(), "1".into()),
             ("FAKE_BRIDGE_LOG".into(), starts_log.display().to_string()),
         ]),
         model: "fixture-model".into(),

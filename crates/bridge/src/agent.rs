@@ -774,26 +774,9 @@ impl SdkBridge {
             .await
             .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &base_secrets)))?;
         let live = &admission.0;
-        let options = sdk_options(turn)?;
         let rpc = &live.rpc;
         let mut secrets = self.secrets(&turn.api_key, &turn.env, &rpc.bearer);
         secrets.extend(turn.callback_token.as_deref());
-        let resumed = rpc
-            .unary(
-                AGENT_SERVICE,
-                "ResumeAgent",
-                json!({"agentId":agent_id,"options":options}),
-            )
-            .await
-            .map_err(|error| anyhow!(redact_text(format!("{error:#}"), &secrets)))?;
-        let resumed_id = resumed
-            .get("agentId")
-            .and_then(Value::as_str)
-            .context("Cursor SDK resume returned no agent id")?;
-        ensure!(
-            resumed_id == agent_id,
-            "Cursor SDK resumed a different agent"
-        );
         let reply = rpc
             .unary(
                 AGENT_SERVICE,

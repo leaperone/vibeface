@@ -150,6 +150,8 @@ class Bridge(BaseHTTPRequestHandler):
         body = json.loads(request or b"{}")
         if method == "SetToolCallback":
             callback_token = body.get("authToken")
+        if method == "ResumeAgent" and os.environ.get("FAKE_BRIDGE_REJECT_RESUME"):
+            return self.answer(409, b'{"message":"readback must not replace the active agent"}')
         if method in ("CreateAgent", "ResumeAgent"):
             record_store(body)
             if body.get("options", {}).get("local", {}).get("store") != local_store:
