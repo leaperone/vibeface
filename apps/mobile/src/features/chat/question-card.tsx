@@ -85,7 +85,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
           <Text className="min-w-0 flex-1 font-medium">{choice.label}</Text>
         </Pressable>
       })}
-      {approval && question.choices.length ? null : <View className={cn(row, 'pe-1', busy !== null && 'opacity-50')}>
+      <View className={cn(row, 'pe-1', busy !== null && 'opacity-50')}>
         <View className={cn(badge, 'bg-muted')}><Icon as={PencilLine} className="size-4 text-muted-foreground" /></View>
         <TextInput {...caret} maxFontSizeMultiplier={2} accessibilityLabel="其他回答" placeholder={question.choices.length ? '其他回答' : '输入回答'} placeholderTextColorClassName="accent-muted-foreground"
           className="min-h-11 min-w-0 flex-1 font-sans text-body text-foreground" value={text} maxLength={4000} editable={busy === null}
@@ -93,7 +93,7 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
         <Button variant="ghost" size="icon" accessibilityLabel="发送回答" disabled={busy !== null || !text.trim()} onPress={typed}>
           <Icon as={busy === 'text' ? LoaderCircle : ArrowUp} />
         </Button>
-      </View>}
+      </View>
     </View>
     <ErrorText error={error} />
   </ActionCard>
