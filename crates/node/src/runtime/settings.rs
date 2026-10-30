@@ -533,8 +533,9 @@ impl Runtime {
                 "invalid manager model"
             );
             ensure!(
-                manager.provider != Provider::Cursor || !manager.model.trim().is_empty(),
-                "Cursor SDK requires a model"
+                !manager.provider.needs_model() || !manager.model.trim().is_empty(),
+                "{} requires a model",
+                manager.provider.label()
             );
             self.ensure_default_workspace(&manager.workspace)?;
             manager.workspace = manager

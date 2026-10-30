@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { botOnChange, folderSuggestions, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { botOnChange, folderSuggestions, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, type ModelChoice, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -481,9 +481,10 @@ const other = "\u0000other"
 /** The bot's model and folder, inside the settings of the provider it runs on. */
 function BotDetails({ fields, manager, models = null, display, working, busy, save }: { fields: (typeof botFields)[number][]; manager: ManagerSettings; models?: ModelChoice[] | null; display: Display; working: boolean; busy: boolean; save(manager: ManagerSettings): Promise<boolean> }) {
   const [draft, setDraft] = useState(manager)
+  const copy = deviceCopy.botModel
   // A model the list does not have stays typed in; 其他 opens the same field.
   const [chosen, setTyping] = useState<boolean | null>(null)
-  const typing = chosen ?? (Boolean(manager.model) && !models?.some((model) => model.id === manager.model))
+  const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
   const dirty = fields.some((key) => draft[key] !== manager[key])
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
@@ -495,16 +496,16 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
     event.preventDefault()
     void save({ ...draft, model: draft.model.trim(), workspace: draft.workspace.trim() })
   }}>
-    {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">Bot 模型
+    {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
       <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
         onChange={(event) => { const model = event.target.value; if (model === other) { setTyping(true); setDraft({ ...draft, model: "" }) } else setDraft({ ...draft, model }) }}>
-        <NativeSelectOption value="">默认</NativeSelectOption>
+        <NativeSelectOption value="">{copy.default}</NativeSelectOption>
         {models.map((model) => <NativeSelectOption key={model.id} value={model.id}>{model.name}</NativeSelectOption>)}
-        <NativeSelectOption value={other}>其他…</NativeSelectOption>
+        <NativeSelectOption value={other}>{copy.other}</NativeSelectOption>
       </NativeSelect>
     </label> : <div className="flex min-w-0 items-end gap-2">
-      <div className="min-w-0 flex-1">{field("model", "Bot 模型", { placeholder: cursor ? "auto" : "默认", required: cursor, plain: true })}</div>
-      {models ? <Button type="button" variant="ghost" size="icon" aria-label="从列表选" title="从列表选" disabled={working}
+      <div className="min-w-0 flex-1">{field("model", copy.label, { placeholder: cursor ? "auto" : copy.default, required: cursor, plain: true })}</div>
+      {models ? <Button type="button" variant="ghost" size="icon" aria-label={copy.pick} title={copy.pick} disabled={working}
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
     {fields.includes("workspace") ? field("workspace", folderLabels.botRun) : null}
