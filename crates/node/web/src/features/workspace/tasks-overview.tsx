@@ -19,7 +19,7 @@ import { QuestionCard } from "./question-card"
 type TaskGroup = "working" | "waiting"
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
 
-const stateTone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const stateTone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified", "unknown", "dispatch_unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 /** The personal task surface. It only derives display rows from the already parsed workspace context. */
 export function TasksOverview() {
