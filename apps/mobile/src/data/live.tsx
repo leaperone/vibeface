@@ -8,7 +8,9 @@ import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from 
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
-import { botReadiness } from '@vibeface/client/workspace/model.ts'
+import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
+import { storageOf } from '@vibeface/client/workspace/storage.ts'
+import type { BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
@@ -17,6 +19,24 @@ import type { ChatMessage, Connection, Conversation, Member, Session, Workspace,
 const busyStates = ['pending_delivery', 'queued', 'claimed', 'running', 'cancelling']
 const empty = { bots: [], primary: null, unread: {}, questions: [], members: [], conversations: {} }
 const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
+
+/**
+ * What this phone last saw of its network, so a cold start that cannot reach it still lists its bots and devices.
+ * `me`: this phone's device ID then; leaving or a reset gives the phone a new one, which retires the record.
+ */
+type LastSeen = { me: string; entry: string; bots: BotRecord[]; primary: string | null; members: Member[] }
+
+const { readStorage } = storageOf(mobilePlatform.storage)
+
+function lastSeen(me: string | undefined): LastSeen | null {
+  const value = readStorage<Record<string, unknown> | null>('last-seen', null)
+  if (!me || !value || value.me !== me || !Array.isArray(value.members)) return null
+  try {
+    const members = value.members.filter((member): member is Member => typeof member?.device_id === 'string' && typeof member.name === 'string' && (member.kind === 'node' || member.kind === 'client'))
+      .map((member) => ({ ...member, current: member.device_id === me, online: undefined }))
+    return { me, entry: typeof value.entry === 'string' ? value.entry : '', bots: parseBots(value), primary: parsePrimary(value), members }
+  } catch { return null }
+}
 
 type Shared = ReturnType<typeof useShared>
 const SharedContext = createContext<Shared | null>(null)
@@ -65,6 +85,8 @@ function Device({ children }: { children: ReactNode }) {
 function Offline({ children }: { children: ReactNode }) {
   const device = useDevice()
   const { session, connection } = useConnection()
+  const me = device.identity?.deviceId
+  const seen = useMemo(() => session.phase === 'ready' ? lastSeen(me) : null, [session.phase, me])
   const actions = useMemo<WorkspaceActions>(() => ({
     join: (invitation, name) => device.join(invitation, name),
     cancelJoin: device.cancelJoin,
@@ -74,7 +96,9 @@ function Offline({ children }: { children: ReactNode }) {
     answer: async () => { throw new Error('还没连上') },
     leave: device.leave,
   }), [device])
-  return <WorkspaceProvider value={{ ...empty, session, connection, actions }}>{children}</WorkspaceProvider>
+  // The entry it last reached is the one that does not answer now, so it alone shows as offline.
+  const kept = seen ? { bots: seen.bots, primary: seen.primary, members: seen.members.map((member) => member.entry ? { ...member, online: false } : member) } : {}
+  return <WorkspaceProvider value={{ ...empty, ...kept, session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, actions }}>{children}</WorkspaceProvider>
 }
 
 function Live({ children }: { children: ReactNode }) {
@@ -85,6 +109,8 @@ function Live({ children }: { children: ReactNode }) {
   latest.current = shared
   const me = device.identity?.deviceId
   const { data, conversationId, nodes, questions, notifications, answered } = shared
+  // Until the first read lands the list keeps what the phone last saw instead of going blank.
+  const seen = useMemo(() => lastSeen(me), [me])
 
   const conversations: Record<string, Conversation> = {}
   if (data && conversationId) {
@@ -131,7 +157,7 @@ function Live({ children }: { children: ReactNode }) {
   for (const item of notifications) unread[item.conversation_id] = (unread[item.conversation_id] ?? 0) + 1
   for (const question of questions) if (question.conversation_id && awaitsAnswer(question, answered)) unread[question.conversation_id] = (unread[question.conversation_id] ?? 0) + 1
 
-  const members: Member[] = (device.directory?.members ?? []).map((member) => {
+  const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
@@ -171,8 +197,14 @@ function Live({ children }: { children: ReactNode }) {
 
   useEffect(() => { if (shared.error) console.warn(shared.error) }, [shared.error])
 
+  const fresh = shared.synced || shared.bots.length > 0
+  const bots = fresh || !seen ? shared.bots : seen.bots, primary = fresh || !seen ? shared.primary : seen.primary
+  const members = device.directory || !seen ? directory : seen.members
+  const record = me && shared.synced && device.directory ? JSON.stringify({ me, entry: connection.entry, bots: shared.bots.map((bot) => ({ ...bot, busy: null })), primary: shared.primary, members: directory }) : null
+  useEffect(() => { if (record) mobilePlatform.storage.setItem('vibeface.last-seen', record) }, [record])
+
   const value: Workspace = {
-    session, connection, bots: shared.bots, primary: shared.primary, unread, questions, members, conversations, actions,
+    session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
   }
   return <SharedContext.Provider value={shared}><WorkspaceProvider value={value}>{children}</WorkspaceProvider></SharedContext.Provider>
 }

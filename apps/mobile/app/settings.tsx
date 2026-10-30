@@ -9,6 +9,7 @@ import { addOnManager, eraseSoleManagerText, onlyManagerText, recoveryCopy, sole
 import { experimentsCopy, useExperiments } from '@vibeface/client/lib/experiments.ts'
 import { useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { ErrorText } from '@/components/action'
+import { OfflineBar } from '@/components/connection-pill'
 import { Online, SettingsGroup, SettingsRow } from '@/components/kit'
 import { Button } from '@/components/ui/button'
 import { Icon } from '@/components/ui/icon'
@@ -43,7 +44,8 @@ export default function Settings() {
   const reset = () => factoryReset(device)
   // The confirmation opens at the foot of the page, below the fold on a phone.
   return <ScrollView ref={scroll} onContentSizeChange={() => { if (reveal.current) { reveal.current = false; scroll.current?.scrollToEnd() } }} contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-6 p-4 pb-10">
-    {/* The home header already shows the connection, so settings starts with the devices. */}
+    {/* The home header already shows the connection; only a computer that does not answer is called out here, above the devices. */}
+    <OfflineBar />
     <JoinRequests />
     {workspace.members.length || manager ? <SettingsGroup title="我的设备">
       {workspace.members.map((member) => <MemberRow key={member.device_id} member={member} />)}

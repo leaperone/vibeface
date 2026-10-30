@@ -1,11 +1,11 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { Bot, ChevronRight, Inbox, Plus, RefreshCw, Settings, ShieldAlert, Star, WifiOff } from 'lucide-react-native'
+import { Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 import { useUniwind, withUniwind } from 'uniwind'
-import { ConnectionMenu } from '@/components/connection-pill'
+import { ConnectionMenu, OfflineBar } from '@/components/connection-pill'
 import { botMood, BotFace } from '@/components/bot-face'
 import { faceOf } from '@vibeface/client/avatar/face.ts'
 import { Badge, botTint, EmptyState, Skeleton } from '@/components/kit'
@@ -57,6 +57,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
       <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
+    <OfflineBar className="mx-1 mb-2 mt-1" />
     {waiting ? <Item key="inbox" layout={move} entering={fadeIn} exiting={fadeOut} className="mb-2 mt-1">
       <Link href="/inbox" replace={replace} asChild>
         <Pressable accessibilityState={{ selected: active('/inbox') }} className={cn('min-h-16 flex-row items-center gap-3 rounded-2xl border px-3 py-2.5 active:opacity-70', device.pendingRecovery ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft', active('/inbox') && (device.pendingRecovery ? 'border-danger' : 'border-warning'))}>
@@ -76,8 +77,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
           preview={last ? `${last.role === 'user' ? '你：' : ''}${last.text}` : '还没有消息'} />
         {index < bots.length - 1 ? <View className="ms-[68px] h-px bg-border" /> : null}
       </Item>
-    }) : empty === 'unreachable' ? <View className="flex-1 justify-center"><EmptyState icon={WifiOff} title="连不上你的网络，正在重试"
-      action={<Button variant="outline" className="min-h-11" onPress={device.retryNow}><Icon as={RefreshCw} /><Text>重试</Text></Button>} /></View>
+    }) : empty === 'unreachable' ? null
     : empty === 'loading' ? <View accessibilityLabel="正在读取 Bot">{[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 px-3 py-2.5">
       <Skeleton className="size-11 rounded-full" />
       <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-1/3 rounded-full" /><Skeleton className="h-3 w-2/3 rounded-full" /></View>
