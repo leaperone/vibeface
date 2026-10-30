@@ -156,11 +156,13 @@ fn workspace_work_summary(work: &WorkProjection, source: &str) -> Value {
         "kind": work.kind,
         "target_node": work.target_node,
         "dispatcher": work.dispatcher,
+        "call_ref": work.call_ref,
         "parent": work.parent,
         "continues": work.continues,
         "thread": work.thread,
         "thread_id": work.thread_id,
         "turn_id": work.turn_id,
+        "phase": work.phase,
         "source": source,
     });
     if let Some(reason) = workspace_bounded_opt(work.failure_reason.as_deref(), 512) {
@@ -770,7 +772,13 @@ impl Runtime {
         let include_finished = workspace_bool(input, "include_finished", false)?;
         let include_sessions = workspace_bool(input, "include_sessions", true)?;
         let requested_scope = input.get("conversation_id").and_then(Value::as_str);
-        let scope_filter = requested_scope.or(access.conversation_id.as_deref());
+        if let Some(allowed_scope) = access.conversation_id.as_deref() {
+            ensure!(
+                requested_scope.is_none_or(|scope| scope == allowed_scope),
+                "outside this tool's conversation"
+            );
+        }
+        let scope_filter = access.conversation_id.as_deref().or(requested_scope);
         let current = self.membership_state().await?;
         let network = &access.network_id;
         let local = self.identity.device_id()?;
