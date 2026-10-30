@@ -7,6 +7,7 @@ import type { Platform } from "../lib/platform.ts"
 import type { Tabs } from "../identity/context.tsx"
 import { mergeProgress, type LiveProgress } from "../lib/progress.ts"
 import { isQueuedReceipt, prepareSend } from "../chat/protocol.ts"
+import { byRank, unreadReply } from "../chat/timeline.ts"
 import {
   inputText, parseConversation, parseNodes, parseNotifications,
   parseBot, parseBots, parseCreateBot, parsePrimary, parsePendingBot, record,
@@ -84,6 +85,10 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
   const [messageBusy, setMessageBusy] = useState(false)
   const [liveProgress, setLiveProgress] = useState<LiveProgress[]>([])
   const [interrupted, setInterrupted] = useState<InterruptedReply[]>([])
+  /** Replies of the open chat that were unread when it came on screen, by event hash; the chat marks where they start. */
+  const [fresh, setFresh] = useState<ReadonlySet<string>>(new Set<string>())
+  /** The chat on screen and the connection it was read over; another connection is another visit. */
+  const onScreen = useRef<{ id: string; connection: ReadyConnection } | null>(null)
   const liveRef = useRef<LiveProgress[]>([])
   liveRef.current = liveProgress
   const [notificationButton, setNotificationButton] = useState<NotificationButton>({ label: `开启${notifier.name}`, disabled: false, state: "off" })
@@ -155,6 +160,8 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     activeId.current = id
     readSequence.current += 1
     dataRef.current = null
+    onScreen.current = null
+    setFresh(new Set<string>())
     setConversationId(id)
     setData(null)
     setLiveProgress([])
@@ -174,10 +181,15 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
     const shown = dataRef.current
     if (connection.catchingUp?.() && shown?.conversation?.conversation_id === id) {
       const missing = shown.messages.filter((message) => !next.messages.some((item) => item.message_id === message.message_id))
-      if (missing.length) next.messages = [...next.messages, ...missing].sort((a, b) => a.created_at_ms - b.created_at_ms)
+      if (missing.length) next.messages = byRank([...next.messages, ...missing])
     }
     dataRef.current = next
     setData(next)
+    if (viewRef.current !== "chat" || !platform.foreground()) onScreen.current = null
+    else if (onScreen.current?.id !== id || onScreen.current.connection !== connection) {
+      onScreen.current = { id, connection }
+      setFresh(new Set(notificationsRef.current.filter((item) => item.conversation_id === id && unreadReply(item)).map((item) => item.notification_id)))
+    }
     // A message or an answer settles once the Node's own history holds it.
     const admitted = (item: PendingMessage) => item.conversation_id === id && next.messages.some((message) => message.message_id === item.message_id)
     const landed = answersRef.current.filter((item) => next.messages.some((message) => message.message_id === answerId(item.question_id)))
@@ -542,7 +554,11 @@ function useWorkspaceState(platform: Platform, connection: ReadyConnection, open
 
   return {
     info: connection.info, generation: connection.generation, isCurrent: current, connectionOnline: current(), connectionText: current() ? "已建立端到端加密连接" : "连接已断开，正在恢复只读订阅；未确认操作不会自动重发。",
-    error, noticeText, view, setView: (next: WorkspaceView) => { viewRef.current = next; setView(next); clearMessages(); if (next === "chat") scheduleRefresh() }, nodes, conversationId, data, notifications, questions, openWorks, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
+    error, noticeText, view, setView: (next: WorkspaceView) => {
+      viewRef.current = next; setView(next); clearMessages()
+      if (next === "chat") scheduleRefresh()
+      else { onScreen.current = null; setFresh(new Set<string>()) }
+    }, nodes, conversationId, data, fresh, notifications, questions, openWorks, answered, pendingAnswers, bots, primary, selectedBot, pendingBot,
     refreshing, incomplete, chatSlot, messagePending, messageBusy, liveProgress, interrupted,
     joined, synced,
     writable: joined && booted && current() && readConnection.current === connection && writeState.state === "writable",
