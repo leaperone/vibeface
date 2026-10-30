@@ -18,7 +18,7 @@ Schedule {
 ```
 
 - 每天、每周分别是 1440 和 10080 分钟。cron 表达式不做：要时区规则和解析器，代价不小，按分钟间隔已覆盖每天、每周和每 N 小时。
-- 触发器是 `schedule:<schedule_id>:<时刻>`，`TriggerKind::Schedule`。一次性的唯一时刻是 `first_run_at_ms`。调度 Node 运行或因迟到跳过一个时刻前，先写一条 `ScheduleRunClaimed { schedule_id, slot_ms, owner_epoch }`，已被任何 Node 领取的时刻不再排。并发领取时 `owner_epoch` 大者胜，再按作者排序，落败方放弃尚未开始的 job。所以一个时刻全网只运行一次，同步、恢复和换调度 Node 都不会重放。
+- 触发器是 `schedule:<schedule_id>:<时刻>`，`TriggerKind::Schedule`。一次性的唯一时刻是 `first_run_at_ms`。调度 Node 运行或因迟到跳过一个时刻前，先写一条 `ScheduleRunClaimed { schedule_id, slot_ms, owner_epoch }`，已被任何 Node 领取的时刻不再排。并发领取时 `owner_epoch` 大者胜，再按作者排序，落败方放弃尚未开始的 job。换到新调度 Node 后 5 分钟内（`TAKEOVER_GRACE_MS`）它不领取任何时刻，留给旧调度 Node 把领取传过来。判定用的是写入方设备的时钟。各设备时钟准确时，同一时刻全网只运行一次。写入方时钟明显偏快，可能漏掉首次运行，换调度 Node 前后也可能漏跑；明显偏慢，换调度 Node 前后可能重复一次。这是已知问题 A33，修复要等下次升 `DATA_EPOCH`。
 - 一次只排最近一个到期时刻，错过的不补跑；早于最近一次修改（定义或启停，取两者较晚者）5 分钟以上的时刻不运行，所以恢复后不补跑。一次性提醒的时刻过了以后不再列出，也不占活动名额。
 - 每个 bot 最多 20 个活动的 schedule（重复的，或时刻未到的一次性）。一次性时刻须在 1 分钟以后、366 天以内。
 
