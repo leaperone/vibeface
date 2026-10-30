@@ -77,8 +77,7 @@ function TaskOverviewCard({ work, bot, lookup, readyDevice, connected }: { work:
   const DeviceIcon = work.target_node === readyDevice ? Laptop : Server
   const device = nodeName(work.target_node, lookup, "未知设备")
   const project = work.cwd ? projectName(work.cwd) : "未指定项目"
-  return <Link to="/b/$botId/work/$workId" params={{ botId: bot?.bot_id ?? "", workId: work.work_id }} search={{ from: "tasks" }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">
-    <Card className="min-w-0 transition-colors group-hover:bg-muted/70 group-active:bg-muted max-md:min-h-11">
+  const card = <Card className="min-w-0 transition-colors max-md:min-h-11" data-navigable={bot ? true : undefined}>
       <CardContent className="grid min-w-0 gap-3">
         <div className="flex min-w-0 items-start gap-3">
           <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className={taskActive(state) && !stale ? "size-5 animate-spin motion-reduce:animate-none text-info" : "size-5"} /></span>
@@ -97,5 +96,5 @@ function TaskOverviewCard({ work, bot, lookup, readyDevice, connected }: { work:
         <p className="whitespace-pre-wrap break-words text-meta text-muted-foreground">{work.summary || work.prompt || "暂无进展"}</p>
       </CardContent>
     </Card>
-  </Link>
+  return bot ? <Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: "tasks" }} className="group block min-w-0 rounded-xl outline-none focus-visible:ring-3 focus-visible:ring-ring/50">{card}</Link> : card
 }
