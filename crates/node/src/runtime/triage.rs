@@ -4346,7 +4346,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn coordination_turns_have_their_own_daily_budget() -> Result<()> {
+    async fn coordination_budget_keeps_unoffered_events_and_request_deadlines() -> Result<()> {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
@@ -4368,6 +4368,9 @@ pub(super) mod tests {
                 "the last turn of the day runs"
             );
 
+            let deferred = turn("s-deferred", "t-deferred", "/tmp");
+            let deferred_id = deferred.event_id.clone();
+            node.ingest_agent_event(deferred).await?;
             let held = node.ingest_agent_event(asks_permission("s2")).await?;
             let request_id = held["request_id"]
                 .as_str()
@@ -4380,23 +4383,22 @@ pub(super) mod tests {
                 "no turn past the budget"
             );
             assert!(
-                !node
+                node
                     .triage
                     .requests
                     .lock()
                     .unwrap()
                     .contains_key(&request_id),
-                "a held request gets the fallback answer at once"
+                "a budget refusal must not shorten the request deadline"
             );
             node.store
                 .lock()
                 .await
                 .reserve_budget(&network, limit, limit)
                 .context("the bots' own turns keep their whole budget")?;
-            assert!(
-                node.pending_events().await?.is_empty(),
-                "its events are dropped"
-            );
+            let pending = node.pending_events().await?;
+            assert_eq!(pending.len(), 2, "events were not offered to the model");
+            assert!(pending.iter().any(|event| event.event_id == deferred_id));
             Ok::<_, anyhow::Error>(())
         }
         .await;
