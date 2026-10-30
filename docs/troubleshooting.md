@@ -39,7 +39,7 @@ Node 没在运行时只输出前四行并以非零码退出，`Detail` 给出原
 | `conversation_id`、`work_id`、`thread_id` | 知道时才有 |
 | `fields` | 其余字段 |
 
-默认级别是 Vibeface 的 info 和依赖库的 warn；`join` 等一次性命令把依赖库压到 error。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
+默认级别是 Vibeface 的 info 和依赖库的 warn；`join` 等一次性命令不显示依赖库日志。可用 `RUST_LOG` 环境变量调整，例如 `RUST_LOG=warn,vibeface=debug`。前台在终端运行时日志同时以文本打印到终端。`node.log` 写到 8 MiB 时改名为 `node.log.1`，旧文件依次后移，共保留 5 个。
 
 同一个日志还收这些来源的记录：
 

@@ -338,8 +338,8 @@ pub fn write(record: &Record) {
 }
 
 /// Info for vibeface unless `RUST_LOG` says otherwise. Libraries log at warn for a serving Node
-/// and at error for one-shot commands such as `join`, whose transient iroh warnings read as
-/// failures to the person at the terminal. A serving Node writes structured records to `node.log`
+/// and not at all for one-shot commands such as `join`: transient iroh warnings and errors read
+/// as failures to the person at the terminal, while the command reports its own outcome. A serving Node writes structured records to `node.log`
 /// and copies text to stderr only on a terminal, so a service's own stderr file keeps just crashes.
 pub fn init(data_dir: Option<&Path>) {
     use std::io::IsTerminal as _;
@@ -349,7 +349,7 @@ pub fn init(data_dir: Option<&Path>) {
         SINK.set(sink.clone()).ok()?;
         Some(sink)
     });
-    let libraries = if data_dir.is_some() { "warn" } else { "error" };
+    let libraries = if data_dir.is_some() { "warn" } else { "off" };
     let terminal = sink.is_none() || std::io::stderr().is_terminal();
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
