@@ -1,5 +1,5 @@
 import { Link, usePathname, type Href } from 'expo-router'
-import { BellRing, Bot, ChevronRight, Inbox, Plus, Settings, ShieldAlert, Star, X } from 'lucide-react-native'
+import { BellRing, Bot, ChevronRight, Inbox, ListChecks, Plus, Settings, ShieldAlert, Star, X } from 'lucide-react-native'
 import { useState, type ReactNode } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import Animated, { FadeIn, FadeOut, LayoutAnimationConfig, LinearTransition, ReduceMotion } from 'react-native-reanimated'
@@ -58,6 +58,7 @@ export function HomeList({ sidebar, minHeight }: { sidebar?: boolean; minHeight?
     {sidebar ? <View className="mb-2 flex-row items-center ps-3 pt-2">
       <Text role="heading" className="flex-1 text-title font-semibold">消息</Text>
       <ConnectionMenu connection={workspace.connection} />
+      <Link href="/tasks" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('size-11 rounded-full', active('/tasks') && 'bg-muted')} accessibilityLabel="任务" accessibilityState={{ selected: active('/tasks') }}><Icon as={ListChecks} /></Button></Link>
       <Link href="/new-bot" asChild><Button variant="ghost" size="icon" className="size-11 rounded-full" accessibilityLabel="新 Bot" disabled={!canCreate}><Icon as={Plus} /></Button></Link>
       <Link href="/settings" replace={replace} asChild><Button variant="ghost" size="icon" className={cn('-me-1 size-11 rounded-full', active('/settings') && 'bg-muted')} accessibilityLabel="设置" accessibilityState={{ selected: active('/settings') }}><Icon as={Settings} className="size-5" /></Button></Link>
     </View> : null}
