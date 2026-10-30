@@ -243,6 +243,7 @@ export type OverviewQuestion = {
   choices: { label: string }[]
   request_id: string | null
   work_id: string | null
+  about: QuestionSubject | null
   created_at_ms: number
   state: "unanswered"
   navigation: { bot_id: string; conversation_id: string } | null
@@ -259,6 +260,9 @@ export type OverviewJob = {
   pending_check: boolean
   outcome: SteerOutcome | null
   unknown_reason: string | null
+  kind: string | null
+  sequence: number | null
+  owner_epoch: number | null
 }
 
 export type OverviewRemoteOwner = { owner: string | null; reachable: boolean | null; reason: string | null; status?: string }
@@ -286,6 +290,8 @@ export type OverviewCoverage = {
 }
 
 export type OverviewRelation = { from_work: string; to_work: string; kind: "parent" | "continues" | "dispatches" }
+export type OverviewConversation = { conversation_id: string; title: string; owner: string | null; owner_epoch: number }
+export type OverviewSession = { conversation_id: string; node: string; session_id: string; agent: ProviderId; muted: boolean; created_at_ms: number; version: number; cwd: string; summary: string }
 
 /** A finite read-only projection. It never implies a complete global queue. */
 export type WorkspaceOverview = {
@@ -295,9 +301,11 @@ export type WorkspaceOverview = {
   heads: Record<string, number>
   consistency: OverviewConsistency
   bots: OverviewBot[]
+  conversations: OverviewConversation[]
   tasks: OverviewTask[]
   questions: OverviewQuestion[]
   jobs: OverviewJob[]
+  sessions: OverviewSession[]
   relations: OverviewRelation[]
   coverage: OverviewCoverage
   truncated: boolean

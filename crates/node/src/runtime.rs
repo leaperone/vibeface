@@ -192,6 +192,20 @@ fn workspace_question_summary(question: &Value) -> Value {
     if let Some(text) = question.get("text").and_then(Value::as_str) {
         row["text"] = json!(workspace_bounded(text, 1024));
     }
+    if let Some(about) = question.get("about").and_then(Value::as_object) {
+        let mut safe = json!({});
+        for key in ["node", "agent", "session_id", "request_id"] {
+            if let Some(value) = about.get(key) {
+                safe[key] = value.clone();
+            }
+        }
+        for (key, limit) in [("cwd", 512), ("summary", 512)] {
+            if let Some(value) = about.get(key).and_then(Value::as_str) {
+                safe[key] = json!(workspace_bounded(value, limit));
+            }
+        }
+        row["about"] = safe;
+    }
     row
 }
 

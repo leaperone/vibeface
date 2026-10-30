@@ -52,7 +52,7 @@ function TaskRow({ work, projected, bot, lookup, connected }: { work: OpenWork; 
   const stale = taskStale(rawState, connected)
   const state = stale ? staleTaskLabel : taskLabel(rawState)
   const active = taskActive(rawState) && !stale
-  const unknown = stale || rawState === 'unverified' || rawState === 'awaiting_confirmation' || rawState === 'unknown' || rawState === 'dispatch_unverified' || rawState === 'accepted_waiting_sync'
+  const unknown = stale || rawState === 'unverified' || rawState === 'awaiting_confirmation' || rawState === 'unknown' || rawState === 'dispatch_rejected' || rawState === 'dispatch_unverified' || rawState === 'accepted_waiting_sync'
   const icon: LucideIcon = unknown ? CircleQuestionMark : rawState === 'failed' || rawState === 'rejected' ? CircleX : rawState === 'interrupted' ? CircleStop : active ? LoaderCircle : CircleCheck
   const agent = work.kind && work.kind !== 'task' ? work.kind : null
   const device = nodeName(work.target_node, lookup)

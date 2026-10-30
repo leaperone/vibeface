@@ -19,7 +19,7 @@ import { QuestionCard } from "./question-card"
 type TaskGroup = "working" | "waiting"
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
 
-const stateTone = (state: string): Tone => state === "failed" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified", "unknown", "accepted_waiting_sync", "dispatch_unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
+const stateTone = (state: string): Tone => state === "failed" || state === "dispatch_rejected" ? "danger" : state === "completed" ? "success" : ["waiting", "awaiting_confirmation", "unverified", "unknown", "accepted_waiting_sync", "dispatch_unverified"].includes(state) ? "warning" : taskActive(state) ? "info" : "neutral"
 
 /** The personal task surface. It only derives display rows from the already parsed workspace context. */
 export function TasksOverview() {
@@ -75,7 +75,7 @@ function OverviewSection({ title, count, children }: { title: string; count: num
 function TaskOverviewCard({ work, projected, lookup, readyDevice, connected }: { work: OpenWork; projected?: ProjectedWork; lookup: { nodes: NodeInfo[]; directory: MembershipView | null }; readyDevice?: string; connected: boolean }) {
   const state = projected?.state ?? shownState(work, lookup.nodes)
   const stale = taskStale(state, connected)
-  const unknown = state === "unknown" || state === "unverified" || state === "dispatch_unverified"
+  const unknown = state === "unknown" || state === "unverified" || state === "accepted_waiting_sync" || state === "dispatch_rejected" || state === "dispatch_unverified"
   const label = stale || state === "unknown" ? staleTaskLabel : taskLabel(state)
   const tone = stale ? "neutral" : stateTone(state)
   const Icon = stale || unknown ? CircleQuestionMark : taskActive(state) ? LoaderCircle : ListChecks

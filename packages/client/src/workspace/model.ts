@@ -4,7 +4,7 @@ import type {
   AnswerResult, BotReadiness, CloseReason, ConversationPayload, ConversationSummary, NodeInfo, NotificationRecord, Outlet, Question, QuestionSubject, SessionHandoff, Severity, TriageSettings,
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
-  WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation,
+  WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
 } from "./types.ts"
 import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
@@ -363,7 +363,7 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
     return {
       kind: "question", question_id: question.question_id, conversation_id: question.conversation_id, bot,
       text: question.text, severity: question.severity, choices: question.choices.map((choice) => ({ label: choice.label })),
-      request_id: question.about.request_id ?? null, work_id: related?.work_id ?? null, created_at_ms: question.created_at_ms,
+      request_id: question.about.request_id ?? null, work_id: related?.work_id ?? null, about: question.about, created_at_ms: question.created_at_ms,
       state: "unanswered", navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
     }
   })
@@ -378,8 +378,8 @@ export function overviewFromWorkspace({ openWorks, bots, questions, nodes }: Wor
     omitted_finished: null, omitted_sessions: null, omitted_tasks: null, omitted_questions: null, omitted_checks: null, omitted_dispatches: null, omitted_deliveries: null, omitted_relations: null, omitted_jobs: null, omitted_live_progress: true,
   }
   return {
-    schema: null, generated_at_ms: null, network_epoch: null, heads: {}, consistency, bots: botRows,
-    tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], relations: [], coverage, truncated: false, next_cursor: null,
+    schema: null, generated_at_ms: null, network_epoch: null, heads: {}, consistency, bots: botRows, conversations: [],
+    tasks: [...tasks, ...checks], questions: overviewQuestions, jobs: [], relations: [], sessions: [], coverage, truncated: false, next_cursor: null,
   }
 }
 
@@ -416,10 +416,11 @@ function parseOverviewTask(value: unknown): OverviewTask {
 }
 function parseOverviewQuestion(value: unknown): OverviewQuestion {
   const data = record(value), bot = data.bot == null ? null : parseOverviewBot(data.bot)
+  const about = data.about == null ? null : subject(data.about)
   return {
     kind: "question", question_id: text(data.question_id), conversation_id: text(data.conversation_id), bot,
     text: text(data.text), severity: severity(data.severity), choices: list(data.choices ?? []).map((choice) => ({ label: text(record(choice).label) })),
-    request_id: nullableText(data.request_id ?? record(data.about ?? {}).request_id), work_id: nullableText(data.work_id), created_at_ms: number(data.created_at_ms), state: "unanswered",
+    request_id: nullableText(data.request_id ?? about?.request_id), work_id: nullableText(data.work_id), about, created_at_ms: number(data.created_at_ms), state: "unanswered",
     navigation: bot ? { bot_id: bot.bot_id, conversation_id: bot.conversation_id } : null,
   }
 }
@@ -430,8 +431,16 @@ function parseOverviewJob(value: unknown): OverviewJob {
     job_id: nullableText(data.job_id) ?? `${conversationId ?? ""}:${trigger}:${messageId ?? ""}`, conversation_id: conversationId, trigger, state,
     message_id: messageId, reply_message_id: nullableText(data.reply_message_id), source_node: nullableText(data.source_node), pending_check: data.pending_check === true,
     outcome: state === "unknown" ? "unknown" : data.outcome === "answered" || data.outcome === "unfinished" || data.outcome === "unknown" ? data.outcome : null,
-    unknown_reason: unknownReason,
+    unknown_reason: unknownReason, kind: nullableText(data.kind), sequence: nullableNumber(data.sequence), owner_epoch: nullableNumber(data.owner_epoch),
   }
+}
+function parseOverviewConversation(value: unknown): OverviewConversation {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), title: data.title == null ? "" : text(data.title), owner: nullableText(data.owner), owner_epoch: number(data.owner_epoch) }
+}
+function parseOverviewSession(value: unknown): OverviewSession {
+  const data = record(value)
+  return { conversation_id: text(data.conversation_id), node: text(data.node), session_id: text(data.session_id), agent: provider(data.agent), muted: data.muted === true, created_at_ms: number(data.created_at_ms), version: number(data.version), cwd: data.cwd == null ? "" : text(data.cwd), summary: data.summary == null ? "" : text(data.summary) }
 }
 function parseOverviewCheck(value: unknown): OverviewTask {
   const data = record(value), checkId = text(data.check_id), conversationId = text(data.conversation_id), reason = nullableText(data.unknown_reason) ?? "process_unconfirmed"
@@ -474,11 +483,11 @@ export function parseWorkspaceOverview(value: unknown): WorkspaceOverview {
   })
   return {
     schema: nullableNumber(data.schema), generated_at_ms: generatedAt, network_epoch: networkEpoch, heads, consistency,
-    bots: list(data.bots ?? []).map(parseOverviewBot), tasks: [...tasks, ...deliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
+    bots: list(data.bots ?? []).map(parseOverviewBot), conversations: list(data.conversations ?? []).map(parseOverviewConversation), tasks: [...tasks, ...deliveries, ...list(data.checks ?? []).map(parseOverviewCheck)], questions: list(data.questions ?? []).filter((question) => {
       const raw = record(question)
       return raw.answer == null && raw.closed == null && raw.state !== "answered" && raw.state !== "closed"
     }).map(parseOverviewQuestion), jobs: list(data.jobs ?? []).map(parseOverviewJob),
-    relations: list(data.relations ?? []).map(parseOverviewRelation), coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
+    relations: list(data.relations ?? []).map(parseOverviewRelation), sessions: list(data.sessions ?? []).map(parseOverviewSession), coverage: parseOverviewCoverage(data.coverage, consistency, truncated, generatedAt, networkEpoch), truncated, next_cursor: nullableText(data.next_cursor),
   }
 }
 
