@@ -9,10 +9,11 @@ import { createHash, randomUUID } from 'node:crypto';
 const { values } = parseArgs({ options: {
   listen: { type: 'string', default: '127.0.0.1:0' },
   output: { type: 'string' },
+  'experiment-fixture': { type: 'boolean', default: false },
   help: { type: 'boolean', default: false },
 }, strict: true, allowPositionals: false });
 if (values.help) {
-  console.log('Usage: node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output /absolute/path/deployment.json');
+  console.log('Usage: node contracts/delivery/deploy-local.mjs --listen 127.0.0.1:0 --output /absolute/path/deployment.json [--experiment-fixture]');
   process.exit(0);
 }
 assert(values.output && path.isAbsolute(values.output), '--output must be an absolute path for a new public deployment file');
@@ -103,10 +104,16 @@ try {
   compile({ checkTrust: true });
   const ganache = requireDependency('ganache');
   const { AbiCoder, BrowserProvider, Contract, ContractFactory, ParamType, hexlify, keccak256, sha256, toUtf8Bytes } = requireDependency('ethers');
+  const fixture = values['experiment-fixture'];
+  const recipe = 'delivery-small-public-test-v1';
+  const genesisTimestamp = 1700000000;
+  const gasPrice = 2_000_000_000n;
+  const coinbase = '0x0000000000000000000000000000000000000000';
   server = ganache.server({
-    chain: { chainId: 31337, networkId: 31337, hardfork: 'shanghai' },
-    wallet: { totalAccounts: 4, defaultBalance: 1000 },
-    miner: { blockTime: 1, blockGasLimit: 30_000_000 },
+    chain: { chainId: 31337, networkId: 31337, hardfork: 'shanghai', ...(fixture ? { time: new Date(genesisTimestamp * 1000) } : {}) },
+    wallet: { totalAccounts: 4, defaultBalance: 1000, ...(fixture ? { seed: recipe } : {}) },
+    miner: { blockTime: fixture ? 0 : 1, blockGasLimit: 30_000_000,
+      ...(fixture ? { timestampIncrement: 1, defaultGasPrice: Number(gasPrice), coinbase, extraData: '0x' } : {}) },
     logging: { quiet: false, logger: { log(message) {
       if (typeof message !== 'string' || !/^(?:eth|net|web3|evm|debug|personal|txpool|miner|rpc)_[A-Za-z0-9_]{1,64}$/.test(message)) return;
       if (Object.hasOwn(counts, message) || Object.keys(counts).length < 256) counts[message] = (counts[message] || 0) + 1;
@@ -124,6 +131,18 @@ try {
   const funder = (await signer.getAddress()).toLowerCase();
   const chainId = Number((await provider.getNetwork()).chainId);
   assert.equal(chainId, 31337);
+  let experimentFixture;
+  if (fixture) {
+    const genesis = await provider.getBlock(0);
+    assert.equal(genesis.timestamp, genesisTimestamp);
+    const accounts = (await provider.send('eth_accounts', [])).map(address => address.toLowerCase());
+    assert.equal(accounts.length, 4);
+    assert.equal(accounts[0], funder);
+    assert.equal(await provider.getTransactionCount(funder), 0);
+    experimentFixture = { recipe, genesis_block: { number: genesis.number, hash: genesis.hash, timestamp: genesis.timestamp },
+      accounts, timestamp_increment: 1, block_time: 0, gas_price_wei: gasPrice.toString(), coinbase,
+      deployment_nonces: { asset: 0, escrow: 1 } };
+  }
   const publicProfile = {
     domain: sha256(toUtf8Bytes('vibeface-delivery-profile-v1')),
     guestImageId: hexlify(Uint8Array.from(profile.guest_image_id)),
@@ -132,12 +151,20 @@ try {
     maxWindowBytes: profile.max_window_bytes, maxTotalBytes: profile.max_total_bytes,
     maxGuestCycles: profile.max_guest_cycles, maxProverMemoryBytes: profile.max_prover_memory_bytes,
   };
+  let deployNonce = 0;
   async function deploy(name, args) {
     const built = artifact(name);
-    const contract = await new ContractFactory(built.abi, built.bytecode, signer).deploy(...args, { gasLimit: 29_000_000 });
+    const nonce = deployNonce++;
+    const contract = await new ContractFactory(built.abi, built.bytecode, signer).deploy(...args, { gasLimit: 29_000_000,
+      ...(fixture ? { nonce, type: 0, gasPrice } : {}) });
     await contract.waitForDeployment();
+    if (fixture) await provider.send('evm_mine', []);
     const receipt = await contract.deploymentTransaction().wait(2);
     assert(receipt && receipt.status === 1, `${name} deployment did not confirm`);
+    if (fixture) {
+      assert.equal(contract.deploymentTransaction().nonce, nonce);
+      assert.equal(await provider.getBlockNumber(), receipt.blockNumber + 1);
+    }
     return { contract, receipt };
   }
   const asset = await deploy('TestToken', [funder]);
@@ -161,6 +188,13 @@ try {
     assert(code !== '0x', `${name} runtime is missing`);
     codeHashes[name] = keccak256(code);
   }
+  if (fixture) {
+    assert.equal(await provider.send('miner_stop', []), true);
+    const pool = await provider.send('txpool_content', []);
+    assert.deepEqual(pool.pending, {});
+    assert.deepEqual(pool.queued, {});
+    assert.equal(await provider.getTransactionCount(funder), 2);
+  }
   const block = await provider.getBlock('latest');
   baseline = { number: block.number, hash: block.hash, timestamp: block.timestamp };
   const receiptValue = receipt => ({ hash: receipt.hash, block_number: receipt.blockNumber, block_hash: receipt.blockHash, gas_used: receipt.gasUsed.toString() });
@@ -175,6 +209,7 @@ try {
     },
     deployment_transactions: { asset: receiptValue(asset.receipt), escrow: receiptValue(escrow.receipt) },
     rpc_counts: { ...counts }, statistics_file: statisticsFile,
+    ...(fixture ? { experiment_fixture: experimentFixture } : {}),
   };
   assert.equal(deployment.baseline_balances.asset[funder], '1000000000000');
   assert.equal(deployment.baseline_balances.asset[escrowAddress], '0');
