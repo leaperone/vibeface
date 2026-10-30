@@ -396,7 +396,7 @@ function parseOverviewTask(value: unknown): OverviewTask {
   const common = {
     item_id: nullableText(data.item_id) ?? nullableText(data.check_id) ?? workId ?? `${conversationId}:${text(data.trigger ?? "")}`,
     work_id: workId, conversation_id: conversationId, bot, title: data.title == null ? "" : text(data.title), summary: data.summary == null ? "" : text(data.summary),
-    state: state === "finished" && outcome === null ? "unknown" : state, outcome,
+    state: outcome === "unverified" ? "unverified" : state === "finished" && outcome === null ? "unknown" : state, outcome,
     target_node: nullableText(data.target_node), dispatcher: nullableText(data.dispatcher), call_ref: nullableText(data.call_ref),
     work_kind: overviewWorkKind(data.work_kind) ?? overviewWorkKind(data.kind),
     parent: nullableText(data.parent), continues: nullableText(data.continues), thread: nullableText(data.thread), thread_id: nullableText(data.thread_id), turn_id: nullableText(data.turn_id),
