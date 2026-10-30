@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import { useLinkingURL } from 'expo-linking'
-import { ArchiveRestore, Camera, CircleCheck, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
+import { ArchiveRestore, Camera, ClipboardPaste, Hourglass, Link2, ShieldAlert, X } from 'lucide-react-native'
 import { humanError } from '@vibeface/client/lib/errors.ts'
 import { useEffect, useState } from 'react'
 import { View } from 'react-native'
@@ -117,7 +117,7 @@ function JoinForm() {
   // Scanning leads; once there is a link it shrinks to one line, and the name and 加入 take over.
   if (ready) return <View className="gap-4">
     <View className="min-h-11 flex-row items-center gap-2 rounded-lg bg-muted/60 ps-3">
-      <Icon as={CircleCheck} className="text-success" />
+      <Icon as={Link2} className="text-muted-foreground" />
       <Text className="min-w-0 flex-1">{joinCopy.linkFilled}</Text>
       <Button variant="ghost" size="icon" accessibilityLabel="清除链接" onPress={() => setInvitation('')}><Icon as={X} /></Button>
     </View>

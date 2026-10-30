@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
 import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { BusyIcon, Details, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
+import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, StatusPill, toast, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
@@ -493,12 +493,4 @@ function Folders({ roots, suggested, display, busy, save }: { roots: string[]; s
     </div>
     </div>
   </section>
-}
-
-/** A long path gives up its parent folders first, so the folder's own name stays readable. `shown`: its `~/…` form. */
-function FolderPath({ path, shown = path }: { path: string; shown?: string }) {
-  const cut = shown.replace(/[\\/]+$/, "").search(/[^\\/]*$/)
-  return <span className="flex min-w-0 flex-1 font-mono text-meta" title={path}>
-    <span className="min-w-0 truncate text-muted-foreground">{shown.slice(0, cut)}</span><span className="max-w-full shrink-0 truncate">{shown.slice(cut)}</span>
-  </span>
 }

@@ -13,7 +13,7 @@ import { defaultBrowserName, defaultComputerName, lastBrowserName, rememberBrows
 import { startOnboarding } from './onboarding-flag'
 import { primaryLane } from '@vibeface/client/identity/connection-lane.ts'
 import { notJoined, removedText, useDevice } from '@vibeface/client/identity/context.tsx'
-import { joinCopy, recoveryCopy } from '@vibeface/client/identity/copy.ts'
+import { joinCopy, manualCopy, recoveryCopy } from '@vibeface/client/identity/copy.ts'
 import { localCopy } from '@/features/workspace/local-session'
 import { webPlatform } from '@/lib/platform'
 
@@ -35,6 +35,8 @@ function purposeOf(invitation: string): Purpose {
 type Detector = { detect(source: HTMLVideoElement): Promise<Array<{ rawValue: string }>> }
 const detectorClass = () => (globalThis as { BarcodeDetector?: new (options: { formats: string[] }) => Detector }).BarcodeDetector
 const canScan = () => typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia) && Boolean(detectorClass())
+/** A phone or tablet, whose camera faces the code; on a desktop pasting leads and scanning steps aside. */
+const touchFirst = () => typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches
 
 /** Reads a join QR code with the camera; only the ticket is kept, any address in it is ignored. */
 function Scanner({ onTicket, onCancel }: { onTicket(ticket: string): void; onCancel(): void }) {
@@ -117,19 +119,24 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   return <label className="grid gap-1.5 text-meta font-medium">{label}{children}</label>
 }
 
-/** A public entry only forwards to people's own devices, so its page only opens join links. */
-function usePublicEntry() {
-  const [publicEntry, setPublicEntry] = useState(false)
+/**
+ * The computer that served this page. A public entry only forwards to people's own devices, so its page only opens join links.
+ * Its `deviceId` fills in a manual address that is this page's own, which the page already trusts by running its code.
+ */
+function usePageNode() {
+  const [node, setNode] = useState<{ publicEntry: boolean; deviceId: string }>({ publicEntry: false, deviceId: '' })
   useEffect(() => {
     let live = true
     if (typeof fetch === 'function') fetch('/api/info', { cache: 'no-store', credentials: 'omit' })
       .then(response => response.ok ? response.json() : null)
-      .then(info => { if (live) setPublicEntry(info?.public_entry === true) })
+      .then(info => { if (live) setNode({ publicEntry: info?.public_entry === true, deviceId: typeof info?.device_id === 'string' ? info.device_id : '' }) })
       .catch(() => {})
     return () => { live = false }
   }, [])
-  return publicEntry
+  return node
 }
+
+const sameOrigin = (address: string) => { try { return new URL(address).origin === location.origin } catch { return false } }
 
 /** Opened from the Home Screen: iOS keeps such an app's storage apart from Safari's. */
 const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('(display-mode: standalone)').matches || (navigator as { standalone?: boolean }).standalone === true)
@@ -137,7 +144,8 @@ const standalone = () => typeof window !== 'undefined' && (window.matchMedia?.('
 /** `lane`: the way in to show first, as the join page does. */
 export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const device = useDevice()
-  const publicEntry = usePublicEntry()
+  const pageNode = usePageNode()
+  const publicEntry = pageNode.publicEntry
   const generation = device.connectionGeneration()
   const [busyGeneration, setBusyGeneration] = useState<number | null>(null)
   const busy = busyGeneration === generation
@@ -151,6 +159,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   const [draftNames, setDraftNames] = useState<Names | null>(null)
   const [scanning, setScanning] = useState(false)
   const scannable = canScan()
+  const scanFirst = scannable && touchFirst()
   const savedName = device.localSetup?.kind === 'initialized' ? device.entryName(device.localSetup.entry) : ''
   const computerName = savedName || '这台电脑'
   const removed = device.error === BROWSER_REMOVED
@@ -274,12 +283,13 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {alert}
       {scanning && purpose !== 'link' ? <Scanner onTicket={(ticket) => { setInvitation(ticket); setScanning(false) }} onCancel={() => setScanning(false)} /> : <form className="grid gap-4" onSubmit={submitInvitation}>
         <fieldset disabled={linking || !usable} className="grid gap-4">
-          {purpose !== 'link' && scannable ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
+          {purpose !== 'link' && scanFirst ? <Button type="button" className="w-fit" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           {purpose === 'empty' || purpose === 'invalid' ? <>
-            <Textarea className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scannable ? joinCopy.paste : '粘贴加入链接'} onChange={(event) => setInvitation(event.target.value)} />
+            <Textarea ref={scanFirst ? undefined : claimFocus} className="h-20 min-h-0 resize-none field-sizing-fixed font-mono text-meta" name="invitation" required value={invitation} aria-label="加入链接" aria-invalid={purpose === 'invalid' || undefined} autoComplete="off" spellCheck={false} placeholder={scanFirst ? joinCopy.paste : joinCopy.pasteFirst} onChange={(event) => setInvitation(event.target.value)} />
             {purpose === 'invalid' ? <InlineError error="这不是有效的加入链接" /> : null}
+            {scannable && !scanFirst ? <Button type="button" variant="ghost" className="-ms-3 w-fit text-muted-foreground" onClick={() => setScanning(true)}><Camera aria-hidden="true" />{joinCopy.scan}</Button> : null}
           </> : <p className="flex min-h-11 items-center gap-2 rounded-lg bg-muted/60 ps-3">
-            <CircleCheck aria-hidden="true" className="size-4 shrink-0 text-success" />
+            <Link2 aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
             <span className="min-w-0 flex-1 truncate">{joinCopy.linkFilled}</span>
             <Button ref={claimFocus} type="button" variant="ghost" onClick={() => setInvitation('')}>换一个</Button>
           </p>}
@@ -304,10 +314,16 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       {alertInBody && !publicEntry && !thisComputer ? <p>另一台电脑上运行 <code>vibeface join</code> 加这条链接。</p> : null}
       <CopyDiagnostics lines={[['这个浏览器', device.identity.deviceId]]} />
       {usable ? <Details label="手动填写地址">
-        <form className="grid gap-3" noValidate onSubmit={(event) => { event.preventDefault(); const form = event.currentTarget; void run(() => device.connect(parseEntry({ address: value(form, 'address'), device_id: value(form, 'device_id') }))) }}>
+        <form className="grid gap-3" noValidate onSubmit={(event) => {
+          event.preventDefault()
+          const form = event.currentTarget, address = value(form, 'address')
+          const deviceId = value(form, 'device_id').trim() || (!publicEntry && sameOrigin(address) ? pageNode.deviceId : '')
+          void run(() => device.connect(parseEntry({ address, device_id: deviceId })))
+        }}>
           <fieldset disabled={linking} className="grid gap-3">
             <Field label="访问地址"><Input type="url" name="address" defaultValue={typeof location === 'undefined' ? '' : location.origin} /></Field>
-            <Field label="设备编号"><Input className="font-mono" name="device_id" autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <Field label="设备编号"><Input className="font-mono" name="device_id" placeholder={publicEntry ? undefined : manualCopy.optional} autoComplete="off" autoCapitalize="none" spellCheck={false} /></Field>
+            <p className="-mt-1 text-muted-foreground">{manualCopy.where}</p>
             <Button type="submit" variant="outline" className="w-fit">连接</Button>
           </fieldset>
         </form>

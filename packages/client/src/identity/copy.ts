@@ -9,10 +9,17 @@ export const joinCopy = {
   byLink: '用加入链接',
   scan: '扫码加入',
   paste: '或粘贴加入链接',
+  pasteFirst: '粘贴加入链接',
   linkFilled: '已填入加入链接',
   deviceName: '这台设备的名字',
   join: '加入',
   joining: '加入中',
+}
+
+/** 手动填写地址, under 详细信息: a device ID pins which computer answers there. */
+export const manualCopy = {
+  optional: '这台电脑可不填',
+  where: '在我的设备 → 那台设备 → 详细信息里复制',
 }
 
 /** 添加设备: a phone scans the code; another computer runs one command, so both ways show without opening the raw link. */
@@ -66,14 +73,14 @@ export const recoveryCopy = {
   cancelLate: '如果已经提交，取消不会撤回。',
   connectTo: '连接到哪台电脑',
   manual: '手动填写',
-  byPhone: '用手机找回',
+  byPhone: '在手机上完成找回',
   qr: '找回二维码',
   scanHint: '在手机 App 的“用恢复文件找回”里扫码',
   unreachable: '手机连不到这台电脑，先连同一个 Wi-Fi 再看',
   scan: '扫电脑上的找回二维码',
   paste: '或粘贴找回链接',
   pasteLabel: '找回链接',
-  notRecoveryLink: '这不是找回链接，到电脑网页的设置 → 找回 → 用手机找回里复制',
+  notRecoveryLink: '这不是找回链接，到电脑网页的设置 → 找回 → 在手机上完成找回里复制',
   target: '要连的电脑',
   replaceHint: '需要现在的恢复文件和旧密码，旧文件会作废',
   replaced: '已换密码，旧恢复文件已失效',

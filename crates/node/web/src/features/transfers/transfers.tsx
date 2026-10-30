@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, RefreshCw } from 'lucide-react'
+import { ArrowDownLeft, ArrowDownToLine, ArrowRightLeft, ArrowUpRight, CircleCheck, Copy, File, FlaskConical, RefreshCw, type LucideIcon } from 'lucide-react'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { useDelivery } from '@vibeface/client/delivery/client.ts'
-import { acceptanceOptions, canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
+import { acceptanceOptions, canRestart, changeMode, deadlineRows, draftFor, evidenceLabels, modeOptions, orderActions, orderHeading, orderStatus, orderSummary, orderTitle, receiverChoices, settlementAmountsLabel, sizeLabel, transferCopy, walletNotice } from '@vibeface/client/delivery/model.ts'
 import type { DeliveryDraft, DeliveryOrder, DeliverySettings, TransferFile } from '@vibeface/client/delivery/types.ts'
 import { messageOf } from '@vibeface/client/lib/node.ts'
 import { useExperiments } from '@vibeface/client/lib/experiments.ts'
@@ -10,6 +10,7 @@ import { BusyIcon, Details, EmptyState, InlineError, Segmented, useAction } from
 import { Button } from '@/components/ui/button'
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field'
 import { Input } from '@/components/ui/input'
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { terms } from '@/lib/glossary'
 import { webPlatform } from '@/lib/platform'
 
@@ -22,7 +23,8 @@ export function Transfers() {
 
 function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeof useDevice>['ready']> }) {
   const delivery = useDelivery(connection, webPlatform)
-  // Paid delivery, its test chain and the raw connection ID stay out of sight unless 实验功能 is on in settings.
+  const { directory } = useDevice()
+  // Paid delivery and its test chain stay out of sight unless 实验功能 is on in settings.
   const [experiments] = useExperiments(webPlatform.storage)
   const [draft, setDraft] = useState<DeliveryDraft>({ receiver_peer: '', provider_peer: '', mode: 'charity', acceptance: 'recoverable', max_service_amount: '0', max_gas_amount: '0' })
   const [file, setFile] = useState<TransferFile | null>(null)
@@ -40,20 +42,26 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
   // Paid already on at this Node stays visible, so it can be seen and turned off.
   const paid = experiments || !!status?.paid_enabled
   const sending = draftFor(draft, paid)
-  const unusable = working || !file || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
+  const mine = receiverChoices(directory?.members ?? [], status?.node_peer ?? '')
+  const picked = mine.some(item => item.device_id === draft.receiver_peer)
+  // Once a pasted ID shows its field, clearing it must not fold the field shut mid-edit.
+  const other = useRef(false)
+  if (!picked && draft.receiver_peer) other.current = true
+  const receiverId = <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={picked ? '' : draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required={!picked} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
+  const unusable = working || !file || !draft.receiver_peer || status?.max_file_bytes === 0 || sending.mode === 'charity' && !status?.charity_enabled || sending.mode === 'paid' && !status?.paid_enabled
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     {feedback('page')}
     {!status ? <p role="status" className="text-meta text-muted-foreground">{transferCopy.loading}</p> : <>
       <section aria-labelledby="transfer-settings" className="grid gap-4 rounded-xl border bg-card p-4">
         <h2 id="transfer-settings" className="text-heading font-semibold">传输设置</h2>
-        <div className="flex flex-wrap gap-x-6 gap-y-1">
+        <div className="grid">
           <Toggle label="启用文件传输" checked={status.enabled} disabled={!delivery.canManage || working} change={enabled => change({ enabled })} />
           {status.enabled ? <>
-            <Toggle label="公益转发" checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
-            {paid ? <Toggle label="付费交付（本地测试）" checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
+            <Toggle label={transferCopy.charity} checked={status.charity_enabled} disabled={!delivery.canManage || working} change={charity_enabled => change({ charity_enabled })} />
+            {paid ? <Toggle label={transferCopy.paid} icon={FlaskConical} checked={status.paid_enabled} disabled={!delivery.canManage || working} change={paid_enabled => change({ paid_enabled })} /> : null}
           </> : null}
         </div>
-        {status.enabled ? <ConnectionId value={status.node_peer} shown={experiments} /> : <p className="text-meta text-muted-foreground">{transferCopy.off}</p>}
+        {status.enabled ? <ConnectionId value={status.node_peer} /> : <p className="text-meta text-muted-foreground">{transferCopy.off}</p>}
         {!delivery.canManage ? <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.admin.icon aria-hidden="true" className="size-4 shrink-0" />{transferCopy.adminOnly}</p> : null}
         {paid ? <>
           {status.paid_enabled || status.wallet.state !== 'absent' ? <p className="text-meta text-muted-foreground">{walletNotice(status.wallet)}</p> : null}
@@ -67,13 +75,21 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
       </section>
       {status.enabled && delivery.canManage ? <form className="grid gap-4 rounded-xl border bg-card p-4" onSubmit={event => { event.preventDefault(); if (file) { setOrigin('form'); void delivery.prepare(sending, file) } }}>
         <h2 className="text-heading font-semibold">发送文件</h2>
-        <Field><FieldLabel htmlFor="transfer-receiver">{transferCopy.receiver}</FieldLabel><Input id="transfer-receiver" className="font-mono" value={draft.receiver_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })} /></Field>
+        {mine.length ? <>
+          <Field><FieldLabel htmlFor="transfer-to">{transferCopy.sendTo}</FieldLabel>
+            <NativeSelect id="transfer-to" className="w-full" value={picked ? draft.receiver_peer : ''} disabled={working} onChange={event => setDraft({ ...draft, receiver_peer: event.target.value })}>
+              <NativeSelectOption value="" disabled>{transferCopy.pickDevice}</NativeSelectOption>
+              {mine.map(item => <NativeSelectOption key={item.device_id} value={item.device_id}>{item.name}</NativeSelectOption>)}
+            </NativeSelect>
+          </Field>
+          <Details label={transferCopy.otherDevice} open={other.current || undefined}>{receiverId}</Details>
+        </> : receiverId}
         <Field><FieldLabel htmlFor="transfer-provider">{transferCopy.provider}</FieldLabel><Input id="transfer-provider" className="font-mono" value={draft.provider_peer} autoCapitalize="none" autoCorrect="off" spellCheck={false} maxLength={64} required disabled={working} onChange={event => setDraft({ ...draft, provider_peer: event.target.value })} /><FieldDescription>{transferCopy.providerHint}</FieldDescription></Field>
         {paid ? <Segmented label="传输方式" value={draft.mode} options={modeOptions} labels disabled={working} onChange={mode => setDraft(changeMode(draft, mode))} /> : null}
         {sending.mode === 'paid' ? <>
           <Segmented label="什么时候付款" value={draft.acceptance} options={acceptanceOptions} labels disabled={working} onChange={acceptance => setDraft({ ...draft, acceptance })} />
-          <Field><FieldLabel htmlFor="transfer-service-cap">服务费上限（测试代币最小单位）</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
-          <Field><FieldLabel htmlFor="transfer-gas-cap">链费上限（测试链原生币最小单位）</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
+          <Field><FieldLabel htmlFor="transfer-service-cap">{transferCopy.serviceCap}</FieldLabel><Input id="transfer-service-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_service_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_service_amount: event.target.value })} /></Field>
+          <Field><FieldLabel htmlFor="transfer-gas-cap">{transferCopy.gasCap}</FieldLabel><Input id="transfer-gas-cap" inputMode="numeric" pattern="[0-9]+" value={draft.max_gas_amount} required disabled={working} onChange={event => setDraft({ ...draft, max_gas_amount: event.target.value })} /></Field>
         </> : <p className="flex items-center gap-1.5 text-meta text-muted-foreground"><terms.encrypted.icon aria-hidden="true" className="size-4 shrink-0 text-success" />{transferCopy.free}</p>}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Button type="button" variant="outline" disabled={working} onClick={() => void picker.run('pick', async () => { const picked = await webPlatform.files?.pick(); if (picked) setFile(picked) })}><BusyIcon busy={picker.busy === 'pick'} icon={File} />选择文件</Button>
@@ -86,7 +102,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
           <Button type="submit" disabled={unusable}><BusyIcon busy={delivery.busy === 'prepare'} />{transferCopy.prepare(sending.mode)}</Button>
           {selected && canRestart(selected) && (paid || selected.mode === 'charity') ? <Button type="button" variant="outline" disabled={unusable} onClick={() => { if (file) { setOrigin('form'); void delivery.prepare(sending, file, selected.intent_id) } }}>作为新订单再次发送</Button> : null}
         </div>
-        <Details><p>{transferCopy.prepareDetails}</p></Details>
+        <Details><p>{transferCopy.prepareDetails}</p>{sending.mode === 'paid' ? <p>{transferCopy.units}</p> : null}</Details>
       </form> : null}
     </>}
     <section aria-labelledby="transfer-orders" className="grid gap-3">
@@ -103,7 +119,7 @@ function TransferPage({ connection }: { connection: NonNullable<ReturnType<typeo
             <span className="text-meta text-muted-foreground">{orderSummary(order)}</span>
           </span>
         </button></li>
-      })}</ul> : <p className="text-meta text-muted-foreground">{transferCopy.noRecords}</p>}
+      })}</ul> : <EmptyState icon={ArrowRightLeft} title={transferCopy.noRecords} />}
     </section>
     {selected ? <OrderDetails key={selected.order_id} order={selected} busy={working} canManage={delivery.canManage} walletReady={status?.wallet.state === 'unlocked'} feedback={feedback('order')}
       confirm={() => { setOrigin('order'); void delivery.confirm(selected) }} accept={() => { setOrigin('order'); void delivery.accept(selected) }}
@@ -120,10 +136,10 @@ function OrderDetails({ order, busy, canManage, walletReady, feedback, confirm, 
     <h2 ref={heading} id="transfer-detail" tabIndex={-1} className="text-heading font-semibold outline-none">{orderHeading(order)}</h2>
     <p>{orderStatus(order)}</p>
     {order.name ? <Info label="文件" value={`${order.name} · ${sizeLabel(order.bytes)}`} /> : null}
-    <Info label="传输方式" value={paid ? '付费交付' : <span className="inline-flex items-center gap-1.5"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />公益转发 · 免费</span>} />
+    <Info label="传输方式" value={paid ? transferCopy.paid : <span className="inline-flex items-center gap-1.5"><terms.encrypted.icon aria-hidden="true" className="size-4 text-success" />{transferCopy.charity}</span>} />
     {paid ? <>
-      <Info label="服务费合计（最小单位）" value={order.payment.total} />
-      <Info label="链费上限（原生币最小单位）" value={order.payment.gas_cap} />
+      <Info label={transferCopy.serviceTotal} value={order.payment.total} />
+      <Info label={transferCopy.gasCap} value={order.payment.gas_cap} />
       {order.acceptance === 'strict' ? <p className="text-meta text-warning">{transferCopy.strict}</p> : null}
     </> : null}
     {order.error ? <p role="alert" className="text-meta text-danger">{order.error}</p> : null}
@@ -161,8 +177,8 @@ function Feedback({ error, notice }: { error: string; notice: string }) {
   return null
 }
 
-/** `shown`: the 64-character ID itself, for 实验功能; otherwise only the button that copies it to send to whoever sends a file. */
-function ConnectionId({ value, shown }: { value: string; shown: boolean }) {
+/** Only the button that copies the 64-character ID, to send to whoever sends a file. */
+function ConnectionId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false)
   useEffect(() => {
     if (!copied) return
@@ -172,13 +188,15 @@ function ConnectionId({ value, shown }: { value: string; shown: boolean }) {
   return <div className="grid gap-1 text-meta">
     <span className="text-muted-foreground">{transferCopy.connectionId}</span>
     <span className="flex min-w-0 items-center gap-2">
-      {shown ? <code className="min-w-0 truncate" title={value}>{value}</code> : null}
       <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => { void navigator.clipboard.writeText(value).then(() => setCopied(true), () => {}) }}>{copied ? <CircleCheck aria-hidden="true" /> : <Copy aria-hidden="true" />}{copied ? '已复制' : '复制'}</Button>
     </span>
   </div>
 }
 
 function Info({ label, value }: { label: string; value: ReactNode }) { return <div className="grid gap-1 text-meta sm:grid-cols-[10rem_minmax(0,1fr)]"><span className="text-muted-foreground">{label}</span><span className="break-all text-foreground">{value}</span></div> }
-function Toggle({ label, checked, disabled, change }: { label: string; checked: boolean; disabled: boolean; change(value: boolean): void }) {
-  return <label className="flex min-h-11 items-center gap-2 text-meta"><input type="checkbox" role="switch" checked={checked} disabled={disabled} onChange={event => change(event.target.checked)} />{label}</label>
+function Toggle({ label, icon: Icon, checked, disabled, change }: { label: string; icon?: LucideIcon; checked: boolean; disabled: boolean; change(value: boolean): void }) {
+  return <label className="flex min-h-11 items-center justify-between gap-3">
+    <span className="flex items-center gap-1.5">{label}{Icon ? <Icon aria-hidden="true" className="size-4 text-muted-foreground" /> : null}</span>
+    <input type="checkbox" role="switch" className="switch" checked={checked} disabled={disabled} onChange={event => change(event.target.checked)} />
+  </label>
 }
