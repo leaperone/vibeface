@@ -870,6 +870,7 @@ impl Runtime {
                     "conversation_id": spec.conversation,
                     "trigger": spec.trigger,
                     "title": workspace_bounded(&spec.title, 256),
+                    "cwd": workspace_bounded(&spec.cwd, 512),
                     "summary": Value::Null,
                     "state": if waiting_sync { "accepted_waiting_sync" } else { state },
                     "outcome": Value::Null,
@@ -893,6 +894,7 @@ impl Runtime {
                     "state": if waiting_sync { "dispatch_accepted" } else { state },
                     "kind": spec.kind,
                     "title": workspace_bounded(&spec.title, 256),
+                    "cwd": workspace_bounded(&spec.cwd, 512),
                     "reason": dispatch.state.reason().map(|reason| workspace_bounded(reason, 512)),
                 }));
             }
