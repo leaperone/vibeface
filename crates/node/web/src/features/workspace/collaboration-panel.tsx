@@ -248,7 +248,7 @@ export function CollaborationPanel({ data: supplied, botId: suppliedBotId, class
   const questions = data.questions
   return <div className={cn("grid min-w-0 gap-5", className)}>
     <OwnerCard data={data} nodes={workspace.nodes} />
-    {scheduler ? <Section title="本机会话队列" count={jobs.length}>
+    {scheduler ? <Section title="会话队列" count={jobs.length}>
       {jobs.length ? <ul className="grid gap-2">{jobs.map((job) => <JobRow key={job.trigger} job={job} data={data} botId={botId} nodes={workspace.nodes} />)}</ul> : <Card size="sm"><CardContent className="py-5 text-meta text-muted-foreground">当前会话没有排队项目。</CardContent></Card>}
     </Section> : <Card size="sm"><CardContent className="flex items-start gap-2 py-4 text-meta text-muted-foreground"><Unplug aria-hidden="true" className="mt-0.5 size-4 shrink-0" />队列状态暂不可见。</CardContent></Card>}
     {works.length ? <Section title="执行工作" count={works.length}><ul className="grid gap-2">{works.map((work) => <WorkRow key={work.work_id} work={work} botId={botId} nodes={workspace.nodes} />)}</ul></Section> : null}
