@@ -1,5 +1,6 @@
 "use client"
 
+import { useLayoutEffect, useRef } from "react"
 import { ChevronLeft, CircleCheck, CircleHelp, CircleQuestionMark, CircleX, EyeOff, Laptop, ListChecks, MessageCircle, MessagesSquare, ScrollText, Server, UserRound, type LucideIcon } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
@@ -18,6 +19,10 @@ type ContextPanelProps = {
 
 /** A read-only view of the fields already present in one ConversationPayload. */
 export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
+  const root = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    root.current?.closest<HTMLElement>('[data-slot="sheet-content"]')?.scrollTo({ top: 0, behavior: "auto" })
+  }, [])
   const owner = data.conversation?.owner
   const ownerName = nodeName(owner ?? undefined, { nodes })
   const messages = data.messages.slice(-4)
@@ -25,7 +30,7 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
   const changes = data.changes
   const questions = data.questions
   const checks = data.checks
-  return <div className="grid gap-5 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+  return <div ref={root} className="grid gap-5 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
     <header className="flex min-w-0 items-start gap-2">
       <Button type="button" variant="ghost" size="icon" className="-ms-2 shrink-0" aria-label="返回 Bot 设置" title="返回 Bot 设置" onClick={onBack}><ChevronLeft aria-hidden="true" /></Button>
       <div className="min-w-0 flex-1 pt-1">
@@ -34,6 +39,18 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
       </div>
       <StatusPill tone="info" icon={MessagesSquare}>共享事实</StatusPill>
     </header>
+    <section className="relative overflow-hidden rounded-2xl border border-brand/15 bg-linear-to-br from-brand-soft/55 via-card to-card p-4 shadow-sm" aria-label="上下文概览">
+      <div aria-hidden="true" className="pointer-events-none absolute -end-10 -top-12 size-32 rounded-full bg-brand/10 blur-2xl" />
+      <div className="relative grid gap-4">
+        <div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-brand ring-1 ring-brand/20"><MessagesSquare aria-hidden="true" className="size-5" /></span><div className="min-w-0"><p className="font-medium">共享上下文</p><p className="text-meta text-muted-foreground">事实、工作和会话各自有边界</p></div></div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <ContextStat label="消息" value={data.messages.length} />
+          <ContextStat label="工作" value={works.length} />
+          <ContextStat label="问题" value={questions.length} />
+          <ContextStat label="检查" value={checks.length} />
+        </div>
+      </div>
+    </section>
     <Details label="数据来源和边界">
       <ul className="grid gap-2">
         <li><span className="font-medium text-foreground">共享聊天事实：</span>消息、工作、变更和问题来自当前聊天快照。</li>
@@ -103,6 +120,10 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
 
     <p className="px-1 text-meta text-muted-foreground">本面板只显示当前快照里的摘要。任务操作仍在任务详情中进行。</p>
   </div>
+}
+
+function ContextStat({ label, value }: { label: string; value: number }) {
+  return <div className="grid gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><span className="text-meta text-muted-foreground">{label}</span><span className="text-lg font-semibold tabular-nums">{value}</span></div>
 }
 
 function roleName(role: string) {

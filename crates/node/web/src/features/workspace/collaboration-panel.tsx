@@ -60,7 +60,7 @@ function when(ms: number) {
 
 function Section({ title, count, children, className }: { title: string; count?: number; children: React.ReactNode; className?: string }) {
   return <section aria-label={title} className={cn("grid gap-2", className)}>
-    <h3 className="flex items-center gap-2 px-1 text-meta font-medium text-muted-foreground">
+    <h3 className="flex items-center gap-2 px-1 text-meta font-medium text-muted-foreground"><span aria-hidden="true" className="h-4 w-1 rounded-full bg-brand" />
       <span>{title}</span>{count === undefined ? null : <span className="tabular-nums">· {count}</span>}
     </h3>
     {children}
@@ -89,7 +89,7 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
           : owner
             ? "owner 状态未知"
             : "owner 未知"
-  return <Card size="sm">
+  return <Card size="sm" className="border-transparent bg-linear-to-br from-info-soft/35 via-card to-card ring-1 ring-border/70">
     <CardContent className="grid gap-3">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
         {reachable === false ? <Unplug aria-hidden="true" className="size-4 shrink-0 text-warning" /> : owner === data.local_node ? <Laptop aria-hidden="true" className="size-4 shrink-0 text-success" /> : <Server aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
@@ -107,7 +107,7 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
 function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: ConversationPayload; botId?: string; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
   const kind = triggerKind(job.trigger)
   const targetBotId = botId
-  return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs">
+  return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-sm">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
       <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Clock3 aria-hidden="true" className="size-4" /></span>
       <span className="min-w-0 flex-1">
@@ -134,7 +134,7 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
 
 function WorkRow({ work, botId, nodes }: { work: WorkRecord; botId?: string; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
   const state = shownState(work, nodes)
-  return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs">
+  return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-sm">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
       <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-info-soft text-info"><ListChecks aria-hidden="true" className="size-4" /></span>
       <span className="min-w-0 flex-1">
