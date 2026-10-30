@@ -16,6 +16,10 @@ on:
         description: 'Run genuine local paid delivery proofs and settlement in the bounded Linux sandbox'
         type: boolean
         default: false
+      delivery_small:
+        description: 'Run only the bounded 4 KiB proof, settlement and exposed-key experiments'
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -26,6 +30,7 @@ permissions:
 
 jobs:
   plan:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     runs-on: ubuntu-24.04
     outputs:
       plan: ${{ steps.select.outputs.plan }}
@@ -585,14 +590,41 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
 
+  delivery-small:
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_small
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Require a single explicit experiment mode
+        env:
+          DELIVERY_LIVE: ${{ inputs.delivery_live }}
+        run: test "$DELIVERY_LIVE" = false
+      - name: Generate genuine proofs and exercise settlement in the fixed sandbox
+        run: python3 scripts/check-delivery.py --sandbox --prove-small
+      - name: Preserve public experiment evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-small-${{ github.sha }}
+          path: |
+            .artifacts/vdp/canonical/small/*/public/summary.json
+            .artifacts/vdp/canonical/small/*/public/resources.json
+            .artifacts/vdp/canonical/small/*/public/proofs/manifest.json
+            .artifacts/vdp/canonical/small/*/public/proofs/relation-*.json
+            .artifacts/vdp/canonical/small/*/public/proofs/relation-*.receipt
+          if-no-files-found: warn
+          retention-days: 14
+
   delivery-android:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small
     uses: ./.github/workflows/mobile.yml
     with:
       android_only: true
 
   delivery-live:
-    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live
+    if: github.event_name == 'workflow_dispatch' && inputs.delivery_live && !inputs.delivery_small
     needs: [plan, package, crypto-web, web, delivery-android]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -786,7 +818,7 @@ jobs:
 
   ci-gate:
     name: ci-gate
-    if: always()
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.delivery_small) }}
     needs: [plan, quick-check, crypto-web, web, rust-check, rust-fast, rust-slow, delivery, delivery-live, package, npm-package, npm-smoke]
     runs-on: ubuntu-24.04
     steps:

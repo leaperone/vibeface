@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -61,8 +63,8 @@ def checked_metadata(manifest, proofs, compiled=None):
             raise ValueError("Fixture relation, profile or image differs from its public journal")
 
 
-def read_fixture(name, limit):
-    file = FIXTURES / name
+def read_fixture(name, limit, directory=None):
+    file = (directory or FIXTURES) / name
     if file.is_symlink() or not file.is_file() or file.stat().st_size > limit:
         raise ValueError(f"Missing, oversized or nonregular public fixture: {name}")
     return file.read_bytes()
@@ -102,16 +104,16 @@ def checked_profile_vectors(vectors, profile, compiled, proofs):
             raise ValueError("Public receipt uses a profile outside the product trust root")
 
 
-def load_fixtures():
-    manifest = json.loads(read_fixture("manifest.json", 16 * 1024))
-    proofs = [json.loads(read_fixture(f"relation-{relation}.json", 32 * 1024)) for relation in range(1, 5)]
+def load_fixtures(directory=None):
+    manifest = json.loads(read_fixture("manifest.json", 16 * 1024, directory))
+    proofs = [json.loads(read_fixture(f"relation-{relation}.json", 32 * 1024, directory)) for relation in range(1, 5)]
     checked_metadata(manifest, proofs)
     schema = (ROOT / "crates/delivery/abi/Statement.sol").read_bytes()
     if manifest["schemaHash"] != hashlib.sha256(schema).hexdigest():
         raise ValueError("Delivery fixtures use an outdated canonical ABI schema")
     load_profile(manifest)
     for relation in range(1, 5):
-        if not read_fixture(f"relation-{relation}.receipt", 16 * 1024 * 1024):
+        if not read_fixture(f"relation-{relation}.receipt", 16 * 1024 * 1024, directory):
             raise ValueError("An empty public receipt is not a proof")
     return manifest, proofs
 
@@ -133,17 +135,19 @@ def checked_verification(result, compiled, proof):
         raise ValueError("Receipt verification result or exported seal differs from its public fixture")
 
 
-def sandbox_commands(context):
+def sandbox_commands(context, small=False):
     image = "vibeface-vdp-proof:check-" + hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
     build = ["docker", "build", "--platform", "linux/amd64", "--file", str(context / "proofs/delivery/Sandbox.Dockerfile"), "--tag", image, str(context)]
     container = ["docker", "run", "--rm", "--platform", "linux/amd64", "--memory", "11g", "--memory-swap", "11g", "--pids-limit", "64", "--env", "HOME=/home/runner"]
     for source, destination in ((ROOT, "/work"), (ARTIFACTS / "cargo", "/cargo"), (ARTIFACTS / "cargo", "/home/runner/.cargo"), (ARTIFACTS / "risc0", "/risc0"), (ARTIFACTS / "canonical", "/artifacts")):
         container.extend(["--mount", f"type=bind,source={source},target={destination}"])
-    container.extend([image, "bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py"])
+    if small:
+        container.extend(["--env", "TOKIO_WORKER_THREADS=2"])
+    container.extend([image, "bash", "-c", "python3 scripts/install-delivery-toolchain.py && python3 scripts/check-delivery.py" + (" --prove-small" if small else "")])
     return build, container
 
 
-def sandbox():
+def sandbox(small=False):
     optional_fixtures()
     for name in ("cargo", "risc0", "canonical"):
         (ARTIFACTS / name).mkdir(parents=True, exist_ok=True)
@@ -156,7 +160,7 @@ def sandbox():
             destination = context / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, destination)
-        build, container = sandbox_commands(context)
+        build, container = sandbox_commands(context, small=small)
         run(build)
     run(container)
 
@@ -204,6 +208,55 @@ def check():
         run(["node", f"contracts/delivery/{script}", *arguments])
     (ARTIFACTS / "proof-results.json").write_text(json.dumps({"imageId": compiled["imageId"], "schemaHash": compiled["schemaHash"], "receipts": verified}, indent=2) + "\n")
     print("Delivery receipts, cross-language bytes and production EVM adapter checks passed" if fixtures else "Guest rebuild, cross-language bytes and production EVM adapter checks passed; skipped: no public proof fixture")
+
+
+def prove_small():
+    live = runpy.run_path(str(ROOT / "scripts/run-delivery-live.py"))
+    _, initial = live["resources"]()
+    destination = Path("/artifacts/small") / uuid.uuid4().hex
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    public = destination / "public"
+    status, failure = "FAIL", None
+    try:
+        check()
+        run(["node", "contracts/delivery/experiment-delivery.mjs", str(destination)])
+        compiled = json.loads((ARTIFACTS / "host-info.json").read_bytes())
+        directory = public / "proofs"
+        manifest, proofs = load_fixtures(directory)
+        expected = {"manifest.json", *[f"relation-{relation}.{suffix}" for relation in range(1, 5) for suffix in ("json", "receipt")]}
+        if {file.name for file in directory.iterdir()} != expected:
+            raise ValueError("Small experiment export must contain exactly nine public proof files")
+        checked_metadata(manifest, proofs, compiled)
+        checked_profile_vectors(json.loads((ARTIFACTS / "public-vectors.json").read_bytes()), load_profile(compiled), compiled, proofs)
+        prover = "/artifacts/proof-target/release/vibeface-delivery-prover"
+        for relation, proof in enumerate(proofs, 1):
+            value = json.loads(run([prover, "verify", proof["journal"]], input=read_fixture(f"relation-{relation}.receipt", 16 * 1024 * 1024, directory), capture_output=True).stdout)
+            checked_verification(value, compiled, proof)
+        summary = json.loads((public / "summary.json").read_bytes())
+        if summary["status"] != "PASS" or len(summary["proofs"]) != 4 or len(summary["branches"]) != 3 or summary["corruptERejectedWithoutOutput"] is not True:
+            raise ValueError("Small experiment did not complete proofs, settlement and recovery")
+        status = "PASS"
+    except Exception as error:
+        failure = error
+    finally:
+        public.mkdir(parents=True, exist_ok=True)
+        try:
+            _, final = live["resources"]()
+            delta = live["oom_delta"](initial, final)
+            if any(delta.values()):
+                status = "FAIL"
+                failure = failure or ValueError("Small experiment incurred kernel OOM events")
+            resources = {"status": status, "scope": "entire bounded sandbox including build, EVM, executor, prover and compression", "initial": initial, "final": final, "oomDelta": delta}
+        except Exception as error:
+            status = "FAIL"
+            failure = failure or error
+            resources = {"status": "UNKNOWN", "initial": initial, "final": None, "oomDelta": None}
+        with (public / "resources.json").open("x") as output:
+            json.dump(resources, output, indent=2)
+            output.write("\n")
+        print(f"Small experiment {status}: {public}", flush=True)
+    if failure:
+        raise failure
 
 
 def self_test():
@@ -299,6 +352,11 @@ def self_test():
     env_pairs = [container[index + 1] for index, value in enumerate(container) if value == "--env"]
     assert env_pairs == ["HOME=/home/runner"]
     assert not {"--env-file", "-e", "--privileged"}.intersection(container)
+    _, small = sandbox_commands(Path("/context"), small=True)
+    assert small[-1].endswith("scripts/check-delivery.py --prove-small")
+    assert small[small.index("--memory") + 1] == small[small.index("--memory-swap") + 1] == "11g"
+    assert "TOKIO_WORKER_THREADS=2" in small
+    assert "run-delivery-live.py --inside" not in small[-1]
     with patch(f"{__name__}.FIXTURES", ROOT / ".artifacts/no-public-proof-fixture"), patch(f"{__name__}.load_fixtures") as loader:
         assert optional_fixtures() is None
         loader.assert_not_called()
@@ -318,7 +376,8 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--check-fixtures", action="store_true")
-    mode.add_argument("--sandbox", action="store_true")
+    mode.add_argument("--prove-small", action="store_true")
+    parser.add_argument("--sandbox", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
@@ -326,6 +385,8 @@ if __name__ == "__main__":
         if optional_fixtures():
             print("Public fixture structure and schema checked; proof verification has not run")
     elif args.sandbox:
-        sandbox()
+        sandbox(small=args.prove_small)
+    elif args.prove_small:
+        prove_small()
     else:
         check()
