@@ -359,7 +359,8 @@ impl Runtime {
                         self.bind_work(network, scope, &work_id, report).await
                     },
                     |args| async move {
-                        (self.ready_for(network, &args).await).map(|agent| agent.name().to_owned())
+                        Ok((self.ready_for(network, &args).await)
+                            .map(|agent| agent.name().to_owned()))
                     },
                     &socket,
                 )

@@ -68,6 +68,8 @@ struct Live {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Pointer {
     file: PathBuf,
+    /// The directory pi runs the session in; a later work in the session runs there too.
+    cwd: PathBuf,
     /// The process group of the session's latest pi; while this Node run tracks it, the turn
     /// may go on.
     group: u32,
@@ -614,14 +616,16 @@ impl Pi {
         }
     }
 
-    /// Keeps where pi writes `session` and the session's last entry so far.
-    fn keep(&self, session: &str, file: &Path, group: u32) -> Result<Option<String>> {
+    /// Keeps where pi writes `session`, the directory it runs in and the session's last entry
+    /// so far.
+    fn keep(&self, session: &str, file: &Path, cwd: &Path, group: u32) -> Result<Option<String>> {
         let after = entries(file)?
             .last()
             .and_then(|entry| entry["id"].as_str())
             .map(str::to_owned);
         let pointer = Pointer {
             file: file.to_owned(),
+            cwd: cwd.to_owned(),
             group,
             after: after.clone(),
         };
@@ -658,7 +662,7 @@ impl Pi {
                 return Err(own(format!("pi opened session {}", state["sessionId"])));
             }
             let file = PathBuf::from(state["sessionFile"].as_str().unwrap_or_default());
-            self.keep(session, &file, process.group)
+            self.keep(session, &file, &launch.cwd, process.group)
                 .map_err(|error| own(format!("keep where pi writes the session: {error:#}")))
         }
         .await;
@@ -1014,6 +1018,8 @@ enum Origin {
     Resume {
         session: String,
         file: PathBuf,
+        /// The directory the session runs in.
+        cwd: PathBuf,
     },
 }
 
@@ -1088,32 +1094,45 @@ impl Executor for Pi {
                 None => None,
             };
             let prepared = async {
-                let file = |session: &str, gone: &'static str| -> Result<(PathBuf, u32)> {
+                let pointer = |session: &str, gone: &'static str| -> Result<Pointer> {
                     self.pointer(session)?
                         .filter(|pointer| pointer.file.is_file())
-                        .map(|pointer| (pointer.file, pointer.group))
                         .context(gone)
                 };
                 let origin = match (work.thread.as_deref(), thread) {
                     (Some(session), _) => {
-                        let (file, group) = file(session, "the pi session of this thread is gone")?;
+                        let Pointer {
+                            file, cwd, group, ..
+                        } = pointer(session, "the pi session of this thread is gone")?;
+                        if !work.cwd.is_empty() && Path::new(&work.cwd) != cwd {
+                            let failure = ExecFailure::new(
+                                FailureKind::Rejected,
+                                format!(
+                                    "this pi session runs in {}, not {}; leave the directory out to go on in it",
+                                    cwd.display(),
+                                    work.cwd
+                                ),
+                            );
+                            return Err(failure.into());
+                        }
                         ensure!(
                             !self.processes.tracked(group),
                             "a pi started earlier still runs in this session"
                         );
                         // A restart before pi takes the prompt reads the session from here on.
-                        self.keep(session, &file, group)?;
+                        self.keep(session, &file, &cwd, group)?;
                         Origin::Resume {
                             session: session.to_owned(),
                             file,
+                            cwd,
                         }
                     }
                     (None, Some(original)) => Origin::Fork(
-                        file(
+                        pointer(
                             original,
                             "the pi session of the work this one continues is gone",
                         )?
-                        .0,
+                        .file,
                     ),
                     (None, None) => Origin::New,
                 };
@@ -1129,7 +1148,7 @@ impl Executor for Pi {
             };
             let (origin, prompt) = prepared.await?;
             let (session, mut launch_args) = match &origin {
-                Origin::Resume { session, file } => (
+                Origin::Resume { session, file, .. } => (
                     session.clone(),
                     vec!["--session".to_owned(), file.display().to_string()],
                 ),
@@ -1156,7 +1175,10 @@ impl Executor for Pi {
             }
             let launch = Launch {
                 bin: node.providers().bin(Provider::Pi),
-                cwd: PathBuf::from(&work.cwd),
+                cwd: match &origin {
+                    Origin::Resume { cwd, .. } => cwd.clone(),
+                    Origin::New | Origin::Fork(_) => PathBuf::from(&work.cwd),
+                },
                 env: node.provider_env(Provider::Pi),
                 args: launch_args,
             };
@@ -1871,16 +1893,37 @@ mod tests {
             .find_map(|work| work.thread_id)
             .context("a session")?;
         let file = node.pi.pointer(&session)?.context("pointer")?.file;
+        let pi = node.pi.clone();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere)?;
+        let moved = WorkSpec {
+            thread: Some(session.clone()),
+            ..spec("w-3", &node.identity.device_id()?, &elsewhere)
+        };
+        node.store
+            .lock()
+            .await
+            .accept_work(&node.identity, &network, moved.clone(), now_ms())?;
+        let refused = node.start_work(pi.as_ref(), &network, &moved, Some(&session), &Value::Null);
+        let refused = refused
+            .await
+            .err()
+            .context("another directory is refused")?;
+        assert!(
+            format!("{refused:#}").contains("this pi session runs in"),
+            "{refused:#}"
+        );
+        // A work that names no directory goes on where the session runs.
         let spec = WorkSpec {
             prompt: "again".into(),
             thread: Some(session.clone()),
+            cwd: String::new(),
             ..spec("w-2", &node.identity.device_id()?, &dir)
         };
         node.store
             .lock()
             .await
             .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
-        let pi = node.pi.clone();
         (node.start_work(pi.as_ref(), &network, &spec, Some(&session), &Value::Null)).await?;
         let deadline = Instant::now() + Duration::from_secs(20);
         let record = loop {

@@ -1187,8 +1187,9 @@ pub(crate) fn request_kind(input: &Value) -> RequestKind {
 }
 
 /// What `vibeface hook claude` prints for the answer to its `PermissionRequest`: allow, with
-/// the question's answers filled in, or deny. `None` prints nothing, which leaves the decision
-/// to the session, as for `{"decision":null}` or an answer that fits neither.
+/// the question's answers filled in, or deny. An allow never changes the tool's input. `None`
+/// prints nothing, which leaves the decision to the session, as for `{"decision":null}`, an
+/// allow that carries `updatedInput`, or an answer that fits neither.
 pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
     if input["hook_event_name"] != "PermissionRequest" {
         return None;
@@ -1203,10 +1204,10 @@ pub fn hook_output(input: &Value, answer: &Value) -> Option<Value> {
             updated["answers"] = Value::Object(answers.clone());
             json!({"behavior":"allow","updatedInput":updated})
         }
-        (_, Some("allow")) => match &answer["updatedInput"] {
-            updated @ Value::Object(_) => json!({"behavior":"allow","updatedInput":updated}),
-            _ => json!({"behavior":"allow"}),
-        },
+        // What was approved is what runs: an allow that rewrites the input is not this
+        // approval, so it prints nothing and the session asks again.
+        (_, Some("allow")) if answer.get("updatedInput").is_some() => return None,
+        (_, Some("allow")) => json!({"behavior":"allow"}),
         (_, Some("deny")) => json!({"behavior":"deny",
             "message":answer["message"].as_str().unwrap_or("The owner's bot declined this."),
             "interrupt":answer["interrupt"] == true}),
@@ -2155,6 +2156,16 @@ mod tests {
         // What `wait_request` gives at the deadline: nothing is printed and the session decides.
         assert_eq!(hook_output(&input, &json!({"decision":null})), None);
         Ok(())
+    }
+
+    #[test]
+    fn an_allow_that_rewrites_the_input_is_not_passed_on() {
+        let input = asks(
+            "Bash",
+            json!({"command":"rm -rf build","description":"Clean the build"}),
+        );
+        let rewritten = json!({"behavior":"allow","updatedInput":{"command":"rm -rf ~"}});
+        assert_eq!(hook_output(&input, &rewritten), None);
     }
 
     #[test]
