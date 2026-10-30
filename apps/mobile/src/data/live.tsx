@@ -22,11 +22,12 @@ const noTabs = { leader: () => true, post() {}, listen: () => () => {} }
 
 /**
  * What this phone last saw of its network, so a cold start that cannot reach it still lists its bots and devices.
- * `me`: this phone's device ID then; leaving or a reset gives the phone a new one, which retires the record.
+ * `me`: this phone's device ID then; leaving or a reset gives the phone a new one, which retires the record, and a removal
+ * keeping the ID erases it, so another network never shows this one's.
  */
 type LastSeen = { me: string; entry: string; bots: BotRecord[]; primary: string | null; members: Member[] }
 
-const { readStorage } = storageOf(mobilePlatform.storage)
+const { readStorage, writeStorage } = storageOf(mobilePlatform.storage)
 
 function lastSeen(me: string | undefined): LastSeen | null {
   const value = readStorage<Record<string, unknown> | null>('last-seen', null)
@@ -87,6 +88,7 @@ function Offline({ children }: { children: ReactNode }) {
   const { session, connection } = useConnection()
   const me = device.identity?.deviceId
   const seen = useMemo(() => session.phase === 'ready' ? lastSeen(me) : null, [session.phase, me])
+  useEffect(() => { if (device.phase === 'removed') writeStorage('last-seen', null) }, [device.phase])
   const actions = useMemo<WorkspaceActions>(() => ({
     join: (invitation, name) => device.join(invitation, name),
     cancelJoin: device.cancelJoin,
@@ -166,20 +168,29 @@ function Live({ children }: { children: ReactNode }) {
     }
   })
 
+  const select = async (id: string) => {
+    const workspace = latest.current
+    const bot = workspace.bots.find((item) => item.conversation_id === id)
+    if (!bot) throw new Error(botCopy.notFound)
+    if (workspace.conversationId !== id) await workspace.selectBot(bot)
+  }
+  // A chat opened from the kept list before the first read finds no bot yet; it is selected once its bot arrives.
+  const waiting = useRef<string | null>(null)
+  const arrived = waiting.current !== null && shared.bots.some((bot) => bot.conversation_id === waiting.current)
+  useEffect(() => {
+    const id = waiting.current
+    if (!arrived || !id) return
+    waiting.current = null
+    void select(id).catch(() => {})
+  }, [arrived])
   const actions = useMemo<WorkspaceActions>(() => {
-    const select = async (id: string) => {
-      const workspace = latest.current
-      const bot = workspace.bots.find((item) => item.conversation_id === id)
-      if (!bot) throw new Error(botCopy.notFound)
-      if (workspace.conversationId !== id) await workspace.selectBot(bot)
-    }
     return {
       join: (invitation, name) => device.join(invitation, name),
       cancelJoin: device.cancelJoin,
       open(id) {
         latest.current.setView('chat')
-        void select(id).catch(() => {})
-        return () => latest.current.setView('other')
+        void select(id).catch(() => { waiting.current = id })
+        return () => { waiting.current = null; latest.current.setView('other') }
       },
       async send(id, text, attachments) {
         await select(id)
@@ -200,8 +211,9 @@ function Live({ children }: { children: ReactNode }) {
   const fresh = shared.synced || shared.bots.length > 0
   const bots = fresh || !seen ? shared.bots : seen.bots, primary = fresh || !seen ? shared.primary : seen.primary
   const members = device.directory || !seen ? directory : seen.members
-  const record = me && shared.synced && device.directory ? JSON.stringify({ me, entry: connection.entry, bots: shared.bots.map((bot) => ({ ...bot, busy: null })), primary: shared.primary, members: directory }) : null
-  useEffect(() => { if (record) mobilePlatform.storage.setItem('vibeface.last-seen', record) }, [record])
+  const snapshot = me && shared.synced && device.directory ? { me, entry: connection.entry, bots: shared.bots.map((bot) => ({ ...bot, busy: null })), primary: shared.primary, members: directory } : null
+  const record = snapshot && JSON.stringify(snapshot)
+  useEffect(() => { if (snapshot) writeStorage('last-seen', snapshot) }, [record])
 
   const value: Workspace = {
     session, connection: { ...connection, entry: connection.entry || seen?.entry || '' }, bots, primary, unread, questions, members, conversations, actions,
