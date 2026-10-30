@@ -1138,7 +1138,7 @@ def prove_small(item, resume_dir=None):
     summary = base_summary(item, commit, producer)
     initial = None
     resources, context, compiled, selected = unknown_resources(), None, None, {}
-    failure, node_failure, pair, bundle, part = None, None, None, None, None
+    failure, deferred_node_failure, pair, bundle, part = None, None, None, None, None
     try:
         _, initial = live["resources"]()
         compiled, _, vectors, _ = prepare_canonical()
@@ -1152,8 +1152,7 @@ def prove_small(item, resume_dir=None):
         try:
             run(command)
         except Exception as error:
-            node_failure = error
-        # Node may have finished a valid proof before a later assertion failed.
+            deferred_node_failure = error
         context_data = read_fixture("context.json", 64 * 1024, public)
         current = checked_context(context_data, compiled, vectors["profileId"], commit)
         if context is not None and json_bytes(context) != context_data:
@@ -1169,8 +1168,8 @@ def prove_small(item, resume_dir=None):
             verify_pair(directory, relation, context, compiled)
             pair = directory
             summary["publication"] = "UNQUALIFIED"
-        if node_failure is not None:
-            raise node_failure
+        if deferred_node_failure is not None:
+            raise deferred_node_failure
         if len(node["executionControls"]) != 4 or len(node["wrongJournals"]) != 4 or node["legacyImagePreTermsRejected"] is not True or node["failure"] is not None:
             raise ValueError("Work item did not finish all actual execute and parser controls")
         proves = [process for process in node["processes"] if process["label"].startswith("prove-")]
