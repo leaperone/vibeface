@@ -1,5 +1,5 @@
 import { Link } from 'expo-router'
-import { Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, type LucideIcon } from 'lucide-react-native'
+import { ArrowUpRight, Bot, ChevronRight, CircleCheck, CircleQuestionMark, CircleStop, CircleX, Laptop, LoaderCircle, ListChecks, Wifi, WifiOff, type LucideIcon } from 'lucide-react-native'
 import { useEffect } from 'react'
 import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
@@ -8,7 +8,7 @@ import { nodeName, shownState, staleTaskLabel, taskActive, taskLabel, taskStale 
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
-import { EmptyState, providerIcons, Skeleton } from '@/components/kit'
+import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
@@ -30,12 +30,16 @@ export function TasksScreen() {
   const projected = new Map(overview?.tasks.filter((task): task is ProjectedWork => (task.kind === 'work' || task.kind === 'dispatch') && Boolean(task.work_id)).map((task) => [task.work_id!, task]))
   const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview) : works
   const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
+  const working = visibleWorks.filter((work) => {
+    const state = projected.get(work.work_id)?.state ?? shownState(work, lookup.nodes)
+    return taskActive(state) && !taskStale(state, Boolean(shared?.connectionOnline))
+  }).length
+  const waiting = Math.max(0, visibleWorks.length - working)
+  const attention = shared?.questions.filter((question) => !question.answer && !question.closed).length ?? 0
+  const bot = workspace.bots[0]
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
-    <View className="gap-1">
-      <Text role="heading" className="text-title font-semibold">任务</Text>
-      <Text className="text-meta text-muted-foreground">进行中或待确认的任务</Text>
-    </View>
+    <MobileMasthead attention={attention} working={working} waiting={waiting} online={Boolean(shared?.connectionOnline)} />
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <Skeleton className="size-8 rounded-lg" />
@@ -44,8 +48,24 @@ export function TasksScreen() {
     </View> : visibleWorks.length ? <View className="gap-2">{visibleWorks.map((work) => {
       const bot = workspace.bots.find((item) => item.conversation_id === work.conversation_id)
       return <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} detailAvailable={works.some((item) => item.work_id === work.work_id)} bot={bot} lookup={lookup} connected={Boolean(shared?.connectionOnline)} />
-    })}</View> : <EmptyState icon={ListChecks} title="没有未完成任务" />}
+    })}</View> : <MobileEmpty bot={bot} />}
   </ScrollView>
+}
+
+function MobileMasthead({ attention, working, waiting, online }: { attention: number; working: number; waiting: number; online: boolean }) {
+  return <View className="overflow-hidden rounded-2xl border border-brand/15 bg-brand-soft/60 p-4"><View className="gap-3">
+    <View className="flex-row flex-wrap items-center gap-2"><Text className="text-meta font-semibold uppercase tracking-[1.5px] text-brand">个人 Agent 工作台</Text><View className="flex-row items-center gap-1 rounded-full border border-success-border bg-success-soft px-2 py-1"><Icon as={online ? Wifi : WifiOff} className={online ? 'size-3.5 text-success' : 'size-3.5 text-warning'} /><Text className={cn('text-meta font-medium', online ? 'text-success' : 'text-warning')}>{online ? '在线' : '待连接'}</Text></View></View>
+    <View className="gap-1"><Text role="heading" className="text-title font-semibold">掌握每个 Bot 的下一步</Text><Text className="text-meta leading-5 text-muted-foreground">执行、等待和协作状态会在这里汇合。</Text></View>
+    <View className="flex-row gap-2"><Metric label="需要留意" value={attention} tone={attention ? 'warning' : 'neutral'} /><Metric label="进行中" value={working} tone={working ? 'info' : 'neutral'} /><Metric label="等待中" value={waiting} tone="neutral" /></View>
+  </View></View>
+}
+
+function Metric({ label, value, tone }: { label: string; value: number; tone: 'neutral' | 'warning' | 'info' }) {
+  return <View className="min-w-0 flex-1 gap-0.5 rounded-xl border border-border/70 bg-background/55 px-3 py-2"><Text className="text-meta text-muted-foreground">{label}</Text><Text className={cn('text-lg font-semibold', tone === 'warning' ? 'text-warning' : tone === 'info' ? 'text-info' : 'text-foreground')}>{value}</Text></View>
+}
+
+function MobileEmpty({ bot }: { bot?: Pick<BotRecord, 'bot_id' | 'name'> }) {
+  return <View className="items-center gap-3 rounded-2xl border border-dashed border-brand/25 bg-brand-soft/35 px-6 py-12"><View className="size-16 items-center justify-center rounded-2xl bg-brand-soft ring-1 ring-brand/20"><Icon as={ListChecks} className="size-8 text-brand" /></View><Text className="text-meta font-semibold uppercase tracking-[1.5px] text-brand">随时开始</Text><Text role="heading" className="text-center text-heading font-semibold">还没有需要盯住的任务</Text><Text className="max-w-[300px] text-center text-meta leading-5 text-muted-foreground">从 Bot 对话里发出第一条请求后，执行步骤和协作消息会在这里汇合。</Text>{bot ? <Link href={`/b/${bot.bot_id}`} asChild><Pressable accessibilityRole="link" accessibilityLabel={`打开 ${bot.name}`} className="mt-2 min-h-11 flex-row items-center gap-2 rounded-xl bg-brand px-4 py-2.5 active:opacity-80"><Text className="font-medium text-brand-foreground">打开 {bot.name}</Text><Icon as={ArrowUpRight} className="size-4 text-brand-foreground" /></Pressable></Link> : null}</View>
 }
 
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
@@ -62,7 +82,7 @@ function TaskRow({ work, projected, detailAvailable, bot, lookup, connected }: {
   const device = nodeName(work.target_node, lookup)
   const title = work.title || '任务'
   const href = bot && detailAvailable ? `/b/${bot.bot_id}/work/${work.work_id}` as const : undefined
-  return <View className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong">
+  return <View className={cn('min-h-16 flex-row items-center gap-3 rounded-xl border bg-card px-4 py-2.5 shadow-xs dark:border-line-strong', active ? 'border-brand/25' : 'border-border')}>
     {bot ? <BotFace bot={bot} mood="idle" size={28} still /> : <View className="size-8 items-center justify-center rounded-lg bg-muted"><Icon as={Bot} className="text-muted-foreground" /></View>}
     <View className="min-w-0 flex-1 gap-0.5">
       <View className="flex-row items-center gap-2">
