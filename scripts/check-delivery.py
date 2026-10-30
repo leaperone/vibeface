@@ -126,6 +126,7 @@ def optional_fixtures():
 
 
 def run(command, **kwargs):
+    print("RUN delivery " + " ".join(str(part) for part in command[:2]), flush=True)
     return subprocess.run(command, cwd=ROOT, check=True, **kwargs)
 
 
@@ -166,6 +167,10 @@ def sandbox(small=False):
             shutil.copyfile(source, destination)
         build, container = sandbox_commands(context, small=small)
         run(build)
+    task = "".join(character if character.isascii() and (character.isalnum() or character in "_.-") else "-" for character in ROOT.name)[:64]
+    name = "vdp-" + task + "-" + uuid.uuid4().hex
+    container[2:2] = ["--name", name, "--label", "vibeface.task-root=" + str(ROOT)]
+    print("Delivery sandbox owned by this task: " + name, flush=True)
     run(container)
 
 
@@ -380,6 +385,14 @@ def self_test():
         else:
             raise AssertionError("Uncommitted sources must not be attributed to HEAD in a proof experiment")
         operation.assert_not_called()
+    with patch(f"{__name__}.optional_fixtures", return_value=None), patch(f"{__name__}.run") as operation:
+        sandbox()
+        assert operation.call_count == 2
+        owned = operation.call_args.args[0]
+        name = owned[owned.index("--name") + 1]
+        assert name.startswith("vdp-") and len(name.rsplit("-", 1)[1]) == 32
+        assert owned[owned.index("--label") + 1] == "vibeface.task-root=" + str(ROOT)
+        assert owned.count("--name") == 1 and "--rm" in owned
     print("Delivery fixture, product profile, receipt export and sandbox command self-tests passed; no Docker job or cryptographic proof ran")
 
 
