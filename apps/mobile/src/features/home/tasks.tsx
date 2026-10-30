@@ -6,7 +6,7 @@ import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
-import { questionOpen } from '@vibeface/client/workspace/questions.ts'
+import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
 import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
@@ -33,7 +33,7 @@ export function TasksScreen() {
   const overviewWorks = shared?.overview ? openWorksFromOverview(shared.overview) : works
   const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
   const bot = workspace.bots[0]
-  const held = new Set((shared?.questions ?? []).filter((question) => questionOpen(question) && question.about.request_id).map((question) => question.about.session_id))
+  const held = new Set((shared?.questions ?? []).filter((question) => awaitsAnswer(question, shared?.answered ?? {}) && question.about.request_id).map((question) => question.about.session_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
   for (const work of visibleWorks) groups[taskGroup(cardState(work, lookup.nodes, projected.get(work.work_id)?.state), held.has(work.thread_id ?? ''))].push(work)
 

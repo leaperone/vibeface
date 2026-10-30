@@ -540,13 +540,19 @@ pub(crate) fn open_works_from(
     // A failure stays until the bot answers after it: a reply to a message written after it ended,
     // or its own report turn's reply. The dispatching turn's reply can land after the failure
     // without having seen it, so a later rank alone does not count.
+    // Separate statements so a scoped call can use the conversation index.
+    let (only, only_w) = if scope.is_some() {
+        ("conversation_id=?2", "w.conversation_id=?2")
+    } else {
+        ("?2 IS NULL", "?2 IS NULL")
+    };
     let works = works_query(
         connection,
-        "FROM works w LEFT JOIN (SELECT conversation_id, max(dispatch_rank) AS newest FROM works
-            WHERE network_id=?1 AND (?2 IS NULL OR conversation_id=?2) AND dispatch IS NOT NULL
+        &format!("FROM works w LEFT JOIN (SELECT conversation_id, max(dispatch_rank) AS newest FROM works
+            WHERE network_id=?1 AND {only} AND dispatch IS NOT NULL
             AND finish IS NOT NULL AND json_extract(finish,'$.outcome')<>'unverified'
             GROUP BY conversation_id) ended ON ended.conversation_id=w.conversation_id
-         WHERE w.network_id=?1 AND (?2 IS NULL OR w.conversation_id=?2) AND (
+         WHERE w.network_id=?1 AND {only_w} AND (
             w.finish IS NULL OR json_extract(w.finish,'$.outcome')='unverified'
             OR json_extract(w.finish,'$.outcome') IN ('failed','rejected') AND w.dispatch_rank=ended.newest
             AND NOT EXISTS(SELECT 1 FROM notification_acks a WHERE a.network_id=w.network_id
@@ -555,7 +561,7 @@ pub(crate) fn open_works_from(
                 AND u.conversation_id=r.conversation_id AND u.message_id=r.in_reply_to
                 WHERE r.network_id=w.network_id AND r.conversation_id=w.conversation_id
                 AND r.role='assistant' AND r.status='completed' AND u.role='user'
-                AND u.rank>substr(w.finish_rank,3)))",
+                AND u.rank>substr(w.finish_rank,3)))"),
         params![network, scope, INBOX_CLIENT],
     )?;
     let mut open = Vec::with_capacity(works.len());

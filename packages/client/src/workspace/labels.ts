@@ -130,6 +130,6 @@ export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ gro
 export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
   work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
-/** A task that failed or was never taken needs the person; one out of their hands or held on them waits; the rest work. */
+/** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */
 export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>
-  needsLook(state) ? "attention" : state === "unverified" || state === "awaiting_confirmation" || heldOnPerson || !taskActive(state) ? "waiting" : "working"
+  needsLook(state) || state === "awaiting_confirmation" ? "attention" : state === "unverified" || heldOnPerson || !taskActive(state) ? "waiting" : "working"
