@@ -338,10 +338,10 @@ pub fn write(record: &Record) {
 }
 
 /// Info for vibeface and warn for libraries unless `RUST_LOG` says otherwise. `quiet_libraries`
-/// turns library logs off for terminal commands such as `join`, where transient iroh warnings and
-/// errors read as failures while the command reports its own outcome. A serving Node writes
-/// structured records to `node.log` and copies text to stderr only on a terminal, so a service's
-/// own stderr file keeps just crashes.
+/// turns library logs off for commands that report their own outcome, such as `join`, whose
+/// transient iroh warnings and errors read as failures. A serving Node writes structured records
+/// to `node.log` and copies text to stderr only on a terminal, so a service's own stderr file
+/// keeps just crashes.
 pub fn init(data_dir: Option<&Path>, quiet_libraries: bool) {
     use std::io::IsTerminal as _;
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
