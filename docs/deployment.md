@@ -12,7 +12,7 @@ vibeface init
 vibeface serve
 ```
 
-读取或写入 Node 数据的命令依次使用 `--data-dir`、`VIBEFACE_DATA_DIR` 和 `~/.vibeface`，路径必须是绝对路径。取不到 `HOME` 时报错，需显式指定目录。直接运行 `vibeface` 只在所选目录为空或不存在时初始化。程序不使用当前目录。
+读取或写入 Node 数据的命令依次使用 `--data-dir`、`VIBEFACE_DATA_DIR` 和 `~/.vibeface`，路径必须是绝对路径。取不到 `HOME` 或 `HOME` 是相对路径时报错，需显式指定目录。直接运行 `vibeface` 只在所选目录为空或不存在时初始化。程序不使用当前目录。
 
 默认只监听回环地址，不开放项目目录，不启用执行 Provider，也不扫描其他应用的会话。要允许访问项目，在初始化时重复传入 `--root '<项目的绝对路径>'`，或在有管理权限的设备设置中配置。
 

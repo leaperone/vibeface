@@ -1249,7 +1249,7 @@ fn start_over(dir: &Path) -> Result<PathBuf> {
         .to_string_lossy();
     let stamp = local_time_stamp();
     let archive = dir.with_file_name(format!("{name}-removed-{stamp}"));
-    let fresh = dir.with_file_name(format!(".{name}-fresh-{stamp}"));
+    let fresh = dir.with_file_name(format!(".{}-fresh-{stamp}", name.trim_start_matches('.')));
     ensure!(
         !archive.exists() && !fresh.exists(),
         "{} already exists",
@@ -1505,6 +1505,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>> {
 }
 
 async fn join(options: Join) -> Result<()> {
+    prepare_start(&options.data.data_dir)?;
     let state =
         vibeface::client::join_network(&options.data.data_dir, &options.link, &options.name)
             .await?;
@@ -2427,6 +2428,35 @@ mod tests {
             assert!(prepare_start(&link).is_err());
             fs::remove_file(link).unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn join_initializes_missing_and_empty_directories_only() {
+        let root = std::env::temp_dir().join(format!("vibeface-join-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let attempt = |data_dir: PathBuf| {
+            join(Join {
+                link: "not-an-invite".into(),
+                data: DataDir { data_dir },
+                name: "我的电脑".into(),
+            })
+        };
+        fs::create_dir(root.join("empty")).unwrap();
+        for name in ["missing", "empty"] {
+            let dir = root.join(name);
+            let error = attempt(dir.clone()).await.unwrap_err();
+            assert!(
+                error.downcast_ref::<std::io::Error>().is_none(),
+                "{error:#}"
+            );
+            Runtime::open(&dir).await.unwrap();
+        }
+        let uninitialized = root.join("uninitialized");
+        fs::create_dir(&uninitialized).unwrap();
+        fs::write(uninitialized.join("existing-data"), b"preserve me").unwrap();
+        assert!(attempt(uninitialized.clone()).await.is_err());
+        assert!(!uninitialized.join("identity.json").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
