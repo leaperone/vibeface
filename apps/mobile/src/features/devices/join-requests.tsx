@@ -68,6 +68,7 @@ function JoinCard({ request, auto, onAllowed }: { request: JoinRequest; auto: bo
     {request.kind === 'client' && !asking && !elsewhere ? <View className="flex-row items-center gap-3">
       <View className="min-w-0 flex-1">
         <Text>设为管理设备</Text>
+        <Text className="text-meta text-muted-foreground">{deviceCopy.manageHint}</Text>
       </View>
       <Switch accessibilityLabel="设为管理设备" accessibilityHint={deviceCopy.manageHint} value={manage} disabled={busy !== null} onValueChange={setManage} />
     </View> : null}
