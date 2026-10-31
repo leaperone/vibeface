@@ -517,7 +517,7 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
+  const selected = models?.find((model) => draft.model.trim() ? model.id === draft.model.trim() : model.default)
   const reasoningEffort = selected?.effort.state === "provider_controlled" ? null : draft.reasoning_effort
   const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes("model") && (reasoningEffort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const efforts = selected?.effort.state === "provider_controlled" ? [] : selected?.effort.state === "selectable" ? selected.effort.options : effortOptions(manager.provider)
