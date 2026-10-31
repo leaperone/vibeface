@@ -7,6 +7,8 @@ description: 查看 Vibeface CI 如何按改动范围选择检查。
 
 `.github/workflows/ci.yml` 使用 `scripts/ci.py` 选择检查范围、Rust 测试分组和必需任务。每次触发都生成计划，`ci-gate` 要求选中的任务全部成功。没有顶层 `paths` 筛选。
 
+Nightly 开发可以给 PR 加上 `nightly` 标签。该标签只对 PR 生效，计划仍会运行并生成 `ci-gate`，但会跳过普通检查、Rust/Web 测试、制品构建、Android/macOS 构建和 npm 检查，因此 `ci-gate` 只验证计划本身。去掉标签后，下一次 PR 运行恢复正常的按改动选择。`nightly` 由维护者显式添加，合并后的制品和实际体验由开发者自行验收。
+
 ## 每个 PR 的核心检查
 
 Draft 与 Ready 使用相同规则。`main` push 也按路径运行核心检查；merge queue 无路径筛选，执行整个工作区的核心检查。
@@ -111,7 +113,7 @@ controller 在真实 key1 后、C0 快照前开放配对，成员随原节点数
 
 ## 定期、手动和发布检查
 
-每日 UTC 03:23 定时、Actions 中手动运行 `ci`、`v*` tag 强制执行扩展检查，不受路径影响。手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
+每日 UTC 03:23 定时、Actions 中手动运行 `ci`、`v*` tag 强制执行扩展检查，不受路径影响。`v*` tag 还会构建 macOS 和 Android 发布资产；手动入口只验证和生成制品，不发布。在 GitHub Actions 选择 `ci` → `Run workflow`，选择待验收分支后运行。
 
 | 扩展检查 | 执行范围 |
 | --- | --- |
