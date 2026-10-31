@@ -262,8 +262,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
   for (const task of overview?.tasks ?? []) if ((task.kind === "work" || task.kind === "dispatch") && task.work_id) projectionByKey.set(activityKey(task.conversation_id, task.work_id), task)
   const workByKey = new Map<string, OpenWork>()
   for (const work of input.works) workByKey.set(activityKey(work.conversation_id, work.work_id), work)
+  const liveQuestionIds = new Set(input.questions.map((question) => question.question_id))
   const attachedQuestions = new Set<string>()
-  const attachedOverviewQuestions = new Set<string>()
   const attachedOverviewChecks = new Set<string>()
   const attachedJobs = new Set<string>()
   const activities: WorkspaceActivity[] = []
@@ -280,17 +280,13 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const effectiveState = taskStale(state, Boolean(input.connected && input.read)) ? "unknown" : state
     const facts = emptyActivityFacts()
     for (const question of input.questions) {
+      if (attachedQuestions.has(question.question_id)) continue
       if (!awaitsAnswer(question, answered) || workApproval({ work, conversationId: work.conversation_id, questions: [question], answered })?.question_id !== question.question_id) continue
       facts.questions.push(question); attachedQuestions.add(question.question_id)
     }
     for (const check of input.checks) {
       if (!checkMatchesWork(check, work)) continue
       facts.checks.push(check)
-    }
-    for (const question of overview?.questions ?? []) {
-      if (question.question_id in answered) continue
-      if (question.conversation_id !== work.conversation_id || question.work_id !== work.work_id && !attachedQuestions.has(question.question_id)) continue
-      facts.overviewQuestions.push(question); attachedOverviewQuestions.add(question.question_id)
     }
     for (const task of overview?.tasks ?? []) {
       if (task.kind !== "check" || task.conversation_id !== work.conversation_id || task.work_id !== work.work_id) continue
@@ -315,6 +311,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const id = activityJobId(entry.conversation_id, entry.job)
     if (attachedJobs.has(id)) continue
     const state = entry.job.state === "unknown" ? "unknown" : entry.job.state
+    const history = schedulerStatus(state).group === "history"
+    if (history && !["failed", "rejected"].includes(state) && !entry.job.pending_check) { attachedJobs.add(id); continue }
     const group: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
     activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group, state, job: entry.job, facts: emptyActivityFacts() }); attachedJobs.add(id)
   }
@@ -329,7 +327,7 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
       : checkKey ? workByKey.get(checkKey) ? checkMatchesWork(check, workByKey.get(checkKey)!) : false : false
     if (!attached) addAttention(`attention:check:${check.check_id}`, check.kind === "work" ? check.conversation_id : null, check)
   }
-  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !attachedOverviewQuestions.has(question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
+  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !liveQuestionIds.has(question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
   for (const task of overview?.tasks ?? []) if (task.kind === "check" && !attachedOverviewChecks.has(task.check_id)) addAttention(`attention:overview-check:${task.item_id}`, task.conversation_id, enrichCheck(task))
   const groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const activity of activities) groups[activity.group].push(activity)

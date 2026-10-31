@@ -1137,6 +1137,7 @@ test("task filters keep the counts, device confirmations and empty state within 
     "@vibeface/client/workspace/labels.ts": taskLabels,
     "@vibeface/client/workspace/model.ts": workspaceModel,
     "@vibeface/client/workspace/questions.ts": workspaceQuestions,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
     "./inbox": { useInbox: () => inbox },
     "./workspace-shell": { useCreateBot: () => () => {} },
   })
@@ -1157,6 +1158,33 @@ test("task filters keep the counts, device confirmations and empty state within 
     elements = app.render("TasksOverview")
     assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 0)
     assert.equal(named(elements, "WorkspaceEmpty")?.props.title, "没有符合筛选的任务")
+  } finally { app.close() }
+})
+
+test("a device confirmation stays visible when Bot filtering removes the first Work", () => {
+  const bots = [{ bot_id: "a", conversation_id: "chat-a", name: "Bot A" }, { bot_id: "b", conversation_id: "chat-b", name: "Bot B" }]
+  const openWork = (conversation_id: string) => ({ work_id: `work-${conversation_id}`, conversation_id, trigger: "message:one", target_node: "offline", cwd: "/project", title: conversation_id, prompt: "检查", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread_id: `thread-${conversation_id}` })
+  const works = [openWork("chat-a"), openWork("chat-b")]
+  const inbox = [{ key: "device", kind: "confirm", check: { kind: "device", check_id: "device", detail: "", target_node: "offline", reason: "offline", works: works.map((work) => ({ kind: "work", check_id: `work:${work.work_id}`, detail: "", work_id: work.work_id, conversation_id: work.conversation_id, target_node: work.target_node, title: work.title, reason: "offline" })) } }]
+  const workspace = { bots, selectedBot: bots[1], openWorks: works, nodes: [{ device_id: "offline", name: "离线设备", local: false, online: false, revoked: false }], questions: [], liveProgress: [], connectionOnline: true, synced: true, answered: {} }
+  const app = componentHarness("./tasks-overview.tsx", {
+    "@vibeface/client/workspace/context.tsx": { useWorkspace: () => workspace },
+    "@vibeface/client/identity/context.tsx": { useDevice: () => ({ directory: null }) },
+    "@vibeface/client/workspace/labels.ts": taskLabels,
+    "@vibeface/client/workspace/model.ts": workspaceModel,
+    "@vibeface/client/workspace/questions.ts": workspaceQuestions,
+    "@/lib/utils": { cn: (...values: unknown[]) => values.filter(Boolean).join(" ") },
+    "./inbox": { useInbox: () => inbox },
+    "./workspace-shell": { useCreateBot: () => () => {} },
+  })
+  try {
+    let elements = app.render("TasksOverview")
+    const selectBot = elements.find(({ type }) => typeof type === "function" && type.name === "TaskFilters")?.props.onBotFilter
+    assert.ok(typeof selectBot === "function")
+    selectBot("b")
+    elements = app.render("TasksOverview")
+    const checks = nestedElements(elements, ["TaskOverviewCard"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    assert.deepEqual(JSON.parse(JSON.stringify(checks)).map((check: { works: { conversation_id: string }[] }) => check.works.map((work) => work.conversation_id)), [["chat-b"]])
   } finally { app.close() }
 })
 
