@@ -16,23 +16,12 @@ on:
       APPLE_API_KEY_P8_BASE64: {required: false}
       APPLE_API_KEY_ID: {required: false}
       APPLE_API_ISSUER_ID: {required: false}
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Existing version tag (for example v0.0.1-nightly.20261031.1)
-        required: true
-        type: string
-      prerelease:
-        description: Mark the GitHub Release as a prerelease
-        required: false
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
 env:
-  VERSION: ${{ inputs.version || github.ref_name }}
+  VERSION: ${{ inputs.version }}
 
 jobs:
   build-macos:
@@ -48,8 +37,8 @@ jobs:
           [[ "$VERSION" != *"/"* ]]
       - name: Build Vibeface.app
         env:
-          APP_VERSION: ${{ inputs.version || github.ref_name }}
-          APP_BUILD_VERSION: ${{ inputs.version || github.ref_name }}
+          APP_VERSION: ${{ inputs.version }}
+          APP_BUILD_VERSION: ${{ inputs.version }}
         run: |
           export APP_VERSION="${APP_VERSION#v}"
           build_version="$(python3 - <<'PY'
@@ -168,23 +157,3 @@ jobs:
           path: .artifacts/android/vibeface-*
           if-no-files-found: error
 
-  github-release:
-    name: Upload App assets to GitHub Release
-    needs: [build-macos, build-android]
-    if: ${{ github.event_name == 'workflow_dispatch' && !cancelled() && needs.build-macos.result == 'success' && needs.build-android.result == 'success' }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: release-macos-${{ github.sha }}
-          path: release
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: release-android-${{ github.sha }}
-          path: release
-      - name: Upload assets to existing GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$VERSION" release/* --clobber
