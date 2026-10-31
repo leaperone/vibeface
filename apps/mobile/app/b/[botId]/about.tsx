@@ -1,5 +1,5 @@
 import { Stack, useLocalSearchParams } from 'expo-router'
-import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
+import { AlarmClock, BookOpen, Bot, CalendarClock, Check, CirclePause, Cpu, FolderOpen, Inbox, Laptop, MessagesSquare, NotebookPen, Pause, Play, Repeat, ScrollText, Star, Trash2, WifiOff, type LucideIcon } from 'lucide-react-native'
 import type { ReactNode } from 'react'
 import { Alert, Pressable, ScrollView, View } from 'react-native'
 import { botCopy, folderLabels, formatIn, projectChoices, projectKey, projectPlace, scheduleDetail, scheduleFrequency, sortSchedules } from '@vibeface/client/workspace/bot-settings.ts'
@@ -19,10 +19,6 @@ import { useWorkspace } from '@/data/context'
 import { nodeName } from '@vibeface/client/workspace/labels.ts'
 import { useLive } from '@/data/live'
 
-/**
- * A bot as the web's bot panel shows it: where it runs and on which model first, then its project, face, what it does, its schedules,
- * notes and the shared skills. The face and project are picked here; the rest changes by asking it in the chat.
- */
 export default function BotAbout() {
   const { botId } = useLocalSearchParams<{ botId: string }>()
   const shared = useLive()
@@ -59,6 +55,7 @@ function About({ bot, shared }: { bot: BotRecord; shared: NonNullable<ReturnType
           : <ActionButton variant="outline" size="sm" icon={Star} accessibilityHint={botCopy.primaryHint} disabled={!shared.writable} action={() => shared.makePrimary(bot.conversation_id)}>设为主 Bot</ActionButton>}
       </View>
     </View>
+    <SettingsGroup><SettingsRow icon={MessagesSquare} label="上下文和协作" description="共享摘要、外部会话记录和后台工作" href={`/b/${bot.bot_id}/context`} /></SettingsGroup>
     {owner || models.length ? <SettingsGroup>
       {owner ? <SettingsRow icon={Laptop} label="运行设备">
         {ownerNode && !ownerNode.online ? <Icon as={WifiOff} accessibilityLabel="离线" className="size-4 text-warning" /> : null}
