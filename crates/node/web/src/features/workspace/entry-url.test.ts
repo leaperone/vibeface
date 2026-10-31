@@ -1183,60 +1183,236 @@ test("mobile task attention counts unanswered questions and program checks and o
   } finally { app.close() }
 })
 
-test("question cards answer with a choice or typed text, retry an unconfirmed answer as sent and fold once answered", async () => {
-  const sent: unknown[][] = []
-  const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce() {},
+test("question cards select locally, send exact answers only on confirmation, and keep unknown retries and winning answers", async () => {
+  const sent: unknown[][] = [], notices: string[] = []
+  let actionBusy: string | null = null, answerStatus = 'answered'
+  const workspace = { generation: 1, writable: true, nodes: [], answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], announce: (notice: string) => { notices.push(notice) },
     bots: [{ bot_id: 'bot', conversation_id: 'chat', name: '项目 Bot' }], openWorks: [], data: { works: [{ work_id: 'w', thread_id: 's', title: '升级依赖', outcome: 'completed' }] },
-    answer: async (...args: unknown[]) => { sent.push(args); return { status: 'answered', text: args[1] } } }
+    answer: async (...args: unknown[]) => { sent.push(args); return { status: answerStatus, text: answerStatus === 'answered' ? args[1] : '停下' } } }
   const toasts: { text: string; action?: { label: string; onClick(): void } }[] = [], visited: unknown[] = []
-  const kit = new Proxy({ useAction: () => ({ busy: null, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
+  const kit = new Proxy({ useAction: () => ({ busy: actionBusy, error: null, run: (_key: string, work: () => Promise<void>) => work() }), toast: (text: string, options: { action?: { label: string; onClick(): void } } = {}) => { toasts.push({ text, action: options.action }) } }, { get: (target, name) => (target as Record<string | symbol, unknown>)[name] ?? String(name) })
   const router = { Link: 'Link', useNavigate: () => (target: unknown) => { visited.push(target) } }
-  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
-  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '要不要继续', choices: [{ label: '继续' }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null }
-  type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void; onSubmit?: (event: unknown) => void } }
+  const app = componentHarness('./question-card.tsx', { '@vibeface/client/workspace/context.tsx': { useWorkspace: () => workspace }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'web', source: 'membership', can_manage: false } } }) }, '@vibeface/client/workspace/labels.ts': { nodeName: () => '工作电脑' }, '@vibeface/client/workspace/questions.ts': { agentName, answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject }, '@/components/app/kit': kit, '@tanstack/react-router': router })
+  const longChoice = '只在本机验证完整配置并保留现有服务，检查通过后再决定是否发布'
+  const question = { question_id: 'q1', conversation_id: 'chat', bot: { bot_id: 'bot', name: '项目 Bot' }, severity: 'attention', text: '\n是否允许继续？\n已完成本机检查。\n\n线上结果未知。', choices: [{ label: '允许' }, { label: longChoice }, { label: '停下' }], about: { node: 'worker', agent: 'codex', session_id: 's', cwd: '/path/to/web/', summary: '改登录' }, author: 'gateway', created_at_ms: 1, answer: null, closed: null }
+  type Element = { type: unknown; props: Record<string, unknown> & { onClick?: () => void; onChange?: (event: unknown) => void } }
   const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as Element).props.children) : ''
-  const labelled = (elements: Element[], label: string) => elements.find(({ props }) => props.onClick && text(props.children).includes(label))
-  const words = (elements: Element[]) => elements.flatMap(({ props }) => [props.children].flat()).filter((child) => typeof child === 'string').join('')
+  const words = (elements: Element[]) => elements.map(({ props }) => text(props.children)).join('')
+  const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
+  const choose = (value: string) => {
+    const option = render().find(({ type, props }) => type === 'input' && props.value === value)
+    assert.ok(option?.props.onChange, `missing radio ${value}`)
+    option.props.onChange({})
+  }
+  const send = async (props: object = {}) => {
+    const button = render(props).find(({ type, props }) => type === 'Button' && text(props.children).includes('发送回答'))
+    assert.ok(button?.props.onClick)
+    button.props.onClick(); await settleComponent()
+  }
+  const write = (value: string) => {
+    const input = render().find(({ type }) => type === 'textarea')
+    assert.ok(input?.props.onChange)
+    input.props.onChange({ target: { value } })
+  }
   const plain = (value: unknown) => JSON.parse(JSON.stringify(value))
   try {
-    let elements: Element[] = app.render('QuestionCard', { question })
-    assert.match(words(elements), /web/, 'the meta line names the project')
-    assert.match(words(elements), /工作电脑/, 'and the device')
-    assert.equal(elements.some(({ type }) => type === 'Link'), false, 'in its own chat the card does not link to it')
-    labelled(elements, '停下')?.props.onClick?.(); await settleComponent()
-    assert.deepEqual(plain(sent[0]), [question, '停下'], 'a choice answers with its label')
-    app.render('QuestionCard', { question }).find(({ props }) => props['aria-label'] === '其他回答')?.props.onChange?.({ target: { value: '先等等' } })
-    app.render('QuestionCard', { question }).find(({ type }) => type === 'form')?.props.onSubmit?.({ preventDefault() {} }); await settleComponent()
-    assert.deepEqual(plain(sent[1]), [question, '先等等'], 'typed text answers too')
-    ;(app.render('QuestionCard', { question }).find(({ props }) => props.role === 'group')?.props.onKeyDown as (event: unknown) => void)({ key: '1', preventDefault() {} }); await settleComponent()
-    assert.deepEqual(plain(sent[2]), [question, '继续'], 'a focused choice answers by its number')
-    elements = app.render('QuestionCard', { question, inbox: true })
-    assert.equal(elements.find(({ type }) => type === 'Link')?.props.params && plain(elements.find(({ type }) => type === 'Link')?.props.params).botId, 'bot', '待处理 links to the chat')
-    workspace.pendingAnswers = [{ question_id: 'q1', text: '继续' }]
-    elements = app.render('QuestionCard', { question })
-    assert.equal(labelled(elements, '停下'), undefined, 'an unconfirmed answer is not replaced by another')
+    let elements = render()
+    assert.match(words(elements), /web[^]*工作电脑/, 'the context identifies its project and device')
+    assert.equal(elements.filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 4, 'three real choices and one custom mode')
+    assert.equal(elements.filter(({ type }) => type === 'input').every(({ props }) => props.checked === false), true, 'no answer is recommended or selected by default')
+    assert.equal(elements.some(({ type }) => type === 'textarea' || type === 'form'), false)
+    assert.equal(elements.some(({ props }) => props.onKeyDown || props['aria-keyshortcuts']), false, 'digits have no answer shortcut')
+    assert.ok(elements.some(({ props }) => props.text === '已完成本机检查。\n\n线上结果未知。'), 'the decision context keeps its paragraphs')
+    await send()
+    assert.equal(sent.length, 0)
+    assert.match(words(render()), /选一个回答，或自己写回答。/)
+    choose('允许')
+    assert.equal(sent.length, 0, 'selecting approval never sends it')
+    assert.equal(render().find(({ type, props }) => type === 'input' && props.value === '允许')?.props.checked, true)
+    await send()
+    assert.deepEqual(plain(sent.at(-1)), [question, '允许'], 'the approval label remains exact')
+    choose(longChoice)
+    assert.equal(sent.length, 1)
+    await send()
+    assert.deepEqual(plain(sent.at(-1)), [question, longChoice], 'the complete choice is submitted')
+    choose('custom')
+    for (const value of ['1', '１', '先检查配置\n确认后再继续']) {
+      write(value)
+      const input = render().find(({ type }) => type === 'textarea')
+      assert.ok(input?.props.id)
+      assert.equal(render().some(({ type, props }) => type === 'label' && props.htmlFor === input.props.id && text(props.children) === '你的回答'), true)
+      assert.equal(input.props.onKeyDown, undefined, 'Enter and IME stay native textarea input')
+      await send()
+      assert.deepEqual(plain(sent.at(-1)), [question, value], 'custom text is literal, including digits and newlines')
+    }
+    const count = sent.length
+    choose('停下'); choose('custom')
+    assert.equal(render().find(({ type }) => type === 'textarea')?.props.value, '先检查配置\n确认后再继续', 'switching modes keeps the handwritten draft')
+    write('   '); await send()
+    assert.equal(sent.length, count, 'whitespace cannot be submitted')
+    elements = render()
+    const invalid = elements.find(({ type }) => type === 'textarea')
+    assert.equal(invalid?.props['aria-invalid'], true)
+    assert.ok(elements.some(({ props }) => props.role === 'alert' && String(invalid?.props['aria-describedby']).includes(String(props.id))))
+    write('新回答')
+    workspace.writable = false
+    elements = render()
+    assert.equal(elements.find(({ type }) => type === 'fieldset')?.props.disabled, true)
+    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.disabled, true)
+    await send()
+    assert.equal(sent.length, count, 'the submit handler also enforces read-only state')
+    workspace.writable = true
+    workspace.pendingAnswers = [{ question_id: 'q1', text: '继续\n原文' }]
+    elements = render()
+    assert.equal(elements.some(({ type }) => type === 'input' || type === 'textarea'), false, 'a pending answer cannot be replaced')
     assert.match(words(elements), /没确认送达/)
-    labelled(elements, '再试')?.props.onClick?.(); await settleComponent()
-    assert.deepEqual(plain(sent[3]), [question, '继续'], 'trying again sends the same answer')
+    const retry = elements.find(({ type, props }) => type === 'Button' && text(props.children).includes('再试'))
+    assert.ok(retry?.props.onClick)
+    retry.props.onClick(); await settleComponent()
+    assert.deepEqual(plain(sent.at(-1)), [question, '继续\n原文'], 'unknown results retry their original text')
+    actionBusy = 'retry'
+    elements = render()
+    assert.match(words(elements), /正在发送/)
+    assert.doesNotMatch(words(elements), /没确认送达/)
+    assert.equal(elements.find(({ type }) => type === 'Button')?.props.disabled, true)
+    actionBusy = null
+    workspace.answered = { q1: '允许' }
+    elements = render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } }, answer: '过时答案' })
+    assert.match(words(elements), /已由另一端回答：停下/, 'the network winner takes precedence over a folded answer, closed state and pending retry')
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
     workspace.pendingAnswers = []
-    elements = app.render('QuestionCard', { question, answer: '继续' })
-    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'form'), false, 'an answered question offers nothing to press')
-    assert.match(words(elements), /已回答 · 继续/)
-    workspace.answered = { q1: '停下' }
-    elements = app.render('QuestionCard', { question })
-    assert.match(words(elements), /已回答 · 停下/, 'an answer that just landed folds the card at once')
-    assert.equal(elements.some(({ props }) => props.role === 'status'), true, 'and is announced')
-    assert.equal(toasts.length, 0, 'answering in the chat itself needs no toast')
-    assert.doesNotMatch(words(elements), /升级依赖/, 'a question that held no task names none')
-    elements = app.render('QuestionCard', { question: { ...question, about: { ...question.about, request_id: 'r' } } })
-    assert.match(words(elements), /升级依赖[^]*工作电脑/, 'an answered approval names the task it held and its device, even once that task finished')
+    elements = render()
+    assert.match(words(elements), /已回答 · 允许/, 'a shared answer folds the card immediately')
+    assert.doesNotMatch(words(elements), /升级依赖/, 'an ordinary question names no held task')
+    elements = render({ question: { ...question, about: { ...question.about, request_id: 'r' } } })
+    assert.match(words(elements), /升级依赖[^]*工作电脑/)
     workspace.answered = {}
-    labelled(app.render('QuestionCard', { question: { ...question, question_id: 'q2' }, inbox: true }), '继续')?.props.onClick?.()
-    await settleComponent()
-    assert.deepEqual(toasts.map(({ text }) => text), ['已回答'], '待处理 says it was answered')
+    elements = render({ question: { ...question, closed: 'request_lost' } })
+    assert.match(words(elements), /已失效/)
+    assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input'), false)
+    const four = { ...question, choices: [...question.choices, { label: '先核对发布目标' }] }
+    assert.equal(render({ question: four }).filter(({ type, props }) => type === 'input' && props.type === 'radio').length, 5, 'four alternatives remain complete')
+    choose('允许')
+    await send({ inbox: true })
+    assert.deepEqual(toasts.map(({ text }) => text), ['已回答'])
     toasts[0].action?.onClick()
-    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'bot' } }], 'and leads to the chat it went to')
+    assert.deepEqual(plain(visited), [{ to: '/b/$botId', params: { botId: 'bot' } }])
+    answerStatus = 'already_answered'
+    await send({ inbox: true })
+    assert.deepEqual(notices, ['这个问题已经回答过了'], 'the existing race announcement is retained')
+    assert.equal(toasts.length, 1, 'a losing answer has no success toast')
   } finally { app.close() }
+})
+
+test("a question without choices opens a labelled multiline answer directly", () => {
+  const app = componentHarness('./question-card.tsx', {
+    '@vibeface/client/workspace/context.tsx': { useWorkspace: () => ({ writable: true, nodes: [], answered: {}, pendingAnswers: [], bots: [], openWorks: [] }) },
+    '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+    '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
+    '@vibeface/client/workspace/questions.ts': { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+    '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
+    '@tanstack/react-router': { useNavigate: () => () => {} },
+  })
+  try {
+    const elements = app.render('QuestionCard', { question: { question_id: 'free', text: '需要什么配置？', choices: [], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null } })
+    assert.equal(elements.find(({ type }) => type === 'textarea')?.props.rows, 3)
+    assert.equal(elements.some(({ type }) => type === 'fieldset'), false)
+  } finally { app.close() }
+})
+
+test("mobile questions select before sending, preserve literal text and retry only the unknown answer", async () => {
+  for (const value of ['允许', '1', '１', '先核对配置\n确认后再继续']) {
+    const sent: unknown[][] = []
+    let hold = pendingResult()
+    const shared = { writable: true, answered: {} as Record<string, string>, pendingAnswers: [] as { question_id: string; text: string }[], openWorks: [], nodes: [] }
+    const question = { question_id: 'mobile', text: '\n是否允许继续？\n线上结果未知。', choices: [{ label: '允许' }, { label: '先核对配置' }, { label: '停下' }, { label: '保持现状' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: null, closed: null }
+    const app = componentHarness('../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+      '@/data/context': { useWorkspace: () => ({ members: [], bots: [], actions: { answer: (...args: unknown[]) => { sent.push(args); return hold.promise } } }) },
+      '@/data/live': { useLive: () => shared },
+      '@vibeface/client/identity/context.tsx': { useDevice: () => ({ ready: { entry: { device_id: 'gateway' }, principal: { device_id: 'mobile', source: 'membership', can_manage: false } } }) },
+      '@vibeface/client/workspace/questions.ts': { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+      '@vibeface/client/lib/errors.ts': errors,
+      'expo-haptics': { notificationAsync: async () => {}, NotificationFeedbackType: { Success: 'success' } },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+    })
+    const render = (props: object = {}) => app.render('QuestionCard', { question, ...props })
+    const press = (label: string) => {
+      const onPress = render().find(({ props }) => props.accessibilityLabel === label)?.props.onPress
+      assert.ok(typeof onPress === 'function', `missing mobile control ${label}`)
+      onPress()
+    }
+    const words = () => render().map(({ props }) => props.children).filter((child) => typeof child === 'string').join('')
+    try {
+      assert.equal(render().filter(({ props }) => props.accessibilityRole === 'radio').length, 5)
+      press('发送回答')
+      assert.equal(sent.length, 0)
+      if (value === '允许') press('允许')
+      else {
+        press('自己写回答')
+        const input = render().find(({ type }) => type === 'TextInput')
+        assert.equal(input?.props.multiline, true)
+        assert.equal(input?.props.submitBehavior, 'newline')
+        assert.equal(input?.props.onSubmitEditing, undefined)
+        const write = input?.props.onChangeText
+        assert.ok(typeof write === 'function')
+        write(value)
+      }
+      assert.equal(sent.length, 0, 'selecting or writing is local')
+      shared.writable = false
+      press('发送回答')
+      assert.equal(sent.length, 0, 'read-only state also guards the handler')
+      shared.writable = true
+      press('发送回答'); press('发送回答')
+      assert.equal(sent.length, 1, 'the busy ref blocks a second tap before React rerenders')
+      assert.equal(sent[0][1], value)
+      shared.pendingAnswers = [{ question_id: 'mobile', text: value }]
+      assert.match(words(), /正在发送/)
+      assert.doesNotMatch(words(), /没确认送达/)
+      hold.reject(new Error('connection lost')); await settleComponent()
+      assert.match(words(), /没确认送达/)
+      assert.equal(render().some(({ type, props }) => type === 'TextInput' || props.accessibilityRole === 'radio'), false)
+      hold = pendingResult()
+      const retry = render().find(({ type }) => type === 'Button')?.props.onPress
+      assert.ok(typeof retry === 'function')
+      retry(); retry()
+      assert.equal(sent.length, 2)
+      assert.equal(sent[1][1], value, 'retry preserves its original text')
+      hold.resolve({ status: 'already_answered', text: '停下' }); await settleComponent()
+      assert.match(words(), /已由另一端回答：停下/, 'the returned winner settles immediately without waiting for a snapshot')
+      shared.answered = { mobile: '允许' }
+      assert.ok(render({ question: { ...question, closed: 'request_lost', answer: { text: '停下' } } }).some(({ props }) => props.children === '已由另一端回答：停下'), 'standing answers precede closed and pending state')
+    } finally { app.close() }
+  }
+})
+
+test("remounted question cards identify the answer author and reserve warning styling for a lost race", () => {
+  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('') : node && typeof node === 'object' && 'props' in node ? text((node as { props: { children?: unknown } }).props.children) : ''
+  for (const platform of ['web', 'mobile']) {
+    for (const scenario of [{ author: 'phone', mine: undefined, elsewhere: true, warned: false }, { author: 'gateway', mine: undefined, elsewhere: true, warned: false }, { author: 'self', mine: undefined, elsewhere: false, warned: false }, { author: 'phone', mine: '停下', elsewhere: true, warned: true }, { author: 'phone', mine: '继续', elsewhere: true, warned: false }]) {
+      const question = { question_id: 'remount', text: '继续吗？\n线上结果未知。', choices: [{ label: '允许' }], severity: 'attention', about: { node: 'worker', session_id: 's', cwd: '' }, answer: { text: '继续', author: scenario.author }, closed: 'request_lost' }
+      const shared = { writable: true, nodes: [], answered: scenario.mine === undefined ? {} : { remount: scenario.mine }, pendingAnswers: [{ question_id: 'remount', text: '旧草稿' }], bots: [], openWorks: [] }
+      const app = componentHarness(platform === 'web' ? './question-card.tsx' : '../../../../../../apps/mobile/src/features/chat/question-card.tsx', {
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared },
+        '@/data/context': { useWorkspace: () => ({ members: [], bots: [] }) },
+        '@/data/live': { useLive: () => shared },
+        '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null, ready: { principal: { device_id: 'self', source: 'membership', can_manage: false } } }) },
+        '@vibeface/client/workspace/labels.ts': { nodeName: () => '设备' },
+        '@vibeface/client/workspace/questions.ts': { answerLabel, approvalTask, declined, questionMeta, questionParts, settledAnswer, sharedProject },
+        '@/components/app/kit': { useAction: () => ({ busy: null, error: null }) },
+        '@tanstack/react-router': { useNavigate: () => () => {} },
+      })
+      try {
+        const elements = app.render('QuestionCard', { question, answer: '过时的折叠答案' })
+        const settled = elements.find(({ props }) => props.ask === '继续吗？')
+        assert.ok(settled, `${platform} returns the standing answer before closed or pending state`)
+        assert.equal(text(settled.props.children), scenario.elsewhere ? '已由另一端回答：继续' : '已回答 · 继续')
+        const marker = settled.props.mark as { props: { className: string } } | undefined
+        const className = platform === 'web' ? marker?.props.className : settled.props.className
+        assert.equal(String(className).includes('text-warning'), scenario.warned, `${platform}: another author alone is not a failed race`)
+        assert.equal(elements.some(({ type }) => type === 'Button' || type === 'input' || type === 'TextInput'), false)
+      } finally { app.close() }
+    }
+  }
 })
 
 test("any entrance stops an unfinished task once, after a confirming second tap, even on another device", async () => {
