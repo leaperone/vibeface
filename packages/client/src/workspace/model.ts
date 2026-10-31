@@ -5,6 +5,7 @@ import type {
   SchedulerSnapshot, ConflictVersion, WriteStatus, WorkRecord, WorkState, DispatchState, WorkOutcome, BotRecord, CreateBotRequest, PendingBot, PendingCheck, CoordinationCheck,
   BotChange, BotChangeRecord, Overwritten, BotSchedule, BotSkill, BotSettings, SentBotMessage, FieldEdit, ModelEdit, BotModels, ConfirmReason, ConversationRecords, OpenWork, SkillSet, SteerOutcome, Busy,
   WorkPhase, OverviewBot, OverviewNode, OverviewConsistency, OverviewTaskState, OverviewTask, OverviewQuestion, OverviewJob, OverviewCoverage, WorkspaceOverview, OverviewDeliveryState, OverviewRelation, OverviewConversation, OverviewSession,
+  AgentLane, QueueHoldReason, ContextProjection, MemoryConflict,
 } from "./types.ts"
 import { answerId, questionOpen } from "./questions.ts"
 import { providerIds, type ProviderId } from "../lib/node.ts"
@@ -94,12 +95,52 @@ function failure(value: unknown): { failure?: FailureKind } {
 }
 function attachments(value: unknown) { return value == null ? undefined : list(value).map((item) => { const file = record(item); return { hash: text(file.hash), size: number(file.size), name: text(file.name) } }) }
 function optionalText(value: unknown): string | undefined { return value == null ? undefined : text(value) }
+function agentLane(value: unknown): AgentLane | undefined {
+  switch (value) {
+    case null: case undefined: return undefined
+    case 'main': case 'task': case 'schedule_routine': case 'bot_message': return value
+    default: throw new Error('未知的任务通道。')
+  }
+}
+function queueHold(value: unknown): QueueHoldReason | undefined {
+  switch (value) {
+    case null: case undefined: return undefined
+    case 'active_turn': case 'steering_settlement': return value
+    default: throw new Error('未知的排队原因。')
+  }
+}
+function contextProjection(value: unknown): ContextProjection | null {
+  if (value == null) return null
+  const data = record(value), coverage = record(data.coverage)
+  const stage = data.stage, provider = data.provider
+  if (stage !== 'compiled' && stage !== 'started' && stage !== 'completed' && stage !== 'failed' && stage !== 'cancelled' && stage !== 'interrupted' && stage !== 'unknown') throw new Error('未知的上下文状态。')
+  if (provider !== 'codex' && provider !== 'cursor' && provider !== 'claude' && provider !== 'pi' && provider !== 'opencode') throw new Error('未知的 AI 服务。')
+  const fingerprint = (value: unknown) => { const digest = text(value); if (!/^[a-f0-9]{64}$/.test(digest)) throw new Error('上下文指纹格式不对。'); return digest }
+  return {
+    attempt_id: text(data.attempt_id), provider, stage,
+    stable_fingerprint: fingerprint(data.stable_fingerprint), dynamic_fingerprint: fingerprint(data.dynamic_fingerprint),
+    session_generation: number(data.session_generation), stable_bytes: number(data.stable_bytes), dynamic_bytes: number(data.dynamic_bytes),
+    invalidation_reason: data.invalidation_reason == null ? null : text(data.invalidation_reason),
+    coverage: {
+      messages_omitted: number(coverage.messages_omitted), works_omitted: number(coverage.works_omitted), dispatches_omitted: number(coverage.dispatches_omitted),
+      questions_omitted: number(coverage.questions_omitted), attachments_omitted: number(coverage.attachments_omitted), memory_omitted: number(coverage.memory_omitted),
+      history_retrieval: text(coverage.history_retrieval),
+    },
+  }
+}
+function memoryConflicts(value: unknown): MemoryConflict[] {
+  return list(value).map((value) => {
+    const data = record(value)
+    return { call_ref: text(data.call_ref), memory_id: text(data.memory_id), expected_epoch: number(data.expected_epoch), actual_epoch: number(data.actual_epoch), expected_revision: text(data.expected_revision), actual_revision: text(data.actual_revision), reason: text(data.reason) }
+  })
+}
 function schedulerSnapshot(value: unknown): SchedulerSnapshot | null {
   if (value == null) return null
   const data = record(value), capabilities = data.capabilities == null ? null : record(data.capabilities), remote = data.remote == null ? null : record(data.remote)
   return {
     unanswered: list(data.unanswered).map(text),
-    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    jobs: list(data.jobs).map((item) => { const job = record(item); return { trigger: text(job.trigger), state: text(job.state), lane: agentLane(job.lane), hold_reason: queueHold(job.hold_reason), message_id: optionalText(job.message_id), reply_message_id: optionalText(job.reply_message_id), failure: job.failure == null ? undefined : { kind: failureKind(record(job.failure).kind) ?? "unknown", detail: text(record(job.failure).detail) }, pending_check: job.pending_check === true, outcome: optionalText(job.outcome) as SteerOutcome | undefined, source_node: optionalText(job.source_node) } }),
+    ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
     provider: optionalText(data.provider), model: optionalText(data.model), capabilities: capabilities ? { streaming: flag(capabilities.streaming), cancel: flag(capabilities.cancel), steer: flag(capabilities.steer) } : undefined,
     remote: remote ? { owner: text(remote.owner), reachable: flag(remote.reachable) } : undefined,
   }
@@ -536,6 +577,8 @@ export function parseRecords(value: unknown): ConversationRecords {
     questions: list(data.questions).map(question), notifications: parseNotifications(data),
     deliveries: list(data.deliveries), checks: list(data.checks).map(coordinationCheck),
     jobs: scheduler?.jobs ?? [], unanswered: scheduler?.unanswered ?? [],
+    ...(data.context === undefined ? {} : { context: contextProjection(data.context) }),
+    ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
     sent: list(data.sent).map(sentBotMessage), open_works: list(data.open_works).map(openWork),
   }
 }
@@ -639,6 +682,7 @@ function botSettings(value: unknown): BotSettings {
       return { ...schedule(view), schedule_id: text(view.schedule_id), next_run_at_ms: view.next_run_at_ms == null ? null : number(view.next_run_at_ms) }
     }),
     memory: list(data.memory).map((item) => { const entry = record(item); return { memory_id: text(entry.memory_id), text: text(entry.text) } }),
+    ...(data.memory_conflicts === undefined ? {} : { memory_conflicts: memoryConflicts(data.memory_conflicts) }),
   }
 }
 export function parseBinaryPage(value: unknown, hash: string, offset: number) {

@@ -18,6 +18,7 @@ fn chat_jobs(jobs: Vec<SchedulerJob>) -> Vec<SchedulerJob> {
 
 fn job_value(job: &SchedulerJob, checks: &[PendingCheck]) -> Result<Value> {
     let mut value = serde_json::to_value(job)?;
+    value["lane"] = json!(job.kind.lane());
     value["reply_message_id"] = json!(job.message_id);
     value["message_id"] = json!(job.trigger.strip_prefix("message:"));
     value["pending_check"] = json!(checks.iter().any(|check| check.trigger == job.trigger));
@@ -425,13 +426,22 @@ impl Runtime {
         let mut jobs = Vec::new();
         for job in &all[all.len().saturating_sub(MAX_OWNER_JOBS)..] {
             let mut value = job_value(job, &checks)?;
+            value["hold_reason"] = json!(store.scheduler_queue_hold(
+                network,
+                &self.identity.device_id()?,
+                scope,
+                &job.state
+            )?);
             if let Some(fields) = value.as_object_mut() {
                 fields.remove("basis");
             }
             value["replied"] = json!(store.message(network, scope, &job.message_id)?.is_some());
             jobs.push(value);
         }
-        Ok(json!({"jobs":jobs,"manager":self.scheduler_manager_metadata()}))
+        Ok(
+            json!({"jobs":jobs,"manager":self.scheduler_manager_metadata(),
+            "context":store.scheduler_context_projection(scope)?}),
+        )
     }
 
     /// When another device schedules the conversation, its jobs join `jobs` for display only,
@@ -492,7 +502,7 @@ impl Runtime {
             jobs.push(job);
         }
         Ok(Some((
-            json!({"owner":owner,"reachable":true}),
+            json!({"owner":owner,"reachable":true,"context":reply["context"]}),
             reply["manager"].clone(),
         )))
     }
@@ -516,6 +526,12 @@ impl Runtime {
         let mut jobs = Vec::new();
         for job in chat_jobs(store.scheduler_jobs(scope)?) {
             let mut value = job_value(&job, &checks)?;
+            value["hold_reason"] = json!(store.scheduler_queue_hold(
+                network,
+                &self.identity.device_id()?,
+                scope,
+                &job.state
+            )?);
             value["manager"] = manager.clone();
             jobs.push(value);
         }

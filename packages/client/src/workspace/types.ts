@@ -62,6 +62,8 @@ export type WorkRecord = {
 export type ManagerJob = {
   trigger: string
   state: string
+  lane?: AgentLane
+  hold_reason?: QueueHoldReason
   message_id?: string
   reply_message_id?: string
   /** A failed or interrupted reply's cause; `detail` is the original text, for 技术详情. */
@@ -72,9 +74,32 @@ export type ManagerJob = {
   /** The owner device that reported it; absent for this device's own jobs. */
   source_node?: string
 }
+export type AgentLane = 'main' | 'task' | 'schedule_routine' | 'bot_message'
+export type QueueHoldReason = 'active_turn' | 'steering_settlement'
+export type ContextProjection = {
+  attempt_id: string
+  provider: ProviderId
+  stable_fingerprint: string
+  dynamic_fingerprint: string
+  session_generation: number
+  coverage: {
+    messages_omitted: number; works_omitted: number; dispatches_omitted: number
+    questions_omitted: number; attachments_omitted: number; memory_omitted: number
+    history_retrieval: string
+  }
+  stable_bytes: number
+  dynamic_bytes: number
+  invalidation_reason: string | null
+  stage: 'compiled' | 'started' | 'completed' | 'failed' | 'cancelled' | 'interrupted' | 'unknown'
+}
+export type MemoryConflict = {
+  call_ref: string; memory_id: string; expected_epoch: number; actual_epoch: number
+  expected_revision: string; actual_revision: string; reason: string
+}
 export type SteerOutcome = 'answered' | 'unfinished' | 'unknown'
 export type SchedulerSnapshot = {
   jobs: ManagerJob[]
+  context?: ContextProjection | null
   /** Messages a former scheduling device left unanswered; only listed on the device that schedules now. */
   unanswered: string[]
   provider?: string
@@ -100,6 +125,8 @@ export type OpenWork = WorkRecord & { conversation_id: string }
 /** What one change touched, pushed by the Node so the page merges it without a reload. */
 export type ConversationRecords = {
   conversation_id: string
+  context?: ContextProjection | null
+  memory_conflicts?: MemoryConflict[]
   messages: TranscriptMessage[]
   works: WorkRecord[]
   last_message: LastMessage | null
@@ -161,7 +188,7 @@ type SkillSummary = { skill_id: string; name: string; description: string }
 export type ScheduleView = BotSchedule & { schedule_id: string; next_run_at_ms: number | null }
 export type ScheduleAction = "pause" | "resume" | "delete"
 /** This bot's schedules still ahead, its notes, and the skill library every bot shares. */
-export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[] }
+export type BotSettings = { skills: SkillSummary[]; schedules: ScheduleView[]; memory: MemoryEntry[]; memory_conflicts?: MemoryConflict[] }
 export type ConversationPayload = {
   conversation: ConversationSummary | null
   messages: TranscriptMessage[]

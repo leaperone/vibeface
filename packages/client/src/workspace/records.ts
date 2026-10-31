@@ -19,7 +19,12 @@ export function mergeConversation(shown: ConversationPayload, records: Conversat
   const jobs = [...records.jobs.filter((job) => job.state !== "pending_delivery" || !remote.some((item) => item.trigger === job.trigger)), ...remote]
   return {
     ...shown, messages, works: withDeliveries(works, records.deliveries), checks: records.checks, questions: records.questions, sent: records.sent,
-    scheduler: shown.scheduler && { ...shown.scheduler, jobs, unanswered: records.unanswered },
+    scheduler: shown.scheduler && { ...shown.scheduler, jobs, unanswered: records.unanswered,
+      ...(!shown.scheduler.remote && records.context !== undefined ? { context: records.context } : {}),
+    },
+    bot_settings: { ...shown.bot_settings,
+      ...(records.memory_conflicts === undefined ? {} : { memory_conflicts: records.memory_conflicts }),
+    },
   }
 }
 

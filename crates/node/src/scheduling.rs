@@ -26,6 +26,54 @@ pub enum TriggerKind {
     BotMessage,
 }
 
+/// The durable lane a trigger occupies. A lane is an explanation and routing key for
+/// projections; it never grants a second writer to a shared session or Memory store.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLane {
+    Main,
+    Task,
+    ScheduleRoutine,
+    BotMessage,
+}
+
+impl TriggerKind {
+    pub const fn lane(self) -> AgentLane {
+        match self {
+            Self::Human | Self::Answer | Self::WorkResult => AgentLane::Main,
+            Self::AgentTask => AgentLane::Task,
+            Self::Schedule => AgentLane::ScheduleRoutine,
+            Self::BotMessage => AgentLane::BotMessage,
+        }
+    }
+}
+
+/// Why a queued job is waiting. This is projection metadata only. The durable job state and
+/// existing `Unverified` handling remain the source of truth for execution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueHoldReason {
+    ActiveTurn,
+    SteeringSettlement,
+}
+
+pub fn queue_hold_reason(
+    state: &JobState,
+    active: bool,
+    steering_unsettled: bool,
+) -> Option<QueueHoldReason> {
+    if !matches!(state, JobState::Queued) {
+        return None;
+    }
+    if active {
+        return Some(QueueHoldReason::ActiveTurn);
+    }
+    if steering_unsettled {
+        return Some(QueueHoldReason::SteeringSettlement);
+    }
+    None
+}
+
 pub fn message_trigger(message_id: &str) -> String {
     format!("message:{message_id}")
 }
@@ -389,6 +437,51 @@ pub struct Shown {
     pub session_generation: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_lineage: Vec<SessionLineage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_conflicts: Vec<MemoryConflict>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStage {
+    Compiled,
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Unknown,
+}
+
+/// Only digests, counts and lifecycle facts leave the local session. The prompt, native
+/// session identifiers and credentials remain private.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextProjection {
+    pub attempt_id: String,
+    pub provider: Provider,
+    pub stable_fingerprint: String,
+    pub dynamic_fingerprint: String,
+    pub session_generation: u64,
+    pub coverage: crate::agent_context::ContextCoverage,
+    pub stable_bytes: usize,
+    pub dynamic_bytes: usize,
+    pub invalidation_reason: Option<String>,
+    pub stage: ContextStage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConflict {
+    pub call_ref: String,
+    pub memory_id: String,
+    pub expected_epoch: u32,
+    pub actual_epoch: u32,
+    pub expected_revision: String,
+    pub actual_revision: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,5 +583,43 @@ pub struct ReplyTurn {
 impl PendingCheck {
     pub fn id(attempt_id: &str) -> String {
         format!("manager:{attempt_id}")
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_kinds_have_stable_lanes() {
+        assert_eq!(TriggerKind::Human.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::Answer.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::WorkResult.lane(), AgentLane::Main);
+        assert_eq!(TriggerKind::AgentTask.lane(), AgentLane::Task);
+        assert_eq!(TriggerKind::Schedule.lane(), AgentLane::ScheduleRoutine);
+        assert_eq!(TriggerKind::BotMessage.lane(), AgentLane::BotMessage);
+    }
+
+    #[test]
+    fn queued_jobs_explain_their_wait_boundary() {
+        assert_eq!(
+            queue_hold_reason(&JobState::Queued, true, false),
+            Some(QueueHoldReason::ActiveTurn)
+        );
+        assert_eq!(
+            queue_hold_reason(&JobState::Queued, false, true),
+            Some(QueueHoldReason::SteeringSettlement)
+        );
+        assert_eq!(
+            queue_hold_reason(
+                &JobState::Cancelled {
+                    attempt: None,
+                    evidence: "stopped".into()
+                },
+                true,
+                false
+            ),
+            None
+        );
     }
 }

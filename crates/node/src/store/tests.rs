@@ -5868,6 +5868,7 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
         staged_memories: Default::default(),
         session_generation: 0,
         session_lineage: Vec::new(),
+        ..Shown::default()
     };
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
@@ -5934,6 +5935,112 @@ fn message_seq(store: &Store, net: &Net, message: &str) -> Result<u64> {
     .context("message")?
     .event
     .seq)
+}
+
+#[test]
+fn compiled_context_tracks_observed_turn_state_without_private_values() -> Result<()> {
+    use crate::scheduling::{ContextProjection, ContextStage, QueueHoldReason};
+    let net = net()?;
+    let mut store = store(&net)?;
+    conversation(&mut store, &net)?;
+    for (index, outcome, expected) in [
+        (1, JobOutcome::Completed, ContextStage::Completed),
+        (
+            2,
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Lost, "unknown"),
+                process_unconfirmed: true,
+            },
+            ContextStage::Unknown,
+        ),
+    ] {
+        let message = format!("context-{index}");
+        say(&mut store, &net, &message, true)?;
+        let claimed = store
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("claim")?;
+        let trigger = claimed.job.trigger.clone();
+        let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+        let projection = ContextProjection {
+            attempt_id: attempt.clone(),
+            provider: Provider::Codex,
+            stable_fingerprint: crate::crypto::digest(b"stable"),
+            dynamic_fingerprint: crate::crypto::digest(b"dynamic"),
+            session_generation: claimed.shown.session_generation,
+            coverage: Default::default(),
+            stable_bytes: 100,
+            dynamic_bytes: 200,
+            invalidation_reason: None,
+            stage: ContextStage::Compiled,
+        };
+        store.record_compiled_context("c", &trigger, &attempt, &projection)?;
+        assert_eq!(
+            store
+                .scheduler_context_projection("c")?
+                .context("compiled")?
+                .stage,
+            ContextStage::Compiled
+        );
+        assert_eq!(
+            store.scheduler_queue_hold(
+                &net.network,
+                &net.a.device_id()?,
+                "c",
+                &JobState::Queued
+            )?,
+            Some(QueueHoldReason::ActiveTurn)
+        );
+        store.mark_started("c", &trigger, &attempt)?;
+        store.save_scheduler_native_id(
+            "c",
+            &trigger,
+            &attempt,
+            "private-native-thread",
+            "private-bearer",
+            false,
+        )?;
+        store.record_manager_turn(
+            &attempt,
+            "system",
+            "private-native-thread",
+            Some("turn"),
+            &Shown::default(),
+        )?;
+        assert_eq!(
+            store
+                .scheduler_context_projection("c")?
+                .context("started")?
+                .stage,
+            ContextStage::Started
+        );
+        store.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            outcome,
+            "reply",
+            5,
+        )?;
+        // A late Provider callback cannot change a terminal observation back to started.
+        store.record_manager_turn(
+            &attempt,
+            "system",
+            "private-native-thread",
+            Some("turn"),
+            &Shown::default(),
+        )?;
+        let context = store
+            .scheduler_context_projection("c")?
+            .context("terminal")?;
+        assert_eq!(context.stage, expected);
+        let encoded = serde_json::to_string(&context)?;
+        assert!(encoded.len() < 2_048);
+        assert!(!encoded.contains("private-native-thread"));
+        assert!(!encoded.contains("private-bearer"));
+    }
+    Ok(())
 }
 
 #[test]

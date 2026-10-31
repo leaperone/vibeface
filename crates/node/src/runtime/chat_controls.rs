@@ -195,12 +195,19 @@ impl Runtime {
             })
             .collect();
         let memory = store.memories(network, scope)?;
+        let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
+        let local_context = store.scheduler_context_projection(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
         drop(store);
         let (remote, metadata) = match owner {
             Some((remote, metadata)) if metadata.is_object() => (remote, metadata),
-            Some((remote, _)) => (remote, self.scheduler_manager_metadata()),
+            Some((remote, _)) => (remote, Value::Null),
             None => (Value::Null, self.scheduler_manager_metadata()),
+        };
+        let context = if remote.is_null() {
+            json!(local_context)
+        } else {
+            remote["context"].clone()
         };
         Ok(json!({
             "conversation":conversation,
@@ -213,11 +220,12 @@ impl Runtime {
             "sent":sent,
             "questions":questions,
             "sessions":sessions,
-            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory},
+            "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory,
+                "memory_conflicts":memory_conflicts},
             "checks":checks,
             "local_node":local,
             "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
-                "capabilities":metadata["capabilities"],"remote":remote},
+                "capabilities":metadata["capabilities"],"remote":remote,"context":context},
             "observation_targets":targets,
         }))
     }
@@ -292,6 +300,8 @@ impl Runtime {
             "deliveries":deliveries(&store, network, scope)?,
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
+            "context":store.scheduler_context_projection(scope)?,
+            "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
         })))
     }

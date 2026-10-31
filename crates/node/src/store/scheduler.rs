@@ -1299,6 +1299,23 @@ fn end_job_from(
         .context("scheduler attempt missing")?
         .clone();
     let attempt_id = attempt.id.clone();
+    if let Some(context) = session
+        .shown
+        .context
+        .as_mut()
+        .filter(|context| context.attempt_id == attempt_id)
+    {
+        context.stage = match &outcome {
+            JobOutcome::Completed => ContextStage::Completed,
+            JobOutcome::Failed(_) => ContextStage::Failed,
+            JobOutcome::Cancelled(_) => ContextStage::Cancelled,
+            JobOutcome::Interrupted {
+                process_unconfirmed: true,
+                ..
+            } => ContextStage::Unknown,
+            JobOutcome::Interrupted { .. } => ContextStage::Interrupted,
+        };
+    }
     let (status, failure, fallback) = reply_status(&outcome);
     let text = if text.trim().is_empty() {
         fallback.to_owned()
@@ -1544,6 +1561,68 @@ impl Store {
                 .map(|session| session.permission_version)
                 .unwrap_or(1),
         )
+    }
+
+    pub(crate) fn scheduler_queue_hold(
+        &self,
+        network: &str,
+        local: &str,
+        conversation: &str,
+        state: &JobState,
+    ) -> Result<Option<QueueHoldReason>> {
+        let session = load_session(&self.connection, conversation)?;
+        let owned = conversation_from(&self.connection, network, conversation)?
+            .is_some_and(|conversation| conversation.owner.as_deref() == Some(local));
+        let steering = owned
+            && !query_jobs(
+                &self.connection,
+                "conversation_id=? AND state='steering'",
+                [conversation],
+            )?
+            .is_empty();
+        Ok(queue_hold_reason(state, session.active.is_some(), steering))
+    }
+
+    pub(crate) fn scheduler_context_projection(
+        &self,
+        conversation: &str,
+    ) -> Result<Option<ContextProjection>> {
+        Ok(load_session(&self.connection, conversation)?.shown.context)
+    }
+
+    pub(crate) fn scheduler_memory_conflicts(
+        &self,
+        conversation: &str,
+    ) -> Result<Vec<MemoryConflict>> {
+        Ok(load_session(&self.connection, conversation)?
+            .shown
+            .memory_conflicts)
+    }
+
+    pub(crate) fn record_compiled_context(
+        &mut self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        context: &ContextProjection,
+    ) -> Result<()> {
+        ensure!(
+            context.attempt_id == attempt_id,
+            "context attempt does not match"
+        );
+        ensure!(
+            context.stage == ContextStage::Compiled,
+            "context has not been submitted yet"
+        );
+        self.update_attempt(conversation, trigger, attempt_id, |job, session| {
+            ensure!(
+                session.active.as_deref() == Some(trigger) && !job.state.terminal(),
+                "scheduler attempt is no longer active"
+            );
+            session.shown.context = Some(context.clone());
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn scheduler_jobs(&self, conversation: &str) -> Result<Vec<SchedulerJob>> {
@@ -1886,6 +1965,8 @@ impl Store {
                     session.shown = Shown {
                         session_generation,
                         session_lineage,
+                        context: session.shown.context.take(),
+                        memory_conflicts: std::mem::take(&mut session.shown.memory_conflicts),
                         ..Shown::default()
                     };
                 }
@@ -2147,6 +2228,7 @@ impl Store {
         )?;
         if turn_id.is_some()
             && let Some(job) = query_jobs(&tx, "attempt_id=?", [attempt_id])?.pop()
+            && !job.state.terminal()
             && job.kind != TriggerKind::AgentTask
         {
             let mut session = load_session(&tx, &job.conversation_id)?;
@@ -2165,6 +2247,17 @@ impl Store {
                     .max(session.shown.session_generation);
                 if shown.session_lineage.is_empty() {
                     shown.session_lineage = session.shown.session_lineage.clone();
+                }
+                shown.memory_conflicts = session.shown.memory_conflicts.clone();
+                if shown.context.is_none() {
+                    shown.context = session.shown.context.clone();
+                }
+                if let Some(context) = shown
+                    .context
+                    .as_mut()
+                    .filter(|context| context.attempt_id == attempt_id)
+                {
+                    context.stage = ContextStage::Started;
                 }
                 session.shown = shown;
                 save_session(&tx, &session)?;

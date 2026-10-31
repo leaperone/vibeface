@@ -55,6 +55,33 @@ test("the owner's jobs stay through a push of this device's records and replace 
   assert.deepEqual(next.scheduler?.jobs.map((item) => [item.trigger, item.state]), [["message:m2", "pending_delivery"], ["message:m1", "running"]])
 })
 
+test("context state and queue reasons survive records without replacing a remote owner's context", () => {
+  const context = {
+    attempt_id: 'attempt', provider: 'codex', stage: 'compiled', session_generation: 2,
+    stable_fingerprint: 'a'.repeat(64), dynamic_fingerprint: 'b'.repeat(64),
+    stable_bytes: 100, dynamic_bytes: 200, invalidation_reason: 'stable_prompt_or_provider_changed',
+    coverage: { messages_omitted: 3, works_omitted: 0, dispatches_omitted: 1, questions_omitted: 0, attachments_omitted: 0, memory_omitted: 2, history_retrieval: 'context' },
+    native_token: 'must-not-enter-client-state', rendered: 'private context',
+  }
+  const conflict = { call_ref: 'remember', memory_id: 'memory', expected_epoch: 9, actual_epoch: 9, expected_revision: '', actual_revision: 'new', reason: 'revision_changed' }
+  const update = records({ context, memory_conflicts: [conflict], jobs: [{ trigger: 'a', state: 'queued', lane: 'main', hold_reason: 'active_turn', pending_check: false }] })
+  const next = mergeConversation(shown, update)
+  assert.equal(next.scheduler?.context?.stage, 'compiled')
+  assert.equal(next.scheduler?.context?.coverage.messages_omitted, 3)
+  assert.equal(next.scheduler?.jobs[0].lane, 'main')
+  assert.equal(next.scheduler?.jobs[0].hold_reason, 'active_turn')
+  assert.equal(next.scheduler?.jobs[0].pending_check, false)
+  assert.deepEqual(next.bot_settings.memory_conflicts, [conflict])
+  assert(!JSON.stringify(next).includes('must-not-enter-client-state'))
+  assert(!JSON.stringify(next).includes('private context'))
+  const away = { ...next, scheduler: next.scheduler && { ...next.scheduler, remote: { owner: 'owner', reachable: true } } }
+  const local = records({ context: { ...context, stage: 'failed', session_generation: 3 } })
+  assert.equal(mergeConversation(away, local).scheduler?.context?.session_generation, 2)
+  assert.equal(mergeConversation(next, records({ context: null })).scheduler?.context, null)
+  assert.throws(() => records({ context: { ...context, stage: 'invented' } }))
+  assert.throws(() => records({ context: { ...context, stable_fingerprint: 'invalid' } }))
+})
+
 test("pushed records update the network-wide lists for their conversation only", () => {
   const pushed = records({
     conversation_id: "chat", questions: [question("open", "chat"), question("done", "chat", { message_id: "a", text: "好", author: "b", created_at_ms: 2 }),
