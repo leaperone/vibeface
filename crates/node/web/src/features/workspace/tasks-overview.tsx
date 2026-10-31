@@ -18,8 +18,6 @@ import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
 import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
-import { ConfirmCard } from "./task-activity"
-import { QuestionCard } from "./question-card"
 import { useCreateBot } from "./workspace-shell"
 
 type ProjectedWork = Extract<OverviewTask, { kind: "work" | "dispatch" }>
@@ -40,16 +38,10 @@ export function TasksOverview() {
   const overview = workspace.overview ?? localOverview
   const overviewWorks = workspace.overview ? openWorksFromOverview(workspace.overview) : workspace.openWorks
   const attention = inbox.filter((item): item is Extract<InboxItem, { kind: "question" | "confirm" }> => item.kind === "confirm" || item.kind === "question" && !item.done)
-  const attentionWorkIds = new Set<string>()
-  for (const item of attention) {
-    if (item.kind !== "confirm") continue
-    if (item.check.kind === "work") attentionWorkIds.add(item.check.work_id)
-    if (item.check.kind === "device") for (const work of item.check.works) attentionWorkIds.add(work.work_id)
-  }
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
   const waitingSessions = new Set(openQuestions.filter((question) => question.about.request_id).map((question) => question.about.session_id))
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
-  const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
+  const tasks = overviewWorks.filter((work) => projected.has(work.work_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
@@ -67,9 +59,13 @@ export function TasksOverview() {
     return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
   })
   const visible = (group: TaskGroup) => filter === "all" || filter === group
-  const noticed = visible("attention") ? visibleAttention.length + groups.attention.length : 0
-  const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
-  const hasContent = visibleCount > 0
+  const pendingWorkIds = new Set(visibleAttention.flatMap((item) => item.kind === "confirm"
+    ? item.check.kind === "work" ? [item.check.work_id] : item.check.kind === "device" ? item.check.works.map((work) => work.work_id) : []
+    : []))
+  const attentionCount = visibleAttention.length + groups.attention.filter((work) => !pendingWorkIds.has(work.work_id)).length
+  const pendingCount = visible("attention") ? visibleAttention.length : 0
+  const visibleCount = (visible("attention") ? groups.attention.length : 0) + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
+  const hasContent = visibleCount > 0 || pendingCount > 0
   const emptyLabel = filter === "all" && botFilter === "all" ? "没有未完成的任务" : "没有符合筛选的任务"
   const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
   const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
@@ -77,13 +73,13 @@ export function TasksOverview() {
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <WorkspaceMasthead attention={visibleAttention.length + groups.attention.length} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
+    <WorkspaceMasthead attention={attentionCount} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
+    {pendingCount ? <Link to="/inbox" className="flex min-h-12 items-center gap-2 rounded-lg border px-3 py-2 font-medium hover:bg-muted focus-visible:ring-3 focus-visible:ring-ring/50"><CircleQuestionMark aria-hidden="true" className="size-4 shrink-0" /><span>待处理 {pendingCount} 项</span><ChevronRight aria-hidden="true" className="ms-auto size-4 shrink-0 text-muted-foreground" /></Link> : null}
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
-      const count = group === "attention" ? noticed : groups[group].length
+      const count = groups[group].length
       return count ? <OverviewSection key={group} title={title} count={count}>
-        {group === "attention" ? visibleAttention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
         {groups[group].map(card)}
       </OverviewSection> : null
     })}
