@@ -1,6 +1,6 @@
 "use client"
 
-import { Bot, CircleQuestionMark, Clock3, ListChecks, Laptop, Send, Server, Unplug } from "lucide-react"
+import { Bot, CircleQuestionMark, Clock3, Laptop, ListChecks, Send, Unplug } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Card, CardContent } from "@/components/ui/card"
 import { Details, DetailRow, StatusPill, type Tone } from "@/components/app/kit"
@@ -92,7 +92,7 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
   return <Card size="sm" className="border-transparent bg-linear-to-br from-info-soft/35 via-card to-card ring-1 ring-border/70">
     <CardContent className="grid gap-3">
       <div className="flex min-w-0 flex-wrap items-center gap-2">
-        {reachable === false ? <Unplug aria-hidden="true" className="size-4 shrink-0 text-warning" /> : owner === data.local_node ? <Laptop aria-hidden="true" className="size-4 shrink-0 text-success" /> : <Server aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
+        {reachable === false ? <Unplug aria-hidden="true" className="size-4 shrink-0 text-warning" /> : owner === data.local_node ? <Laptop aria-hidden="true" className="size-4 shrink-0 text-success" /> : <Laptop aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
         <span className="min-w-0 flex-1 font-medium">运行 owner</span>
         <StatusPill tone={tone}>{label}</StatusPill>
       </div>

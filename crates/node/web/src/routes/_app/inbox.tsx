@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef } from 'react'
 import { createFileRoute, Link } from '@tanstack/react-router'
-import { ChevronRight, Inbox, MessageCircle, X } from 'lucide-react'
-import { claimFocus, EmptyState, Skeleton } from '@/components/app/kit'
+import { ChevronRight, CircleX, Inbox, MessageCircle, Settings, X } from 'lucide-react'
+import { ActionCard, claimFocus, EmptyState, Skeleton } from '@/components/app/kit'
 import { Button } from '@/components/ui/button'
 import { useInbox } from '@/features/workspace/inbox'
 import { QuestionCard } from '@/features/workspace/question-card'
@@ -10,7 +10,11 @@ import { WriteCard } from '@/features/workspace/write-card'
 import { ConfirmCard } from '@/features/workspace/task-activity'
 import { ActionButton } from '@/features/workspace/present'
 import { RecoveryPendingCard, RotateHintCard } from '@/features/identity/recovery-controls'
+import { useDevice } from '@vibeface/client/identity/context.tsx'
+import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { useWorkspace } from '@vibeface/client/workspace/context.tsx'
+import type { InboxItem } from '@vibeface/client/workspace/inbox.ts'
+import { fixOnDevice, fixOnDeviceLabel, nodeName } from '@vibeface/client/workspace/labels.ts'
 
 export const Route = createFileRoute('/_app/inbox')({ component: InboxPage })
 
@@ -37,15 +41,29 @@ function InboxPage() {
     if (items[index]) held.current = { key: items[index].key, index }
   }}>
     {items.map((item) => <li key={item.key} tabIndex={-1} className="min-w-0 outline-none animate-in fade-in-0 slide-in-from-bottom-1 duration-200 ease-out">
-      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
+      {item.kind === 'recovery' ? <RecoveryPendingCard /> : item.kind === 'rotate' ? <RotateHintCard /> : item.kind === 'write' ? <WriteCard kind={item.write} /> : item.kind === 'join' ? <JoinCard request={item.join} /> : item.kind === 'question' ? <QuestionCard question={item.question} inbox from="inbox" /> : item.kind === 'confirm' ? <ConfirmCard check={item.check} inbox from="inbox" /> : item.kind === 'failed' ? <FailedCard item={item} /> : <div className="flex min-h-14 items-center rounded-xl border bg-card shadow-xs">
         <Link to={item.to} className="flex min-h-14 min-w-0 flex-1 items-center gap-3 interactive-row rounded-xl px-4 py-3">
-          <item.icon aria-hidden="true" className={`size-5 shrink-0 ${item.kind === 'failed' ? 'text-danger' : 'text-warning'}`} />
+          <item.icon aria-hidden="true" className="size-5 shrink-0 text-warning" />
           <span className="min-w-0 flex-1 truncate font-medium">{item.title}</span>
           {item.meta ? <span className="max-w-[40%] shrink-0 truncate text-meta text-muted-foreground" title={item.meta}>{item.meta}</span> : null}
           <ChevronRight aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         </Link>
-        {item.kind === 'failed' ? <span className="pe-2"><ActionButton variant="ghost" label="关掉" disabled={!workspace.writable} action={() => workspace.dismissWork(item.work.conversation_id, item.work.work_id)}><X aria-hidden="true" /></ActionButton></span> : null}
       </div>}
     </li>)}
   </ul>
+}
+
+/** A task that did not finish: its device and why, and the device's settings when the fix is there. */
+function FailedCard({ item }: { item: Extract<InboxItem, { kind: 'failed' }> }) {
+  const workspace = useWorkspace()
+  const { directory } = useDevice()
+  const { work, bot } = item
+  const device = nodeName(work.target_node, { nodes: workspace.nodes, directory })
+  const reason = workFailure(work)
+  return <ActionCard icon={CircleX} tone="danger" meta={device}
+    title={<Link to="/b/$botId/work/$workId" params={{ botId: bot.bot_id, workId: work.work_id }} search={{ from: 'inbox' }} className="rounded-sm underline-offset-4 hover:underline">{item.title}</Link>}
+    trailing={<ActionButton variant="ghost" label="关掉" disabled={!workspace.writable} action={() => workspace.dismissWork(work.conversation_id, work.work_id)}><X aria-hidden="true" /></ActionButton>}
+    actions={fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: work.target_node }}><Settings aria-hidden="true" />{fixOnDeviceLabel(device)}</Link></Button> : undefined}>
+    {reason ? <p className="line-clamp-3 text-muted-foreground">{reason}</p> : null}
+  </ActionCard>
 }

@@ -613,8 +613,10 @@ impl Store {
     }
 
     /// This Node's refused dispatches in `scope`, or every conversation, that still want the
-    /// user: not closed in 待处理 and not followed by a completed bot reply from the reply of
-    /// their report turn on.
+    /// user: not closed in 待处理 and not followed by a completed bot reply, from the reply of
+    /// their report turn on or to a message written after their dispatching turn's reply. A
+    /// refusal answered inside its dispatching turn has no report turn, so only the second covers
+    /// a retry the person asked for after it.
     pub fn open_dispatches(&self, network: &str, scope: Option<&str>) -> Result<Vec<Dispatch>> {
         query_dispatches(
             &self.connection,
@@ -629,7 +631,16 @@ impl Store {
                 JOIN messages m ON m.network_id=?1 AND m.conversation_id=j.conversation_id
                     AND m.role='assistant' AND m.status='completed' AND m.rank>=report.rank
                 WHERE j.conversation_id=json_extract(work_dispatches.spec,'$.conversation')
-                    AND j.trigger='work:'||work_dispatches.work_id)",
+                    AND j.trigger='work:'||work_dispatches.work_id)
+             AND NOT EXISTS(SELECT 1 FROM scheduler_jobs j
+                JOIN messages turn ON turn.network_id=?1
+                    AND turn.conversation_id=j.conversation_id AND turn.message_id=j.message_id
+                JOIN messages u ON u.network_id=?1 AND u.conversation_id=j.conversation_id
+                    AND u.role='user' AND u.rank>turn.rank
+                JOIN messages r ON r.network_id=?1 AND r.conversation_id=j.conversation_id
+                    AND r.in_reply_to=u.message_id AND r.role='assistant' AND r.status='completed'
+                WHERE j.conversation_id=json_extract(work_dispatches.spec,'$.conversation')
+                    AND j.trigger=json_extract(work_dispatches.spec,'$.trigger'))",
             params![network, scope, crate::model::INBOX_CLIENT],
         )
     }

@@ -11,6 +11,9 @@ export type ConnectionEntry =
   | { kind: 'local'; address: string; device_id: string }
   | { kind: 'lan'; addrs: string[]; device_id: string }
 export type PublicIdentity = { deviceId: string }
+/** A Web entry forwards a session to any Node in the network, so a manager reaches another computer through the one it is on. */
+export const throughEntry = (via: ConnectionEntry, deviceId: string): ConnectionEntry | undefined =>
+  via.kind === 'gateway' ? { kind: 'gateway', address: via.address, device_id: deviceId } : undefined
 export type ClientPrincipal = { network_id: string; device_id: string; epoch: number } & ({ source: 'membership'; can_manage: boolean } | { source: 'local_session'; can_manage: false })
 export type EntryInfo = { device_id: string; name: string; version: string; initialized: boolean; network_id: string | null; connection_entry?: ConnectionEntry }
 export type ReadyConnection = {
@@ -34,7 +37,7 @@ type JoinStatus = 'pending' | 'confirming' | 'joined' | 'rejected' | 'withdrawn'
 /** One join request as the entry Node stores it; `code` is filled in once both nonces are known. */
 export type JoinRequest = {
   join_id: string; status: JoinStatus; network_id: string; invite_id: string; device_id: string; kind: 'node' | 'client'; name: string; commit: string
-  admin_id: string | null; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
+  admin_id: string | null; admin_name?: string; admin_nonce: string | null; joiner_nonce: string | null; reason: string | null; expires_at_ms: number; code?: string
 }
 export type LocalSetup = { kind: 'uninitialized'; entry: ConnectionEntry; capability: string } | { kind: 'initialized'; entry: ConnectionEntry; removed: boolean; local_launch?: { url: string; device_id: string; token: string } }
 export type ManagerSettings = { provider: ProviderId; workspace: string; model: string }
@@ -157,6 +160,7 @@ export function parseJoinRequest(value: unknown): JoinRequest {
     join_id: text(v.join_id), status: v.status as JoinStatus, network_id: validTarget(v.network_id), invite_id: v.invite_id, device_id: validTarget(v.device_id),
     kind: v.kind, name: text(v.name), commit: validTarget(v.commit), admin_id: hex32(v.admin_id), admin_nonce: hex32(v.admin_nonce), joiner_nonce: hex32(v.joiner_nonce),
     reason: typeof v.reason === 'string' ? v.reason : null, expires_at_ms: integer(v.expires_at_ms),
+    ...(typeof v.admin_name === 'string' ? { admin_name: v.admin_name } : {}),
   }
 }
 export function parseLocalSetup(value: unknown, origin: string): LocalSetup {

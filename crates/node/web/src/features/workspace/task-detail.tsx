@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react"
 import { Link, useNavigate } from "@tanstack/react-router"
-import { ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Server, X } from "lucide-react"
+import { ChevronLeft, Circle, CircleCheck, CircleDot, CircleQuestionMark, CircleStop, FolderOpen, Laptop, Link2, ListChecks, Play, RotateCw, SearchCheck, Settings, X } from "lucide-react"
 import { BusyIcon, Details, DetailRow, EmptyState, InlineError, StatusPill, toast, useAction, type Tone } from "@/components/app/kit"
 import { Markdown } from "@/components/app/markdown"
 import { Button } from "@/components/ui/button"
@@ -12,7 +12,7 @@ import { workChecks, type WorkCheck } from "@vibeface/client/workspace/model.ts"
 import { BackOnline, confirmText } from "./task-activity"
 import { ActionButton } from "./present"
 import { QuestionCard } from "./question-card"
-import { nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
+import { fixOnDevice, fixOnDeviceLabel, nodeName, progressLabel, shownState, staleTaskLabel, taskActive, taskAgent, taskLabel, taskStale, followUp, followUpCopy, type FollowUp } from "@vibeface/client/workspace/labels.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import { CopyDiagnostics } from "@/features/identity/device-controls"
@@ -56,7 +56,7 @@ function inertAround(keep: Element) {
  */
 export function TaskDetail({ botId, workId, from }: { botId: string; workId: string; from?: "inbox" | "tasks" }) {
   const workspace = useWorkspace()
-  const { directory, ready } = useDevice()
+  const { directory } = useDevice()
   const action = useAction()
   const lookup = { nodes: workspace.nodes, directory }
   const work = workspace.data?.works.find((item) => item.work_id === workId)
@@ -115,7 +115,7 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
     {!work ? <EmptyState icon={ListChecks} title="找不到这个任务" /> : <div className="grid min-h-0 flex-1 content-start gap-4 overflow-y-auto p-4">
       {device || work.cwd || agent ? <p className="flex min-w-0 items-center gap-x-3 text-meta text-muted-foreground">
         {agent && AgentIcon ? <span className="flex shrink-0 items-center gap-1.5"><AgentIcon aria-hidden="true" className="size-4 shrink-0" />{providerNames[agent]}</span> : null}
-        {device ? <span className="flex min-w-0 items-center gap-1.5">{device === ready?.entry.device_id ? <Laptop aria-hidden="true" className="size-4 shrink-0" /> : <Server aria-hidden="true" className="size-4 shrink-0" />}<span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
+        {device ? <span className="flex min-w-0 items-center gap-1.5"><Laptop aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">设备 </span><span className="truncate">{nodeName(device, lookup)}</span></span> : null}
         {work.cwd ? <span className="flex min-w-0 items-center gap-1.5" title={work.cwd}><FolderOpen aria-hidden="true" className="size-4 shrink-0" /><span className="sr-only">{folderLabels.project} </span><span className="truncate">{projectName(work.cwd)}</span></span> : null}
       </p> : null}
       {progress?.status && taskActive(state) && progress.status !== "awaiting_input" && progressLabel(progress.status) !== "进行中" ? <p className="text-meta text-muted-foreground">{progressLabel(progress.status)}</p> : null}
@@ -143,12 +143,13 @@ export function TaskDetail({ botId, workId, from }: { botId: string; workId: str
         </div> : <Button type="button" variant="outline" className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => setConfirming(true)}><CircleStop aria-hidden="true" />{sharing.length ? `一起停止 ${sharing.length + 1} 个任务` : "停止任务"}</Button>}
         <InlineError error={action.error} />
       </div> : null}
-      {failed || unknown || state === "interrupted" ? <div className="grid gap-2">
+      {failed || unknown || state === "interrupted" ? <div className="grid gap-2"><div className="flex flex-wrap gap-2">
+        {failed && device && fixOnDevice(work) ? <Button asChild variant="outline"><Link to="/devices/$deviceId" params={{ deviceId: device }}><Settings aria-hidden="true" />{fixOnDeviceLabel(nodeName(device, lookup))}</Link></Button> : null}
         {/* After a failure trying again is the next step; a task the person stopped only offers it. */}
         <Button type="button" variant={state === "interrupted" ? "outline" : "default"} className="w-fit" disabled={!workspace.writable || action.busy !== null} onClick={() => void action.run("retry", async () => {
           if (await workspace.sendMessage(followUpCopy[next].ask(work.title || "这个任务"))) void navigate({ to: "/b/$botId", params: { botId } })
         })}><BusyIcon busy={action.busy === "retry"} icon={followUpIcons[next]} />{followUpCopy[next].action}</Button>
-        <InlineError error={action.error} />
+        </div><InlineError error={action.error} />
       </div> : null}
       <Details>
         {failed && work.result_text ? <DetailRow label="已有输出" value={<span className="whitespace-pre-wrap break-words">{work.result_text}</span>} /> : null}

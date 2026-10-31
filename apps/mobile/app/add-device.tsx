@@ -1,6 +1,6 @@
 import * as Clipboard from 'expo-clipboard'
 import { openURL } from 'expo-linking'
-import { Check, CircleCheck, Clock, Copy, Download, Link2, Monitor, Plus, ScanEye, Share2, ShieldAlert, Smartphone, SquareTerminal } from 'lucide-react-native'
+import { Check, CircleCheck, Clock, Copy, Download, Laptop, Link2, Plus, ScanEye, Share2, ShieldAlert, Smartphone, SquareTerminal } from 'lucide-react-native'
 import { useEffect, useRef, useState } from 'react'
 import { Pressable, ScrollView, Share, View } from 'react-native'
 import { useDevice, type Invitation } from '@vibeface/client/identity/context.tsx'
@@ -15,7 +15,7 @@ import { JoinRequests, useOpenJoins } from '@/features/devices/join-requests'
 import { QrCode } from '@/features/devices/qr-code'
 import { useRun } from '@/lib/use-run'
 
-const kinds = [{ value: 'phone', label: addDeviceCopy.phone, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.computer, icon: Monitor }] as const
+const kinds = [{ value: 'phone', label: addDeviceCopy.phone, icon: Smartphone }, { value: 'computer', label: addDeviceCopy.computer, icon: Laptop }] as const
 type Kind = (typeof kinds)[number]['value']
 
 /** "添加设备": one single-use link the new device opens (a QR for phones, its own Vibeface page for computers), then both sides compare the safety code. */
@@ -88,7 +88,7 @@ export default function AddDevice() {
         <View className="flex-row items-center gap-3"><Step n={1} />{copyLink}
           <Button variant="ghost" size="icon" accessibilityLabel="分享链接" onPress={() => { void Share.share({ message: result.link }).catch(() => {}) }}><Icon as={Share2} /></Button>
         </View>
-        <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Monitor} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
+        <View className="flex-row items-center gap-3"><Step n={2} /><Icon as={Laptop} className="size-4 text-muted-foreground" /><Text className="shrink">{addDeviceCopy.openThere}</Text></View>
         <Pressable accessibilityRole="link" onPress={() => void openURL(joinCopy.installGuide).catch(() => {})} className="min-h-11 flex-row flex-wrap items-center gap-1.5">
           <Icon as={Download} className="size-4 text-muted-foreground" />
           <Text className="text-meta text-muted-foreground">{addDeviceCopy.installThere}</Text>

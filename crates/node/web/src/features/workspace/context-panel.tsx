@@ -1,7 +1,7 @@
 "use client"
 
 import { useLayoutEffect, useRef } from "react"
-import { BrainCircuit, ChevronLeft, CircleCheck, CircleDashed, CircleHelp, CircleQuestionMark, CircleX, Cpu, EyeOff, History, Laptop, ListChecks, MessageCircle, MessagesSquare, ScrollText, Server, Unplug, UserRound, type LucideIcon } from "lucide-react"
+import { BrainCircuit, ChevronLeft, CircleCheck, CircleDashed, CircleHelp, CircleQuestionMark, CircleX, Cpu, EyeOff, History, Laptop, ListChecks, MessageCircle, MessagesSquare, ScrollText, Unplug, UserRound, type LucideIcon } from "lucide-react"
 import { Link } from "@tanstack/react-router"
 import { Button } from "@/components/ui/button"
 import { DetailRow, Details, SettingsGroup, SettingsRow, StatusPill, type Tone } from "@/components/app/kit"
@@ -67,7 +67,7 @@ export function ContextPanel({ bot, data, nodes, onBack }: ContextPanelProps) {
 
     <SettingsGroup title="Bot 身份">
       <SettingsRow icon={UserRound} label="Bot" description="当前聊天" children={<span className="max-w-44 truncate" title={bot.name}>{bot.name}</span>} />
-      {owner ? <SettingsRow icon={owner === data.local_node ? Laptop : Server} label="负责设备" description="共享聊天事实" children={<span className="max-w-44 truncate" title={ownerName}>{ownerName}</span>} /> : null}
+      {owner ? <SettingsRow icon={Laptop} label="负责设备" description="共享聊天事实" children={<span className="max-w-44 truncate" title={ownerName}>{ownerName}</span>} /> : null}
     </SettingsGroup>
 
     <SettingsGroup title="共享上下文">
@@ -206,7 +206,7 @@ function ContinuitySession({ session, nodes, localNode }: { session: SessionHand
         ? { tone: "neutral", icon: CircleDashed, label: "可达性未知", detail: "快照没有这台设备的状态。" }
         : !node.online
           ? { tone: "warning", icon: Unplug, label: "设备不可达", detail: "设备恢复前，续接和结果都不能确认。" }
-          : { tone: "info", icon: node.local || session.node === localNode ? Laptop : Server, label: node.local || session.node === localNode ? "本机线索" : "设备可达", detail: "设备可达不等于原生 session 仍在运行。" }
+          : { tone: "info", icon: Laptop, label: node.local || session.node === localNode ? "本机线索" : "设备可达", detail: "设备可达不等于原生 session 仍在运行。" }
   return <li className="relative grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs">
     <div className="flex min-w-0 items-start gap-2.5">
       <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Icon aria-hidden="true" className="size-4" /></span>

@@ -7100,5 +7100,42 @@ fn open_works_list_only_what_still_wants_the_user() -> Result<()> {
         refusals(&store)?.is_empty(),
         "one answered by its report, one closed"
     );
+
+    let inline = refused("inline")?;
+    store.save_dispatch(&inline)?;
+    store.answer_dispatch(&net.network, &local, &inline.spec.work_id, no, false)?;
+    assert_eq!(refusals(&store)?, ["inline"]);
+    let turn = store
+        .scheduler_job("c", &trigger)?
+        .context("dispatching turn")?;
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        bot_reply(&turn.message_id, "m1"),
+        vec![],
+        72,
+    )?;
+    assert_eq!(
+        refusals(&store)?,
+        ["inline"],
+        "the turn that saw the refusal inline has no report to follow it up"
+    );
+    store.accept_message(
+        &net.a,
+        &net.network,
+        "c",
+        "m3",
+        "again",
+        vec![],
+        true,
+        signature(&net, "m3", "again")?,
+        73,
+    )?;
+    store.append_event(&net.a, &net.network, "c", bot_reply("r3", "m3"), vec![], 74)?;
+    assert!(
+        refusals(&store)?.is_empty(),
+        "the bot answered a message written after the refusing turn"
+    );
     Ok(())
 }

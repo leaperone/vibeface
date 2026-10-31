@@ -139,6 +139,10 @@ export const taskActive = (state: string) => ["accepted", "running", "interrupti
 
 /** A failed work, or a dispatch its device refused: the person sees it until something follows it up. */
 export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.outcome === "failed" || work.outcome === "rejected" || work.state === "dispatch_rejected"
+/** A failure fixed in its device's settings: no bot there to take it, or the AI service there not set up. */
+export const fixOnDevice = (work: Pick<WorkRecord, "failure" | "failure_reason">) =>
+  ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model"].includes(work.failure ?? "") || /has no bot to take the task/i.test(work.failure_reason ?? "")
+export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 
 /** Where a task card sits on the tasks page, in both apps. */
 export type TaskGroup = "attention" | "working" | "waiting"

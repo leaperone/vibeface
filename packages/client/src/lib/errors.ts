@@ -105,6 +105,12 @@ export function humanError(raw: string, code?: unknown, action = '这次操作')
   return patterns.find(([pattern]) => pattern.test(raw))?.[1] ?? `${action}没有成功，请再试一次。`
 }
 
+/** Known backend text in the reader's words, or nothing: for a log line, where a guess would mislead. */
+export function knownError(raw: string): string | undefined {
+  if (chinese.test(raw)) return raw
+  return patterns.find(([pattern]) => pattern !== malformed && pattern.test(raw))?.[1]
+}
+
 /** An external chat test as people read it: it arrived, or why not. */
 export function webhookTestResult(data: { ok?: boolean; status?: number | null; error?: string | null }) {
   if (data.ok === true) return { ok: true, text: '能收到' }
