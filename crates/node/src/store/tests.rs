@@ -3640,6 +3640,38 @@ fn staged_memory_revision_conflict_preserves_the_newer_user_value() -> Result<()
         vec![],
         5,
     )?;
+    assert_eq!(
+        store.stage_memory(
+            &net.network,
+            "c",
+            &trigger,
+            &attempt,
+            "remember-conflict",
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: "agent candidate".into()
+            },
+            5,
+        )?,
+        staged,
+        "a retry returns its original snapshot after a concurrent user edit"
+    );
+    assert!(
+        store
+            .stage_memory(
+                &net.network,
+                "c",
+                &trigger,
+                &attempt,
+                "remember-conflict",
+                ChangeRequest::Remember {
+                    memory_id: None,
+                    text: "another candidate".into()
+                },
+                5,
+            )
+            .is_err()
+    );
     store.finish_job(
         &net.a,
         &net.network,
@@ -3650,6 +3682,12 @@ fn staged_memory_revision_conflict_preserves_the_newer_user_value() -> Result<()
         "done",
         6,
     )?;
+    let conflicts = memory_test_shown(&store)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].memory_id, memory_id);
+    assert_eq!(conflicts[0].reason, "user_controlled");
+    assert_eq!(conflicts[0].expected_revision, "");
+    assert!(!conflicts[0].actual_revision.is_empty());
     let record = store
         .memory_records(&net.network, "c")?
         .into_iter()
@@ -3658,6 +3696,642 @@ fn staged_memory_revision_conflict_preserves_the_newer_user_value() -> Result<()
     assert_eq!(record.entry.text, "user value");
     assert_eq!(record.origin, MemoryOrigin::User);
     assert!(record.user_controlled);
+    Ok(())
+}
+
+fn memory_test_shown(store: &Store) -> Result<Shown> {
+    let shown: String = store.connection.query_row(
+        "SELECT shown FROM scheduler_sessions WHERE conversation_id='c'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&shown)?)
+}
+
+#[test]
+fn memory_review_schema_is_bounded_data_only_and_disabled_by_default() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewPolicy};
+    assert_eq!(MemoryReviewPolicy::default(), MemoryReviewPolicy::Disabled);
+    let operation = json!({"operation":"add","text":"prefers concise replies"});
+    let twenty = json!({"operations":vec![operation.clone(); 20]});
+    assert_eq!(
+        serde_json::from_value::<MemoryReview>(twenty)?
+            .operations
+            .len(),
+        20
+    );
+    for refused in [
+        json!({"operations":vec![operation; 21]}),
+        json!({"operations":[],"tools":["shell"]}),
+        json!({"operations":[],"read_only":false}),
+        json!({"operations":[{"operation":"tool_call","name":"shell"}]}),
+        json!({"operations":[{"operation":"add","text":"safe note","tools":[]}]}),
+        json!({"operations":[{"operation":"add","text":"sk-proj-abcdefghijklmnopqrstuvwxyz123456"}]}),
+        json!({"operations":[{"operation":"update","memory_id":"m","epoch":1,"text":"safe"}]}),
+        json!({"operations":[{"operation":"forget","memory_id":"m","epoch":1,"expected_revision":"bad\nrevision"}]}),
+        json!({"operations":[{"operation":"forget","memory_id":"m","epoch":1,"expected_revision":"sk-proj-abcdefghijklmnopqrstuvwxyz123456"}]}),
+    ] {
+        assert!(
+            serde_json::from_value::<MemoryReview>(refused.clone()).is_err(),
+            "{refused}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_review_stages_add_update_and_forget_until_turn_completion() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    for (call_ref, text) in [
+        ("keep", "old preference"),
+        ("remove", "obsolete preference"),
+    ] {
+        origin.change_bot(
+            &net.a,
+            &net.network,
+            "c",
+            "message:m1",
+            call_ref,
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: text.into(),
+            },
+            Provider::Codex,
+            4,
+        )?;
+    }
+    let records = origin.memory_records(&net.network, "c")?;
+    let kept = records
+        .iter()
+        .find(|record| record.entry.text == "old preference")
+        .context("kept")?;
+    let removed = records
+        .iter()
+        .find(|record| record.entry.text == "obsolete preference")
+        .context("removed")?;
+    let review = MemoryReview {
+        operations: vec![
+            MemoryReviewOperation::Add {
+                text: "new preference".into(),
+            },
+            MemoryReviewOperation::Update {
+                memory_id: kept.entry.memory_id.clone(),
+                epoch: kept.epoch,
+                expected_revision: kept.revision.clone(),
+                text: "updated preference".into(),
+            },
+            MemoryReviewOperation::Forget {
+                memory_id: removed.entry.memory_id.clone(),
+                epoch: removed.epoch,
+                expected_revision: removed.revision.clone(),
+            },
+        ],
+    };
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let disabled = origin
+        .stage_memory_review(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "review",
+            MemoryReviewPolicy::default(),
+            &review,
+        )
+        .unwrap_err();
+    assert!(disabled.to_string().contains("disabled"));
+    assert!(
+        origin
+            .staged_memory_overlay("c", trigger, attempt)?
+            .is_empty()
+    );
+    let staged = origin.stage_memory_review(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "review",
+        MemoryReviewPolicy::ReadOnly,
+        &review,
+    )?;
+    assert_eq!(staged.len(), 3);
+    assert!(staged.iter().all(|result| result["state"] == "staged"));
+    assert_eq!(origin.memories(&net.network, "c")?.len(), 2);
+    assert_eq!(
+        origin.stage_memory_review(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "review",
+            MemoryReviewPolicy::ReadOnly,
+            &review,
+        )?,
+        staged
+    );
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let committed = origin.memory_records(&net.network, "c")?;
+    assert_eq!(committed.len(), 2);
+    assert!(
+        committed
+            .iter()
+            .all(|record| record.origin == MemoryOrigin::Review)
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|record| record.entry.text == "updated preference")
+    );
+    assert!(
+        committed
+            .iter()
+            .any(|record| record.entry.text == "new preference")
+    );
+    let events = origin.version_vector(&net.network)?;
+    assert!(
+        origin
+            .stage_memory_review(
+                &net.network,
+                "c",
+                trigger,
+                attempt,
+                "review",
+                MemoryReviewPolicy::ReadOnly,
+                &review,
+            )?
+            .iter()
+            .all(|result| result["state"] == "committed")
+    );
+    assert_eq!(origin.version_vector(&net.network)?, events);
+    assert!(memory_test_shown(&origin)?.memory_conflicts.is_empty());
+    let mut replica = store(&net)?;
+    all_accepted(&mut replica, &net, &origin)?;
+    assert_eq!(
+        replica.memories(&net.network, "c")?,
+        origin.memories(&net.network, "c")?
+    );
+    for record in replica.memory_records(&net.network, "c")? {
+        assert_eq!(record.origin, MemoryOrigin::Review);
+        assert!(
+            committed
+                .iter()
+                .any(|original| original.revision == record.revision)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_review_preserves_user_controlled_notes_and_rolls_back_its_batch() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::BotChanged {
+            change_id: "user-memory".into(),
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "m1".into(),
+            }),
+            change: BotChange::Memory {
+                memory_id: "manual-note".into(),
+                before: None,
+                after: Some("user-owned preference".into()),
+                epoch: crate::config::DATA_EPOCH,
+                origin: MemoryOrigin::User,
+                user_controlled: true,
+                essential: true,
+            },
+        },
+        vec![],
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    for operation in [
+        MemoryReviewOperation::Update {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch,
+            expected_revision: record.revision.clone(),
+            text: "replacement".into(),
+        },
+        MemoryReviewOperation::Forget {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch,
+            expected_revision: record.revision.clone(),
+        },
+    ] {
+        let review = MemoryReview {
+            operations: vec![
+                MemoryReviewOperation::Add {
+                    text: "discard the partial batch".into(),
+                },
+                operation,
+            ],
+        };
+        let error = origin
+            .stage_memory_review(
+                &net.network,
+                "c",
+                trigger,
+                attempt,
+                "review",
+                MemoryReviewPolicy::ReadOnly,
+                &review,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("user-controlled"));
+        assert!(
+            origin
+                .staged_memory_overlay("c", trigger, attempt)?
+                .is_empty()
+        );
+    }
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    Ok(())
+}
+
+#[test]
+fn memory_review_epoch_conflict_is_visible_without_overwriting_the_note() -> Result<()> {
+    use bot_settings::{MemoryReview, MemoryReviewOperation, MemoryReviewPolicy};
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "remember",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "current preference".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let review = MemoryReview {
+        operations: vec![MemoryReviewOperation::Update {
+            memory_id: record.entry.memory_id.clone(),
+            epoch: record.epoch + 1,
+            expected_revision: record.revision.clone(),
+            text: "stale review preference".into(),
+        }],
+    };
+    origin.stage_memory_review(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "review",
+        MemoryReviewPolicy::ReadOnly,
+        &review,
+    )?;
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        5,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].reason, "epoch_changed");
+    assert_eq!(conflicts[0].expected_epoch, record.epoch + 1);
+    assert_eq!(conflicts[0].actual_epoch, record.epoch);
+    assert_eq!(conflicts[0].actual_revision, record.revision);
+    Ok(())
+}
+
+#[test]
+fn staged_memory_detects_a_revision_change_even_when_the_text_returns_to_its_base() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    origin.change_bot(
+        &net.a,
+        &net.network,
+        "c",
+        "message:m1",
+        "remember",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "base preference".into(),
+        },
+        Provider::Codex,
+        4,
+    )?;
+    let record = origin.memory_records(&net.network, "c")?.remove(0);
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let request = ChangeRequest::Remember {
+        memory_id: Some(record.entry.memory_id.clone()),
+        text: "candidate preference".into(),
+    };
+    let staged = origin.stage_memory(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "update",
+        request.clone(),
+        5,
+    )?;
+    for (index, before, after) in [
+        (0, "base preference", "temporary preference"),
+        (1, "temporary preference", "base preference"),
+    ] {
+        origin.append_event(
+            &net.a,
+            &net.network,
+            "c",
+            EventBody::BotChanged {
+                change_id: format!("concurrent-{index}"),
+                cause: Some(Cause {
+                    conversation_id: "c".into(),
+                    message_id: "m2".into(),
+                }),
+                change: BotChange::Memory {
+                    memory_id: record.entry.memory_id.clone(),
+                    before: Some(before.into()),
+                    after: Some(after.into()),
+                    epoch: record.epoch,
+                    origin: MemoryOrigin::User,
+                    user_controlled: false,
+                    essential: true,
+                },
+            },
+            vec![],
+            6 + index,
+        )?;
+    }
+    assert_eq!(
+        origin.stage_memory(&net.network, "c", trigger, attempt, "update", request, 8)?,
+        staged
+    );
+    origin.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        9,
+    )?;
+    assert_eq!(origin.memories(&net.network, "c")?, vec![record.entry]);
+    let conflicts = memory_test_shown(&origin)?.memory_conflicts;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].reason, "revision_changed");
+    assert_eq!(conflicts[0].expected_revision, record.revision);
+    assert_ne!(conflicts[0].actual_revision, record.revision);
+    Ok(())
+}
+
+#[test]
+fn staged_memory_is_discarded_for_failed_stopped_interrupted_and_unknown_turns() -> Result<()> {
+    for (outcome, pending) in [
+        (
+            JobOutcome::Failed(ExecFailure::new(FailureKind::Rejected, "failed")),
+            0,
+        ),
+        (JobOutcome::Cancelled("stopped".into()), 0),
+        (
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Transport, "interrupted"),
+                process_unconfirmed: false,
+            },
+            0,
+        ),
+        (
+            JobOutcome::Interrupted {
+                failure: ExecFailure::new(FailureKind::Restarted, "unknown result"),
+                process_unconfirmed: true,
+            },
+            1,
+        ),
+    ] {
+        let net = net()?;
+        let (mut origin, _) = bot_with_message(&net)?;
+        say(&mut origin, &net, "m2", true)?;
+        let claimed = origin
+            .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+            .context("job")?;
+        let trigger = &claimed.job.trigger;
+        let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+        origin.mark_started("c", trigger, attempt)?;
+        origin.stage_memory(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "remember",
+            ChangeRequest::Remember {
+                memory_id: None,
+                text: "uncommitted preference".into(),
+            },
+            4,
+        )?;
+        origin.finish_job(
+            &net.a,
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            outcome,
+            "partial",
+            5,
+        )?;
+        assert!(origin.memories(&net.network, "c")?.is_empty());
+        assert!(
+            origin
+                .staged_memory_overlay("c", trigger, attempt)?
+                .is_empty()
+        );
+        assert_eq!(origin.pending_checks()?.len(), pending);
+    }
+    Ok(())
+}
+
+#[test]
+fn staged_memory_reopens_replays_and_discards_a_restarted_unknown_attempt() -> Result<()> {
+    let net = net()?;
+    let (mut origin, _) = bot_with_message(&net)?;
+    say(&mut origin, &net, "m2", true)?;
+    let claimed = origin
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let trigger = &claimed.job.trigger;
+    let attempt = &claimed.job.state.attempt().context("attempt")?.id;
+    origin.mark_started("c", trigger, attempt)?;
+    let request = ChangeRequest::Remember {
+        memory_id: None,
+        text: "persisted candidate".into(),
+    };
+    let staged = origin.stage_memory(
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        "remember",
+        request.clone(),
+        4,
+    )?;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.artifacts")
+        .join(format!("memory-restart-{}", uuid::Uuid::new_v4()));
+    crate::config::private_dir(&dir)?;
+    let path = dir.join("node.sqlite3");
+    origin
+        .connection
+        .execute("VACUUM INTO ?", [path.to_str().context("path")?])?;
+    drop(origin);
+    let mut reopened = Store::open(&path)?;
+    reopened.recover_scheduler_jobs(&net.a, &net.network, "boot")?;
+    assert_eq!(
+        reopened.stage_memory(
+            &net.network,
+            "c",
+            trigger,
+            attempt,
+            "remember",
+            request.clone(),
+            5
+        )?,
+        staged
+    );
+    reopened.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        trigger,
+        attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let initial = reopened.memory_records(&net.network, "c")?.remove(0);
+    reopened.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::BotChanged {
+            change_id: "newer-committed-memory".into(),
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "m2".into(),
+            }),
+            change: BotChange::Memory {
+                memory_id: initial.entry.memory_id,
+                before: Some(initial.entry.text),
+                after: Some("newer committed user preference".into()),
+                epoch: initial.epoch,
+                origin: MemoryOrigin::User,
+                user_controlled: true,
+                essential: true,
+            },
+        },
+        vec![],
+        7,
+    )?;
+    let version = reopened.version_vector(&net.network)?;
+    let replay =
+        reopened.stage_memory(&net.network, "c", trigger, attempt, "remember", request, 7)?;
+    assert_eq!(replay["state"], "committed");
+    assert_eq!(replay["record"]["change"]["after"], "persisted candidate");
+    assert_eq!(reopened.version_vector(&net.network)?, version);
+    let memory = reopened.memory_records(&net.network, "c")?.remove(0);
+    assert_eq!(memory.entry.text, "newer committed user preference");
+    say(&mut reopened, &net, "m3", true)?;
+    let next = reopened
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("next job")?;
+    let next_attempt = &next.job.state.attempt().context("next attempt")?.id;
+    reopened.mark_started("c", &next.job.trigger, next_attempt)?;
+    reopened.stage_memory(
+        &net.network,
+        "c",
+        &next.job.trigger,
+        next_attempt,
+        "discard",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "unknown candidate".into(),
+        },
+        8,
+    )?;
+    drop(reopened);
+    let mut restarted = Store::open(&path)?;
+    restarted.recover_scheduler_jobs(&net.a, &net.network, "new-boot")?;
+    assert_eq!(
+        restarted.memories(&net.network, "c")?,
+        vec![memory.entry.clone()]
+    );
+    assert!(memory_test_shown(&restarted)?.staged_memories.is_empty());
+    assert_eq!(restarted.pending_checks()?.len(), 1);
+    let replayed = restarted.memory_records(&net.network, "c")?.remove(0);
+    assert_eq!(replayed.revision, memory.revision);
+    assert_eq!(replayed.source_event_hash, memory.source_event_hash);
+    let mut replica = store(&net)?;
+    all_accepted(&mut replica, &net, &restarted)?;
+    assert_eq!(replica.memories(&net.network, "c")?, vec![memory.entry]);
+    assert_eq!(
+        replica.memory_records(&net.network, "c")?[0].revision,
+        memory.revision
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(dir)?;
     Ok(())
 }
 

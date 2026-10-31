@@ -554,6 +554,157 @@ fn admit_ended_from(
     Ok(job.receipt(network))
 }
 
+fn staged_memory_result(staged: &StagedMemory) -> Value {
+    json!({
+        "state":"staged",
+        "memory_id":staged.memory_id,
+        "before":staged.before,
+        "after":staged.after,
+        "base_epoch":staged.base_epoch,
+        "base_revision":staged.base_revision,
+        "commit":"turn_completed"
+    })
+}
+
+fn stage_memory_from(
+    connection: &Connection,
+    session: &mut SchedulerSession,
+    network: &str,
+    trigger: &str,
+    call_ref: &str,
+    request: super::bot_settings::ChangeRequest,
+    review_revision: Option<(u32, &str)>,
+) -> Result<Value> {
+    use super::bot_settings::ChangeRequest;
+    vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
+    let conversation = &session.conversation_id;
+    let change_id = super::bot_settings::change_id(conversation, trigger, call_ref);
+    if let Some(record) = super::bot_settings::change_from(connection, network, &change_id)? {
+        ensure!(
+            matches!(&record.change, BotChange::Memory { memory_id, after, .. }
+                if request.matches_memory(memory_id, after.as_deref())),
+            "call_ref {call_ref} already made a different memory mutation"
+        );
+        return Ok(json!({"state":"committed","record":record}));
+    }
+    ensure!(
+        session.active.as_deref() == Some(trigger),
+        "scheduler attempt is no longer active"
+    );
+    ensure!(
+        super::bot_settings::user_cause(connection, network, conversation, trigger)?.is_some(),
+        super::bot_settings::NOT_FROM_USER
+    );
+    let origin = if review_revision.is_some() {
+        MemoryOrigin::Review
+    } else {
+        MemoryOrigin::Agent
+    };
+    let staged = &session.shown.staged_memories;
+    if let Some(previous) = staged.get(call_ref) {
+        ensure!(
+            request.matches_memory(&previous.memory_id, previous.after.as_deref())
+                && previous.origin == origin
+                && review_revision.is_none_or(|(epoch, revision)| previous.base_epoch == epoch
+                    && previous.base_revision == revision),
+            "call_ref {call_ref} already staged a different memory mutation"
+        );
+        return Ok(staged_memory_result(previous));
+    }
+    let committed = super::bot_settings::memory_records_from(connection, network, conversation)?;
+    let (memory_id, before, after, base_epoch, base_revision, essential) = match request {
+        ChangeRequest::Remember { memory_id, text } => {
+            validate_memory(&text)?;
+            let memory_id = memory_id.unwrap_or_else(|| {
+                format!(
+                    "memory-{}",
+                    super::bot_settings::change_digest(conversation, trigger, call_ref),
+                )
+            });
+            vibeface_protocol::validate_id(&memory_id).map_err(anyhow::Error::msg)?;
+            let record = committed
+                .iter()
+                .find(|record| record.entry.memory_id == memory_id);
+            let before = record.map(|record| record.entry.text.clone());
+            if let Some(record) = record {
+                ensure!(
+                    !record.user_controlled,
+                    "this note is user-controlled; change it directly"
+                );
+            }
+            ensure!(
+                !committed.iter().any(|entry| entry.entry.text == text),
+                "this note is already kept"
+            );
+            if before.is_none() {
+                let staged_adds = staged
+                    .values()
+                    .filter(|entry| entry.before.is_none() && entry.after.is_some())
+                    .count();
+                ensure!(
+                    committed.len() + staged_adds < MAX_MEMORIES,
+                    "this bot already keeps {MAX_MEMORIES} notes; forget one first"
+                );
+            }
+            (
+                memory_id,
+                before,
+                Some(text),
+                record
+                    .map(|record| record.epoch)
+                    .unwrap_or(crate::config::DATA_EPOCH),
+                record
+                    .map(|record| record.revision.clone())
+                    .unwrap_or_default(),
+                record.map(|record| record.essential).unwrap_or(true),
+            )
+        }
+        ChangeRequest::Forget { memory_id } => {
+            let record = committed
+                .iter()
+                .find(|record| record.entry.memory_id == memory_id)
+                .context("note not found for this bot")?;
+            ensure!(
+                !record.user_controlled,
+                "this note is user-controlled; change it directly"
+            );
+            (
+                memory_id,
+                Some(record.entry.text.clone()),
+                None,
+                record.epoch,
+                record.revision.clone(),
+                record.essential,
+            )
+        }
+        _ => bail!("only remember and forget use turn memory staging"),
+    };
+    ensure!(
+        !staged.values().any(|entry| entry.memory_id == memory_id),
+        "memory {memory_id} already has a staged mutation in this turn"
+    );
+    let (base_epoch, base_revision) = review_revision
+        .map(|(epoch, revision)| (epoch, revision.to_owned()))
+        .unwrap_or((base_epoch, base_revision));
+    let mutation = StagedMemory {
+        call_ref: call_ref.into(),
+        memory_id,
+        before,
+        after,
+        base_epoch,
+        base_revision,
+        origin,
+        user_controlled: false,
+        essential,
+    };
+    let result = staged_memory_result(&mutation);
+    session
+        .shown
+        .staged_memories
+        .insert(call_ref.to_owned(), mutation);
+    Ok(result)
+}
+
 impl Store {
     pub(crate) fn staged_memory_overlay(
         &self,
@@ -574,11 +725,10 @@ impl Store {
         Ok(session.shown.staged_memories.into_values().collect())
     }
 
-    /// Stage a memory mutation for the active turn. The mutation is kept in the local scheduler
-    /// session and becomes a signed BotChanged event only when that turn completes.
+    /// Stage a memory mutation for the active turn. It becomes a signed event only on completion.
     #[expect(
         clippy::too_many_arguments,
-        reason = "staging is keyed by the active turn and keeps the memory operation explicit"
+        reason = "the active turn and its tool call"
     )]
     pub fn stage_memory(
         &mut self,
@@ -588,8 +738,47 @@ impl Store {
         attempt_id: &str,
         call_ref: &str,
         request: super::bot_settings::ChangeRequest,
-        at: i64,
+        _at: i64,
     ) -> Result<Value> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut session = load_session(&tx, conversation)?;
+        let job = load_job(&tx, conversation, trigger)?.context("scheduler job missing")?;
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "scheduler attempt does not match"
+        );
+        let result =
+            stage_memory_from(&tx, &mut session, network, trigger, call_ref, request, None)?;
+        save_session(&tx, &session)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Stages a data-only review atomically; the normal turn completion owns its commit.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the opt-in review and its active turn"
+    )]
+    pub fn stage_memory_review(
+        &mut self,
+        network: &str,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+        call_ref: &str,
+        policy: super::bot_settings::MemoryReviewPolicy,
+        review: &super::bot_settings::MemoryReview,
+    ) -> Result<Vec<Value>> {
+        use super::bot_settings::{ChangeRequest, MemoryReviewOperation, MemoryReviewPolicy};
+        ensure!(
+            policy == MemoryReviewPolicy::ReadOnly,
+            "memory review is disabled"
+        );
+        review.validate()?;
         vibeface_protocol::validate_id(call_ref).map_err(anyhow::Error::msg)?;
         let tx = self
             .connection
@@ -602,150 +791,60 @@ impl Store {
                 .is_some_and(|attempt| attempt.id == attempt_id),
             "scheduler attempt does not match"
         );
-        ensure!(
-            session.active.as_deref() == Some(trigger),
-            "scheduler attempt is no longer active"
-        );
-        ensure!(
-            super::bot_settings::user_cause(&tx, network, conversation, trigger)?.is_some(),
-            super::bot_settings::NOT_FROM_USER
-        );
-        let change_id = super::bot_settings::change_id(conversation, trigger, call_ref);
-        if let Some(record) = super::bot_settings::change_from(&tx, network, &change_id)? {
-            return Ok(json!({"state":"committed","record":record}));
-        }
-        let staged = session.shown.staged_memories.clone();
-        let committed = super::bot_settings::memory_records_from(&tx, network, conversation)?;
-        let (
-            memory_id,
-            before,
-            after,
-            base_epoch,
-            base_revision,
-            origin,
-            user_controlled,
-            essential,
-        ) = match request {
-            super::bot_settings::ChangeRequest::Remember { memory_id, text } => {
-                validate_memory(&text)?;
-                let memory_id = memory_id.unwrap_or_else(|| {
-                    format!(
-                        "memory-{}",
-                        super::bot_settings::change_digest(conversation, trigger, call_ref)
-                    )
-                });
-                let record = committed
-                    .iter()
-                    .find(|record| record.entry.memory_id == memory_id);
-                let before = record.map(|record| record.entry.text.clone());
-                if let Some(record) = record {
-                    ensure!(
-                        !record.user_controlled,
-                        "this note is user-controlled; change it directly"
-                    );
-                }
-                ensure!(
-                    !committed.iter().any(|entry| entry.entry.text == text),
-                    "this note is already kept"
-                );
-                if before.is_none() {
-                    let staged_adds = staged
-                        .values()
-                        .filter(|entry| entry.before.is_none() && entry.after.is_some())
-                        .count();
-                    ensure!(
-                        committed.len() + staged_adds < MAX_MEMORIES,
-                        "this bot already keeps {MAX_MEMORIES} notes; forget one first"
-                    );
-                }
-                ensure!(
-                    before.as_deref() != Some(text.as_str()),
-                    "this note already has that text"
-                );
-                (
+        let mut results = Vec::with_capacity(review.operations.len());
+        for (index, operation) in review.operations.iter().enumerate() {
+            let (request, expected) = match operation {
+                MemoryReviewOperation::Add { text } => (
+                    ChangeRequest::Remember {
+                        memory_id: None,
+                        text: text.clone(),
+                    },
+                    (crate::config::DATA_EPOCH, ""),
+                ),
+                MemoryReviewOperation::Update {
                     memory_id,
-                    before,
-                    Some(text),
-                    record
-                        .map(|record| record.epoch)
-                        .unwrap_or(crate::config::DATA_EPOCH),
-                    record
-                        .map(|record| record.revision.clone())
-                        .unwrap_or_default(),
-                    crate::model::MemoryOrigin::Agent,
-                    false,
-                    record.map(|record| record.essential).unwrap_or(true),
-                )
-            }
-            super::bot_settings::ChangeRequest::Forget { memory_id } => {
-                let record = committed
-                    .iter()
-                    .find(|record| record.entry.memory_id == memory_id)
-                    .context("note not found for this bot")?;
-                ensure!(
-                    !record.user_controlled,
-                    "this note is user-controlled; change it directly"
-                );
-                (
+                    epoch,
+                    expected_revision,
+                    text,
+                } => (
+                    ChangeRequest::Remember {
+                        memory_id: Some(memory_id.clone()),
+                        text: text.clone(),
+                    },
+                    (*epoch, expected_revision.as_str()),
+                ),
+                MemoryReviewOperation::Forget {
                     memory_id,
-                    Some(record.entry.text.clone()),
-                    None,
-                    record.epoch,
-                    record.revision.clone(),
-                    crate::model::MemoryOrigin::Agent,
-                    false,
-                    record.essential,
+                    epoch,
+                    expected_revision,
+                } => (
+                    ChangeRequest::Forget {
+                        memory_id: memory_id.clone(),
+                    },
+                    (*epoch, expected_revision.as_str()),
+                ),
+            };
+            let operation_ref = format!(
+                "review-{}",
+                super::bot_settings::change_digest(
+                    conversation,
+                    trigger,
+                    &format!("{call_ref}-{index}"),
                 )
-            }
-            _ => bail!("only remember and forget use turn memory staging"),
-        };
-        if let Some(previous) = staged.get(call_ref) {
-            ensure!(
-                previous.memory_id == memory_id
-                    && previous.before == before
-                    && previous.after == after,
-                "call_ref {call_ref} already staged a different memory mutation"
             );
-            return Ok(json!({
-                "state":"staged",
-                "memory_id":memory_id,
-                "before":before,
-                "after":after,
-                "base_epoch":previous.base_epoch,
-                "base_revision":previous.base_revision,
-                "commit":"turn_completed"
-            }));
+            results.push(stage_memory_from(
+                &tx,
+                &mut session,
+                network,
+                trigger,
+                &operation_ref,
+                request,
+                Some(expected),
+            )?);
         }
-        ensure!(
-            !staged.values().any(|entry| entry.memory_id == memory_id),
-            "memory {memory_id} already has a staged mutation in this turn"
-        );
-        session.shown.staged_memories.insert(
-            call_ref.to_owned(),
-            StagedMemory {
-                call_ref: call_ref.into(),
-                memory_id: memory_id.clone(),
-                before: before.clone(),
-                after: after.clone(),
-                base_epoch,
-                base_revision: base_revision.clone(),
-                origin,
-                user_controlled,
-                essential,
-            },
-        );
         save_session(&tx, &session)?;
         tx.commit()?;
-        let _ = at;
-        Ok(json!({
-            "state":"staged",
-            "memory_id":memory_id,
-            "before":before,
-            "after":after,
-            "base_epoch":base_epoch,
-            "base_revision":base_revision,
-            "commit":"turn_completed"
-        }))
+        Ok(results)
     }
 
     /// The user messages of a conversation this Node schedules that no device answered, in
@@ -1361,7 +1460,7 @@ fn end_job_from(
         }
     }
     if matches!(outcome, JobOutcome::Completed) {
-        super::Store::commit_staged_memory_from(
+        session.shown.memory_conflicts = super::Store::commit_staged_memory_from(
             connection,
             blob_dir,
             identity,

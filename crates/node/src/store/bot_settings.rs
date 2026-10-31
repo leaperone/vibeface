@@ -7,13 +7,106 @@ use crate::{
     crypto::digest,
     model::*,
     providers::Provider,
-    scheduling::{AdmissionReceipt, StagedMemory, TriggerKind, ahead, bot_message_trigger},
+    scheduling::{
+        AdmissionReceipt, MemoryConflict, StagedMemory, TriggerKind, ahead, bot_message_trigger,
+    },
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use std::path::Path;
 
 pub const NOT_FROM_USER: &str = "bot settings change only when the user's own message asks for it";
+
+/// A review receives data only. Its JSON proposes mutations without executing tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryReviewPolicy {
+    #[default]
+    Disabled,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryReviewOperation {
+    Add {
+        text: String,
+    },
+    Update {
+        memory_id: String,
+        epoch: u32,
+        expected_revision: String,
+        text: String,
+    },
+    Forget {
+        memory_id: String,
+        epoch: u32,
+        expected_revision: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "MemoryReviewInput")]
+pub struct MemoryReview {
+    pub operations: Vec<MemoryReviewOperation>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryReviewInput {
+    operations: Vec<MemoryReviewOperation>,
+}
+
+impl TryFrom<MemoryReviewInput> for MemoryReview {
+    type Error = anyhow::Error;
+
+    fn try_from(input: MemoryReviewInput) -> Result<Self> {
+        let review = Self {
+            operations: input.operations,
+        };
+        review.validate()?;
+        Ok(review)
+    }
+}
+
+impl MemoryReview {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.operations.len() <= 20,
+            "a memory review proposes at most 20 operations"
+        );
+        for operation in &self.operations {
+            match operation {
+                MemoryReviewOperation::Add { text }
+                | MemoryReviewOperation::Update { text, .. } => validate_memory(text)?,
+                MemoryReviewOperation::Forget { .. } => {}
+            }
+            if let MemoryReviewOperation::Update {
+                memory_id,
+                expected_revision,
+                ..
+            }
+            | MemoryReviewOperation::Forget {
+                memory_id,
+                expected_revision,
+                ..
+            } = operation
+            {
+                vibeface_protocol::validate_id(memory_id).map_err(anyhow::Error::msg)?;
+                ensure!(
+                    !expected_revision.is_empty()
+                        && expected_revision.len() <= 256
+                        && !expected_revision.chars().any(char::is_control),
+                    "memory review requires a bounded expected revision"
+                );
+                ensure!(
+                    !looks_secret(memory_id) && !looks_secret(expected_revision),
+                    "memory review must not contain secrets"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn change_digest(conversation: &str, trigger: &str, call_ref: &str) -> String {
     digest(&serde_json::to_vec(&("bot_change", conversation, trigger, call_ref)).expect("strings"))
@@ -139,6 +232,17 @@ fn avatar_request(
 }
 
 impl ChangeRequest {
+    pub(super) fn matches_memory(&self, id: &str, after: Option<&str>) -> bool {
+        match self {
+            Self::Remember { memory_id, text } => {
+                memory_id.as_deref().is_none_or(|wanted| wanted == id)
+                    && after == Some(text.as_str())
+            }
+            Self::Forget { memory_id } => memory_id == id && after.is_none(),
+            _ => false,
+        }
+    }
+
     /// Every change but a reminder needs the user's own message to stand on.
     fn needs_user(&self) -> bool {
         !matches!(self, Self::Remind { .. })
@@ -286,21 +390,11 @@ impl ChangeRequest {
                 },
             ) => *note == saved.prompt && saved.every_minutes.is_none(),
             (
-                Self::Remember { memory_id, text },
+                Self::Remember { .. } | Self::Forget { .. },
                 BotChange::Memory {
-                    memory_id: id,
-                    after: Some(saved),
-                    ..
+                    memory_id, after, ..
                 },
-            ) => memory_id.as_ref().is_none_or(|wanted| wanted == id) && text == saved,
-            (
-                Self::Forget { memory_id },
-                BotChange::Memory {
-                    memory_id: id,
-                    after: None,
-                    ..
-                },
-            ) => memory_id == id,
+            ) => self.matches_memory(memory_id, after.as_deref()),
             _ => false,
         }
     }
@@ -922,7 +1016,7 @@ fn resolve(
 impl Store {
     /// Commit staged memory changes in the same transaction that closes the turn. A changed
     /// committed revision wins over a stale staged value; the turn remains successful and the
-    /// conflict is kept in the local log for diagnosis.
+    /// conflicts are returned for the local scheduler projection.
     #[expect(
         clippy::too_many_arguments,
         reason = "the completion transaction supplies the same turn identity and store handles"
@@ -936,8 +1030,9 @@ impl Store {
         trigger: &str,
         staged: impl IntoIterator<Item = StagedMemory>,
         at: i64,
-    ) -> Result<()> {
+    ) -> Result<Vec<MemoryConflict>> {
         let cause = user_cause(connection, network, scope, trigger)?;
+        let mut conflicts = Vec::new();
         for staged in staged {
             let current = memory_records_from(connection, network, scope)?
                 .into_iter()
@@ -951,19 +1046,36 @@ impl Store {
                 .as_ref()
                 .map(|record| record.epoch)
                 .unwrap_or(crate::config::DATA_EPOCH);
-            if current_text != staged.before
-                || current_revision != staged.base_revision
-                || current_epoch != staged.base_epoch
-                || current
-                    .as_ref()
-                    .is_some_and(|record| record.user_controlled)
+            let reason = if current
+                .as_ref()
+                .is_some_and(|record| record.user_controlled)
             {
+                Some("user_controlled")
+            } else if current_epoch != staged.base_epoch {
+                Some("epoch_changed")
+            } else if current_revision != staged.base_revision {
+                Some("revision_changed")
+            } else if current_text != staged.before {
+                Some("value_changed")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
                 tracing::warn!(
                     event = "agent.memory_conflict",
                     conversation_id = scope,
                     memory_id = staged.memory_id,
                     "staged memory was not committed because the note changed during the turn"
                 );
+                conflicts.push(MemoryConflict {
+                    call_ref: staged.call_ref,
+                    memory_id: staged.memory_id,
+                    expected_epoch: staged.base_epoch,
+                    actual_epoch: current_epoch,
+                    expected_revision: staged.base_revision,
+                    actual_revision: current_revision,
+                    reason: reason.into(),
+                });
                 continue;
             }
             let change = BotChange::Memory {
@@ -991,7 +1103,7 @@ impl Store {
                 at,
             )?;
         }
-        Ok(())
+        Ok(conflicts)
     }
 
     /// Writes the change a turn's tool call asked for. The same `call_ref` in the same turn
