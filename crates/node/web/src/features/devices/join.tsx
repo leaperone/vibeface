@@ -14,12 +14,15 @@ import { terms } from "@/lib/glossary"
 export const useOpenJoins = (): JoinRequest[] => openJoins(useDevice())
 
 /** Join requests waiting on an admin, compared by the safety code shown on both screens. */
+/** A device this page just allowed in. */
+export type Added = { id: string; kind: "node" | "client"; name: string; manage: boolean }
+
 /**
  * `issuing`: this page just handed out a link, so it starts the comparison without a click.
  * `onAllowed`: the page shows the added device itself instead of a toast.
  */
 /** `manage`: the sheet was opened to add a management device, so a computer or phone asking starts ticked as one. */
-export function JoinRequests({ issuing = false, manage = false, onAllowed }: { issuing?: boolean; manage?: boolean; onAllowed?(name: string, manage: boolean): void }) {
+export function JoinRequests({ issuing = false, manage = false, onAllowed }: { issuing?: boolean; manage?: boolean; onAllowed?(added: Added): void }) {
   const device = useDevice()
   const joins = useOpenJoins()
   // The code appears once the new device reveals its nonce; poll until every open request shows one.
@@ -61,7 +64,7 @@ const started = new Set<string>()
  * Starting the comparison claims the request for this admin, so only the page that issued the link does it
  * on its own; every other admin page asks first.
  */
-export function JoinCard({ request, auto = false, manage: asManager = false, onAllowed }: { request: JoinRequest; auto?: boolean; manage?: boolean; onAllowed?(name: string, manage: boolean): void }) {
+export function JoinCard({ request, auto = false, manage: asManager = false, onAllowed }: { request: JoinRequest; auto?: boolean; manage?: boolean; onAllowed?(added: Added): void }) {
   const device = useDevice()
   const action = useAction()
   const [manage, setManage] = useState(asManager)
@@ -85,7 +88,7 @@ export function JoinCard({ request, auto = false, manage: asManager = false, onA
     actions={<>
       <Button type="button" variant="ghost" disabled={busy} onClick={() => void action.run("reject", async () => { await device.rejectJoin(request.join_id); toast(deviceCopy.rejected(request.name || "新设备"), { icon: CircleX }) })}>拒绝</Button>
       {request.status === "pending" && !auto ? <Button type="button" disabled={busy} onClick={() => void action.run("start", () => device.startApproval(request.join_id))}>{action.busy === "start" ? "处理中" : "显示安全码"}</Button>
-      : <Button ref={allow} type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.(request.name || "新设备", request.kind === "client" && manage) }, onAllowed ? undefined : manage && request.kind === "client" ? deviceCopy.addedManager(request.name || "新设备") : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
+      : <Button ref={allow} type="button" disabled={!request.code || busy || elsewhere} onClick={() => void action.run("allow", async () => { await device.approveJoin(request.join_id, request.kind === "client" && manage); onAllowed?.({ id: request.device_id, kind: request.kind, name: request.name || "新设备", manage: request.kind === "client" && manage }) }, onAllowed ? undefined : manage && request.kind === "client" ? deviceCopy.addedManager(request.name || "新设备") : "已允许加入")}>{action.busy === "allow" ? "处理中" : "一致，允许"}</Button>}
     </>}
   >
     <p className="text-meta text-muted-foreground">{elsewhere ? "正在另一台管理设备上处理" : request.status === "pending" && !auto ? "点“显示安全码”，新设备上会出现同样的码" : request.code ? deviceCopy.compareCode : "等新设备显示安全码"}</p>

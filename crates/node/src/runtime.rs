@@ -902,6 +902,9 @@ impl Runtime {
                 if let Some(reason) = dispatch.state.reason() {
                     task["failure_reason"] = json!(workspace_bounded(reason, 512));
                 }
+                if let Some(failure) = dispatch.state.failure() {
+                    task["failure"] = json!(failure);
+                }
                 tasks.push(task);
                 deliveries.push(json!({
                     "work_id": spec.work_id,
@@ -912,6 +915,7 @@ impl Runtime {
                     "title": workspace_bounded(&spec.title, 256),
                     "cwd": workspace_bounded(&spec.cwd, 512),
                     "reason": dispatch.state.reason().map(|reason| workspace_bounded(reason, 512)),
+                    "failure": dispatch.state.failure(),
                 }));
             }
         }

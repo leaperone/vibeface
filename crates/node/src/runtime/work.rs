@@ -255,10 +255,13 @@ impl Runtime {
                 spec.dispatcher != spec.target,
                 "an agent task goes to another device"
             );
-            ensure!(
-                self.manager().is_some(),
-                "this device has no bot to take the task"
-            );
+            if self.manager().is_none() {
+                return Err(ExecFailure::new(
+                    FailureKind::NoBot,
+                    "this device has no bot to take the task",
+                )
+                .into());
+            }
         }
         Ok(())
     }

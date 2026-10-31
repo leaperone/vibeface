@@ -221,12 +221,12 @@ function LogRow({ record, name, chat, task, open, onToggle, onCopyAll }: { recor
   const alert = outside ? undefined : alertLook[record.level]
   const quiet = outside || record.level === 'debug' || record.level === 'trace'
   const { title, detail } = describe(record, name)
-  const Icon = alert?.icon ?? sourceIcon[record.source]
+  const Icon = alert?.icon ?? (record.source === 'node' ? undefined : sourceIcon[record.source])
   const names: Array<[string, string | undefined]> = [['对话', chat], ['任务', task]]
   const ids: Array<[string, string | undefined]> = [['事件', record.event], ['原文', record.message === title ? undefined : record.message], ['对话', record.conversation_id], ['任务', record.work_id], ['会话', record.thread_id]]
   return <li>
     <button type="button" aria-expanded={open} onClick={onToggle} className="interactive-row flex w-full items-start gap-3 px-4 py-3 text-left">
-      {alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
+      {!Icon ? <span aria-hidden="true" className="size-4 shrink-0" /> : alert ? <Icon aria-label={alert.label} className={cn('mt-0.5 size-4 shrink-0', alert.tone)} /> : <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />}
       <span className="grid min-w-0 flex-1 gap-1">
         <span className={cn('break-words', !open && 'line-clamp-2', quiet && 'text-muted-foreground', outside && 'font-mono text-meta')}>{title}</span>
         {detail ? <span className={cn('break-words text-meta text-muted-foreground', !open && 'line-clamp-1')}>{detail}</span> : null}

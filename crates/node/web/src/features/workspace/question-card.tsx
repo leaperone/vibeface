@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button"
 import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
-import { answerLabel, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
+import { answerLabel, approvalTask, declined, questionMeta, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import { providerNames } from "@vibeface/client/lib/node.ts"
 import { providerIcons } from "@/features/devices/ai-settings"
 import type { Question, Severity } from "@vibeface/client/workspace/types.ts"
@@ -39,12 +39,17 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const settled = settledAnswer(standing, workspace.answered[id])
   // The first line asks; lines after it list what the answer applies to.
   const [ask = question.text, ...lines] = question.text.split(/\r?\n/).filter((line) => line.trim())
-  if (settled) return <Settled ask={ask} lines={lines} focus={answering.current} role={standing === undefined || settled.elsewhere ? "status" : undefined}
+  const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
+  // Read back later, an answered approval says which task on which device it settled.
+  const heldTask = inTask ? null : approvalTask(question, [...workspace.openWorks, ...(workspace.data?.works ?? [])])
+  const about = heldTask ? <span className="flex min-w-0 items-center gap-1"><ListChecks aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">任务 </span><span className="min-w-0 truncate">{heldTask}</span>
+    <span aria-hidden="true">·</span><Laptop aria-hidden="true" className="size-3.5 shrink-0" /><span className="sr-only">设备 </span><span className="min-w-0 truncate">{node}</span></span> : null
+  if (settled) return <Settled ask={ask} lines={lines} about={about} focus={answering.current} role={standing === undefined || settled.elsewhere ? "status" : undefined}
     mark={settled.elsewhere ? <CircleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-warning" /> : declined(settled.text) ? <CircleX aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-danger" /> : <CircleCheck aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-success" />}>
     <span className="text-foreground">{settled.elsewhere ? `已由另一端回答：${settled.text}` : answerLabel(settled.text)}</span>
   </Settled>
 
-  if (question.closed) return <Settled ask={ask} lines={lines} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>
+  if (question.closed) return <Settled ask={ask} lines={lines} about={about} mark={<CircleSlash aria-hidden="true" className="mt-0.5 size-4 shrink-0" />}>已失效</Settled>
 
   const pending = workspace.pendingAnswers.find((item) => item.question_id === id)
   const { tone, label, icon: severityIcon } = looks[question.severity]
@@ -52,7 +57,6 @@ export function QuestionCard({ question, answer, inbox = false, inTask = false, 
   const icon = approval ? terms.approval.icon : severityIcon
   const disabled = !workspace.writable || action.busy !== null
   const shown = question.choices
-  const node = nodeName(question.about.node, { nodes: workspace.nodes, directory })
   const project = question.about.cwd ? sharedProject(question.about.cwd, question.about.node, workspace.nodes) : null
   const send = (key: string, value: string) => action.run(key, async () => {
     answering.current = true
@@ -135,10 +139,13 @@ function Lines({ lines, className }: { lines: string[]; className?: string }) {
  * An answered or closed question as one line. With lines of detail, tapping the line opens them, so a phone without hover still sees what
  * the answer applied to. `focus`: answered here, the line takes the focus. `role`: "status" to announce it when it appears.
  */
-function Settled({ ask, lines, mark, focus = false, role, children }: { ask: string; lines: string[]; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
-  const line = <span role={role} className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:gap-2">
-    <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={ask}>{ask}</span>
-    <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{children}</span>
+function Settled({ ask, lines, about, mark, focus = false, role, children }: { ask: string; lines: string[]; about?: ReactNode; mark: ReactNode; focus?: boolean; role?: "status"; children: ReactNode }) {
+  const line = <span role={role} className="grid min-w-0 flex-1 gap-0.5">
+    {about}
+    <span className="flex min-w-0 flex-col gap-0.5 sm:flex-row sm:gap-2">
+      <span className="min-w-0 truncate sm:max-w-[40%] sm:shrink-0" title={ask}>{ask}</span>
+      <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">{children}</span>
+    </span>
   </span>
   const settled = "flex min-h-9 min-w-0 items-start gap-2 px-2 py-2 outline-none"
   if (!lines.length) return <p ref={focus ? claimFocus : undefined} tabIndex={-1} className={cn("-mx-2 text-meta text-muted-foreground", settled)}>{mark}{line}</p>

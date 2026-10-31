@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { botOnChange, folderSuggestions, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { availability, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, parseProviderModels, providerGroups, providerNames, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -30,11 +30,11 @@ export default function AiScreen() {
   </KeyboardAwareScrollView>
 }
 
-const states: Record<ProviderStatus['state'], { label: string; tone: Tone; icon: LucideIcon }> = {
+const states: Record<Availability, { label: string; tone: Tone; icon: LucideIcon }> = {
   ready: { label: '可用', tone: 'success', icon: CircleCheck },
   needs_setup: { label: '需设置', tone: 'warning', icon: CircleAlert },
   starting: { label: '启动中', tone: 'neutral', icon: LoaderCircle },
-  off: { label: '未使用', tone: 'neutral', icon: CircleDashed },
+  missing: { label: '未安装', tone: 'neutral', icon: CircleDashed },
 }
 
 const services: Record<string, string> = { CURSOR_API_KEY: 'Cursor', OPENAI_API_KEY: 'OpenAI', ANTHROPIC_API_KEY: 'Anthropic', GEMINI_API_KEY: 'Gemini' }
@@ -106,7 +106,7 @@ function AiSettings() {
   </View>
 }
 
-/** One line per provider, as on the web: its uses that are on, and its state unless it is unused. Tapping it opens the switches and settings. */
+/** One line per provider, as on the web: its uses that are on, and whether it can be used, greyed out without its program. Tapping it opens the switches and settings. */
 function ProviderRow({ item, first, response, busy, models, error, change, saveAssistant, test }: {
   item: ProviderStatus; first: boolean; response: NodeSettingsResponse; busy: string; models: ModelChoice[] | null; error: string
   change(key: string, value: Change): Promise<boolean>; saveAssistant(manager: ManagerSettings): Promise<boolean>; test(): Promise<AppServerLink | null>
@@ -114,7 +114,8 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
   const manager = assistant ? response.settings.manager : null
-  const state = item.state === 'off' ? null : states[item.state]
+  const usable = availability(item)
+  const state = states[usable]
   const issue = item.state === 'needs_setup' ? item.issues[0] : undefined
   const [open, setOpen] = useState(false)
   const [bin, setBin] = useState(item.bin)
@@ -122,15 +123,15 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
   const working = busy.startsWith(`${item.provider}:`)
   const using = [assistant ? roles.bot : null, execution ? roles.execution : null].filter((role) => role !== null)
   return <View className={cn(!first && 'border-t border-border')}>
-    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state?.label].filter(Boolean).join('，')}
+    <Pressable accessibilityRole="button" accessibilityState={{ expanded: open }} accessibilityLabel={[name, ...using.map((role) => role.label), state.label].join('，')}
       className="min-h-14 flex-row items-center gap-3 px-4 py-2 active:bg-muted/60" onPress={() => setOpen(!open)}>
-      <Icon as={providerIcons[item.provider]} className="text-muted-foreground" />
-      <Text numberOfLines={1} className="min-w-0 flex-1 font-medium">{name}</Text>
+      <Icon as={providerIcons[item.provider]} className={usable === 'missing' ? 'text-muted-foreground/60' : 'text-muted-foreground'} />
+      <Text numberOfLines={1} className={cn('min-w-0 flex-1 font-medium', usable === 'missing' && 'text-muted-foreground')}>{name}</Text>
       {using.map((role) => <Icon key={role.label} as={role.icon} className="size-4 text-brand" />)}
-      {state ? <View className="flex-row items-center gap-1">
+      <View className="flex-row items-center gap-1">
         <Icon as={state.icon} className={cn('size-4', toneText[state.tone])} />
         <Text className={cn('text-meta', toneText[state.tone])}>{state.label}</Text>
-      </View> : null}
+      </View>
       <Icon as={open ? ChevronDown : ChevronRight} className="size-4 text-muted-foreground" />
     </Pressable>
     {issue ? <View className="-mt-1 flex-row flex-wrap items-center gap-x-2 px-4 pb-2">

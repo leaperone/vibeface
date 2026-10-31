@@ -1,5 +1,6 @@
 import { Link, createFileRoute } from '@tanstack/react-router'
 import { ArrowRight, ArrowUpRight } from 'lucide-react'
+import { SiteLayout } from '@/components/site-layout'
 
 export const Route = createFileRoute('/')({
   head: () => ({
@@ -15,22 +16,7 @@ export const Route = createFileRoute('/')({
 
 function HomePage() {
   return (
-    <div className="landing">
-      <a className="landing-skip" href="#content">跳到内容</a>
-      <header className="landing-header">
-        <Link className="brand" to="/" aria-label="Vibeface 首页">
-          <img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />
-          <span>Vibeface</span>
-        </Link>
-        <nav aria-label="主导航">
-          <Link to="/docs/$" params={{ _splat: 'overview' }}>文档</Link>
-          <a href="/download">下载</a>
-          <a href="/community">社区</a>
-          <a href="/security">安全</a>
-        </nav>
-      </header>
-
-      <main id="content" tabIndex={-1}>
+    <SiteLayout>
         <section className="landing-hero" aria-labelledby="hero-title">
           <div className="hero-copy-block">
             <p className="hero-kicker">自己的设备，自己的 Agent <span aria-hidden="true">/</span> Nightly</p>
@@ -134,13 +120,6 @@ function HomePage() {
           </ol>
           <p className="nightly-note">当前为 Nightly。正式版前不保留协议、数据格式和 API 的向后兼容。<a href="https://github.com/leaperone/vibeface/releases">查看 Nightly Releases <ArrowUpRight size={14} aria-hidden="true" /></a></p>
         </section>
-      </main>
-
-      <footer className="landing-footer">
-        <span className="brand"><img className="brand-mark" src="/logo.svg" width="28" height="28" alt="" />Vibeface</span>
-        <span className="footer-note">自己的设备，共享的 Bot 历史。</span>
-        <a className="text-link" href="https://github.com/leaperone/vibeface">GitHub <ArrowUpRight size={16} aria-hidden="true" /></a>
-      </footer>
-    </div>
+    </SiteLayout>
   )
 }
