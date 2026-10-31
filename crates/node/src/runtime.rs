@@ -198,6 +198,9 @@ fn workspace_question_summary(question: &Value) -> Value {
             row[key] = value.clone();
         }
     }
+    if row["bot"].is_object() {
+        row["bot"]["conversation_id"] = question["conversation_id"].clone();
+    }
     if let Some(text) = question.get("text").and_then(Value::as_str) {
         row["text"] = json!(workspace_bounded(text, 1024));
     }
@@ -221,6 +224,7 @@ fn workspace_question_summary(question: &Value) -> Value {
 fn workspace_session_summary(session: &Value) -> Value {
     let mut row = json!({});
     for key in [
+        "conversation_id",
         "node",
         "session_id",
         "agent",
@@ -266,6 +270,28 @@ fn workspace_job_summary(
 #[cfg(test)]
 mod workspace_overview_tests {
     use super::*;
+
+    #[test]
+    fn question_and_session_summaries_keep_their_conversation() {
+        let question = workspace_question_summary(&json!({
+            "question_id": "q", "conversation_id": "question-chat",
+            "bot": {"bot_id": "b", "name": "Bot"}, "text": "Which format?",
+            "severity": "attention", "choices": [], "created_at_ms": 1,
+        }));
+        assert_eq!(question["conversation_id"], "question-chat");
+        assert_eq!(
+            question["bot"],
+            json!({
+                "bot_id": "b", "name": "Bot", "conversation_id": "question-chat",
+            })
+        );
+        let unowned = workspace_question_summary(&json!({"conversation_id": "gone", "bot": null}));
+        assert!(unowned["bot"].is_null());
+        let session = workspace_session_summary(&json!({
+            "conversation_id": "session-chat", "node": "n", "session_id": "s",
+        }));
+        assert_eq!(session["conversation_id"], "session-chat");
+    }
 
     #[test]
     fn work_summary_does_not_expose_prompt_or_raw_result() {

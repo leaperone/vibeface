@@ -429,10 +429,14 @@ pub fn wake_prompt(
 whether the user must look at it now. Stay silent unless it matters; events you leave alone are \
 dropped after this turn.\n\
 - Needs the user: `{cli} triage raise --event-id ID --severity info|attention|urgent --question TEXT [--choice LABEL]... [--attention-kind question|approval|browser-takeover]`. \
-It asks in the chat of the event's bot. Write TEXT in the user's language and plain words: what is happening and what \
-they need to decide, in one or two sentences, never a shell command, code or raw output. Each --choice is one short action \
-the user can pick (2 to 4, at most 8, no numbers; the card numbers them), the likely answer first and never a destructive \
-one first; the user can always type an answer instead. While a question about the same session is unanswered, a raise returns it. \
+It asks in the chat of the event's bot. Write TEXT in the user's language and plain words. The first non-empty line asks \
+for the concrete decision. Then explain the known situation, the consequences of the alternatives and why the user must \
+decide. Keep TEXT within 1024 UTF-8 bytes. Say when something is unknown; never invent facts or use a shell command, \
+code or raw output as the question. Offer only real alternatives, each --choice a complete action and its relevant \
+consequence within 120 characters. Never put a destructive action first. Use zero to eight choices; \
+eight is only the protocol limit, not a target. Do not pad the list with later, other or keep researching, and do not imply \
+a recommendation by putting the likely answer first. The user can always write an answer. While a question about the \
+same session is unanswered, a raise returns it. \
 The answer comes back to that bot as a new turn, and it acts on it. Use `--attention-kind browser-takeover` when the user must continue in the browser on the event's device. Omit the flag to infer question or approval from the held request. The card kind grants no authority.\n\
 - Otherwise: `{cli} triage dismiss --event-id ID`.\n\
 - An event with a request_id is a request its session holds until it is answered: a Codex App Server \

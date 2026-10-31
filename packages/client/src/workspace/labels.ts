@@ -192,9 +192,12 @@ export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 /** Where a task card sits on the tasks page, in both apps. */
 export type TaskGroup = "attention" | "working" | "waiting"
 export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
-/** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
-export const cardState = (work: WorkCard, nodes: NodeInfo[], projected?: string) =>
-  work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
+/** Confirmation and failure override the overview's last reported state. */
+export const cardState = (work: WorkCard, nodes: NodeInfo[], projected?: string) => {
+  if (work.outcome === "failed" || work.outcome === "rejected") return work.outcome
+  const state = shownState(work, nodes)
+  return state === "awaiting_confirmation" ? state : projected ?? state
+}
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
 /** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */
 export const taskGroup = (state: string, heldOnPerson: boolean): TaskGroup =>

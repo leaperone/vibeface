@@ -24,13 +24,10 @@ export function settledAnswer(standing: string | undefined, mine: string | undef
   return { text, elsewhere: beaten || other, beaten }
 }
 
-/** A question's first line asks; the lines after it list what the answer applies to, each split at its first "：" into a label and a value. */
-export function questionParts(text: string): { ask: string; lines: { label: string | null; value: string }[] } {
-  const [ask = text, ...rest] = text.split(/\r?\n/).filter((line) => line.trim())
-  return { ask, lines: rest.map((line) => {
-    const colon = line.indexOf("：")
-    return colon > 0 ? { label: line.slice(0, colon), value: line.slice(colon + 1) } : { label: null, value: line }
-  }) }
+/** The first non-empty line asks for the decision; the rest keeps its paragraphs. */
+export function questionParts(text: string) {
+  const [ask = "", ...lines] = text.trim().split(/\r?\n/)
+  return { ask: ask.trim(), detail: lines.join("\n").trim() }
 }
 
 /** An answer that turns the request down, so it reads as refused, not agreed. */

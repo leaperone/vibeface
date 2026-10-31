@@ -71,7 +71,7 @@ export default function TaskDetail() {
     {asked.summary ? <Section title="交代的事"><Text selectable>{asked.summary}</Text></Section> : null}
     {result && !active ? <Section title={!failed && (work.result_text || state === 'completed') ? '结果' : '原因'}><Text selectable className={cn(failed && 'text-danger')}>{result}</Text></Section> : null}
     {check ? <ConfirmCard check={check} /> : null}
-    {asking ? <QuestionCard question={asking} inTask /> : null}
+    {asking ? <QuestionCard key={asking.question_id} question={asking} inTask /> : null}
     {canStop && sharing.length ? <Section title="会一起停止">
       {sharing.map((item) => <View key={item.work_id} className="flex-row items-center gap-2">
         <Icon as={Link2} className="size-4 text-muted-foreground" /><Text numberOfLines={1} className="shrink">{item.title || '任务'}</Text>
