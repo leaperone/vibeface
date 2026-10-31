@@ -1,8 +1,9 @@
-import { Bot, CirclePause, CircleX, Clock } from 'lucide-react-native'
+import { Bot, CirclePause, CircleX, Clock, Paperclip, RotateCcw } from 'lucide-react-native'
 import { View } from 'react-native'
 import Animated, { FadeInDown, ReduceMotion } from 'react-native-reanimated'
 import { withUniwind } from 'uniwind'
 import { failureText, rawError, replyFailure } from '@vibeface/client/lib/errors.ts'
+import { ActionButton } from '@/components/action'
 import { BotFace, type FaceBot } from '@/components/bot-face'
 import { Details } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -20,8 +21,9 @@ const ended: Record<string, string> = { stopped: '已中断', interrupted: '已�
 /**
  * The person's message in a bubble on the right; a bot's reply as plain text across the full width; another bot's in a
  * bubble under its name, as on the web. While a reply streams the bot's face moves under it, greyed while offline.
+ * `retry`: 重试 after this reply failed or was stopped.
  */
-export function Message({ message, bot, time: shown, offline }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean }) {
+export function Message({ message, bot, time: shown, offline, retry }: { message: ChatMessage; bot: FaceBot; time?: string; offline: boolean; retry?: () => Promise<unknown> }) {
   const user = message.role === 'user'
   const stopped = message.state === 'interrupted' ? '已中断' : ended[message.status ?? '']
   const failed = message.status === 'failed'
@@ -31,7 +33,9 @@ export function Message({ message, bot, time: shown, offline }: { message: ChatM
   const time = shown ? <Text className="text-meta text-muted-foreground" style={{ fontVariant: ['tabular-nums'] }}>{shown}</Text> : null
   if (user) return <Rise entering={entering} className="max-w-[85%] items-end gap-1 self-end">
     <View className="rounded-2xl rounded-br-md bg-secondary px-4 py-2 ring-1 ring-border/60">
-      <Text selectable className="text-secondary-foreground">{message.text}</Text>
+      {/* A message may be only its files. */}
+      {message.text ? <Text selectable className="text-secondary-foreground">{message.text}</Text>
+        : <View className="flex-row items-center gap-1"><Icon as={Paperclip} className="text-secondary-foreground" /><Text className="text-secondary-foreground">{message.attachments?.length ?? 0} 个文件</Text></View>}
     </View>
     {message.state === 'sending' ? <Icon as={Clock} accessibilityLabel="发送中" className="text-muted-foreground" /> : time}
   </Rise>
@@ -53,6 +57,7 @@ export function Message({ message, bot, time: shown, offline }: { message: ChatM
     {stopped ? <View className="flex-row flex-wrap items-center gap-x-2 gap-y-1">
       <View className="flex-row items-center gap-1"><Icon as={failed ? CircleX : CirclePause} className={failed ? 'text-danger' : 'text-muted-foreground'} /><Text className={failed ? 'text-meta text-danger' : 'text-meta text-muted-foreground'}>{stopped}</Text></View>
       {cause ? <Text className="shrink text-meta text-muted-foreground">{cause}</Text> : null}
+      {retry ? <ActionButton variant="ghost" icon={RotateCcw} action={retry}>重试</ActionButton> : null}
     </View> : null}
     {raw ? <Details><Text selectable className="font-mono text-meta text-muted-foreground">{raw}</Text></Details> : null}
     {time ? <View className="-mt-1.5">{time}</View> : null}

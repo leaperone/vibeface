@@ -28,7 +28,7 @@ type Props = {
 }
 
 export function Composer({ value, onChange, files, onFiles, blocked, sending, onSend, onStop, children, tint }: Props) {
-  const canSend = !blocked && !sending && value.trim().length > 0
+  const canSend = !blocked && !sending && (value.trim().length > 0 || files.length > 0)
   const armed = canSend && !onStop
   const pick = async () => {
     const picked = await DocumentPicker.getDocumentAsync({ multiple: true, copyToCacheDirectory: true })

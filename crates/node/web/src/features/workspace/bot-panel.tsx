@@ -59,6 +59,7 @@ export function BotPanelButton() {
   const look = useAvatarPick(bot ?? { bot_id: "", avatar: null, avatar_version: null }, (version, avatar) => workspace.setBotAvatar(bot!.conversation_id, version, avatar),
     (caught) => toast(messageOf(caught, "换长相"), { tone: "danger" }))
   if (!bot) return null
+  const deleteHint = botCopy.deleteHint(workspace.primary === bot.conversation_id ? workspace.bots.find((item) => item.successor)?.name ?? null : null)
   const shown = { bot_id: bot.bot_id, avatar: look.avatar }
   const rank = (id: string) => { const at = order.current.indexOf(id); return at < 0 ? order.current.length : at }
   const schedules = sortSchedules(view?.schedules ?? []).sort((a, b) => rank(a.schedule_id) - rank(b.schedule_id))
@@ -177,7 +178,7 @@ export function BotPanelButton() {
             {view.skills.map((skill) => <SettingsRow key={skill.skill_id} icon={BookOpen} label={<span title={skill.name}>{skill.name}</span>} description={skill.description || undefined} />)}
           </SettingsGroup> : null}
           <SettingsGroup>
-            <SettingsRow ref={returnFocus("bot")} icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? "不再回复，定时任务停止，聊天记录一并移除" : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
+            <SettingsRow ref={returnFocus("bot")} icon={Trash2} tone="danger" label="删除 Bot" description={deleting ? <span className="block truncate" title={deleteHint}>{deleteHint}</span> : undefined} onClick={deleting || !workspace.writable ? undefined : () => setDeleting(true)}>
               {deleting ? <>
                 <Button type="button" variant="ghost" autoFocus onClick={() => { refocus.current = "bot"; setDeleting(false) }}>取消</Button>
                 <ActionButton variant="destructive" disabled={!workspace.writable} action={async () => { await workspace.deleteBot(bot.conversation_id); toast(`已删除「${bot.name}」`, { tone: "success" }); setOpen(false); void navigate({ to: "/" }) }}>删除</ActionButton>

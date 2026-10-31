@@ -2,6 +2,7 @@ import { botReadiness, inputText } from '../workspace/model.ts'
 import { newId } from '../workspace/storage.ts'
 import type { MessageRequest, PendingMessage, TranscriptMessage } from './types.ts'
 import type { NodeInfo } from '../workspace/types.ts'
+import type { FailureKind } from '../lib/errors.ts'
 
 /** An empty chat's first messages: project questions for a bot with a folder, otherwise what any bot can do from chat. */
 export const starters = { project: ['看看这个项目的结构', '帮我检查依赖', '最近改了什么？'], general: ['你能帮我做什么？', '每天早上 9 点提醒我', '记住：回复用中文'] }
@@ -51,9 +52,11 @@ export function prepareSend(input: {
   text: string
   pending: PendingMessage | null
   reportResults?: boolean
+  /** It carries files, which are a message on their own. */
+  files?: boolean
 }): { ok: true; pending: PendingMessage; body: MessageRequest } | { ok: false; error: string } {
   let text: string
-  try { text = inputText(input.text, '消息内容', 65536) }
+  try { text = input.files && !input.text.trim() ? '' : inputText(input.text, '消息内容', 65536) }
   catch (caught) { return { ok: false, error: caught instanceof Error ? caught.message : '消息内容无效。' } }
   if (input.pending && (input.pending.text !== text || input.pending.conversation_id !== input.conversationId)) {
     return { ok: false, error: '上一条消息还没确认送达，先处理它再发新的。' }
@@ -70,6 +73,16 @@ export function prepareSend(input: {
 /** The Node admitted this exact message; a retry of the same message_id returns the same receipt. */
 export function isQueuedReceipt(value: unknown, pending: PendingMessage): boolean {
   return value !== null && typeof value === 'object' && 'accepted' in value && value.accepted === true && 'message_id' in value && value.message_id === pending.message_id
+}
+// These end a reply before its AI service starts, so the reply did nothing.
+const beforeStart = new Set<FailureKind>(['missing_key', 'missing_binary', 'execution_disabled', 'no_model', 'no_bot', 'writer_busy'])
+/**
+ * What 重试 sends for a reply that failed or was stopped. Only a reply that provably did nothing, by its failure and by leaving no
+ * task or change behind, gets its message again as it was; any other may have written something, so the bot checks first.
+ */
+export function retryText(text: string, failure: FailureKind | undefined, traces: boolean): string {
+  if (failure && beforeStart.has(failure) && !traces) return text
+  return `上次没回完，可能已经做了一部分。先看看做过什么，做过的不要重做，再接着完成${text.trim() ? `：\n${text}` : '。'}`
 }
 export function replyStatusLabel(status: string | undefined): string {
   if (status === 'stopped') return '已中断'
