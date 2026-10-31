@@ -31,7 +31,7 @@ pub const LAST_MANAGER: &str = "the network needs at least one management device
 pub const RECOVERY_INCOMPLETE: &str =
     "this recovery rests on device changes this Node has not received; sync it first";
 pub const GOVERNANCE_DOMAIN: &str = "identity-governance";
-/// How long a recovery that replaces the directory waits for a veto.
+/// The default wait for a recovery that replaces the directory.
 pub const RECOVERY_DELAY_MS: u64 = 48 * 60 * 60 * 1000;
 /// How far a new recovery's or veto's signed time may be from the clock of the Node taking it.
 pub const RECOVERY_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -255,8 +255,8 @@ pub struct RootCheckpoint {
     /// rotation. Only a veto resting on all of them stops the new directory, so whether a veto
     /// counts depends on nothing that arrives after it.
     pub heads: Vec<String>,
-    /// When the root signed it; a new directory takes effect `RECOVERY_DELAY_MS` later, and a
-    /// rotation retires a sibling recovery only if signed before that one's time.
+    /// When the root signed it; a new directory normally takes effect `RECOVERY_DELAY_MS` later.
+    /// A rotation retires a sibling recovery only if signed before that one's natural deadline.
     pub issued_at_ms: u64,
     pub signature: String,
 }
@@ -409,7 +409,7 @@ impl RootCheckpoint {
         Ok(digest(&canonical_json(self)?))
     }
 
-    /// When a new directory takes effect unless vetoed.
+    /// The new directory's natural activation time, unless approved earlier or vetoed.
     pub fn effective_at_ms(&self) -> u64 {
         self.issued_at_ms.saturating_add(RECOVERY_DELAY_MS)
     }
@@ -500,8 +500,13 @@ pub enum GovernanceAction {
         member: Member,
     },
     Revoke(Revocation),
-    /// Stops the recovery waiting on this epoch; counts only if signed before it takes effect.
+    /// Stops a recovery in this epoch if signed before its natural activation deadline.
     Veto {
+        checkpoint: String,
+        at_ms: u64,
+    },
+    /// Activates a pending recovery early if signed before its natural activation deadline.
+    Approve {
         checkpoint: String,
         at_ms: u64,
     },
@@ -550,6 +555,17 @@ impl GovernanceEvent {
                 view.pending.as_ref().map(|p| &p.checkpoint) == Some(checkpoint),
                 NO_RECOVERY_WAITING
             ),
+            GovernanceAction::Approve { checkpoint, at_ms } => {
+                let pending = view
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                ensure!(
+                    *at_ms < pending.effective_at_ms,
+                    "this recovery is already due"
+                );
+            }
         }
         Ok(Self {
             version: IDENTITY_VERSION,
@@ -760,10 +776,18 @@ struct EpochView {
     /// Every event here, valid in its own causal past.
     known: BTreeSet<String>,
     vetoes: Vec<CastVeto>,
+    approvals: Vec<CastApproval>,
 }
 
 /// A veto with its causal past, which alone decides whether it counts.
 struct CastVeto {
+    checkpoint: String,
+    at_ms: u64,
+    ancestors: BTreeSet<String>,
+}
+
+/// An approval with its causal past, which alone decides whether it counts.
+struct CastApproval {
     checkpoint: String,
     at_ms: u64,
     ancestors: BTreeSet<String>,
@@ -819,6 +843,24 @@ fn vetoed(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> bool {
                     .iter()
                     .all(|head| veto.ancestors.contains(head))
         })
+}
+
+/// The first valid confirmation time, including one ahead of this replica's clock.
+fn approval_at(parent: &EpochView, checkpoint: &RootCheckpoint, hash: &str) -> Option<u64> {
+    parent
+        .approvals
+        .iter()
+        .filter(|approval| {
+            checkpoint.directory.is_some()
+                && approval.checkpoint == hash
+                && approval.at_ms < checkpoint.effective_at_ms()
+                && checkpoint
+                    .heads
+                    .iter()
+                    .all(|head| approval.ancestors.contains(head))
+        })
+        .map(|approval| approval.at_ms)
+        .min()
 }
 
 /// Whether a sibling checkpoint signed at `issued_at_ms` retires the recovery `earlier`.
@@ -980,7 +1022,12 @@ impl NetworkState {
         let live = live(&epochs);
         let pending = pending(&epochs, live).map(|index| PendingRecovery {
             checkpoint: epochs[index].checkpoint.clone().unwrap_or_default(),
-            effective_at_ms: epochs[index].effective_at_ms,
+            effective_at_ms: approval_at(
+                &epochs[live].view,
+                &self.checkpoints[index - 1],
+                epochs[index].checkpoint.as_deref().unwrap_or_default(),
+            )
+            .unwrap_or(epochs[index].effective_at_ms),
             members: epochs[index].view.members.values().cloned().collect(),
         });
         let stopped = epochs
@@ -1118,12 +1165,26 @@ impl NetworkState {
         for index in 1..epochs.len() {
             let epoch = &epochs[index];
             let parent = epochs[epoch.parent.expect("only genesis has no parent")].standing;
+            let checkpoint = &self.checkpoints[index - 1];
+            let checkpoint_hash = epoch
+                .checkpoint
+                .as_deref()
+                .expect("checkpoint epoch has a checkpoint hash");
             epochs[index].standing = match parent {
                 Standing::Vetoed | Standing::Void => Standing::Void,
                 _ if epoch.stopped => Standing::Vetoed,
                 _ if epoch.incomplete => Standing::Waiting,
                 Standing::Pending | Standing::Waiting => Standing::Waiting,
-                Standing::Live if epoch.rotation || now_ms >= epoch.effective_at_ms => {
+                Standing::Live
+                    if epoch.rotation
+                        || approval_at(
+                            &epochs[epoch.parent.expect("only genesis has no parent")].view,
+                            checkpoint,
+                            checkpoint_hash,
+                        )
+                        .is_some_and(|at| at <= now_ms)
+                        || now_ms >= epoch.effective_at_ms =>
+                {
                     Standing::Live
                 }
                 Standing::Live => Standing::Pending,
@@ -1194,7 +1255,8 @@ impl NetworkState {
                     }
                 }
                 GovernanceAction::Revoke(revocation) => revocation.validate()?,
-                GovernanceAction::Veto { checkpoint, .. } => validate_hash(checkpoint)?,
+                GovernanceAction::Veto { checkpoint, .. }
+                | GovernanceAction::Approve { checkpoint, .. } => validate_hash(checkpoint)?,
             }
             pending.insert(event.hash()?, (*event).clone());
         }
@@ -1267,13 +1329,22 @@ impl NetworkState {
             "too many concurrent management heads"
         );
         let mut vetoes = Vec::new();
+        let mut approvals = Vec::new();
         for entry in validated.values() {
-            if let GovernanceAction::Veto { checkpoint, at_ms } = &entry.event.action {
-                vetoes.push(CastVeto {
+            match &entry.event.action {
+                GovernanceAction::Veto { checkpoint, at_ms } => vetoes.push(CastVeto {
                     checkpoint: checkpoint.clone(),
                     at_ms: *at_ms,
                     ancestors: entry.ancestors.clone(),
-                });
+                }),
+                GovernanceAction::Approve { checkpoint, at_ms } => {
+                    approvals.push(CastApproval {
+                        checkpoint: checkpoint.clone(),
+                        at_ms: *at_ms,
+                        ancestors: entry.ancestors.clone(),
+                    });
+                }
+                _ => {}
             }
         }
         Ok(EpochView {
@@ -1283,6 +1354,7 @@ impl NetworkState {
             clients,
             known: validated.into_keys().collect(),
             vetoes,
+            approvals,
         })
     }
 }
@@ -1305,7 +1377,7 @@ fn project_members(
     let mut candidates: BTreeMap<String, Vec<&String>> = BTreeMap::new();
     for hash in basis {
         match &events[hash].event.action {
-            GovernanceAction::Veto { .. } => {}
+            GovernanceAction::Veto { .. } | GovernanceAction::Approve { .. } => {}
             GovernanceAction::Revoke(revocation) => widen(&mut revoked, revocation),
             GovernanceAction::Grant { member } => {
                 candidates
@@ -1460,8 +1532,8 @@ impl VerifiedMembership {
         Ok(serde_json::to_string(&self.state)?)
     }
 
-    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}`, `{"type":"revoke",...}` or
-    /// `{"type":"veto","checkpoint":...,"at_ms":...}`.
+    /// An unsigned `GovernanceEvent` for `{"type":"grant",...}`, `{"type":"revoke",...}`,
+    /// `{"type":"veto","checkpoint":...,"at_ms":...}` or the same shape with `"type":"approve"`.
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(js_name = governanceTemplate))]
     pub fn governance_template(&self, issuer: &str, action_json: &str) -> crate::Result<String> {
         js((|| {
@@ -2341,6 +2413,21 @@ mod tests {
         .sign(admin)
     }
 
+    fn approve(
+        admin: &Identity,
+        view: &AuthorizationView,
+        checkpoint: &RootCheckpoint,
+        at_ms: u64,
+    ) -> Result<GovernanceEvent> {
+        let checkpoint = checkpoint.hash()?;
+        GovernanceEvent::unsigned(
+            view,
+            &id(admin),
+            GovernanceAction::Approve { checkpoint, at_ms },
+        )?
+        .sign(admin)
+    }
+
     fn refused(result: Result<impl std::fmt::Debug>, reason: &str) {
         let error = format!("{:#}", result.expect_err(reason));
         assert!(error.contains(reason), "{error}");
@@ -2384,6 +2471,147 @@ mod tests {
         assert!(after.attester(&id(&found)) && after.attester(&id(&a)));
         state.check_root(&id(&next), due, false)?;
         refused(state.check_root(&id(&root), due, false), SUPERSEDED);
+        Ok(())
+    }
+
+    #[test]
+    fn a_manager_approval_makes_a_waiting_recovery_live_immediately() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (found, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let before = state.project_at(T + 1)?;
+        assert_eq!(before.epoch, 1);
+        let event = approve(&a, &before, &checkpoint, T + 1)?;
+        assert!(state.append(event)?);
+
+        assert_eq!(state.project_at(T)?.epoch, 1);
+        assert_eq!(state.project_at(T)?.pending.unwrap().effective_at_ms, T + 1);
+        let view = state.project_at(T + 2)?;
+        assert_eq!(view.epoch, 2);
+        assert!(view.manager(&id(&found)).is_ok());
+        assert!(view.pending.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn approvals_are_idempotent_and_merge_in_any_order() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let event = approve(&a, &state.project_at(T)?, &checkpoint, T + 1)?;
+        let mut approved = state.clone();
+        assert!(approved.append(event.clone())?);
+        assert!(!approved.append(event)?);
+
+        let merged = state.merge(&approved)?;
+        assert_eq!(merged, approved);
+        assert_eq!(approved.merge(&state)?, merged);
+        assert_eq!(merged.project_at(T)?.epoch, 1);
+        assert_eq!(merged.project_at(T + 2)?.epoch, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_approval_needs_the_recovery_management_heads() -> Result<()> {
+        let (root, manager, node, mut state) = setup()?;
+        state.append(GovernanceEvent::grant(
+            &manager,
+            &state.project_at(T)?,
+            Member::client(&identity(), "other", true)?,
+        )?)?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let valid = approve(&manager, &state.project_at(T)?, &checkpoint, T + 1)?;
+        let mut missing = valid.clone();
+        missing.parents.clear();
+        state.append(missing.sign(&manager)?)?;
+        assert_eq!(state.project_at(T + 2)?.epoch, 1);
+        assert_eq!(
+            state.project_at(T + 2)?.pending.unwrap().checkpoint,
+            checkpoint.hash()?
+        );
+        state.append(valid)?;
+        assert_eq!(state.project_at(T + 2)?.epoch, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn veto_takes_priority_over_a_concurrent_approval() -> Result<()> {
+        let (root, a, node, base) = setup()?;
+        let (_, _, checkpoint) = recovering(&base, &root, &node, T)?;
+        let mut recovered = base.clone();
+        recovered.recover_at(checkpoint.clone(), T)?;
+        let view = recovered.project_at(T)?;
+        let approval = approve(&a, &view, &checkpoint, T + 1)?;
+        let veto = veto(&a, &view, &checkpoint, T + 1)?;
+        let mut approved = recovered.clone();
+        approved.append(approval)?;
+        let mut vetoed = recovered;
+        vetoed.append(veto)?;
+
+        let merged = approved.merge(&vetoed)?;
+        for at in [T + 2, T + RECOVERY_DELAY_MS] {
+            let view = merged.project_at(at)?;
+            assert_eq!(view.epoch, 1);
+            assert_eq!(view.stopped, vec![checkpoint.hash()?]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn approvals_reject_wrong_target_non_managers_and_missing_pending_recovery() -> Result<()> {
+        let (root, a, node, mut state) = setup()?;
+        let (_, _, checkpoint) = recovering(&state, &root, &node, T)?;
+        state.recover_at(checkpoint.clone(), T)?;
+        let view = state.project_at(T)?;
+
+        refused(
+            GovernanceEvent::unsigned(
+                &view,
+                &id(&a),
+                GovernanceAction::Approve {
+                    checkpoint: hash(7),
+                    at_ms: T + 1,
+                },
+            ),
+            NO_RECOVERY_WAITING,
+        );
+        refused(
+            GovernanceEvent::unsigned(
+                &view,
+                &id(&node),
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: T + 1,
+                },
+            ),
+            "management permission required",
+        );
+        refused(
+            GovernanceEvent::unsigned(
+                &view,
+                &id(&a),
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: T + RECOVERY_DELAY_MS,
+                },
+            ),
+            "this recovery is already due",
+        );
+
+        let due = T + RECOVERY_DELAY_MS;
+        let after = state.project_at(due)?;
+        assert!(
+            GovernanceEvent::unsigned(
+                &after,
+                &id(&a),
+                GovernanceAction::Approve {
+                    checkpoint: checkpoint.hash()?,
+                    at_ms: T + 1,
+                },
+            )
+            .is_err()
+        );
         Ok(())
     }
 

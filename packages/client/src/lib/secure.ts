@@ -4,8 +4,8 @@ import type { ClientPrincipal, MembershipView, PublicIdentity } from './node.ts'
 
 const encoder = new TextEncoder()
 const decoder = new TextDecoder('utf-8', { fatal: true })
-const notRecoveryFile = '这不是恢复文件。请选名字以 vibeface-recovery 开头的文件。'
-const damagedRecoveryFile = '这个恢复文件已损坏。请选下载时的那个文件。'
+const notRecoveryFile = '这不是恢复文件。选名字以 vibeface-recovery 开头的文件。'
+const damagedRecoveryFile = '这个恢复文件已损坏。选下载时的那个文件。'
 /** What the device already trusts before it reads an authentication answer. */
 export type AuthenticationTrust = { kind: 'network'; networkId: string } | { kind: 'root'; networkId: string; genesis: unknown; checkpoint?: unknown } | { kind: 'local'; networkId: string; nodeId: string }
 /** A recovery file as the platform hands it over: a browser `File` or a phone's picked document. */
@@ -47,7 +47,7 @@ export function secureKit(secure: SecureApi) {
   function verifyRemoval(value: unknown, nodeId: string, networkId: string): boolean {
     const auth = record(value)
     if (auth.node_revoked !== true) return false
-    if (networkId && auth.network_id !== networkId) throw new Error('这台电脑属于另一组设备。请先确认连接的是自己的设备。')
+    if (networkId && auth.network_id !== networkId) throw new Error('这台电脑属于另一组设备。确认连的是自己的设备。')
     if (!verifiedView(auth.state, text(auth.network_id), nodeNow(auth)).revoked.some(item => item.device_id === nodeId)) throw new Error('设备说它已被移出，但记录没通过校验。')
     return true
   }
@@ -71,7 +71,7 @@ export function secureKit(secure: SecureApi) {
     } catch { throw new Error(notRecoveryFile) }
     let cleartext: Uint8Array
     try { cleartext = secure.recoveryOpen(encoder.encode(JSON.stringify(envelope)), password) }
-    catch { throw new Error('打不开恢复文件。请确认密码，并选下载时的那个文件。') }
+    catch { throw new Error('打不开恢复文件。检查密码，并选下载时的那个文件。') }
     let payload: Record<string, unknown>
     try { payload = record(JSON.parse(decoder.decode(cleartext)), '恢复内容') } finally { cleartext.fill(0) }
     let root: SecureIdentity | undefined

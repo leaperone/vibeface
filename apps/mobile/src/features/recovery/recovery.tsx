@@ -195,11 +195,16 @@ export function RecoveryPendingCard() {
   const pending = device.pendingRecovery
   if (!pending) return null
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
+  const confirm = () => Alert.alert(recoveryCopy.confirmAsk, recoveryCopy.confirmNote, [
+    { text: '取消', style: 'cancel' },
+    { text: recoveryCopy.confirm, onPress: () => void run('confirm', async () => { await device.approveRecovery(pending.checkpoint); Alert.alert(recoveryCopy.confirmDone) }) },
+  ])
   const stop = () => Alert.alert(recoveryCopy.stopAsk, recoveryCopy.stopNote, [
     { text: '取消', style: 'cancel' },
     { text: recoveryCopy.stop, style: 'destructive', onPress: () => void run('stop', () => device.vetoRecovery(pending.checkpoint)) },
   ])
   return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} actions={<>
+    <Button disabled={busy !== null} onPress={confirm}><Icon as={ShieldCheck} /><Text>{recoveryCopy.confirm}</Text></Button>
     <Button variant="ghost" disabled={busy !== null} onPress={() => { device.dismissPendingRecovery(); Alert.alert(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset)) }}><Text>{recoveryCopy.itsMe}</Text></Button>
     <Button variant="destructive" disabled={busy !== null} onPress={stop}><Icon as={Hand} /><Text>{busy ? '处理中' : recoveryCopy.stop}</Text></Button>
   </>}>

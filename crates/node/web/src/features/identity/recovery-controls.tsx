@@ -98,26 +98,32 @@ export function PhoneRecovery() {
 export function RecoveryPendingCard() {
   const device = useDevice()
   const { busy, error, run } = useGenerationRun()
-  // Stopping cannot be undone, so it takes one confirmation, as on the phone.
-  const [asking, setAsking] = useState(false)
+  // Either decision changes access, so both require confirmation, as on the phone.
+  const [confirming, setConfirming] = useState<'confirm' | 'stop' | null>(null)
   const pending = device.pendingRecovery
   if (!pending) return null
   const changes = recoveryChanges(pending, device.directory?.members ?? [])
-  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={asking || busy ? <>
-    {/* Keys remount both buttons, so the focus lands on 取消 and a second press of the same key does not confirm. */}
-    <Button key="cancel" type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setAsking(false)}>取消</Button>
-    {/* Solid here, unlike the soft global destructive: the time-limited step must outrank every other button on the page. */}
-    <Button key="confirm" type="button" variant="destructive" className="bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50" disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
-      try { await device.vetoRecovery(pending.checkpoint) } finally { setAsking(false) }
-      toast(recoveryCopy.stopDone, { tone: 'success' })
-    })}><BusyIcon busy={busy} icon={Hand} />{recoveryCopy.stop}</Button>
+  return <ActionCard icon={ShieldAlert} tone="danger" title={recoveryCopy.pending} meta={recoveryCopy.effectiveIn(pending.effective_at_ms - device.nodeClockOffset)} actions={confirming || busy ? <>
+    {/* Remount the confirmation row so focus lands on 取消 and a second press cannot confirm. */}
+    <Button key={`cancel-${confirming ?? 'busy'}`} type="button" variant="ghost" autoFocus disabled={busy} onClick={() => setConfirming(null)}>取消</Button>
+    <Button key={confirming ?? 'busy'} type="button" variant={confirming === 'stop' ? 'destructive' : 'default'} className={confirming === 'stop' ? 'bg-destructive text-primary-foreground shadow-xs hover:bg-destructive/88 focus-visible:border-ring focus-visible:ring-ring/50 dark:bg-destructive dark:hover:bg-destructive/88 dark:focus-visible:ring-ring/50' : undefined} disabled={busy} aria-busy={busy || undefined} onClick={() => void run(async () => {
+      if (confirming === 'confirm') {
+        await device.approveRecovery(pending.checkpoint)
+        toast(recoveryCopy.confirmDone, { tone: 'success' })
+      } else {
+        await device.vetoRecovery(pending.checkpoint)
+        toast(recoveryCopy.stopDone, { tone: 'success' })
+      }
+      setConfirming(null)
+    })}><BusyIcon busy={busy} icon={confirming === 'stop' ? Hand : ShieldCheck} />{confirming === 'stop' ? recoveryCopy.stop : recoveryCopy.confirm}</Button>
   </> : <>
+    <Button type="button" onClick={() => setConfirming('confirm')}><ShieldCheck aria-hidden="true" />{recoveryCopy.confirm}</Button>
     <Button type="button" variant="ghost" onClick={() => { device.dismissPendingRecovery(); toast(recoveryCopy.itsMeDone(pending.effective_at_ms - device.nodeClockOffset), { icon: Hourglass }) }}>{recoveryCopy.itsMe}</Button>
-    <Button type="button" variant="destructive" onClick={() => setAsking(true)}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
+    <Button type="button" variant="destructive" onClick={() => setConfirming('stop')}><Hand aria-hidden="true" />{recoveryCopy.stop}</Button>
   </>}>
-    {asking || busy ? <div role="alert" className="grid gap-1 rounded-lg bg-danger-soft px-3 py-2">
-      <p className="font-medium">{recoveryCopy.stopAsk}</p>
-      <p className="text-meta text-muted-foreground">{recoveryCopy.stopNote}</p>
+    {confirming || busy ? <div role="alert" className="grid gap-1 rounded-lg bg-danger-soft px-3 py-2">
+      <p className="font-medium">{confirming === 'stop' ? recoveryCopy.stopAsk : recoveryCopy.confirmAsk}</p>
+      <p className="text-meta text-muted-foreground">{confirming === 'stop' ? recoveryCopy.stopNote : recoveryCopy.confirmNote}</p>
     </div> : changes.some(({ added }) => !added) ? <p className="text-meta text-muted-foreground">{recoveryCopy.outIfNotStopped}</p> : null}
     {changes.length ? <ul className="grid gap-1">{changes.map(({ member, added }) => {
       const Icon = deviceIcon(member)
@@ -307,7 +313,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         void run(async () => {
           let work: Promise<void>
           try {
-            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`请在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好要连的电脑。`)
+            if (!field(form, 'address').trim() || !field(form, 'device_id').trim()) throw new Error(`还没填要连的电脑。在“${target ? recoveryCopy.connectTo : recoveryCopy.manual}”里填好。`)
             work = device.beginRecovery({ file: fileOf(form), password: field(form, 'password'), name: field(form, 'name'), entry: parseEntry({ address: field(form, 'address'), device_id: field(form, 'device_id') }) })
           }
           finally { clearPasswords(form) }
@@ -334,7 +340,7 @@ export function RecoveryControls({ only }: { only?: 'restore' | 'passphrase' }) 
         event.preventDefault(); const form = event.currentTarget
         void run(async () => {
           const file = fileOf(form)
-          if (!field(form, 'old_password')) throw new Error('请输入旧密码。')
+          if (!field(form, 'old_password')) throw new Error('还没输入旧密码。')
           setTried(true)
           await device.replaceRecoveryFile({ file, oldPassword: field(form, 'old_password'), password: passphrase(field(form, 'password')) })
           clearPasswords(form); setPassword(''); setTried(false)

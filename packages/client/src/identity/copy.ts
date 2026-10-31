@@ -44,8 +44,8 @@ const nodeJoinReasons: [string, string][] = [
   ['already belongs to a personal network', '这台电脑已经在一个网络里了，不用再加入。'],
   ['another join is already running', '这台电脑正在用终端命令加入。等它结束后再试。'],
   ['another join is in progress', '这条链接上次用的是另一个名字。改回上次的名字再加入，会接着等批准。'],
-  ['invite link', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
-  ['Vibeface ticket', '这不是有效的加入链接。请从管理设备的“添加设备”重新复制。'],
+  ['invite link', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
+  ['Vibeface ticket', '这不是有效的加入链接。到管理设备的“添加设备”重新复制。'],
 ]
 export const nodeJoinFailure = (reason: string) => nodeJoinReasons.find(([pattern]) => reason.includes(pattern))?.[1] ?? nodeJoinCopy.failed
 
@@ -84,7 +84,7 @@ export const addDeviceCopy = {
   installHow: '怎么装',
   orCommand: '或在那台电脑的终端运行',
   /** The browser could not write to the clipboard; the text below opens selected instead. */
-  copyFailed: '没能复制，请手动选中下面的内容',
+  copyFailed: '没能复制，手动选中下面的内容',
   compare: '新设备出现安全码后，回这里比对',
   /** After a computer joins: its AI is the next thing to set up. */
   setUpAi: '去配置它的 AI',
@@ -138,7 +138,7 @@ export function whenText(at: number, now = Date.now()) {
 export const recoveryCopy = {
   scope: '找回后，对话会从你的其他电脑同步过来',
   whichLost: '哪台设备丢了？',
-  delay: '2 天后生效，期间你的其他设备可以拦下',
+  delay: '默认 2 天后生效，管理设备可确认立即生效，也可拦下',
   cancelLate: '如果已经提交，取消不会撤回。',
   connectTo: '连接到哪台电脑',
   manual: '手动填写',
@@ -156,7 +156,7 @@ export const recoveryCopy = {
   waiting: '找回等待生效',
   left: (at: number, now = Date.now()) => at > now ? `剩余 ${hoursUntil(at, now)} 小时` : '马上生效',
   autoEnter: '生效后自动进入',
-  managersSee: '你的管理设备会看到提醒',
+  managersSee: '你的管理设备会看到提醒，可确认立即生效',
   closeOk: '可以关掉页面，到时在这个网址打开',
   samePassword: '密码不变，生效后旧文件作废',
   stopped: '这次找回被拦下了',
@@ -173,6 +173,10 @@ export const recoveryCopy = {
   effectiveIn: (at: number, now = Date.now()) => `${hoursUntil(at, now)} 小时后生效`,
   outIfNotStopped: '不拦下，到时划掉的设备会被移出',
   added: '新设备',
+  confirm: '立即生效',
+  confirmAsk: '现在让这次找回立即生效？',
+  confirmNote: '请先确认是你在找回。新设备会立即获得管理权限，标为丢失的设备会被移出。',
+  confirmDone: '已立即生效',
   itsMe: '是我，收起提醒',
   /** 是我 only hides the reminder here; the recovery still takes effect when its wait ends. */
   itsMeDone: (at: number, now = Date.now()) => `已收起提醒。找回仍会在${whenText(at, now)} 生效`,
@@ -221,13 +225,13 @@ export const deviceCopy = {
   /** Ends on what removal cannot do: whatever already reached that device stays there. */
   removeNotice: (bot: boolean) => `${['移除后它无法再连接，要再用需重新加入', bot ? '上面的 Bot 会停止' : null, '对话记录会保留'].filter(Boolean).join('，')}。它已经拿到的内容删不掉。`,
   /**
-   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the line shown
-   * above the providers; `hint` says it again for one provider's control.
+   * A provider's two uses on a device: one provider runs the bot, any number execute tasks. `note` is the short phrase beside each use
+   * on the one line above the providers; `hint` says the whole of it for one provider's control.
    */
   roles: {
-    bot: { label: '运行 Bot', note: '只选一个，Bot 用它回复聊天', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
+    bot: { label: '运行 Bot', note: '选一个', hint: (provider: string) => `Bot 用这台设备的 ${provider} 回复聊天` },
     /** A task reaches a device as its bot's turn, so turning this on with no bot runs one too. */
-    execution: { label: '执行任务', note: '可开多个，派来的任务由这台设备的 Bot 交给它做', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
+    execution: { label: '执行任务', note: '可多个', hint: (provider: string) => `派来的任务由这台设备的 Bot 交给 ${provider} 做` },
   },
   /** How Codex work reaches an App Server: the one already running on that computer, or one Vibeface starts. */
   appServer: { system: '用已在运行的', spawn: '由 Vibeface 启动', useSpawn: '改由 Vibeface 启动' },

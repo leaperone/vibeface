@@ -222,7 +222,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
       try {
         if (!thisComputer) { rememberBrowserName(value(form, 'name')); return await device.join(invitation, value(form, 'name')) }
         // The entry spent the invite on the cancelled request, so it cannot be used again.
-        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入请在已有设备上重新添加。') }
+        if (await device.joinThisComputer(invitation, value(form, 'name')) === 'cancelled') { setInvitation(''); setNotice('已取消。这条链接已用过，要加入就在已有设备上重新添加。') }
       } catch (cause) {
         // A spent link only fails again, so the field opens for a new one.
         if (cause instanceof Error && spentInvite.test(cause.message)) setInvitation('')
@@ -254,7 +254,7 @@ export function ConnectionScreen({ lane: firstLane }: { lane?: Lane } = {}) {
   let body: ReactNode
   // The join card holds its own failure, next to where a new link goes in.
   let alertInBody = false
-  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="请在这台电脑上打开，或用加入链接" />
+  if (device.phase === 'blocked') body = <EmptyState icon={ShieldAlert} title="在这台电脑上打开，或用加入链接" />
   else if (device.phase === 'key_lost') body = <Panel icon={ShieldAlert} title="需要重新加入">
     <p className="text-muted-foreground">这个浏览器保存的登录信息不见了。</p>
     <Button type="button" className="w-fit justify-self-end" disabled={busy} onClick={() => void run(device.replaceLostKey)}>重新开始</Button>
