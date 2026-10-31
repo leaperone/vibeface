@@ -10,13 +10,16 @@ import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { nodeName } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
-import { folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
+import { botCopy, folderLabels, folderSetup, placeChanges, projectChoices, projectKey, scheduleName, scheduleTrigger } from "@vibeface/client/workspace/bot-settings.ts"
 import { agentName, answerLabel, approvalTask, awaitsAnswer, declined, foldAnswers, projectName, questionMeta, questionOpen, questionParts, settledAnswer, sharedProject } from "@vibeface/client/workspace/questions.ts"
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, canSend, composerHint, reachDevice, starters } from "@vibeface/client/chat/protocol.ts"
 import { setUpOnManager } from "@vibeface/client/identity/copy.ts"
-import { chatTimeline, firstUnread } from "@vibeface/client/chat/timeline.ts"
+import { chatTimeline, firstUnread, unreadCounts } from "@vibeface/client/chat/timeline.ts"
+import { accessOf } from "@vibeface/client/identity/access.ts"
+import { storageOf } from "@vibeface/client/workspace/storage.ts"
+import { unreachable } from "@vibeface/client/workspace/home.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
 import * as workspaceModel from "@vibeface/client/workspace/model.ts"
@@ -199,6 +202,7 @@ test("workspace preserves bot and message requests while routing native decision
   const work: WorkRecord = { work_id: "work", trigger: "t", target_node: "gateway", cwd: "/project", title: "工作", prompt: "工作", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null }
   let scheduler: Record<string, unknown> | null = null
   let transcript: Record<string, unknown>[] = []
+  let conversationMessages: Record<string, Record<string, unknown>[]> | null = null
   const posted = (message_id: unknown) => ({ message_id, role: "user", text: "work", event_hash: `event-${message_id}`, created_at_ms: 1 })
   const deferred = () => {
     let resolve: (value: unknown) => void = () => {}, reject: (cause: Error) => void = () => {}
@@ -217,17 +221,19 @@ test("workspace preserves bot and message requests while routing native decision
   let answerOutcome: "answered" | "already_answered" | "lost" = "lost"
   let createMode: "unknown" | "rejected" | "success" = "unknown"
   let knownBots: ReturnType<typeof parseBot>[] = [bot]
+  let knownNodes: ReturnType<typeof parseNodes> = []
   const connection: ReadyConnection = {
     generation: 1, entry: { kind: "gateway", device_id: "gateway", address: "https://node.example" },
     principal: { network_id: "network", device_id: "client", epoch: 1, can_manage: true, source: "membership" },
     info: { device_id: "gateway", name: "gateway", version: "test", initialized: true, network_id: "network" },
     isCurrent: () => activeConnection === connection, subscribe: () => () => {}, request: async (method: string) => { if (method === "write_state") return { state: "writable", conflicts: [] }; throw new Error("unexpected request") },
     async rpc(method, body = {}) {
-      if (method === "nodes") return { nodes: [] }
+      if (method === "nodes") return { nodes: knownNodes }
       if (method === "bots") { if (failBotCheck) throw new Error("lookup unavailable"); return { bots: knownBots } }
       if (method === "notifications") return { notifications: unreadNotifications }
       if (method === "questions") return { questions: questionRows }
       if (method === "open_works") return { works: [] }
+      if (method === "workspace_overview") return {}
       if (method === "answer") {
         answers.push(JSON.parse(JSON.stringify(body)))
         if (answerOutcome === "lost") throw new Error("connection lost")
@@ -235,7 +241,7 @@ test("workspace preserves bot and message requests while routing native decision
         return { status: answerOutcome, message: { message_id: `a-${body.question_id}`, role: "user", text: answerOutcome === "answered" ? body.text : "停下", answers: body.question_id } }
       }
       if (method === "ack") { acknowledgements.push(String(body.notification_id)); unreadNotifications = unreadNotifications.filter(item => item.notification_id !== body.notification_id); return {} }
-      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: transcript, works: [work] }
+      if (method === "conversation") return conversationHold ? conversationHold.promise : { ...context, conversation: { ...context.conversation, conversation_id: body.conversation_id }, scheduler, messages: conversationMessages?.[String(body.conversation_id)] ?? transcript, works: [work] }
       if (method === "create_bot") {
         creations.push(JSON.parse(JSON.stringify(body)))
         assert.deepEqual(botBody(JSON.parse(stored.get("vibeface.pending-bot.client.network") ?? "null")), creations.at(-1))
@@ -463,6 +469,136 @@ test("workspace preserves bot and message requests while routing native decision
       await render().refresh()
       assert.deepEqual(acknowledgements.slice(ackBefore), ["after-reconnect"])
     })
+
+    await t.test('retained native chat focus restores its route through the real live bridge without acknowledging the previously selected Bot', async () => {
+      const botA = { ...bot, name: 'Bot A' }, botB = { ...bot, bot_id: 'bot-b', conversation_id: 'chat-b', name: 'Bot B' }
+      knownBots = [botA, botB]
+      knownNodes = [{ ...parityNode, device_id: 'gateway' }]
+      questionRows = []
+      conversationMessages = Object.fromEntries([botA, botB].map((item) => [item.conversation_id, [{ message_id: `${item.bot_id}-message`, event_hash: `${item.bot_id}-event`, role: 'user', text: `${item.name} 的消息`, created_at_ms: 1 }]]))
+      render().setView('other')
+      await render().selectBot(botA)
+      let shared = render()
+      const device = { get ready() { return activeConnection }, phase: 'ready', link: { kind: 'online' }, entries: [], directory: null, identity: { deviceId: 'client' }, join() {}, cancelJoin() {}, leave() {} }
+      const bridge = componentHarness('../../../../../../apps/mobile/src/data/live.tsx', {
+        '@vibeface/client/identity/context.tsx': { useDevice: () => device }, '@vibeface/client/identity/access.ts': { accessOf },
+        '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@vibeface/client/lib/node.ts': { entryAddress },
+        '@vibeface/client/chat/protocol.ts': { botReach, composerHint }, '@vibeface/client/chat/timeline.ts': { chatTimeline, firstUnread, unreadCounts },
+        '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/inbox.ts': { inboxItems }, '@vibeface/client/workspace/labels.ts': taskLabels,
+        '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': { awaitsAnswer, foldAnswers }, '@vibeface/client/workspace/storage.ts': { storageOf },
+        '@/platform': { mobilePlatform: { storage: browser.localStorage } }, './context': { WorkspaceProvider: 'NativeWorkspace' },
+      })
+      type NativeWorkspace = import('../../../../../../apps/mobile/src/data/types.ts').Workspace
+      let native: NativeWorkspace
+      const mobile = () => {
+        shared = render()
+        const value = bridge.render('Live').find(({ type }) => type === 'NativeWorkspace')?.props.value
+        assert.ok(value && typeof value === 'object')
+        native = value as NativeWorkspace
+        return native
+      }
+      mobile()
+      const chat = componentHarness('../../../../../../apps/mobile/app/b/[botId].tsx', {
+        'expo-router': { Stack: { Screen: 'Screen' }, useLocalSearchParams: () => ({ botId: botA.bot_id }) },
+        'expo-router/react-navigation': { useHeaderHeight: () => 0 },
+        'react-native': { Platform: { OS: 'android' }, FlatList: 'FlatList', View: 'View', StyleSheet: { absoluteFill: {} } },
+        'react-native-keyboard-controller': { useReanimatedKeyboardAnimation: () => ({ height: { value: 0 } }) },
+        'react-native-reanimated': { default: { View: 'AnimatedView' }, useAnimatedStyle: (read: () => unknown) => read() },
+        'react-native-safe-area-context': { useSafeAreaInsets: () => ({ bottom: 0 }), useSafeAreaFrame: () => ({ width: 390 }) },
+        'uniwind': { withUniwind: (component: unknown) => component, useUniwind: () => ({ theme: 'light' }) },
+        '@/data/context': { useWorkspace: () => native }, '@/data/live': { useLive: () => shared }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+        '@vibeface/client/avatar/face.ts': { faceOf: () => ({ hue: 0 }) }, '@vibeface/client/workspace/bot-settings.ts': { botCopy }, '@vibeface/client/workspace/home.ts': { unreachable },
+        '@vibeface/client/chat/protocol.ts': { awaitsDevice: () => false, botReach, reachDevice, starters }, '@vibeface/client/chat/timeline.ts': { messageTimes: () => new Map() },
+        '@/components/bot-face': { BotFace: 'BotFace', ScreenFaces: 'ScreenFaces', botMood: () => 'idle' }, '@/components/kit': { botTint: () => ({}), EmptyState: 'EmptyState' },
+        '@/features/chat/work': { useChatExtras: () => ({ first: [], after: new Map(), rest: [], cards: [] }) }, '@/lib/layout': { useWide: () => false },
+      }, { requestAnimationFrame: (run: () => void) => run(), setInterval: () => 1, clearInterval() {} })
+      const stack = { Screen: 'Screen', Protected: 'Protected' }
+      const layout = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
+        'expo-router': { Stack: stack }, 'expo-linking': { useLinkingURL: () => null }, '@/data/live': { LiveWorkspace: 'LiveWorkspace', useLive: () => shared },
+        '@/data/context': { useWorkspace: () => ({ session: { phase: 'ready' } }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => device },
+        'uniwind': { useCSSVariable: () => ['white', 'black'] }, '@/lib/layout': { useWide: () => false }, 'react-native': { Platform: { OS: 'ios' }, View: 'View' },
+      })
+      try {
+        const tree = layout.render('default')
+        const screens = tree.find(({ type }) => typeof type === 'function' && type.name === 'Screens')
+        assert.ok(screens && typeof screens.type === 'function')
+        screens.type(screens.props)
+        const listener = tree.find(({ type }) => type === stack)?.props.screenListeners
+        assert.ok(typeof listener === 'function')
+        const focus = (name: string) => listener({ route: { name } }).focus()
+        chat.render('default')
+        await settleComponent()
+        mobile()
+        assert.equal(shared.conversationId, 'chat')
+        chat.blur()
+        focus('tasks')
+        unreadNotifications = [
+          { notification_id: 'native-a', kind: 'result', text: 'A 的通知', conversation_id: 'chat' },
+          { notification_id: 'native-b', kind: 'result', text: 'B 的通知', conversation_id: 'chat-b' },
+        ]
+        await render().selectBot(botB)
+        mobile()
+        focus('b/[botId]/work/[workId]')
+        await render().refresh()
+        focus('tasks')
+        const ackBefore = acknowledgements.length
+        focus('b/[botId]')
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), [], 'a Stack focus before the retained chat callback cannot acknowledge Bot B')
+        mobile()
+        chat.focus()
+        await settleComponent()
+        mobile()
+        const elements = chat.render('default')
+        assert.equal(shared.conversationId, 'chat', 'the retained A route reselects A without changing its id or remounting')
+        assert.equal(shared.view, 'chat')
+        const rows = elements.find(({ type }) => type === 'FlatList')?.props.data as { message?: { text?: string } }[]
+        assert.equal(rows[0]?.message?.text, 'Bot A 的消息')
+        assert.equal(elements.find(({ type }) => type === 'Composer')?.props.blocked, null)
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        assert.equal(render().notifications.some((item) => item.notification_id === 'native-b'), true)
+
+        chat.blur()
+        focus('tasks')
+        knownBots = [botB]
+        await render().refresh()
+        const waiting = mobile().actions.open('chat')
+        await settleComponent()
+        assert.equal(render().view, 'other', 'a route whose Bot has not arrived cannot make the old Bot a visible chat')
+        await render().refresh()
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        knownBots = [botA, botB]
+        await render().refresh()
+        mobile()
+        await settleComponent()
+        mobile()
+        assert.equal(shared.conversationId, 'chat', 'a focused waiting route selects its Bot when the catalog arrives')
+        assert.equal(shared.view, 'chat')
+        waiting()
+        knownBots = [botB]
+        await render().refresh()
+        const cancelled = mobile().actions.open('chat')
+        cancelled()
+        knownBots = [botA, botB]
+        await render().refresh()
+        mobile()
+        await settleComponent()
+        assert.equal(render().conversationId, 'chat-b', 'a blurred waiting route cannot select its late Bot')
+        assert.equal(render().view, 'other')
+        conversationHold = deferred()
+        const reading = conversationHold
+        const backgrounded = mobile().actions.open('chat')
+        backgrounded()
+        focus('tasks')
+        reading.resolve({ ...context, scheduler: null, messages: conversationMessages.chat })
+        await settleComponent()
+        mobile()
+        assert.equal(shared.view, 'tasks', 'a completed read from a blurred chat cannot reactivate the chat view')
+        assert.deepEqual(acknowledgements.slice(ackBefore), ['native-a'])
+        conversationHold = null
+      } finally { chat.close(); layout.close(); bridge.close() }
+    })
   } finally {
     for (const effect of effects.values()) effect.cleanup?.()
   }
@@ -470,9 +606,10 @@ test("workspace preserves bot and message requests while routing native decision
 
 function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}) {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
+  const focusEffects = new Map<number, { run: () => (() => void) | void; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
-  let cursor = 0
+  let cursor = 0, focused = true
   function effect(run: () => (() => void) | void, dependencies: unknown[]) {
     const index = cursor++, previous = effects.get(index)
     if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) afterRender.push(() => {
@@ -495,14 +632,27 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { callback, dependencies }
       return (values[index] as { callback: unknown }).callback
     },
+    useMemo(read: () => unknown, dependencies: unknown[]) {
+      const index = cursor++, previous = values[index] as { value: unknown; dependencies: unknown[] } | undefined
+      if (!previous || dependencies.some((value, i) => value !== previous.dependencies[i])) values[index] = { value: read(), dependencies }
+      return (values[index] as { value: unknown }).value
+    },
     useEffect: effect, useLayoutEffect: effect,
   }
   const jsx = (type: unknown, props: Props) => { const element = { type, props }; elements.push(element); return element }
   const ui = new Proxy({}, { get: (_target, name) => String(name) })
   const module: { exports: Record<string, unknown> } = { exports: {} }
-  const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect: (run: () => (() => void) | void) => effect(run, [run]), ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
+  const useFocusEffect = (run: () => (() => void) | void) => {
+    const index = cursor++, previous = focusEffects.get(index)
+    if (!previous || previous.run !== run) afterRender.push(() => {
+      previous?.cleanup?.()
+      focusEffects.set(index, { run, cleanup: focused ? run() ?? undefined : undefined })
+    })
+  }
+  const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : specifier === 'expo-router' ? { Link: 'Link', useFocusEffect, ...dependencies[specifier] as object } : dependencies[specifier] ?? ui
   const filename = fileURLToPath(new URL(path, import.meta.url))
-  const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
+  const source = readFileSync(filename, 'utf8') + (filename.endsWith('/data/live.tsx') ? '\nexport { Live }\n' : '')
+  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
   new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
   return {
     render(name: string, props: unknown = {}) {
@@ -513,7 +663,9 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
       afterRender.splice(0).forEach(run => run())
       return elements
     },
-    close() { for (const effect of effects.values()) effect.cleanup?.() },
+    focus() { if (!focused) { focused = true; for (const effect of focusEffects.values()) effect.cleanup = effect.run() ?? undefined } },
+    blur() { if (focused) { focused = false; for (const effect of focusEffects.values()) { effect.cleanup?.(); effect.cleanup = undefined } } },
+    close() { for (const effect of [...effects.values(), ...focusEffects.values()]) effect.cleanup?.() },
     module: module.exports,
   }
 }
@@ -606,6 +758,47 @@ test('both task overviews preserve known records, show their coverage and only n
         assert.equal(elements.some(({ type, props }) => type === 'Link' && props.href === '/inbox'), true, 'the incoming mobile inbox entry remains available with no pending items')
         assert.equal(elements.some(({ props }) => props.accessibilityLabel === '查看待处理'), true)
       }
+    } finally { app.close() }
+  }
+})
+
+test('both task overviews recover bounded Bot identities only from the current complete catalog', () => {
+  for (const platform of ['web', 'native']) {
+    const bots = Array.from({ length: 257 }, (_, index) => ({ ...parityBot, bot_id: `bot-${index + 1}`, conversation_id: `chat-${index + 1}`, name: `项目 Bot ${index + 1}` }))
+    const shared = { ...parityShared(), conversationId: 'chat-1', bots, openWorks: [], overview: workspaceModel.parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: 'only-check', conversation_id: 'chat-257', trigger: 'message:one' }], truncated: true }) }
+    const app = componentHarness(platform === 'web' ? './tasks-overview.tsx' : '../../../../../../apps/mobile/src/features/home/tasks.tsx', {
+      '@vibeface/client/workspace/context.tsx': { useWorkspace: () => shared }, '@/data/live': { useLive: () => shared, useInbox: () => [] },
+      '@/data/context': { useWorkspace: () => ({ bots: shared.bots }) }, '@vibeface/client/identity/context.tsx': { useDevice: () => ({ directory: null }) },
+      '@vibeface/client/workspace/labels.ts': taskLabels, '@vibeface/client/workspace/model.ts': workspaceModel, '@vibeface/client/workspace/questions.ts': workspaceQuestions,
+      './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} }, '@/components/kit': { providerIcons: {} },
+    })
+    const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
+    const opens = (elements: ReturnType<typeof render>, botId = 'bot-257') => elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === botId : props.href === `/b/${botId}`))
+    try {
+      let elements = render()
+      assert.match(componentText(elements), /项目 Bot 257/)
+      assert.equal(opens(elements), true, `${platform} keeps the only navigation for the Bot outside overview.bots`)
+      assert.doesNotMatch(componentText(elements), /已删除的 Bot/)
+      shared.bots = bots.slice(0, 256)
+      elements = render()
+      assert.match(componentText(elements), /未找到所属 Bot/)
+      assert.equal(opens(elements), false)
+      assert.match(componentText(elements), /程序状态待确认/, 'a missing identity does not remove the check')
+      shared.bots = [{ ...bots[256], conversation_id: 'different-chat' }]
+      assert.equal(opens(render()), false, 'a Bot from a different conversation cannot supply navigation')
+      shared.bots = bots
+      shared.synced = false
+      shared.generation++
+      elements = render()
+      assert.match(componentText(elements), /Bot 身份未加载/)
+      assert.doesNotMatch(componentText(elements), /项目 Bot 257|已删除的 Bot/)
+      assert.equal(opens(elements), false, 'a retained catalog before this connection first read cannot supply an old network identity')
+      shared.bots = [{ ...bots[256], bot_id: 'new-network-bot', name: '新网络 Bot' }]
+      shared.synced = true
+      elements = render()
+      assert.match(componentText(elements), /新网络 Bot/)
+      assert.equal(opens(elements, 'new-network-bot'), true)
+      assert.equal(opens(elements), false)
     } finally { app.close() }
   }
 })
@@ -888,7 +1081,7 @@ test('native context renders shared memory, external attribution, scheduler stat
   } finally { app.close() }
 })
 
-test('native screen focus restores chat and tasks views after leaving a read-only context route', () => {
+test('native Stack focus restores non-chat views while the chat route owns its activation', () => {
   const views: string[] = []
   const stack = { Screen: 'Screen', Protected: 'Protected' }
   const app = componentHarness('../../../../../../apps/mobile/app/_layout.tsx', {
@@ -905,7 +1098,7 @@ test('native screen focus restores chat and tasks views after leaving a read-onl
     const navigation = elements.find(({ type }) => type === stack)?.props.screenListeners
     assert.ok(typeof navigation === 'function')
     for (const name of ['b/[botId]/context', 'b/[botId]', 'b/[botId]/work/[workId]', 'tasks']) navigation({ route: { name } }).focus()
-    assert.deepEqual(views, ['other', 'chat', 'other', 'tasks'])
+    assert.deepEqual(views, ['other', 'other', 'tasks'])
     assert.equal(elements.some(({ props }) => props.name === 'b/[botId]/context'), true)
   } finally { app.close() }
 })

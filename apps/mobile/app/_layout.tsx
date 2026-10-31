@@ -60,7 +60,7 @@ function Screens() {
       {/* Kept mounted and hidden when narrow, so a rotation only flips its display. */}
       {ready ? <View className="w-80 border-e border-border bg-background" style={{ display: wide ? 'flex' : 'none' }}><HomeList sidebar /></View> : null}
       <View className="flex-1">
-        <Stack screenListeners={({ route }) => ({ focus: () => shared?.setView(route.name === 'b/[botId]' ? 'chat' : route.name === 'tasks' ? 'tasks' : 'other') })} screenOptions={{
+        <Stack screenListeners={({ route }) => ({ focus: () => { if (route.name !== 'b/[botId]') shared?.setView(route.name === 'tasks' ? 'tasks' : 'other') } })} screenOptions={{
           headerShadowVisible: false,
           // iOS draws its glass bar with a soft scroll edge; Android's bar is a plain surface in the page colour.
           ...Platform.OS === 'android' ? { headerStyle: { backgroundColor: background } } : {},

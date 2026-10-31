@@ -49,7 +49,7 @@ OpenBot 只提供可借鉴的行为，例如任务分栏、步骤摘要、审批
 
 ### 上下文和会话
 
-上下文页整理已返回的消息、开放工作、Bot 设置、持久记忆和定时任务。当前 `ConversationPayload` 未提供 checkpoint 或完整 decisions，页面不能把未提供的数据显示为零或已清空。
+上下文页整理已返回的消息、工作记录（包含终态）、Bot 设置、持久记忆和定时任务。当前 `ConversationPayload` 未提供 checkpoint 或完整 decisions，页面不能把未提供的数据显示为零或已清空。
 
 `sessions` 来自外部会话的 `SessionAttributed` 归属记录。页面可列出设备、Provider、session ID、目录和静音状态，但它不证明 Bot 自身的原生运行会话存在或不存在，也不证明该会话仍可续接。没有归属记录时，只能说明没有已接入的外部会话。原生 resume token 不进入工作区。
 

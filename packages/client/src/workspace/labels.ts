@@ -1,7 +1,7 @@
 import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, OpenWork, OverviewCoverage, OverviewTask, SessionHandoff, WorkRecord, WorkspaceOverview } from "./types.ts"
+import type { NodeInfo, OpenWork, OverviewBot, OverviewCoverage, OverviewTask, SessionHandoff, WorkRecord, WorkspaceOverview } from "./types.ts"
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
@@ -207,8 +207,8 @@ export function cardState(work: WorkRecord, nodes: NodeInfo[], projected?: Pick<
   return confirmReason(work, nodes) ? "awaiting_confirmation" : work.stop ?? projected?.state ?? work.state
 }
 
-/** The entry's task process check is represented only by an unverified work on that same device. */
-export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: readonly OpenWork[], nodes: NodeInfo[]) {
+/** An entry task check only folds into its unverified work; a bounded Bot list does not prove deletion. */
+export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: readonly OpenWork[], nodes: NodeInfo[], knownBots: readonly OverviewBot[] = []) {
   const local = nodes.find((node) => node.local)?.device_id
   return overview.tasks.filter((check): check is Extract<OverviewTask, { kind: "check" }> => {
     if (check.kind !== "check" || check.target_node !== null) return false
@@ -219,6 +219,10 @@ export function unrepresentedOverviewChecks(overview: WorkspaceOverview, works: 
       if (work.state !== "unverified" && projected?.state !== "unverified") return false
       return ["awaiting_confirmation", "unverified"].includes(cardState(work, nodes, projected))
     })
+  }).map((check) => {
+    if (check.bot) return check
+    const bot = knownBots.find((bot) => bot.conversation_id === check.conversation_id)
+    return bot ? { ...check, bot, navigation: { bot_id: bot.bot_id, conversation_id: check.conversation_id } } : check
   })
 }
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)

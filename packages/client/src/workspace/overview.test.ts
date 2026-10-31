@@ -201,3 +201,14 @@ test("overview task checks only fold into a visible unverified work on this conv
   const bounded = parseWorkspaceOverview({ tasks: [{ ...known, kind: "task" }], checks: [{ check_id: "process-work", conversation_id: known.conversation_id, trigger: `task:${known.work_id}` }] })
   assert.deepEqual(unrepresentedOverviewChecks(bounded, openWorksFromOverview(bounded, []), nodes), [], "an overview-only unverified work also represents its local task check")
 })
+
+test("bounded check identities use the complete known Bot catalog without changing the received snapshot", () => {
+  const bots = Array.from({ length: 257 }, (_, index) => bot(`chat-${index + 1}`))
+  const overview = parseWorkspaceOverview({ bots: bots.slice(0, 256), checks: [{ check_id: "only-check", conversation_id: "chat-257", trigger: "message:one" }], truncated: true })
+  const checks = unrepresentedOverviewChecks(overview, [], [], bots)
+  assert.deepEqual(checks[0]?.bot, bots[256])
+  assert.deepEqual(checks[0]?.navigation, { bot_id: "bot-chat-257", conversation_id: "chat-257" })
+  assert.equal(overview.tasks[0]?.bot, null, "the bounded snapshot remains the actual received observation")
+  assert.equal(unrepresentedOverviewChecks(overview, [], [], bots.slice(0, 256))[0]?.bot, null)
+  assert.equal(unrepresentedOverviewChecks(overview, [], [], [bot("other-chat", "bot-chat-257")])[0]?.navigation, null, "identity is matched by conversation, never by a coincident Bot id")
+})

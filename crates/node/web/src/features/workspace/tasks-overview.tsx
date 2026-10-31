@@ -78,7 +78,7 @@ export function TasksOverview() {
     }
     return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
   })
-  const otherChecks = unrepresentedOverviewChecks(overview, overviewWorks, workspace.nodes).filter((task) => task.conversation_id !== workspace.conversationId && matchesBot(task.conversation_id, task.bot?.bot_id))
+  const otherChecks = unrepresentedOverviewChecks(overview, overviewWorks, workspace.nodes, read ? workspace.bots : []).filter((task) => task.conversation_id !== workspace.conversationId && matchesBot(task.conversation_id, task.bot?.bot_id))
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const noticed = visible("attention") ? visibleAttention.length + groups.attention.length + otherChecks.length : 0
   const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
@@ -97,7 +97,7 @@ export function TasksOverview() {
       const count = group === "attention" ? noticed : groups[group].length
       return count ? <OverviewSection key={group} title={title} count={count}>
         {group === "attention" ? visibleAttention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
-        {group === "attention" ? otherChecks.map((check) => <Card key={`${check.conversation_id}:${check.item_id}`}><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? "已删除的 Bot"} · 请到所属 Bot 查看</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>) : null}
+        {group === "attention" ? otherChecks.map((check) => <Card key={`${check.conversation_id}:${check.item_id}`}><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? (read ? "未找到所属 Bot" : "Bot 身份未加载")}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>) : null}
         {groups[group].map(card)}
       </OverviewSection> : null
     })}
