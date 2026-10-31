@@ -51,8 +51,8 @@ export default function BotContext() {
 
 function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: ConversationPayload; shared: NonNullable<ReturnType<typeof useLive>> }) {
   const nodes = shared.nodes
-  const owner = data.conversation?.owner
   const remote = data.scheduler?.remote
+  const owner = remote?.owner ?? data.conversation?.owner
   const scheduler = data.scheduler
   const jobs = scheduler?.jobs ?? []
   const open = jobs.filter((job) => schedulerStatus(job.state).group !== 'history')

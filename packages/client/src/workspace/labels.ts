@@ -237,6 +237,7 @@ type WorkspaceActivityInput = {
 }
 
 const activityKey = (conversationId: string, workId: string) => JSON.stringify([conversationId, workId])
+const questionKey = (conversationId: string, questionId: string) => JSON.stringify([conversationId, questionId])
 const emptyActivityFacts = (): WorkspaceActivityFacts => ({ questions: [], checks: [], overviewQuestions: [], overviewChecks: [], jobs: [] })
 const activityJobId = (conversationId: string | null, job: ManagerJob | OverviewJob) => `turn:${conversationId ?? ""}:${"source_node" in job ? job.source_node ?? "unknown" : "local"}:${"job_id" in job ? job.job_id : job.trigger}`
 const taskWorkId = (trigger: string) => trigger.startsWith("task:") ? trigger.slice(5) || null : null
@@ -310,8 +311,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
   for (const task of overview?.tasks ?? []) if ((task.kind === "work" || task.kind === "dispatch") && task.work_id) projectionByKey.set(activityKey(task.conversation_id, task.work_id), task)
   const workByKey = new Map<string, OpenWorkCard>()
   for (const work of input.works) workByKey.set(activityKey(work.conversation_id, work.work_id), work)
+  const liveQuestionIds = new Set(input.questions.map((question) => questionKey(question.conversation_id, question.question_id)))
   const attachedQuestions = new Set<string>()
-  const attachedOverviewQuestions = new Set<string>()
   const attachedOverviewChecks = new Set<string>()
   const attachedJobs = new Set<string>()
   const activities: WorkspaceActivity[] = []
@@ -328,17 +329,13 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const effectiveState = taskStale(state, Boolean(input.connected && input.read)) ? "unknown" : state
     const facts = emptyActivityFacts()
     for (const question of input.questions) {
+      if (attachedQuestions.has(questionKey(question.conversation_id, question.question_id))) continue
       if (!awaitsAnswer(question, answered) || workApproval({ work, conversationId: work.conversation_id, questions: [question], answered })?.question_id !== question.question_id) continue
-      facts.questions.push(question); attachedQuestions.add(question.question_id)
+      facts.questions.push(question); attachedQuestions.add(questionKey(question.conversation_id, question.question_id))
     }
     for (const check of input.checks) {
       if (!checkMatchesWork(check, work)) continue
       facts.checks.push(check)
-    }
-    for (const question of overview?.questions ?? []) {
-      if (question.question_id in answered) continue
-      if (question.conversation_id !== work.conversation_id || question.work_id !== work.work_id && !attachedQuestions.has(question.question_id)) continue
-      facts.overviewQuestions.push(question); attachedOverviewQuestions.add(question.question_id)
     }
     for (const task of overview?.tasks ?? []) {
       if (task.kind !== "check" || task.conversation_id !== work.conversation_id || task.work_id !== work.work_id) continue
@@ -352,8 +349,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     workActivities.set(key, activity); activities.push(activity)
   }
   const rawJobs: WorkspaceActivityJob[] = [
-    ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
     ...(input.jobs ?? []),
+    ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
   ]
   const jobGroups: WorkspaceActivityJob[][] = []
   for (const entry of rawJobs) {
@@ -370,13 +367,15 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     const id = activityJobId(entry.conversation_id, entry.job)
     if (attachedJobs.has(id)) continue
     const state = entry.job.state === "unknown" ? "unknown" : entry.job.state
+    const history = schedulerStatus(state).group === "history"
+    if (history && !["failed", "rejected"].includes(state) && !entry.job.pending_check) { attachedJobs.add(id); continue }
     const activityGroup: WorkspaceActivityGroup = ["unknown", "unverified", "failed", "rejected"].includes(state) ? "attention" : taskActive(state) ? "working" : "waiting"
     activities.push({ id, kind: "turn", conversation_id: entry.conversation_id, work_id: null, group: activityGroup, state, job: entry.job, facts: { ...emptyActivityFacts(), jobs: observations.map((item) => item.job) } }); attachedJobs.add(id)
   }
   const addAttention = (id: string, conversationId: string | null, attention: WorkspaceActivityAttention, state = "attention") => {
     activities.push({ id, kind: "attention", conversation_id: conversationId, work_id: null, group: "attention", state, attention, facts: emptyActivityFacts() })
   }
-  for (const question of input.questions) if (awaitsAnswer(question, answered) && !attachedQuestions.has(question.question_id)) addAttention(`attention:question:${question.question_id}`, question.conversation_id, question)
+  for (const question of input.questions) if (awaitsAnswer(question, answered) && !attachedQuestions.has(questionKey(question.conversation_id, question.question_id))) addAttention(`attention:question:${question.question_id}`, question.conversation_id, question)
   for (const check of input.checks) {
     const checkKey = keyForCheck(check)
     const attached = check.kind === "device"
@@ -384,8 +383,7 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
       : checkKey ? workByKey.get(checkKey) ? checkMatchesWork(check, workByKey.get(checkKey)!) : false : false
     if (!attached) addAttention(`attention:check:${check.check_id}`, check.kind === "work" ? check.conversation_id : null, check)
   }
-  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !attachedOverviewQuestions.has(question.question_id)
-    && !input.questions.some((known) => known.conversation_id === question.conversation_id && known.question_id === question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
+  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !liveQuestionIds.has(questionKey(question.conversation_id, question.question_id))) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
   for (const task of overview?.tasks ?? []) if (task.kind === "check" && !attachedOverviewChecks.has(task.check_id)) addAttention(`attention:overview-check:${task.item_id}`, task.conversation_id, enrichCheck(task))
   const groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const activity of activities) groups[activity.group].push(activity)
