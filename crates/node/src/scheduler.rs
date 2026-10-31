@@ -900,6 +900,7 @@ pub(crate) fn bot_value(
                 "text":record.entry.text,
                 "epoch":record.epoch,
                 "revision":record.revision,
+                "control_revision":record.control_revision,
                 "origin":record.origin,
                 "user_controlled":record.user_controlled,
                 "essential":record.essential,

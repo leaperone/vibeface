@@ -596,20 +596,9 @@ pub struct StagedMemory {
     pub memory_id: String,
     pub before: Option<String>,
     pub after: Option<String>,
-    #[serde(default)]
-    pub base_epoch: u32,
-    #[serde(default)]
-    pub base_revision: String,
-    #[serde(default)]
-    pub origin: crate::model::MemoryOrigin,
-    #[serde(default)]
-    pub user_controlled: bool,
-    #[serde(default = "default_memory_essential")]
+    pub base: crate::model::MemoryBase,
+    pub origin: crate::model::AutomaticMemoryOrigin,
     pub essential: bool,
-}
-
-fn default_memory_essential() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

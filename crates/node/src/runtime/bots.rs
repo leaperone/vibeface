@@ -114,6 +114,53 @@ impl Runtime {
         Ok(json!({"written":written.is_some()}))
     }
 
+    pub(super) async fn control_memory(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user controls memory");
+        let scope = id(input, "conversation_id")?;
+        self.require_scope(access, &scope).await?;
+        let command = crate::store::bot_settings::MemoryControlCommand {
+            memory_id: id(input, "memory_id")?,
+            base: serde_json::from_value(input.get("base").context("base is required")?.clone())?,
+            after: serde_json::from_value(
+                input.get("after").context("after is required")?.clone(),
+            )?,
+            attestation: attestation(input)?,
+            operation_id: field(input, "operation_id")?.into(),
+        };
+        let result = self.store.lock().await.control_memory(
+            &self.identity,
+            &access.network_id,
+            &scope,
+            command,
+            now_ms(),
+        )?;
+        if result.state == MemoryControlStatus::Applied {
+            self.publish_changed(&access.network_id, &scope, Changed::Reload);
+        }
+        Ok(json!(result))
+    }
+
+    pub(super) async fn memory_state(&self, access: &Access, input: &Value) -> Result<Value> {
+        ensure!(access.human, "only the user reads memory state");
+        let scope = id(input, "conversation_id")?;
+        self.require_scope(access, &scope).await?;
+        let memory_id = id(input, "memory_id")?;
+        let operation_id = input
+            .get("operation_id")
+            .map(|value| value.as_str().context("operation_id must be a string"))
+            .transpose()?;
+        let store = self.store.lock().await;
+        store
+            .bot_for_conversation(&access.network_id, &scope)?
+            .context("no such bot")?;
+        Ok(json!(store.memory_state(
+            &access.network_id,
+            &scope,
+            &memory_id,
+            operation_id
+        )?))
+    }
+
     /// The user deletes a bot from the web. Deleting one already gone writes nothing.
     pub(super) async fn delete_bot(
         self: &Arc<Self>,

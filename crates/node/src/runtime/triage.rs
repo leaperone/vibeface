@@ -4509,28 +4509,55 @@ pub(super) mod tests {
         let (node, admin, dir) = node().await?;
         let result = async {
             with_agent(&node);
-            let instructions = format!("只管前端仓库，发版前先问用户。{}截断之后", "很".repeat(3000));
+            let instructions = format!(
+                "只管前端仓库，发版前先问用户。{}截断之后",
+                "很".repeat(3000)
+            );
             instructed_bot(&node, &admin, "c", "前端", &instructions, &[]).await?;
             let network = node.network_id().await?;
-            node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                params![network, "memory-1", "c", "用户每周五才发版", "r", now_ms(), crate::config::DATA_EPOCH, "r", serde_json::to_string(&crate::model::MemoryOrigin::Agent)?, false, true],
-            )?;
-            node.store.lock().await.connection.execute(
-                "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                params![network, "memory-2", "c", "长".repeat(500), "r", now_ms() + 1, crate::config::DATA_EPOCH, "r", serde_json::to_string(&crate::model::MemoryOrigin::Agent)?, false, true],
-            )?;
+            for (index, text) in ["用户每周五才发版".to_owned(), "长".repeat(500)]
+                .into_iter()
+                .enumerate()
+            {
+                let body = admin.attest(
+                    &network,
+                    "c",
+                    EventBody::MemoryControlled {
+                        memory_id: format!("memory-{index}"),
+                        base: crate::model::MemoryBase::absent(),
+                        after: Some(text),
+                        attestation: None,
+                    },
+                )?;
+                node.store.lock().await.append_event(
+                    &node.identity,
+                    &network,
+                    "c",
+                    body,
+                    vec![],
+                    now_ms() + index as i64,
+                )?;
+            }
             let mut requests = coordination_app_server(&node)?;
             node.ingest_agent_event(turn("s1", "t1", "/tmp")).await?;
             node.wake_agent().await?;
             let prompt = turn_starts(&mut requests).concat();
-            assert!(prompt.contains("只管前端仓库，发版前先问用户。"), "the bot's instructions");
+            assert!(
+                prompt.contains("只管前端仓库，发版前先问用户。"),
+                "the bot's instructions"
+            );
             assert!(
                 prompt.contains("用户每周五才发版"),
                 "older notes stay when the newest is too long"
             );
-            assert!(!prompt.contains("长长长"), "a note too long to fit is left out");
-            assert!(!prompt.contains("截断之后"), "only the start of long instructions");
+            assert!(
+                !prompt.contains("长长长"),
+                "a note too long to fit is left out"
+            );
+            assert!(
+                !prompt.contains("截断之后"),
+                "only the start of long instructions"
+            );
             Ok::<_, anyhow::Error>(())
         }
         .await;

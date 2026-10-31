@@ -683,8 +683,7 @@ fn staged_memory_result(staged: &StagedMemory) -> Value {
         "memory_id":staged.memory_id,
         "before":staged.before,
         "after":staged.after,
-        "base_epoch":staged.base_epoch,
-        "base_revision":staged.base_revision,
+        "base":staged.base,
         "commit":"turn_completed"
     })
 }
@@ -719,23 +718,28 @@ fn stage_memory_from(
         super::bot_settings::NOT_FROM_USER
     );
     let origin = if review_revision.is_some() {
-        MemoryOrigin::Review
+        AutomaticMemoryOrigin::Review
     } else {
-        MemoryOrigin::Agent
+        AutomaticMemoryOrigin::Agent
     };
     let staged = &session.shown.staged_memories;
     if let Some(previous) = staged.get(call_ref) {
         ensure!(
             request.matches_memory(&previous.memory_id, previous.after.as_deref())
                 && previous.origin == origin
-                && review_revision.is_none_or(|(epoch, revision)| previous.base_epoch == epoch
-                    && previous.base_revision == revision),
+                && review_revision.is_none_or(|(epoch, revision)| previous.base.epoch == epoch
+                    && previous
+                        .base
+                        .version
+                        .as_ref()
+                        .map_or("", |version| version.revision.as_str())
+                        == revision),
             "call_ref {call_ref} already staged a different memory mutation"
         );
         return Ok(staged_memory_result(previous));
     }
     let committed = super::bot_settings::memory_records_from(connection, network, conversation)?;
-    let (memory_id, before, after, base_epoch, base_revision, essential) = match request {
+    let (memory_id, mut before, after, mut base, essential) = match request {
         ChangeRequest::Remember { memory_id, text } => {
             validate_memory(&text)?;
             let memory_id = memory_id.unwrap_or_else(|| {
@@ -745,13 +749,16 @@ fn stage_memory_from(
                 )
             });
             vibeface_protocol::validate_id(&memory_id).map_err(anyhow::Error::msg)?;
-            let record = committed
-                .iter()
-                .find(|record| record.entry.memory_id == memory_id);
-            let before = record.map(|record| record.entry.text.clone());
-            if let Some(record) = record {
+            let record = super::bot_settings::memory_state_from(
+                connection,
+                network,
+                conversation,
+                &memory_id,
+            )?;
+            let before = record.as_ref().and_then(|record| record.text.clone());
+            if let Some(record) = &record {
                 ensure!(
-                    !record.user_controlled,
+                    !record.metadata.user_controlled,
                     "this note is user-controlled; change it directly"
                 );
             }
@@ -774,30 +781,31 @@ fn stage_memory_from(
                 before,
                 Some(text),
                 record
-                    .map(|record| record.epoch)
-                    .unwrap_or(crate::config::DATA_EPOCH),
+                    .as_ref()
+                    .map_or_else(MemoryBase::absent, |record| record.metadata.base()),
                 record
-                    .map(|record| record.revision.clone())
-                    .unwrap_or_default(),
-                record.map(|record| record.essential).unwrap_or(true),
+                    .as_ref()
+                    .is_none_or(|record| record.metadata.essential),
             )
         }
         ChangeRequest::Forget { memory_id } => {
-            let record = committed
-                .iter()
-                .find(|record| record.entry.memory_id == memory_id)
-                .context("note not found for this bot")?;
+            let record = super::bot_settings::memory_state_from(
+                connection,
+                network,
+                conversation,
+                &memory_id,
+            )?
+            .context("note not found for this bot")?;
             ensure!(
-                !record.user_controlled,
+                !record.metadata.user_controlled,
                 "this note is user-controlled; change it directly"
             );
             (
                 memory_id,
-                Some(record.entry.text.clone()),
+                Some(record.text.context("note not found for this bot")?),
                 None,
-                record.epoch,
-                record.revision.clone(),
-                record.essential,
+                record.metadata.base(),
+                record.metadata.essential,
             )
         }
         _ => bail!("only remember and forget use turn memory staging"),
@@ -806,18 +814,39 @@ fn stage_memory_from(
         !staged.values().any(|entry| entry.memory_id == memory_id),
         "memory {memory_id} already has a staged mutation in this turn"
     );
-    let (base_epoch, base_revision) = review_revision
-        .map(|(epoch, revision)| (epoch, revision.to_owned()))
-        .unwrap_or((base_epoch, base_revision));
+    if let Some((epoch, revision)) = review_revision {
+        base.epoch = epoch;
+        if base
+            .version
+            .as_ref()
+            .is_some_and(|version| version.revision != revision)
+        {
+            let source = super::log::event_from(connection, network, revision)?
+                .context("memory review base is not stored here")?;
+            let operation = super::bot_settings::memory_operation(network, revision, &source)?
+                .context("memory review base is not a memory operation")?;
+            ensure!(
+                source.scope_id == *conversation
+                    && operation.memory_id == memory_id
+                    && !operation.user_controlled,
+                "memory review base belongs to another note"
+            );
+            before = operation.after;
+            base.version = Some(operation.version);
+        } else if base.version.is_none() {
+            ensure!(
+                revision.is_empty(),
+                "a review update needs a committed base"
+            );
+        }
+    }
     let mutation = StagedMemory {
         call_ref: call_ref.into(),
         memory_id,
         before,
         after,
-        base_epoch,
-        base_revision,
+        base,
         origin,
-        user_controlled: false,
         essential,
     };
     let result = staged_memory_result(&mutation);

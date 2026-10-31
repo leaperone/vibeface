@@ -203,6 +203,7 @@ impl Runtime {
             })
             .collect();
         let memory = memory_view(&store, network, scope)?;
+        let memory_sync_conflicts = store.memory_sync_conflicts(network, scope)?;
         let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
         let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
@@ -248,7 +249,8 @@ impl Runtime {
             "questions":questions,
             "sessions":sessions,
             "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory,
-                "memory_staged_count":memory_staged_count,"memory_conflicts":memory_conflicts},
+                "memory_staged_count":memory_staged_count,"memory_conflicts":memory_conflicts,
+                "memory_sync_conflicts":memory_sync_conflicts},
             "checks":checks,
             "local_node":local,
             "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
@@ -340,6 +342,7 @@ impl Runtime {
             "jobs":jobs,
             "context":context,
             "memory":memory_view(&store, network, scope)?,
+            "memory_sync_conflicts":store.memory_sync_conflicts(network, scope)?,
             "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
             "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
@@ -412,9 +415,7 @@ fn memory_view(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> 
         .map(|record| {
             json!({
                 "memory_id":record.entry.memory_id,"text":record.entry.text,
-                "metadata":{"epoch":record.epoch,"revision":record.revision,"origin":record.origin,
-                    "user_controlled":record.user_controlled,"essential":record.essential,
-                    "source_event_hash":record.source_event_hash},
+                "metadata":record.metadata(),
             })
         })
         .collect())

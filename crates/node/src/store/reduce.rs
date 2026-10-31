@@ -1,7 +1,7 @@
 //! Incremental projections. Each event updates its rows once, as it is stored; every rule is
 //! order-independent (first/last by rank, max epoch or version), so any arrival order converges.
-//! Bot settings, skills, schedules and notes keep the last change by rank; a removal is a `NULL`
-//! row, so an older change arriving later cannot bring it back.
+//! Bot settings, skills and schedules use rank. Memories permanently prefer signed user
+//! control and its stable counter; removals remain as tombstones.
 use crate::model::*;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -31,20 +31,6 @@ fn text(value: impl serde::Serialize) -> Result<String> {
         serde_json::Value::String(text) => text,
         other => other.to_string(),
     })
-}
-
-/// The same signed request has the same key wherever an entry Node wraps it, so a retry through
-/// another entry cannot win a tie the original lost.
-fn request_key(network: &str, event: &Event) -> Result<String> {
-    let signer = event
-        .body
-        .attestation()
-        .map_or(event.author.as_str(), |attestation| {
-            attestation.device_id.as_str()
-        });
-    let mut signed = crate::crypto::attestation_payload(network, &event.scope_id, &event.body)?;
-    signed.extend_from_slice(signer.as_bytes());
-    Ok(crate::crypto::digest(&signed))
 }
 
 /// Every table `apply` writes. A rebuild clears exactly these; nothing else is derived from the log.
@@ -124,7 +110,7 @@ pub(crate) fn apply(
         } => {
             connection.execute(
                 "INSERT INTO conversations(network_id,conversation_id,owner,owner_epoch,owner_key) VALUES(?,?,?,?,?) ON CONFLICT(network_id,conversation_id) DO UPDATE SET owner=excluded.owner,owner_epoch=excluded.owner_epoch,owner_key=excluded.owner_key WHERE owner IS NULL OR excluded.owner_epoch>owner_epoch OR (excluded.owner_epoch=owner_epoch AND excluded.owner_key<owner_key)",
-                params![network, scope, scheduler_node, epoch, request_key(network, event)?],
+                params![network, scope, scheduler_node, epoch, crate::crypto::request_key(network, scope, &event.body, &event.author)?],
             )?;
         }
         EventBody::BotCreated {
@@ -408,36 +394,12 @@ pub(crate) fn apply(
                     after: None,
                     ..
                 } => remove_schedule(connection, network, schedule_id, scope, rank, seen_at_ms)?,
-                BotChange::Memory {
-                    memory_id,
-                    after,
-                    epoch,
-                    origin,
-                    user_controlled,
-                    essential,
-                    ..
-                } => {
-                    let epoch = (*epoch).max(crate::config::DATA_EPOCH);
-                    connection.execute(
-                        "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential,source_event_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms,epoch=excluded.epoch,revision=excluded.revision,origin=excluded.origin,user_controlled=excluded.user_controlled,essential=excluded.essential,source_event_hash=excluded.source_event_hash WHERE conversation_id=excluded.conversation_id AND excluded.rank>rank",
-                        params![
-                            network,
-                            memory_id,
-                            scope,
-                            after,
-                            rank,
-                            event.created_at_ms,
-                            epoch,
-                            rank,
-                            serde_json::to_string(origin)?,
-                            user_controlled,
-                            essential,
-                            hash,
-                        ],
-                    )?;
+                BotChange::Memory { .. } => {
+                    apply_memory(connection, network, hash, event, rank)?;
                 }
             }
         }
+        EventBody::MemoryControlled { .. } => apply_memory(connection, network, hash, event, rank)?,
         // `null` clears it; see `store::bots::MERGED_COLUMNS`.
         EventBody::BotProjectSet { project, .. } => {
             connection.execute(
@@ -760,4 +722,32 @@ pub(crate) fn work_from(
         params![network, work_id],
     )?
     .pop())
+}
+
+fn apply_memory(
+    connection: &Connection,
+    network: &str,
+    hash: &str,
+    event: &Event,
+    event_rank: &str,
+) -> Result<()> {
+    let operation =
+        super::bot_settings::memory_operation(network, hash, event)?.expect("memory event");
+    let version = &operation.version;
+    let rank = if operation.user_controlled {
+        version.revision.as_str()
+    } else {
+        event_rank
+    };
+    connection.execute(
+        "INSERT INTO memories(network_id,conversation_id,memory_id,text,rank,changed_at_ms,epoch,revision,control_revision,origin,user_controlled,essential,source_event_hash)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(network_id,conversation_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms,
+         epoch=excluded.epoch,revision=excluded.revision,control_revision=excluded.control_revision,origin=excluded.origin,user_controlled=excluded.user_controlled,essential=excluded.essential,source_event_hash=excluded.source_event_hash
+         WHERE (excluded.user_controlled,excluded.control_revision,excluded.rank)>(memories.user_controlled,memories.control_revision,memories.rank)
+         OR (excluded.user_controlled=1 AND memories.user_controlled=1 AND excluded.revision=memories.revision AND excluded.source_event_hash<memories.source_event_hash)",
+        params![network, event.scope_id, operation.memory_id, operation.after, rank, event.created_at_ms, operation.base.epoch,
+            version.revision, version.control_revision, serde_json::to_string(&operation.origin)?, operation.user_controlled, operation.essential, hash],
+    )?;
+    Ok(())
 }

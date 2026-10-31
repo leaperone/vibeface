@@ -1357,6 +1357,8 @@ impl Runtime {
             "set_bot_project" => self.set_bot_project(&access, &input).await,
             "set_bot_avatar" => self.set_bot_avatar(&access, &input).await,
             "control_schedule" => self.control_schedule(&access, &input).await,
+            "control_memory" => self.control_memory(&access, &input).await,
+            "memory_state" => self.memory_state(&access, &input).await,
             "cancel_manager" => self.cancel_manager(&access, &input).await,
             "reply_unanswered" => self.settle_unanswered(&access, &input, false).await,
             "dismiss_unanswered" => self.settle_unanswered(&access, &input, true).await,
