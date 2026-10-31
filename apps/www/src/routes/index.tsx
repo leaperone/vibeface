@@ -68,11 +68,15 @@ function HomePage() {
           <p className="section-eyebrow">01 / 工作流</p>
           <h2 id="story-title">一条需求，留在同一段聊天。</h2>
           <p className="story-prompt"><span>示例需求</span>检查这个项目的失败测试，并说明需要怎样修改。</p>
-          <ol className="work-story" role="list">
-            <li><h3>把需求交给 Bot</h3><p>交代目标、项目和希望使用的设备。Bot 结合这段聊天的历史组织工作。</p></li>
-            <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
-            <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
-          </ol>
+          <div className="story-frame">
+            <div className="story-frame-meta"><span>WORK LOOP / 01</span><span>PRIVATE NETWORK</span></div>
+            <ol className="work-story" role="list">
+              <li><h3>把需求交给 Bot</h3><p>交代目标、项目和希望使用的设备。Bot 结合这段聊天的历史组织工作。</p></li>
+              <li><h3>选定电脑执行</h3><p>工作交给已授权、已准备好项目的电脑，由那里的 Agent 读取文件、运行工具。</p></li>
+              <li><h3>回原聊天看结果</h3><p>阶段和持久结果回到原聊天。结果不确定时先核对原任务，不直接重发。</p></li>
+            </ol>
+            <div className="story-frame-result"><span>RETURNED TO CHAT</span><strong>阶段与持久结果回到原聊天</strong><small>完整逐字进度仍留在执行设备。</small></div>
+          </div>
         </section>
 
         <section className="landing-system" id="system" aria-labelledby="system-title">
@@ -82,6 +86,7 @@ function HomePage() {
             <p>增加长期 Bot 协调和个人设备间的共享历史，执行仍交给本机的 Agent。</p>
             <a className="text-link" href="/docs/bot-and-execution">看看分工怎么安排 <ArrowRight size={16} aria-hidden="true" /></a>
           </div>
+          <p className="system-manifesto">协调可以迁移，<em>执行留在你选择的电脑。</em></p>
           <div className="system-details">
             <article><h3>Bot 与执行分开</h3><p>协调与执行可以分别选择产品。复用自己电脑上的 Codex 或 Claude Code，各自准备程序、登录和项目。</p></article>
             <article><h3>共享 Bot 历史</h3><div><p>带签名和因果依赖的 DAG 同步 Bot 聊天、设置、任务阶段和结果。项目、依赖、登录与原生 SDK 状态不会自动迁移，完整逐字进度不作为共享历史保存。</p><a className="text-link" href="/docs/history-sync">了解同步范围 <ArrowRight size={16} aria-hidden="true" /></a></div></article>
