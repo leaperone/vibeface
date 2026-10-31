@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { awaitsDevice, botReach, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, reachDevice, replyStatusLabel, roleLabel } from './protocol.ts'
+import { awaitsDevice, botReach, canSend, composerHint, isQueuedReceipt, isSubmitKey, prepareSend, reachDevice, replyStatusLabel, retryText, roleLabel } from './protocol.ts'
 import { parseNodes } from '../workspace/model.ts'
 
 const ready = { hasConversation: true, loaded: true, bot: 'ready' as const }
@@ -89,4 +89,23 @@ test('stopped and interrupted replies are labelled; completed replies are not', 
   assert.equal(replyStatusLabel(undefined), '')
   assert.equal(replyStatusLabel('stopped'), '已中断')
   assert.equal(replyStatusLabel('interrupted'), '已中断')
+})
+
+test('重试 sends the message as it was only when the reply provably did nothing', () => {
+  assert.equal(retryText('改一下 README', 'missing_key', false), '改一下 README')
+  assert.match(retryText('改一下 README', 'missing_key', true), /做过的不要重做/, 'a task it started may have written')
+  assert.match(retryText('改一下 README', 'transport', false), /做过的不要重做/, 'it may have broken off midway')
+  assert.match(retryText('改一下 README', undefined, false), /做过的不要重做/, 'a stopped reply may have done part')
+})
+
+test('a message may be only its files', () => {
+  assert.equal(prepareSend({ conversationId: 'chat', text: ' ', pending: null }).ok, false)
+  const files = prepareSend({ conversationId: 'chat', text: ' ', pending: null, files: true })
+  assert.equal(files.ok && files.body.text, '')
+})
+
+test("a model the bot set itself is changed in its chat, not on the device", async () => {
+  const { replyFailure } = await import("../lib/errors.ts")
+  assert.equal(replyFailure("no_model", "model not found（这个 bot 设定的模型是 gpt-x）"), "这个 Bot 设定的模型 gpt-x 用不了。在聊天里让它换一个。")
+  assert.match(replyFailure("no_model", "model not found"), /设备/)
 })

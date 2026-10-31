@@ -103,14 +103,15 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const timeline = chatTimeline(data?.messages ?? [], [
     ...questions.map((question) => ({ key: `question:${question.question_id}`, created_at_ms: question.created_at_ms, waiting: awaitsAnswer(question, workspace.answered, folded.answers), node: <div id={`question-${question.question_id}`} className="scroll-mb-4"><QuestionCard question={question} answer={folded.answers.get(question.question_id)} /></div> })),
     ...(data?.sent ?? []).map((sent) => ({ key: `sent:${sent.message_id}`, created_at_ms: sent.created_at_ms, node: <SentToBot sent={sent} to={workspace.bots.find((bot) => bot.conversation_id === sent.to) ?? { name: '另一个 Bot' }} /> })),
-  ])
+  ], merged)
 
-  // When the newest reply failed, its message can go out again as is, unless it carried files.
+  // 重试 sits on the newest reply when it failed or was stopped; it reads the conversation again first and words what it sends by what the reply may have done.
   const newest = data?.messages.at(-1)
-  // A reply whose outcome is unknown may have done its work, so it is checked, not sent again.
-  const newestUnknown = jobs.some((job) => job.reply_message_id === newest?.message_id && outcomeUnknown(job.failure?.kind, job.failure?.detail))
-  const failedAsk = newest?.status === 'failed' && !newestUnknown ? data?.messages.find((message) => message.role === 'user' && message.message_id === newest.in_reply_to && !message.attachments?.length) : undefined
-  const retry = failedAsk && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(failedAsk.text) } : undefined
+  const endedAsk = newest && ['failed', 'stopped', 'interrupted'].includes(newest.status ?? '') ? newest.in_reply_to : undefined
+  // A reply whose outcome is unknown may have done its work: it is checked, never retried.
+  const retryOf = (messageId: string | undefined) => messageId && !sendDisabled && !jobs.some((job) => job.message_id === messageId && outcomeUnknown(job.failure?.kind, job.failure?.detail))
+    ? async () => { setSendError(null); await workspace.retryReply(messageId) } : undefined
+  const retry = retryOf(endedAsk)
   const replied = new Set((data?.messages ?? []).map((message) => message.message_id))
   // A message sent while the bot replies waits behind that reply, so it shows after it until its own turn starts.
   const replying = jobs.some((job) => ['claimed', 'running', 'cancelling'].includes(job.state))
@@ -138,11 +139,11 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       if (job.reply_message_id && replied.has(job.reply_message_id) && message.role === 'user') announced.set(job.reply_message_id, started)
       else entries.push(...started)
       if ((job.state !== 'failed' && job.state !== 'rejected') || replied.has(job.reply_message_id ?? '')) continue
-      // Only a click sends it again, as a new message; once it is sent this message is no longer the newest.
-      const again = message.role === 'user' && message.message_id === newest?.message_id && !outcomeUnknown(job.failure?.kind, job.failure?.detail) && !message.attachments?.length && !sendDisabled ? async () => { setSendError(null); await workspace.sendMessage(message.text) } : undefined
+      // A reply that ended with no message of its own: 重试 sits on this line while the message is the newest.
+      const again = message.role === 'user' && message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined
       entries.push({ key: `job:${job.trigger}`, node: <JobLine job={job} retry={again} /> })
     }
-    for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply)))
+    for (const reply of workspace.interrupted) if (reply.after === message.message_id) entries.push(pendingRow(interruptedRow(reply), message.message_id === newest?.message_id ? retryOf(message.message_id) : undefined))
     for (const turn of placedChanges.after.get(message.message_id) ?? []) entries.push(changeRow(turn))
     if (queued.has(message.message_id)) waiting.push(...entries.splice(start).map((entry) => 'message' in entry && entry.message.message_id === message.message_id ? { ...entry, message: { ...entry.message, state: merging.has(message.message_id) ? 'merging' as const : 'queued' as const } } : entry))
   }
@@ -219,7 +220,8 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
       return next
     })
   }, [conversationId, data, messagePending])
-  useEffect(() => { setSendError(null) }, [conversationId])
+  // Picked files belong to the bot they were picked for.
+  useEffect(() => { setSendError(null); setFiles([]) }, [conversationId])
   // Nothing pushes a device's bot readiness, so while a device that could reply to an open bot is not ready, read it again every 10s, or every 2s while it starts.
   const latest = useRef(workspace)
   latest.current = workspace
@@ -287,7 +289,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
         files={files}
         onFiles={setFiles}
         onSubmit={() => {
-          if (sendDisabled || !text.trim()) return
+          if (sendDisabled || !text.trim() && !files.length) return
           setSendError(null)
           workspace.sendMessage(text, files).then((sent) => { if (sent && workspace.isCurrent()) { clearSentDraft(conversationId, text); setFiles([]) } }).catch(setSendError)
         }}
@@ -370,11 +372,11 @@ function SentToBot({ sent, to }: { sent: SentBotMessage; to: { name: string; bot
   </div>
 }
 
-/** `retry`: sends the message again as a new one; only offered while it is the newest. */
+/** `retry`: 重试, only offered while its message is the newest. */
 function JobLine({ job, retry }: { job: ManagerJob; retry?: () => Promise<void> }) {
   return <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta">
     <span className="flex shrink-0 items-center gap-1 text-danger"><CircleX aria-hidden="true" className="size-4 shrink-0" />Bot 没能回复</span>
     {job.failure ? <span className="min-w-0 truncate text-muted-foreground" title={job.failure.detail}>{failureText(job.failure.kind) || failureReason(job.failure.detail)}</span> : null}
-    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />再发一次</ActionButton> : null}
+    {retry ? <ActionButton variant="ghost" className="-ms-1 h-8 px-2 text-meta max-md:h-11" action={retry}><RotateCcw aria-hidden="true" />重试</ActionButton> : null}
   </div>
 }

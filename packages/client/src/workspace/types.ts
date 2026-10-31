@@ -196,7 +196,7 @@ type LastMessage = { text: string; role: string; created_at_ms: number }
 /** What the bot does on the device serving this list: a message waiting or claimed, or a reply running. A bot another device schedules reads null once its message is delivered. */
 export type Busy = "thinking" | "replying" | null
 /** `avatar` null: the face its id gives. `avatar_version` names the face to change it, null before any change. */
-export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy }
+export type BotRecord = CreateBotRequest & { models: BotModels; skills: SkillSet; avatar: Avatar | null; avatar_version: string | null; event_hash: string; last_message: LastMessage | null; busy: Busy; successor?: true }
 
 export type OverviewBot = Pick<BotRecord, "bot_id" | "conversation_id" | "name">
 export type OverviewNode = Pick<NodeInfo, "device_id" | "name" | "online" | "revoked" | "local">

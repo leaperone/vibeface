@@ -87,7 +87,9 @@ impl Runtime {
                 value
             })
             .collect();
-        Ok(json!({"bots":bots,"primary":store.primary_bot(&access.network_id)?}))
+        let primary = store.primary_bot(&access.network_id)?;
+        let successor = store.primary_successor(&access.network_id)?;
+        Ok(json!({"bots":bots,"primary":primary,"successor":successor}))
     }
 
     /// The user pauses, resumes or deletes a schedule; the scheduler reads the projection, so a

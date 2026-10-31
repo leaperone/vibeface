@@ -11,7 +11,7 @@ import { ActionButton } from '@/features/workspace/present'
 import { openSchedule } from '@/features/workspace/bot-panel'
 import type { AvatarEdit } from '@vibeface/client/workspace/types.ts'
 import { avatarChangeWords } from '@vibeface/client/avatar/pick.ts'
-import { changeTitle, formatWhen, lineDiff, overwriteCopy, restoreRequest, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
+import { changeTitle, firedAt, formatWhen, lineDiff, overwriteCopy, restoreRequest, scheduleDetail, scheduleFrequency, type DiffLine } from '@vibeface/client/workspace/bot-settings.ts'
 import type { BotChange, BotChangeRecord, BotSchedule, BotSkill, Overwritten, ScheduleView, SkillSet } from '@vibeface/client/workspace/types.ts'
 
 /**
@@ -49,7 +49,7 @@ function ChangeRows({ change, conversationId, schedules, overwritten }: { change
   }
   if (change.kind === 'skill') return <SkillRow before={change.before} after={change.after} />
   if (change.kind === 'memory') return <MemoryRow before={change.before} after={change.after} />
-  return <ScheduleRow before={change.before} after={change.after} current={schedules.find((schedule) => schedule.schedule_id === change.schedule_id)} />
+  return <ScheduleRow id={change.schedule_id} before={change.before} after={change.after} current={schedules.find((schedule) => schedule.schedule_id === change.schedule_id)} />
 }
 
 /** Another device's write replaced this setting without seeing it: what it is now, and setting it back the usual way. */
@@ -147,9 +147,11 @@ function SkillRow({ before, after }: { before: BotSkill | null; after: BotSkill 
  * A one-time schedule shows when it runs. A repeating one shows its next run from the schedule as it is now,
  * so a card for a removed, paused or finished one shows none.
  */
-function ScheduleRow({ before, after, current }: { before: BotSchedule | null; after: BotSchedule | null; current?: ScheduleView }) {
+function ScheduleRow({ id, before, after, current }: { id: string; before: BotSchedule | null; after: BotSchedule | null; current?: ScheduleView }) {
+  const { data } = useWorkspace()
   const schedule = after ?? before!
   const once = schedule.every_minutes === undefined
+  const fired = once ? firedAt(data?.messages ?? [], id) : null
   const icon = once ? AlarmClock : Repeat
   const tag = !before ? '新定时任务' : !after ? '已删除' : before.enabled !== after.enabled ? (after.enabled ? '已恢复' : '已暂停') : '已更新'
   if (!after) return <Row icon={icon} label={schedule.name} tag={tag} removed />
@@ -157,14 +159,15 @@ function ScheduleRow({ before, after, current }: { before: BotSchedule | null; a
   const next = once ? after.first_run_at_ms : current?.enabled ? current.next_run_at_ms : null
   const detail = scheduleDetail(after)
   // One still listed opens the bot panel on it, where it is paused, resumed or deleted.
-  const label = current ? <button type="button" className="rounded-sm text-left underline-offset-4 outline-none hover:underline focus-visible:ring-3 focus-visible:ring-ring/50" onClick={() => openSchedule(current.schedule_id)}>{after.name}</button> : after.name
+  const label = current && fired === null ? <button type="button" className="rounded-sm text-left underline-offset-4 outline-none hover:underline focus-visible:ring-3 focus-visible:ring-ring/50" onClick={() => openSchedule(current.schedule_id)}>{after.name}</button> : after.name
   return <Row icon={icon} label={label} tag={tag}>
     {before && before.name !== after.name ? <BeforeAfter className="text-meta" before={before.name} after={after.name} /> : null}
     {previous !== frequency ? <BeforeAfter className="text-meta" before={previous} after={frequency} /> : null}
     <p className="flex flex-wrap items-center gap-x-2 text-meta text-muted-foreground tabular-nums">
       {previous === frequency ? <span>{frequency}</span> : null}
       {/* A repeating schedule no longer listed was deleted since; one listed says whether it is paused now, not then. */}
-      {!once && !current ? <span className="inline-flex items-center gap-1"><Trash2 aria-hidden="true" className="size-4" />现已删除</span>
+      {fired !== null ? <span className="inline-flex items-center gap-1"><CircleCheck aria-hidden="true" className="size-4" />已提醒 {formatWhen(fired)}</span>
+        : !once && !current ? <span className="inline-flex items-center gap-1"><Trash2 aria-hidden="true" className="size-4" />现已删除</span>
         : !(current ?? after).enabled ? <span className="inline-flex items-center gap-1"><CirclePause aria-hidden="true" className="size-4" />{current && after.enabled ? '现已暂停' : '已暂停'}</span>
         : next !== null ? <span>{once ? '' : '下次 '}{formatWhen(next)}</span> : null}
     </p>

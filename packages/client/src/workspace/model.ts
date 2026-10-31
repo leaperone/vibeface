@@ -698,15 +698,16 @@ export function parseBot(value: unknown): BotRecord {
   return { ...parseCreateBot(value), models: botModels(data.models), skills: skillSet(data.skills), avatar: avatar(data.avatar), avatar_version: data.avatar_version == null ? null : text(data.avatar_version), event_hash: text(data.event_hash), last_message: last && { text: text(last.text), role: text(last.role), created_at_ms: number(last.created_at_ms) }, busy: busy(data.busy) }
 }
 const busy = (value: unknown): Busy => value === "thinking" || value === "replying" ? value : null
+/** Bots in order; `successor` marks the one that becomes primary once the primary bot is deleted. */
 export function parseBots(value: unknown): BotRecord[] {
-  return list(record(value).bots).map(parseBot)
+  const data = record(value)
+  return list(data.bots).map((item) => { const bot = parseBot(item); return bot.conversation_id === data.successor ? { ...bot, successor: true } : bot })
 }
 /** The primary bot's conversation: sessions no bot started go there first. */
 export function parsePrimary(value: unknown): string | null {
   const primary = record(value).primary
   return primary == null ? null : text(primary)
 }
-
 export function parsePendingBot(value: unknown): PendingBot {
   const data = record(value), submission = record(data.submission)
   if (submission.state !== "unconfirmed" && submission.state !== "rejected") throw new Error("Bot 创建记录的提交状态无效。")

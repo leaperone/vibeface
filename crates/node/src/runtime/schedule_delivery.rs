@@ -359,12 +359,18 @@ impl Runtime {
             Some(value) => serde_json::from_value(value.clone()).context("invalid attachments")?,
             None => vec![],
         };
+        // A message may be only its files.
+        let text = input["text"].as_str().context("text is required")?;
+        ensure!(
+            (!text.trim().is_empty() || !attachments.is_empty()) && text.len() <= 65536,
+            "invalid text"
+        );
         let (message, receipt) = self.store.lock().await.accept_message(
             &self.identity,
             network,
             &scope,
             &message_id,
-            field(input, "text")?,
+            text,
             attachments,
             report_results,
             attestation(input)?,
