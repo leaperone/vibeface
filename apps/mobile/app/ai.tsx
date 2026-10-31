@@ -256,7 +256,7 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
         </View>}
     </Field> : null}
     {fields.includes('workspace') ? <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field> : null}
-    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !draft.model.trim())}
+    {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !(fields.includes('model') ? draft.model : manager.model).trim())}
       onPress={() => void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])) })}><Text>保存</Text></Button> : null}
   </View>
 }

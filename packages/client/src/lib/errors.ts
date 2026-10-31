@@ -44,7 +44,7 @@ const patterns: [RegExp, string][] = [
   [/too many devices are joining|too many pending invites/i, '同时加入的设备太多。稍后重试。'],
   [/has not confirmed its short code/i, '新设备还没显示安全码，等它显示后再比对。'],
   [/only the manager that started the confirmation/i, '这里批准不了。到发出加入链接的那台设备上批准。'],
-  [/join request (not found|vanished|can no longer|is not waiting|belongs to another)|join completed with another grant|different nonce/i, '这个加入请求已处理或已过期。请重新生成加入链接。'],
+  [/join request (not found|vanished|can no longer|is not waiting|belongs to another)|join completed with another grant|different nonce/i, '这个加入请求已处理或已过期。重新生成加入链接。'],
   [/this recovery removes this Node/i, '这次找回会移除你正连着的设备。换一台要保留的设备打开。'],
   [/replaced by a newer recovery/i, '这个恢复文件已作废。改用最近一次下载的那份。'],
   [/conflicting recovery checkpoint|recovery epoch rollback/i, '这组设备已经用另一份恢复文件找回过。改用最近一次下载的那份。'],
@@ -93,7 +93,7 @@ const patterns: [RegExp, string][] = [
   [/recovery (key|proof)/i, '恢复文件和这组设备对不上，或这次找回已过期。'],
   [/signature|proof|handshake|identity/i, '设备身份校验没通过，已断开。'],
   [/too large|too long|exceeds|limit/i, '内容超过了大小限制。'],
-  [malformed, '请求内容不完整或格式不对。请刷新页面后重试。'],
+  [malformed, '请求内容不完整或格式不对。刷新页面后重试。'],
 ]
 
 const chinese = /[一-鿿]/

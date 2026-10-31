@@ -169,14 +169,15 @@ export const failedWork = (work: Pick<WorkRecord, "outcome" | "state">) => work.
 /** A failure fixed in its device's settings: no bot there to take it, or the AI service there not set up. */
 export const fixOnDevice = (work: Pick<WorkRecord, "failure">) =>
   ["missing_key", "auth_failed", "missing_binary", "execution_disabled", "no_model", "no_bot"].includes(work.failure ?? "")
-/** A prompt that parses as JSON is machine text; plain words that merely open with "[" or "{" are not. */
+/** A prompt whose whole text or first line parses as JSON is machine text; plain words that merely open with "[" or "{" are not. */
 function machineText(text: string) {
   if (!/^[{[]/.test(text)) return false
-  try { JSON.parse(text); return true } catch { return false }
+  const parses = (value: string) => { try { JSON.parse(value); return true } catch { return false } }
+  return parses(text) || parses(text.split(/\r?\n/, 1)[0])
 }
 /** Characters as a person sees them, so a cut never splits an emoji; Hermes without `Intl.Segmenter` falls back to code points. */
 function graphemes(text: string): string[] {
-  return typeof Intl.Segmenter === "function" ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment) : Array.from(text)
+  return typeof Intl !== "undefined" && typeof Intl.Segmenter === "function" ? Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text), (part) => part.segment) : Array.from(text)
 }
 /**
  * What a task was asked, short enough for its page: the first plain line, cut at 80 characters. Machine text such as JSON gives none,

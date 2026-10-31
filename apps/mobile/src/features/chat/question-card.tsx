@@ -48,7 +48,8 @@ export function QuestionCard({ question, answer, inTask = false }: { question: Q
   const heldTask = inTask ? null : approvalTask(question, [...shared?.openWorks ?? [], ...shared?.data?.works ?? []])
   const about = heldTask ? `${heldTask} · ${member?.name ?? '另一台设备'}` : undefined
   const elsewhere = settled && (settled.elsewhere || beaten)
-  if (settled) return <Settled icon={elsewhere ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={elsewhere ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} about={about}>
+  const warned = settled && (settled.beaten || beaten)
+  if (settled) return <Settled icon={warned ? CircleAlert : declined(settled.text) ? CircleX : CircleCheck} className={warned ? 'text-warning' : declined(settled.text) ? 'text-danger' : 'text-success'} ask={ask} about={about}>
     {elsewhere ? `已由另一端回答：${settled.text}` : declined(settled.text) ? answerLabel(settled.text) : settled.text}
   </Settled>
   if (question.closed) return <Settled icon={CircleSlash} ask={ask} about={about}>已失效</Settled>

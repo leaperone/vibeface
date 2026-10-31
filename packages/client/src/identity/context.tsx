@@ -691,13 +691,13 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     const pins = approvalPins()
     const seen = joins.find(item => item.join_id === joinId)
     if (!pins[joinId]) {
-      if (seen?.status !== 'pending') throw new Error('这个加入请求已失效。请重新生成加入链接。')
+      if (seen?.status !== 'pending') throw new Error('这个加入请求已失效。重新生成加入链接。')
       // Kept across reloads and retries, so a repeated start sends the same nonce.
       pins[joinId] = { nonce: randomHex(), device_id: seen.device_id, invite_id: seen.invite_id, commit: seen.commit }
       store('approval-pins', Object.fromEntries(Object.entries(pins).slice(-16)))
     }
     const request = parseJoinRequest(await scoped()('approve', { join_id: joinId, admin_nonce: pins[joinId].nonce }))
-    if (request.status !== 'confirming') throw new Error('这个加入请求已失效。请重新生成加入链接。')
+    if (request.status !== 'confirming') throw new Error('这个加入请求已失效。重新生成加入链接。')
     await refreshDirectory()
   }
   async function approveJoin(joinId: string, manage: boolean) {
@@ -960,7 +960,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     }
     if (status.status === 'rejected' || status.status === 'expired') {
       // The join is gone, so the poller can no longer tell it apart from a stale one; say why here.
-      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。请重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。请重新生成。' : joinCopy.rejected)
+      const failure = new Error(status.reason === 'commitment_mismatch' ? '加入请求校验失败，已作废。重新生成加入链接。' : status.status === 'expired' ? '加入链接已过期。重新生成一条。' : joinCopy.rejected)
       setJoin(null); setError(failure.message)
       throw failure
     }
@@ -1013,7 +1013,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     sensitive.current = flow; setReview({ kind: 'bootstrap', networkId })
   }
   async function openLocalAccess(thenRejoin = false) {
-    if (localSetup?.kind !== 'initialized') throw new Error('这里不是本机页面。先打开这台电脑的本机页面。')
+    if (localSetup?.kind !== 'initialized') throw new Error('本机页面还没准备好。在这台电脑上打开它再试。')
     // A member browser reconnects as itself; the launcher would start a separate local session on another origin.
     // A removed browser would only be refused again, so it takes the local session.
     const computer = localSetup.entry
@@ -1029,7 +1029,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     if (!setup.local_launch) throw new Error('本机免确认打开已关闭。改用加入链接或恢复文件。')
     const url = new URL(setup.local_launch.url)
     url.hash = new URLSearchParams({ local: setup.local_launch.token, node: setup.local_launch.device_id, ...thenRejoin ? { rejoin: '1' } : {} }).toString()
-    if (!page) throw new Error('这里不是本机页面。在这台电脑上打开它的本机页面。')
+    if (!page) throw new Error('这里打不开本机页面。到这台电脑上打开。')
     page.open(url.href)
   }
   function setKept(next: KeptRecovery | null) {
