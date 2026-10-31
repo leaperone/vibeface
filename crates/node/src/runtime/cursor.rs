@@ -935,7 +935,8 @@ mod tests {
         assert_eq!(seen_before_completion, 0);
         assert!(
             interrupted
-                .unwrap_err()
+                .err()
+                .context("expected interrupted Cursor turn")?
                 .downcast_ref::<crate::manager::ManagerError>()
                 .unwrap()
                 .cancelled()
