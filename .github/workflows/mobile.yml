@@ -1,6 +1,6 @@
 name: mobile
 
-# Extended platform build: run by hand, or on a pull request labelled `mobile`.
+# Extended platform build: run by hand or from the delivery proof workflow.
 on:
   workflow_dispatch:
   workflow_call:
@@ -8,8 +8,6 @@ on:
       android_only:
         type: boolean
         default: false
-  pull_request:
-    types: [labeled, unlabeled, synchronize]
 
 concurrency:
   group: mobile-${{ github.ref }}
@@ -20,9 +18,7 @@ permissions:
 
 jobs:
   android:
-    if: >-
-      (inputs.android_only || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'nightly'))
+    if: inputs.android_only || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -47,8 +43,6 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
           cargo install cargo-ndk --locked
       - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
-        with:
-          cache-read-only: ${{ github.event_name == 'pull_request' }}
       - run: pnpm install --frozen-lockfile
       - run: scripts/build-mobile-secure.sh android
       - name: Verify generated native sources match this commit
@@ -71,10 +65,7 @@ jobs:
           if-no-files-found: error
 
   ios:
-    if: >-
-      !inputs.android_only &&
-      (github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'mobile')) &&
-      !(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'nightly'))
+    if: ${{ !inputs.android_only && github.event_name == 'workflow_dispatch' }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:

@@ -46,25 +46,23 @@ PLATFORMS = (
     {"runner": "macos-15", "target": "aarch64-apple-darwin"},
 )
 JOBS = ("quick-check", "crypto-web", "web", "rust-check", "rust-fast", "rust-slow", "delivery", "package", "npm-package", "npm-smoke", "www")
-NIGHTLY_LABEL = "nightly"
 
 
-def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly", nightly=False):
+def make_plan(paths, event="pull_request", ref_type="branch", channel="nightly"):
     scopes = set()
     for path in paths:
         scopes.add(next((scope for scope, patterns in PATH_RULES if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)), "full"))
         if any(fnmatch.fnmatchcase(path, pattern) for pattern in WWW_PATHS):
             scopes.add("www")
-    return dict(scope_plan(scopes, event, ref_type, channel, nightly=nightly), changed_files=len(paths))
+    return dict(scope_plan(scopes, event, ref_type, channel), changed_files=len(paths))
 
 
-def scope_plan(scopes, event, ref_type, channel, nightly=False):
+def scope_plan(scopes, event, ref_type, channel):
     if (
         scopes - {"full", "docs", "web", "www", *DEPENDENTS}
         or event not in {"pull_request", "push", "schedule", "workflow_dispatch", "merge_group"}
         or ref_type not in {"branch", "tag"}
         or channel not in {"stable", "rc", "nightly"}
-        or (nightly and event != "pull_request")
     ):
         raise ValueError("Invalid CI scopes or scenario")
     extended = event in {"schedule", "workflow_dispatch"} or ref_type == "tag"
@@ -101,26 +99,7 @@ def scope_plan(scopes, event, ref_type, channel, nightly=False):
         "package_mode": "node" if "node" in affected and extended else "web",
         "package_matrix": {"include": list(platforms) if web else []},
         "npm": channel == "nightly" and "node" in affected and extended,
-        "nightly": nightly,
     }
-    if nightly:
-        plan.update(
-            full=False,
-            extended=False,
-            check_msrv=False,
-            docs_only=False,
-            web=False,
-            www=False,
-            node=False,
-            delivery=False,
-            rust_packages=[],
-            test_tiers=[],
-            package_mode="web",
-            package_matrix={"include": []},
-            npm=False,
-            required_jobs=[],
-        )
-        return plan
     required = {"quick-check"}
     if web:
         required.update(("crypto-web", "web", "package"))
@@ -170,10 +149,7 @@ def event_plan(args):
     else:
         paths = changed_paths(base, head, event)
     metadata = release_metadata(ref_type, os.environ.get("GITHUB_REF_NAME", ""))
-    nightly = event == "pull_request" and any(
-        label.get("name") == NIGHTLY_LABEL for label in payload.get("pull_request", {}).get("labels", [])
-    )
-    plan = make_plan(paths, event, ref_type, metadata["channel"], nightly=nightly)
+    plan = make_plan(paths, event, ref_type, metadata["channel"])
     plan.update(metadata)
     return plan
 
@@ -216,7 +192,6 @@ def write_plan(plan, output=None):
             "msrv": plan["msrv"],
             "channel": plan["channel"],
             "prerelease": str(plan["prerelease"]).lower(),
-            "nightly": str(plan["nightly"]).lower(),
         }
         with open(output, "a") as destination:
             destination.writelines(f"{key}={value}\n" for key, value in outputs.items())
@@ -227,7 +202,6 @@ def write_plan(plan, output=None):
                 "### Selected CI coverage\n\n"
                 f"- Changed paths: {plan['changed_files']}\n"
                 f"- Full workspace scope: {plan['full']}\n"
-                f"- Nightly bypass: {plan['nightly']}\n"
                 f"- Coverage tier: {'extended' if plan['extended'] else 'core'}\n"
                 f"- Minimum Rust version check: {plan['check_msrv']}\n"
                 f"- Rust packages: {', '.join(plan['rust_packages']) or 'none'}\n"
@@ -243,7 +217,7 @@ def gate(needs, plan=None, delivery_live=False):
     if plan is None:
         plan = json.loads(needs["plan"]["outputs"]["plan"])
     expected = scope_plan(
-        set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"], nightly=plan.get("nightly", False)
+        set(plan["scopes"]), plan["event"], plan["ref_type"], plan["channel"]
     )
     if any(plan.get(key) != value for key, value in expected.items()):
         raise ValueError("Required coverage differs from the selected CI scope and scenario")
@@ -313,11 +287,6 @@ def self_test():
     assert make_plan(["packages/client/src/lib/transport.ts", "pnpm-lock.yaml"])["scopes"] == ["web", "www"]
     assert make_plan(["apps/mobile/app/_layout.tsx", "packages/theme/theme.css"])["scopes"] == ["web", "www"]
     assert make_plan(["crates/secure-ffi/src/lib.rs"])["rust_packages"] == ["vibeface-secure-ffi"]
-    nightly = make_plan(["crates/node/src/api.rs"], nightly=True)
-    assert nightly["nightly"] and nightly["required_jobs"] == []
-    assert nightly["rust_packages"] == [] and nightly["package_matrix"]["include"] == []
-    for event in ("push", "schedule", "workflow_dispatch", "merge_group"):
-        expect_failure(lambda event=event: scope_plan(set(), event, "branch", "nightly", nightly=True))
     docs = make_plan(["README.md", "docs/node.md"])
     assert docs["docs_only"] and docs["www"] and docs["required_jobs"] == ["quick-check", "www"]
     expected = {
@@ -462,12 +431,6 @@ def self_test():
                 diff.assert_called_with(new_base, pr_head, "pull_request")
                 assert selected == make_plan(paths)
                 assert selected["test_tiers"] == ["fast"]
-            event_file.write_text(json.dumps({"pull_request": {"base": {"sha": new_base}, "head": {"sha": pr_head}, "labels": [{"name": NIGHTLY_LABEL}]}}))
-            selected = event_plan(arguments)
-            assert selected["nightly"] and selected["required_jobs"] == []
-        nightly_needs = {job: {"result": "skipped"} for job in JOBS}
-        nightly_needs["plan"] = {"result": "success", "outputs": {"plan": json.dumps(nightly)}}
-        gate(nightly_needs)
         for version, channel in (("1.2.3", "stable"), ("1.2.3-rc.2", "rc"), ("1.2.3-nightly.20261019.1", "nightly")):
             cargo_metadata = {"packages": [{"name": "vibeface", "version": version, "rust_version": "1.89"}]}
             with patch("subprocess.check_output", return_value=json.dumps(cargo_metadata)), patch(f"{__name__}.git") as ancestor:

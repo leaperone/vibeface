@@ -1,8 +1,6 @@
 name: ci
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, labeled, unlabeled]
   push:
     branches: [main]
     tags: ['v*']
@@ -19,7 +17,6 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -38,7 +35,6 @@ jobs:
       package_matrix: ${{ steps.select.outputs.package_matrix }}
       package_mode: ${{ steps.select.outputs.package_mode }}
       npm: ${{ steps.select.outputs.npm }}
-      nightly: ${{ steps.select.outputs.nightly }}
       version: ${{ steps.select.outputs.version }}
       msrv: ${{ steps.select.outputs.msrv }}
       channel: ${{ steps.select.outputs.channel }}
@@ -55,7 +51,6 @@ jobs:
 
   quick-check:
     needs: plan
-    if: needs.plan.outputs.nightly != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -378,7 +373,7 @@ jobs:
           cache: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && 'pnpm' || '' }}
           cache-dependency-path: pnpm-lock.yaml
       - name: Import Developer ID signing identity
-        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -460,7 +455,7 @@ jobs:
           "$package/vibeface" --help
           printf 'package=%s\n' "$package" >> "$GITHUB_OUTPUT"
       - name: Verify Developer ID signature
-        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         env:
           PACKAGE: ${{ steps.unpack.outputs.package }}
         run: |
@@ -614,7 +609,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
       - name: Remove signing keychain and notary key
-        if: always() && matrix.target == 'aarch64-apple-darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        if: always() && matrix.target == 'aarch64-apple-darwin' && github.event_name != 'merge_group'
         run: |
           security delete-keychain "$RUNNER_TEMP/vibeface-signing.keychain-db" 2> /dev/null || true
           rm -f "$RUNNER_TEMP/vibeface-notary.p8" "$RUNNER_TEMP/vibeface-signing.p12"
@@ -834,7 +829,7 @@ jobs:
 
   app-build:
     needs: [plan]
-    if: ${{ needs.plan.outputs.nightly != 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     uses: ./.github/workflows/release-apps.yml
     with:
       version: v${{ needs.plan.outputs.version }}
