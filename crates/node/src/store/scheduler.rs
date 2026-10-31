@@ -555,6 +555,25 @@ fn admit_ended_from(
 }
 
 impl Store {
+    pub(crate) fn staged_memory_overlay(
+        &self,
+        conversation: &str,
+        trigger: &str,
+        attempt_id: &str,
+    ) -> Result<Vec<StagedMemory>> {
+        let session = load_session(&self.connection, conversation)?;
+        let Some(job) = load_job(&self.connection, conversation, trigger)? else {
+            return Ok(Vec::new());
+        };
+        ensure!(
+            job.state
+                .attempt()
+                .is_some_and(|attempt| attempt.id == attempt_id),
+            "scheduler attempt does not match"
+        );
+        Ok(session.shown.staged_memories.into_values().collect())
+    }
+
     /// Stage a memory mutation for the active turn. The mutation is kept in the local scheduler
     /// session and becomes a signed BotChanged event only when that turn completes.
     #[expect(
@@ -596,16 +615,17 @@ impl Store {
             return Ok(json!({"state":"committed","record":record}));
         }
         let staged = session.shown.staged_memories.clone();
-        let committed = super::bot_settings::memories_from(&tx, network, conversation)?;
-        let current =
-            |memory_id: &str| match staged.values().find(|entry| entry.memory_id == memory_id) {
-                Some(entry) => entry.after.clone(),
-                None => committed
-                    .iter()
-                    .find(|entry| entry.memory_id == memory_id)
-                    .map(|entry| entry.text.clone()),
-            };
-        let (memory_id, before, after) = match request {
+        let committed = super::bot_settings::memory_records_from(&tx, network, conversation)?;
+        let (
+            memory_id,
+            before,
+            after,
+            base_epoch,
+            base_revision,
+            origin,
+            user_controlled,
+            essential,
+        ) = match request {
             super::bot_settings::ChangeRequest::Remember { memory_id, text } => {
                 validate_memory(&text)?;
                 let memory_id = memory_id.unwrap_or_else(|| {
@@ -614,9 +634,18 @@ impl Store {
                         super::bot_settings::change_digest(conversation, trigger, call_ref)
                     )
                 });
-                let before = current(&memory_id);
+                let record = committed
+                    .iter()
+                    .find(|record| record.entry.memory_id == memory_id);
+                let before = record.map(|record| record.entry.text.clone());
+                if let Some(record) = record {
+                    ensure!(
+                        !record.user_controlled,
+                        "this note is user-controlled; change it directly"
+                    );
+                }
                 ensure!(
-                    !committed.iter().any(|entry| entry.text == text),
+                    !committed.iter().any(|entry| entry.entry.text == text),
                     "this note is already kept"
                 );
                 if before.is_none() {
@@ -633,11 +662,40 @@ impl Store {
                     before.as_deref() != Some(text.as_str()),
                     "this note already has that text"
                 );
-                (memory_id, before, Some(text))
+                (
+                    memory_id,
+                    before,
+                    Some(text),
+                    record
+                        .map(|record| record.epoch)
+                        .unwrap_or(crate::config::DATA_EPOCH),
+                    record
+                        .map(|record| record.revision.clone())
+                        .unwrap_or_default(),
+                    crate::model::MemoryOrigin::Agent,
+                    false,
+                    record.map(|record| record.essential).unwrap_or(true),
+                )
             }
             super::bot_settings::ChangeRequest::Forget { memory_id } => {
-                let before = current(&memory_id).context("note not found for this bot")?;
-                (memory_id, Some(before), None)
+                let record = committed
+                    .iter()
+                    .find(|record| record.entry.memory_id == memory_id)
+                    .context("note not found for this bot")?;
+                ensure!(
+                    !record.user_controlled,
+                    "this note is user-controlled; change it directly"
+                );
+                (
+                    memory_id,
+                    Some(record.entry.text.clone()),
+                    None,
+                    record.epoch,
+                    record.revision.clone(),
+                    crate::model::MemoryOrigin::Agent,
+                    false,
+                    record.essential,
+                )
             }
             _ => bail!("only remember and forget use turn memory staging"),
         };
@@ -648,9 +706,15 @@ impl Store {
                     && previous.after == after,
                 "call_ref {call_ref} already staged a different memory mutation"
             );
-            return Ok(
-                json!({"state":"staged","memory_id":memory_id,"before":before,"after":after,"commit":"turn_completed"}),
-            );
+            return Ok(json!({
+                "state":"staged",
+                "memory_id":memory_id,
+                "before":before,
+                "after":after,
+                "base_epoch":previous.base_epoch,
+                "base_revision":previous.base_revision,
+                "commit":"turn_completed"
+            }));
         }
         ensure!(
             !staged.values().any(|entry| entry.memory_id == memory_id),
@@ -663,6 +727,11 @@ impl Store {
                 memory_id: memory_id.clone(),
                 before: before.clone(),
                 after: after.clone(),
+                base_epoch,
+                base_revision: base_revision.clone(),
+                origin,
+                user_controlled,
+                essential,
             },
         );
         save_session(&tx, &session)?;
@@ -673,6 +742,8 @@ impl Store {
             "memory_id":memory_id,
             "before":before,
             "after":after,
+            "base_epoch":base_epoch,
+            "base_revision":base_revision,
             "commit":"turn_completed"
         }))
     }
@@ -1660,15 +1731,43 @@ impl Store {
             } else {
                 "stable_prompt_or_provider_changed"
             };
+            let generation = session.shown.session_generation.saturating_add(1);
+            let handoff_revision = crate::crypto::digest(&serde_json::to_vec(&(
+                session.sdk_config.as_deref(),
+                sdk_config,
+                generation,
+                &job.basis,
+            ))?);
             let invalidation = Some(SessionInvalidation {
                 old_config: session.sdk_config.clone(),
                 new_config: sdk_config.into(),
                 reason: reason.into(),
+                generation,
+                handoff_revision,
             });
             session.native_id = None;
             session.native_token = None;
             session.covers.clear();
-            session.shown = Shown::default();
+            let mut lineage = std::mem::take(&mut session.shown.session_lineage);
+            if let Some(old_config) = session.sdk_config.clone() {
+                lineage.push(SessionLineage {
+                    generation: session.shown.session_generation,
+                    fingerprint: old_config,
+                    reason: reason.into(),
+                    handoff_revision: invalidation
+                        .as_ref()
+                        .map(|value| value.handoff_revision.clone())
+                        .unwrap_or_default(),
+                });
+            }
+            if lineage.len() > 8 {
+                lineage.drain(..lineage.len() - 8);
+            }
+            session.shown = Shown {
+                session_generation: generation,
+                session_lineage: lineage,
+                ..Shown::default()
+            };
             session.sdk_config = Some(sdk_config.into());
             session.owner_epoch = owner_epoch;
             invalidation
@@ -1688,9 +1787,15 @@ impl Store {
         let covers = resumable
             .then(|| session.covers.clone())
             .filter(|covers| !covers.is_empty());
+        let session_generation = session.shown.session_generation;
+        let session_lineage = session.shown.session_lineage.clone();
         let shown = match covers {
             Some(_) => session.shown.clone(),
-            None => Shown::default(),
+            None => Shown {
+                session_generation,
+                session_lineage,
+                ..Shown::default()
+            },
         };
         job.state = JobState::Claimed {
             attempt: ManagerAttempt {
@@ -1776,7 +1881,13 @@ impl Store {
             if job.kind != TriggerKind::AgentTask {
                 if session.native_id.as_deref() != Some(native_id) {
                     session.covers.clear();
-                    session.shown = Shown::default();
+                    let session_generation = session.shown.session_generation;
+                    let session_lineage = session.shown.session_lineage.clone();
+                    session.shown = Shown {
+                        session_generation,
+                        session_lineage,
+                        ..Shown::default()
+                    };
                 }
                 session.native_id = Some(native_id.into());
                 session.native_token = Some(token.into());
@@ -2041,7 +2152,14 @@ impl Store {
             let mut session = load_session(&tx, &job.conversation_id)?;
             if session.native_id.as_deref() == Some(thread_id) {
                 session.covers = job.basis;
-                session.shown = shown.clone();
+                let mut shown = shown.clone();
+                shown.session_generation = shown
+                    .session_generation
+                    .max(session.shown.session_generation);
+                if shown.session_lineage.is_empty() {
+                    shown.session_lineage = session.shown.session_lineage.clone();
+                }
+                session.shown = shown;
                 save_session(&tx, &session)?;
             }
         }

@@ -373,6 +373,8 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     target_provider: provider,
                     basis: job.basis.clone(),
                     source_fingerprint: invalidation.old_config.clone().unwrap_or_default(),
+                    generation: invalidation.generation,
+                    handoff_revision: invalidation.handoff_revision.clone(),
                     recent_context: "The new provider session rebuilds from the recorded DAG basis. Use context to read older events.".into(),
                     open_work: works.iter().filter(|work| work.outcome.is_none()).map(|work| work.work_id.clone()).collect(),
                     decisions: vec![],
@@ -408,11 +410,14 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             } else {
                 format!("{}\n\n{}", handoff_text, prompt)
             };
-            let dynamic = agent_context::DynamicContext::compile(
+            let mut dynamic = agent_context::DynamicContext::compile(
                 job.basis.clone(),
                 trigger.clone(),
                 prompt.clone(),
             )?;
+            dynamic.memory = bot["memory_context"].clone();
+            dynamic.session_generation = shown.session_generation;
+            dynamic.refresh_fingerprint()?;
             let prompt = if thread {
                 prompt
             } else {
@@ -434,11 +439,15 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                     } else {
                         format!("{}\n\n{}", handoff_text, fresh_prompt)
                     };
-                    fresh_shown.dynamic = Some(agent_context::DynamicContext::compile(
+                    let mut fresh_dynamic = agent_context::DynamicContext::compile(
                         job.basis.clone(),
                         trigger.clone(),
                         fresh_prompt.clone(),
-                    )?.fingerprint);
+                    )?;
+                    fresh_dynamic.memory = bot["memory_context"].clone();
+                    fresh_dynamic.session_generation = fresh_shown.session_generation;
+                    fresh_dynamic.refresh_fingerprint()?;
+                    fresh_shown.dynamic = Some(fresh_dynamic.fingerprint);
                     let fresh_prompt = if thread {
                         fresh_prompt
                     } else {
@@ -807,11 +816,25 @@ pub(crate) fn bot_value(
         .map(|entry| schedule_row(entry, now))
         .collect();
     let memory: Vec<Value> = store
-        .memories(network, conversation)?
+        .memory_records(network, conversation)?
         .into_iter()
-        .map(|note| json!({"memory_id":note.memory_id,"text":note.text}))
+        .map(|record| {
+            json!({
+                "memory_id":record.entry.memory_id,
+                "text":record.entry.text,
+                "epoch":record.epoch,
+                "revision":record.revision,
+                "origin":record.origin,
+                "user_controlled":record.user_controlled,
+                "essential":record.essential,
+                "source_event_hash":record.source_event_hash
+            })
+        })
         .collect();
     let memory_context = agent_context::essential_memory_block(memory.iter().filter_map(|row| {
+        if row["essential"].as_bool() == Some(false) {
+            return None;
+        }
         Some((
             row["memory_id"].as_str()?.to_owned(),
             row["text"].as_str()?.to_owned(),

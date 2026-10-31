@@ -484,6 +484,30 @@ table "memories" {
     null = false
     type = integer
   }
+  column "epoch" {
+    null = false
+    type = integer
+  }
+  column "revision" {
+    null = false
+    type = text
+  }
+  column "origin" {
+    null = false
+    type = text
+  }
+  column "user_controlled" {
+    null = false
+    type = integer
+  }
+  column "essential" {
+    null = false
+    type = integer
+  }
+  column "source_event_hash" {
+    null = true
+    type = text
+  }
   primary_key {
     columns = [column.network_id, column.memory_id]
   }

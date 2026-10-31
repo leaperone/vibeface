@@ -403,6 +403,22 @@ pub struct Sender {
     pub name: String,
 }
 
+/// Where a memory came from. Agent writes are staged until the turn completes; user-controlled
+/// values cannot be replaced by an automatic review.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryOrigin {
+    #[default]
+    Agent,
+    User,
+    Review,
+    Import,
+}
+
+fn default_memory_essential() -> bool {
+    true
+}
+
 /// What a chat turn changed about its bot. A `None` after removes the skill, schedule or
 /// note.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -434,6 +450,14 @@ pub enum BotChange {
         memory_id: String,
         before: Option<String>,
         after: Option<String>,
+        #[serde(default)]
+        epoch: u32,
+        #[serde(default)]
+        origin: MemoryOrigin,
+        #[serde(default)]
+        user_controlled: bool,
+        #[serde(default = "default_memory_essential")]
+        essential: bool,
     },
 }
 
@@ -674,6 +698,7 @@ impl BotChange {
                 memory_id,
                 before,
                 after,
+                ..
             } => {
                 id(memory_id)?;
                 anyhow::ensure!(

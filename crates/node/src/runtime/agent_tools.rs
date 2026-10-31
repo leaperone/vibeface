@@ -128,10 +128,9 @@ impl Runtime {
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
-                let notes: Vec<_> = self
-                    .store
-                    .lock()
-                    .await
+                let manager = access.manager.as_ref();
+                let store = self.store.lock().await;
+                let mut notes: Vec<_> = store
                     .memories(network, &scope)?
                     .into_iter()
                     .filter(|note| {
@@ -140,7 +139,38 @@ impl Runtime {
                             .is_none_or(|query| note.text.to_lowercase().contains(query))
                     })
                     .collect();
-                Ok(json!({ "memory": notes }))
+                let mut staged = Vec::new();
+                if let Some(manager) = manager {
+                    for mutation in store.staged_memory_overlay(
+                        &scope,
+                        &manager.trigger,
+                        &manager.attempt_id,
+                    )? {
+                        notes.retain(|note| note.memory_id != mutation.memory_id);
+                        if let Some(text) = mutation.after {
+                            if query
+                                .as_ref()
+                                .is_none_or(|query| text.to_lowercase().contains(query))
+                            {
+                                notes.push(crate::model::MemoryEntry {
+                                    memory_id: mutation.memory_id.clone(),
+                                    text: text.clone(),
+                                });
+                                staged.push(json!({
+                                    "memory_id": mutation.memory_id,
+                                    "text": text,
+                                    "state": "staged"
+                                }));
+                            }
+                        } else {
+                            staged.push(json!({
+                                "memory_id": mutation.memory_id,
+                                "state": "staged_forget"
+                            }));
+                        }
+                    }
+                }
+                Ok(json!({ "memory": notes, "staged": staged }))
             }
             Tool::FetchUrl => crate::fetch::fetch_url(field(&args, "url")?).await,
             Tool::ListBots => {

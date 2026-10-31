@@ -360,6 +360,17 @@ pub struct SessionInvalidation {
     pub old_config: Option<String>,
     pub new_config: String,
     pub reason: String,
+    pub generation: u64,
+    pub handoff_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLineage {
+    pub generation: u64,
+    pub fingerprint: String,
+    pub reason: String,
+    pub handoff_revision: String,
 }
 
 /// Digests of the bot and of each work a Codex thread was last shown, kept on this Node with
@@ -374,6 +385,10 @@ pub struct Shown {
     /// Memory changes waiting for this attempt to complete.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub staged_memories: BTreeMap<String, StagedMemory>,
+    #[serde(default)]
+    pub session_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_lineage: Vec<SessionLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +398,20 @@ pub struct StagedMemory {
     pub memory_id: String,
     pub before: Option<String>,
     pub after: Option<String>,
+    #[serde(default)]
+    pub base_epoch: u32,
+    #[serde(default)]
+    pub base_revision: String,
+    #[serde(default)]
+    pub origin: crate::model::MemoryOrigin,
+    #[serde(default)]
+    pub user_controlled: bool,
+    #[serde(default = "default_memory_essential")]
+    pub essential: bool,
+}
+
+fn default_memory_essential() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

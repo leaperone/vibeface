@@ -561,8 +561,8 @@ fn a_reply_stopped_before_it_started_is_recorded_once() -> Result<()> {
     let net = net()?;
     let mut store = store(&net)?;
     conversation(&mut store, &net)?;
-    say(&mut store, &net, "m2", true)?;
-    let trigger = message_trigger("m2");
+    say(&mut store, &net, "m1", true)?;
+    let trigger = message_trigger("m1");
     let job = store.scheduler_job("c", &trigger)?.context("job")?;
     for _ in 0..2 {
         store.request_manager_cancel(&net.a, &net.network, "c", &trigger)?;
@@ -3538,6 +3538,16 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         5,
     )?;
     assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    let record = store
+        .memory_records(&net.network, "c")?
+        .into_iter()
+        .next()
+        .context("memory record")?;
+    assert_eq!(record.epoch, crate::config::DATA_EPOCH);
+    assert!(!record.revision.is_empty());
+    assert_eq!(record.origin, MemoryOrigin::Agent);
+    assert!(!record.user_controlled);
+    assert!(record.essential);
 
     say(&mut store, &net, "m3", true)?;
     let trigger = message_trigger("m3");
@@ -3569,6 +3579,77 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         7,
     )?;
     assert_eq!(store.memories(&net.network, "c")?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn staged_memory_revision_conflict_preserves_the_newer_user_value() -> Result<()> {
+    let net = net()?;
+    let (mut store, _) = bot_with_message(&net)?;
+    say(&mut store, &net, "m2", true)?;
+    let trigger = message_trigger("m2");
+    let claimed = store
+        .claim_next(&net.a, &net.network, "c", "boot", "cfg")?
+        .context("job")?;
+    let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
+    store.mark_started("c", &trigger, &attempt)?;
+    let staged = store.stage_memory(
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        "remember-conflict",
+        ChangeRequest::Remember {
+            memory_id: None,
+            text: "agent candidate".into(),
+        },
+        4,
+    )?;
+    let memory_id = staged["memory_id"]
+        .as_str()
+        .context("memory id")?
+        .to_owned();
+    store.append_event(
+        &net.a,
+        &net.network,
+        "c",
+        EventBody::BotChanged {
+            change_id: "external-memory-change".into(),
+            cause: Some(Cause {
+                conversation_id: "c".into(),
+                message_id: "m2".into(),
+            }),
+            change: BotChange::Memory {
+                memory_id: memory_id.clone(),
+                before: None,
+                after: Some("user value".into()),
+                epoch: crate::config::DATA_EPOCH,
+                origin: MemoryOrigin::User,
+                user_controlled: true,
+                essential: true,
+            },
+        },
+        vec![],
+        5,
+    )?;
+    store.finish_job(
+        &net.a,
+        &net.network,
+        "c",
+        &trigger,
+        &attempt,
+        JobOutcome::Completed,
+        "done",
+        6,
+    )?;
+    let record = store
+        .memory_records(&net.network, "c")?
+        .into_iter()
+        .find(|record| record.entry.memory_id == memory_id)
+        .context("memory record")?;
+    assert_eq!(record.entry.text, "user value");
+    assert_eq!(record.origin, MemoryOrigin::User);
+    assert!(record.user_controlled);
     Ok(())
 }
 
@@ -5777,6 +5858,8 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
         works: [("w1".to_owned(), "work-digest".to_owned())].into(),
         dynamic: None,
         staged_memories: Default::default(),
+        session_generation: 0,
+        session_lineage: Vec::new(),
     };
     let mut turn = |id: &str, key: &str| -> Result<crate::scheduling::ClaimedJob> {
         say(&mut store, &net, id, true)?;
@@ -5800,13 +5883,22 @@ fn a_new_session_key_opens_a_new_thread_shown_everything() -> Result<()> {
         )?;
         Ok(claimed)
     };
-    assert_eq!(turn("m1", "cfg")?.shown, Shown::default());
+    assert_eq!(
+        turn("m1", "cfg")?.shown,
+        Shown {
+            session_generation: 1,
+            ..Shown::default()
+        }
+    );
     let resumed = turn("m2", "cfg")?;
     assert_eq!(resumed.previous_native_id.as_deref(), Some("thread"));
-    assert_eq!(resumed.shown, shown);
+    assert_eq!(resumed.shown.session_generation, 1);
+    assert!(resumed.shown.session_lineage.is_empty());
     let fresh = turn("m3", "cfg-new-instructions")?;
     assert_eq!(fresh.previous_native_id, None);
-    assert_eq!(fresh.shown, Shown::default());
+    assert_eq!(fresh.shown.session_generation, 2);
+    assert_eq!(fresh.shown.session_lineage.len(), 1);
+    assert_eq!(fresh.shown.session_lineage[0].generation, 1);
     Ok(())
 }
 

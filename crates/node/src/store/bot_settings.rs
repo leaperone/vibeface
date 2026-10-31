@@ -423,22 +423,54 @@ pub(crate) fn schedule_from(
         .transpose()
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryRecord {
+    pub entry: MemoryEntry,
+    pub epoch: u32,
+    pub revision: String,
+    pub origin: MemoryOrigin,
+    pub user_controlled: bool,
+    pub essential: bool,
+    pub source_event_hash: Option<String>,
+}
+
+/// One bot's notes with local revision metadata, oldest first.
+pub(crate) fn memory_records_from(
+    connection: &Connection,
+    network: &str,
+    conversation: &str,
+) -> Result<Vec<MemoryRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT memory_id,text,epoch,revision,origin,user_controlled,essential,source_event_hash FROM memories WHERE network_id=? AND conversation_id=? AND text IS NOT NULL ORDER BY changed_at_ms,memory_id",
+    )?;
+    let rows = statement.query_map(params![network, conversation], |r| {
+        let origin: String = r.get(4)?;
+        Ok(MemoryRecord {
+            entry: MemoryEntry {
+                memory_id: r.get(0)?,
+                text: r.get(1)?,
+            },
+            epoch: r.get(2)?,
+            revision: r.get(3)?,
+            origin: serde_json::from_str(&origin).unwrap_or_default(),
+            user_controlled: r.get(5)?,
+            essential: r.get(6)?,
+            source_event_hash: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// One bot's notes, oldest first.
 pub(crate) fn memories_from(
     connection: &Connection,
     network: &str,
     conversation: &str,
 ) -> Result<Vec<MemoryEntry>> {
-    let mut statement = connection.prepare(
-        "SELECT memory_id,text FROM memories WHERE network_id=? AND conversation_id=? AND text IS NOT NULL ORDER BY changed_at_ms,memory_id",
-    )?;
-    let rows = statement.query_map(params![network, conversation], |r| {
-        Ok(MemoryEntry {
-            memory_id: r.get(0)?,
-            text: r.get(1)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    Ok(memory_records_from(connection, network, conversation)?
+        .into_iter()
+        .map(|record| record.entry)
+        .collect())
 }
 
 const CHANGE_COLUMNS: &str = "change_id,cause,event_hash,created_at_ms,change,conversation_id";
@@ -861,6 +893,10 @@ fn resolve(
                 memory_id,
                 before,
                 after: Some(text),
+                epoch: crate::config::DATA_EPOCH,
+                origin: MemoryOrigin::Agent,
+                user_controlled: false,
+                essential: true,
             }
         }
         ChangeRequest::Forget { memory_id } => {
@@ -872,6 +908,10 @@ fn resolve(
                 memory_id,
                 before: Some(before.text),
                 after: None,
+                epoch: crate::config::DATA_EPOCH,
+                origin: MemoryOrigin::Agent,
+                user_controlled: false,
+                essential: true,
             }
         }
     };
@@ -881,7 +921,7 @@ fn resolve(
 
 impl Store {
     /// Commit staged memory changes in the same transaction that closes the turn. A changed
-    /// committed value wins over a stale staged value; the turn remains successful and the
+    /// committed revision wins over a stale staged value; the turn remains successful and the
     /// conflict is kept in the local log for diagnosis.
     #[expect(
         clippy::too_many_arguments,
@@ -899,11 +939,25 @@ impl Store {
     ) -> Result<()> {
         let cause = user_cause(connection, network, scope, trigger)?;
         for staged in staged {
-            let current = memories_from(connection, network, scope)?
+            let current = memory_records_from(connection, network, scope)?
                 .into_iter()
-                .find(|entry| entry.memory_id == staged.memory_id)
-                .map(|entry| entry.text);
-            if current != staged.before {
+                .find(|record| record.entry.memory_id == staged.memory_id);
+            let current_text = current.as_ref().map(|record| record.entry.text.clone());
+            let current_revision = current
+                .as_ref()
+                .map(|record| record.revision.clone())
+                .unwrap_or_default();
+            let current_epoch = current
+                .as_ref()
+                .map(|record| record.epoch)
+                .unwrap_or(crate::config::DATA_EPOCH);
+            if current_text != staged.before
+                || current_revision != staged.base_revision
+                || current_epoch != staged.base_epoch
+                || current
+                    .as_ref()
+                    .is_some_and(|record| record.user_controlled)
+            {
                 tracing::warn!(
                     event = "agent.memory_conflict",
                     conversation_id = scope,
@@ -916,6 +970,10 @@ impl Store {
                 memory_id: staged.memory_id.clone(),
                 before: staged.before,
                 after: staged.after,
+                epoch: staged.base_epoch,
+                origin: staged.origin,
+                user_controlled: staged.user_controlled,
+                essential: staged.essential,
             };
             change.validate()?;
             log::append_from(
@@ -1030,6 +1088,10 @@ impl Store {
 
     pub fn memories(&self, network: &str, scope: &str) -> Result<Vec<MemoryEntry>> {
         memories_from(&self.connection, network, scope)
+    }
+
+    pub(crate) fn memory_records(&self, network: &str, scope: &str) -> Result<Vec<MemoryRecord>> {
+        memory_records_from(&self.connection, network, scope)
     }
 
     pub fn find_bot(&self, network: &str, wanted: &str) -> Result<Bot> {

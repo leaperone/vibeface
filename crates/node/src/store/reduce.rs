@@ -409,11 +409,31 @@ pub(crate) fn apply(
                     ..
                 } => remove_schedule(connection, network, schedule_id, scope, rank, seen_at_ms)?,
                 BotChange::Memory {
-                    memory_id, after, ..
+                    memory_id,
+                    after,
+                    epoch,
+                    origin,
+                    user_controlled,
+                    essential,
+                    ..
                 } => {
+                    let epoch = (*epoch).max(crate::config::DATA_EPOCH);
                     connection.execute(
-                        "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms) VALUES(?,?,?,?,?,?) ON CONFLICT(network_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms WHERE conversation_id=excluded.conversation_id AND excluded.rank>rank",
-                        params![network, memory_id, scope, after, rank, event.created_at_ms],
+                        "INSERT INTO memories(network_id,memory_id,conversation_id,text,rank,changed_at_ms,epoch,revision,origin,user_controlled,essential,source_event_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(network_id,memory_id) DO UPDATE SET text=excluded.text,rank=excluded.rank,changed_at_ms=excluded.changed_at_ms,epoch=excluded.epoch,revision=excluded.revision,origin=excluded.origin,user_controlled=excluded.user_controlled,essential=excluded.essential,source_event_hash=excluded.source_event_hash WHERE conversation_id=excluded.conversation_id AND excluded.rank>rank",
+                        params![
+                            network,
+                            memory_id,
+                            scope,
+                            after,
+                            rank,
+                            event.created_at_ms,
+                            epoch,
+                            rank,
+                            serde_json::to_string(origin)?,
+                            user_controlled,
+                            essential,
+                            hash,
+                        ],
                     )?;
                 }
             }

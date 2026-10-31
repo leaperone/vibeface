@@ -5,7 +5,7 @@
 //! and gives each boundary a stable digest.
 use crate::{
     crypto::digest,
-    model::VersionVector,
+    model::{MemoryOrigin, VersionVector},
     providers::{Provider, ProviderDescriptor},
 };
 use anyhow::Result;
@@ -57,7 +57,12 @@ impl PromptFingerprint {
 #[serde(deny_unknown_fields)]
 pub struct StableInstructions {
     pub schema_version: u32,
+    pub bot: Value,
+    pub standing_rules: String,
+    pub workspace: Vec<String>,
     pub provider: ProviderDescriptor,
+    pub tools: BTreeMap<String, Value>,
+    pub skills: Vec<Value>,
     pub fingerprint: PromptFingerprint,
     pub rendered: String,
 }
@@ -84,6 +89,45 @@ pub struct DynamicContext {
     pub trigger: String,
     pub rendered: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub coverage: ContextCoverage,
+    #[serde(default)]
+    pub memory: Value,
+    #[serde(default)]
+    pub session_generation: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextCoverage {
+    pub messages_omitted: usize,
+    pub works_omitted: usize,
+    pub dispatches_omitted: usize,
+    pub questions_omitted: usize,
+    pub attachments_omitted: usize,
+    pub memory_omitted: usize,
+    pub history_retrieval: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRevision {
+    pub memory_id: String,
+    pub epoch: u32,
+    pub revision: String,
+    pub origin: MemoryOrigin,
+    pub user_controlled: bool,
+    pub essential: bool,
+    pub source_event_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledTurn {
+    pub stable: StableInstructions,
+    pub dynamic: DynamicContext,
+    pub prompt_mode: crate::providers::PromptMode,
+    pub session_generation: u64,
 }
 
 impl DynamicContext {
@@ -93,14 +137,33 @@ impl DynamicContext {
         rendered: String,
     ) -> Result<Self> {
         let trigger = trigger.into();
-        let fingerprint = digest(&serde_json::to_vec(&(&basis, &trigger, &rendered))?);
-        Ok(Self {
+        let mut context = Self {
             schema_version: SCHEMA_VERSION,
             basis,
             trigger,
             rendered,
-            fingerprint,
-        })
+            fingerprint: String::new(),
+            coverage: ContextCoverage {
+                history_retrieval: "context".into(),
+                ..ContextCoverage::default()
+            },
+            memory: Value::Null,
+            session_generation: 0,
+        };
+        context.refresh_fingerprint()?;
+        Ok(context)
+    }
+
+    pub fn refresh_fingerprint(&mut self) -> Result<()> {
+        self.fingerprint = digest(&serde_json::to_vec(&(
+            &self.basis,
+            &self.trigger,
+            &self.rendered,
+            &self.coverage,
+            &self.memory,
+            self.session_generation,
+        ))?);
+        Ok(())
     }
 }
 
@@ -112,6 +175,8 @@ pub struct ContextHandoff {
     pub target_provider: Provider,
     pub basis: VersionVector,
     pub source_fingerprint: String,
+    pub generation: u64,
+    pub handoff_revision: String,
     pub recent_context: String,
     pub open_work: Vec<String>,
     pub decisions: Vec<String>,
@@ -150,7 +215,12 @@ pub fn compile_stable(input: StableInput) -> Result<StableInstructions> {
     );
     Ok(StableInstructions {
         schema_version: SCHEMA_VERSION,
+        bot: input.bot,
+        standing_rules: input.standing_rules,
+        workspace,
         provider,
+        tools: input.tools,
+        skills: input.skills,
         fingerprint,
         rendered,
     })
@@ -223,6 +293,17 @@ mod tests {
             "body".into(),
         )?;
         assert_ne!(first.fingerprint, second.fingerprint);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_fingerprint_tracks_memory_and_generation() -> Result<()> {
+        let mut first = DynamicContext::compile(BTreeMap::new(), "message:m", "body".into())?;
+        let original = first.fingerprint.clone();
+        first.memory = json!({"entries":[{"memory_id":"m1","text":"fact"}]});
+        first.session_generation = 2;
+        first.refresh_fingerprint()?;
+        assert_ne!(first.fingerprint, original);
         Ok(())
     }
 

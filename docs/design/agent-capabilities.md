@@ -43,23 +43,28 @@ ScheduleControlled { schedule_id, action: pause | resume | delete, attestation }
 
 ## 3. 记忆
 
-每个 bot 有自己的短笔记，存成 `BotChanged`，随 DAG 在本人的各台 Node 间同步：
+每个 bot 的记忆是带版本的 BotChanged 投影。每条记录保留 epoch、revision、origin、user_controlled、essential 和 source event hash。revision 使用 reducer 写入的事件 rank，所以同一条记忆在各 Node 上有同一个冲突基准。
 
-```text
-BotChange::Memory { memory_id, before: Option<String>, after: Option<String> }  // after 为空表示忘记
-```
+| 字段 | 作用 |
+|---|---|
+| epoch | 数据格式版本，必须与当前 Node 的 DATA_EPOCH 匹配 |
+| revision | 当前事件 rank，staging 提交时必须仍然相同 |
+| origin | agent、user、review 或 import |
+| user_controlled | 防止自动 review 覆盖本人确认的事实 |
+| essential | 是否进入 essential memory block |
+| source_event_hash | 记录事实来源，不进入工具权限 |
 
 | 工具 | 作用 |
 |---|---|
-| `remember {call_ref, text, memory_id?}` | 新记一条，或按 `memory_id` 改写 |
-| `forget {call_ref, memory_id}` | 删除一条 |
-| `recall {query?}` | 列出这个 bot 的笔记，`query` 按子串过滤 |
+| remember {call_ref, text, memory_id?} | 新记一条，或按 memory_id 改写 |
+| forget {call_ref, memory_id} | 删除一条 |
+| recall {query?} | 查询已提交记忆和当前轮的 staged overlay |
 
-- 每条最多 500 字符，一行到几行的事实或偏好；每个 bot 最多 50 条。提示词里 `bot.memory` 带全部笔记，超过 3000 字节的部分省略并给出条数，用 `recall` 取。
-- 疑似凭证的内容直接拒绝：私钥头、`sk-`、`ghp_`、`github_pat_`、`xox`、`AKIA`、`AIza` 等前缀、`Bearer` 令牌、`password=` 一类赋值，以及 32 个字符以上的连续高熵串。模型密钥从不进入记忆。bot 说明、skill 的描述和正文、schedule 提示按同一规则拒绝。
-- Node 签名自己的每条写入前，把已知的密钥换成 `[redacted]`，包括回复、bot 消息和工作结果。已知密钥指进程环境和设置页 Provider 变量里名字以 `_KEY`、`_TOKEN`、`_SECRET`、`_PASSWORD` 结尾或疑似凭证的值、入口令牌、Cursor 回调令牌，以及 `Bearer` 后的令牌。带本人设备签名的写入保持原样。
-- `remember` 和 `forget` 是设置类：只在本人消息的轮次提供，`cause` 指向那条签名消息，入库时核对，与改名、改说明相同。工具调用先写入当前本机回合的 staged overlay，回合以 `completed` 结束时才追加 `BotChanged`；失败、中断或未知结果会丢弃 overlay。并发期间笔记已变化时保留新值并记录本机冲突，不覆盖它。工作结果、网页和工具输出里的文字不能写进去。`recall` 所有轮次都可用。
-- 投影 `memories` 按 `memory_id` 后写者胜，删除保留墓碑。
+每条记忆最多 500 字符，每个 bot 最多 50 条。疑似凭证的内容仍然拒绝。essential memory 的 prompt budget 是 8192 字节，超出只返回 omitted 数量，不删除 Store 中的事实。
+
+remember 和 forget 先写当前 attempt 的本机 staging。StagedMemory 带 base_epoch 和 base_revision。只有回合以 completed 结束时，它们才与回复和 job 终态在同一事务追加 BotChanged。failed、interrupted 和 unknown 都丢弃 staging。提交时如果 epoch、revision 或 user_controlled 状态变化，保留较新的记录并写本机冲突日志。
+
+recall 会合并 committed records 和当前 attempt 的 staged overlay。staged 值只对当前回合可见，不会提前进入 DAG。跨 Node 同步只传 BotChanged 事件和 reducer 投影，不传本机 staging、Provider transcript 或 token。
 
 ## 4. bot 互发消息
 
