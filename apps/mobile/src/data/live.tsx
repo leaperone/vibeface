@@ -8,7 +8,7 @@ import { entryAddress } from '@vibeface/client/lib/node.ts'
 import { WorkspaceProvider as SharedWorkspace, useWorkspace as useShared } from '@vibeface/client/workspace/context.tsx'
 import { botCopy } from '@vibeface/client/workspace/bot-settings.ts'
 import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
-import { addressName, deviceOnline } from '@vibeface/client/workspace/labels.ts'
+import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
 import type { BotRecord } from '@vibeface/client/workspace/types.ts'
@@ -69,9 +69,11 @@ function useConnection(): { session: Session; connection: Connection } {
     : device.joining ? { phase: 'joining', code: device.joining.code ?? null, admin: device.joining.admin }
     : { phase: 'unjoined' }
   const { link } = device
-  const state: Connection['state'] = link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
   const entry = device.ready?.entry ?? device.entry
-  return { session, connection: { state, entry: device.ready?.info.name ?? (entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''), direct: entry?.kind === 'lan' } }
+  const name = device.ready ? entryLabel({ joined: device.ready.principal.source === 'membership', directory: device.directory, entryId: device.ready.entry.device_id, ownName: device.ready.info.name, address: entryAddress(device.ready.entry) })
+    : entry ? device.entryName(entry) || addressName(entryAddress(entry)) : ''
+  const state: Connection['state'] = name === null ? 'connecting' : link.kind === 'online' ? (link.catchingUp ? 'syncing' : 'online') : link.kind === 'offline' ? 'offline' : 'connecting'
+  return { session, connection: { state, entry: name ?? '', direct: entry?.kind === 'lan' } }
 }
 
 function Device({ children }: { children: ReactNode }) {
@@ -168,7 +170,7 @@ function Live({ children }: { children: ReactNode }) {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
     return {
       device_id: member.device_id, name: member.name, kind: member.kind === 'node' ? 'node' : 'client', admin: member.manage,
-      online: deviceOnline(member.kind, node, entry, shared.connectionOnline),
+      online: deviceOnline(member.kind, node, entry, shared.connectionOnline, member.device_id === me),
       current: member.device_id === me, entry, bot: botReadiness(node),
     }
   })

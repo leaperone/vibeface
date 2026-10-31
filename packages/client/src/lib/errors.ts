@@ -130,7 +130,7 @@ export function taskError(raw: string): string {
 }
 
 /** Why an execution failed, as the Node names it; its original text stays in 技术详情. */
-export type FailureKind = 'missing_key' | 'auth_failed' | 'quota' | 'missing_binary' | 'execution_disabled' | 'no_model' | 'writer_busy'
+export type FailureKind = 'missing_key' | 'auth_failed' | 'quota' | 'missing_binary' | 'execution_disabled' | 'no_model' | 'no_bot' | 'writer_busy'
   | 'rejected' | 'transport' | 'timed_out' | 'restarted' | 'lost' | 'unknown'
 const settings = '去「设备 → Bot 与任务」'
 const failures: Record<FailureKind, string> = {
@@ -140,6 +140,7 @@ const failures: Record<FailureKind, string> = {
   missing_binary: `这台电脑上找不到 AI 服务的程序。${settings}检查。`,
   execution_disabled: `这台电脑上这个 AI 服务没开执行任务。${settings}打开。`,
   no_model: `没选模型，或 AI 服务不认识这个模型。${settings}选一个。`,
+  no_bot: `那台设备还没设置 Bot。${settings}打开。`,
   writer_busy: '另一个进程正在写这个会话。等它结束后再试。',
   rejected: 'AI 服务拒绝了这次请求，没有执行。',
   transport: '连不上 AI 服务，或连接中途断了。稍后再试。',

@@ -28,8 +28,8 @@ export function ConnectionPill({ connection }: { connection: Connection }) {
   const look = looks[connection.state]
   return <View accessible accessibilityLabel={describe(connection)} className="min-h-11 flex-row items-center gap-2 px-2 py-2">
     <Icon as={look.icon} className={cn('size-4', toneText[look.tone])} />
-    <Text className="min-w-0 flex-1 text-meta">{connection.entry}</Text>
-    <Text className="text-meta text-muted-foreground">{label(connection)}</Text>
+    <Text className="min-w-0 flex-1 text-meta">{connection.entry || label(connection)}</Text>
+    {connection.entry ? <Text className="text-meta text-muted-foreground">{label(connection)}</Text> : null}
   </View>
 }
 

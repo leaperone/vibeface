@@ -321,7 +321,7 @@ fn deliveries(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
         deliveries.push(
             json!({"work_id":spec.work_id,"target_node":spec.target,"state":dispatch.state.name(),
             "kind":spec.kind,"title":spec.title,"cwd":spec.cwd,"reason":dispatch.state.reason(),
-            "trigger":spec.trigger,"prompt":spec.prompt}),
+            "failure":dispatch.state.failure(),"trigger":spec.trigger,"prompt":spec.prompt}),
         );
     }
     for stop in store.stop_requests()? {
@@ -343,16 +343,12 @@ pub(super) fn open_works(store: &Store, network: &str, scope: Option<&str>) -> R
         .collect::<Result<Vec<_>>>()?;
     for dispatch in store.open_dispatches(network, scope)? {
         let spec = &dispatch.spec;
-        let failure = match &dispatch.state {
-            DispatchState::Rejected { failure, .. } => *failure,
-            _ => None,
-        };
         works.push(
             json!({"work_id":spec.work_id,"conversation_id":spec.conversation,
             "target_node":spec.target,"trigger":spec.trigger,"dispatcher":spec.dispatcher,
             "kind":spec.kind,"cwd":spec.cwd,"title":spec.title,"prompt":spec.prompt,
             "call_ref":spec.call_ref,"state":dispatch.state.name(),"summary":"","outcome":null,
-            "result_text":"","failure_reason":dispatch.state.reason(),"failure":failure}),
+            "result_text":"","failure_reason":dispatch.state.reason(),"failure":dispatch.state.failure()}),
         );
     }
     Ok(works)
