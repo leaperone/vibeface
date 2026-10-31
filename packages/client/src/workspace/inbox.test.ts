@@ -3,7 +3,7 @@ import test from 'node:test'
 import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
-import type { NodeInfo, Question, WorkRecord } from './types.ts'
+import type { BotRecord, NodeInfo, Question, WorkRecord } from './types.ts'
 
 const question = (id: string, closed = false): Question => ({
   question_id: id, conversation_id: 'c', bot: { bot_id: 'b', name: '助手' }, severity: 'normal', text: id, choices: [], about: { kind: 'general' },
@@ -14,6 +14,7 @@ const join = (status: JoinRequest['status']): JoinRequest => ({
   admin_id: null, admin_nonce: null, joiner_nonce: null, reason: null, expires_at_ms: 1,
 })
 const unready: NodeInfo = { device_id: 'mac', name: 'Mac', local: true, online: true, revoked: false, capabilities: { manager: 'codex', manager_state: 'needs_setup', relay: false, roots: [] } }
+const botRecord: BotRecord = { bot_id: 'b', conversation_id: 'c', name: '助手', instructions: '', models: {}, skills: null, avatar: null, avatar_version: null, event_hash: 'h', last_message: null, busy: null }
 
 const source = (manage: boolean, answered: Record<string, string> = {}): InboxSource => ({
   device: { ready: { principal: { network_id: 'n', device_id: 'me', epoch: 1, source: 'membership', can_manage: manage }, entry: { device_id: 'mac' } }, joins: [join('pending'), join('joined')], pendingRecovery: null, rotateHint: false },
@@ -56,8 +57,17 @@ test('a failed task waits in 待处理 under its bot until something follows it 
   const failed = source(false)
   const work = { work_id: 'w1', conversation_id: 'c', trigger: '', target_node: 'mac', cwd: '/w', title: '跑测试', prompt: '', state: 'finished', summary: '', outcome: 'failed', result_text: '', failure_reason: 'timed out' } as const
   failed.workspace.openWorks = [work, { ...work, work_id: 'w2', outcome: null, state: 'running' }, { ...work, work_id: 'w3', title: '', outcome: null, state: 'dispatch_rejected' }]
-  failed.workspace.bots = [{ bot_id: 'b', conversation_id: 'c', name: '助手' } as never]
+  failed.workspace.bots = [botRecord]
   assert.deepEqual(inboxItems(failed).filter((item) => item.kind === 'failed').map((item) => [item.key, item.title, item.meta]), [['failed:w1', '跑测试', 'Mac'], ['failed:w3', '任务没有完成', 'Mac']], 'a refused dispatch waits like a failure')
+})
+
+test('a session handoff reminder points at its Bot and keeps its text', () => {
+  const handoff = source(true)
+  handoff.workspace.bots = [botRecord]
+  handoff.workspace.notifications = [{ notification_id: 'n-session', kind: 'session_attributed', text: 'tests fail', conversation_id: 'c' }]
+  const item = inboxItems(handoff).find((entry) => entry.kind === 'session')
+  assert.equal(item?.kind, 'session')
+  if (item?.kind === 'session') assert.deepEqual([item.bot.bot_id, item.notification.text], ['b', 'tests fail'])
 })
 
 test('a phone asking to join reads as a phone, and only a computer has an online state', () => {

@@ -11,7 +11,7 @@ import { inboxItems, type InboxItem } from '@vibeface/client/workspace/inbox.ts'
 import { addressName, deviceOnline, entryLabel } from '@vibeface/client/workspace/labels.ts'
 import { botReadiness, parseBots, parsePrimary } from '@vibeface/client/workspace/model.ts'
 import { storageOf } from '@vibeface/client/workspace/storage.ts'
-import type { BotRecord } from '@vibeface/client/workspace/types.ts'
+import { isSessionNotification, type BotRecord } from '@vibeface/client/workspace/types.ts'
 import { awaitsAnswer, foldAnswers } from '@vibeface/client/workspace/questions.ts'
 import { mobilePlatform } from '@/platform'
 import { WorkspaceProvider } from './context'
@@ -47,11 +47,11 @@ const SharedContext = createContext<Shared | null>(null)
 /** The shared workspace while a member connection is up, for screens that call its actions directly; null before that. */
 export const useLive = () => useContext(SharedContext)
 
-/** 待处理, item for item as the web lists it; nothing before a member connection. */
+/** 手机可处理的待处理项；会话提醒由网页 Bell 承载；没有连接时不返回列表。 */
 export function useInbox(): InboxItem[] {
   const device = useDevice()
   const shared = useLive()
-  return shared ? inboxItems({ device, workspace: shared }) : []
+  return shared ? inboxItems({ device, workspace: shared }).filter((item) => item.kind !== 'session') : []
 }
 
 /** The real network behind the screens: the shared device and workspace providers, reshaped for `useWorkspace`. */
@@ -165,7 +165,7 @@ function Live({ children }: { children: ReactNode }) {
     }
   }
 
-  const unread = unreadCounts(notifications, questions.filter((question) => awaitsAnswer(question, answered)))
+  const unread = unreadCounts(notifications.filter((item) => !isSessionNotification(item)), questions.filter((question) => awaitsAnswer(question, answered)))
 
   const directory: Member[] = (device.directory?.members ?? []).map((member) => {
     const node = nodes.find((item) => item.device_id === member.device_id), entry = member.device_id === device.ready?.entry.device_id
