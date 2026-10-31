@@ -31,7 +31,7 @@ pub const LAST_MANAGER: &str = "the network needs at least one management device
 pub const RECOVERY_INCOMPLETE: &str =
     "this recovery rests on device changes this Node has not received; sync it first";
 pub const GOVERNANCE_DOMAIN: &str = "identity-governance";
-/// How long a recovery that replaces the directory waits for a veto.
+/// The default wait for a recovery that replaces the directory.
 pub const RECOVERY_DELAY_MS: u64 = 48 * 60 * 60 * 1000;
 /// How far a new recovery's or veto's signed time may be from the clock of the Node taking it.
 pub const RECOVERY_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -500,12 +500,12 @@ pub enum GovernanceAction {
         member: Member,
     },
     Revoke(Revocation),
-    /// Stops the recovery waiting on this epoch; counts only if signed before it takes effect.
+    /// Stops a recovery in this epoch if signed before its natural activation deadline.
     Veto {
         checkpoint: String,
         at_ms: u64,
     },
-    /// Confirms the recovery waiting on this epoch; counts only if signed before it takes effect.
+    /// Activates a pending recovery early if signed before its natural activation deadline.
     Approve {
         checkpoint: String,
         at_ms: u64,
