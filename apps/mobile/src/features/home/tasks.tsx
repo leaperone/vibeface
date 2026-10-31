@@ -14,12 +14,13 @@ import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
 import { Text } from '@/components/ui/text'
 import { useWorkspace } from '@/data/context'
-import { useLive } from '@/data/live'
+import { useInbox, useLive } from '@/data/live'
 import { cn } from '@/lib/utils'
 
 /** The personal task projection; only open and unsettled work is available without loading every Bot conversation. */
 export function TasksScreen() {
   const shared = useLive()
+  const attention = useInbox().filter((item) => item.kind === 'question' && !item.done || item.kind === 'confirm' && item.check.kind === 'process')
   const workspace = useWorkspace()
   const { directory } = useDevice()
   useEffect(() => { if (!shared) return; shared.setView('tasks'); return () => shared.setView('other') }, [shared?.generation])
@@ -38,7 +39,8 @@ export function TasksScreen() {
   for (const work of visibleWorks) groups[taskGroup(cardState(work, lookup.nodes, projected.get(work.work_id)?.state), held.has(work.thread_id ?? ''))].push(work)
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
-    <MobileMasthead attention={groups.attention.length} working={groups.working.length} waiting={groups.waiting.length} online={Boolean(shared?.connectionOnline)} />
+    <MobileMasthead attention={groups.attention.length + attention.length} working={groups.working.length} waiting={groups.waiting.length} online={Boolean(shared?.connectionOnline)} />
+    {attention.length ? <Link href="/inbox" asChild><Pressable accessibilityRole="link" className="min-h-11 flex-row items-center gap-3 rounded-xl border border-warning/25 bg-warning-soft px-4 py-3"><Icon as={CircleQuestionMark} className="size-5 text-warning" /><Text className="min-w-0 flex-1">{attention.length} 项问题或程序待确认</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link> : null}
     {loading ? <View accessibilityLabel="正在读取任务" className="gap-2">
       {[0, 1, 2].map((item) => <View key={item} className="min-h-16 flex-row items-center gap-3 rounded-xl border border-border bg-card px-4 py-3">
         <Skeleton className="size-8 rounded-lg" />
@@ -47,7 +49,7 @@ export function TasksScreen() {
     </View> : visibleWorks.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
       {groups[group].map((work) => <TaskRow key={work.work_id} work={work} projected={projected.get(work.work_id)} bot={workspace.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline)} progress={taskProgress(work, shared?.liveProgress ?? [])} />)}
-    </View> : null) : <MobileEmpty bot={bot} />}
+    </View> : null) : attention.length ? null : <MobileEmpty bot={bot} />}
   </ScrollView>
 }
 

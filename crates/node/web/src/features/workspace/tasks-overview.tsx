@@ -1,7 +1,7 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { Link } from "@tanstack/react-router"
 import { Bot, ChevronRight, CircleQuestionMark, CircleX, FolderOpen, Laptop, ListChecks, LoaderCircle, MessageCircle, Plus, Wifi, WifiOff } from "lucide-react"
 import { Card, CardContent } from "@/components/ui/card"
@@ -51,24 +51,33 @@ export function TasksOverview() {
   const projected = new Map(overview.tasks.filter((task): task is ProjectedWork => task.kind === "work" || task.kind === "dispatch").filter((task) => task.work_id).map((task) => [task.work_id!, task]))
   const tasks = overviewWorks.filter((work) => projected.has(work.work_id) && !attentionWorkIds.has(work.work_id))
   const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
-  const botIds = useMemo(() => new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id])), [workspace.bots])
+  const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
   for (const work of tasks) {
     const item = projected.get(work.work_id)
     if (matchesBot(work.conversation_id, item?.bot?.bot_id)) groups[taskGroup(cardState(work, workspace.nodes, item?.state), waitingSessions.has(work.thread_id ?? ""))].push(work)
   }
-  const visibleAttention = attention.filter((item) => item.kind === "question" ? matchesBot(item.question.conversation_id, item.question.bot?.bot_id) : item.check.kind === "work" ? matchesBot(item.check.conversation_id) : item.check.kind === "device" ? item.check.works.some((work) => matchesBot(work.conversation_id)) : true)
+  const visibleAttention = attention.flatMap((item): typeof attention => {
+    if (item.kind === "question") return matchesBot(item.question.conversation_id, item.question.bot?.bot_id) ? [item] : []
+    const check = item.check
+    if (check.kind === "device") {
+      const works = check.works.filter((work) => matchesBot(work.conversation_id))
+      return works.length ? [{ ...item, check: { ...check, works } }] : []
+    }
+    return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
+  })
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const noticed = visible("attention") ? visibleAttention.length + groups.attention.length : 0
   const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
   const hasContent = visibleCount > 0
+  const emptyLabel = filter === "all" && botFilter === "all" ? "没有未完成的任务" : "没有符合筛选的任务"
   const card = (work: OpenWork) => <TaskOverviewCard key={work.work_id} work={work} projected={projected.get(work.work_id)} lookup={lookup} connected={workspace.connectionOnline} progress={taskProgress(work, workspace.liveProgress)} />
-  const bot = workspace.selectedBot ?? workspace.bots[0]
+  const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
 
   if (workspace.incomplete && !workspace.nodes.length) return <div className="mx-auto grid w-full max-w-(--page-width) gap-3" aria-busy="true"><Skeleton className="h-20" /><Skeleton className="h-20" /><Skeleton className="h-20" /></div>
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
-    <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : "没有未完成的任务"}</p>
-    <WorkspaceMasthead attention={attention.length + groups.attention.length} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
+    <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
+    <WorkspaceMasthead attention={visibleAttention.length + groups.attention.length} working={groups.working.length} waiting={groups.waiting.length} online={workspace.connectionOnline} />
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
@@ -78,7 +87,7 @@ export function TasksOverview() {
         {groups[group].map(card)}
       </OverviewSection> : null
     })}
-    {!hasContent ? <WorkspaceEmpty bot={bot} onCreate={createBot} /> : null}
+    {!hasContent ? <WorkspaceEmpty title={emptyLabel} bot={bot} onCreate={createBot} /> : null}
   </div>
 }
 
@@ -111,8 +120,8 @@ function TaskFilters({ filter, botFilter, bots, onFilter, onBotFilter }: { filte
   </section>
 }
 
-function WorkspaceEmpty({ bot, onCreate }: { bot?: { bot_id: string; name: string }; onCreate: () => void }) {
-  return <EmptyState icon={ListChecks} title="没有未完成的任务" action={bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}><MessageCircle aria-hidden="true" />打开 {bot.name}</Link></Button> : <Button type="button" onClick={onCreate}><Plus aria-hidden="true" />新 Bot</Button>} />
+function WorkspaceEmpty({ title, bot, onCreate }: { title: string; bot?: { bot_id: string; name: string }; onCreate: () => void }) {
+  return <EmptyState icon={ListChecks} title={title} action={bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}><MessageCircle aria-hidden="true" />打开 {bot.name}</Link></Button> : <Button type="button" onClick={onCreate}><Plus aria-hidden="true" />新 Bot</Button>} />
 }
 
 function OverviewSection({ title, count, children }: { title: string; count: number; children: ReactNode }) {
