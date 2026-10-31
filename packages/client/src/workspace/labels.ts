@@ -248,12 +248,14 @@ const taskWorkId = (trigger: string) => trigger.startsWith("task:") ? trigger.sl
 /** Build the shared Work/Turn/Attention activity domain from already loaded facts. */
 export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceActivityView {
   const nodes = input.nodes ?? []
+  const localNode = nodes.find((node) => node.local)?.device_id
   const answered = input.answered ?? {}
   const overview = input.overview ?? null
   const knownBots = input.knownBots ?? []
+  const botCatalog = input.read === false ? knownBots : [...knownBots, ...(overview?.bots ?? [])]
   const enrichCheck = (task: Extract<OverviewTask, { kind: "check" }>) => {
     if (task.bot) return task
-    const bot = knownBots.find((item) => item.conversation_id === task.conversation_id)
+    const bot = botCatalog.find((item) => item.conversation_id === task.conversation_id)
     return bot ? { ...task, bot, navigation: { bot_id: bot.bot_id, conversation_id: task.conversation_id } } : task
   }
   const projectionByKey = new Map<string, Extract<OverviewTask, { kind: "work" | "dispatch" }>>()
@@ -292,6 +294,10 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     }
     for (const task of overview?.tasks ?? []) {
       if (task.kind !== "check" || task.conversation_id !== work.conversation_id || task.work_id !== work.work_id) continue
+      if (localNode && work.target_node !== localNode) continue
+      if (task.target_node !== null && task.target_node !== work.target_node) continue
+      if (task.target_node !== null && localNode && task.target_node !== localNode) continue
+      if (localNode && !["awaiting_confirmation", "unknown", "unverified"].includes(cardState(work, [...nodes], projection))) continue
       facts.overviewChecks.push(enrichCheck(task)); attachedOverviewChecks.add(task.check_id)
     }
     const activity: WorkspaceActivity = { id: `work:${work.conversation_id}:${work.work_id}`, kind: "work", conversation_id: work.conversation_id, work_id: work.work_id, group: taskGroup(effectiveState, facts.questions.length > 0 || facts.checks.length > 0), state: effectiveState, work, projection, facts }

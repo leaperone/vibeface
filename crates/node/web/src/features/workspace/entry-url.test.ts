@@ -677,6 +677,25 @@ const pendingResult = () => {
 }
 const settleComponent = () => new Promise(setImmediate)
 
+function nestedElements(elements: readonly { type: unknown; props: Record<string, unknown> }[], names: readonly string[]) {
+  const expanded = [...elements]
+  const pending = [...elements]
+  const enqueue = (value: unknown) => {
+    if (Array.isArray(value)) { value.forEach(enqueue); return }
+    if (!value || typeof value !== "object" || !("type" in value) || !("props" in value)) return
+    const element = value as { type: unknown; props: Record<string, unknown> }
+    if (!expanded.includes(element)) expanded.push(element)
+    pending.push(element)
+    if (element.props && "children" in element.props) enqueue(element.props.children)
+  }
+  while (pending.length) {
+    const element = pending.shift()!
+    if (typeof element.type !== "function" || !names.includes(element.type.name)) continue
+    enqueue(element.type(element.props))
+  }
+  return expanded
+}
+
 function componentText(node: unknown): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(componentText).join('')
@@ -728,7 +747,7 @@ test('both task overviews preserve known records, show their coverage and only n
       assert.match(componentText(elements), /尚未读取其他设备的后台工作/)
       assert.doesNotMatch(componentText(elements), /0 项.*未列出/)
       assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'another Bot program check cannot settle against the active conversation')
-      assert.equal(elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
+      assert.equal(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'other' : props.href === '/b/other')), true)
       shared.nodes = [{ ...parityNode, online: false }]
       elements = app.render(screen)
       assert.equal(elements.find(({ type }) => typeof type === 'function' && type.name === mastheadName)?.props.attention, 258)
@@ -773,30 +792,30 @@ test('both task overviews recover bounded Bot identities only from the current c
       './inbox': { useInbox: () => [] }, './workspace-shell': { useCreateBot: () => () => {} }, '@/components/kit': { providerIcons: {} },
     })
     const render = () => app.render(platform === 'web' ? 'TasksOverview' : 'TasksScreen')
-    const opens = (elements: ReturnType<typeof render>, botId = 'bot-257') => elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === botId : props.href === `/b/${botId}`))
+    const opens = (elements: ReturnType<typeof render>, botId = 'bot-257') => nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard']).some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === botId : props.href === `/b/${botId}`))
     try {
       let elements = render()
-      assert.match(componentText(elements), /项目 Bot 257/)
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /项目 Bot 257/)
       assert.equal(opens(elements), true, `${platform} keeps the only navigation for the Bot outside overview.bots`)
-      assert.doesNotMatch(componentText(elements), /已删除的 Bot/)
+      assert.doesNotMatch(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /已删除的 Bot/)
       shared.bots = bots.slice(0, 256)
       elements = render()
-      assert.match(componentText(elements), /未找到所属 Bot/)
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /未找到所属 Bot/)
       assert.equal(opens(elements), false)
-      assert.match(componentText(elements), /程序状态待确认/, 'a missing identity does not remove the check')
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /程序状态待确认/, 'a missing identity does not remove the check')
       shared.bots = [{ ...bots[256], conversation_id: 'different-chat' }]
       assert.equal(opens(render()), false, 'a Bot from a different conversation cannot supply navigation')
       shared.bots = bots
       shared.synced = false
       shared.generation++
       elements = render()
-      assert.match(componentText(elements), /Bot 身份未加载/)
-      assert.doesNotMatch(componentText(elements), /项目 Bot 257|已删除的 Bot/)
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /Bot 身份未加载/)
+      assert.doesNotMatch(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /项目 Bot 257|已删除的 Bot/)
       assert.equal(opens(elements), false, 'a retained catalog before this connection first read cannot supply an old network identity')
       shared.bots = [{ ...bots[256], bot_id: 'new-network-bot', name: '新网络 Bot' }]
       shared.synced = true
       elements = render()
-      assert.match(componentText(elements), /新网络 Bot/)
+      assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /新网络 Bot/)
       assert.equal(opens(elements, 'new-network-bot'), true)
       assert.equal(opens(elements), false)
     } finally { app.close() }
@@ -886,7 +905,7 @@ test('both task overviews reconcile raw confirmations and only fold task process
           assert.doesNotMatch(componentText(elements), /程序状态待确认|任务状态待确认/)
         }
         if (variant === 'missing') {
-          assert.match(componentText(elements), /任务状态待确认/)
+          assert.match(componentText(nestedElements(elements, ['AttentionActivity', 'OverviewCheckCard'])), /任务状态待确认/)
           assert.equal(elements.some(({ type }) => type === 'ConfirmCard'), false, 'a bounded-out work keeps navigation rather than a settlement against the active Bot')
           assert.equal(elements.some(({ type, props }) => type === 'Link' && (platform === 'web' ? (props.params as { botId?: string })?.botId === 'bot' : props.href === '/b/bot')), true)
         }
@@ -1124,13 +1143,13 @@ test("task filters keep the counts, device confirmations and empty state within 
   const named = (elements: ReturnType<typeof app.render>, name: string) => elements.find(({ type }) => typeof type === "function" && type.name === name)
   try {
     let elements = app.render("TasksOverview")
-    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 3)
+    assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 2)
     const selectBot = named(elements, "TaskFilters")?.props.onBotFilter
     assert.ok(typeof selectBot === "function")
     selectBot("a")
     elements = app.render("TasksOverview")
     assert.equal(named(elements, "WorkspaceMasthead")?.props.attention, 1)
-    const checks = elements.filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
+    const checks = nestedElements(elements, ["AttentionActivity"]).filter(({ type }) => type === "ConfirmCard").map(({ props }) => props.check)
     assert.deepEqual(JSON.parse(JSON.stringify(checks)), [{ kind: "device", works: [work("chat-a")] }])
     assert.equal(elements.some(({ type }) => type === "QuestionCard"), false)
     assert.equal(elements.find(({ props }) => props.role === "status")?.props.children, "1 项任务")

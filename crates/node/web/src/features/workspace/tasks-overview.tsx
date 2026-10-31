@@ -66,7 +66,10 @@ export function TasksOverview() {
   const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
     const bot = activityBot(activity)
-    if (matchesBot(activity.conversation_id ?? "", bot?.bot_id)) visibleGroups[group].push(activity)
+    const deviceWorks = activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" ? activity.attention.works.filter((work) => matchesBot(work.conversation_id)) : undefined
+    if (!matchesBot(activity.conversation_id ?? "", bot?.bot_id) && !deviceWorks?.length) continue
+    if (activity.kind === "attention" && "kind" in activity.attention && activity.attention.kind === "device" && deviceWorks) visibleGroups[group].push({ ...activity, attention: { ...activity.attention, works: deviceWorks } })
+    else visibleGroups[group].push(activity)
   }
   const visible = (group: TaskGroup) => filter === "all" || filter === group
   const noticed = visible("attention") ? visibleGroups.attention.length : 0
@@ -111,8 +114,8 @@ function WorkspaceMasthead({ attention, working, waiting, online }: { attention:
   </section>
 }
 
-function OverviewCheckCard({ check }: { check: Extract<OverviewTask, { kind: "check" }> }) {
-  return <Card><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? "未找到所属 Bot"}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>
+function OverviewCheckCard({ check, read = true }: { check: Extract<OverviewTask, { kind: "check" }>; read?: boolean }) {
+  return <Card><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? (read ? "未找到所属 Bot" : "Bot 身份未加载")}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>
 }
 
 function TurnActivity({ activity }: { activity: Extract<WorkspaceActivity, { kind: "turn" }> }) {
@@ -125,7 +128,7 @@ function AttentionActivity({ activity, bot, read }: { activity: Extract<Workspac
   const attention = activity.attention
   if (!attention) return null
   if ("answer" in attention && "about" in attention) return <QuestionCard question={attention} inbox from="tasks" />
-  if ("kind" in attention && attention.kind === "check") return <OverviewCheckCard check={attention} />
+  if ("kind" in attention && attention.kind === "check") return <OverviewCheckCard check={attention} read={read} />
   if ("kind" in attention && (attention.kind === "work" || attention.kind === "device" || attention.kind === "process")) return <ConfirmCard check={attention} inbox from="tasks" />
   if ("question_id" in attention) return <Card><CardContent className="grid gap-2"><p className="font-medium">问题待确认</p><p className="text-meta text-muted-foreground">{attention.text}</p>{bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}>打开 {bot.name}</Link></Button> : <p className="text-meta text-muted-foreground">{read ? "未找到所属 Bot" : "Bot 身份未加载"}</p>}</CardContent></Card>
   return null
