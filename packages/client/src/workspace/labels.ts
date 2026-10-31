@@ -300,8 +300,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
     workActivities.set(key, activity); activities.push(activity)
   }
   const jobs = [
-    ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
     ...(input.jobs ?? []),
+    ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
   ]
   for (const entry of jobs) {
     const workId = taskWorkId(entry.job.trigger)

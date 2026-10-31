@@ -286,5 +286,7 @@ test("workspace activities dedupe overview and live scheduler jobs by conversati
     jobs: [{ conversation_id: "chat-1", job: { trigger: "message:queue", state: "running" } }],
     nodes: [], read: true, connected: true,
   })
-  assert.deepEqual(view.activities.filter((activity) => activity.kind === "turn").map((activity) => activity.id), ["turn:chat-1:message:queue"])
+  const turns = view.activities.filter((activity): activity is Extract<typeof view.activities[number], { kind: "turn" }> => activity.kind === "turn")
+  assert.deepEqual(turns.map((activity) => activity.id), ["turn:chat-1:message:queue"])
+  assert.equal(turns[0]?.job.state, "running", "the live conversation snapshot wins over an older overview job")
 })
