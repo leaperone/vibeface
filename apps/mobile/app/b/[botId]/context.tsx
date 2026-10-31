@@ -4,7 +4,7 @@ import { useCallback, useRef, useState, type ReactNode } from 'react'
 import { ScrollView, View } from 'react-native'
 import { messageOf, providerNames } from '@vibeface/client/lib/node.ts'
 import { formatWhen, scheduleFrequency } from '@vibeface/client/workspace/bot-settings.ts'
-import { externalSessionLabels, externalSessionStatus, nodeName, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
+import { contextCoverageLabels, contextIndexLabels, contextInvalidation, contextStages, externalSessionLabels, externalSessionStatus, memoryConflictLabel, memoryOrigins, nativeSessionObservation, nodeName, queueHoldLabels, schedulerStatus, shownState, staleTaskLabel, taskLabel, taskStale } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import type { BotRecord, ConversationPayload, ManagerJob } from '@vibeface/client/workspace/types.ts'
 import { Details, EmptyState, providerIcons, SettingsGroup, SettingsRow } from '@/components/kit'
@@ -59,6 +59,10 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
   const history = jobs.filter((job) => schedulerStatus(job.state).group === 'history')
   const ownerNode = nodes.find((node) => node.device_id === owner)
   const connected = shared.connectionOnline && shared.synced
+  const context = scheduler?.context
+  const stage = context && contextStages[context.stage]
+  const native = connected && remote?.reachable !== false ? context?.session_status : null
+  const nativeStatus = nativeSessionObservation(native)
   const reach = !connected ? '状态未知，显示最近归属' : remote?.reachable === false ? '负责设备不可达，后台工作状态未知' : ownerNode?.revoked ? '设备已撤权' : ownerNode?.online === false ? '设备不可达' : ownerNode?.online ? '设备可达' : '设备可达性未知'
   const botNames = new Map(shared.bots.map((item) => [item.conversation_id, item]))
   const incoming = data.messages.filter((message) => message.role === 'bot' && message.sender)
@@ -66,7 +70,21 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
     <SettingsGroup title="Bot 身份">
       <SettingsRow icon={Bot} label={bot.name} description="共享聊天身份" href={`/b/${bot.bot_id}`} />
       <SettingsRow icon={Laptop} label="负责设备" description={reach}><Text className="max-w-[50%] text-muted-foreground">{owner ? nodeName(owner, { nodes }) : '归属未知'}</Text></SettingsRow>
-      <SettingsRow icon={MessagesSquare} label="Bot 自身会话" description="当前记录未提供它的状态，外部会话记录不代表它仍可继续。" />
+      <SettingsRow icon={MessagesSquare} label="Bot 自身会话" description={`${nativeStatus.label}。${nativeStatus.detail}`} />
+    </SettingsGroup>
+    <SettingsGroup title="本轮上下文">
+      <SettingsRow icon={MessagesSquare} label={!connected || remote?.reachable === false ? '当前状态未知' : stage?.label ?? '状态未提供'} description={!connected || remote?.reachable === false ? '显示最近读取的编译记录。' : stage?.detail ?? '当前记录未提供编译或发送状态。'} />
+      <SettingsRow icon={ListChecks} label="共享事实已保存" description="聊天和工作来自共享记录，AI 会话缓存不替代聊天记录。" />
+      {context ? <Fold label="本轮上下文详情">
+        <Text>会话代次 {context.session_generation} · {providerNames[context.provider]} · {contextStages[context.stage].label}</Text>
+        {context.invalidation_reason ? <Text>{contextInvalidation(context.invalidation_reason)}，本代次使用新的上下文。</Text> : null}
+        <Text>{context.session_status?.pending_generation ? '配置已更新，当前回合继续使用原配置，下一轮生效。' : '配置变更从下一轮生效，当前回合按启动时的配置继续。'}</Text>
+        <Text className="text-meta text-muted-foreground">本轮编译时因预算省略的数量。内容仍在共享记录，可按需读取。</Text>
+        {Object.entries(context.coverage).map(([key, count]) => typeof count === 'number' ? <Text key={key} className="text-meta">{contextCoverageLabels[key] ?? '其他内容'} · {count}</Text> : null)}
+        {Object.entries(context.coverage.bot_indexes_omitted).map(([key, count]) => <Text key={`index:${key}`} className="text-meta">{contextIndexLabels[key] ?? '其他索引'} · {count}</Text>)}
+        <Text className="text-meta">稳定内容 {context.stable_bytes} 字节 · 本轮内容 {context.dynamic_bytes} 字节</Text>
+        <Text selectable className="font-mono text-meta">稳定指纹 {context.stable_fingerprint}</Text><Text selectable className="font-mono text-meta">本轮指纹 {context.dynamic_fingerprint}</Text>
+      </Fold> : null}
     </SettingsGroup>
     <SettingsGroup title="共享摘要">
       <SettingsRow icon={MessagesSquare} label="消息" description={`${data.messages.length} 条已加载消息`} href={`/b/${bot.bot_id}`} />
@@ -78,7 +96,16 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
       <Fold label="最近消息摘要">{data.messages.length ? data.messages.slice(-4).map((message) => <View key={message.message_id} className="gap-1"><Text className="text-meta font-medium">{message.sender?.name ?? (message.role === 'user' ? '你' : 'Bot')} · {formatWhen(message.created_at_ms)}</Text><Text selectable>{message.text}</Text></View>) : <Text className="text-muted-foreground">当前记录没有聊天消息</Text>}</Fold>
     </SettingsGroup>
     <SettingsGroup title="持久记忆和定时任务">
-      <Fold label={`持久记忆 · ${data.bot_settings.memory.length}`}>{data.bot_settings.memory.length ? data.bot_settings.memory.map((entry) => <Text key={entry.memory_id} selectable>{entry.text}</Text>) : <Text className="text-muted-foreground">当前记录没有持久记忆</Text>}</Fold>
+      <SettingsRow icon={ListChecks} label={`已保存记忆 · ${data.bot_settings.memory.length}`} description={`待提交 ${data.bot_settings.memory_staged_count ?? '未提供'} · 提交冲突 ${data.bot_settings.memory_conflicts?.length ?? '未提供'} · 本轮省略 ${context?.coverage.memory_omitted ?? '未提供'}`} />
+      <View className="px-4 py-2"><Text className="text-meta text-muted-foreground">待提交和冲突来自负责设备最近的观察。待提交记忆只在本轮成功后保存；失败、中断或结果未知时丢弃。省略的记忆仍可按需读取。</Text></View>
+      <Fold label={`查看已保存记忆 · ${data.bot_settings.memory.length}`}>{data.bot_settings.memory.length ? data.bot_settings.memory.map((entry) => <View key={entry.memory_id} className="gap-2">
+        <Text selectable>{entry.text}</Text>
+        {entry.metadata ? <>
+          <Text className="text-meta text-muted-foreground">{memoryOrigins[entry.metadata.origin]} · {entry.metadata.user_controlled ? '由你维护，受保护' : 'Bot 可更新'} · {entry.metadata.essential ? '优先带入上下文' : '按需读取'}</Text>
+          <Details label="记忆版本"><Text selectable className="font-mono text-meta">数据版本 {entry.metadata.epoch} · {entry.metadata.revision}</Text>{entry.metadata.source_event_hash ? <Text selectable className="font-mono text-meta">来源事件 {entry.metadata.source_event_hash}</Text> : null}</Details>
+        </> : <Text className="text-meta text-muted-foreground">来源与版本未提供</Text>}
+      </View>) : <Text className="text-muted-foreground">当前记录没有已保存记忆</Text>}</Fold>
+      {data.bot_settings.memory_conflicts?.length ? <Fold label={`查看记忆冲突 · ${data.bot_settings.memory_conflicts.length}`}>{data.bot_settings.memory_conflicts.map((conflict) => <View key={`${conflict.call_ref}:${conflict.memory_id}`} className="gap-1"><Text>{memoryConflictLabel(conflict.reason)}</Text><Text selectable className="font-mono text-meta">记忆 {conflict.memory_id} · 数据版本 {conflict.expected_epoch} / {conflict.actual_epoch}</Text><Text selectable className="font-mono text-meta">预期 {conflict.expected_revision || '尚无版本'} · 当前 {conflict.actual_revision || '已移除'}</Text></View>)}</Fold> : null}
       <Fold label={`定时任务 · ${data.bot_settings.schedules.length}`}>{data.bot_settings.schedules.length ? data.bot_settings.schedules.map((schedule) => <View key={schedule.schedule_id} className="gap-1"><Text className="font-medium">{schedule.name} · {schedule.enabled ? '启用' : '已暂停'}</Text><Text className="text-meta text-muted-foreground">{scheduleFrequency(schedule)}{schedule.next_run_at_ms === null ? ' · 尚未安排下一次运行' : ` · 下次 ${formatWhen(schedule.next_run_at_ms)}`}</Text><Text selectable>{schedule.prompt}</Text></View>) : <Text className="text-muted-foreground">当前记录没有待执行定时任务</Text>}</Fold>
     </SettingsGroup>
     <SettingsGroup title="问题和检查">
@@ -111,7 +138,7 @@ function ContextRecords({ bot, data, shared }: { bot: BotRecord; data: Conversat
       {data.sent.map((message) => <MessageRecord key={`sent:${message.message_id}`} icon={Send} label={`发给 ${botNames.get(message.to)?.name ?? '另一个 Bot'}`} text={message.text} time={message.created_at_ms} bot={botNames.get(message.to)} sent />)}
       {!incoming.length && !data.sent.length ? <SettingsRow icon={MessagesSquare} label="当前记录没有 Bot 协作消息" /> : null}
     </SettingsGroup>
-    <Text className="text-meta text-muted-foreground">这里显示当前已加载的记录。完整历史摘要、执行过程和 Bot 自身会话状态未提供。回答、停止和结算仍在原有对话与任务详情中进行。</Text>
+    <Text className="text-meta text-muted-foreground">这里显示当前已加载的记录，不包含完整 AI 会话或提示词。回答、停止和结算仍在原有对话与任务详情中进行。</Text>
   </>
 }
 
@@ -120,7 +147,7 @@ function Fold({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function JobObservation({ job, unknown }: { job: ManagerJob; unknown: boolean }) {
-  return <View className="gap-1 px-4 py-3"><Text className="font-medium">{unknown ? '状态未知' : schedulerStatus(job.state).label}{job.pending_check ? ' · 需要确认' : ''}</Text><Details label="后台工作详情"><Text selectable className="font-mono text-meta">{job.trigger}</Text>{job.failure ? <Text selectable className="text-danger">{job.failure.detail}</Text> : null}</Details></View>
+  return <View className="gap-1 px-4 py-3"><Text className="font-medium">{unknown ? '状态未知' : schedulerStatus(job.state).label}{job.pending_check ? ' · 需要确认' : ''}</Text>{job.hold_reason ? <Text className="text-meta text-muted-foreground">{queueHoldLabels[job.hold_reason]}</Text> : null}<Details label="后台工作详情"><Text selectable className="font-mono text-meta">{job.trigger}</Text>{job.failure ? <Text selectable className="text-danger">{job.failure.detail}</Text> : null}</Details></View>
 }
 
 function MessageRecord({ icon, label, text, time, bot, sent }: { icon: LucideIcon; label: string; text: string; time: number; bot?: BotRecord; sent?: boolean }) {

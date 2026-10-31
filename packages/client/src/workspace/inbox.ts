@@ -74,7 +74,7 @@ export function inboxItems({ device, workspace }: InboxSource): InboxItem[] {
   const canSetUp = device.ready?.principal.can_manage === true || device.ready?.principal.source === "local_session"
   // A device still starting may come up on its own, but it does not hide another one that needs setting up.
   const waiting = !unready && workspace.nodes.some((node) => botReadiness(node) === "starting")
-  if (canSetUp && workspace.nodes.length && !waiting && !workspace.nodes.some((node) => botReadiness(node) === "ready")) {
+  if (canSetUp && workspace.nodes.length && !waiting && !workspace.nodes.some((node) => botReadiness(node) === "ready" || botReadiness(node) === "unverified")) {
     items.push({ key: "setup", kind: "setup", device: unready?.device_id ?? device.ready?.entry.device_id, title: unready ? "运行 Bot 的设备需设置" : "设置运行 Bot 的设备" })
   }
   return items

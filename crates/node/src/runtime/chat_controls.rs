@@ -1,5 +1,8 @@
 use super::*;
-use crate::{scheduling::PendingCheck, work::DispatchState};
+use crate::{
+    scheduling::{PendingCheck, TriggerKind},
+    work::DispatchState,
+};
 
 const ARTIFACT_PAGE: usize = 65_536;
 /// Progress sources one conversation view follows, within the observer's own limit.
@@ -148,6 +151,11 @@ impl Runtime {
         let local = self.identity.device_id()?;
         let store = self.store.lock().await;
         let works = store.works(network, scope)?;
+        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
+        let work_values = works
+            .iter()
+            .map(|work| work_view(work, &task_jobs))
+            .collect::<Result<Vec<_>>>()?;
         let checks = without_work_checks(checks, &works);
         let deliveries = deliveries(&store, network, scope)?;
         let conversation = store.conversation(network, scope)?;
@@ -194,7 +202,8 @@ impl Runtime {
                 value
             })
             .collect();
-        let memory = store.memories(network, scope)?;
+        let memory = memory_view(&store, network, scope)?;
+        let memory_staged_count = store.scheduler_memory_staged_count(scope)?;
         let memory_conflicts = store.scheduler_memory_conflicts(scope)?;
         let local_context = store.scheduler_context_projection(scope)?;
         let unanswered = store.unanswered_messages(network, &local, scope)?;
@@ -209,11 +218,19 @@ impl Runtime {
         } else {
             remote["context"].clone()
         };
+        let (memory_staged_count, memory_conflicts) = if remote.is_null() {
+            (json!(memory_staged_count), json!(memory_conflicts))
+        } else {
+            (
+                remote["memory_staged_count"].clone(),
+                remote["memory_conflicts"].clone(),
+            )
+        };
         Ok(json!({
             "conversation":conversation,
             "bot":bot,
             "messages":messages,
-            "works":works,
+            "works":work_values,
             "deliveries":deliveries,
             "changes":changes,
             "overwritten":overwritten,
@@ -221,7 +238,7 @@ impl Runtime {
             "questions":questions,
             "sessions":sessions,
             "bot_settings":{"skills":skills,"schedules":schedules,"memory":memory,
-                "memory_conflicts":memory_conflicts},
+                "memory_staged_count":memory_staged_count,"memory_conflicts":memory_conflicts},
             "checks":checks,
             "local_node":local,
             "scheduler":{"jobs":jobs,"unanswered":unanswered,"provider":metadata["provider"],"model":metadata["model"],
@@ -277,10 +294,12 @@ impl Runtime {
         };
         let messages = message.map(|message| json!(message));
         let works = store.works(network, scope)?;
+        let task_jobs = task_observations(self, &store, network, scope, &checks)?;
         let changed: Vec<_> = works
             .iter()
             .filter(|work| work_id.as_deref() == Some(work.work_id.as_str()))
-            .collect();
+            .map(|work| work_view(work, &task_jobs))
+            .collect::<Result<_>>()?;
         let notifications: Vec<_> = store
             .pending_notifications(network, client)?
             .into_iter()
@@ -301,10 +320,55 @@ impl Runtime {
             "checks":without_work_checks(checks, &works),
             "jobs":jobs,
             "context":store.scheduler_context_projection(scope)?,
+            "memory":memory_view(&store, network, scope)?,
+            "memory_staged_count":store.scheduler_memory_staged_count(scope)?,
             "memory_conflicts":store.scheduler_memory_conflicts(scope)?,
             "unanswered":store.unanswered_messages(network, &self.identity.device_id()?, scope)?,
         })))
     }
+}
+
+fn task_observations(
+    runtime: &Runtime,
+    store: &Store,
+    network: &str,
+    scope: &str,
+    checks: &[PendingCheck],
+) -> Result<BTreeMap<String, Value>> {
+    store
+        .scheduler_jobs(scope)?
+        .into_iter()
+        .filter(|job| job.kind == TriggerKind::AgentTask)
+        .map(|job| {
+            Ok((
+                job.reply_to.clone(),
+                runtime.scheduler_job_projection(store, network, &job, checks)?,
+            ))
+        })
+        .collect()
+}
+
+fn work_view(work: &WorkProjection, jobs: &BTreeMap<String, Value>) -> Result<Value> {
+    let mut value = serde_json::to_value(work)?;
+    if work.kind == crate::model::WorkKind::Task {
+        value["coordination_job"] = jobs.get(&work.work_id).cloned().unwrap_or(Value::Null);
+    }
+    Ok(value)
+}
+
+fn memory_view(store: &Store, network: &str, scope: &str) -> Result<Vec<Value>> {
+    Ok(store
+        .memory_records(network, scope)?
+        .into_iter()
+        .map(|record| {
+            json!({
+                "memory_id":record.entry.memory_id,"text":record.entry.text,
+                "metadata":{"epoch":record.epoch,"revision":record.revision,"origin":record.origin,
+                    "user_controlled":record.user_controlled,"essential":record.essential,
+                    "source_event_hash":record.source_event_hash},
+            })
+        })
+        .collect())
 }
 
 /// One card per work: an unverified agent task's coordination check is answered by its work card.

@@ -63,7 +63,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
   const checks = pendingChecks(data, workspace.nodes, conversationId)
   const live = workspace.liveProgress.filter((progress) => progress.kind === 'manager' && progress.conversation_id === conversationId && progress.text && !jobs.some((job) => job.trigger === progress.trigger && (!streamingStates.includes(job.state) || job.reply_message_id && data?.messages.some((message) => message.message_id === job.reply_message_id))))
   const gate = { ...chatSlot, hasConversation: Boolean(conversationId), loaded: Boolean(data) }
-  const reach = botReach(workspace.nodes), agentReady = reach === 'ready'
+  const reach = botReach(workspace.nodes), agentReady = reach === 'ready' || reach === 'unverified'
   const sendDisabled = !workspace.writable || !bot || !agentReady || Boolean(messagePending) || !canSend({ ...gate, busy: messageBusy })
   const botBusy = activeJobs.length > 0
   const stopJob = jobs.find((job) => data?.scheduler?.capabilities?.cancel === true && ['queued', 'claimed', 'running'].includes(job.state))
@@ -154,7 +154,7 @@ export function ConversationScreen({ missing = false }: { missing?: boolean }) {
 
   const owner = data?.conversation?.owner
   const here = workspace.nodes.find((node) => node.device_id === data?.local_node)
-  const ownerAway = Boolean(owner && here && botReadiness(here) === 'ready' && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
+  const ownerAway = Boolean(owner && here && (botReadiness(here) === 'ready' || botReadiness(here) === 'unverified') && owner !== here.device_id && !workspace.nodes.some((node) => node.device_id === owner && node.online && !node.revoked))
   const lastUnanswered = data?.messages.filter((message) => unanswered.includes(message.message_id)).at(-1)
   const status = workspace.liveProgress.find((item) => item.kind === 'manager' && item.conversation_id === conversationId && item.status)?.status
   // The owner holds the reply's state; when it does not answer, a waiting message shows that state as unknown.

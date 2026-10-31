@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
+import { availability, parseNodeSettings, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { cardState, chatTaskState, deviceForm, deviceOnline, entryLabel, externalSessionLabels, externalSessionStatus, fixOnDevice, formName, parseSummarySteps, promptSummary, schedulerStatus, staleTaskLabel, taskGroup, taskLabel, taskStale } from './labels.ts'
 import type { BotRecord, NodeInfo, Question, WorkRecord } from './types.ts'
@@ -35,6 +35,9 @@ test('待处理 counts the same items wherever it shows: open questions, joins t
   assert.deepEqual(inboxItems(starting).map((item) => item.kind), ['question', 'join'], 'a bot still starting is not a device to set up')
   starting.workspace.nodes.push({ ...unready, device_id: 'pc', local: false })
   assert.deepEqual(inboxItems(starting).find((item) => item.kind === 'setup'), { key: 'setup', kind: 'setup', device: 'pc', title: '运行 Bot 的设备需设置' }, 'one device starting does not hide another that needs setup')
+  const unverified = source(true)
+  unverified.workspace.nodes = [{ ...unready, capabilities: { ...unready.capabilities!, manager_state: 'unverified' } }]
+  assert.equal(inboxItems(unverified).some((item) => item.kind === 'setup'), false, 'unverified login does not require setup')
 })
 
 test('a different pending recovery gets a fresh confirmation card', () => {
@@ -110,11 +113,26 @@ test('the capsule names the computer from the directory once it lists it, not by
 
 test('a provider shows whether it can be used before any use is picked', () => {
   const provider = (extra: Partial<ProviderStatus>) => ({ state: 'off', installed: true, env: [], ...extra }) as Pick<ProviderStatus, 'state' | 'installed' | 'env'>
-  assert.equal(availability(provider({})), 'ready')
+  assert.equal(availability(provider({})), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
   assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: false, required: true }] })), 'needs_setup')
-  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'ready')
+  assert.equal(availability(provider({ env: [{ name: 'CURSOR_API_KEY', set: false, inherited: true, required: true }] })), 'unverified')
   assert.equal(availability(provider({ state: 'starting' })), 'starting')
+})
+
+test('provider observations preserve unknown prerequisites and discard private fields', () => {
+  const observed = {
+    installed: { status: 'confirmed', evidence: 'binary_discovery' }, launchable: { status: 'confirmed', evidence: 'app_server_handshake' },
+    authenticated: { status: 'unknown', evidence: 'authentication_not_observed' }, model_known: { status: 'unknown', evidence: 'model_catalog_not_observed' }, ready: { status: 'unknown', evidence: 'readiness_not_observed' },
+  }
+  const provider = { provider: 'codex', roles: ['agent'], supports: ['agent', 'execution'], installed: true, bin: 'codex', app_server: null, env: [], state: 'unverified', issues: [], observed }
+  const response = { settings: { roots: [], manager: null }, defaults: { workspace: '/project' }, readiness: { manager: 'authentication_unverified', missing: [] }, display_paths: {}, suggested_roots: [], providers: [provider] }
+  const parsed = parseNodeSettings({ ...response, providers: [{ ...provider, observed: { ...observed, authenticated: { ...observed.authenticated, native_token: 'private-token' } } }] })
+  assert.equal(parsed.providers[0].state, 'unverified')
+  assert.deepEqual(parsed.providers[0].observed, observed)
+  assert(!JSON.stringify(parsed).includes('private-token'))
+  assert.throws(() => parseNodeSettings({ ...response, providers: [{ ...provider, observed: { ...observed, ready: { status: 'ready', evidence: 'readiness_not_observed' } } }] }))
+  assert.throws(() => parseNodeSettings({ ...response, providers: [{ ...provider, observed: { ...observed, ready: { status: 'unknown', evidence: 'invented' } } }] }))
 })
 
 test('a task page shows a summary of what it was asked and folds the rest', () => {

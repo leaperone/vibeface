@@ -13,13 +13,16 @@ test('send waits for a loaded conversation', () => {
   assert.equal(composerHint({ ...ready, bot: 'needs_setup' }), '运行 Bot 的设备需设置')
 })
 test('chat rereads readiness only while a device that could reply is not ready yet', () => {
-  const node = (online: boolean, manager_state: 'ready' | 'starting' | 'needs_setup' | null) => ({
+  const node = (online: boolean, manager_state: 'ready' | 'unverified' | 'starting' | 'needs_setup' | null) => ({
     device_id: 'd', name: 'Mac', local: false, online, revoked: false,
     capabilities: manager_state === null ? undefined : { manager: 'codex', manager_state, relay: false, roots: [], codex_connected: false },
   })
   assert.equal(botReach([]), 'none')
   assert.equal(botReach([node(true, null)]), 'none')
   assert.equal(botReach([node(true, 'needs_setup')]), 'needs_setup')
+  assert.equal(botReach([node(true, 'needs_setup'), node(true, 'unverified')]), 'unverified')
+  assert.equal(composerHint({ ...ready, bot: 'unverified' }), '', 'an unverified provider can be tried')
+  assert.equal(awaitsDevice('unverified'), false, 'unknown authentication is not a pending launch')
   assert.equal(botReach([node(true, 'needs_setup'), node(true, 'starting')]), 'starting', 'a bot coming up is not a device to set up')
   assert.equal(composerHint({ ...ready, bot: 'starting' }), 'Bot 正在启动')
   assert.equal(botReach([node(false, 'needs_setup')]), 'offline')

@@ -53,6 +53,13 @@ export type AppServerLink = { state: 'off' } | { state: 'starting' } | { state: 
 export type AppServerMode = 'system' | 'spawn'
 /** `socket` is required when enabling a system App Server connection. */
 export type AppServer = { mode: AppServerMode; socket: string | null; link: AppServerLink }
+export type ProviderObservation = {
+  status: 'confirmed' | 'rejected' | 'unknown'
+  evidence: 'binary_discovery' | 'launch_prerequisites' | 'app_server_handshake' | 'app_server_starting' | 'app_server_unavailable' | 'managed_launch_failed' | 'configuration_invalid' | 'authentication_not_observed' | 'model_catalog_not_observed' | 'readiness_not_observed' | 'prerequisites_rejected'
+}
+export type ProviderObservations = Record<'installed' | 'launchable' | 'authenticated' | 'model_known' | 'ready', ProviderObservation>
+export const providerObservationLabels: Record<string, string> = { installed: '程序安装', launchable: '程序启动', authenticated: '登录状态', model_known: '模型可用性', ready: '完整可用性' }
+export const providerObservationStates: Record<ProviderObservation['status'], string> = { confirmed: '已确认', rejected: '未满足', unknown: '未验证' }
 /**
  * One local provider of the connected Node. `roles` is what it runs now: `agent` while the bot
  * runs on it, `execution` while it executes tasks; `off` means it runs nothing.
@@ -65,7 +72,8 @@ export type ProviderStatus = {
   /** Codex only: the Codex folder and the sessions folder the device uses. */
   home: string | null; sessions: string | null
   env: { name: string; set: boolean; inherited: boolean; required: boolean }[]
-  state: 'ready' | 'needs_setup' | 'starting' | 'off'; issues: ProviderIssue[]
+  state: 'ready' | 'needs_setup' | 'starting' | 'unverified' | 'off'; issues: ProviderIssue[]
+  observed?: ProviderObservations
 }
 export type NodeSettingsResponse = {
   settings: NodeSettings
@@ -197,14 +205,14 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
 }
 
 /**
- * Whether a provider can be used, shown before any use is picked: an unused one reads ready once its program is here and
- * the keys it needs are set, `missing` without its program. A used one keeps the state the device reports.
+ * An unused program with prerequisites present can be tried; authentication and model availability remain unverified.
+ * A used provider keeps the state the device reports.
  */
 export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
 export function availability(item: Pick<ProviderStatus, 'state' | 'installed' | 'env'>): Availability {
   if (item.state !== 'off') return item.state
   if (!item.installed) return 'missing'
-  return item.env.some((row) => row.required && !row.set && !row.inherited) ? 'needs_setup' : 'ready'
+  return item.env.some((row) => row.required && !row.set && !row.inherited) ? 'needs_setup' : 'unverified'
 }
 
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
@@ -235,7 +243,8 @@ export const providerIds: readonly ProviderId[] = ['codex', 'cursor', 'claude', 
 /** A provider named by a peer's capabilities, or null when it names none this client knows. */
 export const asProvider = (value: unknown): ProviderId | null => providerIds.includes(value as ProviderId) ? value as ProviderId : null
 const providerRoles: ProviderRole[] = ['agent', 'execution']
-const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'off']
+const providerStates: ProviderStatus['state'][] = ['ready', 'needs_setup', 'starting', 'unverified', 'off']
+const observationEvidence: ProviderObservation['evidence'][] = ['binary_discovery', 'launch_prerequisites', 'app_server_handshake', 'app_server_starting', 'app_server_unavailable', 'managed_launch_failed', 'configuration_invalid', 'authentication_not_observed', 'model_catalog_not_observed', 'readiness_not_observed', 'prerequisites_rejected']
 function oneOf<T extends string>(value: unknown, options: readonly T[]): T {
   if (!options.includes(value as T)) throw new Error('AI 状态格式不对。')
   return value as T
@@ -281,6 +290,7 @@ function parseAppServer(value: unknown): AppServer | null {
 }
 function parseProvider(value: unknown): ProviderStatus {
   const v = record(value)
+  const observed = v.observed == null ? null : record(v.observed)
   return {
     provider: oneOf(v.provider, providerIds),
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
@@ -288,7 +298,15 @@ function parseProvider(value: unknown): ProviderStatus {
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
+    ...(observed ? { observed: {
+      installed: parseObservation(observed.installed), launchable: parseObservation(observed.launchable),
+      authenticated: parseObservation(observed.authenticated), model_known: parseObservation(observed.model_known), ready: parseObservation(observed.ready),
+    } } : {}),
   }
+}
+function parseObservation(value: unknown): ProviderObservation {
+  const observation = record(value)
+  return { status: oneOf(observation.status, ['confirmed', 'rejected', 'unknown']), evidence: oneOf(observation.evidence, observationEvidence) }
 }
 function canonical(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value)
