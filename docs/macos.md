@@ -28,6 +28,6 @@ open .artifacts/macos/Vibeface.app
 
 手机 App（Expo + `@vibeface/client`）是跨设备客户端。macOS 壳当前复用的是 **Node 内嵌 Web UI**（`crates/node/web`），与浏览器访问本机 Node 等价，便于在本机管理同一 Node。后续若需要与手机同款的独立客户端，可评估 Expo macOS 或 Tauri 嵌入 `@vibeface/client` UI。
 
-## CI
+## CI 与发版
 
-PR 打上 `macos` 标签或手动 `workflow_dispatch` 触发 `.github/workflows/macos.yml`，上传 `vibeface-macos-<sha>.zip` artifact。
+PR 打上 `macos` 标签或手动 `workflow_dispatch` 触发 `.github/workflows/macos.yml`，上传构建 artifact。版本 tag 的 `ci` 发布流程会额外生成并上传 `vibeface-<ver>-macos-arm64.zip` 与 `.sha256`；当前没有 Developer ID 证书，产物不签名、不公证。
