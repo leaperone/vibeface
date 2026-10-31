@@ -281,7 +281,10 @@ mod workspace_overview_tests {
             prompt: "provider secret".into(),
             call_ref: "call-ref".into(),
             model: None,
-            resolved: None,
+            resolved: ResolvedModel {
+                provider: Provider::Codex,
+                model: None,
+            },
             continues: None,
             parent: None,
             thread: None,
@@ -351,6 +354,9 @@ pub struct Runtime {
     pub events: broadcast::Sender<Update>,
     pub agent_tokens: Mutex<HashMap<String, Access>>,
     pub(crate) manager_controls: Mutex<HashMap<String, Arc<manager_control::ActiveManager>>>,
+    #[cfg(test)]
+    pub(crate) claim_to_start_barrier:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     schedule_workers: Mutex<BTreeSet<(String, String)>>,
     schedule_wakeup: tokio::sync::Notify,
     observation: std::sync::Mutex<observation::ObservationState>,
@@ -546,6 +552,8 @@ impl Runtime {
             events,
             agent_tokens: Mutex::new(HashMap::new()),
             manager_controls: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            claim_to_start_barrier: std::sync::Mutex::new(None),
             schedule_workers: Mutex::new(BTreeSet::new()),
             schedule_wakeup: tokio::sync::Notify::new(),
             observation: std::sync::Mutex::new(Default::default()),

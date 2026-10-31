@@ -2120,7 +2120,10 @@ mod tests {
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Claude),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Claude,
+                model: None,
+            },
             cwd: place.dir.join("work").display().to_string(),
             title: "t".into(),
             prompt: prompt.into(),
@@ -2132,10 +2135,12 @@ mod tests {
 
     /// Registers the work and has Claude Code start it, as `track_work` does.
     async fn dispatch(node: &Arc<Runtime>, network: &str, spec: &WorkSpec) -> Result<bool> {
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let claude = node.executor(Provider::Claude)?;
         node.start_work(claude, network, spec, None, &json!({}))
             .await
@@ -2239,10 +2244,12 @@ mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never sent")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let session = derived(SESSION_SEED, &spec.work_id);
         let journaled = node
             .signal_work(&network, &spec.work_id, Signal::ThreadCreated(session))
@@ -2288,7 +2295,7 @@ mod tests {
                 thread: Some(session.clone()),
                 ..spec(&node, &place, call_ref, "hang around")?
             };
-            node.store.lock().await.accept_work(
+            node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec.clone(),
@@ -2376,10 +2383,12 @@ mod tests {
         let place = Place::new()?;
         let (node, _, network) = node(&place).await?;
         let spec = spec(&node, &place, "r1", "never run")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         let error = node
             .start_work(&Unstartable, &network, &spec, None, &json!({}))
             .await

@@ -5,6 +5,62 @@ use crate::{crypto::digest, model::*};
 use serde::{Deserialize, Serialize};
 use vibeface_bridge::{failure::ExecFailure, turn::TurnStatus};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(into = "String", try_from = "String")]
+pub enum RequestedWorkKind {
+    Agent(Option<crate::providers::Provider>),
+    Task,
+}
+
+impl From<RequestedWorkKind> for String {
+    fn from(kind: RequestedWorkKind) -> String {
+        match kind {
+            RequestedWorkKind::Agent(Some(provider)) => provider.name().into(),
+            RequestedWorkKind::Agent(None) => "agent".into(),
+            RequestedWorkKind::Task => "task".into(),
+        }
+    }
+}
+
+impl TryFrom<String> for RequestedWorkKind {
+    type Error = serde_json::Error;
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        match name.as_str() {
+            "task" => Ok(Self::Task),
+            "agent" => Ok(Self::Agent(None)),
+            _ => serde_json::from_value(serde_json::Value::String(name))
+                .map(|provider| Self::Agent(Some(provider))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkRequest {
+    pub work_id: String,
+    pub conversation: String,
+    pub trigger: String,
+    pub target: DeviceId,
+    pub dispatcher: DeviceId,
+    pub call_ref: String,
+    pub kind: RequestedWorkKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub cwd: String,
+    pub title: String,
+    pub prompt: String,
+    pub continues: Option<String>,
+    pub parent: Option<String>,
+    pub thread: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct WorkAdmission {
+    pub spec: WorkSpec,
+    pub record: WorkRecord,
+    pub created: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkSpec {
     pub work_id: String,
@@ -18,9 +74,7 @@ pub struct WorkSpec {
     /// The dispatcher's optional model override. The target resolves it once on acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Filled only by the accepting Node; never supplied by a remote dispatcher.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved: Option<ResolvedModel>,
+    pub resolved: ResolvedModel,
     pub cwd: String,
     pub title: String,
     pub prompt: String,
@@ -43,10 +97,7 @@ impl WorkSpec {
     /// The model an executor must use after registration. A resolved provider default is an
     /// intentional `None`, so callers must not fall back to mutable dispatch arguments.
     pub fn execution_model(&self) -> Option<&str> {
-        match &self.resolved {
-            Some(resolved) => resolved.model.as_deref(),
-            None => self.model.as_deref(),
-        }
+        self.resolved.model.as_deref()
     }
 }
 
@@ -54,7 +105,7 @@ impl WorkSpec {
 /// writes `WorkDispatched`, so the DAG never names work the target did not accept.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Dispatch {
-    pub spec: WorkSpec,
+    pub spec: WorkRequest,
     #[serde(flatten)]
     pub state: DispatchState,
 }
@@ -661,7 +712,10 @@ mod tests {
                 call_ref: "r".into(),
                 kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 model: None,
-                resolved: None,
+                resolved: crate::model::ResolvedModel {
+                    provider: crate::providers::Provider::Codex,
+                    model: None,
+                },
                 cwd: "/tmp".into(),
                 title: "do".into(),
                 prompt: "do".into(),
@@ -716,10 +770,10 @@ mod tests {
             call_ref: "r".into(),
             kind: WorkKind::Agent(crate::providers::Provider::Codex),
             model: Some("request-model".into()),
-            resolved: Some(ResolvedModel {
+            resolved: ResolvedModel {
                 provider: crate::providers::Provider::Codex,
                 model: None,
-            }),
+            },
             cwd: "/tmp".into(),
             title: "do".into(),
             prompt: "do".into(),
@@ -728,10 +782,10 @@ mod tests {
             thread: None,
         };
         assert_eq!(spec.execution_model(), None);
-        spec.resolved = Some(ResolvedModel {
+        spec.resolved = ResolvedModel {
             provider: crate::providers::Provider::Codex,
             model: Some("frozen-model".into()),
-        });
+        };
         assert_eq!(spec.execution_model(), Some("frozen-model"));
     }
 

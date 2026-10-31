@@ -45,7 +45,7 @@ Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Nod
 
 同一请求重试先比较并回读已接纳记录，之后关闭执行、切换 Bot Provider 或修改模型不会改变原接纳结果，也不会再次入队或发送。首次并发接纳由 Store 事务裁决，所有成功返回都使用已持久化的同一选择。本机省略 `agent` 的请求在首次接纳时选择 Provider，后续重试沿用该选择；显式更换 Provider 或请求内容则拒绝。
 
-Bot 关闭时暂停尚未启动的 Task，已有接纳请求仍回原记录。切换 Bot Provider 不修改已接纳 Task 的冻结选择。调度在 claim 前读取该选择、计算 readiness 和会话身份；配置失败不保留 claimed job，启动中继续等待。原任务不因切换 Provider 而静默改用新的设备默认。
+已接纳的远端 Task 只有在当前 Bot 仍使用同一 Provider 时才可启动。Bot 关闭或换用其他 Provider 时，尚未启动的 Task 记为明确失败，执行证据为 `NotStarted`，保留原 Provider 和模型。此收尾不启动 SDK、不改变其他活跃回合，也不将已启动或结果未知的工作降为未启动。已有接纳请求仍回读原记录，启动中继续等待，配置失败不保留 claimed job。
 
 Codex 默认使用 Node-owned `<data-dir>/providers/codex`、sessions 和 hook 根，并由 Node 启动独立 App Server。Claude 使用 Node-owned `CLAUDE_CONFIG_DIR`、transcript 和 hook 根。Codex system 只有通过显式 socket 才接入外部服务，并共享该服务的会话。pi 只固定 `<data-dir>/providers/pi/sessions`，保留本机认证配置。OpenCode 使用 `<data-dir>/providers/opencode` 中的私有 XDG 数据、配置、状态和缓存，强制数据库与配置目录；外部 config override 和项目配置不参与该服务。启动和 session Shell 环境使用相同根。
 
@@ -57,7 +57,7 @@ Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的
 
 重启后的回合处于 `reconciling`。按原执行标识读取结果，明确结束后才提交最终回复。只有进程退出、没有可读历史或查询失败时继续等待确认，不重新发送 prompt。
 
-备用策略保存在 Node 本地，默认关闭。开启后按顺序选择一个不同候选，最多追加一次尝试。跨服务候选须在本机启用执行角色，使用该设备配置的账户。只有原回合明确未启动、没有工具调用和待确认记录时才切换。记录保留原选项、实际提交选项和切换原因。
+备用策略保存在 Node 本地，默认关闭。开启后按顺序选择一个不同候选，最多追加一次尝试。跨服务候选须在本机启用执行角色，使用该设备配置的账户。只有原回合明确未启动、没有工具调用和待确认记录时才切换。已接纳的远端 Task 不自动切换备用，始终保留冻结的 Provider 和模型。记录保留原选项、实际提交选项和切换原因。
 
 私有 Codex、Claude Code 和 OpenCode 根可能需要重新认证。`ProviderStatus.setup` 返回非敏感目录和可复制登录命令，Web 与 Mobile 提供复制和重新检查入口；Node 不自动登录，不读取或复制用户凭证。未确认的认证仍显示未知，已确认缺少登录时显示需要设置。
 

@@ -8,7 +8,7 @@ import type { NodeInfo } from "./types.ts"
 const rank = (lamport: number) => `${String(lamport).padStart(20, "0")}:${"0".repeat(20)}:h${lamport}`
 const message = (message_id: string, lamport: number) => ({ message_id, role: "user", text: message_id, event_hash: `e-${message_id}`, created_at_ms: lamport, rank: rank(lamport) })
 const work = (work_id: string, extra: Record<string, unknown> = {}) => ({
-  work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", ...extra,
+  work_id, trigger: "t", target_node: "worker", cwd: "/w", title: "", prompt: "p", state: "running", summary: "", outcome: null, result_text: "", failure_reason: null, kind: "codex", resolved: { provider: "codex", model: null }, ...extra,
 })
 const question = (question_id: string, conversation_id: string, answer: unknown = null) => ({
   question_id, conversation_id, bot: null, severity: "info", text: "?", choices: [],

@@ -214,10 +214,6 @@ fn turn_settings(
     resolved: Option<&crate::model::ResolvedModel>,
 ) -> crate::config::ManagerSettings {
     if let Some(resolved) = resolved {
-        if settings.provider != resolved.provider {
-            settings.reasoning_effort = None;
-        }
-        settings.provider = resolved.provider;
         settings.model = resolved.model.clone().unwrap_or_default();
     } else if let Some(model) = bot_model(&settings, bot) {
         settings.model = model;
@@ -318,6 +314,23 @@ pub(crate) fn prefix(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+pub(crate) fn task_start_failure(
+    current: Option<crate::providers::Provider>,
+    accepted: crate::providers::Provider,
+) -> Option<ExecFailure> {
+    match current {
+        None => Some(ExecFailure::new(
+            FailureKind::NoBot,
+            "this device's Bot is turned off",
+        )),
+        Some(provider) if provider != accepted => Some(ExecFailure::new(
+            FailureKind::ExecutionDisabled,
+            "the accepted task provider is no longer this device's Bot",
+        )),
+        Some(_) => None,
+    }
+}
+
 /// Invocation only consumes durable admissions; imported history never creates runnable jobs.
 pub async fn run(
     node: Arc<Runtime>,
@@ -342,6 +355,15 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             .is_none_or(|id| id == &conversation),
         "conversation access denied"
     );
+    let network = access.network_id.clone();
+    if let Some(job) = node
+        .finish_incompatible_tasks(&network, Some(&conversation))
+        .await?
+        .into_iter()
+        .next()
+    {
+        return Ok(Some(invocation_value(&job, &network)));
+    }
     if !node.apply_provider_launches().await? {
         return Ok(None);
     }
@@ -354,116 +376,125 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     }
     let local_settings = node.settings_snapshot();
     let local_providers = node.providers();
-    let Some(device_settings) = local_settings.manager.clone() else {
-        return Ok(None);
+    let Some(settings) = local_settings.manager.clone() else {
+        drop(launch_claim);
+        return Ok(node
+            .finish_incompatible_tasks(&network, Some(&conversation))
+            .await?
+            .first()
+            .map(|job| invocation_value(job, &network)));
     };
-    let network = access.network_id.clone();
-    let (bot, works) = {
-        let store = node.store.lock().await;
-        (
-            store.bot_for_conversation(&network, &conversation)?,
-            store.works(&network, &conversation)?,
-        )
-    };
-    let mut probes = BTreeMap::new();
-    for provider in crate::providers::Provider::ALL {
-        probes.insert(provider, node.provider_probe_snapshot(provider).await);
-    }
+    let bot = node
+        .store
+        .lock()
+        .await
+        .bot_for_conversation(&network, &conversation)?;
+    let provider = settings.provider;
+    let probe = node.provider_probe_snapshot(provider).await;
+    let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
     let tool_url = node
         .tool_url
         .get()
         .context("local tool listener is not ready")?;
+    let server = match provider.sessions() {
+        crate::providers::Sessions::AppServer => node.codex.server(),
+        crate::providers::Sessions::Store(store) => store.to_owned(),
+        crate::providers::Sessions::Process => String::new(),
+    };
     let tool_cli = std::env::current_exe()?;
-    let mut selection = None;
-    let claimed = {
+    let guide = manager::bot_instructions(
+        Some(&tool_cli),
+        &provider.tools_for(TriggerKind::Human),
+        &thread_instructions(),
+    );
+    let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
+        network: network.clone(),
+        conversation: conversation.clone(),
+    });
+    let selected = {
         let mut store = node.store.lock().await;
         store.authorize_node(&network, &node.identity.device_id()?)?;
-        match store.claim_next(&node.identity, &network, &conversation, boot_id(), |job| {
-            let resolved = if job.kind == TriggerKind::AgentTask {
-                Some(
-                    works
-                        .iter()
-                        .find(|work| work.work_id == job.reply_to)
-                        .context("agent task work is not stored on this device")?
-                        .resolved
+        store.claim_next(
+            &node.identity,
+            &network,
+            &conversation,
+            boot_id(),
+            |job, accepted| {
+                if job.kind == TriggerKind::AgentTask {
+                    let accepted = accepted.context("agent task selection missing")?;
+                    if let Some(failure) =
+                        task_start_failure(Some(settings.provider), accepted.provider)
+                    {
+                        return Err(ManagerError {
+                            stage: ProviderStage::Validate,
+                            outcome: manager::ManagerFailure::Failed,
+                            start: manager::StartEvidence::NotStarted,
+                            session_id: None,
+                            failure,
+                        }
+                        .into());
+                    }
+                }
+                let actual = turn_settings(settings.clone(), bot.as_ref(), accepted);
+                let readiness = probe.readiness(&actual.model);
+                if matches!(readiness, crate::providers::ProviderReadiness::Starting) {
+                    return Ok(None);
+                }
+                let generation = node.provider_generation(actual.provider, &local_providers)?;
+                let session_config = session_key(
+                    &actual,
+                    thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
+                    instance
                         .as_ref()
-                        .context("agent task model was not resolved on acceptance")?,
-                )
-            } else {
-                None
-            };
-            let settings = turn_settings(device_settings, bot.as_ref(), resolved);
-            let provider = settings.provider;
-            let readiness = probes[&provider].readiness(&settings.model);
-            if matches!(readiness, crate::providers::ProviderReadiness::Starting) {
-                return Ok(None);
-            }
-            let generation = node.provider_generation(provider, &local_providers)?;
-            let thread = provider.prompt_mode() == crate::providers::PromptMode::Thread;
-            let server = match provider.sessions() {
-                crate::providers::Sessions::AppServer => node.codex.server(),
-                crate::providers::Sessions::Store(store) => store.to_owned(),
-                crate::providers::Sessions::Process => String::new(),
-            };
-            let guide = manager::bot_instructions(
-                Some(&tool_cli),
-                &provider.tools_for(TriggerKind::Human),
-                &thread_instructions(),
-            );
-            let instance = provider.instance_per_bot().then(|| CursorInstance::Bot {
-                network: network.clone(),
-                conversation: conversation.clone(),
-            });
-            let session_config = session_key(
-                &settings,
-                thread.then_some((tool_url.as_str(), server.as_str(), guide.as_str())),
-                instance
-                    .as_ref()
-                    .map(|instance| node.cursor_store_root(instance)),
-            )?;
-            let sdk_config = digest(&serde_json::to_vec(&(
-                session_config,
-                &generation,
-                &settings.model,
-                &settings.reasoning_effort,
-            ))?);
-            selection = Some((settings, generation, readiness, thread, server, instance));
-            Ok(Some(sdk_config))
-        })? {
-            Some(claimed) => claimed,
-            None => return Ok(None),
-        }
+                        .map(|instance| node.cursor_store_root(instance)),
+                )?;
+                let sdk_config = digest(&serde_json::to_vec(&(
+                    session_config,
+                    &generation,
+                    &actual.model,
+                    &actual.reasoning_effort,
+                ))?);
+                let selection = RuntimeSelection {
+                    provider: actual.provider,
+                    model: (!actual.model.is_empty()).then(|| actual.model.clone()),
+                    reasoning_effort: actual.reasoning_effort.clone(),
+                };
+                Ok(Some((
+                    sdk_config,
+                    selection,
+                    generation,
+                    (actual, readiness),
+                )))
+            },
+        )
     };
     drop(launch_claim);
-    let (settings, generation, readiness, thread, server, instance) =
-        selection.context("claimed scheduler configuration missing")?;
-    let provider = settings.provider;
+    let (claimed, (settings, readiness)) = match selected {
+        Ok(Some(selected)) => selected,
+        Ok(None) => return Ok(None),
+        Err(error)
+            if error.downcast_ref::<ManagerError>().is_some_and(|error| {
+                matches!(
+                    error.failure.kind,
+                    FailureKind::NoBot | FailureKind::ExecutionDisabled
+                )
+            }) =>
+        {
+            return Ok(node
+                .finish_incompatible_tasks(&network, Some(&conversation))
+                .await?
+                .first()
+                .map(|job| invocation_value(job, &network)));
+        }
+        Err(error) => return Err(error),
+    };
     let mut job = claimed.job;
     let trigger = job.trigger.clone();
     let attempt = job
         .state
         .attempt()
-        .context("claimed scheduler attempt missing")?
+        .expect("Store returns a claimed attempt")
         .clone();
-    let runtime = TurnRuntime {
-        provider,
-        model: (!settings.model.is_empty()).then(|| settings.model.clone()),
-        reasoning_effort: settings.reasoning_effort.clone(),
-        generation,
-        session_generation: claimed.session_generation,
-        delivery_id: attempt.id.clone(),
-        stage: ProviderStage::Validate,
-        execution: TurnExecution::NotStarted,
-        attempted_at_ms: crate::runtime::now_ms(),
-        switched_from: None,
-        switch_reason: None,
-    };
-    job = node.store.lock().await.record_turn_runtime(
-        &conversation,
-        &trigger,
-        &attempt.id,
-        &runtime,
-    )?;
     if let Some(work_id) = trigger
         .strip_prefix("work:")
         .or_else(|| trigger.strip_prefix("task:"))
@@ -489,6 +520,18 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
     let mut registered = false;
     let mut sdk_live = false;
     let outcome: Result<Value> = std::panic::AssertUnwindSafe(async {
+        #[cfg(test)]
+        if job.kind == TriggerKind::AgentTask {
+            let barrier = node
+                .claim_to_start_barrier
+                .lock()
+                .expect("claim barrier")
+                .take();
+            if let Some((claimed, resume)) = barrier {
+                claimed.notify_one();
+                resume.notified().await;
+            }
+        }
         let local = node.identity.device_id()?;
         // A resumed thread the backend no longer has is replaced by a new one, which needs it all.
         let wants_fresh = thread && claimed.previous_native_id.is_some();
@@ -658,10 +701,12 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             )
             .await?;
         registered = true;
-        node.store
-            .lock()
-            .await
-            .mark_started(&conversation, &trigger, &attempt.id)?;
+        if job.kind != TriggerKind::AgentTask {
+            node.store
+                .lock()
+                .await
+                .mark_started(&conversation, &trigger, &attempt.id)?;
+        }
         node.publish_changed(&network, &conversation, Changed::Job(&trigger));
         started = true;
         sdk_live = true;
@@ -692,6 +737,7 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
                 let known = record_failure(&node, &job, &error, TurnExecution::Unknown).await?;
                 let backup = error
                     .downcast_ref::<ManagerError>()
+                    .filter(|_| job.kind != TriggerKind::AgentTask)
                     .and_then(|error| {
                         settings.backup.candidate(
                             &settings,
@@ -915,10 +961,16 @@ async fn turn(node: Arc<Runtime>, access: Access, conversation: String) -> Resul
             || ExecFailure::new(FailureKind::Unknown, error.to_string()),
             |e| e.failure.clone(),
         );
-        let uncertain = sdk_live
-            && error
-                .downcast_ref::<ManagerError>()
-                .is_none_or(|e| e.uncertain());
+        let uncertain = job.pending_check
+            || !started
+                && job
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.execution != TurnExecution::NotStarted)
+            || sdk_live
+                && error
+                    .downcast_ref::<ManagerError>()
+                    .is_none_or(|e| e.uncertain());
         if !registered {
             tools_fenced = true;
         }
@@ -1115,10 +1167,12 @@ async fn record_failure(
     };
     if execution == TurnExecution::NotStarted
         && (current.tool_calls
-            || current
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.execution == TurnExecution::Started))
+            || current.pending_check
+            || current.runtime.as_ref().is_some_and(|runtime| {
+                runtime.execution == TurnExecution::Started
+                    || otherwise == TurnExecution::NotStarted
+                        && runtime.execution == TurnExecution::Unknown
+            }))
     {
         execution = TurnExecution::Unknown;
     }
@@ -1908,13 +1962,13 @@ mod tests {
             backup: Default::default(),
         };
         let frozen = crate::model::ResolvedModel {
-            provider: crate::providers::Provider::Claude,
+            provider: crate::providers::Provider::Pi,
             model: Some("accepted".into()),
         };
         let selected = turn_settings(settings.clone(), None, Some(&frozen));
         assert_eq!(selected.provider, frozen.provider);
         assert_eq!(selected.model, "accepted");
-        assert_eq!(selected.reasoning_effort, None);
+        assert_eq!(selected.reasoning_effort, Some("high".into()));
         assert_ne!(
             session_key(&selected, None, None)?,
             session_key(&settings, None, None)?

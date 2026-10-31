@@ -567,25 +567,23 @@ pub fn validate_event_shape(event: &Event) -> Result<()> {
             if let Some(model) = model {
                 crate::model::validate_model(model)?;
             }
-            if let Some(resolved) = resolved {
-                let role = if *kind == WorkKind::Task {
-                    crate::providers::Role::Agent
-                } else {
-                    crate::providers::Role::Execution
-                };
-                if let WorkKind::Agent(provider) = kind {
-                    ensure!(
-                        resolved.provider == *provider,
-                        "resolved work provider does not match its agent"
-                    );
-                }
+            let role = if *kind == WorkKind::Task {
+                crate::providers::Role::Agent
+            } else {
+                crate::providers::Role::Execution
+            };
+            if let WorkKind::Agent(provider) = kind {
                 ensure!(
-                    resolved.provider.supports().contains(&role),
-                    "resolved work provider cannot run this kind"
+                    resolved.provider == *provider,
+                    "resolved work provider does not match its agent"
                 );
-                if let Some(model) = &resolved.model {
-                    crate::model::validate_model(model)?;
-                }
+            }
+            ensure!(
+                resolved.provider.supports().contains(&role),
+                "resolved work provider cannot run this kind"
+            );
+            if let Some(model) = &resolved.model {
+                crate::model::validate_model(model)?;
             }
             for work in continues.iter().chain(parent.iter()).chain(thread.iter()) {
                 id(work)?;
@@ -1048,10 +1046,10 @@ mod tests {
                 call_ref: "call-1".into(),
                 kind: WorkKind::Agent(Provider::Codex),
                 model: None,
-                resolved: Some(ResolvedModel {
+                resolved: ResolvedModel {
                     provider,
                     model: None,
-                }),
+                },
                 cwd: "/tmp".into(),
                 title: "run".into(),
                 prompt: "run".into(),
@@ -1065,6 +1063,12 @@ mod tests {
             .sign_event(event(Provider::Codex))
             .expect("matching frozen provider should be valid");
         assert!(identity.sign_event(event(Provider::Claude)).is_err());
+        let mut missing = serde_json::to_value(event(Provider::Codex))?;
+        missing["body"]
+            .as_object_mut()
+            .context("body")?
+            .remove("resolved");
+        assert!(serde_json::from_value::<Event>(missing).is_err());
         Ok(())
     }
 }

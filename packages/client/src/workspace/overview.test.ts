@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
+import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
@@ -11,12 +11,12 @@ const node = (device_id: string, online = true, local = false): NodeInfo => ({
   device_id, name: device_id, local, online, revoked: false,
   capabilities: { manager: "manager", manager_state: "ready", relay: false, roots: [], codex_connected: true },
 })
-const work = (extra: Partial<OpenWork> = {}): OpenWork => ({
+const work = (extra: Record<string, unknown> = {}): OpenWork => parseOpenWorks({ works: [{
   work_id: "work-1", conversation_id: "chat-1", trigger: "message:m1", dispatcher: "gateway", call_ref: "dispatch-1",
   target_node: "worker", cwd: "/project", title: "检查部署", prompt: "检查", state: "running", phase: "running",
   summary: "执行中", outcome: null, result_text: "", failure_reason: null, kind: "codex", thread: "provider-thread",
-  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", ...extra,
-})
+  thread_id: "provider-thread", turn_id: "turn-1", parent: "parent-work", continues: "continued-work", resolved: { provider: "codex", model: null }, ...extra,
+}] })[0]!
 const question = (extra: Partial<Question> = {}): Question => ({
   question_id: "question-1", conversation_id: "chat-1", bot: { bot_id: "bot-chat-1", name: "Bot" }, severity: "attention",
   text: "要继续吗？", choices: [{ label: "继续" }], about: { node: "worker", agent: "codex", session_id: "provider-thread", cwd: "/project", summary: "", request_id: "request-1" },
@@ -107,4 +107,23 @@ test("an overview row the Node names only by its conversation shows that convers
 test("a failed open work stays on the task page", () => {
   const overview = overviewFromWorkspace({ openWorks: [work({ state: "finished", outcome: "failed", failure_reason: "boom" })], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
   assert.deepEqual(overview.tasks.map((task) => [task.work_id, task.outcome]), [["work-1", "failed"]])
+})
+
+
+test("accepted records require a frozen selection while dispatch and overview cards stay summaries", () => {
+  const accepted = work()
+  assert.deepEqual(accepted.resolved, { provider: "codex", model: null })
+  const { resolved: _selection, ...missing } = accepted
+  assert.throws(() => parseOpenWorks({ works: [missing] }))
+  assert.throws(() => parseOpenWorks({ works: [{ ...missing, resolved: null }] }))
+  assert.throws(() => parseOpenWorks({ works: [{ ...missing, resolved: { provider: "codex" } }] }))
+  const [dispatch] = parseOpenWorks({ works: [{ ...missing, state: "dispatch_waiting" }] })
+  assert.equal(dispatch?.state, "dispatch_waiting")
+  assert.equal(dispatch?.resolved, undefined)
+  const overview = overviewFromWorkspace({ openWorks: [accepted], bots: [bot("chat-1")], questions: [], nodes: [node("worker")] })
+  const [card] = openWorksFromOverview(overview)
+  assert.equal(card?.work_id, accepted.work_id)
+  assert.equal(card?.state, "running")
+  assert.equal(card && "resolved" in card, false)
+  assert.equal(card && "prompt" in card, false)
 })

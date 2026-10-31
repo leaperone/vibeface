@@ -1,7 +1,7 @@
 import { asProvider, type MembershipView, type ProviderId } from "../lib/node.ts"
 import type { LiveProgress } from "../lib/progress.ts"
 import { confirmReason } from "./model.ts"
-import type { NodeInfo, WorkRecord } from "./types.ts"
+import type { NodeInfo, WorkCard, WorkRecord } from "./types.ts"
 
 const stateNames: Record<string, string> = {
   accepted: "已接收",
@@ -144,14 +144,14 @@ export function taskProgress(work: Pick<WorkRecord, "work_id" | "target_node" | 
  * A work only the person can settle now reads as awaiting confirmation; a finished one as its outcome; a stop not yet
  * confirmed as that stop, which keeps being retried.
  */
-export const shownState = (work: WorkRecord, nodes: NodeInfo[] = []) =>
+export const shownState = (work: WorkCard, nodes: NodeInfo[] = []) =>
   confirmReason(work, nodes) ? "awaiting_confirmation" : work.outcome ?? work.stop ?? work.state
 export const taskActive = (state: string) => ["accepted", "running", "interrupting", "dispatch_waiting", "stop_waiting", "stop_timed_out"].includes(state)
 /**
  * A chat task's state: one that completed while a work it dispatched, or that work's own, still runs waits on them. No record
  * says so, so this reads only the works this device holds; a child not synced yet does not hold its parent.
  */
-export function chatTaskState(work: WorkRecord, works: readonly WorkRecord[], nodes: NodeInfo[] = []): string {
+export function chatTaskState(work: WorkCard, works: readonly WorkCard[], nodes: NodeInfo[] = []): string {
   const state = shownState(work, nodes)
   if (state !== "completed") return state
   const seen = new Set([work.work_id])
@@ -197,7 +197,7 @@ export const fixOnDeviceLabel = (device: string) => `去设置「${device}」`
 export type TaskGroup = "attention" | "working" | "waiting"
 export const taskGroups: readonly { group: TaskGroup; title: string }[] = [{ group: "attention", title: "需要留意" }, { group: "working", title: "进行中" }, { group: "waiting", title: "等待中" }]
 /** The state a task card shows: the overview names a failed work only as finished, so its outcome says how. */
-export const cardState = (work: WorkRecord, nodes: NodeInfo[], projected?: string) =>
+export const cardState = (work: WorkCard, nodes: NodeInfo[], projected?: string) =>
   work.outcome === "failed" || work.outcome === "rejected" ? work.outcome : projected ?? shownState(work, nodes)
 export const needsLook = (state: string) => ["failed", "rejected", "dispatch_rejected", "dispatch_unverified"].includes(state)
 /** A task that failed, was never taken or awaits the person's confirmation needs them; one out of their hands or held on them waits; the rest work. */

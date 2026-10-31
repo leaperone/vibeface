@@ -1182,7 +1182,10 @@ mod tests {
             call_ref: call_ref.into(),
             kind: WorkKind::Agent(Provider::Cursor),
             model: None,
-            resolved: None,
+            resolved: crate::model::ResolvedModel {
+                provider: Provider::Cursor,
+                model: Some("fixture-model".into()),
+            },
             cwd: workspace.display().to_string(),
             title: "cursor work".into(),
             prompt: prompt.into(),
@@ -1226,7 +1229,7 @@ mod tests {
             ),
         ] {
             let spec = work(&node, &workspace, call_ref, "fixture prompt")?;
-            node.store.lock().await.accept_work(
+            node.store.lock().await.accept_work_fixture(
                 &node.identity,
                 &network,
                 spec.clone(),
@@ -1284,10 +1287,12 @@ mod tests {
     async fn cursor_work_dispatches_once_and_returns_result() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "once", "build it")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         assert!(
             !node
                 .start_work(
@@ -1308,11 +1313,12 @@ mod tests {
             "{finished:?}"
         );
         assert_eq!(finished.text, "done: build it");
-        let (_, created) =
-            node.store
-                .lock()
-                .await
-                .accept_work(&node.identity, &network, spec, now_ms())?;
+        let (_, created) = node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec,
+            now_ms(),
+        )?;
         assert!(
             !created,
             "retrying the same call only reads the existing work"
@@ -1332,10 +1338,12 @@ mod tests {
     async fn cursor_interrupt_waits_for_provider_cancelled_terminal() -> Result<()> {
         let (node, dir, network, workspace) = cursor_node().await?;
         let spec = work(&node, &workspace, "cancel", "hang around")?;
-        node.store
-            .lock()
-            .await
-            .accept_work(&node.identity, &network, spec.clone(), now_ms())?;
+        node.store.lock().await.accept_work_fixture(
+            &node.identity,
+            &network,
+            spec.clone(),
+            now_ms(),
+        )?;
         node.start_work(
             node.executor(Provider::Cursor)?,
             &network,

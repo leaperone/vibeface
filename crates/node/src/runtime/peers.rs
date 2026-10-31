@@ -2512,7 +2512,10 @@ mod tests {
                 call_ref: "remote".into(),
                 kind: WorkKind::Agent(crate::providers::Provider::Codex),
                 model: None,
-                resolved: None,
+                resolved: crate::model::ResolvedModel {
+                    provider: crate::providers::Provider::Codex,
+                    model: None,
+                },
                 cwd: "/tmp".into(),
                 title: "t".into(),
                 prompt: "p".into(),
@@ -2542,7 +2545,7 @@ mod tests {
                 )?;
                 let signature = posted.attestation().cloned().context("signed message")?;
                 store.accept_message(&ia, &network, "c", "m1", "go", vec![], true, signature, 2)?;
-                store.accept_work(&ib, &network, work.clone(), 3)?;
+                store.accept_work_fixture(&ib, &network, work.clone(), 3)?;
             }
             let shared = async || -> Result<(i64, Option<WorkOutcome>)> {
                 let store = a.store.lock().await;
@@ -3418,7 +3421,7 @@ mod tests {
                     now_ms(),
                 )?;
                 let claimed = store
-                    .claim_next(&ic, &network, "bot", "boot", |_| Ok(Some("cfg".into())))?
+                    .claim_next_fixture(&ic, &network, "bot", "boot", "cfg")?
                     .context("job")?;
                 let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
                 store.mark_started("bot", &claimed.job.trigger, &attempt)?;
@@ -4003,9 +4006,9 @@ mod tests {
     async fn accepted_tasks_survive_disabled_or_changed_bot_settings_and_concurrent_retries()
     -> Result<()> {
         use crate::{
-            model::{ResolvedModel, WorkKind},
+            model::ResolvedModel,
             providers::Provider,
-            work::WorkSpec,
+            work::{RequestedWorkKind, WorkRequest, WorkSpec},
         };
         let (sender, target) = (LocalIdentity::generate(), LocalIdentity::generate());
         let state =
@@ -4038,16 +4041,15 @@ mod tests {
                 now_ms(),
             )?;
         }
-        let spec = WorkSpec {
+        let spec = WorkRequest {
             work_id: WorkSpec::id("c", "message:m1", "same"),
             conversation: "c".into(),
             trigger: "message:m1".into(),
             target: target.device_id()?,
             dispatcher: sender.device_id()?,
             call_ref: "same".into(),
-            kind: WorkKind::Task,
+            kind: RequestedWorkKind::Task,
             model: Some("  ".into()),
-            resolved: None,
             cwd: dir.display().to_string(),
             title: "task".into(),
             prompt: "go".into(),
@@ -4056,34 +4058,50 @@ mod tests {
             thread: None,
         };
         let (first, second) = tokio::join!(
-            node.accept_dispatch(&network, spec.clone()),
-            node.accept_dispatch(&network, spec.clone()),
+            node.accept_dispatch(&network, spec.clone(), &Value::Null),
+            node.accept_dispatch(&network, spec.clone(), &Value::Null),
         );
-        assert_eq!(u8::from(first?.1) + u8::from(second?.1), 1);
+        assert_eq!(u8::from(first?.created) + u8::from(second?.created), 1);
         node.settings.lock().unwrap().manager = None;
-        assert!(!node.accept_dispatch(&network, spec.clone()).await?.1);
+        assert!(
+            !node
+                .accept_dispatch(&network, spec.clone(), &Value::Null)
+                .await?
+                .created
+        );
         node.settings.lock().unwrap().manager = Some(config::ManagerSettings {
             provider: Provider::Pi,
             model: "changed-model".into(),
             ..initial
         });
-        assert!(!node.accept_dispatch(&network, spec.clone()).await?.1);
-        let changed = WorkSpec {
+        assert!(
+            !node
+                .accept_dispatch(&network, spec.clone(), &Value::Null)
+                .await?
+                .created
+        );
+        let changed = WorkRequest {
             model: Some("conflict".into()),
             ..spec.clone()
         };
         assert!(
             format!(
                 "{:#}",
-                node.accept_dispatch(&network, changed).await.unwrap_err()
+                node.accept_dispatch(&network, changed, &Value::Null)
+                    .await
+                    .unwrap_err()
             )
             .contains("changed: model")
         );
-        let changed = WorkSpec {
+        let changed = WorkRequest {
             prompt: "different".into(),
             ..spec.clone()
         };
-        assert!(node.accept_dispatch(&network, changed).await.is_err());
+        assert!(
+            node.accept_dispatch(&network, changed, &Value::Null)
+                .await
+                .is_err()
+        );
         {
             let store = node.store.lock().await;
             let works = store.works(&network, "c")?;
@@ -4091,10 +4109,10 @@ mod tests {
             assert_eq!(works[0].model, None);
             assert_eq!(
                 works[0].resolved,
-                Some(ResolvedModel {
+                ResolvedModel {
                     provider: Provider::Claude,
                     model: Some("first-model".into())
-                })
+                }
             );
             assert_eq!(
                 store
@@ -4107,7 +4125,12 @@ mod tests {
         }
         drop(node);
         let node = Arc::new(Runtime::reopen(&dir).await?);
-        assert!(!node.accept_dispatch(&network, spec).await?.1);
+        assert!(
+            !node
+                .accept_dispatch(&network, spec, &Value::Null)
+                .await?
+                .created
+        );
         drop(node);
         std::fs::remove_dir_all(dir)?;
         Ok(())

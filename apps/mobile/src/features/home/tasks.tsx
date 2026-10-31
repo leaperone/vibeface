@@ -8,7 +8,7 @@ import { workFailure } from '@vibeface/client/lib/errors.ts'
 import { cardState, needsLook, nodeName, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { awaitsAnswer } from '@vibeface/client/workspace/questions.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
-import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
+import type { BotRecord, NodeInfo, OpenWorkCard, OverviewTask } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -37,7 +37,7 @@ export function TasksScreen() {
   const visibleWorks = overview ? overviewWorks.filter((work) => projected.has(work.work_id)) : overviewWorks
   const bot = workspace.bots[0]
   const held = new Set((shared?.questions ?? []).filter((question) => awaitsAnswer(question, shared?.answered ?? {}) && question.about.request_id).map((question) => question.about.session_id))
-  const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
+  const groups: Record<TaskGroup, OpenWorkCard[]> = { attention: [], working: [], waiting: [] }
   for (const work of visibleWorks) groups[taskGroup(cardState(work, lookup.nodes, projected.get(work.work_id)?.state), held.has(work.thread_id ?? ''))].push(work)
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
@@ -74,7 +74,7 @@ function MobileEmpty({ bot }: { bot?: Pick<BotRecord, 'bot_id' | 'name'> }) {
 type Lookup = { nodes: NodeInfo[]; directory: ReturnType<typeof useDevice>['directory'] }
 type TaskBot = Pick<BotRecord, 'bot_id' | 'conversation_id' | 'name' | 'avatar'>
 
-function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: OpenWork; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
+function TaskRow({ work, projected, bot, lookup, connected, progress }: { work: OpenWorkCard; projected?: Extract<OverviewTask, { kind: 'work' | 'dispatch' }>; bot?: TaskBot; lookup: Lookup; connected: boolean; progress: string }) {
   const rawState = cardState(work, lookup.nodes, projected?.state)
   const failed = needsLook(rawState) && rawState !== 'dispatch_unverified'
   const stale = taskStale(rawState, connected)
