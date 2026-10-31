@@ -2650,7 +2650,12 @@ mod tests {
         });
         let observed = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
         let pending = !task.is_finished();
-        let seen_before_completion = calls.lock().unwrap().len();
+        let recorded_before_completion = calls.lock().unwrap().clone();
+        let seen_before_completion = recorded_before_completion
+            .iter()
+            .filter(|(_, turn)| turn.is_some())
+            .count();
+        let native_before_completion = persisted.lock().unwrap().clone();
         let received = place.user_frames();
         release(&place);
         let result = task.await??;
@@ -2658,8 +2663,17 @@ mod tests {
         assert!(pending);
         assert_eq!(received, 1);
         assert_eq!(seen_before_completion, 0);
+        let native = native_before_completion.context("native session persisted before start")?;
+        assert_eq!(recorded_before_completion, vec![(native.clone(), None)]);
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (native.clone(), None),
+                (native.clone(), Some(derived(MESSAGE_SEED, "start-state"))),
+            ]
+        );
+        assert_eq!(result.session_id.as_deref(), Some(native.as_str()));
         assert_eq!(result.output, "done: hello");
         Ok(())
     }

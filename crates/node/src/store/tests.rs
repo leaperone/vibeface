@@ -710,11 +710,31 @@ fn stopped_and_interrupted_turns_leave_a_status_reply() -> Result<()> {
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &claimed.job.trigger, &attempt)?;
     store.recover_scheduler_jobs(&net.a, &net.network, "boot-2")?;
+    assert!(
+        store
+            .message(&net.network, "c", &claimed.job.message_id)?
+            .is_none(),
+        "an unknown restart has no terminal reply"
+    );
+    assert_eq!(store.pending_checks()?.len(), 1);
+    assert!(matches!(
+        store
+            .scheduler_job("c", &message_trigger("m2"))?
+            .context("job")?
+            .state,
+        JobState::Reconciling { .. }
+    ));
+    let check = store
+        .pending_checks()?
+        .into_iter()
+        .find(|check| check.attempt_id == attempt)
+        .context("pending check")?;
+    store.confirm_manager_stopped(&net.a, &net.network, &check, 5)?;
     let reply = store
         .message(&net.network, "c", &claimed.job.message_id)?
-        .context("reply")?;
+        .context("confirmed reply")?;
     assert_eq!(reply.status, Some(ReplyStatus::Interrupted));
-    assert_eq!(store.pending_checks()?.len(), 1);
+    assert_eq!(store.pending_checks()?.len(), 0);
     assert!(matches!(
         store
             .scheduler_job("c", &message_trigger("m2"))?
@@ -5870,7 +5890,14 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             .context("job")?;
         let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
         store.mark_started("c", &claimed.job.trigger, &attempt)?;
-        let job = store.finish_job(
+        let unknown = matches!(
+            &outcome,
+            JobOutcome::Interrupted {
+                process_unconfirmed: true,
+                ..
+            }
+        );
+        let mut job = store.finish_job(
             &net.a,
             &net.network,
             "c",
@@ -5880,9 +5907,24 @@ fn a_failed_turn_shares_its_kind_and_keeps_the_raw_detail_local() -> Result<()> 
             "",
             3,
         )?;
+        if unknown {
+            assert!(
+                store
+                    .message(&net.network, "c", &claimed.job.message_id)?
+                    .is_none(),
+                "an unknown result has no terminal reply"
+            );
+            assert!(matches!(job.state, JobState::Reconciling { .. }));
+            let check = store
+                .pending_checks()?
+                .into_iter()
+                .find(|check| check.attempt_id == attempt)
+                .context("pending check")?;
+            job = store.confirm_manager_stopped(&net.a, &net.network, &check, 4)?;
+        }
         let reply = store
             .message(&net.network, "c", &claimed.job.message_id)?
-            .context("reply")?;
+            .context("confirmed reply")?;
         assert_eq!(
             (reply.status, reply.failure, reply.text.as_str()),
             (Some(status), Some(FailureKind::MissingKey), ""),

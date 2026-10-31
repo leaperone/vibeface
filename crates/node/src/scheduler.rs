@@ -2298,6 +2298,7 @@ mod tests {
                 serde_json::from_value(json!({
                     "work_id":format!("w{index}"),"conversation_id":"c","target_node":"a",
                     "trigger":"message:m30","dispatcher":"a","kind":"codex","cwd":"/work",
+                    "model":null,"resolved":{"provider":"codex","model":null},
                     "title":"work","prompt":"p".repeat(500),"call_ref":format!("call-{index}"),
                     "summary":"s".repeat(400),"result_text":"r".repeat(1_000),"state":"unverified",
                 }))

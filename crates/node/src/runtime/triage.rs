@@ -6228,14 +6228,33 @@ pub(super) mod tests {
                 .scheduler_job("c", &trigger)?
                 .context("claim")?;
             let attempt = job.state.attempt().context("attempt")?.id.clone();
-            node.store
-                .lock()
-                .await
-                .mark_started("c", &trigger, &attempt)?;
+            let before_registration = {
+                let mut store = node.store.lock().await;
+                store.mark_started("c", &trigger, &attempt)?;
+                store.update_turn_runtime(
+                    "c",
+                    &trigger,
+                    &attempt,
+                    vibeface_bridge::failure::ProviderStage::TurnStart,
+                    crate::scheduling::TurnExecution::Unknown,
+                )?
+            };
             resume.notify_one();
             tokio::time::timeout(Duration::from_secs(10), running)
                 .await???
                 .context("reconciled refusal")?;
+            assert!(matches!(
+                before_registration.state,
+                crate::scheduling::JobState::Running { .. }
+            ));
+            assert_eq!(
+                before_registration
+                    .runtime
+                    .as_ref()
+                    .context("unknown runtime before registration")?
+                    .execution,
+                crate::scheduling::TurnExecution::Unknown
+            );
             let job = node
                 .store
                 .lock()

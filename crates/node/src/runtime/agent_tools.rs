@@ -123,50 +123,8 @@ impl Runtime {
                 work_status(&works, &dispatches, &args)
             }
             Tool::CallLookup => {
-                let manager = access
-                    .manager
-                    .as_ref()
-                    .context("call lookup requires an agent invocation")?;
-                let call_ref = field(&args, "call_ref")?;
-                let id = WorkSpec::id(&scope, &manager.trigger, call_ref);
-                let store = self.store.lock().await;
-                if let Some(work) = store
-                    .works(network, &scope)?
-                    .into_iter()
-                    .find(|work| work.work_id == id)
-                {
-                    return Ok(json!(work));
-                }
-                if let Some(dispatch) = store.dispatch(&id)? {
-                    return Ok(dispatch_row(&dispatch));
-                }
-                if let Some(change) =
-                    store.bot_change(network, &change_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(change));
-                }
-                if let Some(staged) = store.staged_memory_call(
-                    &scope,
-                    &manager.trigger,
-                    &manager.attempt_id,
-                    call_ref,
-                )? {
-                    return Ok(staged);
-                }
-                if let Some(message) = store
-                    .bot_message(network, &bot_message_id(&scope, &manager.trigger, call_ref))?
-                {
-                    return Ok(json!(message));
-                }
-                let (bot_id, _) = created_bot_id(&scope, &manager.trigger, call_ref);
-                let bot = store
-                    .bots(network)?
-                    .into_iter()
-                    .find(|bot| bot.bot_id == bot_id)
-                    .context(
-                        "nothing was dispatched, changed, sent or created with this call_ref",
-                    )?;
-                Ok(tool_bot(&bot))
+                self.call_lookup(&access, &scope, field(&args, "call_ref")?)
+                    .await
             }
             Tool::Recall => {
                 let query = args["query"].as_str().map(str::to_lowercase);
@@ -700,6 +658,11 @@ impl Runtime {
             store.bot_change(network, &change_id(scope, &manager.trigger, call_ref))?
         {
             return Ok(json!(change));
+        }
+        if let Some(staged) =
+            store.staged_memory_call(scope, &manager.trigger, &manager.attempt_id, call_ref)?
+        {
+            return Ok(staged);
         }
         if let Some(message) =
             store.bot_message(network, &bot_message_id(scope, &manager.trigger, call_ref))?
@@ -1393,7 +1356,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cloned_access_cannot_reenter_after_backup_reregistration() -> Result<()> {
-        use crate::scheduling::{RuntimeSelection, TurnExecution, TurnRuntime};
+        use crate::scheduling::{RuntimeSelection, SessionConfig, TurnExecution, TurnRuntime};
         use vibeface_bridge::failure::{FailureKind, ProviderStage};
 
         let (node, admin, dir) = node().await?;
@@ -1411,7 +1374,11 @@ mod tests {
             crate::scheduling::JobState::Claimed { .. }
         ));
         assert_eq!(
-            claimed.runtime.context("claimed runtime")?.execution,
+            claimed
+                .runtime
+                .as_ref()
+                .context("claimed runtime")?
+                .execution,
             TurnExecution::NotStarted
         );
         let idle = Access {
@@ -1425,11 +1392,11 @@ mod tests {
             model: Some("primary".into()),
             reasoning_effort: None,
             generation: "primary-configuration".into(),
-            session_generation: node
-                .store
-                .lock()
-                .await
-                .advance_scheduler_lineage("c", &trigger, &attempt)?,
+            session_generation: claimed
+                .runtime
+                .as_ref()
+                .context("claimed runtime")?
+                .session_generation,
             delivery_id: attempt.clone(),
             stage: ProviderStage::Validate,
             execution: TurnExecution::NotStarted,
@@ -1473,11 +1440,22 @@ mod tests {
         runtime.switch_reason = Some(FailureKind::Quota);
         runtime.provider = Provider::Pi;
         runtime.model = Some("backup".into());
+        runtime.generation = "backup-configuration".into();
         runtime.session_generation = node
             .store
             .lock()
             .await
-            .advance_scheduler_lineage("c", &trigger, &attempt)?;
+            .switch_scheduler_session(
+                "c",
+                &trigger,
+                &attempt,
+                &SessionConfig {
+                    stable_fingerprint: "backup-stable".into(),
+                    runtime_fingerprint: "backup-runtime".into(),
+                    provider: Provider::Pi,
+                },
+            )?
+            .session_generation;
         node.store
             .lock()
             .await
@@ -1549,11 +1527,10 @@ mod tests {
             .await
             .err()
             .context("old epoch must fail")?;
-        assert!(
-            error
-                .to_string()
-                .contains("requires an initialized data epoch 9 directory")
-        );
+        assert!(error.to_string().contains(&format!(
+            "requires an initialized data epoch {} directory",
+            crate::config::DATA_EPOCH
+        )));
         assert_eq!(std::fs::read_dir(&dir)?.count(), 1);
         std::fs::remove_dir_all(dir)?;
         Ok(())
