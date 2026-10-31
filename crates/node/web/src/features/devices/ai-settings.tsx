@@ -10,7 +10,7 @@ import { deviceCopy } from "@vibeface/client/identity/copy.ts"
 import { folderLabels } from "@vibeface/client/workspace/bot-settings.ts"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import { terms } from "@/lib/glossary"
-import { availability, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
+import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, modelTyped, parseAppServerLink, parseNodeSettings, parseProvider, probeIssueText, effortOptions, type ModelChoice, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type NodeSettings, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from "@vibeface/client/lib/node.ts"
 
 export const docs = "https://github.com/leaperone/vibeface/blob/main/docs/"
 export const providerIcons: Record<ProviderId, LucideIcon> = { codex: SquareTerminal, cursor: MousePointer2, claude: Asterisk, pi: Pi, opencode: Braces }
@@ -312,8 +312,10 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
   const bot = item.roles.includes("agent"), execution = item.roles.includes("execution")
   const botable = item.supports.includes("agent"), executable = item.supports.includes("execution")
   const manager = bot ? response.settings.manager : null
+  const readiness = summaryReadiness(item)
   const usable = availability(item)
   const state = states[usable]
+  const executionState = states[item.execution_readiness.state]
   const [editing, setEditing] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
   const [value, setValue] = useState("")
@@ -411,8 +413,8 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         : <button type="button" className="hit-area relative font-medium text-foreground underline underline-offset-4" onClick={() => openProvider(item.provider)}>去设置</button>}
     </p> : null}
     <div className="grid gap-1 px-4 pb-3 sm:ps-12">
-      {'issue' in item.readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</p> : null}
-      {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(item.readiness.state) ? <div className="grid gap-2 text-meta">
+      {'issue' in readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</p> : null}
+      {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(readiness.state) ? <div className="grid gap-2 text-meta">
         <p>在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</p>
         <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
         <div className="flex min-w-0 gap-2">
@@ -437,6 +439,8 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
             busy={busy === `${item.provider}:bot_details`} save={saveBot} />
         </Details> : null}
         {execution ? <Details label="执行任务">
+          <p role="status" className={cn("text-meta", toneText[executionState.tone])}>执行模型：{executionState.label}</p>
+          {'issue' in item.execution_readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.execution_readiness.issue)}</p> : null}
           <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
             busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} />
         </Details> : null}

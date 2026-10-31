@@ -202,8 +202,11 @@ export function botOnChange(response: NodeSettingsResponse, provider: ProviderSt
 }
 
 export type Availability = Exclude<ProviderStatus['state'], 'off'> | 'missing'
-export function availability(item: Pick<ProviderStatus, 'installed' | 'readiness'>): Availability {
-  return item.installed ? item.readiness.state : 'missing'
+export function summaryReadiness(item: Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'>): ProviderReadiness {
+  return item.roles.includes('execution') && !item.roles.includes('agent') ? item.execution_readiness : item.readiness
+}
+export function availability(item: Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>): Availability {
+  return item.installed ? summaryReadiness(item).state : 'missing'
 }
 
 /** Providers in use or on the device get a row; the others fold away until someone looks for one. */
@@ -329,6 +332,7 @@ export function parseProvider(value: unknown): ProviderStatus {
   const provider = oneOf(v.provider, providerIds)
   const setup = v.setup == null ? null : record(v.setup, 'AI 配置方式')
   if (oneOf(probe.provider, providerIds) !== provider) throw new Error('检查结果和 AI 服务不一致。')
+  if (typeof v.execution_model !== 'string') throw new Error('执行任务模型格式不对。')
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
   return {
@@ -339,7 +343,7 @@ export function parseProvider(value: unknown): ProviderStatus {
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,
     env: array(v.env).map(row => { const r = record(row); return { name: text(r.name), set: boolean(r.set), inherited: boolean(r.inherited), required: boolean(r.required) } }),
     state: oneOf(v.state, providerStates), issues: array(v.issues).map(parseIssue),
-    readiness: parseProviderReadiness(v.readiness), execution_model: typeof v.execution_model === 'string' ? v.execution_model : '', execution_readiness: parseProviderReadiness(v.execution_readiness ?? v.readiness),
+    readiness: parseProviderReadiness(v.readiness), execution_model: v.execution_model, execution_readiness: parseProviderReadiness(v.execution_readiness),
     probe: { provider: oneOf(probe.provider, providerIds), config_id: text(probe.config_id), checked_at_ms: probe.checked_at_ms, launch: launchState, authentication: oneOf(probe.authentication, ['unverified', 'authenticated', 'not_required', 'sign_in_required']), catalog: parseProviderModels(probe.catalog), version: probe.version === null ? null : text(probe.version) },
   }
 }

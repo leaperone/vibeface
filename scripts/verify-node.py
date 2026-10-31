@@ -864,6 +864,24 @@ def fixture_codex(arguments):
     """Implement the native App Server contract without loading a provider."""
     fixture_schema_check()
     run = Path(arguments[arguments.index("--fixture-root") + 1])
+    def provider_reply(method):
+        path = run / "native-provider-stage.json"
+        if not path.exists() or method not in ("account/read", "model/list"):
+            return None
+        require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 64
+                and path.stat().st_mode & 0o077 == 0, "native provider stage is one private bounded task file")
+        stage = json.loads(path.read_text())
+        require(stage in ("signed_out", "ready", "catalog_unknown"), "native provider stage is fixed")
+        if method == "account/read":
+            return {"result": {"requiresOpenaiAuth": True,
+                               "account": None if stage == "signed_out" else {"type": "chatgpt"}}}
+        if stage == "catalog_unknown":
+            return {"error": {"code": -32000, "message": "controlled catalog unavailable"}}
+        return {"result": {"data": [
+            {"id": "native-selectable", "model": "native-selectable", "displayName": "Native selectable",
+             "isDefault": True, "supportedReasoningEfforts": [{"reasoningEffort": "medium"}, {"reasoningEffort": "high"}]},
+            {"id": "native-controlled", "model": "native-controlled", "displayName": "Native controlled",
+             "reasoningEffortConfigurable": False, "supportedReasoningEfforts": []}], "nextCursor": None}}
     address = arguments[arguments.index("--listen") + 1]
     require(address.startswith("unix://"), "fixture only binds its private Unix socket")
     socket_path = Path(address.removeprefix("unix://"))
@@ -1063,7 +1081,12 @@ def fixture_codex(arguments):
                     thread_id = params.get("threadId")
                     thread = state["threads"].get(thread_id) if thread_id else None
                     if method in FIXTURE_CANNED:
-                        result = copy.deepcopy(FIXTURE_CANNED[method])
+                        observed = provider_reply(method)
+                        if observed is not None:
+                            error = observed.get("error")
+                            result = observed.get("result")
+                        else:
+                            result = copy.deepcopy(FIXTURE_CANNED[method])
                     elif method == "initialize":
                         result = {"userAgent": "controlled-fixture", "platformFamily": "unix", "platformOs": sys.platform}
                     elif method == "thread/loaded/list":
@@ -7073,6 +7096,8 @@ def e2e_fixture(options):
     relay = PkarrRelay() if options.fixture_kind == "delivery" else None
     rpc = DeliveryRpcSpy() if relay else None
     native_ready = False
+    native_provider = False
+    native_queue = None
 
     def details():
         return {"run": str(run), "nodes": {
@@ -7155,6 +7180,69 @@ def e2e_fixture(options):
                             "native and managing device must show the exact same revealed safety code")
                     client.grant(pending, manage=True)
                     result = {"approved": True}
+                elif op == "native_provider_setup":
+                    require(set(request) == {"op"} and native_ready and not native_provider,
+                            "native provider setup belongs to its initialized receiver and runs once")
+                    private_json(run / "native-provider-stage.json", "signed_out")
+                    client = nodes["receiver"].client
+                    client.call("configure_provider", {"provider": "codex", "bot": False, "execution": False,
+                        "bin": str(fixture_wrapper(run, "native-codex", "--fixture-codex")),
+                        "app_server": SPAWN_APP_SERVER})
+                    # Startup probes an enabled manager, so only the native UI enables this provider.
+                    nodes["receiver"].stop()
+                    nodes["receiver"].start()
+                    client.connect()
+                    client.authenticate()
+                    native_provider = True
+                    result = {"configured": True}
+                elif op == "native_provider_stage":
+                    require(set(request) == {"op", "stage"} and native_provider
+                            and request["stage"] in ("signed_out", "ready", "catalog_unknown"),
+                            "native provider stage has one fixed task scope and enum")
+                    private_json(run / "native-provider-stage.json", request["stage"])
+                    result = {"stage": request["stage"]}
+                elif op == "native_provider_queue":
+                    require(set(request) == {"op"} and native_provider and native_queue is None,
+                            "native provider queue is accepted once in its controlled receiver")
+                    client = nodes["receiver"].client
+                    manager = client.call("node_settings")["settings"]["manager"]
+                    require(manager is not None and manager["provider"] == "codex",
+                            "the native UI must enable the controlled manager before queue preparation")
+                    native_queue = {"bot_id": "native-provider", "conversation_id": "native-provider",
+                                    "running_trigger": "message:native-running", "queued_trigger": "message:native-queued"}
+                    client.rpc("create_bot", bot_id=native_queue["bot_id"], conversation_id=native_queue["conversation_id"],
+                               name="Native Provider", instructions="Controlled native acceptance", project=None)
+                    for label in ("native-running", "native-queued"):
+                        directive = {"phase1": True, "label": label}
+                        if label == "native-running":
+                            directive["gate"] = str(run / "native-never-release")
+                        receipt = client.rpc("message", conversation_id=native_queue["conversation_id"],
+                                             message_id=label, text=json.dumps(directive), report_results=False)
+                        require(receipt["trigger"] == "message:" + label, "native queue preserves the accepted trigger")
+                        wait_for("native message reaches its actual queue state", lambda:
+                            any(job["trigger"] == receipt["trigger"] and job["state"] == ("running" if label == "native-running" else "queued")
+                                for job in client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"]))
+                        if label == "native-running":
+                            wait_for("the native queue has one positive controlled invocation", lambda:
+                                len([row for row in fixture_records(run) if row["conversation_id"] == native_queue["conversation_id"]
+                                     and row["trigger"] == native_queue["running_trigger"]]) == 1)
+                    result = native_queue
+                elif op == "native_provider_inspect":
+                    require(set(request) == {"op"} and native_provider, "native inspection reads only its controlled receiver")
+                    client = nodes["receiver"].client
+                    settings = client.call("node_settings")
+                    provider = next(item for item in settings["providers"] if item["provider"] == "codex")
+                    manager = settings["settings"]["manager"]
+                    jobs = client.rpc("conversation", conversation_id=native_queue["conversation_id"])["scheduler"]["jobs"] if native_queue else []
+                    calls = [row for row in fixture_records(run) if native_queue and row["conversation_id"] == native_queue["conversation_id"]]
+                    result = {"manager": {key: manager[key] for key in ("provider", "model", "reasoning_effort")} if manager is not None else None,
+                              "readiness": provider["readiness"]["state"], "catalog": provider["probe"]["catalog"]["state"],
+                              "authentication": provider["probe"]["authentication"],
+                              "checked": provider["probe"]["checked_at_ms"] is not None,
+                              "jobs": [{"trigger": row["trigger"], "state": row["state"]} for row in jobs
+                                       if row["trigger"] in (native_queue["running_trigger"], native_queue["queued_trigger"])],
+                              "running_invocations": sum(row["trigger"] == native_queue["running_trigger"] for row in calls),
+                              "queued_invocations": sum(row["trigger"] == native_queue["queued_trigger"] for row in calls)}
                 elif op == "native_send":
                     require(native_ready, "native delivery is scoped to the initialized fixture")
                     intent = str(uuid.uuid4())
@@ -7170,13 +7258,15 @@ def e2e_fixture(options):
             except Exception as error:
                 print(json.dumps({"ok": False, "error": type(error).__name__}), flush=True)
     finally:
-        for node in reversed(list(nodes.values())):
-            node.client.close()
-            node.stop()
-        if relay:
-            relay.close()
-        if rpc:
-            rpc.close()
+        cleanup_failed = False
+        actions = [action for node in reversed(list(nodes.values())) for action in (node.client.close, node.stop)]
+        actions += ([relay.close] if relay else []) + ([rpc.close] if rpc else []) + [lambda: stop_fixture_processes(run)]
+        for action in actions:
+            try:
+                action()
+            except Exception:
+                cleanup_failed = True
+        require(not cleanup_failed, "the fixture stops all of its own resources")
 
 
 if __name__ == "__main__":

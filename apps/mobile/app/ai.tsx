@@ -4,7 +4,7 @@ import { Pressable, View } from 'react-native'
 import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { deviceCopy } from '@vibeface/client/identity/copy.ts'
-import { availability, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
+import { availability, summaryReadiness, botOnChange, folderSuggestions, type Availability, messageOf, modelTyped, parseAppServerLink, parseNodeSettings, effortOptions, probeIssueText, providerGroups, providerNames, providerIds, type BackupPolicy, type AppServer, type AppServerLink, type AppServerMode, type ManagerSettings, type ModelChoice, type NodeSettingsResponse, type ProviderId, type ProviderIssue, type ProviderStatus } from '@vibeface/client/lib/node.ts'
 import { folderLabels } from '@vibeface/client/workspace/bot-settings.ts'
 import { ErrorText } from '@/components/action'
 import { CopyableId, Details, EmptyState, Skeleton, providerIcons, toneText, type Tone } from '@/components/kit'
@@ -105,8 +105,10 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
   const name = providerNames[item.provider]
   const assistant = item.roles.includes('agent'), execution = item.roles.includes('execution')
   const manager = assistant ? response.settings.manager : null
+  const readiness = summaryReadiness(item)
   const usable = availability(item)
   const state = states[usable]
+  const executionState = states[item.execution_readiness.state]
   const issue = item.state === 'needs_setup' ? item.issues[0] : undefined
   const [open, setOpen] = useState(false)
   const [bin, setBin] = useState(item.bin)
@@ -133,8 +135,8 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
         : open ? null : <Button variant="link" className="px-0" onPress={() => setOpen(true)}><Text>去设置</Text></Button>}
     </View> : null}
     <View className="gap-1 px-4 pb-3">
-      {'issue' in item.readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</Text> : null}
-      {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(item.readiness.state) ? <View className="gap-2">
+      {'issue' in readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, readiness.issue)}</Text> : null}
+      {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(readiness.state) ? <View className="gap-2">
         <Text className="text-meta text-muted-foreground">在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
         <CopyableId value={item.setup.command} label={`${name} 私有目录登录命令`} />
@@ -152,6 +154,8 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
           <AssistantDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={['model']} manager={manager} models={models} working={working} save={saveAssistant} />
         </Details> : null}
         {execution ? <Details label="执行任务" keepMounted>
+          <Text className={cn('text-meta', toneText[executionState.tone])}>执行模型：{executionState.label}</Text>
+          {'issue' in item.execution_readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.execution_readiness.issue)}</Text> : null}
           <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
             save={(model) => change('execution_model', { execution_model: model })} />
         </Details> : null}

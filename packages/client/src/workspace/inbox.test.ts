@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { availability, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
+import { availability, summaryReadiness, type JoinRequest, type ProviderStatus } from '../lib/node.ts'
 import { inboxItems, waitingItems, type InboxSource } from './inbox.ts'
 import { chatTaskState, deviceForm, deviceOnline, entryLabel, fixOnDevice, formName, promptSummary, taskLabel } from './labels.ts'
 import type { BotRecord, NodeInfo, Question, WorkCard } from './types.ts'
@@ -109,12 +109,26 @@ test('the capsule names the computer from the directory once it lists it, not by
 })
 
 test('an installed provider remains unverified until the device confirms readiness', () => {
-  const provider = (extra: Partial<Pick<ProviderStatus, 'installed' | 'readiness'>> = {}): Pick<ProviderStatus, 'installed' | 'readiness'> => ({ installed: true, readiness: { state: 'unverified', issue: { stage: 'authentication', code: 'authentication_unverified' } }, ...extra })
+  type Status = Pick<ProviderStatus, 'installed' | 'roles' | 'readiness' | 'execution_readiness'>
+  const unverified: ProviderStatus['readiness'] = { state: 'unverified', issue: { stage: 'model_list', code: 'model_unverified' } }
+  const provider = (extra: Partial<Status> = {}): Status => ({ installed: true, roles: ['agent'], readiness: unverified, execution_readiness: unverified, ...extra })
   assert.equal(availability(provider()), 'unverified')
   assert.equal(availability(provider({ installed: false })), 'missing')
   assert.equal(availability(provider({ readiness: { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } } })), 'needs_setup')
   assert.equal(availability(provider({ readiness: { state: 'ready' } })), 'ready')
   assert.equal(availability(provider({ readiness: { state: 'starting' } })), 'starting')
+  const roles: ProviderStatus['roles'][] = [['execution'], ['agent', 'execution'], ['execution', 'agent'], ['agent'], []]
+  for (const role of roles) {
+    const executionOnly = role.length === 1 && role[0] === 'execution'
+    const status = provider({ roles: role, readiness: { state: 'ready' } })
+    assert.equal(summaryReadiness(status), executionOnly ? status.execution_readiness : status.readiness)
+    assert.equal(availability(status), executionOnly ? 'unverified' : 'ready')
+    assert.equal(availability(provider({ roles: role, execution_readiness: { state: 'ready' } })), executionOnly ? 'ready' : 'unverified')
+    assert.equal(availability(provider({ roles: role, installed: false, readiness: { state: 'ready' }, execution_readiness: { state: 'ready' } })), 'missing')
+  }
+  const botNeedsSetup = provider({ roles: ['agent', 'execution'], readiness: { state: 'needs_setup', issue: { stage: 'model_list', code: 'model_unavailable' } }, execution_readiness: { state: 'ready' } })
+  assert.equal(summaryReadiness(botNeedsSetup), botNeedsSetup.readiness)
+  assert.equal(availability(botNeedsSetup), 'needs_setup')
 })
 
 test('a task page shows a summary of what it was asked and folds the rest', () => {

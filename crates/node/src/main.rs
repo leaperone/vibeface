@@ -2003,6 +2003,7 @@ async fn hooks(options: Hooks, host: vibeface::discovery::Host) -> Result<()> {
         .home
         .clone()
         .or_else(|| host.home.clone())
+        .filter(|home| home.is_absolute())
         .context("HOME is not an absolute path; pass --home")?;
     let claude_home = options
         .home
@@ -2982,7 +2983,7 @@ mod tests {
         use vibeface::discovery::Host;
         let dir = std::env::temp_dir().join(format!("vibeface-hooks-{}", uuid::Uuid::new_v4()));
         let (home, codex, data) = (dir.join("home"), dir.join("codex"), dir.join("data"));
-        let run = async |host: Host, home: Option<&Path>| {
+        let run = async |host: Host, home: Option<&Path>, dry_run: bool| {
             let mut args = vec![
                 "vibeface",
                 "hooks",
@@ -2992,6 +2993,9 @@ mod tests {
             ];
             if let Some(home) = home {
                 args.extend(["--home", home.to_str().unwrap()]);
+            }
+            if dry_run {
+                args.push("--dry-run");
             }
             let Some(Action::Hooks(options)) = Cli::try_parse_from(args).unwrap().command else {
                 panic!("expected hooks")
@@ -3003,8 +3007,13 @@ mod tests {
             codex_home,
             path: None,
         };
+        let invalid = run(env(PathBuf::from("relative-home"), None), None, true)
+            .await
+            .unwrap_err();
+        assert!(invalid.to_string().contains("HOME is not an absolute path"));
+        assert!(!data.exists());
         let given = dir.join("given");
-        run(env(home.clone(), Some(codex.clone())), Some(&given))
+        run(env(home.clone(), Some(codex.clone())), Some(&given), false)
             .await
             .unwrap();
         assert!(given.join(".codex/hooks.json").is_file());
@@ -3013,14 +3022,14 @@ mod tests {
             !codex.exists() && !home.exists(),
             "--home keeps CODEX_HOME and $HOME untouched"
         );
-        run(env(home.clone(), Some(codex.clone())), None)
+        run(env(home.clone(), Some(codex.clone())), None, false)
             .await
             .unwrap();
         assert!(data.join("providers/codex/hooks.json").is_file());
         assert!(data.join("providers/claude/settings.json").is_file());
         assert!(!home.join(".claude").exists() && !home.join(".codex").exists() && !codex.exists());
         fs::create_dir_all(&codex).unwrap();
-        run(env(home.clone(), Some(codex.clone())), None)
+        run(env(home.clone(), Some(codex.clone())), None, false)
             .await
             .unwrap();
         assert!(data.join("providers/codex/hooks.json").is_file());

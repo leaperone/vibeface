@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url"
 import { createContext, Script } from "node:vm"
 import { JsxEmit, ModuleKind, transpileModule } from "typescript"
 import { entryAddress, entryJson, entryKey, parseEntry, parseInfo, providerIds, providerNames } from "@vibeface/client/lib/node.ts"
-import type { ReadyConnection } from "@vibeface/client/lib/node.ts"
+import * as nodeSettings from "@vibeface/client/lib/node.ts"
+import type { NodeSettingsResponse, ProviderReadiness, ProviderStatus, ReadyConnection } from "@vibeface/client/lib/node.ts"
 import type { WorkRecord } from "@vibeface/client/workspace/types.ts"
 import { cardState, nodeName, taskGroup, taskGroups } from "@vibeface/client/workspace/labels.ts"
 import { botReadiness, inputText, parseArtifactPage, parseConversation, pendingChecks, parseNodes, parseCreateBot, parseBot, formatSize, attachmentName, signedOrder } from "@vibeface/client/workspace/model.ts"
@@ -15,7 +16,7 @@ import { agentName, answerLabel, attentionLabel, approvalTask, awaitsAnswer, dec
 import * as errors from "@vibeface/client/lib/errors.ts"
 import { followUp, followUpCopy, promptSummary } from "@vibeface/client/workspace/labels.ts"
 import { awaitsDevice, botReach, botCanSend, botProviderNotice, canRetryJob, runtimeLabel, canSend, composerHint, starters, reachDevice } from "@vibeface/client/chat/protocol.ts"
-import { setUpOnManager } from "@vibeface/client/identity/copy.ts"
+import { deviceCopy, setUpOnManager } from "@vibeface/client/identity/copy.ts"
 import { chatTimeline, firstUnread } from "@vibeface/client/chat/timeline.ts"
 import { primaryLane } from "@vibeface/client/identity/connection-lane.ts"
 import * as taskLabels from "@vibeface/client/workspace/labels.ts"
@@ -484,7 +485,7 @@ test("workspace preserves bot and message requests while routing native decision
   }
 })
 
-function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}) {
+function componentHarness(path: string, dependencies: Record<string, unknown>, globals: Record<string, unknown> = {}, privateExport = '') {
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   type Props = Record<string, unknown> & { name?: string; type?: string; role?: string; disabled?: boolean; value?: unknown; onChange?: (event: unknown) => void; onSubmit?: (event?: unknown) => void; onClick?: () => void; action?: () => Promise<unknown> }
   const elements: { type: unknown; props: Props }[] = [], afterRender: (() => void)[] = []
@@ -512,7 +513,8 @@ function componentHarness(path: string, dependencies: Record<string, unknown>, g
   const module: { exports: Record<string, unknown> } = { exports: {} }
   const require = (specifier: string) => specifier === 'react' ? react : specifier === 'react/jsx-runtime' ? { jsx, jsxs: jsx } : dependencies[specifier] ?? ui
   const filename = fileURLToPath(new URL(path, import.meta.url))
-  const compiled = transpileModule(readFileSync(filename, 'utf8'), { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
+  const source = readFileSync(filename, 'utf8') + (privateExport ? `\nexport { ${privateExport} }\n` : '')
+  const compiled = transpileModule(source, { compilerOptions: { module: ModuleKind.CommonJS, jsx: JsxEmit.ReactJSX } }).outputText
   new Script(`(function (exports, require, module) {\n${compiled}\n})`, { filename }).runInNewContext({ Map, Error, TextEncoder, ...globals })(module.exports, require, module)
   return {
     render(name: string, props: unknown = {}) {
@@ -534,6 +536,71 @@ const pendingResult = () => {
   return { promise, resolve, reject }
 }
 const settleComponent = () => new Promise(setImmediate)
+
+test("provider cards keep summary readiness, setup and execution details in their own roles", async (t) => {
+  const ready: ProviderReadiness = { state: 'ready' }
+  const signIn: ProviderReadiness = { state: 'needs_setup', issue: { stage: 'authentication', code: 'sign_in_required' } }
+  const model: ProviderReadiness = { state: 'unverified', issue: { stage: 'model_list', code: 'model_unverified' } }
+  const signInText = 'Codex 需要登录，请在运行设备完成登录'
+  const modelText = 'Codex 尚未确认这个模型，可发送消息或先检查可用性'
+  const cases: (Pick<ProviderStatus, 'roles' | 'readiness' | 'execution_readiness'> & {
+    name: string; label: string; reason: string; setup: boolean; executionLabel: string | null; executionReason: string
+  })[] = [
+    { name: 'execution-only unverified', roles: ['execution'], readiness: ready, execution_readiness: model, label: '尚未确认', reason: modelText, setup: true, executionLabel: '尚未确认', executionReason: modelText },
+    { name: 'execution-only ready', roles: ['execution'], readiness: signIn, execution_readiness: ready, label: '可用', reason: '', setup: false, executionLabel: '可用', executionReason: '' },
+    { name: 'Bot ready and execution unverified', roles: ['agent', 'execution'], readiness: ready, execution_readiness: model, label: '可用', reason: '', setup: false, executionLabel: '尚未确认', executionReason: modelText },
+    { name: 'Bot needs setup and execution ready', roles: ['execution', 'agent'], readiness: signIn, execution_readiness: ready, label: '需设置', reason: signInText, setup: true, executionLabel: '可用', executionReason: '' },
+    { name: 'no roles', roles: [], readiness: signIn, execution_readiness: ready, label: '需设置', reason: signInText, setup: false, executionLabel: null, executionReason: '' },
+  ]
+  const text = (node: unknown): string => typeof node === 'string' ? node : Array.isArray(node) ? node.map(text).join('')
+    : node && typeof node === 'object' && 'props' in node && node.props && typeof node.props === 'object' && 'children' in node.props ? text(node.props.children) : ''
+  const kit = { toneText: { neutral: 'neutral', success: 'success', warning: 'warning' }, providerIcons: { codex: 'CodexIcon' }, Details: 'Details', FolderPath: 'FolderPath', CopyableId: 'CopyableId', BusyIcon: 'BusyIcon' }
+  for (const platform of ['web', 'mobile']) for (const example of cases) await t.test(`${platform} ${example.name}`, () => {
+    const item: ProviderStatus = {
+      provider: 'codex', roles: example.roles, supports: ['agent', 'execution'], bin: '/usr/bin/codex', app_server: null,
+      execution_model: 'saved-model', execution_readiness: example.execution_readiness,
+      setup: { directory: '/private/provider', command: 'codex --home /private/provider login' }, installed: true,
+      home: null, sessions: null, env: [], state: example.readiness.state, issues: [], readiness: example.readiness,
+      probe: { provider: 'codex', config_id: 'config', checked_at_ms: null, launch: { state: 'launchable' }, authentication: 'unverified', catalog: { state: 'unavailable', reason: 'catalog_unavailable' }, version: null },
+    }
+    const response: NodeSettingsResponse = {
+      settings: { roots: [], manager: item.roles.includes('agent') ? { provider: 'codex', workspace: '/project', model: 'bot-model', reasoning_effort: null, backup: { automatic: false, candidates: [] } } : null },
+      defaults: { workspace: '/project' }, readiness: { manager: item.readiness }, providers: [item], display_paths: {}, suggested_roots: [],
+    }
+    const name = platform === 'web' ? 'ProviderCard' : 'ProviderRow'
+    const app = componentHarness(platform === 'web' ? '../devices/ai-settings.tsx' : '../../../../../../apps/mobile/app/ai.tsx', {
+      '@vibeface/client/lib/node.ts': nodeSettings,
+      '@vibeface/client/identity/copy.ts': { deviceCopy },
+      '@/lib/utils': { cn: (...names: unknown[]) => names.filter(Boolean).join(' ') },
+      '@/lib/glossary': { terms: { bot: { icon: 'Bot' }, task: { icon: 'ListChecks' } } },
+      '@/components/app/kit': kit,
+      '@/components/kit': kit,
+    }, {}, name)
+    const props = { item, response, onboarding: false, first: true, busy: '', models: null, error: '' }
+    try {
+      let elements = app.render(name, props)
+      if (platform === 'mobile') {
+        assert.equal(elements.some(({ props }) => props.label === '执行任务'), false, 'execution details start collapsed')
+        const expand = elements.find(({ type, props }) => type === 'Pressable' && props.accessibilityRole === 'button')?.props.onPress
+        assert.ok(typeof expand === 'function')
+        expand()
+        elements = app.render(name, props)
+      }
+      const children = elements.at(-1)?.props.children
+      assert.ok(Array.isArray(children))
+      assert.equal(text(children[0]), `Codex${example.label}`, 'the row header shows the selected summary state')
+      const summary = text(children[2])
+      for (const reason of [signInText, modelText]) assert.equal(summary.includes(reason), example.reason === reason, 'the summary shows only its own reason')
+      assert.equal(elements.filter(({ props }) => props.value === item.setup?.command).length, example.setup ? 1 : 0, 'setup follows the selected readiness and enabled roles')
+      const execution = elements.find(({ props }) => props.label === '执行任务')
+      if (example.executionLabel === null) assert.equal(execution, undefined)
+      else {
+        assert.ok(execution)
+        assert.equal(text(execution), `执行模型：${example.executionLabel}${example.executionReason}`, 'execution details show the saved execution readiness independently')
+      }
+    } finally { app.close() }
+  })
+})
 
 test("mobile provider probes discard settings that arrive after another call or connection", async () => {
   for (const changed of ['call', 'connection', 'none']) {
