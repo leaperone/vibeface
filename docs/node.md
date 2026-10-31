@@ -137,7 +137,7 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 回答本人自己开的会话
 
-`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。文件默认在 Node-owned Provider 根目录；Codex 在 `<data-dir>/providers/codex/hooks.json`，Claude 在 `<data-dir>/providers/claude/settings.json`。显式 `--home` 才编辑用户目录。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
+`vibeface hooks install` 写入各产品的监听入口，已打开的会话重启后加载。Codex 默认写入 `<data-dir>/providers/codex/hooks.json`，Claude 默认写入 `<data-dir>/providers/claude/settings.json`；pi 与 opencode 的扩展仍写入下表所列的用户目录。给 `--home <目录>` 时全部写在该目录下，Codex 的在 `<目录>/.codex`，不看 `CODEX_HOME`：
 
 | 产品 | 写入 | Bot 能回答 |
 |---|---|---|
@@ -477,7 +477,7 @@ Node 用自身的业务 UDP 端口登记。发现服务只交换它从已认证�
 - **停止当前回复**只请求取消当前管理轮，并撤销该轮的 Node 工具权限。已输出的部分回复保留为一条标记“已停止”的回答。取消待确认时不能当作已经停止，也不停止已派发的工作。
 - **停止工作**作用于选中的工作，中断它的原生 turn，并一并停止它委派出的工作。任何入口都能停止其他设备上的工作。停止请求先存在本机再发送，直到工作结束都不会放弃：目标离线时入口以 3 秒起、最长 1 分钟的间隔持续投递，设备上线后照样收到并停下；执行设备在 `turn/interrupt` 失败或重启后先读回合再重发，回合已结束就不再中断。页面显示“停止中”，30 秒仍未确认显示“还在尝试停止”。执行器接受中断后 30 秒回合仍未结束时再读一次：仍在运行就再发，读不到则进入待核对。
 
-Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“Bot 正在看这条补充”，并入后显示“已补充给 Bot”，该回复未正常完成时显示“补充后回复没完成”，无法确认时显示“不确定 Bot 看到了没有”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态才能确认取消；本地进程退出时仍须核对结果。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `interrupted` 并列入待核对。停止回复不影响已派发的工作，停止工作是单独操作。
+Cursor SDK 和 Codex 都提供进度和取消请求。Codex Bot 的回合在 App Server 上运行，回复进行中再发的消息直接并入当前回复（`turn/steer`），网页显示“Bot 正在看这条补充”，并入后显示“已补充给 Bot”，该回复未正常完成时显示“补充后回复没完成”，无法确认时显示“不确定 Bot 看到了没有”；Cursor 没有原生 steer，新消息排在当前回复之后。Codex 线程创建时把本轮的工具令牌和本机工具地址写进 Shell 环境，之后续接同一线程的回合沿用这个令牌，令牌在该线程每轮都有效（接受的取舍）；Node 重启时沿用上次的工具端口（记在数据目录的 `tool-port`），端口被占用而换了地址时 Bot 开新线程。Cursor 需要匹配的 Provider 终态才能确认取消；本地进程退出时仍须核对结果。Codex 停止时发 `turn/interrupt`，确认回合已结束才回报已停止；无法确认时该轮进入 `reconciling`，保留部分回复并列入待核对，待查询或本人确认后再记录最终状态。停止回复不影响已派发的工作，停止工作是单独操作。
 
 Agent 通过 Node 的 `dispatch_work` 工具派发工作，例如 `vibeface tool dispatch_work --json '{"title":"跑测试","prompt":"...","cwd":"...","call_ref":"REF","target_node":"<设备编号>"}'`。`title` 是给本人看的几个字，任务卡片以它为名，`prompt` 放在详细信息里。省略 `target_node` 时派发到本机，由 `agent` 指定的产品执行（本机只开了一个执行产品时可省略）：Codex 工作由 CLI 先向 Node 登记，再直接连本机 App Server 开线程、以完全访问（`approvalPolicy=never`、`danger-full-access`）发一个 turn，Node 记录并观察它。`target_node` 是另一台设备时，任务交给那台设备的协调 Agent，作为它的一轮执行，由它在本机派发，不能再向其他设备派发；远端任务由目标 Bot 选择并冻结模型。`continues` 填原工作编号时，在原工作的 thread 上继续；`thread` 填本机已有线程时，消息进入该线程，与 `continues` 互斥。目标 Node 核对派发方仍是成员且处于进行中的调度轮次，并要求 `cwd` 位于目标自己 `config.json` 的 `roots` 内，不满足时拒绝，页面显示“未接收”。同一轮用同一 `call_ref` 重试得到同一工作，不会启动第二个 turn；结果不明时用 `call_lookup` 查询。
 

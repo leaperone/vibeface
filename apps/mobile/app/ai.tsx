@@ -135,7 +135,7 @@ function ProviderRow({ item, first, response, busy, models, error, change, saveA
     <View className="gap-1 px-4 pb-3">
       {'issue' in item.readiness ? <Text className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</Text> : null}
       {item.setup && (assistant || execution) && ['needs_setup', 'unverified'].includes(item.readiness.state) ? <View className="gap-2">
-        <Text className="text-meta text-muted-foreground">在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</Text>
+        <Text className="text-meta text-muted-foreground">在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</Text>
         <Text selectable className="font-mono text-meta text-muted-foreground">{item.setup.directory}</Text>
         <CopyableId value={item.setup.command} label={`${name} 私有目录登录命令`} />
       </View> : null}
@@ -252,8 +252,9 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === 'cursor'
-  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes('model') && (draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
+  const reasoningEffort = selected?.effort.state === 'provider_controlled' ? null : draft.reasoning_effort
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes('model') && (reasoningEffort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const efforts = selected?.effort.state === 'provider_controlled' ? [] : selected?.effort.state === 'selectable' ? selected.effort.options : effortOptions(manager.provider)
   const input = (key: (typeof assistantFields)[number], label: string, placeholder?: string) => <Input accessibilityLabel={label} className={key === 'model' ? 'min-w-0 flex-1' : 'font-mono'} autoCapitalize="none" autoCorrect={false} placeholder={placeholder}
     value={draft[key]} editable={!working} onChangeText={(text) => setDraft({ ...draft, [key]: text })} />
@@ -269,7 +270,7 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
     </Field>
     <Field label="推理强度">
       {efforts.length ? <View className="flex-row flex-wrap gap-1">
-        {[null, ...efforts].map((effort) => <Button key={effort ?? 'default'} variant={draft.reasoning_effort === effort ? 'outline' : 'ghost'} disabled={working} onPress={() => setDraft({ ...draft, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}
+        {[null, ...efforts].map((effort) => <Button key={effort ?? 'default'} variant={reasoningEffort === effort ? 'outline' : 'ghost'} disabled={working} onPress={() => setDraft({ ...draft, reasoning_effort: effort })}><Text>{effort ?? '由 AI 服务决定'}</Text></Button>)}
         <Text className="text-meta text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</Text>
       </View> : <Text className="text-meta text-muted-foreground">由 AI 服务决定</Text>}
     </Field>
@@ -278,7 +279,7 @@ function AssistantDetails({ fields, manager, models, working, save }: { fields: 
     {fields.includes('workspace') ? <Field label={folderLabels.botRun}>{input('workspace', folderLabels.botRun)}</Field> : null}
     {dirty ? <Button variant="outline" className="self-start" disabled={working || (cursor && !(fields.includes('model') ? draft.model : manager.model).trim()) || fields.includes('model') && draft.backup.candidates.some((candidate) => !candidate.model.trim())}
       onPress={() => void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
-        ...(fields.includes('model') ? { reasoning_effort: draft.reasoning_effort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })}><Text>保存</Text></Button> : null}
+        ...(fields.includes('model') ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })}><Text>保存</Text></Button> : null}
   </View>
 }
 

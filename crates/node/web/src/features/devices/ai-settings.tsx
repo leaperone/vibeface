@@ -409,7 +409,7 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
     <div className="grid gap-1 px-4 pb-3 sm:ps-12">
       {'issue' in item.readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</p> : null}
       {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(item.readiness.state) ? <div className="grid gap-2 text-meta">
-        <p>在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</p>
+        <p>在运行 AI 的电脑上执行以下命令，为独立目录登录或配置，再点“检查可用性”。不会复制已有登录信息。</p>
         <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
         <div className="flex min-w-0 gap-2">
           <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
@@ -517,8 +517,9 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   const [chosen, setTyping] = useState<boolean | null>(null)
   const typing = chosen ?? modelTyped(manager.model, models)
   const cursor = manager.provider === "cursor"
-  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes("model") && (draft.reasoning_effort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const selected = models?.find((model) => draft.model ? model.id === draft.model : model.default)
+  const reasoningEffort = selected?.effort.state === "provider_controlled" ? null : draft.reasoning_effort
+  const dirty = fields.some((key) => draft[key] !== manager[key]) || fields.includes("model") && (reasoningEffort !== manager.reasoning_effort || JSON.stringify(draft.backup) !== JSON.stringify(manager.backup))
   const efforts = selected?.effort.state === "provider_controlled" ? [] : selected?.effort.state === "selectable" ? selected.effort.options : effortOptions(manager.provider)
   const field = (key: (typeof botFields)[number], label: string, extra: { placeholder?: string; required?: boolean; plain?: boolean } = {}) => {
     const props = { name: key, value: draft[key], disabled: working, placeholder: extra.placeholder, required: extra.required,
@@ -528,7 +529,7 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
   return <form className="grid gap-3" onSubmit={(event) => {
     event.preventDefault()
     void save({ ...manager, ...Object.fromEntries(fields.map((key) => [key, draft[key].trim()])),
-      ...(fields.includes("model") ? { reasoning_effort: draft.reasoning_effort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
+      ...(fields.includes("model") ? { reasoning_effort: reasoningEffort, backup: { ...draft.backup, candidates: draft.backup.candidates.map((candidate) => ({ ...candidate, model: candidate.model.trim() })) } } : {}) })
   }}>
     {fields.includes("model") ? models && !typing ? <label className="grid gap-1 text-meta">{copy.label}
       <NativeSelect className="w-full" name="model" value={draft.model} disabled={working}
@@ -543,9 +544,9 @@ function BotDetails({ fields, manager, models = null, display, working, busy, sa
         onClick={() => { setTyping(false); setDraft({ ...draft, model: models.some((model) => model.id === draft.model) ? draft.model : "" }) }}><List aria-hidden="true" /></Button> : null}
     </div> : null}
     {fields.includes("model") ? efforts.length ? <label className="grid gap-1 text-meta">推理强度
-      <NativeSelect value={draft.reasoning_effort ?? ""} disabled={working} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
+      <NativeSelect value={reasoningEffort ?? ""} disabled={working} onChange={(event) => setDraft({ ...draft, reasoning_effort: event.target.value || null })}>
         <NativeSelectOption value="">由 AI 服务决定</NativeSelectOption>
-        {draft.reasoning_effort && !efforts.includes(draft.reasoning_effort) ? <NativeSelectOption value={draft.reasoning_effort}>{draft.reasoning_effort}</NativeSelectOption> : null}
+        {reasoningEffort && !efforts.includes(reasoningEffort) ? <NativeSelectOption value={reasoningEffort}>{reasoningEffort}</NativeSelectOption> : null}
         {efforts.map((effort) => <NativeSelectOption key={effort} value={effort}>{effort}</NativeSelectOption>)}
       </NativeSelect>
       <span className="text-muted-foreground">用于下一回合，模型是否支持以 AI 服务的检查结果为准。</span>

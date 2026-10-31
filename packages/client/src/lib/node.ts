@@ -327,7 +327,7 @@ function parseAppServer(value: unknown): AppServer | null {
 export function parseProvider(value: unknown): ProviderStatus {
   const v = record(value), probe = record(v.probe), launch = record(probe.launch)
   const provider = oneOf(v.provider, providerIds)
-  const setup = v.setup == null ? null : record(v.setup, 'AI 配置入口')
+  const setup = v.setup == null ? null : record(v.setup, 'AI 配置')
   if (oneOf(probe.provider, providerIds) !== provider) throw new Error('检查结果和 AI 服务不一致。')
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
