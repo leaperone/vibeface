@@ -85,6 +85,7 @@ function OwnerCard({ data, nodes }: { data: ConversationPayload; nodes: ReturnTy
 function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: ConversationPayload; botId?: string; nodes: ReturnType<typeof useWorkspace>["nodes"] }) {
   const kind = triggerKind(job.trigger)
   const targetBotId = botId
+  const unknown = data.scheduler?.remote?.reachable === false && schedulerStatus(job.state).group !== "history"
   return <li className="grid min-w-0 gap-2 rounded-xl border bg-card p-3 shadow-xs transition-[transform,box-shadow] duration-200 hover:-translate-y-0.5 hover:shadow-sm">
     <div className="flex min-w-0 flex-wrap items-center gap-2">
       <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><Clock3 aria-hidden="true" className="size-4" /></span>
@@ -92,7 +93,7 @@ function JobRow({ job, data, botId, nodes }: { job: ManagerJob; data: Conversati
         <span className="block truncate font-medium" title={job.trigger}>{kind.label}</span>
         <span className="block truncate text-meta text-muted-foreground">{kind.detail}</span>
       </span>
-      <StatusPill tone={schedulerTone(job.state)}>{schedulerStatus(data.scheduler?.remote?.reachable === false && schedulerStatus(job.state).group !== "history" ? "unknown" : job.state).label}</StatusPill>
+      <StatusPill tone={unknown ? "warning" : schedulerTone(job.state)}>{schedulerStatus(unknown ? "unknown" : job.state).label}</StatusPill>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted-foreground">
       <span>{job.source_node ? `来自 ${nodeName(job.source_node, { nodes })}` : data.scheduler?.remote ? "其他设备负责" : "本机记录"}</span>
