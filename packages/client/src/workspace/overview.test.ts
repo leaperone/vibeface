@@ -2,7 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { openWorksFromOverview, overviewFromWorkspace, parseConversation, parseOpenWorks, parseWorkspaceOverview } from "./model.ts"
 import { cardState, overviewScope, taskGroup, taskLabel, unrepresentedOverviewChecks } from "./labels.ts"
-import type { BotRecord, NodeInfo, OpenWork, Question } from "./types.ts"
+import { workspaceActivities } from "./labels.ts"
+import type { BotRecord, NodeInfo, OpenWork, PendingCheck, Question } from "./types.ts"
 
 const bot = (conversation_id: string, bot_id = `bot-${conversation_id}`, name = conversation_id): BotRecord => ({
   bot_id, conversation_id, name, instructions: "", models: {}, skills: null, avatar: null, avatar_version: null,
@@ -211,4 +212,38 @@ test("bounded check identities use the complete known Bot catalog without changi
   assert.equal(overview.tasks[0]?.bot, null, "the bounded snapshot remains the actual received observation")
   assert.equal(unrepresentedOverviewChecks(overview, [], [], bots.slice(0, 256))[0]?.bot, null)
   assert.equal(unrepresentedOverviewChecks(overview, [], [], [bot("other-chat", "bot-chat-257")])[0]?.navigation, null, "identity is matched by conversation, never by a coincident Bot id")
+})
+
+test("workspace activities attach approval facts, keep task checks with work, and leave other turns separate", () => {
+  const running = work({ thread_id: "provider-thread" })
+  const approval = question({ about: { node: "worker", agent: "codex", session_id: "provider-thread", cwd: "/project", summary: "", request_id: "request-1" } })
+  const workCheck: PendingCheck = { kind: "work", check_id: "work:work-1", detail: "", work_id: running.work_id, target_node: running.target_node, conversation_id: running.conversation_id, title: running.title, reason: "offline" }
+  const overview = parseWorkspaceOverview({
+    tasks: [
+      { ...running, kind: "work" },
+    ],
+    checks: [{ check_id: "process-work", conversation_id: running.conversation_id, trigger: `task:${running.work_id}` }],
+    questions: [{ question_id: approval.question_id, conversation_id: approval.conversation_id, text: approval.text, severity: approval.severity, choices: approval.choices, created_at_ms: approval.created_at_ms, answer: null, closed: null, about: approval.about }],
+    jobs: [{ job_id: "job-1", conversation_id: running.conversation_id, trigger: "message:ordinary", state: "queued", message_id: "message-1" }],
+    truncated: true,
+  })
+  const view = workspaceActivities({ works: [running], questions: [approval], checks: [workCheck], overview, nodes: [node("worker")], read: true, connected: true, answered: {} })
+  assert.equal(view.activities.length, 2, "approval, pending check and task process check share one work activity; ordinary job is a turn")
+  const workActivity = view.activities.find((activity) => activity.kind === "work")
+  assert.ok(workActivity)
+  assert.equal(workActivity?.facts.questions.length, 1)
+  assert.equal(workActivity?.facts.checks.length, 1)
+  assert.equal(workActivity?.facts.overviewChecks.length, 1)
+  assert.equal(workActivity?.group, "waiting")
+  assert.equal(view.activities.filter((activity) => activity.kind === "turn").length, 1)
+  const answered = workspaceActivities({ works: [running], questions: [approval], checks: [workCheck], overview, nodes: [node("worker")], read: true, connected: true, answered: { [approval.question_id]: "继续" } })
+  assert.equal(answered.activities.length, 2, "answering removes only the attention fact and never drops the work")
+  assert.ok(["working", "waiting"].includes(answered.activities.find((activity) => activity.kind === "work")?.group ?? ""), "the work remains running or waiting on its own unresolved device check")
+  const parentChild = workspaceActivities({ works: [running, { ...running, work_id: "child", parent: running.work_id }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true })
+  assert.equal(parentChild.activities.filter((activity) => activity.kind === "work").length, 2, "parent and child remain separate activities")
+  const processOnly = workspaceActivities({ works: [running], questions: [], checks: [{ kind: "process", check_id: "process", detail: "still alive" }], nodes: [node("worker")], read: true, connected: true })
+  assert.equal(processOnly.activities.filter((activity) => activity.kind === "attention").length, 1)
+  const mismatched = workspaceActivities({ works: [running], questions: [], checks: [{ ...workCheck, conversation_id: "other-chat" }, { ...workCheck, target_node: "other" }], nodes: [node("worker"), node("other")], read: true, connected: true })
+  assert.equal(mismatched.activities.filter((activity) => activity.kind === "attention").length, 2, "different conversations and devices do not dedupe")
+  assert.equal(workspaceActivities({ works: [{ ...running, state: "unverified", outcome: "unverified" }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true }).groups.attention.length, 1)
 })

@@ -318,6 +318,33 @@ export type WorkspaceOverview = {
   next_cursor: string | null
 }
 
+export type WorkspaceActivityGroup = "attention" | "working" | "waiting"
+export type WorkspaceActivityJob = { conversation_id: string | null; job: ManagerJob | OverviewJob }
+export type WorkspaceActivityFacts = {
+  questions: Question[]
+  checks: PendingCheck[]
+  overviewQuestions: OverviewQuestion[]
+  overviewChecks: Extract<OverviewTask, { kind: "check" }>[]
+  jobs: (ManagerJob | OverviewJob)[]
+}
+export type WorkspaceActivityAttention = Question | PendingCheck | OverviewQuestion | Extract<OverviewTask, { kind: "check" }>
+type WorkspaceActivityBase = {
+  id: string
+  conversation_id: string | null
+  work_id: string | null
+  group: WorkspaceActivityGroup
+  state: string
+  facts: WorkspaceActivityFacts
+}
+export type WorkspaceActivity =
+  | (WorkspaceActivityBase & { kind: "work"; work: OpenWork; projection?: Extract<OverviewTask, { kind: "work" | "dispatch" }> })
+  | (WorkspaceActivityBase & { kind: "turn"; job: ManagerJob | OverviewJob })
+  | (WorkspaceActivityBase & { kind: "attention"; attention: WorkspaceActivityAttention })
+export type WorkspaceActivityView = {
+  activities: WorkspaceActivity[]
+  groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]>
+}
+
 export type PendingBot = CreateBotRequest & {
   submission: { state: "unconfirmed" | "rejected"; entry_node: string }
 }

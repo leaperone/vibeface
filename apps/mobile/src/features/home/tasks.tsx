@@ -5,10 +5,9 @@ import { Pressable, ScrollView, View } from 'react-native'
 import { useDevice } from '@vibeface/client/identity/context.tsx'
 import { providerNames } from '@vibeface/client/lib/node.ts'
 import { workFailure } from '@vibeface/client/lib/errors.ts'
-import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskAgent, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, unrepresentedOverviewChecks, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
-import { workApproval } from '@vibeface/client/workspace/questions.ts'
+import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskAgent, taskGroups, taskLabel, taskProgress, taskStale, workspaceActivities, type TaskGroup } from '@vibeface/client/workspace/labels.ts'
 import { openWorksFromOverview, overviewFromWorkspace } from '@vibeface/client/workspace/model.ts'
-import type { BotRecord, NodeInfo, OpenWork, OverviewTask } from '@vibeface/client/workspace/types.ts'
+import type { BotRecord, NodeInfo, OpenWork, OverviewTask, WorkspaceActivity } from '@vibeface/client/workspace/types.ts'
 import { BotFace } from '@/components/bot-face'
 import { providerIcons, Skeleton } from '@/components/kit'
 import { Icon } from '@/components/ui/icon'
@@ -21,7 +20,6 @@ import { cn } from '@/lib/utils'
 export function TasksScreen() {
   const shared = useLive()
   const inbox = useInbox()
-  const attention = inbox.filter((item) => item.kind === 'question' && !item.done || item.kind === 'confirm' && item.check.kind === 'process')
   const pending = inbox.filter((item) => !(item.kind === 'question' && item.done)).length
   const workspace = useWorkspace()
   const { directory } = useDevice()
@@ -31,22 +29,25 @@ export function TasksScreen() {
   const lookup = { nodes: shared?.nodes ?? [], directory }
   const localOverview = shared ? overviewFromWorkspace({ openWorks: works, bots: shared.bots, questions: shared.questions, nodes: lookup.nodes }) : null
   const overview = shared?.overview ?? localOverview
-  type ProjectedWork = Extract<OverviewTask, { kind: 'work' | 'dispatch' }>
-  const projected = new Map([...(localOverview?.tasks ?? []), ...(overview?.tasks ?? [])].filter((task): task is ProjectedWork => (task.kind === 'work' || task.kind === 'dispatch') && Boolean(task.work_id)).map((task) => [JSON.stringify([task.conversation_id, task.work_id]), task]))
-  const projection = (work: OpenWork) => projected.get(JSON.stringify([work.conversation_id, work.work_id]))
   const visibleWorks = overview ? openWorksFromOverview(overview, works) : works
-  const loading = !read && Boolean(shared?.connectionOnline) && !visibleWorks.length
+  const openQuestions = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'question' }> => item.kind === 'question' && !item.done && Boolean(item.question)).map((item) => item.question)
+  const pendingChecks = inbox.filter((item): item is Extract<typeof inbox[number], { kind: 'confirm' }> => item.kind === 'confirm').map((item) => item.check)
+  const activityView = workspaceActivities({ works: visibleWorks, questions: openQuestions, checks: pendingChecks, overview, answered: shared?.answered ?? {}, nodes: lookup.nodes, knownBots: read ? shared?.bots ?? [] : [], connected: Boolean(shared?.connectionOnline), read, jobs: (shared?.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: shared?.conversationId ?? null, job })) })
+  const workActivities = activityView.activities.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work')
+  const loading = !read && Boolean(shared?.connectionOnline) && !workActivities.length
   const bot = workspace.bots[0]
-  const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
-  for (const work of visibleWorks) {
-    const state = cardState(work, lookup.nodes, projection(work))
-    const asking = state === 'running' && workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} })
-    groups[taskGroup(taskStale(state, Boolean(shared?.connectionOnline && read)) ? 'unknown' : state, Boolean(asking))].push(work)
+  const groups: Record<TaskGroup, Extract<WorkspaceActivity, { kind: 'work' }>[] > = {
+    attention: activityView.groups.attention.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work'),
+    working: activityView.groups.working.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work'),
+    waiting: activityView.groups.waiting.filter((activity): activity is Extract<WorkspaceActivity, { kind: 'work' }> => activity.kind === 'work'),
   }
-  const otherChecks = overview ? unrepresentedOverviewChecks(overview, visibleWorks, lookup.nodes, read ? shared?.bots ?? [] : []).filter((task) => task.conversation_id !== shared?.conversationId) : []
+  const otherChecks = activityView.groups.attention.flatMap((activity) => {
+    if (activity.kind !== 'attention' || activity.conversation_id === shared?.conversationId || !('kind' in activity.attention) || activity.attention.kind !== 'check') return []
+    return [activity.attention as Extract<OverviewTask, { kind: 'check' }>]
+  })
 
   return <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerClassName="w-full max-w-3xl self-center gap-4 p-4 pb-10">
-    <MobileMasthead attention={read ? groups.attention.length + attention.length + otherChecks.length : null} working={read ? groups.working.length : null} waiting={read ? groups.waiting.length : null} online={Boolean(shared?.connectionOnline)} />
+    <MobileMasthead attention={read ? activityView.groups.attention.length : null} working={read ? activityView.groups.working.length : null} waiting={read ? activityView.groups.waiting.length : null} online={Boolean(shared?.connectionOnline)} />
     <Text className="text-meta text-muted-foreground">{[...(overview ? overviewScope(overview.coverage) : ['尚未读取任务记录']), ...(!read ? ['当前连接尚未完成首读'] : !shared?.connectionOnline ? ['连接已断开，显示最近记录'] : [])].join(' · ')}</Text>
     <Link href="/inbox" asChild><Pressable accessibilityRole="link" accessibilityLabel={pending ? `${pending} 件事等你决定` : '查看待处理'} className={`min-h-11 flex-row items-center gap-3 rounded-xl border px-4 py-3 active:bg-muted ${pending ? 'border-warning/25 bg-warning-soft' : 'border-border bg-card'}`}><Icon as={pending ? CircleQuestionMark : Inbox} className={`size-5 ${pending ? 'text-warning' : 'text-muted-foreground'}`} /><Text className="min-w-0 flex-1">{pending ? `${pending} 件事等你决定` : '查看待处理'}</Text><Icon as={ChevronRight} className="size-4 text-muted-foreground" /></Pressable></Link>
     {otherChecks.map((check) => <View key={`${check.conversation_id}:${check.item_id}`} className="gap-2 rounded-xl border border-border bg-card p-4"><Text className="font-medium">{check.work_id ? '任务状态待确认' : '程序状态待确认'} · {check.bot?.name ?? (read ? '未找到所属 Bot' : 'Bot 身份未加载')}</Text>{check.bot ? <Link href={`/b/${check.bot.bot_id}`} asChild><Pressable accessibilityRole="link" className="min-h-11 justify-center"><Text>打开 {check.bot.name}</Text></Pressable></Link> : null}</View>)}
@@ -55,10 +56,10 @@ export function TasksScreen() {
         <Skeleton className="size-8 rounded-lg" />
         <View className="flex-1 gap-2"><Skeleton className="h-3.5 w-2/3 rounded-full" /><Skeleton className="h-3 w-1/2 rounded-full" /></View>
       </View>)}
-    </View> : visibleWorks.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
+    </View> : workActivities.length ? taskGroups.map(({ group, title }) => groups[group].length ? <View key={group} className="gap-2">
       <Text role="heading" className="px-1 text-heading font-semibold">{title} <Text className="text-muted-foreground">{groups[group].length}</Text></Text>
-      {groups[group].map((work) => <TaskRow key={JSON.stringify([work.conversation_id, work.work_id])} work={work} projected={projection(work)} waiting={Boolean(workApproval({ work, conversationId: work.conversation_id, questions: shared?.questions ?? [], answered: shared?.answered ?? {} }))} bot={shared?.bots.find((item) => item.conversation_id === work.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(work, shared?.liveProgress ?? [])} />)}
-    </View> : null) : attention.length || otherChecks.length ? null : <MobileEmpty bot={bot} read={read} />}
+      {groups[group].map((activity) => <TaskRow key={activity.id} work={activity.work!} projected={activity.projection} waiting={activity.facts.questions.length > 0} bot={shared?.bots.find((item) => item.conversation_id === activity.conversation_id)} lookup={lookup} connected={Boolean(shared?.connectionOnline && read)} progress={taskProgress(activity.work!, shared?.liveProgress ?? [])} />)}
+    </View> : null) : activityView.groups.attention.length || otherChecks.length ? null : <MobileEmpty bot={bot} read={read} />}
   </ScrollView>
 }
 

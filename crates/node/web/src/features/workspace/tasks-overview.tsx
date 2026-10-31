@@ -13,10 +13,10 @@ import { useDevice } from "@vibeface/client/identity/context.tsx"
 import { useWorkspace } from "@vibeface/client/workspace/context.tsx"
 import type { MembershipView } from "@vibeface/client/lib/node.ts"
 import { openWorksFromOverview, overviewFromWorkspace } from "@vibeface/client/workspace/model.ts"
-import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskGroup, taskGroups, taskLabel, taskProgress, taskStale, unrepresentedOverviewChecks, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
-import { projectName, workApproval } from "@vibeface/client/workspace/questions.ts"
+import { cardState, needsLook, nodeName, overviewScope, staleTaskLabel, taskActive, taskGroups, taskLabel, taskProgress, taskStale, workspaceActivities, type TaskGroup } from "@vibeface/client/workspace/labels.ts"
+import { projectName } from "@vibeface/client/workspace/questions.ts"
 import { workFailure } from "@vibeface/client/lib/errors.ts"
-import type { NodeInfo, OpenWork, OverviewTask } from "@vibeface/client/workspace/types.ts"
+import type { NodeInfo, OpenWork, OverviewTask, WorkspaceActivity } from "@vibeface/client/workspace/types.ts"
 import { useInbox } from "./inbox"
 import { ConfirmCard } from "./task-activity"
 import { QuestionCard } from "./question-card"
@@ -52,53 +52,45 @@ export function TasksOverview() {
     const works = item.check.works.filter(needsConfirmation)
     return works.length ? [{ ...item, check: { ...item.check, works } }] : []
   })
-  const attentionWorkIds = new Set<string>()
-  for (const item of attention) {
-    if (item.kind !== "confirm") continue
-    if (item.check.kind === "work") attentionWorkIds.add(JSON.stringify([item.check.conversation_id, item.check.work_id]))
-    if (item.check.kind === "device") for (const work of item.check.works) attentionWorkIds.add(JSON.stringify([work.conversation_id, work.work_id]))
-  }
   const openQuestions = attention.filter((item): item is Extract<InboxItem, { kind: "question" }> => item.kind === "question").map((item) => item.question)
-  const tasks = overviewWorks.filter((work) => !attentionWorkIds.has(JSON.stringify([work.conversation_id, work.work_id])))
-  const groups: Record<TaskGroup, OpenWork[]> = { attention: [], working: [], waiting: [] }
+  const pendingChecks = attention.filter((item): item is Extract<InboxItem, { kind: "confirm" }> => item.kind === "confirm").map((item) => item.check)
+  const activityView = workspaceActivities({
+    works: overviewWorks, questions: openQuestions, checks: pendingChecks, overview,
+    jobs: (workspace.data?.scheduler?.jobs ?? []).map((job) => ({ conversation_id: workspace.conversationId, job })),
+    answered: workspace.answered, nodes: workspace.nodes, knownBots: read ? workspace.bots : [], connected: workspace.connectionOnline, read,
+  })
+  const groups: Record<TaskGroup, WorkspaceActivity[]> = activityView.groups
   const botIds = new Map(workspace.bots.map((bot) => [bot.conversation_id, bot.bot_id]))
   const matchesBot = (conversationId: string, projectedBotId?: string | null) => botFilter === "all" || projectedBotId === botFilter || botIds.get(conversationId) === botFilter
-  for (const work of tasks) {
-    const item = projection(work)
-    const state = cardState(work, workspace.nodes, item)
-    const asking = state === "running" && workApproval({ work, conversationId: work.conversation_id, questions: openQuestions, answered: workspace.answered })
-    if (matchesBot(work.conversation_id, item?.bot?.bot_id)) groups[taskGroup(taskStale(state, workspace.connectionOnline && read) ? "unknown" : state, Boolean(asking))].push(work)
+  const activityBot = (activity: WorkspaceActivity) => activity.conversation_id ? workspace.bots.find((bot) => bot.conversation_id === activity.conversation_id) ?? overview.bots.find((bot) => bot.conversation_id === activity.conversation_id) : undefined
+  const visibleGroups: Record<TaskGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
+  for (const group of taskGroups.map(({ group }) => group)) for (const activity of groups[group]) {
+    const bot = activityBot(activity)
+    if (matchesBot(activity.conversation_id ?? "", bot?.bot_id)) visibleGroups[group].push(activity)
   }
-  const visibleAttention = attention.flatMap((item): typeof attention => {
-    if (item.kind === "question") return matchesBot(item.question.conversation_id, item.question.bot?.bot_id) ? [item] : []
-    const check = item.check
-    if (check.kind === "device") {
-      const works = check.works.filter((work) => matchesBot(work.conversation_id))
-      return works.length ? [{ ...item, check: { ...check, works } }] : []
-    }
-    return matchesBot(check.kind === "work" ? check.conversation_id : workspace.selectedBot?.conversation_id ?? "") ? [item] : []
-  })
-  const otherChecks = unrepresentedOverviewChecks(overview, overviewWorks, workspace.nodes, read ? workspace.bots : []).filter((task) => task.conversation_id !== workspace.conversationId && matchesBot(task.conversation_id, task.bot?.bot_id))
   const visible = (group: TaskGroup) => filter === "all" || filter === group
-  const noticed = visible("attention") ? visibleAttention.length + groups.attention.length + otherChecks.length : 0
-  const visibleCount = noticed + (visible("working") ? groups.working.length : 0) + (visible("waiting") ? groups.waiting.length : 0)
+  const noticed = visible("attention") ? visibleGroups.attention.length : 0
+  const visibleCount = noticed + (visible("working") ? visibleGroups.working.length : 0) + (visible("waiting") ? visibleGroups.waiting.length : 0)
   const hasContent = visibleCount > 0
   const emptyLabel = !read ? workspace.connectionOnline ? "正在读取当前连接的任务" : "尚未读取任务，连接后再确认" : filter === "all" && botFilter === "all" ? "当前记录没有未完成的任务" : "没有符合筛选的任务"
-  const card = (work: OpenWork) => <TaskOverviewCard key={JSON.stringify([work.conversation_id, work.work_id])} work={work} projected={projection(work)} bot={workspace.bots.find((bot) => bot.conversation_id === work.conversation_id)} waiting={Boolean(workApproval({ work, conversationId: work.conversation_id, questions: openQuestions, answered: workspace.answered }))} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(work, workspace.liveProgress)} />
+  const card = (activity: WorkspaceActivity) => {
+    if (activity.kind === "work" && activity.work) return <div key={activity.id} className="grid gap-2"><TaskOverviewCard work={activity.work} projected={activity.projection} bot={activityBot(activity)} waiting={activity.facts.questions.length > 0} lookup={lookup} connected={workspace.connectionOnline && read} progress={taskProgress(activity.work, workspace.liveProgress)} />{activity.facts.questions.map((question) => <QuestionCard key={`question:${question.question_id}`} question={question} inbox from="tasks" />)}{activity.facts.checks.filter((check) => check.kind !== "device" || check.works[0]?.work_id === activity.work_id).map((check) => <ConfirmCard key={`check:${check.check_id}`} check={check} inbox from="tasks" />)}{activity.facts.overviewChecks.map((check) => <OverviewCheckCard key={`overview-check:${check.check_id}`} check={check} />)}</div>
+    if (activity.kind === "turn" && activity.job) return <TurnActivity key={activity.id} activity={activity} />
+    if (activity.kind === "attention" && activity.attention) return <AttentionActivity key={activity.id} activity={activity} bot={activityBot(activity)} read={read} />
+    return null
+  }
   const bot = workspace.bots.find((item) => item.bot_id === botFilter) ?? workspace.selectedBot ?? workspace.bots[0]
 
   return <div className="mx-auto grid w-full max-w-(--page-width) gap-6">
     <p className="sr-only" role="status" aria-live="polite">{hasContent ? `${visibleCount} 项任务` : emptyLabel}</p>
-    <WorkspaceMasthead attention={read ? visibleAttention.length + groups.attention.length + otherChecks.length : null} working={read ? groups.working.length : null} waiting={read ? groups.waiting.length : null} online={workspace.connectionOnline} />
+    <WorkspaceMasthead attention={read ? visibleGroups.attention.length : null} working={read ? visibleGroups.working.length : null} waiting={read ? visibleGroups.waiting.length : null} online={workspace.connectionOnline} />
     <p className="text-meta text-muted-foreground">{[...overviewScope(overview.coverage), ...(!read ? ["当前连接尚未完成首读"] : !workspace.connectionOnline ? ["连接已断开，显示最近记录"] : [])].join(" · ")}</p>
     <TaskFilters filter={filter} botFilter={botFilter} bots={workspace.bots} onFilter={setFilter} onBotFilter={setBotFilter} />
     {taskGroups.map(({ group, title }) => {
       if (!visible(group)) return null
-      const count = group === "attention" ? noticed : groups[group].length
+      const count = visibleGroups[group].length
       return count ? <OverviewSection key={group} title={title} count={count}>
-        {group === "attention" ? visibleAttention.map((item) => <div key={item.key}>{item.kind === "question" ? <QuestionCard question={item.question} inbox from="tasks" /> : <ConfirmCard check={item.check} inbox from="tasks" />}</div>) : null}
-        {group === "attention" ? otherChecks.map((check) => <Card key={`${check.conversation_id}:${check.item_id}`}><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? (read ? "未找到所属 Bot" : "Bot 身份未加载")}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>) : null}
-        {groups[group].map(card)}
+        {visibleGroups[group].map(card)}
       </OverviewSection> : null
     })}
     {!hasContent && !read && workspace.connectionOnline ? <div aria-busy="true" className="grid gap-3"><Skeleton className="h-20" /><Skeleton className="h-20" /></div> : !hasContent ? <WorkspaceEmpty title={emptyLabel} bot={bot} onCreate={createBot} /> : null}
@@ -117,6 +109,26 @@ function WorkspaceMasthead({ attention, working, waiting, online }: { attention:
       <div className="grid grid-cols-3 gap-2" aria-label="任务概览"><Metric label="需要留意" value={attention} tone={attention ? "warning" : "neutral"} /><Metric label="进行中" value={working} tone={working ? "info" : "neutral"} /><Metric label="等待中" value={waiting} tone="neutral" /></div>
     </div>
   </section>
+}
+
+function OverviewCheckCard({ check }: { check: Extract<OverviewTask, { kind: "check" }> }) {
+  return <Card><CardContent className="grid gap-2"><p className="font-medium">{check.work_id ? "任务状态待确认" : "程序状态待确认"}</p><p className="text-meta text-muted-foreground">{check.bot?.name ?? "未找到所属 Bot"}{check.bot ? " · 请到所属 Bot 查看" : ""}</p>{check.bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: check.bot.bot_id }}>打开 {check.bot.name}</Link></Button> : null}</CardContent></Card>
+}
+
+function TurnActivity({ activity }: { activity: Extract<WorkspaceActivity, { kind: "turn" }> }) {
+  const job = activity.job
+  if (!job) return null
+  return <Card><CardContent className="grid gap-1"><p className="font-medium">后台工作</p><p className="text-meta text-muted-foreground">{job.state} · {job.trigger || "未提供触发信息"}</p>{"source_node" in job && job.source_node ? <p className="text-meta text-muted-foreground">来源设备 · {job.source_node}</p> : null}</CardContent></Card>
+}
+
+function AttentionActivity({ activity, bot, read }: { activity: Extract<WorkspaceActivity, { kind: "attention" }>; bot?: { bot_id: string; name: string }; read: boolean }) {
+  const attention = activity.attention
+  if (!attention) return null
+  if ("answer" in attention && "about" in attention) return <QuestionCard question={attention} inbox from="tasks" />
+  if ("kind" in attention && attention.kind === "check") return <OverviewCheckCard check={attention} />
+  if ("kind" in attention && (attention.kind === "work" || attention.kind === "device" || attention.kind === "process")) return <ConfirmCard check={attention} inbox from="tasks" />
+  if ("question_id" in attention) return <Card><CardContent className="grid gap-2"><p className="font-medium">问题待确认</p><p className="text-meta text-muted-foreground">{attention.text}</p>{bot ? <Button asChild variant="outline"><Link to="/b/$botId" params={{ botId: bot.bot_id }}>打开 {bot.name}</Link></Button> : <p className="text-meta text-muted-foreground">{read ? "未找到所属 Bot" : "Bot 身份未加载"}</p>}</CardContent></Card>
+  return null
 }
 
 function Metric({ label, value, tone }: { label: string; value: number | null; tone: Tone }) {
