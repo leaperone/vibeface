@@ -34,7 +34,7 @@
 | `network` | iroh 传输、relay 和公共入口设置，见下表 |
 | `manager` | Bot 配置，`provider` 是运行 Bot 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`），关闭时为 `null` |
 | `providers.execution` | 执行派发工作的产品列表，默认为空，只能列 `supports` 含 `execution` 的产品（`codex`、`cursor`、`claude`、`pi` 或 `opencode`）；为空时不提供派发执行能力。`providers.execution_models` 按 Provider 保存执行任务默认模型，空值跟随 Provider 默认；它与 Bot 的 `manager.model` 分开 |
-| `providers.codex_app_server` | `{mode, socket}`：缺少 mode 时默认为 `spawn`；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
+| `providers.codex_app_server` | `{mode, socket}`：整个对象省略时默认 `spawn`，提供对象时 `mode` 必填；`system` 只有显式绝对 `socket` 才连接外部 App Server；`spawn` 时 Node 使用 `<data-dir>/providers/codex` 作为 Node-owned `CODEX_HOME`，不扫描或复用用户 App Server |
 | `bins` | 各产品的程序，键为产品名 `codex`、`cursor`、`claude`、`pi` 或 `opencode`；没写的用同名程序，Cursor 为 `cursor-sdk-bridge`。后台运行时用绝对路径 |
 | `timeout_secs` | 单次 SDK 调用超时，默认 600 秒 |
 | `daily_decision_limit` | 本 Node 每个网络的 UTC 每日非本人触发的管理调用次数，默认 20；本人主动聊天不受此额度限制；协调 Agent 的分诊唤醒按同一上限另行计数 |

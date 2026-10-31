@@ -19,7 +19,7 @@ use vibeface::{
     local_access::Launcher,
     maintenance,
     net::{self, NetworkConfig, PublicEntry, RelayServiceMode},
-    providers::Provider,
+    providers::{AppServer, AppServerMode, Provider},
     runtime::Runtime,
     store::Store,
     update::{self, Update},
@@ -239,7 +239,8 @@ struct Init {
     /// default name. May be repeated.
     #[arg(long = "bin", value_name = "PROVIDER=PATH", value_parser = provider_bin)]
     bins: Vec<(Provider, PathBuf)>,
-    /// Socket of the running Codex App Server; found under the Codex folder when omitted.
+    /// Absolute socket of an external Codex App Server; selects system mode.
+    /// Omit to let the Node start its own server.
     #[arg(long)]
     codex_socket: Option<PathBuf>,
     /// iroh relay of another Node in the personal network, e.g. `https://relay.example`. May be repeated.
@@ -1080,7 +1081,12 @@ fn init(options: Init) -> Result<()> {
     configuration.local_listen = options.local_listen;
     configuration.web_enabled = !options.no_web;
     configuration.local_auto_access = !options.no_local_auto_access;
-    configuration.providers.codex_app_server.socket = options.codex_socket;
+    if let Some(socket) = options.codex_socket {
+        configuration.providers.codex_app_server = AppServer {
+            mode: AppServerMode::System,
+            socket: Some(socket),
+        };
+    }
     configuration.bins = options.bins.into_iter().collect();
     if let Some(url) = options.public_url {
         configuration.public_url = origin(&url)?.to_string().trim_end_matches('/').to_owned();
@@ -2875,6 +2881,33 @@ mod tests {
         assert!(!dir.join("identity.json").exists());
         assert!(!dir.join("config.json").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn initialization_selects_system_only_for_an_explicit_codex_socket() {
+        for socket in [None, Some("/tmp/vibeface-fixture-codex.sock")] {
+            let dir =
+                std::env::temp_dir().join(format!("vibeface-cli-mode-{}", uuid::Uuid::new_v4()));
+            let mut args = vec!["vibeface", "init", "--data-dir", dir.to_str().unwrap()];
+            if let Some(socket) = socket {
+                args.extend(["--codex-socket", socket]);
+            }
+            let Some(Action::Init(options)) = Cli::try_parse_from(args).unwrap().command else {
+                panic!("expected init")
+            };
+            init(*options).unwrap();
+            let saved = Config::load(&dir).unwrap().providers.codex_app_server;
+            assert_eq!(
+                saved.mode,
+                if socket.is_some() {
+                    AppServerMode::System
+                } else {
+                    AppServerMode::Spawn
+                }
+            );
+            assert_eq!(saved.socket.as_deref(), socket.map(Path::new));
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

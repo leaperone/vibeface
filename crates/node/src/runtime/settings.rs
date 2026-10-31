@@ -145,11 +145,12 @@ impl ProviderChange {
                 "{} does not execute dispatched work here yet",
                 provider.label()
             );
-            let model = provider.model(model.trim());
-            crate::model::validate_model(&model)?;
+            let model = model.trim();
             if model.is_empty() {
                 target.local.switches.execution_models.remove(&provider);
             } else {
+                let model = provider.model(model);
+                crate::model::validate_model(&model)?;
                 target
                     .local
                     .switches
@@ -1120,5 +1121,41 @@ pathlib.Path(__file__).with_name('observed.json').write_text(json.dumps({'args':
         assert!(provider_setup(Provider::Pi, &system, &roots).is_none());
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn clearing_a_cursor_execution_model_removes_the_override() {
+        let mut local = providers::Local {
+            switches: Default::default(),
+            bins: Default::default(),
+            env: Default::default(),
+        };
+        let mut manager = None;
+        let mut triage = Default::default();
+        for input in ["custom", "  ", "auto", ""] {
+            let change: ProviderChange = serde_json::from_value(json!({
+                "provider":"cursor", "execution_model":input,
+            }))
+            .unwrap();
+            change
+                .apply(
+                    Target {
+                        local: &mut local,
+                        manager: &mut manager,
+                        triage: &mut triage,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                local
+                    .switches
+                    .execution_models
+                    .get(&Provider::Cursor)
+                    .map(String::as_str),
+                (!input.trim().is_empty()).then_some(input)
+            );
+        }
+        assert_eq!(Provider::Cursor.model(""), "auto");
     }
 }
