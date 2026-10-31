@@ -1,8 +1,6 @@
 name: macOS app
 on:
   workflow_dispatch:
-  pull_request:
-    paths: [apps/macos/**, .github/workflows/macos.yml]
 permissions: {contents: read}
 jobs:
   build:
