@@ -272,18 +272,23 @@ impl Runtime {
     pub(super) async fn accept_dispatch(
         self: &Arc<Self>,
         network: &str,
-        spec: WorkSpec,
+        mut spec: WorkSpec,
     ) -> Result<(WorkRecord, bool)> {
-        let spec = self.resolve_work_model(network, spec).await?;
-        if self
-            .store
-            .lock()
-            .await
-            .work_record(&spec.work_id)?
-            .is_none()
+        spec.model = spec
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        let _settings = self.manager_controls.lock().await;
         {
-            self.authorize_dispatch(network, &spec).await?;
+            let mut store = self.store.lock().await;
+            if store.work_record(&spec.work_id)?.is_some() {
+                return store.accept_work(&self.identity, network, spec, now_ms());
+            }
         }
+        let spec = self.resolve_work_model(network, spec).await?;
+        self.authorize_dispatch(network, &spec).await?;
         let (record, created) =
             self.store
                 .lock()
@@ -308,8 +313,6 @@ impl Runtime {
         Ok((record, created))
     }
 
-    /// Resolves a work model exactly once at the accepting Node. The request model remains in
-    /// `WorkSpec.model`; the result is persisted separately and is never accepted from a peer.
     pub(super) async fn resolve_work_model(
         &self,
         network: &str,

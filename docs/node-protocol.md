@@ -1,6 +1,6 @@
 # Node 协议参考
 
-协议版本为 `1`，数据格式 `data_epoch=9`，数据库 `user_version=9`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，不同 epoch 的数据目录和程序不能混用。
+协议版本为 `1`，数据格式 `data_epoch=9`，数据库 `user_version=9`。共享结构以 `crates/node/src/model.rs` 为准。本文描述本机配置、HTTP 与浏览器通道、业务 RPC、调度、工作、事件 DAG、写入保护和 Node 之间的 iroh 传输。项目尚未发布正式版，epoch 9 使用本文定义的最终事件结构。同一个人网络中的所有 Node 必须使用该最终格式的构建，不能混跑 epoch 8 或旧的 epoch 9 开发快照。`data-epoch.json` 只检查本机目录，不参与 peer 握手。旧 Node 会因 `deny_unknown_fields` 拒绝新增的 `model`、`resolved` 等字段；协议版本 1 不代表这些不同结构可以互通。程序不迁移或清空旧数据。
 
 ## 身份与数据范围
 
@@ -61,15 +61,21 @@
 {
 	"provider": "cursor",
 	"workspace": "/absolute/manager-workspace",
-	"model": "auto"
+	"model": "auto",
+	"reasoning_effort": null,
+	"backup": { "automatic": false, "candidates": [] }
 }
 ```
+
+`reasoning_effort` 为可选推理档位。`backup` 保存本机备用策略，默认关闭。候选项为 `{provider, model, reasoning_effort}`，最多 5 个不同的 Provider 与模型组合，自动策略只允许原回合已确认未执行时尝试一次。
 
 `provider` 可为 `codex`、`cursor`、`claude`、`pi` 或 `opencode`。Codex Bot 回合在 Codex App Server 上运行（`turn/start`，`clientUserMessageId` 为 attempt ID）。`manager_capabilities` 声明本机 SDK 能力，包含流式进度、取消请求、本机原生会话延续和 steer；Codex、pi 与 opencode 支持 steer，Cursor 与 Claude Code 的消息继续排队。`cancel_confirmation=true` 表示取消可被确认，Codex 以 App Server 回合结束为证据，Cursor 必须收到 Provider 终态；本地进程组退出不等于 Provider 确认取消，结果仍须按待核对路径结算。配置存在、进程可达和真实模型可用是不同状态。
 
 Cursor 的常驻进程按个人网络与 Bot 会话隔离，设备的 coordination Agent 使用独立进程。任务也使用独立进程和存储，续接同一本机任务会话时复用原有 owner。同一个 Bot 只允许一轮活跃回合，不同 Bot 可同时运行。每个进程使用数据目录下独立的 JSONL store 和 bridge state，工作目录仍是用户选择的项目，不在项目的 `.sdk` 或 `~/.cursor` 写 SDK 状态。回合先保存原生 agent ID，再发送提示；进程重启仍从同一私有 store 续接。会话键包含实际 JSONL root，store 改变时清空旧原生 ID 与覆盖向量，从 DAG 重建上下文，不读取或迁移旧的默认 SQLite store。Node 按 10 分钟间隔回收空闲至少 10 分钟的进程及内存槽，保留 JSONL 历史；退出时停止全部受管进程组。
 
 Cursor 执行器在发送前保存 Agent ID，流首次给出 Run ID 时记录该运行。工作进度和结果使用既有工作状态与事件；取消只在 Provider 终态确认后结算。断流或重启后按已知 Agent ID、Run ID 和原有私有存储调用 `GetRun`；缺少运行 ID 或读取失败时保持待核对，绝不按最新运行猜测或重新发送。任务回读不改变 Bot 的 `run_reconcile=false` 能力声明。
+
+pi 的实际会话保存在 `<data-dir>/providers/pi/sessions`，真实启动同时固定 `--session-dir` 与 `PI_CODING_AGENT_SESSION_DIR`。原有 pi 认证配置不变。OpenCode 的数据、配置、状态和缓存分别使用 `<data-dir>/providers/opencode/{data,config,state,cache}`，`OPENCODE_DB` 固定为该 data 根中的 `opencode/opencode.db`。Node 强制私有 `OPENCODE_CONFIG_DIR`，忽略外部 `OPENCODE_CONFIG`、额外 CLI 配置和项目配置覆盖，Shell 工具继承相同私有根。
 
 Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工具进程环境。Node 不再通过插件修改 Shell 环境；发送提示前必须成功设置该轮的工具凭证。读取消息和待处理 inbox 后才判断发送结果，不重发结果未知的请求。取消会删除本轮仍在 inbox 中的输入；只有没有待处理输入时才结清待核对，新的回合也不能唤醒残留队列。外部 CLI 会话的 hook 插件不在此适配范围内。
 
@@ -93,6 +99,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `codex-app-server.pid` | 托管 App Server 的进程组号 |
 | `cursor-sdk-bridge.pid` | 常驻 Cursor SDK Bridge 的进程组号和程序路径，Node 启动时结束上次遗留且命令相符的进程组 |
 | `cursor/instances/<owner 摘要>/` | 每个 Cursor Bot、coordination Agent 或任务会话的私有 JSONL store；`bridge-state/` 保存 bridge discovery、令牌和 SDK 本机数据，目录 0700，不进入共享 DAG |
+| `providers/pi/sessions/` | pi 原生会话文件，Node 的 `pi/` 仍保存恢复指针 |
+| `providers/opencode/` | OpenCode 私有 XDG 数据、配置、状态、缓存及数据库，不复制用户认证 |
 | `cursor/work-owners.json` | 本机 Cursor 任务到原生 Agent、会话 owner 和工作目录的映射，0600；不含模型密钥，不进入共享 DAG |
 | `node.log`、`node.log.1`…`node.log.4` | Node 日志，JSON lines，0600，8 MiB 轮转，共保留 5 个 |
 | `service.*.log`、`update.*.log` | macOS 服务和更新器的标准输出与错误 |
@@ -146,10 +154,11 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `diagnostics` | 可选 `since_ms`、`until_ms`，默认最近一天 | 脱敏诊断包，见 [排障](troubleshooting.md) |
 | `log` | `records`：1 到 20 条 `{level, event, message, conversation_id?, work_id?, fields?}` | 浏览器写日志，来源记为 `web`，每条 JSON 不超过 8 KiB，每台设备每分钟 120 条 |
 | `logs` | 可选 `since_ms`、`until_ms`、`level`、`sources`、`conversation_id`、`work_id`、`text`、`limit` | 读本机日志，返回 `records`，最多 20000 条 |
-| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager, missing}`（`missing` 列出 Bot 缺程序的产品）和 `providers`。`providers` 只列 `supports` 非空的产品，每项为 `{provider, roles, supports, installed, state, issues, bin, app_server, execution_model, execution_readiness, env}`，`bin` 是它实际运行的程序，`installed` 说明这台电脑上找得到这个程序（同启动时的查找）：`roles` 是它现在的用途（运行 Bot 为 `agent`，执行派发的工作为 `execution`），`state` 为 `ready`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
+| `node_settings` | `{}` | 读取本机 `settings {roots, manager}`、`defaults`、`readiness {manager}`和 `providers`。`providers` 只列 `supports` 非空的产品，每项为 `{provider, roles, supports, installed, state, issues, bin, app_server, execution_model, execution_readiness, env, probe, readiness, setup}`，`bin` 是它实际运行的程序，`installed` 说明这台电脑上找得到这个程序（同启动时的查找）：`roles` 是它现在的用途（运行 Bot 为 `agent`，执行派发的工作为 `execution`），`state` 为 `ready`、`unverified`、`needs_setup`、`starting` 或 `off`（没有用途），`env` 只说明变量是否已设置。`display_paths` 把响应里位于主目录下的每个绝对路径映射为 `~/…` 写法，只用于显示；`configure_provider` 和 `configure_node` 收到的路径以 `~` 开头时按主目录展开 |
 | `configure_node` | `manager`、`roots` | 保存可用文件夹和当前 Bot 的模型和工作目录，路径开头的 `~` 按本机主目录展开；不能开关 Bot 或更换它的服务 |
-| `configure_provider` | `provider`，可选 `bot`、`execution`、`execution_model`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。任务只经目标设备的 Bot 到达，所以这台设备没有 Bot 时，`execution: true` 且未给 `bot` 会让这个服务同时运行 Bot。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`execution_model` 只写执行角色的设备默认模型，空字符串清除覆盖并回落 Provider 默认；`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin` 和 `app_server.socket` 开头的 `~` 按本机主目录展开；`CODEX_HOME` 由 Node 固定为 Node-owned 根。写入前只补齐所开用途缺少的程序路径，system 模式只显示显式外部连接，不会自动发现用户目录。
-| `provider_models` | `provider` | 读取这个 Provider 共享的模型目录，Bot 和执行任务复用同一目录；目录不可用时仍可保存空值或手填模型。目前只有 Codex 经已连接的 App Server `model/list` 列出，略去隐藏模型；其他服务或未连接时为 `null`，网页保留手填 |
+| `configure_provider` | `provider`，可选 `bot`、`execution`、`execution_model`、`bin`、`app_server`、`env` | 唯一选择用途的方法。`bot: true` 让这个服务运行 Bot，保留已有的 Bot 设置，没有时用 `defaults`；Cursor 模型为空时取 `auto`，换到 Codex 时 `auto` 改为默认。`bot: false` 只在 Bot 运行于这个服务时关闭它。任务只经目标设备的 Bot 到达，所以这台设备没有 Bot 时，`execution: true` 且未给 `bot` 会让这个服务同时运行 Bot。`bot` 和 `execution` 只用于 `supports` 含对应用途的产品，`app_server` 只用于 Codex；`bin` 为空时恢复默认程序。`execution_model` 只写执行角色的设备默认模型，空字符串清除覆盖并回落 Provider 默认；`env` 中字符串设置变量，`null` 删除，值只写入本机私有文件。`bin` 和 `app_server.socket` 开头的 `~` 按本机主目录展开；`CODEX_HOME` 由 Node 固定为 Node-owned 根。写入前只补齐所开用途缺少的程序路径，system 模式只显示显式外部连接，不会自动发现用户目录。 |
+| `provider_models` | `provider` | 读取共享模型目录 `ModelCatalog`，Bot 和执行任务复用。`available` 带模型和覆盖范围，`unavailable` 带原因；两种状态都保留默认和手填。Codex 经 App Server `model/list`，pi 经无会话 RPC 列出 |
+| `provider_probe` | `provider` | 主动刷新该 Provider 的无 prompt 检查，返回完整 `ProviderStatus`；不调用模型或执行登录 |
 | `local_access` | 可选 `enabled` | 查询或开关本机自动访问 |
 | `invite` | `record` | 管理设备登记签名邀请，返回 `join_id`、`entry_id`、`entry { relay_url, direct_addrs }` 和 `gateway_url` |
 | `join_check` | `secret` | 打开链接时询问入口还收不收它，回 `invite` 为 `open`、`used` 或 `expired`，不占用链接。必须持有 secret 才能问。没登记过的 secret 与过期的回答相同，回答也不超出 `join` 拒绝时给的信息。本设备已提交且仍在等待的请求回 `open` |
@@ -163,6 +172,8 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 | `approve_recovery` | `event` | 管理设备签名确认当前等待的找回并立即生效：`epoch` 是生效 epoch，`at_ms` 不晚于 Node 当前时间且相差不超过 10 分钟，并早于生效时间，目标须是当前 `pending`。确认确实改变生效 epoch 后才安装，返回 `state`、`view` 和 `now_ms`，即使新目录移除了签发者也返回这份签名结果。同一事件重复提交不新增记录 |
 | `recovery_state` | `expires_at_ms`、`signature`、`checkpoints`、`events` | 恢复密钥以绑定本通道设备的两分钟签名读取当前目录 `state` 和本机各作者主分支的头 `heads`；先合并恢复文件带来的 `checkpoints` 和 `events`；新 checkpoint 据此为没有保留的 Node 写 `retired`，并从 `state` 取签名 epoch 的管理事件 heads 写入 `heads` |
 | `recover` | `genesis`、`checkpoints`、`events`、`capability` | `checkpoints` 是完整链，最后一个是新 checkpoint，`events` 是恢复文件里的管理事件。空 Node 凭 `capability` 安装整条链和全部事件；已建网 Node 只取指向所带 checkpoint 的 `veto`，`approve` 和其余事件丢弃，最后一个 checkpoint 本机已有时什么也不改，否则合并后安装它。新的换目录 checkpoint 的 `issued_at_ms` 须在 Node 时间 10 分钟内（太早回 `this recovery was signed too long ago; start it again`，太晚回时钟偏差）；本机没有的旧 checkpoint 已作废的直接放过，仍会生效的同样检查 |
+
+`ProviderStatus.setup` 为 `{directory, command}` 或 `null`，只含非敏感私有目录和可复制登录命令。Codex spawn、Claude Code 和 OpenCode 提供入口，Web 和 Mobile 保留复制与检查可用性。Codex system 共享外部服务的会话且 `setup=null`。pi 只隔离会话目录并保留本机认证，`setup=null`。
 
 未加入的设备只能调用 `info`、`authenticate`、`join_check`、`join`、`join_status`、`join_withdraw`、`recovery_state`、`recover`，以及本机页面使用的 `node_join_check`、`node_join`、`node_join_cancel` 和 `rejoin`。`node_join_check` 带一次性本机授权 `capability` 和 `link`，由这台 Node 经 `vibeface/join/1` 向邀请所在 Node 发 `join_check`，转回其回答；其他方法要求已验证的成员或本机会话。`recovery_state` 和 `recover` 是根恢复的专用准入：前者要求当前恢复密钥对 `{device_id, expires_at_ms, network_id}` 的签名，`device_id` 为本通道设备，有效期最长两分钟；后者在安装前验证新 `RootCheckpoint` 由当前恢复密钥签名且 epoch 加一，验证前没有副作用。签名来自已被替换的恢复密钥时两者都回 `this recovery key was replaced by a newer recovery`，有找回在等时回 `another recovery is waiting to take effect`，来自被否决的找回时回 `one of your devices stopped this recovery`。所有管理浏览器都丢失时，新浏览器凭恢复文件经这两个方法找回，48 小时后得到管理权限，等待期内它只是未加入的设备。`authenticate`、`directory` 和 `recovery_state` 的回复带 `now_ms`，回复里的视图按这个时间算出，浏览器用它复算核对，签否决或确认时也用 Node 时间。到点或迟到的否决改变生效目录时，Node 重新安装一次签名状态，重算投影并作废邀请；定时任务每次最多睡 15 分钟，醒来按墙钟重算。每个请求都重新查成员目录；目录变化时，已订阅或正在观察进度的会话重新核对，设备被移除后会话关闭。`confirm_writable`、`diagnostics`、`logs`、`node_settings`、`provider_models`、`configure_node` 和 `configure_provider` 另要求管理设备或本机会话，`invite`、`approve`、`approve_recovery` 和 `veto` 要求管理设备，`revoke` 要求管理设备或撤销自己的客户端成员。
 
@@ -215,7 +226,9 @@ Opencode Bot 和执行器使用 2.2.0 的 `/api` 接口，按 session 设置工�
 
 `changes` 按 rank 列出本会话的 bot 修改，每项为 `{ change_id, conversation_id, cause, event_hash, created_at_ms, change }`，`conversation_id` 是被修改的 bot 的会话，`cause` 为 `{ conversation_id, message_id }` 或 `null`（bot 自己定的提醒），`change` 即 `BotChanged.change`。`overwritten` 列出本会话里被另一台设备没看到就覆盖的修改，每项为 `{ change_id, field, provider?, by, value }`：`field` 为 `name`、`instructions`、`model`（带 `provider`）、`skills` 或 `avatar`，`by` 是当前值的写入设备，`value` 是当前值。它由已生效事件按 rank 现算，规则见 design/bot-config.md 第 3 节。`bot_settings` 为 `{ skills: [{ skill_id, name, description }], schedules: [{ schedule_id, name, prompt, first_run_at_ms, every_minutes?, enabled, depth?, next_run_at_ms }], memory: [{ memory_id, text }] }`，skill 是全网共用的库，schedules 只列本会话还会运行或已暂停的 schedule，暂停时 `next_run_at_ms` 为 `null`，没有 `every_minutes` 的是一次性提醒，`depth` 省略即 0。`messages` 中 `role=bot` 的是另一个 bot 发来的消息，带 `sender { conversation_id, name }`。
 
-`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`cwd`、`title`、`prompt`、`call_ref`、`continues`、`parent`、`thread`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure`，以及每台设备都从 DAG 推出的 `state`（`accepted`、`running`、`interrupting`、`finished` 或 `unverified`）。网页以 `title` 为任务名，`prompt` 作为“交代的事”显示在任务详情主区。
+`works` 的每项包含 `work_id`、`conversation_id`、`target_node`、`trigger`、`dispatcher`、`kind`、`model`、`resolved`、`cwd`、`title`、`prompt`、`call_ref`、`continues`、`parent`、`thread`、`phase`、`summary`、`thread_id`、`turn_id`、`outcome`、`result_text`、`failure_reason`、`failure`，以及每台设备都从 DAG 推出的 `state`（`accepted`、`running`、`interrupting`、`finished` 或 `unverified`）。网页以 `title` 为任务名，`prompt` 作为“交代的事”显示在任务详情主区。
+
+工作接纳先读取已有 `work_id` 并校验完整请求，只有新工作读取可变设置。停用或切换 Bot 后，相同请求仍返回原状态且不重新发送。任务调度在 claim 和会话身份计算之前选择冻结的 Provider 与模型。`resolved.model=null` 固定 Provider 默认语义，不再读取 Node 后来修改的默认值，也不保证 Provider 内部实际型号不变。
 
 ## 可靠调度回执
 
@@ -307,7 +320,7 @@ Event {
 | `bot_avatar_set` | `version`、`avatar`、`attestation` | 入口 Node，写在该 bot 的会话；`version` 为 `null` 或 16 位十六进制，签名覆盖 `version`，投影只用 `avatar` |
 | `message_steered` | `message_id`、`reply` | steer 这条本人消息的 Node，在宿主回复 `reply` 完成且消息并入其中时写 |
 | `message_posted` | `message_id`、`role`、`text`、`attachments`、`report_results?`、`in_reply_to?`、`status?`、`failure?`、`answers?`、`attestation?` | 本人消息由入口写，回答由负责人写；`answers` 只在本人消息上，`message_id` 为 `a-<question_id>` |
-| `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（执行它的产品名，或 `task`）、`cwd`、`title`、`prompt`、`continues?`、`parent?`、`thread?` | 目标 Node |
+| `work_dispatched` | `work_id`、`trigger`、`dispatcher`、`call_ref`、`kind`（执行它的产品名，或 `task`）、`model?`、`resolved? {provider, model}`、`cwd`、`title`、`prompt`、`continues?`、`parent?`、`thread?` | 目标 Node |
 | `work_progress` | `work_id`、`phase`、`summary`、`thread_id?`、`turn_id?` | 目标 Node |
 | `work_finished` | `work_id`、`outcome`、`result_text`、`failure_reason?`、`failure?`、`attestation?` | 目标 Node，本人结清时由入口写 |
 | `notification_acked` | `notification_id`、`client_id`、`attestation` | 入口 Node |
@@ -323,7 +336,7 @@ Event {
 
 `context_checkpoint`、没有 `cause` 的 `bot_changed`（bot 自设提醒）、`schedule_run_claimed` 和 `bot_messaged` 只能由对应会话的负责人写：前三者看写入的会话，`bot_messaged` 看发送方会话 `from.conversation_id`，写 `bot_messaged` 时 `deps` 也包含发送方会话里各作者的最新事件。入库和本机写入都按作者写入时的认知核对：只看作者自己此前的事件和每个 `deps` 所在日志到该依赖为止的 `conversation_owner`，其中 epoch 最大的若有一条指名作者即通过，否则拒绝并记 `sync.event_rejected` 日志。`schedule_run_claimed` 的 `owner_epoch` 还必须等于这个最大 epoch。作者还没看到的换负责人不算违规；乱序到达的事件先等依赖入库再核对，所以各副本结论一致。换负责人后旧负责人结束回合时只写回复，不再写检查点。同一 `(会话, schedule_id, slot_ms)` 的领取投影为 `schedule_claims`，`owner_epoch` 大者胜，相同时作者较小者胜，与到达顺序无关。
 
-通知由三类事件派生，通知 ID 即该事件 hash：Bot 回答 `message_posted(assistant)`（`status` 为 `completed` 时类型为 `manager_response`，其余为 `manager_attention`）、`work_finished`（类型 `work_finished`）和会话里的 `question_asked`（类型 `question`）。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`：工作记录 rank 最小者胜，`session_attributed` rank 最大者胜并覆盖工作记录，`session_muted` 置 `muted`；所属 Bot 已删除的行读取时视为无主。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
+通知由四类事件派生，通知 ID 即该事件 hash：Bot 回答 `message_posted(assistant)`（`status` 为 `completed` 时类型为 `manager_response`，其余为 `manager_attention`）、`work_finished`（类型 `work_finished`）、会话里的 `question_asked`（类型 `question`）和新的会话归属 `session_attributed`（类型 `session_attributed`）。会话归属投影 `session_owners` 来自 `work_progress.thread_id`（作者即设备）和 `session_attributed`：工作记录 rank 最小者胜，`session_attributed` rank 最大者胜并覆盖工作记录，`session_muted` 置 `muted`；所属 Bot 已删除的行读取时视为无主。Codex 回合内部的命令、diff、推理和工具输出不进入 DAG。
 
 入库逐个检查，顺序为 hash、网络、事件形状与 `attestation`，重复，作者是当前成员或带上限的已撤销设备，作者签名，然后才看 `seq` 与 `prev` 的连续性和 `deps` 是否已入库。签名只在入库时验证一次，未通过验证的事件不会入库，也不会触发 `forked`。重复事件忽略；序号跳过的事件丢弃并从缺口重新拉取；`prev` 或 `deps` 还没入库的事件进入 `pending_events`，等它们入库后在同一事务内自动入库。`pending_events` 最多 10000 条，满了之后到达的事件这次丢弃，之后的同步轮次再拉。入库后才向本机客户端推送该事件的 `changed` 并执行它的后续动作，例如 `bot_deleted` 停止该 bot 的回合；还在等待的事件不推送。所有事件存在同一张 `events` 表：`prev` 是本机主分支头的为 `main=1`，同作者同序号的另一支为 `main=0`，作为分叉证据，不锁住会话。每行另存事件类型 `kind` 和它所指的消息、工作或提问 `subject`，按类型的读取（检查点、负责人记录、触发事件、`context` 的类型过滤）走索引。`log_heads` 保存每个作者主分支的 `max_seq` 和 `head_hash`，即本机版本向量。
 

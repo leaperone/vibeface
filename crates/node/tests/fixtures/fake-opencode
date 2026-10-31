@@ -1,9 +1,25 @@
-#!/bin/sh
-# Stands in for `opencode serve` in the Node's tests: records how it was started, names the
-# address of the test's fake opencode API, and waits to be stopped.
-dir=$FAKE_OPENCODE_DIR
-printf %s "$OPENCODE_SERVER_PASSWORD" > "$dir/password"
-printf %s "$OPENCODE_CONFIG_CONTENT" > "$dir/config.json"
-printf '%s\n' "$*" >> "$dir/argv"
-echo "opencode server listening on http://127.0.0.1:$FAKE_OPENCODE_PORT"
-exec sleep 120
+#!/usr/bin/env python3
+"""Controlled serve that records its launch and writes the selected private database path."""
+import json
+import os
+from pathlib import Path
+import time
+import sys
+
+directory = Path(os.environ['FAKE_OPENCODE_DIR'])
+(directory / 'password').write_text(os.environ['OPENCODE_SERVER_PASSWORD'])
+(directory / 'config.json').write_text(os.environ['OPENCODE_CONFIG_CONTENT'])
+with (directory / 'argv').open('a') as output:
+    output.write(' '.join(sys.argv[1:]) + '\n')
+names = ['XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME',
+         'OPENCODE_DB', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG', 'OPENCODE_CLI_CONFIG_CONTENT',
+         'OPENCODE_TEST_HOME', 'OPENCODE_DISABLE_PROJECT_CONFIG', 'OPENCODE_CONFIG_PROJECT_DISABLE']
+with (directory / 'roots.jsonl').open('a') as output:
+    output.write(json.dumps({**{name: os.environ.get(name) for name in names},
+                             'fake_auth_present': bool(os.environ.get('FAKE_API_KEY'))}) + '\n')
+database = Path(os.environ['OPENCODE_DB'])
+database.parent.mkdir(parents=True, exist_ok=True)
+with database.open('a') as output:
+    output.write('fixture session store\n')
+print('opencode server listening on http://127.0.0.1:' + os.environ['FAKE_OPENCODE_PORT'], flush=True)
+time.sleep(120)

@@ -139,6 +139,8 @@ export type PendingCheck =
   | { kind: "device"; check_id: string; detail: string; target_node: string; reason: "offline" | "disconnected"; works: Extract<PendingCheck, { kind: "work" }>[] }
   | { kind: "process"; check_id: string; detail: string }
 export type NotificationRecord = { notification_id: string; kind: string; text: string; conversation_id: string }
+export const sessionNotificationKind = "session_attributed"
+export const isSessionNotification = (item: Pick<NotificationRecord, "kind">) => item.kind === sessionNotificationKind
 export type FieldEdit = { before: string; after: string }
 /** A bot's model on one provider; empty follows the device's default. */
 export type ModelEdit = FieldEdit & { provider: ProviderId }
@@ -193,7 +195,7 @@ export type ConversationPayload = {
   sent: SentBotMessage[]
 }
 export type SentBotMessage = { message_id: string; to: string; text: string; created_at_ms: number }
-/** "chat" while a conversation route is on screen; reading it then acknowledges its notifications. */
+/** "chat" while a conversation route is on screen; reading it acknowledges ordinary notifications. */
 export type WorkspaceView = "chat" | "tasks" | "other"
 /** One version of an event, as a Node keeps it when two copies of a device wrote the same place. */
 export type ConflictVersion = { hash: string; scope_id: string; created_at_ms: number; body: Record<string, unknown> }

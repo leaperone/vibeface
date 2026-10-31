@@ -62,6 +62,7 @@ export type AppServer = { mode: AppServerMode; socket: string | null; link: AppS
 export type ProviderStatus = {
   provider: ProviderId; roles: ProviderRole[]; supports: ProviderRole[]; bin: string; app_server: AppServer | null
   execution_model: string; execution_readiness: ProviderReadiness
+  setup: { directory: string; command: string } | null
   /** Whether its program is on that device. */
   installed: boolean
   /** Codex only: the Codex folder and the sessions folder the device uses. */
@@ -326,11 +327,13 @@ function parseAppServer(value: unknown): AppServer | null {
 export function parseProvider(value: unknown): ProviderStatus {
   const v = record(value), probe = record(v.probe), launch = record(probe.launch)
   const provider = oneOf(v.provider, providerIds)
+  const setup = v.setup == null ? null : record(v.setup, 'AI 配置入口')
   if (oneOf(probe.provider, providerIds) !== provider) throw new Error('检查结果和 AI 服务不一致。')
   const launchState = launch.state === 'failed' ? { state: 'failed' as const, issue: parseProbeIssue(launch.issue) } : { state: oneOf(launch.state, ['unchecked', 'starting', 'launchable'] as const) }
   if (probe.checked_at_ms !== null && (typeof probe.checked_at_ms !== 'number' || !Number.isSafeInteger(probe.checked_at_ms) || probe.checked_at_ms < 0)) throw new Error('检查时间无效。')
   return {
     provider,
+    setup: setup === null ? null : { directory: text(setup.directory), command: text(setup.command) },
     roles: array(v.roles).map(role => oneOf(role, providerRoles)), supports: array(v.supports).map(role => oneOf(role, providerRoles)),
     installed: boolean(v.installed), bin: text(v.bin), app_server: parseAppServer(v.app_server),
     home: typeof v.home === 'string' ? v.home : null, sessions: typeof v.sessions === 'string' ? v.sessions : null,

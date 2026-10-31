@@ -41,9 +41,9 @@ Provider 能原生压缩时记录压缩状态，否则通过有界上下文交�
 
 ## 当前实现
 
-Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Node 接纳边界按显式请求、`providers.execution_models`、Provider 默认的顺序解析，并把 `model` 请求值与 `resolved { provider, model }` 冻结到 `WorkDispatched` 和投影。重试比较请求模型，远端任务不接受发起端显式模型，由目标 Bot 冻结自己的模型。
+Bot 模型和执行任务默认模型是两个独立设置。执行任务在 Node 接纳边界按显式请求、`providers.execution_models`、Provider 默认的顺序解析，并把 `model` 请求值与 `resolved { provider, model }` 冻结到 `WorkDispatched` 和投影。重试先回读原工作并比较完整请求，只有新工作读取当前设置。远端任务不接受发起端显式模型，由目标 Bot 冻结自己的 Provider 与模型。停用 Bot 暂停尚未启动的任务，但相同接纳请求仍返回原状态；切换 Provider 不改变已有任务的冻结选择。调度先解析冻结选择，再计算会话身份和 claim。`resolved.model=null` 固定 Provider 默认语义，不再读取之后修改的 Node 默认，也不保证 Provider 内部型号永久不变。
 
-Codex 默认使用 Node-owned `<data-dir>/providers/codex`、sessions 和 hook 根，并由 Node 启动独立 App Server。Claude 使用 Node-owned `CLAUDE_CONFIG_DIR`、transcript 和 hook 根。用户正在运行的 App Server、Claude transcript 或 hook 只有通过显式外部配置才会被接入。
+Codex 默认使用 Node-owned `<data-dir>/providers/codex`、sessions 和 hook 根，并由 Node 启动独立 App Server。Claude 使用 Node-owned `CLAUDE_CONFIG_DIR`、transcript 和 hook 根。Codex system 只有通过显式 socket 才接入外部服务，并共享该服务的会话。pi 只固定 `<data-dir>/providers/pi/sessions`，保留本机认证配置。OpenCode 使用 `<data-dir>/providers/opencode` 中的私有 XDG 数据、配置、状态和缓存，强制数据库与配置目录；外部 config override 和项目配置不参与该服务。启动和 session Shell 环境使用相同根。
 
 Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的登录状态命令检查，pi 通过无会话、无工具的 RPC 提供模型建议。Cursor 和 opencode 缺少已核实的账户查询时显示未确认。目录不完整时保留手填模型，不因某个模型未出现在列表中而阻止发送。
 
@@ -55,4 +55,6 @@ Codex 通过只读账户和模型接口检查，Claude Code 通过无 prompt 的
 
 备用策略保存在 Node 本地，默认关闭。开启后按顺序选择一个不同候选，最多追加一次尝试。跨服务候选须在本机启用执行角色，使用该设备配置的账户。只有原回合明确未启动、没有工具调用和待确认记录时才切换。记录保留原选项、实际提交选项和切换原因。
 
-存储使用 epoch 9 最终结构。程序不会迁移或清空旧 epoch 8 数据。受控协议、真实账户、模型理解质量和手机验收分别记录证据。
+私有 Codex、Claude Code 和 OpenCode 根可能需要重新认证。`ProviderStatus.setup` 返回非敏感目录和可复制登录命令，Web 与 Mobile 提供复制和重新检查入口；Node 不自动登录，不读取或复制用户凭证。未确认的认证仍显示未知，已确认缺少登录时显示需要设置。
+
+存储使用 epoch 9 最终结构与事件协议 1。同一网络要求所有 Node 使用本轮最终格式，不能混用 epoch 8 或 epoch 9 的旧开发快照；本机 epoch 校验不是 peer 握手。旧形状会拒绝新增字段。程序不会迁移或清空旧 epoch 8 数据。受控协议、真实账户、模型理解质量和手机验收分别记录证据。

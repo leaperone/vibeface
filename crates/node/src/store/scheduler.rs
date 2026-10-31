@@ -1501,7 +1501,7 @@ impl Store {
         network: &str,
         conversation: &str,
         boot: &str,
-        sdk_config: &str,
+        configure: impl FnOnce(&SchedulerJob) -> Result<Option<String>>,
     ) -> Result<Option<ClaimedJob>> {
         let tx = self
             .connection
@@ -1597,10 +1597,17 @@ impl Store {
             tx.commit()?;
             return Ok(None);
         };
+        let Some(sdk_config) = configure(&job)? else {
+            save_session(&tx, &session)?;
+            tx.commit()?;
+            return Ok(None);
+        };
         job.basis = log::version_vector_from(&tx, network)?;
-        if session.sdk_config.as_deref() != Some(sdk_config) || session.owner_epoch != owner_epoch {
+        if session.sdk_config.as_deref() != Some(sdk_config.as_str())
+            || session.owner_epoch != owner_epoch
+        {
             advance_lineage(&mut session, &job.basis)?;
-            session.sdk_config = Some(sdk_config.into());
+            session.sdk_config = Some(sdk_config);
             session.owner_epoch = owner_epoch;
         }
         let resumable = job.kind != TriggerKind::AgentTask

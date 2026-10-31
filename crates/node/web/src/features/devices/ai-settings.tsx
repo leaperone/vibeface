@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentProps, type ReactNode } from "react"
-import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
+import { Asterisk, Braces, ChevronRight, CircleAlert, CircleCheck, CircleDashed, Copy, Download, ExternalLink, FolderOpen, FolderPlus, List, LoaderCircle, Lock, Monitor, MousePointer2, Pencil, Pi, Play, PlugZap, Plus, Power, RotateCw, SquareTerminal, Trash2, Unplug, X, type LucideIcon } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { BusyIcon, Details, FolderPath, InlineError, Segmented, Skeleton, toast, toneText, type Tone } from "@/components/app/kit"
 import { Button } from "@/components/ui/button"
@@ -122,6 +122,7 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
           <BusyIcon busy={testing} icon={PlugZap} />测试连接
         </Button>
       </div>
+      {server.mode === "system" ? <p className="text-meta text-muted-foreground">共享所选外部 App Server 的会话，不隔离该服务的数据。</p> : null}
       {blocked ? null : <LinkLine link={shown} prefix={tested ? "测试：" : ""} />}
       {shown.state === "handshake_failed" || shown.state === "launch_failed" ? <Details label="原因"><code className="font-mono break-all">{shown.reason}</code></Details> : null}
     </div>
@@ -136,10 +137,6 @@ function AppServerSettings({ server, home, sessions, display, working, blocked, 
   </div>
 }
 
-/**
- * When the device found no Codex on this computer: an explicit system socket can still be entered here.
- * The spawn runtime directory is always Node-owned.
- */
 function ManualCodex({ onboarding, working, busy, save }: { onboarding: boolean; working: boolean; busy: string; save(key: string, change: Omit<Change, "provider">): Promise<boolean> }) {
   return <Details label="手动填写">
     <div className="grid gap-3">
@@ -411,6 +408,14 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
     </p> : null}
     <div className="grid gap-1 px-4 pb-3 sm:ps-12">
       {'issue' in item.readiness ? <p role="status" className="text-meta text-muted-foreground">{probeIssueText(item.provider, item.readiness.issue)}</p> : null}
+      {item.setup && (bot || execution) && ["needs_setup", "unverified"].includes(item.readiness.state) ? <div className="grid gap-2 text-meta">
+        <p>在这台 Node 的电脑上运行以下命令，为私有目录登录或配置，然后检查可用性。本机 CLI 的其他目录登录状态不会自动复制。</p>
+        <FolderPath path={item.setup.directory} shown={display[item.setup.directory]} />
+        <div className="flex min-w-0 gap-2">
+          <Input readOnly aria-label={`${name} 私有目录登录命令`} className="min-w-0 font-mono" value={item.setup.command} onFocus={(event) => event.target.select()} />
+          <Button type="button" variant="outline" onClick={() => { if (item.setup) void navigator.clipboard.writeText(item.setup.command).then(() => toast("已复制登录命令", { tone: "success" }), () => toast("请选中命令后复制", { tone: "warning" })) }}><Copy aria-hidden="true" />复制命令</Button>
+        </div>
+      </div> : null}
       <div className="flex flex-wrap items-center gap-2 text-meta text-muted-foreground">
         <span>{item.probe.checked_at_ms === null ? "尚未主动检查" : `检查于 ${new Date(item.probe.checked_at_ms).toLocaleString()}`}</span>
         <Button type="button" variant="ghost" size="sm" disabled={busy !== ""} onClick={() => void probe()}><BusyIcon busy={busy === `${item.provider}:probe`} icon={RotateCw} />检查可用性</Button>
@@ -423,10 +428,14 @@ function ProviderCard({ item, response, onboarding, busy, models, error, change,
         <ChevronRight aria-hidden="true" className="size-4 transition-transform duration-200" />设置
       </summary>
       <div className="grid gap-4 px-4 sm:ps-12 pt-1 pb-4">
-        {manager ? <BotDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
-          busy={busy === `${item.provider}:bot_details`} save={saveBot} /> : null}
-        {execution ? <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
-          busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} /> : null}
+        {manager ? <Details label="运行 Bot">
+          <BotDetails key={`${manager.provider}:${JSON.stringify([manager.model, manager.reasoning_effort, manager.backup])}`} fields={["model"]} manager={manager} models={models} display={display} working={working}
+            busy={busy === `${item.provider}:bot_details`} save={saveBot} />
+        </Details> : null}
+        {execution ? <Details label="执行任务">
+          <ExecutionDetails key={`${item.execution_model}:${item.provider}`} model={item.execution_model} models={models} working={working}
+            busy={busy === `${item.provider}:execution_model`} save={(model) => change("execution_model", { execution_model: model })} />
+        </Details> : null}
         {keys.length ? <ul className="grid gap-1" aria-label={terms.secret.label}>{keys.map((row) => envRow(row, true))}</ul> : null}
 
         {/* Connection, folders, program and variables are for whoever needs them; a problem in them opens the fold. */}

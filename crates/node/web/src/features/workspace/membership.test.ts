@@ -52,6 +52,10 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   const values: unknown[] = [], effects = new Map<number, { dependencies: unknown[]; cleanup?: () => void }>()
   const afterRender: (() => void)[] = []
   const rpcs: string[] = [], stored = new Map<string, string>(), failing = new Set<string>(), ticks: (() => void)[] = []
+  let notificationReads = [
+    { notification_id: 'n-1', conversation_id: conversationId, kind: 'progress', text: '有新进展' },
+    { notification_id: 'n-session', conversation_id: conversationId, kind: 'session_attributed', text: 'tests fail' },
+  ]
   if (readBefore) stored.set(`vibeface.read-before.${browser}.${network}`, JSON.stringify(readBefore))
   let cursor = 0
   const react = {
@@ -75,7 +79,7 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
   }
   const reads: Record<string, unknown> = {
     nodes: { nodes: [] }, bots: { bots: [bot], primary: conversationId }, questions: { questions: [question] }, conversation, open_works: { works: [] },
-    notifications: { notifications: [{ notification_id: 'n-1', conversation_id: conversationId, kind: 'progress', text: '有新进展' }] },
+    notifications: { notifications: notificationReads },
   }
   const connection = {
     generation: 1, entry: { address: 'https://node.example', device_id: entry },
@@ -89,7 +93,11 @@ function workspace(source: 'membership' | 'local_session', readBefore: string[] 
       if (method in reads) return reads[method]
       // The entry checks the signature against the membership directory, as `AuthorizationView::member` does.
       if (source !== 'membership') throw Object.assign(new Error(notMember), { responded: true })
-      if (method === 'ack') { reads.notifications = { notifications: [] }; return {} }
+      if (method === 'ack') {
+        notificationReads = notificationReads.filter((item) => item.notification_id !== String(params.notification_id))
+        reads.notifications = { notifications: notificationReads }
+        return {}
+      }
       if (method === 'answer') return { status: 'answered', message: { message_id: `a-${params.question_id}`, text: params.text } }
       return {}
     },
@@ -162,7 +170,8 @@ test('a member reads its notifications and can answer', async () => {
   try {
     assert.equal(app.render().writable, true)
     for (let tick = 0; tick < 3; tick++) { await app.render().refresh(); await settle() }
-    assert.equal(app.rpcs.filter(method => method === 'ack').length, 1, 'read once, then the notification is gone')
+    assert.equal(app.rpcs.filter(method => method === 'ack').length, 1, 'read once, then ordinary notification is gone')
+    assert.deepEqual(app.render().notifications.map((item: { notification_id: string }) => item.notification_id), ['n-session'], 'a session reminder stays until its reminder row is opened')
     assert.equal((await app.render().answer(question, '继续')).status, 'answered')
     assert.equal(app.render().joined, true)
   } finally { app.close() }
@@ -174,7 +183,7 @@ test('a new device starts with the history read and sends no read receipts for i
     for (let tick = 0; tick < 3; tick++) { await app.render().refresh(); await settle() }
     assert.deepEqual(app.render().notifications, [])
     assert.equal(app.rpcs.filter(method => method === 'ack').length, 0)
-    assert.equal(app.stored.get(`vibeface.read-before.${browser}.${network}`), JSON.stringify(['n-1']))
+    assert.equal(app.stored.get(`vibeface.read-before.${browser}.${network}`), JSON.stringify(['n-1', 'n-session']))
   } finally { app.close() }
 })
 

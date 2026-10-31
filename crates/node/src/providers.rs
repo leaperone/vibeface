@@ -848,6 +848,8 @@ pub struct ProviderRoots {
     pub codex_sessions: PathBuf,
     pub claude_config: PathBuf,
     pub claude_projects: PathBuf,
+    pub pi_sessions: PathBuf,
+    pub opencode: PathBuf,
 }
 
 impl ProviderRoots {
@@ -857,9 +859,58 @@ impl ProviderRoots {
         Self {
             codex_sessions: codex_home.join("sessions"),
             claude_projects: claude_config.join("projects"),
+            pi_sessions: data_dir.join("providers/pi/sessions"),
+            opencode: data_dir.join("providers/opencode"),
             codex_home,
             claude_config,
         }
+    }
+
+    pub fn env(&self, provider: Provider) -> BTreeMap<String, String> {
+        let paths = match provider {
+            Provider::Codex => vec![("CODEX_HOME", self.codex_home.clone())],
+            Provider::Claude => vec![("CLAUDE_CONFIG_DIR", self.claude_config.clone())],
+            Provider::Pi => vec![("PI_CODING_AGENT_SESSION_DIR", self.pi_sessions.clone())],
+            Provider::Opencode => vec![
+                ("XDG_DATA_HOME", self.opencode.join("data")),
+                ("XDG_CONFIG_HOME", self.opencode.join("config")),
+                ("XDG_STATE_HOME", self.opencode.join("state")),
+                ("XDG_CACHE_HOME", self.opencode.join("cache")),
+                (
+                    "OPENCODE_DB",
+                    self.opencode.join("data/opencode/opencode.db"),
+                ),
+                ("OPENCODE_CONFIG_DIR", self.opencode.join("config/opencode")),
+            ],
+            Provider::Cursor => vec![],
+        };
+        let mut env: BTreeMap<_, _> = paths
+            .into_iter()
+            .map(|(name, path)| (name.into(), path.to_string_lossy().into_owned()))
+            .collect();
+        if provider == Provider::Opencode {
+            for name in [
+                "OPENCODE_DISABLE_PROJECT_CONFIG",
+                "OPENCODE_CONFIG_PROJECT_DISABLE",
+                "OPENCODE_DISABLE_CLAUDE_CODE",
+            ] {
+                env.insert(name.into(), "true".into());
+            }
+        }
+        env
+    }
+
+    pub fn apply(&self, local: &mut Local) -> Result<()> {
+        for provider in Provider::ALL {
+            local.env.apply(
+                provider,
+                self.env(provider)
+                    .into_iter()
+                    .map(|(name, value)| (name, Some(value)))
+                    .collect(),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1165,6 +1216,41 @@ mod tests {
             PathBuf::from("/private/node/providers/claude")
         );
         assert_eq!(roots.claude_projects, roots.claude_config.join("projects"));
+    }
+
+    #[test]
+    fn runtime_root_environment_can_be_saved_and_loaded_without_losing_auth() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vibeface-provider-roots-{}", uuid::Uuid::new_v4()));
+        crate::config::private_dir(&dir)?;
+        let roots = ProviderRoots::new(&dir);
+        let mut local = Local {
+            switches: Providers::default(),
+            bins: BTreeMap::new(),
+            env: ProviderEnv::default(),
+        };
+        local.env.apply(
+            Provider::Opencode,
+            BTreeMap::from([("ANTHROPIC_API_KEY".into(), Some("fixture-auth".into()))]),
+        )?;
+        roots.apply(&mut local)?;
+        local.env.save(&dir)?;
+        let loaded = ProviderEnv::load(&dir)?;
+        for provider in Provider::ALL {
+            for (name, value) in roots.env(provider) {
+                assert_eq!(loaded.get(provider).get(&name), Some(&value));
+            }
+        }
+        assert_eq!(
+            loaded
+                .get(Provider::Opencode)
+                .get("ANTHROPIC_API_KEY")
+                .map(String::as_str),
+            Some("fixture-auth")
+        );
+        assert!(!loaded.get(Provider::Pi).contains_key("ANTHROPIC_API_KEY"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

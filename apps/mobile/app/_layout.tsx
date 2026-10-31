@@ -84,6 +84,8 @@ function Screens() {
             <Stack.Screen name="ai" options={({ route }) => ({ title: 'Bot 与任务', headerLeft: (route.params as { sheet?: string } | undefined)?.sheet ? Close : undefined })} />
             <Stack.Screen name="inbox" options={{ title: '待处理', ...root }} />
             <Stack.Screen name="settings" options={{ title: '设置', ...root }} />
+            <Stack.Screen name="lab" options={{ title: '实验室' }} />
+            <Stack.Screen name="logs" options={{ title: '日志' }} />
             <Stack.Screen name="external-chat" options={{ title: '外部聊天' }} />
             <Stack.Screen name="transfers" options={{ title: '文件传输' }} />
             <Stack.Screen name="device/[deviceId]" options={{ title: '' }} />

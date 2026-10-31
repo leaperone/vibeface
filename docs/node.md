@@ -76,7 +76,7 @@ bash scripts/build-web.sh
 
 通过 `manager.model` 选择账户实际可用的模型。`auto` 或默认模型不保证响应速度，实际延迟取决于 Provider、模型和网络。
 
-在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择；没有 Bot 时打开执行任务会让这个服务同时运行 Bot，因为派来的任务由 Bot 接下。Bot 所在服务的**设置**默认只显示模型和需要的密钥；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
+在签名管理浏览器或可信本机会话打开设备页的 **AI**。Codex、Cursor、Claude Code、pi 和 opencode 各占一行：点某一行的 Bot 图标，由它运行 Bot，再点一次关闭 Bot；各行的任务图标开关本机执行任务，Bot 和执行任务可分别选择；没有 Bot 时打开执行任务会让这个服务同时运行 Bot，因为派来的任务由 Bot 接下。服务的**设置**分别展开**运行 Bot**与**执行任务**的模型配置，两个角色独立保存；连接方式、Bot 工作文件夹、程序路径和环境变量收在**设置 → 高级**里，出问题时自动展开。允许 Agent 访问的项目目录在**可用文件夹**里。默认 Agent 工作目录为当前数据目录下的 `manager-workspace`，首次选择 Bot 时自动建立为私有目录。自定义工作目录须已存在，且与项目编辑目录分开。修改只影响当前节点的本机配置，新操作立即读取，已运行任务不会重启或自动取消。
 
 网页在每个服务那一行列出所需程序和准备状态。Codex 打开执行任务且选择由 Vibeface 启动时，Node 启动私有 App Server，但不会安装 Provider、执行账户登录、调用模型或扩大节点角色。程序可用也不代表 Provider 已登录。确认安装和授权前提后，再通过真实对话核验。下面的初始化参数是可选备用方式，字段说明见 [本机配置](node-protocol.md#本机配置)。
 
@@ -121,13 +121,13 @@ Bot 通过本机 `vibeface tool` 命令调用限定到当前网络和聊天的�
 
 ### 使用 Claude Code、pi 或 opencode
 
-三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先在同一用户下装好并登录，或在该服务的**设置**里填模型密钥变量。
+三者都像 Codex 一样经 `vibeface tool` 调用协调工具，Bot 和执行任务都能用。Node 在本机运行它们，不安装、不登录。先安装所选程序。Claude Code 与 OpenCode 使用 Node 私有目录，需按设备 AI 设置中可复制的命令在这台电脑上登录或配置，再点**检查可用性**；Node 不复制用户凭证。pi 只隔离会话目录，继续读取用户本机认证配置。已有显式认证环境仍按对应 Provider 使用。
 
 | 产品 | 程序 | 登录 | Node 怎么运行 |
 |---|---|---|---|
-| Claude Code | `claude` | `claude` 里的 `/login`，或变量 `ANTHROPIC_API_KEY` | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
+| Claude Code | `claude` | AI 设置提供带私有 `CLAUDE_CONFIG_DIR` 的 `claude auth login`，或现有认证环境 | 每轮和每个任务一个 `claude -p` 进程，`bypassPermissions` |
 | pi | npm 包 `@earendil-works/pi-coding-agent` 的 `pi` | pi 里的 `/login`，或所用服务的密钥变量 | 每轮和每个任务一个 `pi --mode rpc --no-extensions` 进程 |
-| opencode | `opencode` | `opencode auth login`，或所用服务的密钥变量 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
+| opencode | `opencode` | AI 设置提供带私有 XDG 与 DB 路径的 `opencode --standalone auth login`，或现有认证环境 | 回环地址上的一个 `opencode serve`；Node 建的会话允许全部工具、拒绝提问，规则排在本人配置之后。子 Agent 的会话不带这些规则 |
 
 程序先在 Node 的 PATH 里找，再找 `~/.local/bin`、`~/.claude/local`（Claude Code）、`~/.opencode/bin`（opencode）、`/opt/homebrew/bin` 和 `/usr/local/bin`。后台服务没有交互式 shell 的 PATH：nvm 或自定义 npm 前缀装的 pi 要在设置里填绝对路径，并在 pi 的变量里设含 `node` 所在目录的 `PATH`。
 

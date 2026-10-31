@@ -64,6 +64,14 @@ Node 只连接这个 socket，不搜索其他正在运行的会话，也不启�
 
 由 Node 启动自己的 App Server 时只需保持 `spawn`。Node 会在启动边界注入 Node-owned `CODEX_HOME`，覆盖普通 Provider 环境里的同名值。Provider 的其他认证环境通过设备设置或服务配置填写。不要把密钥写入源码、URL、共享记录或命令历史。Cursor 的 bridge 路径和协调 Agent 工作目录也由本机配置指定。
 
+## 为 Node 私有目录登录
+
+Codex spawn、Claude Code 和 OpenCode 的本机 CLI 已登录，不代表 Node 的私有目录已登录。打开设备 **AI** 设置，复制对应服务的登录命令，在运行该 Node 的电脑上执行，再点**检查可用性**。命令包含实际程序与私有目录的绝对路径，不包含凭证。
+
+Codex 命令设置 `<data-dir>/providers/codex` 的 `CODEX_HOME` 后执行 `codex login`。Claude Code 设置 `<data-dir>/providers/claude` 的 `CLAUDE_CONFIG_DIR` 后执行 `claude auth login`。OpenCode 命令固定 `<data-dir>/providers/opencode` 内的 XDG 与数据库路径，清除外部 config override，再执行 `opencode --standalone auth login`，防止登录到用户已有后台服务。按 Provider 保存的合法认证变量与 Node 继承的认证环境继续生效，Node 不自动读取或复制用户 auth 文件或密钥。
+
+pi 的认证目录不变，只有 session 目录固定为 `<data-dir>/providers/pi/sessions`。OpenCode 的数据、配置、状态和缓存分别位于私有根的 `data`、`config`、`state` 和 `cache`，项目配置不会覆盖此运行配置。Codex system 模式共享明确指定的外部服务会话，使用该服务自身的登录入口。
+
 ## 配置会话扫描和 hooks
 
 会话扫描默认关闭。需要扫描时，在 `config.json` 的 `triage` 中配置：
