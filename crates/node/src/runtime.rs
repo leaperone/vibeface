@@ -272,9 +272,12 @@ mod workspace_overview_tests {
             "severity": "attention", "choices": [], "created_at_ms": 1,
         }));
         assert_eq!(question["conversation_id"], "question-chat");
-        assert_eq!(question["bot"], json!({
-            "bot_id": "b", "name": "Bot", "conversation_id": "question-chat",
-        }));
+        assert_eq!(
+            question["bot"],
+            json!({
+                "bot_id": "b", "name": "Bot", "conversation_id": "question-chat",
+            })
+        );
         let unowned = workspace_question_summary(&json!({"conversation_id": "gone", "bot": null}));
         assert!(unowned["bot"].is_null());
         let session = workspace_session_summary(&json!({
