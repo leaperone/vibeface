@@ -69,6 +69,8 @@ type DeviceContextValue = {
   pendingRecovery: PendingRecovery | null; dismissPendingRecovery(): void
   /** Stops the recovery `checkpoint` names; resolves once it is stopped, also when an earlier try already stopped it. */
   vetoRecovery(checkpoint: string): Promise<void>
+  /** Confirms the recovery `checkpoint` now; resolves once it is active, also when an earlier try already did it. */
+  approveRecovery(checkpoint: string): Promise<void>
   /** Left by a stop on this device until the recovery key changes: whoever started it holds the file. */
   rotateHint: boolean; dismissRotateHint(): void
   /** The Node's clock minus this browser's, as of the last directory: times in the directory are on the Node's clock. */
@@ -861,6 +863,52 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     await refreshDirectory()
   }
   /**
+   * Confirms the recovery `checkpoint` immediately. The directory is read before signing and
+   * again after an unknown write, so a retry never signs a second event.
+   */
+  async function approveRecovery(checkpoint: string) {
+    const connection = managing(), request = scoped()
+    const read = async () => {
+      let response: Record<string, unknown>
+      try { response = record(await request('directory')) }
+      catch (cause) {
+        // An approval may remove this manager before its reply arrives. Authentication still
+        // tells us that the session lost membership, which is a completed approval outcome.
+        try {
+          const auth = record(await request('authenticate'))
+          return { event: null, pending: false, detached: auth.principal === null }
+        } catch { throw cause }
+      }
+      const now = nodeNow(response) ?? Date.now()
+      const verified = verifyState(response.state, connection.principal.network_id, now)
+      try {
+        const view = parseView(JSON.parse(verified.viewJson()))
+        const event = view.pending?.checkpoint === checkpoint
+          ? JSON.parse(verified.governanceTemplate(own().deviceId, JSON.stringify({ type: 'approve', checkpoint, at_ms: now }))) as Record<string, unknown>
+          : null
+        return { event, pending: view.pending?.checkpoint === checkpoint, detached: false }
+      } finally { verified.free() }
+    }
+    const before = await read(), event = before.event
+    if (event) {
+      event.signature = await signClient('identity-governance', governancePayload(JSON.stringify(event)))
+      try {
+        const answer = record(await request('approve_recovery', { event }))
+        // `authentication` is allowed to return no principal after the approved directory
+        // removes this manager; that is still a successful write.
+        if (answer.principal === null) { await refreshDirectory().catch(() => {}); return }
+      }
+      catch (cause) {
+        // Whether it landed is unknown; a reread that no longer waits on it means it did.
+        const after = await read().catch(() => null)
+        if (!after || after.event || after.pending) throw cause
+        await refreshDirectory().catch(() => {})
+        return
+      }
+    }
+    await refreshDirectory()
+  }
+  /**
    * The app tries the entry Node where the ticket says it listens on the LAN, then this page's own entry: a scanned
    * code's address is only a hint, the device key is the check.
    */
@@ -1392,7 +1440,7 @@ export function DeviceProvider({ platform, children, restart }: { platform: Plat
     async confirmBootstrap(saved) { if (!sensitive.current?.bootstrap) throw new Error('这一步已失效，请重新开始创建。'); await sensitive.current.bootstrap(saved) },
     async confirmRecovery(members) { if (!sensitive.current?.recover) throw new Error('这一步已失效，请重新选择恢复文件。'); await sensitive.current.recover(members) },
     cancelSensitive,
-    pendingRecovery, vetoRecovery, nodeClockOffset, rotateHint,
+    pendingRecovery, vetoRecovery, approveRecovery, nodeClockOffset, rotateHint,
     dismissRotateHint() { if (ready) setRotateHint(ready.principal.network_id, null) },
     dismissPendingRecovery() { if (!ready || !pendingRecovery) return; hideRecovery(ready.principal.network_id, pendingRecovery.checkpoint); setDismissals(count => count + 1) },
     recovery, dismissRecovery, recovered, unsavedRecovery, downloadUnsavedRecovery,

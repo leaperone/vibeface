@@ -1015,6 +1015,42 @@ async fn dispatch(
             }
             authentication(node, session).await
         }
+        "approve_recovery" => {
+            let view = manager_view(node, session).await?;
+            let event: GovernanceEvent = from_field(&params, "event")?;
+            let GovernanceAction::Approve { checkpoint, at_ms } = &event.action else {
+                bail!("invalid recovery approval signer or action")
+            };
+            ensure!(
+                event.issuer == session.device_id,
+                "invalid recovery approval signer or action"
+            );
+            let mut state = node.membership_state().await?;
+            // A retry after the approval landed finds the event and changes nothing.
+            if !state.events.contains(&event) {
+                ensure!(
+                    event.epoch == view.epoch,
+                    "invalid recovery approval signer or action"
+                );
+                let now = crate::runtime::now_ms() as u64;
+                ensure!(
+                    at_ms.abs_diff(now) <= RECOVERY_SKEW_MS,
+                    "this device's clock is too far from this Node's clock"
+                );
+                let pending = view
+                    .pending
+                    .as_ref()
+                    .filter(|pending| pending.checkpoint == *checkpoint)
+                    .context(NO_RECOVERY_WAITING)?;
+                ensure!(
+                    *at_ms < pending.effective_at_ms,
+                    "this recovery is already due"
+                );
+                state.append(event)?;
+                node.install_membership(state).await?;
+            }
+            authentication(node, session).await
+        }
         "recovery_state" => {
             // The recovery root may not be a member any more, so it proves itself
             // with a two-minute signature bound to this channel's device. The checkpoints its
@@ -3342,6 +3378,87 @@ mod tests {
         drop(node);
         std::fs::remove_dir_all(&dir)?;
         result
+    }
+
+    #[tokio::test]
+    async fn approve_recovery_accepts_a_near_due_checkpoint_and_is_idempotent() -> Result<()> {
+        use crate::config::{self, Config};
+
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.artifacts")
+            .join(format!("approve-recovery-{}", uuid::Uuid::new_v4()));
+        config::private_dir(&dir)?;
+        let mut config = Config::local("127.0.0.1:0".parse()?, vec![], false);
+        config.providers.codex_app_server.socket = Some(dir.join("unavailable-codex.sock"));
+        config.save(&dir)?;
+        config::private_write(
+            &dir.join("data-epoch.json"),
+            &crate::config::data_epoch_marker(),
+        )?;
+        config::private_write(
+            &dir.join("identity.json"),
+            &serde_json::to_vec(&LocalIdentity::generate())?,
+        )?;
+
+        let node = Arc::new(Runtime::open(&dir).await?);
+        let (root, manager) = (LocalIdentity::generate(), LocalIdentity::generate());
+        let mut state = NetworkState::new(Genesis::create(
+            &root,
+            Member::client(&manager, "manager", true)?,
+            Member::node(&node.identity, "node")?,
+        )?)?;
+        let now = crate::runtime::now_ms() as u64;
+        let checkpoint = RootCheckpoint::recovery(
+            &state,
+            &root,
+            &LocalIdentity::generate().device_id()?,
+            state.genesis.members.clone(),
+            vec![],
+            now - vibeface_secure::membership::RECOVERY_DELAY_MS + 60_000,
+        )?;
+        state.recover_at(checkpoint.clone(), now)?;
+        node.install_membership(state.clone()).await?;
+
+        let mut session = Session {
+            device_id: manager.device_id()?,
+            cookie: None,
+            subscribed: None,
+            observation: None,
+        };
+        let view = state.project_at(now)?.clone();
+        let event = GovernanceEvent::unsigned(
+            &view,
+            &manager.device_id()?,
+            GovernanceAction::Approve {
+                checkpoint: checkpoint.hash()?,
+                at_ms: now,
+            },
+        )?
+        .sign(&manager)?;
+        let first = dispatch(
+            &node,
+            &mut session,
+            "approve_recovery",
+            json!({"event":event}),
+        )
+        .await?;
+        assert_eq!(first["view"]["epoch"], 2);
+        assert!(first["view"]["pending"].is_null());
+        let events = node.membership_state().await?.events;
+        assert_eq!(events.len(), 1);
+
+        let second = dispatch(
+            &node,
+            &mut session,
+            "approve_recovery",
+            json!({"event":events[0]}),
+        )
+        .await?;
+        assert_eq!(second["view"], first["view"]);
+        assert_eq!(node.membership_state().await?.events.len(), 1);
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[tokio::test]
