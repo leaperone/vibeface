@@ -2153,6 +2153,13 @@ impl Store {
             if session.native_id.as_deref() == Some(thread_id) {
                 session.covers = job.basis;
                 let mut shown = shown.clone();
+                shown.staged_memories.extend(
+                    session
+                        .shown
+                        .staged_memories
+                        .iter()
+                        .map(|(call_ref, mutation)| (call_ref.clone(), mutation.clone())),
+                );
                 shown.session_generation = shown
                     .session_generation
                     .max(session.shown.session_generation);

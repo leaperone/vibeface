@@ -3513,6 +3513,7 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
         .context("job")?;
     let attempt = claimed.job.state.attempt().context("attempt")?.id.clone();
     store.mark_started("c", &trigger, &attempt)?;
+    store.save_scheduler_native_id("c", &trigger, &attempt, "thread", "token", false)?;
     let staged = store.stage_memory(
         &net.network,
         "c",
@@ -3527,6 +3528,13 @@ fn staged_memory_commits_only_with_a_completed_turn() -> Result<()> {
     )?;
     assert_eq!(staged["state"], "staged");
     assert!(store.memories(&net.network, "c")?.is_empty());
+    store.record_manager_turn(
+        &attempt,
+        "system",
+        "thread",
+        Some("turn"),
+        &Shown::default(),
+    )?;
     store.finish_job(
         &net.a,
         &net.network,
