@@ -301,7 +301,9 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
   }
   const jobs = [
     ...(overview?.jobs ?? []).map((job) => ({ conversation_id: job.conversation_id, job })),
-    ...(input.jobs ?? []),
+    ...(input.jobs ?? []).filter(({ conversation_id, job }) => !overview?.jobs.some((known) =>
+      conversation_id && job.trigger && known.conversation_id === conversation_id && known.trigger === job.trigger
+      && known.source_node !== null && known.source_node === (job.source_node ?? localNode))),
   ]
   for (const entry of jobs) {
     const workId = taskWorkId(entry.job.trigger)
@@ -325,7 +327,8 @@ export function workspaceActivities(input: WorkspaceActivityInput): WorkspaceAct
       : checkKey ? workByKey.get(checkKey) ? checkMatchesWork(check, workByKey.get(checkKey)!) : false : false
     if (!attached) addAttention(`attention:check:${check.check_id}`, check.kind === "work" ? check.conversation_id : null, check)
   }
-  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !attachedOverviewQuestions.has(question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
+  for (const question of overview?.questions ?? []) if (!(question.question_id in answered) && !attachedOverviewQuestions.has(question.question_id)
+    && !input.questions.some((known) => known.conversation_id === question.conversation_id && known.question_id === question.question_id)) addAttention(`attention:overview-question:${question.question_id}`, question.conversation_id, question)
   for (const task of overview?.tasks ?? []) if (task.kind === "check" && !attachedOverviewChecks.has(task.check_id)) addAttention(`attention:overview-check:${task.item_id}`, task.conversation_id, enrichCheck(task))
   const groups: Record<WorkspaceActivityGroup, WorkspaceActivity[]> = { attention: [], working: [], waiting: [] }
   for (const activity of activities) groups[activity.group].push(activity)

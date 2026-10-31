@@ -264,3 +264,28 @@ test("workspace activities attach approval facts, keep task checks with work, an
   assert.equal(mismatched.activities.filter((activity) => activity.kind === "attention").length, 2, "different conversations and devices do not dedupe")
   assert.equal(workspaceActivities({ works: [{ ...running, state: "unverified", outcome: "unverified" }], questions: [], checks: [], nodes: [node("worker")], read: true, connected: true }).groups.attention.length, 1)
 })
+
+test("workspace activities show a standalone question once across full and overview records", () => {
+  const pending = question()
+  const overview = overviewFromWorkspace({ openWorks: [], bots: [], questions: [pending], nodes: [] })
+  const activities = workspaceActivities({ works: [], questions: [pending], checks: [], overview }).activities
+  assert.equal(activities.length, 1)
+  assert.equal(activities[0]?.kind === "attention" && activities[0].attention, pending, "keep the complete actionable question")
+  assert.equal(workspaceActivities({ works: [], questions: [], checks: [], overview }).activities.length, 1, "an overview-only question stays visible")
+  const other = { ...overview, questions: overview.questions.map((entry) => ({ ...entry, conversation_id: "other-chat" })) }
+  assert.equal(workspaceActivities({ works: [], questions: [pending], checks: [], overview: other }).activities.length, 2, "a different conversation is a separate question")
+  assert.equal(workspaceActivities({ works: [], questions: [pending], checks: [], overview, answered: { [pending.question_id]: "继续" } }).activities.length, 0)
+})
+
+test("workspace activities count the same known scheduler job once without merging different sources", () => {
+  const overview = parseWorkspaceOverview({ jobs: [{ job_id: "job-1", conversation_id: "chat-1", trigger: "message:ordinary", state: "queued", source_node: "entry" }] })
+  const local = { conversation_id: "chat-1", job: { trigger: "message:ordinary", state: "queued" } }
+  const jobs = [local]
+  const input = { works: [], questions: [], checks: [], overview, jobs, nodes: [node("entry", true, true)] }
+  const activities = workspaceActivities(input).activities
+  assert.equal(activities.length, 1)
+  assert.equal(activities[0]?.kind === "turn" && activities[0].job, overview.jobs[0])
+  assert.equal(workspaceActivities({ ...input, nodes: [] }).activities.length, 2, "an unknown local identity cannot prove a duplicate")
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, conversation_id: "other-chat" }] }).activities.length, 2)
+  assert.equal(workspaceActivities({ ...input, jobs: [{ ...local, job: { ...local.job, source_node: "other-node" } }] }).activities.length, 2)
+})
